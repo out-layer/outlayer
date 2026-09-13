@@ -42,7 +42,21 @@ APPLY=false
 [[ "${1:-}" == "--apply" ]] && APPLY=true
 
 NETWORK="${NETWORK:-testnet}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+# The RPC every probe here reads through. A FastNEAR endpoint WITH an API key:
+# the unkeyed host is rate-limited and slow, and its timeouts read exactly like
+# product failures (N3, 2026-09-13). The key comes from FASTNEAR_API_KEY, else
+# from near-cli's own config, and never from this file.
+fastnear_key() {
+  [[ -n "${FASTNEAR_API_KEY:-}" ]] && { printf '%s' "$FASTNEAR_API_KEY"; return 0; }
+  local cfg="$HOME/Library/Application Support/near-cli/config.toml"
+  [[ -r "$cfg" ]] && grep -oE "rpc\.${NETWORK}\.fastnear\.com/\?apiKey=[A-Za-z0-9]+" "$cfg" | head -1 | sed 's/.*apiKey=//'
+}
+if [[ -z "${RPC_URL:-}" ]]; then
+  _k="$(fastnear_key || true)"
+  if [[ -n "$_k" ]]; then RPC_URL="https://rpc.${NETWORK}.fastnear.com/?apiKey=$_k"
+  else RPC_URL="https://rpc.${NETWORK}.fastnear.com"; echo "⚠ no FastNEAR API key (FASTNEAR_API_KEY or near-cli config): using the unkeyed RPC, expect rate limits and timeouts" >&2; fi
+  unset _k
+fi
 FUNDER="${FUNDER:-}"
 EXECUTOR="${EXECUTOR:-}"
 RECIPIENT="${RECIPIENT:-}"

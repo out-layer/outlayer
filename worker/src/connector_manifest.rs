@@ -476,9 +476,13 @@ pub const MANIFEST_SECTION: &str = "outlayer.manifest";
 /// the core modules a component embeds, so a manifest placed by the guest's
 /// source survives `wasm-tools component new`.
 ///
-/// Returns `None` when there is no such section or it is not valid JSON. The
-/// caller decides what that means — for a connector it means "no network".
-pub fn manifest_from_wasm(wasm: &[u8]) -> Option<ProjectManifest> {
+/// `Ok(None)` when there is no such section, `Ok(Some)` when it parses, and
+/// `Err(reason)` when a section IS there and cannot be read — over the size
+/// cap, not JSON, not a manifest. The caller refuses the run on `Err`: a
+/// declaration nobody can read must not become "no declaration", because with
+/// the author's secret would go the author's admission gate, and an app opened
+/// to a circle would run for everyone.
+pub fn manifest_from_wasm(wasm: &[u8]) -> Result<Option<ProjectManifest>, String> {
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         // A malformed tail must not lose a section already found, and must not
         // panic: these bytes come from a project we did not write.
@@ -488,22 +492,18 @@ pub fn manifest_from_wasm(wasm: &[u8]) -> Option<ProjectManifest> {
                 continue;
             }
             if reader.data().len() > MAX_MANIFEST_BYTES {
-                tracing::warn!(
-                    len = reader.data().len(),
-                    "embedded manifest too large — ignored"
-                );
-                return None;
+                return Err(format!(
+                    "the {MANIFEST_SECTION} section is {} bytes, over the {MAX_MANIFEST_BYTES}-byte limit",
+                    reader.data().len()
+                ));
             }
-            match ProjectManifest::parse(reader.data()) {
-                Some(m) => return Some(m),
-                None => {
-                    tracing::warn!("embedded manifest is not valid JSON — ignored");
-                    return None;
-                }
-            }
+            return match ProjectManifest::parse(reader.data()) {
+                Some(m) => Ok(Some(m)),
+                None => Err(format!("the {MANIFEST_SECTION} section does not parse as a manifest")),
+            };
         }
     }
-    None
+    Ok(None)
 }
 
 /// Decide one outbound request and record it.
@@ -733,7 +733,7 @@ mod tests {
     fn the_allowlist_has_exactly_one_source() {
         // No section: a connector gets no network, whatever its repository says.
         assert_eq!(
-            resolve_network_policy(true, manifest_from_wasm(b"not a wasm at all").as_ref()),
+            resolve_network_policy(true, manifest_from_wasm(b"not a wasm at all").unwrap().as_ref()),
             NetworkPolicy::Allowlist(Vec::new()),
             "a connector without an embedded manifest reaches nothing"
         );
@@ -741,7 +741,7 @@ mod tests {
         // And the module offers no way to look elsewhere. `manifest_from_wasm`
         // takes bytes and returns immediately; nothing here is async, and
         // nothing here takes an HTTP client.
-        assert!(manifest_from_wasm(&[]).is_none());
+        assert!(matches!(manifest_from_wasm(&[]), Ok(None)));
     }
 
     // ============ parsing ============
@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn the_manifest_is_read_from_a_core_module() {
         let wasm = core_module(&[custom_section(MANIFEST_SECTION, MANIFEST_JSON)]);
-        let manifest = manifest_from_wasm(&wasm).expect("section must be found");
+        let manifest = manifest_from_wasm(&wasm).unwrap().expect("section must be found");
         assert_eq!(manifest.connector_id.as_deref(), Some("near-email"));
         assert_eq!(manifest.allowlist(), Some(&["mail.near.email".to_string()][..]));
     }
@@ -951,7 +951,7 @@ mod tests {
             MANIFEST_SECTION,
             MANIFEST_JSON,
         )]));
-        let manifest = manifest_from_wasm(&wasm).expect("nested section must be found");
+        let manifest = manifest_from_wasm(&wasm).unwrap().expect("nested section must be found");
         assert_eq!(manifest.connector_id.as_deref(), Some("near-email"));
     }
 
@@ -966,38 +966,43 @@ mod tests {
             custom_section(MANIFEST_SECTION, MANIFEST_JSON),
             custom_section(".debug_info", b"\xde\xad\xbe\xef"),
         ]);
-        assert!(manifest_from_wasm(&wasm).is_some());
+        assert!(matches!(manifest_from_wasm(&wasm), Ok(Some(_))));
 
         // ...and a binary with no manifest section reports none, rather than
         // picking up whichever custom section came first.
         let without = core_module(&[custom_section("producers", b"processed-by")]);
-        assert!(manifest_from_wasm(&without).is_none());
+        assert!(matches!(manifest_from_wasm(&without), Ok(None)));
     }
 
     #[test]
     fn a_wasm_that_is_not_a_wasm_yields_nothing_and_does_not_panic() {
         // These bytes come from a project we did not write. Whatever they are,
         // reading them must produce an answer, not a crashed worker.
-        assert!(manifest_from_wasm(b"").is_none());
-        assert!(manifest_from_wasm(b"not wasm at all").is_none());
+        assert!(matches!(manifest_from_wasm(b""), Ok(None)));
+        assert!(matches!(manifest_from_wasm(b"not wasm at all"), Ok(None)));
         // Right magic, truncated body.
-        assert!(manifest_from_wasm(&[0x00, 0x61, 0x73, 0x6d, 0x01]).is_none());
+        assert!(matches!(manifest_from_wasm(&[0x00, 0x61, 0x73, 0x6d, 0x01]), Ok(None)));
         // A section header claiming more bytes than exist.
         let mut truncated = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00];
         truncated.extend_from_slice(&leb128(9_999));
-        assert!(manifest_from_wasm(&truncated).is_none());
+        assert!(matches!(manifest_from_wasm(&truncated), Ok(None)));
     }
 
     #[test]
-    fn a_section_that_is_not_json_is_ignored_rather_than_guessed_at() {
+    fn a_section_that_is_not_json_refuses_the_run() {
+        // Plan A11: a section that is not JSON is refused with a message, never
+        // ignored — ignored would drop the author's secret and, with it, the
+        // author's admission gate.
         let wasm = core_module(&[custom_section(MANIFEST_SECTION, b"not json")]);
-        assert!(manifest_from_wasm(&wasm).is_none());
-        // And for a connector, "ignored" resolves to no network at all rather
-        // than to unrestricted.
-        assert_eq!(
-            resolve_network_policy(true, manifest_from_wasm(&wasm).as_ref()),
-            NetworkPolicy::Allowlist(vec![])
-        );
+        let err = manifest_from_wasm(&wasm).expect_err("an unreadable section is an error, not None");
+        assert!(err.contains("does not parse as a manifest"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_with_a_numeric_profile_refuses_the_run() {
+        // Valid JSON, not a manifest: `profile` must be a string.
+        let wasm = core_module(&[custom_section(MANIFEST_SECTION, br#"{"author_secrets":{"profile":5}}"#)]);
+        assert!(manifest_from_wasm(&wasm).is_err());
     }
 
     #[test]
@@ -1022,13 +1027,14 @@ mod tests {
         );
 
         let wasm = core_module(&[custom_section(MANIFEST_SECTION, huge.as_bytes())]);
-        assert!(manifest_from_wasm(&wasm).is_none());
+        let err = manifest_from_wasm(&wasm).expect_err("over the cap is an error, not None");
+        assert!(err.contains("over the"), "{err}");
 
         // Just under the limit still goes through, so the check is a bound and
         // not a blanket refusal.
         let small = r#"{"connector_id":"near-email"}"#;
         let ok = core_module(&[custom_section(MANIFEST_SECTION, small.as_bytes())]);
-        assert!(manifest_from_wasm(&ok).is_some());
+        assert!(matches!(manifest_from_wasm(&ok), Ok(Some(_))));
     }
 
     #[test]

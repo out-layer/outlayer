@@ -2261,7 +2261,30 @@ async fn handle_execute_job(
     // The manifest of what actually ran: read once, from the bytes that run,
     // and used for the author's secrets, the network policy, the sub-key
     // gate and the report below.
-    let declared_manifest = connector_manifest::manifest_from_wasm(&wasm_bytes);
+    let declared_manifest = match connector_manifest::manifest_from_wasm(&wasm_bytes) {
+        Ok(m) => m,
+        Err(reason) => {
+            // A declaration nobody can read is refused, not dropped: with the
+            // author's secret would go the author's admission gate.
+            let msg = format!(
+                "The artefact's manifest cannot be read: {reason}. The run is refused rather than \
+                 run without the author's declaration."
+            );
+            error!("❌ {}", msg);
+            report_refusal(
+                api_client,
+                near_client,
+                job,
+                request_id,
+                is_https_call,
+                call_id.map(|s| s.as_str()),
+                msg,
+                Some(api_client::JobStatus::Custom),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     if declared_manifest.is_some() {
         debug!("📄 Manifest read from the wasm's own custom section");
     }
@@ -4571,5 +4594,84 @@ mod proven_sender_tests {
         assert_eq!(proven_sender(Some("alice.near"), "bob.near"), Ok("alice.near"));
         let refusal = proven_sender(None, "bob.near").expect_err("no sender, no decryption");
         assert!(refusal.contains("bob.near") && refusal.contains("no sender"), "{refusal}");
+    }
+}
+
+#[cfg(test)]
+mod k2_a_keystore_that_cannot_answer_refuses_the_run {
+    //! Plan, catalogue K2: "keystore unreachable during an author-secret run →
+    //! refused `Failed`, never run without the credential". The run is refused
+    //! in `author_secrets_for_run` — an `Err` here is what `report_refusal`
+    //! turns into a refused job, and an `Ok(None)` would be a run without the
+    //! author's credential and without the author's admission gate. Two ways
+    //! the keystore cannot answer: there is none, and there is one nobody can
+    //! reach. Both must be `Failed` (an infrastructure fault, not the caller's).
+    use super::*;
+
+    fn manifest_naming_an_author_secret() -> connector_manifest::ProjectManifest {
+        serde_json::from_str(r#"{"author_secrets":{"profile":"author"}}"#)
+            .expect("a manifest with only an author profile parses")
+    }
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(f)
+    }
+
+    #[test]
+    fn no_keystore_client_at_all_refuses_as_failed() {
+        let manifest = manifest_naming_an_author_secret();
+        let out = run(author_secrets_for_run(
+            Some(&manifest),
+            Some("alice.near/app"),
+            None,
+            Some("bob.near"),
+            "data-id",
+            None,
+        ));
+        match out {
+            Err((msg, api_client::JobStatus::Failed)) => {
+                assert!(msg.contains("keystore"), "the refusal names the missing keystore: {msg}");
+            }
+            Err((msg, other)) => panic!("refused, but as {other:?} rather than Failed: {msg}"),
+            Ok(_) => panic!("the run proceeded without the author's credential"),
+        }
+    }
+
+    #[test]
+    fn an_unreachable_keystore_refuses_as_failed_and_never_runs() {
+        let manifest = manifest_naming_an_author_secret();
+        // Port 9 is the discard service; nothing listens on it here, so the
+        // connection is refused at once rather than timing out.
+        let keystore = KeystoreClient::new(vec!["http://127.0.0.1:9".to_string()], "token".to_string())
+            .expect("a client over one unreachable instance");
+        let out = run(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                author_secrets_for_run(
+                    Some(&manifest),
+                    Some("alice.near/app"),
+                    Some(&keystore),
+                    Some("bob.near"),
+                    "data-id",
+                    None,
+                ),
+            )
+            .await
+        });
+        match out {
+            Err(_) => panic!("30 s and no answer — an unreachable keystore must refuse, not hang"),
+            Ok(Err((msg, api_client::JobStatus::Failed))) => {
+                assert!(
+                    !msg.contains("none are stored"),
+                    "an unreachable keystore must not read as 'no secrets stored': {msg}"
+                );
+            }
+            Ok(Err((msg, other))) => panic!("refused, but as {other:?} rather than Failed: {msg}"),
+            Ok(Ok(_)) => panic!("the run proceeded without the author's credential"),
+        }
     }
 }

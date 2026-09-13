@@ -95,6 +95,14 @@ anyhow::bail!("Feature X is not supported. Please use Y instead.");
 | `tests/` | - | Integration tests |
 | `scripts/` | - | Deployment & utility scripts |
 
+## Live tests: a keyed RPC, always
+Every e2e/live run — the suites' own `curl`, near-cli, and the keystore under
+test — goes through a FastNEAR RPC **with an API key**. The unkeyed testnet
+host is rate-limited and slow, and its timeouts read exactly like product
+failures. `tests/lib/hos_common.sh` builds `RPC_URL` from `FASTNEAR_API_KEY`
+(or near-cli's config) and warns when it cannot; do not run a suite past that
+warning.
+
 ## Commands
 ```bash
 cd contract && ./build.sh                # Build contract

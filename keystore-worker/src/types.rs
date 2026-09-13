@@ -421,6 +421,23 @@ impl AccessCondition {
     /// What a refused caller is told. Names a lapsed time limit when there is
     /// one, because that is the one refusal the owner fixes by re-granting
     /// rather than the caller by asking.
+    /// The first `AccountPattern` in this tree that is not a valid regular
+    /// expression, with the compiler's reason — `None` when every pattern
+    /// compiles. Any position counts: a leaf that cannot be evaluated makes
+    /// the whole condition unreadable, and an unreadable condition refuses the
+    /// owner's own runs rather than being guessed at. Under `Not` the guess
+    /// would ADMIT — a denying leaf negated — which is the wrong side to err on.
+    pub fn unparseable_pattern(&self) -> Option<(String, String)> {
+        match self {
+            AccessCondition::AccountPattern { pattern } => compile_anchored_account_pattern(pattern)
+                .err()
+                .map(|e| (pattern.clone(), e.to_string())),
+            AccessCondition::Logic { conditions, .. } => conditions.iter().find_map(|c| c.unparseable_pattern()),
+            AccessCondition::Not { condition } => condition.unparseable_pattern(),
+            _ => None,
+        }
+    }
+
     pub fn denial_message(&self) -> String {
         match self.lapsed_time_limit(now_ns()) {
             Some(until) => format!(
@@ -762,3 +779,57 @@ mod near_sdk_format_tests {
     }
 }
 
+
+#[cfg(test)]
+mod an_unreadable_condition_refuses_wherever_it_sits {
+    //! Plan U12b: a malformed condition (a bad regex) refuses that owner's own
+    //! runs with a parse message. The parse check runs before evaluation
+    //! because evaluation alone gets one placement wrong: a bad pattern denies
+    //! as a leaf, and `Not` over a denying leaf ADMITS.
+    use super::*;
+
+    fn bad() -> AccessCondition {
+        AccessCondition::AccountPattern { pattern: "(".to_string() }
+    }
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn a_bad_pattern_is_found_and_named() {
+        let (pattern, why) = bad().unparseable_pattern().expect("found");
+        assert_eq!(pattern, "(");
+        assert!(!why.is_empty(), "the compiler's reason travels with it");
+    }
+
+    #[test]
+    fn a_valid_pattern_is_not_reported() {
+        let ok = AccessCondition::AccountPattern { pattern: ".*\\.near".to_string() };
+        assert!(ok.unparseable_pattern().is_none());
+        assert!(AccessCondition::AllowAll.unparseable_pattern().is_none());
+    }
+
+    #[test]
+    fn found_under_and_or_and_not() {
+        let under_and = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![AccessCondition::AllowAll, bad()],
+        };
+        let under_or = AccessCondition::Logic {
+            operator: LogicOperator::Or,
+            conditions: vec![AccessCondition::AllowAll, bad()],
+        };
+        let under_not = AccessCondition::Not { condition: Box::new(bad()) };
+        for c in [under_and, under_or, under_not] {
+            assert_eq!(c.unparseable_pattern().map(|(p, _)| p).as_deref(), Some("("));
+        }
+    }
+
+    #[test]
+    fn evaluated_alone_a_bad_pattern_under_not_would_admit_everyone() {
+        // The reason the parse check exists: this is what `validate` says.
+        let under_not = AccessCondition::Not { condition: Box::new(bad()) };
+        let admitted = run(under_not.validate("anyone.near", None)).expect("validate answers");
+        assert!(admitted, "a denying leaf negated admits — so the door must refuse before evaluating");
+    }
+}

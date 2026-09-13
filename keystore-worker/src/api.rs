@@ -1962,6 +1962,18 @@ async fn decrypt_handler(
     // Use user_account_id (who requested execution) as caller for access control
     let caller = &req.user_account_id;
 
+    // An unreadable condition is refused BEFORE it is evaluated, wherever the
+    // unreadable leaf sits: evaluated, a bad pattern denies as a leaf, and
+    // under `Not` that denial would admit. The message names the owner's own
+    // pattern — public on chain in the row — and nothing else.
+    if let Some((pattern, why)) = access_condition.unparseable_pattern() {
+        let message = format!(
+            "Access denied by access condition: its AccountPattern `{pattern}` is not a valid regular expression ({why})"
+        );
+        tracing::warn!(task_id = %task_id_str, caller = %caller, "{message}");
+        return Err(ApiError::Unauthorized(message));
+    }
+
     let access_granted = access_condition.validate(caller, state.near_client.as_ref().map(|c| c.as_ref())).await
         .map_err(|e| {
             tracing::error!(task_id = %task_id_str, error = %e, "Access validation failed");

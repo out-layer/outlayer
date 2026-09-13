@@ -217,6 +217,13 @@ run_as "$MATCHER" patternprobe
 [[ "$RUN_SECRET" == "$CANARY" ]] \
   && pass "A1 and the module read the canary out of the enclave — the gate opens on a real secret" \
   || fail "A1 the module saw '$RUN_SECRET', expected the canary this run stored"
+# A1 is the positive control for everything below. While the author profile is
+# missing this project refuses EVERY run, and each denial row would then pass on
+# a refusal that has nothing to do with the condition it names.
+[[ "$RUN_OK" == "true" && "$RUN_SECRET" == "$CANARY" ]] || {
+  fail "A1 failed, so every refusal below would pass for the wrong reason — stopping here"
+  verdict "secret access conditions"; exit 1
+}
 
 # ── A2/A3 the two ends of the substring hole ─────────────────────────────────
 log "A2 a character BEFORE the pattern"

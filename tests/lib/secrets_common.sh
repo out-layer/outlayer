@@ -63,9 +63,29 @@ wait_row_after() { # wait_row_after <project> <profile> <previous updated_at> [o
   return 1
 }
 
-# The outlayer CLI: OUTLAYER_BIN when a suite names one (a freshly built
-# binary), else whatever is on PATH.
+# The outlayer CLI: OUTLAYER_BIN when a suite names one, else a binary built
+# from the checkout next door, else whatever is on PATH.
+#
+# The guard is not politeness. A binary that predates the priced access edit
+# writes a whitelist as a bare array, which the contract refuses to deserialize,
+# so every row that stores through the CLI dies for a reason that has nothing to
+# do with what it tests — and the refusal rows among them would PASS on it.
+OUTLAYER_CLI_DIR="${OUTLAYER_CLI_DIR:-$HOME/projects/outlayer-cli}"
+# A bare "outlayer" is the default, not a choice: prefer the local build over
+# whatever release binary happens to sit on PATH. Only an explicit path wins.
+if [[ ( -z "${OUTLAYER_BIN:-}" || "${OUTLAYER_BIN:-}" == "outlayer" ) && -x "$OUTLAYER_CLI_DIR/target/release/outlayer" ]]; then
+  OUTLAYER_BIN="$OUTLAYER_CLI_DIR/target/release/outlayer"
+fi
 OUTLAYER_BIN="${OUTLAYER_BIN:-outlayer}"
+OUTLAYER_BIN_PATH="$(command -v "$OUTLAYER_BIN" 2>/dev/null || echo "$OUTLAYER_BIN")"
+# Counted, not `grep -q`: under `pipefail` a quiet grep exits at the first
+# match, `strings` dies of SIGPIPE, and the pipeline's 141 reads as "the symbol
+# is missing" — condemning the very binary that carries it.
+if [[ -x "$OUTLAYER_BIN_PATH" ]] && [[ "$(strings "$OUTLAYER_BIN_PATH" 2>/dev/null | grep -c estimate_storage_cost)" == "0" ]]; then
+  echo "✗ $OUTLAYER_BIN_PATH predates the priced access edit: it writes a whitelist shape the contract refuses." >&2
+  echo "  Build it:  cargo build --release --manifest-path $OUTLAYER_CLI_DIR/Cargo.toml   (or set OUTLAYER_BIN)" >&2
+  exit 1
+fi
 
 store() { # store <project> <profile> <secrets-json> <access>   (the CLI signs as PARENT)
   local before out
@@ -185,8 +205,23 @@ run_as() {
     sign-as "$signer" network-config "$NETWORK" "sign-$signer_flag" send 2>&1)
   ev=$(grep -o 'EVENT_JSON:.*execution_completed.*' <<<"$out" | sed 's/^EVENT_JSON://' | head -1)
   if [[ -z "$ev" ]]; then
-    # No completion event at all: the transaction did not land, or the CLI
-    # failed before sending. Neither is a verdict about the product.
+    # A send that expired on its block hash, or never left the CLI, produces no
+    # event — and no verdict about the product. It is also transient, so it is
+    # worth one retry before the row is written off: a lost transaction cost
+    # this catalogue a whole row (U5) in an earlier sweep.
+    # A send that TIMED OUT may have landed: resending it would run the
+    # request twice and let the second event overwrite the first verdict, so
+    # a timeout is not retried — only a send that provably never left.
+    if grep -qiE "expired|Tx not found|connection" <<<"$out"; then
+      note "the send never landed (transient), retrying once for $signer"
+      sleep 5
+      out=$(near contract call-function as-transaction "$CONTRACT_ID" request_execution \
+        json-args "$args" prepaid-gas '300.0 Tgas' attached-deposit "$DEPOSIT" \
+        sign-as "$signer" network-config "$NETWORK" "sign-$signer_flag" send 2>&1)
+      ev=$(grep -o 'EVENT_JSON:.*execution_completed.*' <<<"$out" | sed 's/^EVENT_JSON://' | head -1)
+    fi
+  fi
+  if [[ -z "$ev" ]]; then
     RUN_OK=absent; RUN_ERR=""; RUN_OUT=""
     note "no completion event from $signer: $(grep -iE 'error|fail|panick|reset|limit' <<<"$out" | head -2 | head -c 300)"
     return 0

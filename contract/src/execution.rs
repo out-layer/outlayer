@@ -971,3 +971,89 @@ impl Contract {
         }
     }
 }
+
+#[cfg(test)]
+mod who_the_on_chain_door_judges {
+    //! The plan defines the identity a secret's condition is judged against
+    //! (Phase 0, entry point 2): `user_account_id` = the transaction's SIGNER on
+    //! this door, the payment key's owner over HTTPS. `request_execution` hands
+    //! that identity to the worker as the `sender_id` of the
+    //! `execution_requested` payload; the worker forwards it as
+    //! `user_account_id` and the keystore validates the row's condition against
+    //! it. This pins which account that is when the predecessor and the signer
+    //! differ — a contract relaying a request a human signed. Should the plan
+    //! move to the predecessor, the assertion flips with it: the payload
+    //! already carries `predecessor_id`.
+    use super::*;
+    use near_sdk::test_utils::{accounts, get_logs, VMContextBuilder};
+    use near_sdk::{testing_env, NearToken};
+
+    fn context(predecessor: AccountId, signer: AccountId, deposit: NearToken) -> VMContextBuilder {
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(predecessor)
+            .signer_account_id(signer)
+            .attached_deposit(deposit)
+            .prepaid_gas(Gas::from_tgas(300));
+        b
+    }
+
+    /// The `sender_id` inside the payload handed to the worker — the string
+    /// the `execution_requested` event carries. Nested JSON is unescaped by
+    /// parsing, never by string surgery.
+    fn worker_payload_sender() -> String {
+        for log in get_logs() {
+            let Some(json) = log.strip_prefix("EVENT_JSON:") else { continue };
+            let event: serde_json::Value = serde_json::from_str(json).expect("event is JSON");
+            if event["event"] != "execution_requested" {
+                continue;
+            }
+            fn find(v: &serde_json::Value) -> Option<String> {
+                match v {
+                    serde_json::Value::String(s) if s.contains("\"sender_id\"") => {
+                        serde_json::from_str::<serde_json::Value>(s)
+                            .ok()
+                            .and_then(|p| p["sender_id"].as_str().map(str::to_string))
+                    }
+                    serde_json::Value::Object(m) => m.values().find_map(find),
+                    serde_json::Value::Array(a) => a.iter().find_map(find),
+                    _ => None,
+                }
+            }
+            if let Some(s) = find(&event) {
+                return s;
+            }
+        }
+        panic!("no execution_requested event with a sender_id in the logs");
+    }
+
+    #[test]
+    fn the_worker_is_handed_the_signer_to_judge_the_condition_against() {
+        let owner = accounts(0);
+        let operator = accounts(1);
+        let deputy = accounts(2);
+        let victim = accounts(3);
+        testing_env!(context(owner.clone(), owner.clone(), NearToken::from_near(0)).build());
+        let mut contract = Contract::new(owner, Some(operator), None, None);
+
+        // A contract (the deputy) is the predecessor; a human (the victim) signed.
+        testing_env!(context(deputy.clone(), victim.clone(), NearToken::from_near(1)).build());
+        contract.request_execution(
+            ExecutionSource::GitHub {
+                repo: "https://github.com/out-layer/anything".to_string(),
+                commit: "0000000000000000000000000000000000000000".to_string(),
+                build_target: None,
+            },
+            None, // compile-only: the cheapest shape that still yields
+            None,
+            Some(SecretsReference { profile: "sec".to_string(), account_id: victim.clone() }),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            worker_payload_sender(),
+            victim.to_string(),
+            "the plan names the transaction's signer as the judged identity; the worker was handed someone else"
+        );
+    }
+}

@@ -129,12 +129,16 @@ if [[ -z "${RPC_URL:-}" && -f "$SCRIPT_DIR/../.env" ]]; then
 fi
 RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
 
-PASS=0; FAILED=0; FAILED_NAMES=()
+PASS=0; FAILED=0; SKIPPED=0; FAILED_NAMES=()
 log()  { printf '\n\033[36m▶ %s\033[0m\n' "$*" >&2; }
 note() { printf '\033[35m• %s\033[0m\n' "$*" >&2; }
 warn() { printf '\033[33m⚠ %s\033[0m\n' "$*" >&2; }
 pass() { printf '\033[32m✓ %s\033[0m\n' "$*" >&2; PASS=$((PASS+1)); }
 fail() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; FAILED=$((FAILED+1)); FAILED_NAMES+=("$*"); }
+# A row that could not be exercised is neither a pass nor a failure, and must
+# still be visible: without this the call below is an unbound command and the
+# row vanishes from the tally altogether.
+skip() { printf '\033[33m∅ SKIP: %s\033[0m\n' "$*" >&2; SKIPPED=$((SKIPPED+1)); }
 want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 
 for tool in jq curl near; do command -v "$tool" >/dev/null || { echo "✗ missing $tool" >&2; exit 1; }; done
@@ -600,22 +604,47 @@ if want C6 && agent_secret_mode C6; then
       # credential pays for no lookup, and a compromised one gets nothing by
       # default.
       R=$(agent_probe)
-      if [[ "$(echo "$R" | jq -r '[.output.secrets[].found] | any')" == false ]]; then
+      # A call that never RAN has no `output` at all, and `.output.secrets[]`
+      # on null makes jq fail — which the old reading turned into "a secret
+      # reached the guest", announcing a leak where there was not even a run.
+      # The commonest cause is this wallet's daily connector quota, which the
+      # suite itself spends in C7.
+      C6_SECRETS=$(echo "$R" | jq -c '.output.secrets // empty' 2>/dev/null)
+      if [[ -z "$C6_SECRETS" ]]; then
+        # Only a spent quota is a reason to stand aside: this suite is one of
+        # the plan's "run unchanged" regressions, and any other refusal here is
+        # the regression it exists to catch.
+        if echo "$R" | grep -qi "quota"; then
+          skip "C6 the call did not run (quota), so nothing can be said about what a guest saw: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 110)"
+        else
+          fail "C6 the call without the header did not run, and not for quota: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 160)"
+        fi
+        C6_DEAD=1
+      elif [[ "$(echo "$C6_SECRETS" | jq -r '[.[].found] | any')" == false ]]; then
         pass "C6 without the header no secret is fetched at all"
       else
-        fail "C6 a secret reached the guest without X-Use-Owner-Secret: $(echo "$R" | jq -c '.output.secrets')"
+        fail "C6 a secret reached the guest without X-Use-Owner-Secret: $C6_SECRETS"
       fi
 
       R=$(agent_probe -H 'X-Use-Owner-Secret: 1')
-      GOT1=$(echo "$R" | jq -r '.output.secrets[] | select(.key=="PROBE_TOKEN") | .sha256_prefix')
-      GOT2=$(echo "$R" | jq -r '.output.secrets[] | select(.key=="PROBE_SECOND") | .sha256_prefix')
-      if [[ "$GOT1" == "$P1" && "$GOT2" == "$P2" ]]; then
+      GOT1=$(echo "$R" | jq -r '.output.secrets[]? | select(.key=="PROBE_TOKEN") | .sha256_prefix' 2>/dev/null)
+      GOT2=$(echo "$R" | jq -r '.output.secrets[]? | select(.key=="PROBE_SECOND") | .sha256_prefix' 2>/dev/null)
+      if [[ "${C6_DEAD:-0}" == "1" ]]; then
+        skip "C6 with the header: not judged, the half without the header could not run"
+      elif [[ -z "$GOT1" && -z "$GOT2" ]]; then
+        if echo "$R" | grep -qi "quota"; then
+          skip "C6 with the header: the call did not run (quota) — $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 110)"
+        else
+          fail "C6 with the header the call did not run, and not for quota: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 160)"
+        fi
+      elif [[ "$GOT1" == "$P1" && "$GOT2" == "$P2" ]]; then
         # Not just "a secret arrived" — THE secret, hashed on the way out so the
         # value never leaves the enclave to be checked.
         pass "C6 with the header both secrets arrive, and their hashes are the ones just stored"
       else
         fail "C6 the guest saw $GOT1/$GOT2, the secrets stored hash to $P1/$P2"
       fi
+      unset C6_DEAD
     else
       fail "C6 could not store the secrets for the agent"
     fi
@@ -1092,8 +1121,9 @@ if want C12 && agent_secret_mode C12; then
     #    the attack the ownership half of the rule exists for: the connector
     #    running on the planter's token instead of the agent's.
     if [[ -n "$CALLER" ]] && "$OUTLAYER_BIN" secrets set --help >/dev/null 2>&1; then
+      PLANT_OK=1
       "$OUTLAYER_BIN" secrets set "$(jq -nc '{PROBE_TOKEN:"planted-by-a-stranger"}')" \
-        --project "$PROJECT" --profile "$AGENT_ACCOUNT" >&2 2>/dev/null || true
+        --project "$PROJECT" --profile "$AGENT_ACCOUNT" >&2 2>/dev/null || PLANT_OK=0
       sleep 5
       R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "Authorization: Bearer $AGENT_WALLET_KEY" \
             -H 'X-Use-Owner-Secret: 1' -H 'Content-Type: application/json' \
@@ -1106,6 +1136,11 @@ if want C12 && agent_secret_mode C12; then
         note "C12 the planted-credential check is INCONCLUSIVE — the call was $(echo "$R" | jq -r '.reason // .error' | head -c 50)"
       elif [[ "$STILL" == "$PLANTED" ]]; then
         fail "C12 the guest received the PLANTED credential — a stranger's secret was served under the agent's name"
+      elif [[ "$PLANT_OK" != 1 ]]; then
+        # The contract refuses an implicit-account profile to a non-agent owner,
+        # so the plant never landed. Saying "not served" here would be a pass
+        # for a credential that was never stored.
+        skip "C12 the planted-credential check is INCONCLUSIVE — the store itself was refused, so nothing was planted to serve"
       else
         pass "C12 a credential planted under the agent's name by another owner is not served (guest saw ${STILL:-nothing}, not $PLANTED)"
       fi
@@ -1958,7 +1993,7 @@ if want C7; then
     done
     if [[ -z "$hit" ]]; then
       fail "C7 thirty calls and never refused — the quota is not being enforced"
-    elif echo "$hit" | grep -qE "[0-9]+"; then
+    elif echo "$hit" | jq -r '.error // empty' | grep -qE '[0-9]+[^0-9]{1,24}[0-9]+'; then
       pass "C7 refused with connector_quota_exceeded, and the message names the numbers: $(echo "$hit" | jq -r '.error' | head -c 120)"
     else
       fail "C7 refused, but the message says neither what was used nor what the limit is: $(echo "$hit" | head -c 160)"
@@ -1974,6 +2009,7 @@ if [[ "$APPLY" != true ]]; then
   warn "C1 and C2 spend the operations' prices out of CALLER's in-contract balance, plus 0.1 NEAR of compute deposit per call."
 fi
 pass "passed: $PASS"
+[[ $SKIPPED -gt 0 ]] && warn "skipped: $SKIPPED"
 if [[ $FAILED -gt 0 ]]; then
   for n in "${FAILED_NAMES[@]}"; do printf '\033[31m  ✗ %s\033[0m\n' "$n" >&2; done
   echo "FAILED: $FAILED" >&2

@@ -198,6 +198,20 @@ else
     for i in $(seq 1 "$N"); do
       [[ "$(field "$(cat "$WORK/g1.$i")" '"message_id" in o')" == "True" ]] && sent=$((sent + 1))
     done
+    # Nothing sent means the cap was never approached, and both asserts below
+    # would pass on an empty run: 0 ≤ room, and after == before + 0. The one
+    # honest exception is a cap already reached today (room 0): then every
+    # send must be refused, and that refusal IS the cap working.
+    if (( room == 0 )); then
+      refused=0
+      for i in $(seq 1 "$N"); do
+        [[ "$(field "$(cat "$WORK/g1.$i")" '"message_id" in o')" != "True" ]] && refused=$((refused + 1))
+      done
+      [[ "$refused" == "$N" ]] && pass "the cap was already reached today and every send was refused ($N/$N)" \
+                               || fail "THE OWNER'S CAP WAS PASSED: room 0, yet $((N - refused)) sends went through"
+    else
+      [[ "$sent" -ge 1 ]] || fail "G1 nothing was sent with room for $room — the cap was never exercised, so the two checks below say nothing"
+    fi
     [[ "$sent" -le "$room" ]] && pass "no more than the room was sent ($sent ≤ $room)" \
                               || fail "THE OWNER'S CAP WAS PASSED: $sent sent with room for $room"
     after="$(field "$(gmail '{"operation":"status"}')" 'o["sent_today"]')"
