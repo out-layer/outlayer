@@ -18,14 +18,41 @@ holds keys, opened for nobody's benefit.
 
 ## Publishing
 
+The project id must be **`connectors.outlayer.testnet/connector-probe`**, and
+that is the whole difficulty: `outlayer deploy` signs as the one identity the
+CLI has stored, so running it here publishes `<you>/connector-probe` — a project
+the registry does not recognise as a connector, with no price and no fee. The
+version has to be added BY the namespace account, which means near-cli:
+
 ```bash
-./build.sh                      # checks the manifest section is present, prints the SHA256
-outlayer deploy                 # or upload the wasm and publish a version by hash
+./build.sh                      # checks the manifest section, prints the SHA256
+outlayer upload target/wasm32-wasip2/release/connector-probe.wasm
+# → https://test.fastfs.io/<uploader>/outlayer.testnet/<hash>.wasm
+# Who uploaded only shows up in the URL. The contract records url + hash, and
+# the worker verifies the hash, so any fetchable URL serving those bytes works.
+
+near contract call-function as-transaction outlayer.testnet add_version \
+  json-args '{"project_name":"connector-probe",
+              "source":{"WasmUrl":{"url":"<url>","hash":"<hash>","build_target":"wasm32-wasip2"}},
+              "set_active":false}' \
+  prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \
+  sign-as connectors.outlayer.testnet network-config testnet sign-with-legacy-keychain send
+
+# Check the URL really serves those bytes, then activate. `version_key` IS the hash.
+near contract call-function as-transaction outlayer.testnet set_active_version \
+  json-args '{"project_name":"connector-probe","version_key":"<hash>"}' \
+  prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
+  sign-as connectors.outlayer.testnet network-config testnet sign-with-legacy-keychain send
 ```
 
-The project id must be **`connectors.outlayer.testnet/connector-probe`**. Every
-connector is deployed under that one account, so its id is `{namespace}/{name}`
-and it is called like any other project:
+Adding with `set_active:false` first is the point: nothing any caller runs
+changes until the activation, the previous version stays published, and a
+rollback is one `set_active_version`. A new OPERATION also needs its price row
+(`scripts/set_connector_prices_testnet.sh`, signed by the contract owner), or
+the coordinator refuses it with `unknown_operation` however good the wasm is;
+that table is cached for up to a minute.
+
+It is called like any other project:
 
 ```
 POST /call/connectors.outlayer.testnet/connector-probe

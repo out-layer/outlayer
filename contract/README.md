@@ -181,14 +181,16 @@ Store encrypted secrets for a repository.
 **Important:** Always estimate storage cost first using `estimate_storage_cost` to attach the correct deposit.
 
 ```bash
-# 1. Estimate storage cost
+# 1. Estimate storage cost. The arguments are the slot the store will use:
+# an ACCESSOR (not repo/branch), the profile, the owner, the ciphertext and the
+# condition — the condition is priced too, so a large whitelist costs more.
 near view outlayer.testnet estimate_storage_cost '{
-  "repo": "github.com/alice/project",
-  "branch": "main",
+  "accessor": {"Repo": {"repo": "github.com/alice/project", "branch": "main"}},
   "profile": "default",
   "owner": "alice.testnet",
   "encrypted_secrets_base64": "YWJjZGVm...",
-  "access": "AllowAll"
+  "access": "AllowAll",
+  "vault_id": null
 }'
 # Output: "1500000000000000000000" (0.0015 NEAR)
 
@@ -249,12 +251,21 @@ near call outlayer.testnet delete_secrets '{
 ```
 
 #### `update_access`
-Change who may read a stored secret. The condition moves; the ciphertext and
-the storage deposit stay, so no value is re-entered and a TEE-generated key is
-never lost. Keyed on `(accessor, profile, caller)`: only the owner of the row
-can change it, and a non-owner's call panics with `Secrets not found`. This is
-how an owner hands a secret to an agent and takes it back — the agent names
-`{account_id: owner, profile}` in `secrets_ref`.
+Change who may read a stored secret. The condition moves and the ciphertext
+stays, so no value is re-entered and a TEE-generated key is never lost. Keyed on
+`(accessor, profile, caller)`: only the owner of the row can change it, and a
+non-owner's call panics with `Secrets not found`. This is how an owner hands a
+secret to an agent and takes it back — the agent names `{account_id: owner,
+profile}` in `secrets_ref`.
+
+Payable, because a condition is stored bytes: a `Whitelist` of two thousand
+accounts occupies some fifty kilobytes whichever door it arrives through. The
+row is re-priced against the new condition and the deposit already held counts
+towards it, so narrowing refunds the difference, an edit that does not change
+the size needs nothing, and only growth asks for more. Call
+`estimate_storage_cost` with the row's existing `encrypted_secrets_base64` and
+the new condition to learn the figure; attaching it is always sufficient, and
+the excess comes back in the same transaction.
 
 ```bash
 near call outlayer.testnet update_access '{
@@ -267,7 +278,7 @@ near call outlayer.testnet update_access '{
       {"ValidUntil": {"until_ns": "1790812800000000000"}}
     ]}}
   ]}}
-}' --accountId alice.testnet --gas 30000000000000
+}' --accountId alice.testnet --gas 30000000000000 --deposit 0.1
 ```
 
 #### Access conditions

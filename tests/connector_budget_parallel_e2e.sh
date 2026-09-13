@@ -83,6 +83,26 @@ except Exception:
 ' "$1" "$2"
 }
 
+# The counter, read with a retry. A read has no side effect — the counter is
+# durable state and nobody else is touching this run id — so re-reading is safe
+# in a way re-reserving would not be. One call straight after a burst of twelve
+# parallel ones is not a measurement: a single transient refusal would read as a
+# wrong count and accuse the connector of losing a reservation. On giving up it
+# says what actually came back, because a bare "<not json>" teaches nothing.
+counter() {  # counter <run-id>  → the count on stdout, diagnostics on stderr
+  local run=$1 out value i
+  for i in 1 2 3; do
+    out="$(probe "{\"operation\":\"budget\",\"mode\":\"read\",\"run\":\"$run\"}")"
+    value="$(field "$out" 'o["count"]')"
+    case "$value" in
+      ''|'<not json>'|'<missing>') sleep 3 ;;
+      *) printf '%s' "$value"; return 0 ;;
+    esac
+  done
+  printf '%s' "unread"
+  echo "        the counter could not be read in 3 tries; last answer: ${out:0:200}" >&2
+}
+
 echo "Budget under parallel calls — run id $RUN, N=$N, CAP=$CAP"
 echo "  coordinator: $COORDINATOR_URL"
 echo "  probe:       $PROBE"
@@ -98,9 +118,8 @@ if [[ -z "$PAYMENT_KEY" ]]; then
   skip "B1–B4: no PAYMENT_KEY"
 else
   echo; echo "B1 a fresh budget reads zero"
-  out="$(probe "{\"operation\":\"budget\",\"mode\":\"read\",\"run\":\"$RUN\"}")"
-  count="$(field "$out" 'o["count"]')"
-  [[ "$count" == "0" ]] && pass "count=0" || fail "count=$count — $out"
+  count="$(counter "$RUN")"
+  [[ "$count" == "0" ]] && pass "count=0" || fail "count=$count"
 
   echo; echo "B2 $N reservations at once against a cap of $CAP"
   for i in $(seq 1 "$N"); do
@@ -130,8 +149,7 @@ else
     echo "        note: $contended calls lost the compare-and-swap five times and were refused —"
     echo "        the safe direction; it means fewer than the cap may have been admitted"
   fi
-  out="$(probe "{\"operation\":\"budget\",\"mode\":\"read\",\"run\":\"$RUN\"}")"
-  count="$(field "$out" 'o["count"]')"
+  count="$(counter "$RUN")"
   [[ "$count" == "$admitted" ]] && pass "the counter equals the admitted calls ($count)" \
                                   || fail "counter=$count but $admitted were admitted — a reservation leaked or was lost"
 
@@ -142,14 +160,14 @@ else
   done
   out="$(probe "{\"operation\":\"budget\",\"mode\":\"reserve\",\"cap\":$CAP,\"run\":\"$RUN\"}")"
   [[ "$(field "$out" 'o["admitted"]')" == "False" ]] && pass "refused" || fail "admitted past a full budget — $out"
-  count="$(field "$(probe "{\"operation\":\"budget\",\"mode\":\"read\",\"run\":\"$RUN\"}")" 'o["count"]')"
+  count="$(counter "$RUN")"
   [[ "$count" == "$CAP" ]] && pass "the refusal took nothing (count=$count)" || fail "count=$count, expected $CAP"
 
   echo; echo "B4 a reservation the work did not use is given back"
   RUN2="${RUN}-release"
   out="$(probe "{\"operation\":\"budget\",\"mode\":\"release\",\"cap\":$CAP,\"run\":\"$RUN2\"}")"
   [[ "$(field "$out" 'o["admitted"]')" == "True" ]] && pass "the reservation was taken" || fail "not taken — $out"
-  count="$(field "$(probe "{\"operation\":\"budget\",\"mode\":\"read\",\"run\":\"$RUN2\"}")" 'o["count"]')"
+  count="$(counter "$RUN2")"
   [[ "$count" == "0" ]] && pass "and given back (count=0)" || fail "count=$count after a release"
 fi
 

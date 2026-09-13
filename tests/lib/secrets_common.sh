@@ -38,17 +38,25 @@ make_account() { # make_account <name> <parent> <amount>
 accessor_json() { jq -nc --arg p "$1" '{Project:{project_id:$p}}'; }
 
 # The stored row, as the chain reports it (ciphertext + condition), or empty.
-row_of() { # row_of <project> <profile>
-  near_view "$CONTRACT_ID" get_secrets "$(jq -nc --argjson a "$(accessor_json "$1")" --arg pr "$2" --arg o "$PARENT" \
+#
+# A row is keyed by OWNER as much as by accessor and profile, and the owner is
+# not always the account a suite signs as: a custody wallet owns its rows as its
+# own implicit account. `row_of` reads the common case, `row_of_owner` any.
+row_of_owner() { # row_of_owner <project> <profile> <owner>
+  near_view "$CONTRACT_ID" get_secrets "$(jq -nc --argjson a "$(accessor_json "$1")" --arg pr "$2" --arg o "$3" \
     '{accessor:$a, profile:$pr, owner:$o}')"
+}
+
+row_of() { # row_of <project> <profile>
+  row_of_owner "$1" "$2" "$PARENT"
 }
 
 # Wait until the row's `updated_at` moves past a value: `outlayer secrets set`
 # and `near call` return once EXECUTED, `near_view` reads FINAL.
-wait_row_after() { # wait_row_after <project> <profile> <previous updated_at>
-  local after=$3 i
+wait_row_after() { # wait_row_after <project> <profile> <previous updated_at> [owner]
+  local after=$3 owner=${4:-$PARENT} i
   for i in $(seq 1 15); do
-    after=$(jq -r '.updated_at // 0' <<<"$(row_of "$1" "$2")")
+    after=$(jq -r '.updated_at // 0' <<<"$(row_of_owner "$1" "$2" "$owner")")
     [[ "$after" != "$3" ]] && return 0
     sleep 2
   done
@@ -68,15 +76,67 @@ store() { # store <project> <profile> <secrets-json> <access>   (the CLI signs a
   note "stored $1/$2 ($4)"
 }
 
-set_access() { # set_access <project> <profile> <access-json>
-  local before
-  before=$(jq -r '.updated_at // 0' <<<"$(row_of "$1" "$2")")
+# What this condition costs to store, in yoctoNEAR, priced by the contract
+# itself against the row's real ciphertext. A condition is stored bytes, so an
+# edit that grows one has to fund the growth; attaching the whole estimate is
+# always enough, because the deposit already held is credited towards it and
+# the excess comes back in the same transaction.
+access_price() { # access_price <project> <profile> <access-json> [owner]
+  local owner=${4:-$PARENT} row cipher
+  row=$(row_of_owner "$1" "$2" "$owner")
+  cipher=$(jq -r '.encrypted_secrets // ""' <<<"$row" 2>/dev/null)
+  near_view "$CONTRACT_ID" estimate_storage_cost \
+    "$(jq -nc --argjson a "$(accessor_json "$1")" --arg pr "$2" --arg o "$owner" \
+        --arg c "$cipher" --argjson x "$3" \
+      '{accessor:$a, profile:$pr, owner:$o, encrypted_secrets_base64:$c, access:$x, vault_id:null}')" \
+    2>/dev/null | tr -d '"'
+}
+
+update_access_call() { # update_access_call <json-args> <deposit>
   near --quiet contract call-function as-transaction "$CONTRACT_ID" update_access \
-    json-args "$(jq -nc --argjson a "$(accessor_json "$1")" --arg pr "$2" --argjson x "$3" \
-      '{accessor:$a, profile:$pr, new_access:$x}')" \
-    prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' \
-    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1 \
-    || { echo "✗ update_access failed for $1/$2" >&2; exit 1; }
+    json-args "$1" prepaid-gas '30.0 Tgas' attached-deposit "$2" \
+    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send
+}
+
+set_access() { # set_access <project> <profile> <access-json>
+  local before price args out
+  before=$(jq -r '.updated_at // 0' <<<"$(row_of "$1" "$2")")
+  price=$(access_price "$1" "$2" "$3")
+  # A condition the estimator cannot price is one the contract will refuse
+  # anyway; 1 NEAR keeps the refusal about the condition rather than the money.
+  [[ "$price" =~ ^[0-9]+$ ]] || price=1000000000000000000000000
+  args=$(jq -nc --argjson a "$(accessor_json "$1")" --arg pr "$2" --argjson x "$3" \
+    '{accessor:$a, profile:$pr, new_access:$x}')
+  # What a failure here is worth reporting AS. A transaction refused for its
+  # CONTENT is a verdict; one refused because two transactions from the same key
+  # raced, or the RPC timed out, is not, and a suite that exits on the second
+  # reports noise as product failure. So: one retry on a transient refusal, and
+  # enough of the message to tell the two apart.
+  local deposit_used="$price yoctoNEAR" transient=0
+  while :; do
+    out=$(update_access_call "$args" "$deposit_used" 2>&1) && break
+    # Changing the deposit's SPELLING is not a retry. A contract that predates
+    # the deposit refuses any deposit at all, and that answer is free: letting
+    # it consume the retry budget leaves nothing for the refusals that actually
+    # need one, which is how two runs died at the first expired transaction.
+    if [[ "$deposit_used" != "0 NEAR" ]] && grep -qi "accept deposit\|not payable" <<<"$out"; then
+      note "the deployed contract predates the update_access deposit: retrying without one"
+      deposit_used='0 NEAR'
+      continue
+    fi
+    # `Transaction has expired` means the block hash aged out before the RPC
+    # took the transaction. It says nothing about the condition under test.
+    if (( transient < 3 )) && grep -qiE "expired|nonce|timed out|timeout|Tx not found|connection|50[23]" <<<"$out"; then
+      transient=$((transient + 1))
+      note "update_access hit a transient refusal ($transient/3), retrying"
+      sleep $((transient * 5))
+      continue
+    fi
+    echo "✗ update_access failed for $1/$2 (deposit $deposit_used):" >&2
+    grep -viE '^\s*$' <<<"$out" | tail -12 | head -c 900 >&2
+    echo >&2
+    exit 1
+  done
   wait_row_after "$1" "$2" "$before" || { echo "✗ $1/$2 access change never became final" >&2; exit 1; }
   note "$1/$2 access → $(jq -c 'if type=="string" then . else keys[0] end' <<<"$3")"
 }
@@ -103,12 +163,20 @@ whitelist() { jq -nc '$ARGS.positional' --args "$@" | jq -c '{Whitelist:{account
 # own answer. `run_as <signer> [owner/profile] [input-json]`; an empty second
 # argument names no secret at all.
 RUN_OK=""; RUN_ERR=""; RUN_OUT=""
+# `run_as <signer> [owner/profile] [input-json] [version_key]`. A fourth
+# argument pins a published version instead of the active one: pinning is a
+# field of the `Project` SOURCE, not of the request, so the project and the
+# stored rows stay the same and only the artefact changes — which is what it
+# takes to show that a behaviour comes from the wasm's own manifest.
 run_as() {
-  local signer=$1 ref=${2:-} input=${3:-'{"message":"probe"}'} out ev args signer_flag=with-legacy-keychain
+  local signer=$1 ref=${2:-} input=${3:-'{"message":"probe"}'} version=${4:-} out ev args signer_flag=with-legacy-keychain
   [[ "$signer" == "$PARENT" ]] && signer_flag=with-keychain
   args=$(jq -nc --arg p "$PROJECT" --arg i "$input" \
     '{source:{Project:{project_id:$p}}, input_data:$i,
       resource_limits:{max_instructions:1000000000,max_memory_mb:128,max_execution_seconds:30}}')
+  if [[ -n "$version" ]]; then
+    args=$(jq -c --arg v "$version" '.source.Project.version_key = $v' <<<"$args")
+  fi
   if [[ -n "$ref" ]]; then
     args=$(jq -c --arg o "${ref%%/*}" --arg pr "${ref#*/}" '. + {secrets_ref:{profile:$pr, account_id:$o}}' <<<"$args")
   fi

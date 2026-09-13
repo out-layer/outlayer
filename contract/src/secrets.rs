@@ -617,6 +617,17 @@ impl Contract {
     /// * `accessor` - What code can access these secrets (Repo or WasmHash)
     /// * `profile` - Profile name
     /// * `new_access` - New access control rules
+    ///
+    /// Payable, for the reason `store_secrets` is payable: a condition is
+    /// stored bytes, and a `Whitelist` of two thousand accounts occupies some
+    /// fifty kilobytes whichever door it arrives through. Storage that nobody
+    /// funds is storage every other account funds.
+    ///
+    /// The deposit already held against the row counts towards the new
+    /// requirement, so the common edits cost nothing: narrowing a condition
+    /// refunds the difference, and one that does not change the size needs no
+    /// deposit at all. Only growth asks for more, and only for the growth.
+    #[payable]
     pub fn update_access(
         &mut self,
         accessor: SecretAccessor,
@@ -636,16 +647,47 @@ impl Contract {
         let mut profile_data = self.secrets_storage.get(&key)
             .expect("Secrets not found");
 
-        // Update access rules and timestamp
+        // Priced exactly as a store prices it, against the row's real
+        // ciphertext and the NEW condition. The binding state is read rather
+        // than assumed: an edit never changes it, but the size depends on it.
+        let vault_bound = self.secret_vault_bindings.get(&key).is_some();
+        let required_deposit = self.calculate_secret_storage_size(
+            &key,
+            &profile_data.encrypted_secrets,
+            &new_access,
+            vault_bound,
+        ) as u128
+            * STORAGE_PRICE_PER_BYTE;
+
+        let attached_deposit = env::attached_deposit().as_yoctonear();
+        let total_available = attached_deposit + profile_data.storage_deposit;
+        assert!(
+            total_available >= required_deposit,
+            "Insufficient deposit for this condition. Required: {} yoctoNEAR, \
+             available (attached {} + already held {}): {} yoctoNEAR",
+            required_deposit,
+            attached_deposit,
+            profile_data.storage_deposit,
+            total_available
+        );
+
+        let refund = total_available - required_deposit;
+        if refund > 0 {
+            near_sdk::Promise::new(caller.clone()).transfer(NearToken::from_yoctonear(refund));
+        }
+
+        // Update access rules, timestamp and what the row is funded for.
         profile_data.access = new_access;
         profile_data.updated_at = env::block_timestamp();
+        profile_data.storage_deposit = required_deposit;
 
         self.secrets_storage.insert(&key, &profile_data);
 
         log!(
-            "Access control updated: accessor={:?}, profile={}",
+            "Access control updated: accessor={:?}, profile={}, deposit={}",
             accessor,
-            profile
+            profile,
+            required_deposit
         );
     }
 
@@ -1128,6 +1170,137 @@ mod tests {
             "default".to_string(),
             user.clone(),
         ));
+    }
+
+    /// A condition is stored bytes, so growing one is buying storage.
+    ///
+    /// Fifty kilobytes of whitelist funded by nobody is fifty kilobytes every
+    /// other account funds. The row is re-priced on every edit; these three
+    /// pin the whole of that arithmetic. They use a `Repo` accessor because
+    /// the arithmetic does not depend on which accessor names the row, and a
+    /// `Project` one would drag project registration into a storage test.
+    fn a_row_with(access: types::AccessCondition, deposit: NearToken) -> (Contract, AccountId) {
+        let owner = accounts(0);
+        let user = accounts(2);
+        testing_env!(get_context(owner.clone(), NearToken::from_near(0)).build());
+        let mut contract = Contract::new(owner, None, None, None);
+
+        testing_env!(get_context(user.clone(), deposit).build());
+        contract.store_secrets(
+            SecretAccessor::Repo {
+                repo: "github.com/alice/project".to_string(),
+                branch: None,
+            },
+            "default".to_string(),
+            "base64encodeddata".to_string(),
+            access,
+            None,
+        );
+        (contract, user)
+    }
+
+    fn repo_accessor() -> SecretAccessor {
+        SecretAccessor::Repo {
+            repo: "github.com/alice/project".to_string(),
+            branch: None,
+        }
+    }
+
+    fn many_accounts(n: usize) -> Vec<AccountId> {
+        (0..n)
+            .map(|i| format!("account{i}.near").parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient deposit for this condition")]
+    fn growing_a_condition_without_a_deposit_is_refused() {
+        let user = accounts(2);
+        let (mut contract, _) = a_row_with(
+            types::AccessCondition::Whitelist { accounts: vec![user.clone()] },
+            NearToken::from_near(1),
+        );
+
+        // A thousand accounts is tens of kilobytes the row was never funded
+        // for. Nothing attached, so there is nothing to fund it with.
+        testing_env!(get_context(user, NearToken::from_near(0)).build());
+        contract.update_access(
+            repo_accessor(),
+            "default".to_string(),
+            types::AccessCondition::Whitelist { accounts: many_accounts(1000) },
+        );
+    }
+
+    #[test]
+    fn narrowing_a_condition_gives_the_difference_back() {
+        let user = accounts(2);
+        let (mut contract, _) = a_row_with(
+            types::AccessCondition::Whitelist { accounts: many_accounts(500) },
+            NearToken::from_near(5),
+        );
+        let wide = contract
+            .get_secrets(repo_accessor(), "default".to_string(), user.clone())
+            .expect("row stored")
+            .storage_deposit
+            .0;
+
+        testing_env!(get_context(user.clone(), NearToken::from_near(0)).build());
+        contract.update_access(
+            repo_accessor(),
+            "default".to_string(),
+            types::AccessCondition::Whitelist { accounts: vec![user.clone()] },
+        );
+        let narrow = contract
+            .get_secrets(repo_accessor(), "default".to_string(), user)
+            .expect("row still there")
+            .storage_deposit
+            .0;
+
+        assert!(
+            narrow < wide,
+            "narrowing left the row funded for the wider condition: {narrow} vs {wide}"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_does_not_change_the_size_needs_no_deposit() {
+        let user = accounts(2);
+        // Two names of EQUAL length. `accounts(2)` and `accounts(3)` are
+        // `charlie` and `danny`, and swapping those is a narrowing, which is a
+        // different claim and is covered by its own test.
+        let named: AccountId = "aaa.near".parse().unwrap();
+        let other: AccountId = "bbb.near".parse().unwrap();
+        let (mut contract, _) = a_row_with(
+            types::AccessCondition::Whitelist { accounts: vec![named] },
+            NearToken::from_near(1),
+        );
+        let before = contract
+            .get_secrets(repo_accessor(), "default".to_string(), user.clone())
+            .expect("row stored")
+            .storage_deposit
+            .0;
+
+        // Swapping one name for another of the same length moves no bytes, so
+        // an owner revoking and re-granting is never asked for money.
+        testing_env!(get_context(user.clone(), NearToken::from_near(0)).build());
+        contract.update_access(
+            repo_accessor(),
+            "default".to_string(),
+            types::AccessCondition::Whitelist { accounts: vec![other.clone()] },
+        );
+
+        let row = contract
+            .get_secrets(repo_accessor(), "default".to_string(), user)
+            .expect("row still there");
+        assert_eq!(
+            row.access,
+            types::AccessCondition::Whitelist { accounts: vec![other] },
+            "the condition did not move"
+        );
+        assert_eq!(
+            row.storage_deposit.0, before,
+            "a same-size edit changed what the row is funded for"
+        );
     }
 
     #[test]
@@ -2166,12 +2339,16 @@ impl Contract {
 
         let value_size = encrypted_size + access_size + timestamps_and_deposit_size;
 
-        // Add overhead for user index entry (only for new entries)
-        let index_overhead = if self.secrets_storage.get(key).is_none() {
-            INDEX_ENTRY_OVERHEAD
-        } else {
-            0 // Updating existing entry, no new index entry
-        };
+        // The owner's index entry, counted always.
+        //
+        // This function quotes the TOTAL a row occupies, not the delta from
+        // whatever is there now: `store_secrets` and `update_access` both
+        // compare the answer against the deposit already held and settle the
+        // difference. An index entry that exists before the call still exists
+        // after it, so leaving it out on the update paths would refund its 64
+        // bytes to the owner while the entry stays on chain — storage funded
+        // by nobody, which is the very thing the deposit exists to prevent.
+        let index_overhead = INDEX_ENTRY_OVERHEAD;
 
         // Side-table entry for the optional vault binding. The
         // `secret_vault_bindings: LookupMap<SecretKey, AccountId>` map
