@@ -1,52 +1,63 @@
-//! A confused-deputy stand-in for the on-chain door (test plan: "conditions
-//! judge the payer", stated twice — "Holes considered" bullet 4 and "Attack
-//! surface" bullet 7).
+//! A relay contract for the on-chain door's identity row (X1 in
+//! `tests/secrets_security_e2e.sh`).
 //!
-//! What it exists to test. The plan says a secret's `AccessCondition` is judged
-//! against the account that PAYS for the run. On the on-chain door that account
-//! is the predecessor; the value actually fed to the keystore is the SIGNER
-//! (`contract/src/execution.rs`: the event's `sender_id` is `signer_id`, not
-//! `predecessor_id`). This contract is the wedge between the two: a victim signs
-//! ONE transaction to `relay`, and this contract — the predecessor, the payer —
-//! forwards `request_execution` naming a secret the victim owns and a project
-//! the CALLER chose. If the keystore judged the payer, `request_execution` would
-//! be judged against THIS contract, which no victim whitelists, and the run
-//! would be refused. If it judges the signer, the victim's own whitelist admits
-//! their own signature and the secret decrypts into a run this contract
-//! launched.
+//! The door judges the transaction's SIGNER: `request_execution` puts
+//! `signer_id` into the event as `sender_id`, and that is the account the
+//! keystore evaluates a secret's `AccessCondition` against. When a contract
+//! relays `request_execution`, it is the predecessor and the payer while the
+//! account that signed the outer transaction is still the signer. This
+//! contract is that relay: its owner signs ONE transaction to `relay`, and it
+//! forwards `request_execution` naming a row the owner holds and a source of
+//! the caller's choosing. `success == true` in the completion event is the
+//! keystore's admission of the owner's secret to a run this contract asked
+//! for — the boundary the row observes. The guest's bytes are downstream of
+//! it: the yield's value is this transaction's own return value.
 //!
-//! What it deliberately does NOT do: read the secret back. The completion event
-//! carries `success`/`error_message` but not the guest's output, and
-//! `get_request` drops a finished request — so the leaked bytes are not
-//! chain-visible (the same wall the D2/B3 rows hit). What IS visible is the
-//! ADMISSION: a denied `secrets_ref` refuses the whole run, so `success == true`
-//! in the completion event is proof the keystore admitted the victim's secret to
-//! a run this contract, not the victim, asked for. That admission is the
-//! security boundary; the bytes are downstream of it.
-//!
-//! A mirror, not a second implementation: it forwards arguments verbatim and
-//! enforces nothing.
+//! Guarded so that it cannot be turned on anyone else: only the `owner` named
+//! at initialisation may call `relay` (the owner signs, the owner relays); it
+//! initialises only from a transaction the deputy account signs itself (the
+//! deploy), and only on a `.testnet` account. It forwards its arguments
+//! verbatim and enforces nothing else.
 
-use near_sdk::{env, near, AccountId, Gas, NearToken, Promise, PanicOnDefault};
 use near_sdk::json_types::U128;
+use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise};
 use serde_json::json;
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
-pub struct Deputy {}
+pub struct Deputy {
+    owner: AccountId,
+}
 
 #[near]
 impl Deputy {
-    #[init]
-    pub fn new() -> Self {
-        Self {}
+    /// `owner` is the one account `relay` accepts calls from — named
+    /// explicitly, because the deploy-and-init transaction is signed by the
+    /// deputy account's own key, so the predecessor here is the deputy
+    /// itself. Re-initialisable: a redeploy of the artefact over an existing
+    /// account takes the new owner without a migration — a fixture, not a
+    /// product.
+    #[init(ignore_state)]
+    pub fn new(owner: AccountId) -> Self {
+        assert!(
+            env::current_account_id().as_str().ends_with(".testnet"),
+            "the deputy stub is a test fixture and initialises only on a .testnet account"
+        );
+        // Re-initialisable means anyone could otherwise call this and become
+        // the owner: only a transaction the deputy account signs itself may.
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "the deputy initialises only from its own deploy transaction"
+        );
+        Self { owner }
     }
 
     /// Forward `request_execution` to `outlayer`, naming a `source` the caller
-    /// chose and a `secrets_ref` for a row the caller does not own. The attached
-    /// deposit is THIS contract's balance — the point of the test is that the
+    /// chose and a `secrets_ref` for a row the owner holds. The attached
+    /// deposit is THIS contract's balance — the point of the row is that the
     /// payer is the deputy while the signer is whoever signed the transaction
-    /// that reached this method. `resource_limits` are the same shape `run_as`
+    /// that reached this method. `resource_limits` are the shape `run_as`
     /// sends, so the run is a real execute, not a compile-only.
     #[payable]
     pub fn relay(
@@ -56,6 +67,11 @@ impl Deputy {
         secrets_ref: serde_json::Value,
         deposit: U128,
     ) -> Promise {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner,
+            "only the deputy's owner may relay through it"
+        );
         let args = json!({
             "source": source,
             "secrets_ref": secrets_ref,
@@ -74,7 +90,12 @@ impl Deputy {
         )
     }
 
-    /// The deputy's own balance, so a test can confirm it is funded before the
+    /// The one account `relay` accepts calls from.
+    pub fn owner(&self) -> AccountId {
+        self.owner.clone()
+    }
+
+    /// The deputy's own balance, so a row can confirm it is funded before the
     /// relay attaches a deposit from it.
     pub fn balance(&self) -> U128 {
         U128(env::account_balance().as_yoctonear())

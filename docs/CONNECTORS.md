@@ -239,9 +239,12 @@ calling wallet: an owner who stored a credential once under their own account
 and whitelisted their agents hands it over this way, and takes it back by editing
 the whitelist. The header is the shortcut for the one row an agent need not know
 the name of, its own. A reference the contract could never hold a row for — an
-account id that is not one, a profile that is empty or over 64 characters — is
-refused at the door (`invalid_secrets_ref`, 400) rather than queued for a run
-that would read nothing.
+account id that is not one, a profile that is not 1–64 bytes or holds an ASCII
+character other than a letter, digit, `-` or `_` — is refused at the door
+(`invalid_secrets_ref`, 400) rather than queued for a run that would read
+nothing; on the on-chain path the contract itself refuses a malformed
+`profile` at `request_execution`, before yielding, with the same sentence,
+and a malformed `account_id` fails argument deserialisation there.
 
 The header is meaningful only for a key owned by a custody wallet. An ordinary
 payment key's holder addresses their own secrets through the body, as always.

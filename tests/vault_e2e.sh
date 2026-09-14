@@ -61,7 +61,7 @@ NETWORK="${NETWORK:-testnet}"
 # only by that account holding 0.2 NEAR against the 1.1 it needed.
 export OUTLAYER_NETWORK="$NETWORK"
 
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_URL, or a warning
 
 # Is this account on chain at all? Used to tell "deploy a vault" from "a vault
 # is already deployed" — `vault init` refuses the second case outright.

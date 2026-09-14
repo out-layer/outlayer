@@ -156,10 +156,9 @@ pub(crate) fn assert_profile_is_unambiguous(profile: &str) {
     // `profile` is a plain argument here, not something derived — that happens
     // in the keystore — so it is worth being exact about what already guards
     // it. On the STORE path a colon could never have reached the message:
-    // `store_secrets_internal` accepts only alphanumerics, dashes and
-    // underscores, which was true long before any of this. The DELETE path
-    // never reaches that validation, and this is what makes it hold the same
-    // line.
+    // `profile_shape_error` admits only letters, digits, dashes and
+    // underscores. The DELETE path never reaches that rule, and this is what
+    // makes it hold the same line.
     assert!(
         !profile.contains(':'),
         "profile must not contain ':' — it is a field separator in the signed \
@@ -363,6 +362,12 @@ impl Contract {
         let accessor = canonical_accessor(accessor);
         let profile = canonical_profile(&accessor, profile);
 
+        // The profile rule first, worded as every store door words it; the
+        // colon check after it is about the signed message's shape and cannot
+        // fire on a profile the rule admits.
+        if let Some(why) = profile_shape_error(&profile) {
+            env::panic_str(&format!("profile must be {PROFILE_RULE} ({why})"));
+        }
         // Before anything is hashed: a field that can move a boundary makes the
         // signature cover more than one tuple. Checked here rather than inside
         // `secret_store_message`, which is a pure function used for verification
@@ -646,6 +651,8 @@ impl Contract {
 
         let mut profile_data = self.secrets_storage.get(&key)
             .expect("Secrets not found");
+
+        assert_account_pattern_bounds(&new_access);
 
         // Priced exactly as a store prices it, against the row's real
         // ciphertext and the NEW condition. The binding state is read rather
@@ -1374,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Profile name must contain only alphanumeric")]
+    #[should_panic(expected = "profile must be 1–64 bytes of letters, digits, '-' or '_' (it contains ' ')")]
     fn test_invalid_profile_name() {
         let owner = accounts(0);
         let user = accounts(2);
@@ -1966,6 +1973,8 @@ impl Contract {
         let accessor = canonical_accessor(accessor);
         let profile = canonical_profile(&accessor, profile);
 
+        assert_account_pattern_bounds(&access);
+
         // Validate accessor
         match &accessor {
             SecretAccessor::Repo { repo, branch } => {
@@ -2037,12 +2046,9 @@ impl Contract {
         }
 
         // Validate common inputs
-        assert!(!profile.is_empty(), "Profile cannot be empty");
-        assert!(profile.len() <= 64, "Profile name too long (max 64 chars)");
-        assert!(
-            profile.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
-            "Profile name must contain only alphanumeric, dash, or underscore"
-        );
+        if let Some(why) = profile_shape_error(&profile) {
+            env::panic_str(&format!("profile must be {PROFILE_RULE} ({why})"));
+        }
         assert!(
             !encrypted_secrets_base64.is_empty(),
             "Encrypted secrets cannot be empty"
@@ -2364,3 +2370,63 @@ impl Contract {
         BASE_STORAGE_OVERHEAD + key_size + value_size + index_overhead + binding_overhead
     }
 }
+
+/// Bounds on a condition's `AccountPattern` leaves: how many, and how many
+/// bytes of pattern text in all. The keystore compiles every pattern of a
+/// condition before judging a decrypt and refuses a condition past these
+/// same numbers (`shared_tee_helpers::access_limits`), so a row it would
+/// refuse to judge is not stored. Nothing else bounds them: a condition is
+/// priced by the byte, and a pattern's compiled size is not its text size.
+pub(crate) const MAX_ACCOUNT_PATTERNS: usize = 16;
+pub(crate) const MAX_ACCOUNT_PATTERN_BYTES: usize = 4096;
+
+fn account_pattern_count(access: &types::AccessCondition) -> (usize, usize) {
+    match access {
+        types::AccessCondition::AccountPattern { pattern } => (1, pattern.len()),
+        types::AccessCondition::Logic { conditions, .. } => conditions
+            .iter()
+            .map(account_pattern_count)
+            .fold((0, 0), |(l, b), (l2, b2)| (l + l2, b + b2)),
+        types::AccessCondition::Not { condition } => account_pattern_count(condition),
+        _ => (0, 0),
+    }
+}
+
+fn assert_account_pattern_bounds(access: &types::AccessCondition) {
+    let (leaves, bytes) = account_pattern_count(access);
+    if leaves > MAX_ACCOUNT_PATTERNS {
+        env::panic_str(&format!(
+            "the condition holds {leaves} AccountPattern leaves; at most {MAX_ACCOUNT_PATTERNS} are judged"
+        ));
+    }
+    if bytes > MAX_ACCOUNT_PATTERN_BYTES {
+        env::panic_str(&format!(
+            "the condition's AccountPattern text is {bytes} bytes in all; at most {MAX_ACCOUNT_PATTERN_BYTES} are judged"
+        ));
+    }
+}
+
+/// The shape of a profile name, as every refusal words it.
+pub(crate) const PROFILE_RULE: &str = "1–64 bytes of letters, digits, '-' or '_'";
+pub(crate) const PROFILE_MAX_BYTES: usize = 64;
+
+/// Why a profile name cannot be stored — and therefore why a `secrets_ref`
+/// carrying it can name nothing: `None` when it is well formed, otherwise the
+/// half of the rule it fails, worded for the refusal. One rule for both doors:
+/// `store_secrets` refuses the row and `request_execution` refuses a reference
+/// the contract could never match, with the same words. Bytes, not characters:
+/// storage is priced by the byte and the row is keyed by the bytes. The
+/// worker and the coordinator mirror the byte-length and ASCII halves of this
+/// rule (`shared_tee_helpers::secrets_ref`), with the same sentence; a
+/// non-ASCII character is judged only here, by this crate's own Unicode table.
+pub(crate) fn profile_shape_error(profile: &str) -> Option<String> {
+    let n = profile.len();
+    if !(1..=PROFILE_MAX_BYTES).contains(&n) {
+        return Some(format!("got {n} bytes"));
+    }
+    profile
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || *c == '-' || *c == '_'))
+        .map(|c| format!("it contains {c:?}"))
+}
+

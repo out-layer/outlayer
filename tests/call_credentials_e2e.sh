@@ -67,7 +67,7 @@ PARENT="${PARENT:-}"
 DEPOSIT_USDC="${DEPOSIT_USDC:-0.30}"
 FUND_NEAR="${FUND_NEAR:-0.3}"
 TOKEN_CONTRACT="${TOKEN_CONTRACT:-usdc.fakes.testnet}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_URL, or a warning
 
 PASS=0; FAILED=0; FAILED_NAMES=()
 log()  { printf '\n\033[36m▶ %s\033[0m\n' "$*" >&2; }

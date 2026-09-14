@@ -990,9 +990,9 @@ mod tests {
 
     #[test]
     fn a_section_that_is_not_json_refuses_the_run() {
-        // Plan A11: a section that is not JSON is refused with a message, never
-        // ignored — ignored would drop the author's secret and, with it, the
-        // author's admission gate.
+        // A section that is not JSON is refused with a message, never ignored
+        // — ignored would drop the author's secret and, with it, the author's
+        // admission gate.
         let wasm = core_module(&[custom_section(MANIFEST_SECTION, b"not json")]);
         let err = manifest_from_wasm(&wasm).expect_err("an unreadable section is an error, not None");
         assert!(err.contains("does not parse as a manifest"), "{err}");

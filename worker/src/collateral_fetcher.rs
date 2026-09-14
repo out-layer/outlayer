@@ -28,8 +28,7 @@ pub async fn fetch_collateral_from_phala(tdx_quote_hex: &str) -> Result<String> 
     tracing::info!("   API endpoint: {}", PHALA_COLLATERAL_API);
     tracing::info!("   Quote size: {} bytes (hex: {} chars)",
         tdx_quote_hex.len() / 2, tdx_quote_hex.len());
-    tracing::info!("   Quote hex preview (first 100 chars): {}",
-        if tdx_quote_hex.len() > 100 { &tdx_quote_hex[..100] } else { tdx_quote_hex });
+    tracing::info!("   Quote hex preview (first 100 chars): {}", crate::near_client::head(tdx_quote_hex, 100));
 
     // Create HTTP client with 10s timeout
     let client = reqwest::Client::builder()

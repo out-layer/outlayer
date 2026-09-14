@@ -45,6 +45,17 @@ impl Contract {
     ) {
         self.assert_not_paused();
 
+        // A reference to a profile the contract could never have stored is
+        // refused at the door, naming the rule — the one `store_secrets`
+        // applies — so the worker never asks the keystore for it and nothing
+        // sits in `pending_requests` for a run that cannot have a secret.
+        if let Some(why) = secrets_ref.as_ref().and_then(|r| crate::secrets::profile_shape_error(&r.profile)) {
+            env::panic_str(&format!(
+                "secrets_ref.profile must be {} ({why}); the contract stores no such profile",
+                crate::secrets::PROFILE_RULE
+            ));
+        }
+
         // Resolve ExecutionSource to CodeSource (and get project_uuid if applicable)
         let (resolved_source, project_uuid) = self.resolve_execution_source(&source);
 
@@ -1053,7 +1064,215 @@ mod who_the_on_chain_door_judges {
         assert_eq!(
             worker_payload_sender(),
             victim.to_string(),
-            "the plan names the transaction's signer as the judged identity; the worker was handed someone else"
+            "the judged identity is the transaction's signer; the worker was handed someone else"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_reference_the_contract_could_never_match {
+    //! A hostile `secrets_ref` is refused cleanly, and every refusal names its
+    //! reason. On this door the contract refuses a profile `store_secrets`
+    //! would never have accepted, before yielding.
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, NearToken};
+
+    fn request_with_profile(profile: &str) {
+        let owner = accounts(0);
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(owner.clone()).signer_account_id(owner.clone())
+            .attached_deposit(NearToken::from_near(0)).prepaid_gas(Gas::from_tgas(300));
+        testing_env!(b.build());
+        let mut contract = Contract::new(owner, Some(accounts(1)), None, None);
+        let caller = accounts(2);
+        let mut b2 = VMContextBuilder::new();
+        b2.predecessor_account_id(caller.clone()).signer_account_id(caller.clone())
+            .attached_deposit(NearToken::from_near(1)).prepaid_gas(Gas::from_tgas(300));
+        testing_env!(b2.build());
+        contract.request_execution(
+            ExecutionSource::GitHub {
+                repo: "https://github.com/out-layer/anything".to_string(),
+                commit: "0".repeat(40),
+                build_target: None,
+            },
+            None,
+            None,
+            Some(SecretsReference { profile: profile.to_string(), account_id: caller }),
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn a_64_character_profile_is_accepted() {
+        request_with_profile(&"p".repeat(64));
+    }
+    #[test]
+    #[should_panic(expected = "'-' or '_' (got 10240 bytes)")]
+    fn a_10_kb_profile_is_refused_naming_the_rule() {
+        request_with_profile(&"p".repeat(10_240));
+    }
+    #[test]
+    #[should_panic(expected = "secrets_ref.profile must be 1–64 bytes")]
+    fn a_65_character_profile_is_refused() {
+        request_with_profile(&"p".repeat(65));
+    }
+    #[test]
+    #[should_panic(expected = "secrets_ref.profile must be 1–64 bytes")]
+    fn an_empty_profile_is_refused() {
+        request_with_profile("");
+    }
+    #[test]
+    #[should_panic(expected = "'-' or '_' (it contains '/')")]
+    fn a_profile_with_a_slash_is_refused_naming_the_character() {
+        request_with_profile("sec/../author");
+    }
+    /// The verdict of a real `store_secrets` and of a real `request_execution`
+    /// on the same profile, side by side: what one door refuses the other
+    /// refuses, for the same reason, and what one stores the other can name.
+    /// Through the public entry points, not the predicate — a predicate agrees
+    /// with itself for free.
+    #[test]
+    fn the_door_and_the_store_agree_on_the_rule() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        fn reason(payload: Box<dyn std::any::Any + Send>) -> String {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        }
+        fn store_verdict(profile: &str) -> Result<(), String> {
+            catch_unwind(AssertUnwindSafe(|| {
+                let owner = accounts(0);
+                let mut b = VMContextBuilder::new();
+                b.predecessor_account_id(owner.clone()).signer_account_id(owner.clone())
+                    .attached_deposit(NearToken::from_near(0)).prepaid_gas(Gas::from_tgas(300));
+                testing_env!(b.build());
+                let mut contract = Contract::new(owner, Some(accounts(1)), None, None);
+                let user = accounts(2);
+                let mut b2 = VMContextBuilder::new();
+                b2.predecessor_account_id(user.clone()).signer_account_id(user.clone())
+                    .attached_deposit(NearToken::from_near(1)).prepaid_gas(Gas::from_tgas(300));
+                testing_env!(b2.build());
+                contract.store_secrets(
+                    SecretAccessor::Repo { repo: "github.com/alice/project".to_string(), branch: None },
+                    profile.to_string(),
+                    "base64encodeddata".to_string(),
+                    crate::types::AccessCondition::AllowAll,
+                    None,
+                );
+            }))
+            .map_err(reason)
+        }
+        fn door_verdict(profile: &str) -> Result<(), String> {
+            catch_unwind(AssertUnwindSafe(|| request_with_profile(profile))).map_err(reason)
+        }
+        // A multi-byte letter is a letter (the charset rule is Unicode) but
+        // counts by its bytes: 64 of them is 128 bytes, refused by both doors.
+        let sixty_four_cyrillic = "ж".repeat(64);
+        let thirty_two_cyrillic = "ж".repeat(32);
+        let cases: [&str; 13] = [
+            "sec", "a-b_c9", &"x".repeat(64), &thirty_two_cyrillic,
+            "", "a/b", "a b", "a:b", "a(b", "a)b", &"x".repeat(65), &sixty_four_cyrillic, &"p".repeat(10_240),
+        ];
+        for profile in cases {
+            let (store, door) = (store_verdict(profile), door_verdict(profile));
+            match (&store, &door) {
+                (Ok(()), Ok(())) => {}
+                (Err(s), Err(d)) => {
+                    // The reason is the parenthesised group right after the
+                    // rule. The door adds a "; …" tail the store does not, and
+                    // the mock wraps the message in `GuestPanic { … "…" }`, so
+                    // the group ends at the first `)` followed by `;` or `"`.
+                    let why = |m: &str| {
+                        let rest = m.split_once(crate::secrets::PROFILE_RULE)?.1.trim_start();
+                        let end = rest.find(");").or_else(|| rest.find(")\""))?;
+                        Some(rest[..=end].to_string())
+                    };
+                    assert_eq!(why(s), why(d), "the two doors refuse {profile:?} for different reasons:\n  store: {s}\n  door:  {d}");
+                    assert!(s.contains(crate::secrets::PROFILE_RULE) && d.contains(crate::secrets::PROFILE_RULE), "both name the rule");
+                }
+                _ => panic!("the doors disagree on {profile:?}: store={store:?} door={door:?}"),
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod a_condition_past_the_pattern_bounds_is_not_stored {
+    //! The keystore refuses to judge a condition with more than
+    //! `MAX_ACCOUNT_PATTERNS` leaves or more than `MAX_ACCOUNT_PATTERN_BYTES`
+    //! of pattern text; both store doors refuse to store one.
+    use super::*;
+    use crate::secrets::{MAX_ACCOUNT_PATTERNS, MAX_ACCOUNT_PATTERN_BYTES};
+    use crate::types::{AccessCondition, LogicOperatorV1};
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{testing_env, NearToken};
+
+    fn contract_and_user() -> (Contract, AccountId) {
+        let owner = accounts(0);
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(owner.clone()).signer_account_id(owner.clone())
+            .attached_deposit(NearToken::from_near(0)).prepaid_gas(Gas::from_tgas(300));
+        testing_env!(b.build());
+        let contract = Contract::new(owner, Some(accounts(1)), None, None);
+        let user = accounts(2);
+        let mut b2 = VMContextBuilder::new();
+        b2.predecessor_account_id(user.clone()).signer_account_id(user.clone())
+            .attached_deposit(NearToken::from_near(1)).prepaid_gas(Gas::from_tgas(300));
+        testing_env!(b2.build());
+        (contract, user)
+    }
+    fn or_of_patterns(patterns: Vec<String>) -> AccessCondition {
+        AccessCondition::Logic {
+            operator: LogicOperatorV1::Or,
+            conditions: patterns.into_iter().map(|pattern| AccessCondition::AccountPattern { pattern }).collect(),
+        }
+    }
+    fn store(contract: &mut Contract, profile: &str, access: AccessCondition) {
+        contract.store_secrets(
+            SecretAccessor::Repo { repo: "github.com/alice/project".to_string(), branch: None },
+            profile.to_string(),
+            "base64encodeddata".to_string(),
+            access,
+            None,
+        );
+    }
+
+    #[test]
+    fn the_bounds_themselves_are_stored() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "leaves", or_of_patterns((0..MAX_ACCOUNT_PATTERNS).map(|i| format!("a{i}\\.near")).collect()));
+        store(&mut contract, "bytes", or_of_patterns(vec!["a".repeat(MAX_ACCOUNT_PATTERN_BYTES / 2), "b".repeat(MAX_ACCOUNT_PATTERN_BYTES / 2)]));
+    }
+
+    #[test]
+    #[should_panic(expected = "holds 17 AccountPattern leaves; at most 16 are judged")]
+    fn one_leaf_past_the_count_is_refused_at_store() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "leaves", or_of_patterns((0..=MAX_ACCOUNT_PATTERNS).map(|i| format!("a{i}\\.near")).collect()));
+    }
+
+    #[test]
+    #[should_panic(expected = "AccountPattern text is 4097 bytes in all; at most 4096 are judged")]
+    fn one_byte_past_the_text_bound_is_refused_at_store() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "bytes", or_of_patterns(vec!["a".repeat(MAX_ACCOUNT_PATTERN_BYTES), "b".to_string()]));
+    }
+
+    #[test]
+    #[should_panic(expected = "holds 17 AccountPattern leaves")]
+    fn the_same_bound_holds_at_update_access() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "row", AccessCondition::AllowAll);
+        contract.update_access(
+            SecretAccessor::Repo { repo: "github.com/alice/project".to_string(), branch: None },
+            "row".to_string(),
+            or_of_patterns((0..=MAX_ACCOUNT_PATTERNS).map(|i| format!("a{i}\\.near")).collect()),
         );
     }
 }

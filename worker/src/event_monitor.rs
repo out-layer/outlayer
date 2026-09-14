@@ -779,7 +779,7 @@ impl EventMonitor {
                 // message can include the raw text that caused the issue.
                 let block_data: BlockData = serde_json::from_str(&response_text)
                     .with_context(|| format!("Failed to parse block data from JSON. Raw text (truncated): '{}'",
-                        if response_text.len() > 200 { &response_text[..200] } else { &response_text }))?;
+                        crate::near_client::head(&response_text, 200)))?;
 
                 // The rest of your logic remains unchanged.
                 let shard_count = block_data.shards.as_ref().map(|s| s.len()).unwrap_or(0);

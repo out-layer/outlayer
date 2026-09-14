@@ -270,11 +270,9 @@ cmd_call() {
 
     # 2. Check NEAR balance via RPC
     echo -e "${CYAN}[2/4] Checking NEAR balance...${NC}"
-    if [ "$NETWORK" = "mainnet" ]; then
-        RPC_URL="https://rpc.mainnet.fastnear.com"
-    else
-        RPC_URL="https://rpc.testnet.fastnear.com"
-    fi
+    # A keyed RPC for this network, or a warning (lib/rpc.sh); an RPC_URL
+    # already in the environment is used as it is.
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"
 
     BALANCE_RESP=$(curl -s "$RPC_URL" \
         -H 'Content-Type: application/json' \

@@ -92,7 +92,7 @@ APPROVER2="${APPROVER2:-}"
 EXTERNAL_ACCT="${EXTERNAL_ACCT:-$APPROVER1}"
 # Shared constant sink for every DeleteAccount + the sweep's intents-withdraw (real/existing/wNEAR-registered → never burns).
 BENEFICIARY="${BENEFICIARY:-$([ "$NETWORK" = mainnet ] && echo zavodil.near || echo zavodil.testnet)}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_URL, or a warning
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 COORDINATOR_URL="${COORDINATOR_URL:-https://testnet-api.outlayer.ai}"
 WNEAR="${WNEAR:-wrap.testnet}"

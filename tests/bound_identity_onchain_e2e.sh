@@ -49,7 +49,7 @@ APPLY=false
 NETWORK="${NETWORK:-testnet}"
 COORDINATOR_URL="${COORDINATOR_URL:-https://testnet-api.outlayer.ai}"
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_URL, or a warning
 PROJECT="${PROJECT:-connectors.outlayer.testnet/connector-probe}"
 TOKEN_CONTRACT="${TOKEN_CONTRACT:-usdc.fakes.testnet}"
 PARENT="${PARENT:-}"

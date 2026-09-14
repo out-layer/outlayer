@@ -182,9 +182,12 @@ else
       -H "X-Payment-Key: $GMAIL_PAYMENT_KEY" -H "X-Wallet-Id: $GMAIL_WALLET_ID" \
       -H "X-Use-Owner-Secret: 1" -H "Content-Type: application/json" -d "{\"input\": $1}"
   }
+  # The connector answers an envelope {success, operation, error, output,
+  # logs}; the fields are under `output`, a cap refusal is success:false with
+  # error "policy_denied: N of the owner's M messages a day are used; …".
   status="$(gmail '{"operation":"status"}')"
-  max="$(field "$status" 'o["policy"]["max_per_day"]')"
-  before="$(field "$status" 'o["sent_today"]')"
+  max="$(field "$status" 'o["output"]["policy"]["max_per_day"]')"
+  before="$(field "$status" 'o["output"]["sent_today"]')"
   if ! [[ "$max" =~ ^[0-9]+$ && "$before" =~ ^[0-9]+$ ]]; then
     fail "status did not report max_per_day and sent_today — $status"
   else
@@ -196,25 +199,28 @@ else
     wait
     sent=0
     for i in $(seq 1 "$N"); do
-      [[ "$(field "$(cat "$WORK/g1.$i")" '"message_id" in o')" == "True" ]] && sent=$((sent + 1))
+      [[ "$(field "$(cat "$WORK/g1.$i")" 'bool(o.get("success")) and "message_id" in (o.get("output") or {})')" == "True" ]] && sent=$((sent + 1))
     done
     # Nothing sent means the cap was never approached, and both asserts below
     # would pass on an empty run: 0 ≤ room, and after == before + 0. The one
     # honest exception is a cap already reached today (room 0): then every
     # send must be refused, and that refusal IS the cap working.
     if (( room == 0 )); then
+      # Refused BY THE CAP — the sentence the cap writes — not merely "no
+      # message_id": a dead credential or a rejected recipient also sends
+      # nothing, and would pass a row that only counted silence.
       refused=0
       for i in $(seq 1 "$N"); do
-        [[ "$(field "$(cat "$WORK/g1.$i")" '"message_id" in o')" != "True" ]] && refused=$((refused + 1))
+        [[ "$(field "$(cat "$WORK/g1.$i")" '(not o.get("success")) and "messages a day are used" in str(o.get("error") or "")')" == "True" ]] && refused=$((refused + 1))
       done
-      [[ "$refused" == "$N" ]] && pass "the cap was already reached today and every send was refused ($N/$N)" \
-                               || fail "THE OWNER'S CAP WAS PASSED: room 0, yet $((N - refused)) sends went through"
+      [[ "$refused" == "$N" ]] && pass "the cap was already reached today and every send was refused by the cap ($N/$N)" \
+                               || fail "THE OWNER'S CAP WAS PASSED, or a send failed for another reason: room 0, yet only $refused of $N were refused by the cap"
     else
       [[ "$sent" -ge 1 ]] || fail "G1 nothing was sent with room for $room — the cap was never exercised, so the two checks below say nothing"
     fi
     [[ "$sent" -le "$room" ]] && pass "no more than the room was sent ($sent ≤ $room)" \
                               || fail "THE OWNER'S CAP WAS PASSED: $sent sent with room for $room"
-    after="$(field "$(gmail '{"operation":"status"}')" 'o["sent_today"]')"
+    after="$(field "$(gmail '{"operation":"status"}')" 'o["output"]["sent_today"]')"
     [[ "$after" == "$(( before + sent ))" ]] && pass "status agrees ($after)" \
                                              || fail "status says $after, expected $(( before + sent ))"
   fi

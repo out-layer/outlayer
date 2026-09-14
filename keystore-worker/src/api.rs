@@ -377,6 +377,39 @@ impl AppState {
     }
 }
 
+/// The door's verdict on one stored condition for one caller.
+///
+/// The condition's patterns are compiled first, once: one the engine will
+/// not compile ([`crate::types::UnreadablePattern`]) refuses everyone with a
+/// 401 naming the pattern, before anything is evaluated — the OWNER fixes
+/// the row. Then the verdict: a denial carries the condition's own sentence
+/// (`denial_message_in`, which names the caller's own lapsed time limit);
+/// an error from evaluation (a chain read that failed, no client) is this
+/// service's failure, a 500. Nothing is ever admitted on an error.
+pub(crate) async fn judge_access(
+    condition: &crate::types::AccessCondition,
+    caller: &str,
+    near_client: Option<&crate::near::NearClient>,
+) -> Result<(), ApiError> {
+    // Bounds first: a condition the keystore will not judge in full is refused
+    // whole, before a single pattern is compiled — nothing else bounds how
+    // many patterns a row holds, and each costs memory to compile.
+    let shape = serde_json::to_value(condition)
+        .map_err(|e| ApiError::InternalError(format!("Access condition could not be serialised: {e}")))?;
+    if let Err(why) = shared_tee_helpers::access_limits::account_pattern_bounds(&shape) {
+        return Err(ApiError::Unauthorized(format!("Access denied by access condition: {why}")));
+    }
+    let patterns = match condition.compile_patterns() {
+        Ok(patterns) => patterns,
+        Err(unreadable) => return Err(ApiError::Unauthorized(unreadable.to_string())),
+    };
+    match condition.evaluate(caller, near_client, &patterns).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ApiError::Unauthorized(condition.denial_message_in(caller, &patterns))),
+        Err(e) => Err(ApiError::InternalError(format!("Access validation failed: {e}"))),
+    }
+}
+
 /// API error types
 #[derive(Debug)]
 pub enum ApiError {
@@ -1962,32 +1995,14 @@ async fn decrypt_handler(
     // Use user_account_id (who requested execution) as caller for access control
     let caller = &req.user_account_id;
 
-    // An unreadable condition is refused BEFORE it is evaluated, wherever the
-    // unreadable leaf sits: evaluated, a bad pattern denies as a leaf, and
-    // under `Not` that denial would admit. The message names the owner's own
-    // pattern — public on chain in the row — and nothing else.
-    if let Some((pattern, why)) = access_condition.unparseable_pattern() {
-        let message = format!(
-            "Access denied by access condition: its AccountPattern `{pattern}` is not a valid regular expression ({why})"
-        );
-        tracing::warn!(task_id = %task_id_str, caller = %caller, "{message}");
-        return Err(ApiError::Unauthorized(message));
-    }
-
-    let access_granted = access_condition.validate(caller, state.near_client.as_ref().map(|c| c.as_ref())).await
-        .map_err(|e| {
-            tracing::error!(task_id = %task_id_str, error = %e, "Access validation failed");
-            ApiError::InternalError(format!("Access validation failed: {}", e))
-        })?;
-
-    if !access_granted {
-        let message = access_condition.denial_message();
-        tracing::warn!(
-            task_id = %task_id_str,
-            caller = %caller,
-            "{message}"
-        );
-        return Err(ApiError::Unauthorized(message));
+    if let Err(refusal) = judge_access(&access_condition, caller, state.near_client.as_ref().map(|c| c.as_ref())).await {
+        match &refusal {
+            // The message quotes an owner-written pattern: escaped, so a
+            // newline or an escape sequence in it cannot forge a log line.
+            ApiError::Unauthorized(message) => tracing::warn!(task_id = %task_id_str, caller = %caller, "{}", message.escape_debug()),
+            other => tracing::error!(task_id = %task_id_str, caller = %caller, "{other:?}"),
+        }
+        return Err(refusal);
     }
 
     tracing::info!(task_id = %task_id_str, caller = %caller, "Access granted");
@@ -4875,6 +4890,13 @@ async fn wallet_sign_secret_store_handler(
                     .to_string(),
             )
         })?;
+
+    // A condition the keystore would refuse to judge is not signed into a row.
+    if let Err(why) = shared_tee_helpers::access_limits::account_pattern_bounds(
+        &serde_json::to_value(&req.access).unwrap_or(serde_json::Value::Null),
+    ) {
+        return Err(ApiError::BadRequest(format!("access condition refused: {why}")));
+    }
 
     // 2. Only now build the message the contract will rebuild, and sign it.
     // The message covers the ACCESSOR as well. The signature authorises one
@@ -9007,5 +9029,99 @@ mod reserved_keys_tests {
              worker dropped a variable (then drop it here too) or the reservation needs a comment \
              saying what it is for"
         );
+    }
+}
+
+#[cfg(test)]
+mod the_door_judges_one_condition_for_one_caller {
+    //! `judge_access` is the one place a stored condition becomes a verdict
+    //! for a decrypt; the handler calls nothing else. An unreadable pattern is
+    //! a 401 that names it — wherever it sits — and nothing is admitted on an
+    //! error.
+    use super::*;
+    use crate::types::{AccessCondition, ComparisonOperator, LogicOperator};
+
+    fn bad() -> AccessCondition {
+        AccessCondition::AccountPattern { pattern: "(".to_string() }
+    }
+
+    #[tokio::test]
+    async fn a_bad_pattern_under_not_is_a_401_naming_the_pattern() {
+        let not_bad = AccessCondition::Not { condition: Box::new(bad()) };
+        match judge_access(&not_bad, "anyone.near", None).await {
+            Err(ApiError::Unauthorized(m)) => {
+                assert!(m.contains("AccountPattern `(`") && m.contains("cannot be compiled"), "{m}");
+            }
+            other => panic!("Not over an unreadable leaf must refuse with the pattern named, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bad_leaf_under_or_and_and_is_the_same_401() {
+        let or = AccessCondition::Logic {
+            operator: LogicOperator::Or,
+            conditions: vec![AccessCondition::Whitelist { accounts: vec!["bob.near".into()] }, bad()],
+        };
+        let and = AccessCondition::Logic { operator: LogicOperator::And, conditions: vec![AccessCondition::AllowAll, bad()] };
+        for c in [or, and] {
+            assert!(matches!(judge_access(&c, "alice.near", None).await, Err(ApiError::Unauthorized(m)) if m.contains("cannot be compiled")));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denial_carries_the_conditions_own_sentence() {
+        let wl = AccessCondition::Whitelist { accounts: vec!["bob.near".into()] };
+        match judge_access(&wl, "alice.near", None).await {
+            Err(ApiError::Unauthorized(m)) => assert!(m.starts_with("Access denied by access condition"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(judge_access(&wl, "bob.near", None).await.is_ok());
+        assert!(judge_access(&AccessCondition::AllowAll, "anyone.near", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_grant_is_named_to_the_caller_it_bound_and_to_nobody_else() {
+        let dated = |a: &str| AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![
+                AccessCondition::Whitelist { accounts: vec![a.into()] },
+                AccessCondition::ValidUntil { until_ns: "1".into() },
+            ],
+        };
+        let grants = AccessCondition::Logic {
+            operator: LogicOperator::Or,
+            conditions: vec![AccessCondition::Whitelist { accounts: vec!["owner.near".into()] }, dated("agent.near")],
+        };
+        match judge_access(&grants, "agent.near", None).await {
+            Err(ApiError::Unauthorized(m)) => assert!(m.ends_with("its time limit passed at 1970-01-01T00:00:00Z"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match judge_access(&grants, "stranger.near", None).await {
+            Err(ApiError::Unauthorized(m)) => assert_eq!(m, "Access denied by access condition", "not named, so no date"),
+            other => panic!("{other:?}"),
+        }
+        assert!(judge_access(&grants, "owner.near", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_condition_past_the_pattern_bounds_is_refused_whole_before_any_compile() {
+        let leaf = |i: usize| AccessCondition::AccountPattern { pattern: format!("a{i}\\.near") };
+        let mut seventeen: Vec<_> = (0..17).map(leaf).collect();
+        seventeen.push(AccessCondition::AllowAll);
+        let tree = AccessCondition::Logic { operator: LogicOperator::Or, conditions: seventeen };
+        match judge_access(&tree, "anyone.near", None).await {
+            Err(ApiError::Unauthorized(m)) => assert!(m.contains("17 AccountPattern leaves"), "{m}"),
+            other => panic!("AllowAll beside 17 patterns must still refuse: {other:?}"),
+        }
+        let sixteen = AccessCondition::Logic { operator: LogicOperator::Or, conditions: (0..16).map(leaf).chain([AccessCondition::AllowAll]).collect() };
+        assert!(judge_access(&sixteen, "anyone.near", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_chain_read_that_cannot_run_is_this_services_failure_not_an_admission() {
+        let balance = AccessCondition::NearBalance { operator: ComparisonOperator::Gte, value: "1".into() };
+        assert!(matches!(judge_access(&balance, "anyone.near", None).await, Err(ApiError::InternalError(_))));
+        let negated = AccessCondition::Not { condition: Box::new(balance) };
+        assert!(matches!(judge_access(&negated, "anyone.near", None).await, Err(ApiError::InternalError(_))));
     }
 }

@@ -136,9 +136,8 @@ set_access() { # set_access <project> <profile> <access-json>
   while :; do
     out=$(update_access_call "$args" "$deposit_used" 2>&1) && break
     # Changing the deposit's SPELLING is not a retry. A contract that predates
-    # the deposit refuses any deposit at all, and that answer is free: letting
-    # it consume the retry budget leaves nothing for the refusals that actually
-    # need one, which is how two runs died at the first expired transaction.
+    # the deposit refuses any deposit at all, and that answer is free: it must
+    # not consume the retry budget the transient refusals need.
     if [[ "$deposit_used" != "0 NEAR" ]] && grep -qi "accept deposit\|not payable" <<<"$out"; then
       note "the deployed contract predates the update_access deposit: retrying without one"
       deposit_used='0 NEAR'
@@ -207,12 +206,14 @@ run_as() {
   if [[ -z "$ev" ]]; then
     # A send that expired on its block hash, or never left the CLI, produces no
     # event — and no verdict about the product. It is also transient, so it is
-    # worth one retry before the row is written off: a lost transaction cost
-    # this catalogue a whole row (U5) in an earlier sweep.
-    # A send that TIMED OUT may have landed: resending it would run the
-    # request twice and let the second event overwrite the first verdict, so
-    # a timeout is not retried — only a send that provably never left.
-    if grep -qiE "expired|Tx not found|connection" <<<"$out"; then
+    # worth one retry before the row is written off.
+    # A send that TIMED OUT may have landed, and so may one the RPC answered
+    # `Tx not found` for (it has not seen the transaction YET), or one whose
+    # connection dropped mid-answer: resending any of those would run the
+    # request twice and let the second event overwrite the first verdict.
+    # Only a send the RPC most likely never took — an expired block hash, no
+    # connection at all — is retried.
+    if grep -qiE "expired|connection refused|dns error|could not resolve|failed to connect" <<<"$out"; then
       note "the send never landed (transient), retrying once for $signer"
       sleep 5
       out=$(near contract call-function as-transaction "$CONTRACT_ID" request_execution \
@@ -221,6 +222,9 @@ run_as() {
       ev=$(grep -o 'EVENT_JSON:.*execution_completed.*' <<<"$out" | sed 's/^EVENT_JSON://' | head -1)
     fi
   fi
+  # The CLI's whole transcript, for the rows that judge a refusal the CONTRACT
+  # makes before yielding — there is no event then, only the panic's text.
+  RUN_RAW="$out"
   if [[ -z "$ev" ]]; then
     RUN_OK=absent; RUN_ERR=""; RUN_OUT=""
     note "no completion event from $signer: $(grep -iE 'error|fail|panick|reset|limit' <<<"$out" | head -2 | head -c 300)"
@@ -252,6 +256,7 @@ call_https() {
 HTTP_CODE=""; ANS=""
 https_post() {
   local key=$1 project=$2 body=$3; shift 3
+  RUN_RAW=""   # an on-chain transcript is `run_as`'s; none belongs to this call
   throttle
   local raw
   raw=$(curl -sS --max-time 90 -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/call/$project" \

@@ -7,9 +7,8 @@
 #
 # Every refusal here is judged on three things at once: the verdict, the
 # STATUS (a 4xx, or a finished call — never a 5xx) and the TIME (an answer, not
-# a hang). A refusal that hangs is the row-11 defect of the audit (the worker
-# never settled the HTTPS call); such a case is reported as a FINDING with the
-# call id rather than as a pass.
+# a hang). A refusal that hangs is a refused run the worker never settled;
+# such a case is reported as a FINDING with the call id rather than as a pass.
 #
 #   N1  a condition nested 200 deep never sits on chain: the contract refuses it
 #   N2  a condition nested 60 deep is stored, evaluated within the call's own
@@ -55,15 +54,14 @@
 #       the secret until the OWNER edits the row. Destructive — it ends the
 #       binding D3 and D9 need, so it runs last and only with
 #       D7_DESTROY_BINDING=1
-#   X1  the plan defines the judged identity: `user_account_id` = the tx
-#       SIGNER (Phase 0, entry point 2). A contract the owner signs one
-#       transaction to (tests/deputy-stub) relays request_execution naming the
-#       owner's own row: the deputy pays, the owner signed. Judged by the
-#       signer, the owner's own whitelist admits it — the run completes and the
-#       event names the owner. That is the plan's choice, pinned as written;
-#       its consequence (any contract the owner signs to can drive the owner's
-#       credentialed app) is a decision on the plan. If the plan moves to the
-#       predecessor, this row flips with it
+#   X1  the on-chain door judges the transaction's SIGNER: `user_account_id`
+#       is `signer_id`. A contract the owner signs one transaction to
+#       (tests/deputy-stub) is the predecessor and the payer when it relays
+#       request_execution naming the owner's own row; judged by the signer,
+#       the owner's own whitelist admits it — the run completes and the event
+#       names the owner. That is what judging the signer means: any contract
+#       the owner signs to can drive the owner's credentialed app with input
+#       of its own. A door that also judged the predecessor would flip this row
 #   D12 the body claims another sender_id on a key owned by the owner → the
 #       guest sees the payer and the row is judged against the key's owner
 #   U10b a 10 KB profile on the ON-CHAIN door → not-found or a clean refusal
@@ -85,22 +83,19 @@
 #       is refused by that row's condition. The prerequisite for retiring
 #       the agent-secret path: without it a wallet with no named account
 #       behind it could keep no secret at all
-#   U5  the caller names the AUTHOR's row directly. UNREACHABLE as the plan
-#       words it: this project's manifest already declares that profile, so
-#       naming it again makes the SAME key arrive twice and the collision rule
-#       refuses — which is correct, and is what A7 pins. The row asserts the
-#       refusal instead of pretending to compare environments
+#   U5  the caller names the AUTHOR's row directly. This project's manifest
+#       already declares that profile, so naming it again makes the SAME key
+#       arrive twice and the collision rule refuses — which is correct, and is
+#       what A7 pins. The row asserts the refusal instead of pretending to
+#       compare environments
 #   U4  a row stored for project A, named from a call to project B → not found,
 #       and B runs without it
 #   U11 a profile shaped like an implicit account (64 hex) on a human's row →
-#       the CONTRACT refuses the store, naming the owner and saying what to do.
-#       The plan (and this suite, at first) expected the keystore's
-#       `enforce_agent_secret` to be the gate; it is only the second line
+#       the CONTRACT refuses the store, naming the owner and saying what to do;
+#       the keystore's `enforce_agent_secret` is the second line
 #   D11 a secret named after a system variable → refused AT THE DOOR, before
-#       anything is encrypted or stored, with the offending keys named. Three
-#       guesses were wrong before this one: the plan expected the contract to
-#       refuse, this suite first expected nothing to refuse and the worker to
-#       strip at run time. The worker's strip is real but is the SECOND line
+#       anything is encrypted or stored, with the offending keys named. The
+#       worker's strip of SYSTEM_ENV_VARS at run time is the SECOND line
 #   A4  a DaoMember condition against a real sputnik DAO whose council names the
 #       owner → the member is admitted and reads the canary, a non-member is
 #       refused by the condition
@@ -109,10 +104,12 @@
 #       and the row's storage_deposit is read before and after — because
 #       `update_access` charges NO deposit while it can grow the condition by
 #       tens of kilobytes. Whether that is paid for is measured, not assumed
-#   K4  the same row overwritten afterwards still works, and the deposit returns
-#       to what it was — accounting that closes rather than drifts
+#   K4  shrinking the condition returns the deposit to what it was — accounting
+#       that closes rather than drifts — and a real `store_secrets` overwrite of
+#       the same row afterwards still decrypts, with the new value
 #   T1  a grant whose ValidUntil has passed refuses, and the message names the
-#       instant (the naming needs a worker carrying access_denied_message; the
+#       instant — the keystore names a lapsed limit to the caller whose own
+#       branch it sits in, and the worker passes that sentence through (the
 #       rows skip themselves on a contract or keystore without ValidUntil)
 #   T2  the same grant moved to the future admits
 #   T3  until_ns "abc" is refused by the contract; "0" is stored, and the
@@ -147,12 +144,11 @@
 #   PARENT=you.testnet OWNER_PAYMENT_KEY=… ./tests/secrets_security_e2e.sh --apply
 #   ONLY=N1,B4 … --apply                                          # a subset
 #
-# Two of the plan's rows are UNREACHABLE by construction and are asserted
-# nowhere, on purpose: D12 (an HTTPS caller claiming another `context.sender_id`)
-# because `HttpsCallRequest` has no such field at all — the guest-visible sender
-# is computed server-side as `bound_sender.unwrap_or(sender_id)`; and the
-# unknown-sender refusal, for the same kind of reason (every door fills it).
-# Writing a live row for either would test the test, not the product.
+# One case of the catalogue is asserted nowhere, on purpose: the unknown-sender
+# refusal. Every door fills the sender (the contract's event, the payment key's
+# owner, the re-queue path), so no live request arrives without one; the
+# worker's refusal is unit-covered, and a live row for it would test the test,
+# not the product.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -263,11 +259,11 @@ try_update_access() { # try_update_access <signer> <project> <profile> <access-j
 # What a hang MEANS, per section. A reference the contract could never match is
 # the coordinator door's to refuse (`well_formed_secrets_ref` → 400
 # `invalid_secrets_ref`); a reference it could match, refused by the row's own
-# condition, is the worker's to settle (`report_refusal` → `complete_https_call`,
-# audit row 11). Both live in the working tree: against a coordinator or a worker
-# without them, such a call waits for the timeout sweeper instead of answering.
-HANG_FIX="the worker must settle the refused call (audit row 11: report_refusal \
-answers complete_https_call) — deploy the worker"
+# condition, is the worker's to settle (`report_refusal` → `complete_https_call`).
+# A call that waits for the timeout sweeper instead of answering is one of those
+# two doors not doing its part.
+HANG_FIX="the worker must settle the refused call (report_refusal answers \
+complete_https_call)"
 
 # Whose key may read the call a row made. `/calls/{id}` is authenticated: it
 # admits the payment key that owns the call, or the wallet's own credential.
@@ -302,7 +298,7 @@ answered() {
       [[ "$status" == "completed" || "$status" == "failed" ]] && break
     done
     if [[ "$status" != "completed" && "$status" != "failed" ]]; then
-      finding "$label: call $cid is still '$status' a minute later — a refused run nobody settled (audit row 11; the worker redeploy)"
+      finding "$label: call $cid is still '$status' a minute later — a refused run nobody settled"
       return
     fi
   fi
@@ -332,7 +328,45 @@ fi
 USER_CANARY="user-$(openssl rand -hex 6)"
 store "$PROJECT" "$ROW" "$(jq -nc --arg v "$USER_CANARY" '{USER_SECRET:$v}')" "whitelist:$PARENT"
 restore_row() { set_access "$PROJECT" "$ROW" "$(whitelist "$PARENT")"; }
-trap 'restore_row >/dev/null 2>&1 || true' EXIT
+# C6 switches the project's ACTIVE version. If the run dies in between, the
+# version it found active goes back on the way out — every later caller of the
+# project, and every other suite, runs whatever is active.
+C6_RESTORE=""
+ACTIVATE_ERR=""
+activate() { # activate <version_key> — leaves the reason in ACTIVATE_ERR when it fails
+  local attempt
+  for attempt in 1 2; do
+    ACTIVATE_ERR=$(near --quiet contract call-function as-transaction "$CONTRACT_ID" set_active_version \
+      json-args "$(jq -nc --arg n "${PROJECT#*/}" --arg v "$1" '{project_name:$n, version_key:$v}')" \
+      prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
+      sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1) && { ACTIVATE_ERR=""; return 0; }
+    # A send the RPC never took says nothing about the version; one more try.
+    grep -qiE "expired|timed out|connection" <<<"$ACTIVATE_ERR" && (( attempt == 1 )) && { sleep 5; continue; }
+    break
+  done
+  ACTIVATE_ERR=$(grep -viE '^\s*$' <<<"$ACTIVATE_ERR" | tail -4 | tr '\n' ' ' | head -c 300)
+  return 1
+}
+# Each restore runs in a SUBSHELL: the helpers end the shell on failure, and
+# inside a trap that would end the trap with the rest of it undone. The
+# version first — a project left on the wrong build affects every caller —
+# and every failure on stderr: a restore that did not happen is the first
+# thing to read after an interrupted run.
+on_exit() {
+  if [[ -n "$C6_RESTORE" ]]; then
+    activate "$C6_RESTORE" && note "C6 active version restored to ${C6_RESTORE:0:16}… on exit" \
+      || echo "✗ C6 COULD NOT RESTORE the active version — it may not be ${C6_RESTORE:0:16}…, check and put it back by hand: $ACTIVATE_ERR" >&2
+  fi
+  # A row already holding the fixture's own condition needs no transaction:
+  # every run — an `ONLY=` subset that never touched it included — would
+  # otherwise spend one `update_access` putting back what it never changed.
+  # A read that answers nothing reads as "changed", so the restore still runs.
+  if [[ "$(jq -Sc '.access // empty' <<<"$(row_of "$PROJECT" "$ROW")" 2>/dev/null)" \
+        != "$(jq -Sc . <<<"$(whitelist "$PARENT")")" ]]; then
+    ( restore_row ) || echo "✗ $PROJECT/$ROW was NOT restored to Whitelist[$PARENT] — put it back by hand" >&2
+  fi
+}
+trap on_exit EXIT
 
 # ── N nesting ────────────────────────────────────────────────────────────────
 if want N1; then
@@ -349,8 +383,11 @@ else
   # try_update_access returns 1 for a contract refusal AND for a send that never
   # arrived. Only the first is a verdict; recording the second as "the contract
   # refused it" would turn every RPC outage into a security pass.
-  if grep -qE 'Smart contract panicked|[Rr]ecursion|deserializ|Exceeded' <<<"$TRY_OUT"; then
-    pass "N1 the contract refused to store it: $(grep -o 'Smart contract panicked[^"]\{0,90\}\|[Rr]ecursion[^"]\{0,60\}\|Error:[^"]\{0,80\}' <<<"$TRY_OUT" | head -1)"
+  # A refusal FOR THE TREE: the deserializer giving up on its depth. Any
+  # other failure — gas exceeded, a deposit, a missing method — is a failed
+  # send, not a verdict.
+  if grep -qE '[Rr]ecursion|deserializ' <<<"$TRY_OUT"; then
+    pass "N1 the contract refused to store it: $(grep -iE 'panick|recursion|deserializ' <<<"$TRY_OUT" | head -2 | tr '\n' ' ' | head -c 200)"
   else
     fail "N1 the send failed without the contract refusing it: $(grep -viE '^\s*$' <<<"$TRY_OUT" | tail -3 | head -c 200)"
   fi
@@ -382,11 +419,11 @@ if ! want M && ! want B && ! want Y1; then
 elif [[ -z "$OWNER_PAYMENT_KEY" ]]; then
   skip "M1–M8, B1–B4, Y1 need OWNER_PAYMENT_KEY (a payment key owned by $PARENT)"
 else
-  # M and B name rows the contract could never hold. EITHER deploy clears them:
+  # M and B name rows the contract could never hold. Either door answers them:
   # the coordinator's door check stops such a reference before a job exists, and
   # the worker's refusal path settles the call if one is already running.
-  HANG_FIX="either deploy clears this: the coordinator refuses the reference at the door \
-(invalid_secrets_ref, 400), or the worker settles the refused call (audit row 11)"
+  HANG_FIX="either the coordinator refuses the reference at the door \
+(invalid_secrets_ref, 400), or the worker settles the refused call"
   POLL_KEY="$OWNER_PAYMENT_KEY"
   if want M; then
   log "M a hostile secrets_ref is answered, never with a 5xx, never with the secret"
@@ -394,15 +431,18 @@ else
     https_post "$OWNER_PAYMENT_KEY" "$PROJECT" \
       "$(jq -nc --arg a "$2" --arg pr "$3" '{input:{message:"probe"}, secrets_ref:{account_id:$a, profile:$pr}}')"
     answered "$1 $4"
-    [[ -z "$(secret_value USER_SECRET)" ]] \
-      && pass "$1 and no secret reached the guest" \
-      || fail "$1 USER_SECRET reached the guest through '$2'/'$3'"
-    # M6 aims its traversal at the AUTHOR profile, which every run carries
-    # anyway: checking USER_SECRET alone could not see that leak. No hostile
-    # reference may deliver a caller secret of any name.
-    [[ "$(field .user)" != "true" ]] \
-      && pass "$1 and the guest was handed no caller secret at all" \
-      || fail "$1 a caller secret reached the guest through '$2'/'$3'"
+    # A refused run carries no environment, so "no secret reached the guest"
+    # is a claim only about a run that COMPLETED. M6 aims its traversal at the
+    # AUTHOR profile, which every run carries anyway: checking USER_SECRET
+    # alone could not see that leak, so the guest's own `user` flag is read
+    # too — no hostile reference may deliver a caller secret of any name.
+    if [[ "$RUN_OK" == "true" ]]; then
+      [[ -z "$(secret_value USER_SECRET)" && "$(field .user)" != "true" ]] \
+        && pass "$1 the run completed and no caller secret reached the guest (user=$(field .user))" \
+        || fail "$1 a caller secret reached the guest through '$2'/'$3' (user=$(field .user))"
+    else
+      note "$1 refused before any run — no environment to leak into"
+    fi
   }
   m_row M1 "nobody-$(openssl rand -hex 4).testnet" "$ROW" "an account that does not exist"
   m_row M2 "" "$ROW" "an empty account"
@@ -422,13 +462,13 @@ else
       4*) pass "$1 $3 → HTTP $HTTP_CODE: $(head -c 100 <<<"$RUN_ERR")" ;;
       5*|000) fail "$1 $3 → HTTP $HTTP_CODE — $HANG_FIX" ;;
       *) if [[ "${4:-}" == "ignored-ok" ]]; then
-           # Plan C5: an unknown extra field is IGNORED and the reference still
-           # works — so the run must have completed WITH the owner's row.
+           # An unknown extra field is IGNORED and the reference beside it
+           # still works — so the run must have completed WITH the owner's row.
            [[ "$RUN_OK" == "true" && "$(field .user)" == "true" ]] \
              && pass "$1 $3 ignored, and the reference beside it still worked (user=true)" \
              || fail "$1 $3 was accepted but the reference beside it did not work: success=$RUN_OK user=$(field .user)"
          else
-           fail "$1 $3 was ACCEPTED (HTTP $HTTP_CODE) — the plan (C5) refuses this shape at the door with a 400"
+           fail "$1 $3 was ACCEPTED (HTTP $HTTP_CODE) — this shape is refused at the door with a 400"
          fi ;;
     esac
   }
@@ -598,7 +638,7 @@ if want U5; then
   else
     fail "U5 refused for something other than the collision: $(head -c 160 <<<"$RUN_ERR")"
   fi
-  note "U5 as the plan words it (naming the author's row for an identical environment) is unreachable on a project whose manifest declares that profile"
+  note "U5 naming the author's row for an identical environment is unreachable on a project whose manifest declares that profile: the same key arrives twice and the collision rule refuses"
 fi
 
 # ── U4 a row belonging to another project ────────────────────────────────────
@@ -606,16 +646,11 @@ fi
 # Rows are keyed by accessor. A row stored for project A must be invisible to a
 # call to project B even when B's caller names it, and B must still RUN — a
 # missing row is not a refusal.
-if ! want U4; then
-  :
-elif [[ -z "$(jq -r '.encrypted_secrets // empty' <<<"$(row_of "$OTHER_PROJECT" u4)" 2>/dev/null)" ]]; then
-  store "$OTHER_PROJECT" u4 "$(jq -nc --arg v "other-project-$(openssl rand -hex 4)" '{USER_SECRET:$v}')" allow-all
-  U4_READY=1
-else
-  U4_READY=1
-fi
-if want U4 && [[ "${U4_READY:-}" == "1" ]]; then
+if want U4; then
   log "U4 a row stored for $OTHER_PROJECT, named from a call to $PROJECT"
+  if [[ -z "$(jq -r '.encrypted_secrets // empty' <<<"$(row_of "$OTHER_PROJECT" u4)" 2>/dev/null)" ]]; then
+    store "$OTHER_PROJECT" u4 "$(jq -nc --arg v "other-project-$(openssl rand -hex 4)" '{USER_SECRET:$v}')" allow-all
+  fi
   run_as "$PARENT" "$PARENT/u4"
   if [[ "$RUN_OK" == "true" ]]; then
     [[ -z "$(secret_value USER_SECRET)" && "$(field .user)" == "false" ]] \
@@ -625,6 +660,10 @@ if want U4 && [[ "${U4_READY:-}" == "1" ]]; then
     # A refusal is also wrong here: not-found must not stop the run.
     fail "U4 the run was REFUSED rather than continuing without the missing row: $(head -c 140 <<<"$RUN_ERR")"
   fi
+  # The row is this row's fixture only; nothing stays under the other project.
+  # In a subshell: the helper ends the shell on failure, and one row's cleanup
+  # must not end the suite.
+  ( delete_row "$OTHER_PROJECT" u4 ) || fail "U4 could not delete its fixture row under $OTHER_PROJECT — remove it by hand"
 fi
 
 # ── U11 a profile shaped like an implicit account ─────────────────────────────
@@ -658,11 +697,10 @@ fi
 
 # ── D11 a secret named after a system variable ────────────────────────────────
 #
-# The plan expected `store_secrets` to refuse these. It does not — there is no
-# such check in the contract. The defence is the WORKER stripping every
-# SYSTEM_ENV_VARS name from the merged map before writing its own, so the row
-# stores and is then neutralised. Asserting the plan's version would have
-# encoded an expectation the system does not make.
+# A secret named after a system variable is refused at the encrypt door, before
+# anything is encrypted or stored, with the offending keys named. The WORKER's
+# strip of every SYSTEM_ENV_VARS name from the merged map is the second line,
+# for ciphertext that arrived by a route without that door.
 if want D11; then
   log "D11 a secret named NEAR_SENDER_ID and NEAR_USER_ACCOUNT_ID"
   # NOT the `store` helper: it exits on failure, and a refusal is the result.
@@ -890,12 +928,9 @@ else
   log "C6 activating $SWITCH_TO, then the first call with a secrets_ref"
   WAS_ACTIVE=$(near_view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{project_id:$p}')" | jq -r '.active_version // empty')
   [[ -n "$WAS_ACTIVE" ]] || { fail "C6 could not read the current active version"; WAS_ACTIVE=""; }
-  activate() { # activate <version_key>
-    near --quiet contract call-function as-transaction "$CONTRACT_ID" set_active_version \
-      json-args "$(jq -nc --arg n "${PROJECT#*/}" --arg v "$1" '{project_name:$n, version_key:$v}')" \
-      prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
-      sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
-  }
+  # Flagged BEFORE the switch: a switch that landed while its send timed out
+  # must still be undone on the way out (restoring is idempotent).
+  [[ -n "$WAS_ACTIVE" ]] && C6_RESTORE="$WAS_ACTIVE"
   if [[ -n "$WAS_ACTIVE" ]] && activate "$SWITCH_TO"; then
     https_post "$OWNER_PAYMENT_KEY" "$PROJECT" \
       "$(jq -nc --arg a "$PARENT" --arg pr "$ROW" '{input:{message:"c6"}, secrets_ref:{account_id:$a, profile:$pr}}')"
@@ -904,10 +939,12 @@ else
     else
       fail "C6 first call after the switch: success=$RUN_OK user=$(field .user) value='$(secret_value USER_SECRET)' err='$(head -c 140 <<<"$RUN_ERR")'"
     fi
-    activate "$WAS_ACTIVE" && note "C6 active version restored to ${WAS_ACTIVE:0:16}…" \
+    activate "$WAS_ACTIVE" && { C6_RESTORE=""; note "C6 active version restored to ${WAS_ACTIVE:0:16}…"; } \
       || fail "C6 COULD NOT RESTORE the active version — it is still $SWITCH_TO, put it back by hand"
   else
-    fail "C6 could not activate $SWITCH_TO"
+    fail "C6 could not activate $SWITCH_TO: ${ACTIVATE_ERR:-no active version could be read}"
+    # A refusal BY THE CONTRACT means nothing moved; a lost send may have.
+    grep -qiE "not found|Only project owner" <<<"$ACTIVATE_ERR" && C6_RESTORE=""
   fi
 fi
 
@@ -1041,14 +1078,19 @@ else
     [[ "$DEPOSIT_RESTORED" == "$DEPOSIT_BEFORE" ]] \
       && pass "K4 shrinking the condition returned the deposit to where it started" \
       || finding "K4 storage_deposit did not return: started $DEPOSIT_BEFORE, ended $DEPOSIT_RESTORED"
+    # A real overwrite: store_secrets on the existing row, a new value, the
+    # fixture's condition. Every later row reads this canary.
+    K4_CANARY="user-$(openssl rand -hex 6)"
+    store "$PROJECT" "$ROW" "$(jq -nc --arg v "$K4_CANARY" '{USER_SECRET:$v}')" "whitelist:$PARENT"
+    USER_CANARY="$K4_CANARY"
     run_as "$PARENT" "$PARENT/$ROW"
     [[ "$RUN_OK" == "true" && "$(secret_value USER_SECRET)" == "$USER_CANARY" ]] \
-      && pass "K4 and the row still decrypts after being rewritten twice" \
-      || fail "K4 the row stopped working after the overwrite: success=$RUN_OK err='$(head -c 150 <<<"$RUN_ERR")'"
+      && pass "K4 and a store_secrets overwrite of the same row still decrypts, with the new value" \
+      || fail "K4 the row stopped working after the overwrite: success=$RUN_OK value='$(secret_value USER_SECRET)' err='$(head -c 150 <<<"$RUN_ERR")'"
   else
-    # The plan's sentence: a 2 000-account whitelist STORES and the deposit
-    # scales. A refusal is a divergence, not a defensible cap.
-    fail "U9 the contract refused a ${U9_SIZE}-account whitelist — the plan says it stores (deposit scales)"
+    # A 2 000-account whitelist STORES, and the deposit scales with it. A
+    # refusal is a divergence, not a defensible cap.
+    fail "U9 the contract refused a ${U9_SIZE}-account whitelist — it must store, with the deposit scaling"
     note "U9 nothing was changed; the row keeps the condition it had"
   fi
 fi
@@ -1082,14 +1124,14 @@ else
   elif [[ "$RUN_OK" == "false" ]] && grep -qi "denied" <<<"$RUN_ERR"; then
     # The VERDICT and the REASON are two claims, and only the first is the
     # product's behaviour. A lapsed grant must refuse; naming the instant it
-    # lapsed at is the worker passing the keystore's own sentence through
-    # (`access_denied_message`), which a worker built before that fix replaces
-    # with a fixed string.
+    # lapsed at is the keystore's `denial_message_for` — the date sits in the
+    # branch that names THIS caller — and the worker passing that sentence
+    # through (`access_denied_message`).
     pass "T1 the lapsed grant refuses the stranger: $(head -c 100 <<<"$RUN_ERR")"
     if grep -q "time limit passed at 1970-01-01T00:00:00Z" <<<"$RUN_ERR"; then
       pass "T1 and the message names the instant it lapsed at"
     else
-      finding "T1 the refusal does not name the instant — this worker replaces the keystore's sentence with a fixed string; needs the access_denied_message fix deployed"
+      finding "T1 the refusal does not name the instant — the keystore under test does not name the caller's own lapsed grant (denial_message_for); deploy the one that does"
     fi
   else
     fail "T1 stranger: success=$RUN_OK user=$(field .user) err='$RUN_ERR' (expected a refusal)"
@@ -1114,7 +1156,7 @@ else
     log "T3 raw until_ns values"
     if try_update_access "$PARENT" "$PROJECT" "$ROW" "$(grant_until abc)"; then
       fail "T3 the contract stored until_ns \"abc\""
-    elif grep -qE 'Smart contract panicked|deserializ|invalid type|invalid digit' <<<"$TRY_OUT"; then
+    elif grep -qE 'deserializ|invalid type|invalid digit' <<<"$TRY_OUT"; then
       pass "T3 until_ns \"abc\" is refused by the contract"
     else
       fail "T3 the send failed without the contract refusing it: $(grep -viE '^\s*$' <<<"$TRY_OUT" | tail -3 | head -c 200)"
@@ -1125,9 +1167,9 @@ else
       && pass "T3 until_ns \"0\" is stored and the owner's branch admits the owner" \
       || fail "T3 owner under until_ns 0: success=$RUN_OK user=$(field .user) err='$RUN_ERR'"
     run_as "$STRANGER" "$PARENT/$ROW"
-    [[ "$RUN_OK" == "false" ]] \
+    [[ "$RUN_OK" == "false" ]] && grep -qi "denied" <<<"$RUN_ERR" \
       && pass "T3 and the stranger's lapsed branch refuses" \
-      || fail "T3 stranger under until_ns 0 was admitted"
+      || fail "T3 stranger under until_ns 0: success=$RUN_OK err='$(head -c 120 <<<"$RUN_ERR")' (expected a refusal by the condition)"
 
     # ── T4 the whole cycle, on one row, with the value never re-stored ──────────
     #
@@ -1197,7 +1239,7 @@ else
     CLI3_ROW=$(row_of "$PROJECT" "$ROW")
     CLI3_ACCESS=$(jq -c '.access // empty' <<<"$CLI3_ROW")
     # The shape the contract stores, not merely "something changed": a bare
-    # array under the variant name is exactly what it used to refuse.
+    # array under the variant name is a shape the contract refuses.
     if jq -e --arg a "$PARENT" --arg b "$STRANGER" \
          '.access.Whitelist.accounts as $l | ($l | index($a)) and ($l | index($b))' \
          <<<"$CLI3_ROW" >/dev/null 2>&1; then
@@ -1301,11 +1343,11 @@ fi
 
 # ── D12 a body that claims another sender ────────────────────────────────────
 #
-# Plan D12: "HTTPS `context.sender_id` claiming another account without a
-# binding → guest sees the payer; with a binding → the bound name only". The
-# request type has no such field, so the door ignores it — but "ignored" is a
-# claim about the guest's ENVIRONMENT and the row's condition, and those are
-# what is read here. The bound half is D3.
+# An HTTPS body claiming another sender (`context.sender_id`, `sender_id`)
+# names nothing the request type has, so the door ignores it — but "ignored"
+# is a claim about the guest's ENVIRONMENT and the row's condition, and those
+# are what is read here: the guest sees the payer, the row is judged against
+# the key's owner. The bound half is D3.
 if ! want D12; then
   :
 elif [[ -z "$OWNER_PAYMENT_KEY" ]]; then
@@ -1331,41 +1373,49 @@ fi
 
 # ── U10b a hostile profile on the ON-CHAIN door ──────────────────────────────
 #
-# M1–M8 are the HTTPS door. `request_execution` bounds nothing about
-# `profile`, and the plan's sentence (U10) is the same on both doors: a clean
-# refusal or not-found, never a 5xx, never a hang.
+# M1–M8 are the HTTPS door. On this one the contract refuses a profile no row
+# could match before yielding, naming the rule, and a worker that meets one
+# refuses it before any keystore round trip: a clean refusal naming why, never
+# a 5xx, never a hang.
 if want U10b; then
   log "U10b a 10 KB profile in an on-chain secrets_ref"
   run_as "$PARENT" "$PARENT/$(head -c 10240 /dev/zero | tr '\0' p)"
   if [[ "$RUN_OK" == "absent" ]]; then
-    fail "U10b no completion event — the request hung, or the contract refused it before yielding (no event either way)"
+    # A contract that refuses the reference before yielding leaves no event —
+    # only its panic, which must still name the rule.
+    if grep -q "Smart contract panicked" <<<"${RUN_RAW:-}" && grep -q "secrets_ref.profile" <<<"${RUN_RAW:-}"; then
+      pass "U10b refused by the contract at the door, naming the rule: $(grep -o 'secrets_ref.profile[^"]\{0,110\}' <<<"$RUN_RAW" | head -1)"
+    else
+      fail "U10b no completion event and no contract refusal naming the profile — the request hung, or died for another reason: $(grep -iE 'panick|error' <<<"${RUN_RAW:-}" | head -1 | head -c 160)"
+    fi
   elif [[ "$RUN_OK" == "true" ]]; then
     [[ "$(field .user)" != "true" ]] \
       && pass "U10b not found: the run completed with no caller secret (user=$(field .user))" \
       || fail "U10b a 10 KB profile delivered a caller secret"
   elif grep -qi "internal" <<<"$RUN_ERR"; then
     fail "U10b refused with an internal error, which is the 5xx of this door: $(head -c 140 <<<"$RUN_ERR")"
-  elif grep -qiE "not found|no such|1.64 characters|64 characters|too long|profile" <<<"$RUN_ERR"; then
+  elif grep -qiE "not found|no such|1.64 bytes|64 bytes|too long|profile" <<<"$RUN_ERR"; then
     pass "U10b refused, naming why: $(head -c 120 <<<"$RUN_ERR")"
   else
-    # The catalogue's rule for every refusal: the message names the reason. A
-    # generic "failed to decrypt" tells the caller nothing about a 10 KB
-    # profile; the HTTPS door says "profile must be 1-64 characters".
-    fail "U10b refused without naming why (plan: every refusal names its reason): '$(head -c 140 <<<"$RUN_ERR")'"
+    # Every refusal names its reason. A generic "failed to decrypt" tells the
+    # caller nothing about a 10 KB profile; both doors say which half of the
+    # profile rule it broke.
+    fail "U10b refused without naming why: '$(head -c 140 <<<"$RUN_ERR")'"
   fi
 fi
 
 # ── U12b the owner stores a condition the keystore cannot evaluate ───────────
 #
-# Plan U12b: "owner update_access to a malformed condition (empty Whitelist, bad
-# regex) → that owner's runs refused with a parse message; others unaffected".
-# R2 is the empty whitelist; this is the bad regex. Neither door validates the
-# structure (the plan says so), so the refusal, and its message, are the
-# keystore's.
+# The owner stores a condition the keystore cannot read: every run naming the
+# row is refused with a message naming the pattern, whatever the tree's other
+# branches say, and a caller naming no row is unaffected. R2 is the empty
+# whitelist; this is the bad regex — as a leaf, and under Not, where a leaf
+# that merely "denied" would ADMIT. Neither door validates the structure at
+# store time, so the refusal, and its message, are the keystore's.
 if want U12b; then
   log "U12b an AccountPattern that is not a regex"
   if ! ( set_access "$PROJECT" "$ROW" '{"AccountPattern":{"pattern":"("}}' ); then
-    fail "U12b the condition could not be stored — the plan has the contract accept it and the keystore refuse the run"
+    fail "U12b the condition could not be stored — the contract accepts any structure; the keystore is the door that refuses the run"
   else
     run_as "$PARENT" "$PARENT/$ROW"
     if [[ "$RUN_OK" == "true" ]]; then
@@ -1382,6 +1432,21 @@ if want U12b; then
     [[ "$RUN_OK" == "true" ]] \
       && pass "U12b and a caller naming no row is unaffected — one row's condition touches one row" \
       || fail "U12b an unrelated caller was refused too: $(head -c 120 <<<"$RUN_ERR")"
+    log "U12b the same pattern under Not"
+    if ! ( set_access "$PROJECT" "$ROW" '{"Not":{"condition":{"AccountPattern":{"pattern":"("}}}}' ); then
+      fail "U12b the Not shape could not be stored"
+    else
+      run_as "$PARENT" "$PARENT/$ROW"
+      if [[ "$RUN_OK" == "true" ]]; then
+        fail "U12b ADMITTED through Not over an unreadable pattern — a denying leaf, negated"
+      elif [[ "$RUN_OK" == "false" ]] && grep -qiE "regex|pattern|compiled" <<<"$RUN_ERR"; then
+        pass "U12b refused through Not, naming the pattern: $(head -c 120 <<<"$RUN_ERR")"
+      elif [[ "$RUN_OK" == "false" ]]; then
+        fail "U12b refused under Not, but not for the pattern: $(head -c 160 <<<"$RUN_ERR")"
+      else
+        fail "U12b no completion event under Not — the run hung or never landed"
+      fi
+    fi
     restore_row
   fi
 fi
@@ -1390,8 +1455,8 @@ fi
 #
 # N1/N2 are depth (Not over Not, one leaf, no chain reads). This is width: an
 # Or of 200 NearBalance leaves, each a chain read inside the keystore, with the
-# owner's own whitelist LAST so every leaf is walked before the answer. Plan
-# U8's sentence applies: no hang, no 5xx, unrelated callers unaffected.
+# owner's own whitelist LAST so every leaf is walked before the answer. The
+# same bar as U8: no hang, no 5xx, unrelated callers unaffected.
 if want N3; then
   log "N3 an Or of 200 NearBalance leaves before the owner's own name"
   N3_COND=$(jq -nc --arg p "$PARENT" \
@@ -1410,7 +1475,7 @@ if want N3; then
     elif grep -qiE "failed to send|timed out|timeout|connection" <<<"$RUN_ERR"; then
       # Not a verdict on the condition: the keystore did not answer inside the
       # worker's window, and the caller was handed an infrastructure failure.
-      # Plan U8: "no hang, no 5xx surfaced to the caller". This is the 5xx.
+      # No 5xx may surface to the caller; this is the 5xx of this door.
       fail "N3 the keystore did not answer inside the worker's window (${N3_DT}s): '$(head -c 120 <<<"$RUN_ERR")' — 200 chain-read leaves amplify one call past the timeout, and the caller gets an infrastructure failure, not a verdict"
     elif grep -qiE "denied|permission" <<<"$RUN_ERR"; then
       fail "N3 the owner was DENIED under a condition whose last branch names them (${N3_DT}s): $(head -c 160 <<<"$RUN_ERR")"
@@ -1431,9 +1496,8 @@ fi
 
 # ── H3 a stranger's row under the owner's project accessor ───────────────────
 #
-# Plan, "Holes considered": "A third party storing a row under
-# Project(victim/app) — rows are keyed by owner; the manifest reads the named
-# owner's row only; a stranger's row is never consulted". `store_secrets`
+# Rows are keyed by owner: the manifest reads the named owner's row only, and
+# a stranger's row under the same accessor is never consulted. `store_secrets`
 # checks that the project exists, never who owns it, so the stranger CAN store
 # under the owner's accessor — including the very profile the manifest names.
 if ! want H3; then
@@ -1457,39 +1521,43 @@ else
     if [[ -z "$H3_ROW" ]]; then
       fail "H3 the stranger's row never appeared on chain — nothing to test against"
     else
-      pass "H3 the contract stored a stranger's row under the owner's accessor (keyed by owner, as the plan says)"
-      run_as "$PARENT"
-      if [[ "$RUN_OK" != "true" ]]; then
-        fail "H3 the owner's own run did not complete: $(head -c 140 <<<"$RUN_ERR")"
-      elif [[ "$(secret_value AUTHOR_SECRET)" == "$H3_CANARY" ]]; then
-        fail "H3 THE STRANGER'S ROW REACHED THE GUEST as the author secret"
-      else
-        pass "H3 the author path read the owner's row, not the stranger's"
-      fi
-      run_as "$STRANGER"
-      if [[ "$RUN_OK" == "true" && "$(secret_value AUTHOR_SECRET)" == "$H3_CANARY" ]]; then
-        fail "H3 the stranger's own call received the planted row as the author secret"
-      else
-        pass "H3 and the stranger's own call gets the owner's author row too — the manifest names one owner"
-      fi
+      pass "H3 the contract stored a stranger's row under the owner's accessor (rows are keyed by owner)"
+      # Both halves need a run that COMPLETED with the author's row present: a
+      # refused run, or one with no author secret at all, would also "not
+      # carry the planted value" and say nothing about which row was read.
+      h3_run() { # h3_run <signer> <label>
+        run_as "$1"
+        if [[ "$RUN_OK" != "true" ]]; then
+          fail "H3 $2 did not complete: $(head -c 140 <<<"$RUN_ERR")"
+        elif [[ "$(secret_value AUTHOR_SECRET)" == "$H3_CANARY" ]]; then
+          fail "H3 THE STRANGER'S ROW REACHED THE GUEST as the author secret ($2)"
+        elif [[ "$(field .author)" == "true" ]]; then
+          pass "H3 $2 received the owner's author row, not the planted one"
+        else
+          fail "H3 $2 completed with NO author secret (author=$(field .author)) — neither row was read, so nothing here is a verdict"
+        fi
+      }
+      h3_run "$PARENT" "the owner's run"
+      h3_run "$STRANGER" "the stranger's own run"
     fi
-    # Leave nothing planted behind.
+    # Leave nothing planted behind. A row that stays is a fixture the next run
+    # inherits, so failing to remove it is a failure of this row.
     near --quiet contract call-function as-transaction "$CONTRACT_ID" delete_secrets \
       json-args "$(jq -nc --argjson a "$(accessor_json "$PROJECT")" '{accessor:$a, profile:"author"}')" \
       prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
       sign-as "$STRANGER" network-config "$NETWORK" sign-with-legacy-keychain send >/dev/null 2>&1 \
-      || note "H3 could not delete the stranger's planted row — remove it by hand"
+      || fail "H3 could not delete the stranger's planted row — remove it by hand"
   fi
   rm -f "$H3_ERR"
 fi
 
 # ── CLI1 / CLI2 / CLI4 the CLI's own defaults, on the chain ──────────────────
 #
-# Plan CLI1: a NEW --project row without --access defaults to
-# whitelist:<signer>. CLI2: a re-`set` without --access keeps the stored
-# condition. CLI4: `a1@<rfc3339>` becomes And[Whitelist[a1], ValidUntil] under
-# an Or with the undated names. The unit tests pin parse_access; these pin what
-# reaches the chain through the real command, key order ignored.
+# CLI1: a NEW --project row without --access defaults to whitelist:<signer>.
+# CLI2: a re-`set` without --access keeps the stored condition. CLI4:
+# `a1@<rfc3339>` becomes And[Whitelist[a1], ValidUntil] under an Or with the
+# undated names. The unit tests pin parse_access; these pin what reaches the
+# chain through the real command, key order ignored.
 if want CLI1; then
   CLI_ROW="cli-$(openssl rand -hex 3)"
   log "CLI1 secrets set with no --access on a new --project row"
@@ -1528,14 +1596,14 @@ fi
 
 # ── X1 who the on-chain door judges ──────────────────────────────────────────
 #
-# The plan defines the judged identity in one sentence (Phase 0, entry point
-# 2): `user_account_id` = the transaction's SIGNER; its "conditions judge the
-# payer" bullets both say `user_account_id`. On this door, then, the plan chose
-# the signer. A contract the owner signs ONE transaction to is the predecessor
-# when it relays `request_execution`; the row's condition is judged against the
-# owner, and `Whitelist[owner]` admits the owner's own signature. The completion
-# event does not carry the guest's bytes, but it carries the ADMISSION (a
-# refused `secrets_ref` refuses the whole run) and the sender.
+# The on-chain door judges the transaction's SIGNER: the contract puts
+# `signer_id` into the event as `sender_id`, the worker forwards it as
+# `user_account_id`, and the keystore evaluates the row's condition against
+# it. A contract the owner signs ONE transaction to is the predecessor and the
+# payer when it relays `request_execution`; the row's condition is judged
+# against the owner, and `Whitelist[owner]` admits the owner's own signature.
+# The completion event does not carry the guest's bytes, but it carries the
+# ADMISSION (a refused `secrets_ref` refuses the whole run) and the sender.
 #
 # What the deputy reaches is bounded by the accessor: the decryption accessor
 # comes from the run's `source`, so a Project row decrypts only into the
@@ -1543,9 +1611,8 @@ fi
 # input it chose and receives the output — for a mail connector, a message from
 # the owner's mailbox. It pays; it cannot make the owner pay.
 #
-# Written to the plan's sentence, so it is green while the door judges the
-# signer. Whether to keep that property is a decision on the plan; the event
-# already carries `predecessor_id`.
+# Green while the door judges the signer. The event also carries
+# `predecessor_id`, so a door that judged it too would flip this row.
 if ! want X1; then
   :
 elif [[ ! -f "$DEPUTY_WASM" ]]; then
@@ -1556,11 +1623,35 @@ else
   if ! account_exists "$DEPUTY"; then
     create_subaccount "$DEPUTY" 3 || { fail "X1 could not create $DEPUTY"; X1_DEAD=1; }
   fi
-  if [[ "${X1_DEAD:-0}" != 1 && "$(account_field "$DEPUTY" code_hash)" == "11111111111111111111111111111111" ]]; then
-    near --quiet contract deploy "$DEPUTY" use-file "$DEPUTY_WASM" \
-      with-init-call new json-args '{}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
-      network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1 \
-      || { fail "X1 the deputy did not deploy to $DEPUTY"; X1_DEAD=1; }
+  # The artefact's code hash as the chain reports it (base58 of sha256), so
+  # a deputy carrying other code is redeployed rather than trusted.
+  deputy_wasm_hash() {
+    python3 - "$DEPUTY_WASM" <<'PY'
+import hashlib, sys
+d = hashlib.sha256(open(sys.argv[1], 'rb').read()).digest()
+A = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+n = int.from_bytes(d, 'big'); s = ''
+while n:
+    n, r = divmod(n, 58); s = A[r] + s
+print('1' * (len(d) - len(d.lstrip(b'\0'))) + s)
+PY
+  }
+  # (Re)deployed whenever the code on the account is not this artefact, or
+  # its `owner` is not $PARENT. `new` is re-initialisable and takes the owner
+  # by name; it accepts only its own deploy transaction, which is signed by
+  # the deputy's key.
+  X1_WANT_HASH=$(deputy_wasm_hash)
+  if [[ ! "$X1_WANT_HASH" =~ ^[1-9A-HJ-NP-Za-km-z]{43,44}$ ]]; then
+    # Without the artefact's hash "the code differs" would be true every run
+    # and cost a deploy each time.
+    fail "X1 could not hash the deputy artefact (python3? $DEPUTY_WASM?) — got '$X1_WANT_HASH'"; X1_DEAD=1
+  fi
+  if [[ "${X1_DEAD:-0}" != 1 ]] && { [[ "$(account_field "$DEPUTY" code_hash)" != "$X1_WANT_HASH" ]] \
+       || [[ "$(near_view "$DEPUTY" owner '{}' | tr -d '"')" != "$PARENT" ]]; }; then
+    X1_DEPLOY=$(near --quiet contract deploy "$DEPUTY" use-file "$DEPUTY_WASM" \
+      with-init-call new json-args "$(jq -nc --arg o "$PARENT" '{owner:$o}')" prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
+      network-config "$NETWORK" sign-with-keychain send 2>&1) \
+      || { fail "X1 the deputy did not deploy to $DEPUTY: $(grep -viE '^\s*$' <<<"$X1_DEPLOY" | tail -3 | tr '\n' ' ' | head -c 240)"; X1_DEAD=1; }
     sleep 3
   fi
   if [[ "${X1_DEAD:-0}" != 1 ]]; then
@@ -1589,7 +1680,8 @@ else
       done
     fi
     if ! grep -q "execution_requested" <<<"$X1_LOGS"; then
-      fail "X1 the relay never reached request_execution: $(grep -iE 'error|panick|fail' <<<"$X1_OUT" | head -2 | head -c 240)"
+      # near-cli puts "Error:" on one line and the reason on the next ones.
+      fail "X1 the relay never reached request_execution: $(grep -A3 -iE 'error|panick|fail' <<<"$X1_OUT" | grep -viE '^\s*$' | head -4 | tr '\n' ' ' | head -c 300)"
     elif ! grep -q "execution_completed" <<<"$X1_LOGS"; then
       fail "X1 no completion event in ${X1_TX:-<no tx hash>} after two minutes — the run did not finish, so nothing here is a verdict"
     else
@@ -1599,18 +1691,18 @@ else
       X1_SENDER=$(jq -r '.data[0].sender_id // ""' <<<"$X1_EV" 2>/dev/null)
       note "X1 the completion event names sender_id='$X1_SENDER'; the deputy is $DEPUTY, the signer $PARENT"
       if [[ "$X1_OK" == "true" && "$X1_SENDER" == "$PARENT" ]]; then
-        pass "X1 as the plan says: judged against the signer ($PARENT), the owner's own whitelist admitted the relayed run — the deputy ($DEPUTY) drove the owner's app with the owner's credential"
+        pass "X1 judged against the signer ($PARENT): the owner's own whitelist admitted the relayed run — the deputy ($DEPUTY) drove the owner's app with the owner's credential"
       elif [[ "$X1_OK" == "true" ]]; then
-        fail "X1 the run completed but the event names sender_id='$X1_SENDER', not the signer $PARENT — the identity handed to the keystore is not the one the plan defines"
+        fail "X1 the run completed but the event names sender_id='$X1_SENDER', not the signer $PARENT — the identity handed to the keystore is not the signer"
       elif [[ "$X1_OK" == "false" ]] && grep -qiE "denied|permission|condition" <<<"$X1_ERR"; then
-        fail "X1 the relayed run was REFUSED by the condition — the door no longer judges the signer the plan names; if that is deliberate, amend the plan (Phase 0, entry point 2) and flip this row"
+        fail "X1 the relayed run was REFUSED by the condition — the door does not judge the signer alone; if that is deliberate, flip this row"
       else
         fail "X1 neither ran nor was clearly refused: success=$X1_OK err='$(head -c 200 <<<"$X1_ERR")'"
       fi
       # What came BACK. The module's answer is the yield's value; `relay`
       # returned that promise, so it is this transaction's return value — the
-      # deputy's caller sees it, and a deputy with a callback would hold it. No
-      # plan sentence covers this, so it is measured and reported, not judged.
+      # deputy's caller sees it, and a deputy with a callback would hold it. It
+      # is measured and reported, not judged.
       if [[ -n "$X1_TX" ]]; then
         X1_RET=$(curl -sS --max-time 45 "$RPC_URL" -X POST -H 'Content-Type: application/json' \
           -d "$(jq -nc --arg t "$X1_TX" --arg s "$PARENT" \
@@ -1637,7 +1729,7 @@ fi
 # and nothing here puts it back: re-binding needs the asset account and the
 # setup kit again.
 #
-# The trade-off the plan states out loud. A whitelist names an executor, not a
+# The trade-off, stated out loud. A whitelist names an executor, not a
 # binding, so tearing the binding down leaves the grant standing — the agent
 # keeps reading the secret until somebody edits the condition. That is the cost
 # of explicit grants, and the reason the dashboard lists grants per account and

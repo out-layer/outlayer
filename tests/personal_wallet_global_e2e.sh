@@ -22,7 +22,7 @@ APPLY=false
 [[ "${1:-}" == "--apply" ]] && APPLY=true
 
 NETWORK="${NETWORK:-testnet}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_URL, or a warning
 FUNDER="${FUNDER:-}"
 EXECUTOR="${EXECUTOR:-}"
 RECIPIENT="${RECIPIENT:-}"

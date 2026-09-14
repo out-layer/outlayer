@@ -48,9 +48,10 @@ The answer is always `{"success": bool, "output": {...}, "error": "...", "logs":
 | `wallet_busy` | another operation holds the wallet | poll `in_flight_request_id` if present, then retry once |
 | `Daily connector quota reached` | the wallet's daily call budget is spent (refused calls count too) | wait; the budget grows with wallet age |
 | `unknown_operation` / "does not sell operation" | the operation is not priced | read the connector's skill for the list |
-| `invalid_secrets_ref` | the `secrets_ref` names no possible row: the account id is not one, or the profile is empty or over 64 characters | fix the reference — `{"account_id": "<owner>", "profile": "<name>"}` |
+| `invalid_secrets_ref` | the `secrets_ref` names no possible row: the account id is not one, or the profile is not 1–64 bytes or holds an ASCII character other than a letter, digit, `-` or `_` | fix the reference — `{"account_id": "<owner>", "profile": "<name>"}` |
 | `Access denied by access condition` | the row exists but its condition does not admit your wallet | ask the owner to whitelist your wallet's 64-character account (`outlayer secrets access`), or name a row that does |
 | `… its time limit passed at <date>` | you WERE granted and the grant has expired | ask the owner to grant again with a later date; being named again without one does not help |
+| `… its AccountPattern \`…\` cannot be compiled as a regular expression` | the owner's condition holds a pattern the engine will not compile; the row refuses everyone, whatever its other branches say, until the owner fixes it | ask the owner to fix the pattern (`outlayer secrets access`) |
 | the venue's own text | the outside service refused | act on it; the platform did its part |
 
 ## What a call costs

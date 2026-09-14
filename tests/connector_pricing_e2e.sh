@@ -121,13 +121,14 @@ OUTLAYER_BIN="${OUTLAYER_BIN:-outlayer}"
 export OUTLAYER_NETWORK="$NETWORK"
 ONLY="${ONLY:-}"
 
-# The RPC. `.env` at the repo root carries the key-bearing URL; without it the
-# public host still works, just at a public rate limit.
+# The RPC. `.env` at the repo root may carry the key-bearing URL.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -z "${RPC_URL:-}" && -f "$SCRIPT_DIR/../.env" ]]; then
   RPC_URL=$(grep -E "^$(echo "$NETWORK" | tr '[:lower:]' '[:upper:]')_NEAR_RPC_URL=" "$SCRIPT_DIR/../.env" | cut -d= -f2-)
 fi
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+# Otherwise lib/rpc.sh builds a keyed URL from FASTNEAR_API_KEY or near-cli's
+# config, or warns and uses the unkeyed host.
+source "$SCRIPT_DIR/lib/rpc.sh"
 
 PASS=0; FAILED=0; SKIPPED=0; FAILED_NAMES=()
 log()  { printf '\n\033[36m▶ %s\033[0m\n' "$*" >&2; }

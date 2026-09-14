@@ -53,7 +53,7 @@ APPLY=false
 NETWORK="${NETWORK:-testnet}"
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 COORDINATOR_URL="${COORDINATOR_URL:-https://testnet-api.outlayer.ai}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_URL, or a warning
 PARENT="${PARENT:-}"
 
 # The daily ceiling the whole run is built around, and the two amounts that sit

@@ -2289,8 +2289,11 @@ async fn handle_execute_job(
         debug!("📄 Manifest read from the wasm's own custom section");
     }
 
-    info!("🔍 DEBUG secrets_ref: {:?}", secrets_ref);
-    info!("🔍 DEBUG keystore_client: {}", if keystore_client.is_some() { "Some" } else { "None" });
+    debug!(
+        "secrets_ref: {}; keystore: {}",
+        if secrets_ref.is_some() { "present" } else { "none" },
+        if keystore_client.is_some() { "configured" } else { "none" }
+    );
 
     // Whether this run belongs to a curated connector. Structural — decided by
     // the project's owner account on chain, which a project cannot claim about
@@ -2338,6 +2341,25 @@ async fn handle_execute_job(
     }
 
     let user_secrets = if let (Some(secrets_ref), Some(keystore)) = (secrets_ref, keystore_client) {
+        // A reference the contract could never hold is refused here, naming
+        // the rule, before any keystore round trip — the contract's own rule,
+        // mirrored with the coordinator's door in shared_tee_helpers.
+        if let Err(shape) = shared_tee_helpers::secrets_ref::well_formed_secrets_ref(&secrets_ref.profile, &secrets_ref.account_id) {
+            let msg = shape.to_string();
+            error!("❌ {}", msg);
+            report_refusal(
+                api_client,
+                near_client,
+                job,
+                request_id,
+                is_https_call,
+                call_id.map(|s| s.as_str()),
+                msg,
+                Some(api_client::JobStatus::Custom),
+            )
+            .await?;
+            return Ok(());
+        }
         info!("🔐 Decrypting secrets: profile={}, owner={}", secrets_ref.profile, secrets_ref.account_id);
 
         // The subject the keystore judges the secret's on-chain
@@ -3723,6 +3745,19 @@ async fn author_secrets_for_run(
     let Some(author) = connector_manifest::author_secrets_ref(project_id, manifest).map_err(|m| (m, JobStatus::Custom))? else {
         return Ok(agent_secrets);
     };
+    // The manifest is author-written bytes: a reference the contract could
+    // never hold is refused here, naming the rule, before it is echoed into
+    // any message or sent to the keystore — the same door a caller's
+    // `secrets_ref` goes through.
+    if let Err(shape) = shared_tee_helpers::secrets_ref::well_formed_secrets_ref(&author.profile, &author.owner) {
+        return Err((
+            format!(
+                "the manifest's author_secrets names no row the contract could hold: {}",
+                shape.sentence("author_secrets.profile", "author_secrets.owner")
+            ),
+            JobStatus::Custom,
+        ));
+    }
     let Some(keystore) = keystore_client else {
         return Err((
             "the manifest names author_secrets, but this worker has no keystore to decrypt them with".to_string(),
@@ -4578,6 +4613,14 @@ mod refusal_settlement_tests {
             rest = &rest[at + 1..];
         }
         assert_eq!(seen, 2, "both download branches are checked");
+        // A caller's secrets_ref that can match no row is refused through the
+        // path, and before the sender is even looked at.
+        assert!(after("secrets_ref::well_formed_secrets_ref(&secrets_ref.profile", 700).contains("report_refusal("));
+        let shape_check = src.find("secrets_ref::well_formed_secrets_ref(&secrets_ref.profile").expect("the caller-reference check exists");
+        let sender_check = src.find("proven_sender(user_account_id.map(").expect("the sender check exists");
+        assert!(shape_check < sender_check, "the reference's shape is judged before the sender");
+        // The author's reference from the manifest goes through the same rule.
+        assert!(after("secrets_ref::well_formed_secrets_ref(&author.profile", 500).contains("JobStatus::Custom"));
         // The secrets refusals (caller's, author's, unknown sender).
         assert!(src.matches("report_refusal(").count() >= 7, "fewer refusal sites than expected");
     }

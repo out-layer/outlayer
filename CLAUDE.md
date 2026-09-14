@@ -99,9 +99,15 @@ anyhow::bail!("Feature X is not supported. Please use Y instead.");
 Every e2e/live run — the suites' own `curl`, near-cli, and the keystore under
 test — goes through a FastNEAR RPC **with an API key**. The unkeyed testnet
 host is rate-limited and slow, and its timeouts read exactly like product
-failures. `tests/lib/hos_common.sh` builds `RPC_URL` from `FASTNEAR_API_KEY`
-(or near-cli's config) and warns when it cannot; do not run a suite past that
-warning.
+failures. Every suite that reads the chain itself builds `RPC_URL` through
+`tests/lib/rpc.sh` (directly, or via `tests/lib/hos_common.sh`): an `RPC_URL`
+in the environment wins (two suites, `contract_probe` and `connector_pricing`,
+take `.env`'s `<NET>_NEAR_RPC_URL` first); otherwise the key comes from
+`FASTNEAR_API_KEY` or near-cli's own config (macOS and XDG paths), and without
+one the suite prints `⚠ no FastNEAR API key` and runs unkeyed — do not run a
+suite past that warning. A suite that only shells out to near-cli reads
+near-cli's own `rpc_url`, the keyed URL `rpc.sh` falls back to. A new suite
+sources `lib/rpc.sh` rather than spelling an RPC host of its own.
 
 ## Commands
 ```bash

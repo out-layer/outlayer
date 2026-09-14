@@ -56,8 +56,11 @@ pub enum AccessConditionV1 {
     ///     every `*.gov.near`, which may be wider than intended.
     ///
     /// Nothing here validates the pattern: one that does not compile is stored
-    /// happily and then denies every caller, because the keystore treats a
-    /// compile error as a refusal.
+    /// happily and then denies every caller, because the keystore refuses a
+    /// condition it cannot read. What the contract does bound is how many
+    /// patterns a condition holds and their total length
+    /// (`MAX_ACCOUNT_PATTERNS`, `MAX_ACCOUNT_PATTERN_BYTES` in `secrets.rs`) —
+    /// the same numbers the keystore judges by.
     ///
     /// Example: `.*\.gov\.near` matches any `*.gov.near` account and only those.
     AccountPattern {

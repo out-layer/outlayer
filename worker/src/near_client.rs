@@ -78,7 +78,7 @@ impl NearClient {
             );
             for (j, log) in receipt_outcome.outcome.logs.iter().enumerate() {
                 let preview = if log.len() > 300 {
-                    format!("{}...", &log[..300])
+                    format!("{}...", head(log, 300))
                 } else {
                     log.clone()
                 };
@@ -91,7 +91,7 @@ impl NearClient {
 
         // Try to find "[[yNEAR charged: \"...\"]]" log (most reliable, set after refund calculation)
         for (i, log) in all_logs.iter().enumerate() {
-            info!("   Log #{}: {}", i, if log.len() > 200 { &log[..200] } else { log });
+            info!("   Log #{}: {}", i, head(log, 200));
 
             // Parse log format: [[yNEAR charged: "123456789"]] (exact final cost after refunds)
             if let Some(start) = log.find("[[yNEAR charged: \"") {
@@ -358,18 +358,11 @@ impl NearClient {
                 info!("⚠️  Payload exceeds limit ({} >= {}) but execution failed - truncating error message",
                     payload_size, PAYLOAD_LIMIT);
 
-                // Calculate how much space we have for error message
-                // Reserve space for JSON structure: {"success":false,"output":null,"error":"...","resources_used":{...}}
-                const MAX_ERROR_SIZE: usize = 512; // Conservative limit to ensure total payload < 1024
-
                 let truncated_result = if let Some(ref error_msg) = result.error {
                     if error_msg.len() > MAX_ERROR_SIZE {
-                        let truncated = format!("{}... (truncated, original size: {} bytes)",
-                            &error_msg[..MAX_ERROR_SIZE], error_msg.len());
                         info!("   Truncated error from {} to {} bytes", error_msg.len(), MAX_ERROR_SIZE);
-
                         let mut new_result = result.clone();
-                        new_result.error = Some(truncated);
+                        new_result.error = Some(truncate_error_for_chain(error_msg));
                         new_result
                     } else {
                         result.clone()
@@ -417,9 +410,7 @@ impl NearClient {
         let args_json = serde_json::to_string(&args).context("Failed to serialize args")?;
         info!("📤 resolve_execution args (1-call flow, with output): size={} bytes", args_json.len());
 
-        // Debug: print first 500 chars of args
-        let preview = if args_json.len() > 500 { &args_json[..500] } else { &args_json };
-        info!("   Args preview (first 500 chars): {}", preview);
+        info!("   Args preview (first 500 bytes): {}", head(&args_json, 500));
 
         // Send transaction
         info!("🔗 Sending resolve_execution transaction:");
@@ -1099,6 +1090,55 @@ pub enum ContractCodeSource {
         hash: String,
         build_target: Option<String>,
     },
+}
+
+/// The most of an error message that fits the 1-call flow's 1024-byte
+/// payload beside its JSON envelope.
+const MAX_ERROR_SIZE: usize = 512;
+
+/// An error message cut to fit the chain, saying it was cut. Cut on a
+/// character boundary: the text is whatever a guest or a refusal wrote,
+/// multi-byte letters included, and a byte index inside one of them is a
+/// panic — in the worker's own loop, which ends the process.
+fn truncate_error_for_chain(error_msg: &str) -> String {
+    format!(
+        "{}... (truncated, original size: {} bytes)",
+        head(error_msg, MAX_ERROR_SIZE),
+        error_msg.len()
+    )
+}
+
+/// The first `max` bytes of `s`, never cutting a character: every preview of
+/// text this worker did not write — a guest's output, a contract's log, an
+/// RPC body — goes through here rather than through `&s[..n]`.
+pub(crate) fn head(s: &str, max: usize) -> &str {
+    &s[..s.floor_char_boundary(max)]
+}
+
+#[cfg(test)]
+mod text_this_worker_did_not_write_is_cut_on_a_character_boundary {
+    use super::{head, truncate_error_for_chain, MAX_ERROR_SIZE};
+
+    #[test]
+    fn a_multibyte_error_straddling_the_limit_does_not_panic() {
+        // 600 two-byte letters: byte 512 falls inside the 257th.
+        let msg = "ж".repeat(600);
+        let cut = truncate_error_for_chain(&msg);
+        assert!(cut.ends_with("(truncated, original size: 1200 bytes)"), "{cut}");
+        assert!(cut.starts_with(&"ж".repeat(256)) && !cut.starts_with(&"ж".repeat(257)));
+        let payload = cut.len() - "... (truncated, original size: 1200 bytes)".len();
+        assert!(payload <= MAX_ERROR_SIZE);
+    }
+
+    #[test]
+    fn head_never_splits_a_character() {
+        assert_eq!(head("abc", 10), "abc");
+        assert_eq!(head("abcdef", 3), "abc");
+        assert_eq!(head("жж", 1), "");
+        assert_eq!(head("жж", 2), "ж");
+        assert_eq!(head("жж", 3), "ж");
+        assert_eq!(head("", 5), "");
+    }
 }
 
 #[cfg(test)]

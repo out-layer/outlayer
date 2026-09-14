@@ -345,8 +345,7 @@ impl RegistrationClient {
             .context("Failed to generate TDX quote for registration")?;
 
         info!("✅ Generated TDX quote (length: {} bytes)", tdx_quote_hex.len() / 2);
-        info!("   TDX quote hex (first 100 chars): {}...",
-            if tdx_quote_hex.len() > 100 { &tdx_quote_hex[..100] } else { &tdx_quote_hex });
+        info!("   TDX quote hex (first 100 chars): {}...", crate::near_client::head(&tdx_quote_hex, 100));
 
         // Check TEE measurements approval before spending gas on registration transaction
         if let Some(measurements) = crate::tdx_attestation::extract_all_measurements_from_quote_hex(&tdx_quote_hex) {

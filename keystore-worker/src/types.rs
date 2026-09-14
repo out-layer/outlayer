@@ -97,13 +97,15 @@ pub enum AccessCondition {
 }
 
 /// Nanoseconds since the epoch, by this host's clock. A clock that reads
-/// before the epoch answers `u64::MAX`, so every time limit has lapsed: a
-/// host whose time cannot be trusted admits nobody on the strength of it.
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
+/// before the epoch cannot judge a time limit, and says so as an error —
+/// which refuses at every combinator. A verdict either way would admit
+/// somebody: "lapsed" admits everyone under `Not`, "live" admits every
+/// dated grant.
+fn now_ns() -> anyhow::Result<u64> {
+    let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
-        .unwrap_or(u64::MAX)
+        .map_err(|_| anyhow::anyhow!("the host clock reads before the epoch; no time limit can be judged"))?;
+    Ok(since_epoch.as_nanos().min(u64::MAX as u128) as u64)
 }
 
 /// `ns` since the epoch as `YYYY-MM-DDTHH:MM:SSZ`, for a refusal a person reads.
@@ -168,15 +170,135 @@ pub fn iso8601_utc(ns: u64) -> String {
 /// error as denial (fail-closed); wrapping a VALID pattern can never make it
 /// invalid.
 fn compile_anchored_account_pattern(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    regex::Regex::new(&format!(r"\A(?:{})\z", pattern))
+    // Bounded: an account id is at most 64 bytes, and a pattern that needs
+    // megabytes of program to match one is not a pattern for account ids. The
+    // default limit (10 MiB per pattern) is what lets a row of a few
+    // patterns like `\pL{200}` cost a gigabyte per decrypt.
+    regex::RegexBuilder::new(&format!(r"\A(?:{})\z", pattern))
+        .size_limit(shared_tee_helpers::access_limits::REGEX_SIZE_LIMIT)
+        .dfa_size_limit(shared_tee_helpers::access_limits::REGEX_SIZE_LIMIT)
+        .build()
+}
+
+/// An `AccountPattern` the engine will not compile, found while compiling a
+/// condition's patterns before anything is evaluated. One anywhere in the
+/// tree refuses the whole condition for everyone — the owner hears which
+/// pattern, in so many bytes, and nobody is judged by a tree that cannot be
+/// read. Carried as the ERROR of [`AccessCondition::validate`], so a caller
+/// that evaluates without compiling first still cannot admit through it.
+/// The pattern and the compiler's reason are clipped: the pattern is
+/// owner-written, the reason quotes it, and the row bounds neither.
+#[derive(Debug)]
+pub struct UnreadablePattern {
+    pub pattern: String,
+    pub why: String,
+}
+
+impl UnreadablePattern {
+    const CLIP: usize = 256;
+
+    fn new(pattern: &str, error: &regex::Error) -> Self {
+        // The compiler's message quotes the whole wrapped pattern with a caret
+        // line under it; its last line is the reason ("error: unclosed group").
+        let reason = error
+            .to_string()
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches("error: ")
+            .to_string();
+        Self { pattern: clip(pattern, Self::CLIP), why: clip(&reason, Self::CLIP) }
+    }
+}
+
+impl std::fmt::Display for UnreadablePattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Access denied by access condition: its AccountPattern `{}` cannot be compiled as a regular expression ({})",
+            self.pattern, self.why
+        )
+    }
+}
+
+impl std::error::Error for UnreadablePattern {}
+
+/// The first `max` bytes of `s` on a character boundary, with an ellipsis
+/// when anything was cut.
+fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Every `AccountPattern` of one condition, compiled once, keyed by its text.
+/// Built before evaluation and handed to it, so a pattern is compiled exactly
+/// once per decrypt however many branches name it and whichever the caller
+/// reaches.
+pub struct CompiledPatterns(std::collections::HashMap<String, regex::Regex>);
+
+impl CompiledPatterns {
+    fn get(&self, pattern: &str) -> Option<&regex::Regex> {
+        self.0.get(pattern)
+    }
 }
 
 impl AccessCondition {
-    /// Validate access condition against caller account
+    /// Every pattern in this tree, compiled. The first the engine will not
+    /// compile is the error, wherever it sits: an unreadable leaf makes the
+    /// whole condition unreadable, and a condition that cannot be read
+    /// admits nobody — its owner fixes the row, and hears which pattern.
+    pub fn compile_patterns(&self) -> Result<CompiledPatterns, UnreadablePattern> {
+        let mut compiled = std::collections::HashMap::new();
+        self.collect_patterns(&mut compiled)?;
+        Ok(CompiledPatterns(compiled))
+    }
+
+    fn collect_patterns(&self, into: &mut std::collections::HashMap<String, regex::Regex>) -> Result<(), UnreadablePattern> {
+        match self {
+            AccessCondition::AccountPattern { pattern } => {
+                if !into.contains_key(pattern) {
+                    let re = compile_anchored_account_pattern(pattern).map_err(|e| UnreadablePattern::new(pattern, &e))?;
+                    into.insert(pattern.clone(), re);
+                }
+                Ok(())
+            }
+            AccessCondition::Logic { conditions, .. } => conditions.iter().try_for_each(|c| c.collect_patterns(into)),
+            AccessCondition::Not { condition } => condition.collect_patterns(into),
+            _ => Ok(()),
+        }
+    }
+
+    /// Validate access condition against caller account: compile every
+    /// pattern, then evaluate.
     ///
-    /// Returns Ok(true) if access granted, Ok(false) if denied
-    /// Returns Err if validation failed (e.g. invalid regex, RPC error)
+    /// `Ok(true)` admits, `Ok(false)` denies. `Err` means the condition could
+    /// not be evaluated — an `AccountPattern` the engine will not compile
+    /// ([`UnreadablePattern`], refused before anything is evaluated, wherever
+    /// it sits), a chain read that failed or has no client, a time limit that
+    /// is not a number — and an error refuses at every combinator: `Not`
+    /// propagates it rather than negating a guess, `And`/`Or` stop at it.
     pub async fn validate(&self, caller: &str, near_client: Option<&crate::near::NearClient>) -> anyhow::Result<bool> {
+        let patterns = self.compile_patterns().map_err(anyhow::Error::new)?;
+        self.evaluate(caller, near_client, &patterns).await
+    }
+
+    /// Evaluate against patterns already compiled by [`Self::compile_patterns`]
+    /// — the door compiles once and uses the same set for the verdict and for
+    /// the refusal's wording.
+    pub async fn evaluate(
+        &self,
+        caller: &str,
+        near_client: Option<&crate::near::NearClient>,
+        patterns: &CompiledPatterns,
+    ) -> anyhow::Result<bool> {
         match self {
             AccessCondition::AllowAll => {
                 tracing::debug!("AllowAll condition - access granted");
@@ -199,28 +321,18 @@ impl AccessCondition {
                 // which matches a substring and silently turns an exact-looking
                 // pattern into a whitelist bypass. See
                 // [`compile_anchored_account_pattern`].
-                match compile_anchored_account_pattern(pattern) {
-                    Ok(re) => {
-                        let granted = re.is_match(caller);
-                        tracing::debug!(
-                            condition = "AccountPattern",
-                            pattern = %pattern,
-                            caller = %caller,
-                            granted = %granted,
-                            "Validated account pattern"
-                        );
-                        Ok(granted)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            pattern = %pattern,
-                            error = %e,
-                            "Invalid regex pattern in AccessCondition"
-                        );
-                        // Invalid regex = deny access (fail-safe)
-                        Ok(false)
-                    }
-                }
+                let re = patterns
+                    .get(pattern)
+                    .ok_or_else(|| anyhow::anyhow!("AccountPattern was not compiled before evaluation"))?;
+                let granted = re.is_match(caller);
+                tracing::debug!(
+                    condition = "AccountPattern",
+                    pattern = %pattern,
+                    caller = %caller,
+                    granted = %granted,
+                    "Validated account pattern"
+                );
+                Ok(granted)
             }
 
             AccessCondition::Logic { operator, conditions } => {
@@ -228,7 +340,7 @@ impl AccessCondition {
                     LogicOperator::And => {
                         // All conditions must pass
                         for condition in conditions {
-                            let fut = Box::pin(condition.validate(caller, near_client));
+                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns));
                             if !fut.await? {
                                 tracing::debug!("Logic::And - condition failed");
                                 return Ok(false);
@@ -240,7 +352,7 @@ impl AccessCondition {
                     LogicOperator::Or => {
                         // At least one condition must pass
                         for condition in conditions {
-                            let fut = Box::pin(condition.validate(caller, near_client));
+                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns));
                             if fut.await? {
                                 tracing::debug!("Logic::Or - condition passed");
                                 return Ok(true);
@@ -253,7 +365,7 @@ impl AccessCondition {
             }
 
             AccessCondition::Not { condition } => {
-                let fut = Box::pin(condition.validate(caller, near_client));
+                let fut = Box::pin(condition.evaluate(caller, near_client, patterns));
                 let result = fut.await?;
                 tracing::debug!(
                     inner_result = %result,
@@ -266,10 +378,9 @@ impl AccessCondition {
             AccessCondition::NearBalance { operator, value } => {
                 let near_client = match near_client {
                     Some(client) => client,
-                    None => {
-                        tracing::warn!("NearBalance check requires NEAR client, but none provided");
-                        return Ok(false);
-                    }
+                    // Not a verdict: under `Not` a false here would ADMIT. An error
+                    // refuses at every combinator.
+                    None => anyhow::bail!("NearBalance cannot be evaluated: this keystore has no NEAR client configured"),
                 };
 
                 // Parse required balance
@@ -298,10 +409,9 @@ impl AccessCondition {
             AccessCondition::FtBalance { contract, operator, value } => {
                 let near_client = match near_client {
                     Some(client) => client,
-                    None => {
-                        tracing::warn!("FtBalance check requires NEAR client, but none provided");
-                        return Ok(false);
-                    }
+                    // Not a verdict: under `Not` a false here would ADMIT. An error
+                    // refuses at every combinator.
+                    None => anyhow::bail!("FtBalance cannot be evaluated: this keystore has no NEAR client configured"),
                 };
 
                 // Parse required balance
@@ -331,10 +441,9 @@ impl AccessCondition {
             AccessCondition::NftOwned { contract, token_id } => {
                 let near_client = match near_client {
                     Some(client) => client,
-                    None => {
-                        tracing::warn!("NftOwned check requires NEAR client, but none provided");
-                        return Ok(false);
-                    }
+                    // Not a verdict: under `Not` a false here would ADMIT. An error
+                    // refuses at every combinator.
+                    None => anyhow::bail!("NftOwned cannot be evaluated: this keystore has no NEAR client configured"),
                 };
 
                 // Check NFT ownership (specific token or any token)
@@ -355,10 +464,9 @@ impl AccessCondition {
             AccessCondition::DaoMember { dao_contract, role } => {
                 let near_client = match near_client {
                     Some(client) => client,
-                    None => {
-                        tracing::warn!("DaoMember check requires NEAR client, but none provided");
-                        return Ok(false);
-                    }
+                    // Not a verdict: under `Not` a false here would ADMIT. An error
+                    // refuses at every combinator.
+                    None => anyhow::bail!("DaoMember cannot be evaluated: this keystore has no NEAR client configured"),
                 };
 
                 // Check DAO membership for specified role
@@ -376,70 +484,127 @@ impl AccessCondition {
                 Ok(granted)
             }
 
-            AccessCondition::ValidUntil { until_ns } => Ok(Self::valid_until_at(until_ns, now_ns())),
+            AccessCondition::ValidUntil { until_ns } => Self::valid_until_at(until_ns, now_ns()?),
         }
     }
 
-    /// `ValidUntil` at a given instant. A limit that does not parse denies —
-    /// the owner wrote something the chain stored and nobody can read, and the
-    /// safe reading of that is "not yet".
-    fn valid_until_at(until_ns: &str, now: u64) -> bool {
-        match until_ns.parse::<u64>() {
-            Ok(until) => {
-                let granted = now < until;
-                tracing::debug!(condition = "ValidUntil", until_ns = %until, now_ns = %now, granted = %granted, "Validated time limit");
-                granted
+    /// `ValidUntil` at a given instant. A limit that is not a number cannot
+    /// be evaluated and is an error — under `Not` a plain "denied" would
+    /// admit. The contract stores the field as a `U64`, so the chain never
+    /// hands one over; the error is for any other caller of this type.
+    fn valid_until_at(until_ns: &str, now: u64) -> anyhow::Result<bool> {
+        let until: u64 = until_ns
+            .parse()
+            .map_err(|_| anyhow::anyhow!("ValidUntil.until_ns {until_ns:?} is not a number"))?;
+        let granted = now < until;
+        tracing::debug!(condition = "ValidUntil", until_ns = %until, now_ns = %now, granted = %granted, "Validated time limit");
+        Ok(granted)
+    }
+
+    /// The time limit that stands between THIS caller and admission, if that
+    /// is what refused them: a lapsed `ValidUntil` in a branch that names the
+    /// caller — `And[…, Whitelist[caller], …, ValidUntil]` — searched through
+    /// `Or`s, or a lapsed limit that binds everyone (top level, or beside
+    /// `AllowAll`). A hint for a person; the verdict is [`Self::validate`]'s.
+    /// A lapsed limit beside a whitelist that does not name the caller is not
+    /// their reason: re-granting the date would not admit them. Never under
+    /// `Not`, where a passed limit is what ADMITS.
+    #[cfg(test)]
+    pub(crate) fn lapsed_grant_for(&self, caller: &str, now: u64) -> Option<u64> {
+        let patterns = self.compile_patterns().ok()?;
+        self.lapsed_grant_in(caller, now, &patterns)
+    }
+
+    /// [`Self::lapsed_grant_for`] with the patterns already compiled.
+    pub fn lapsed_grant_in(&self, caller: &str, now: u64, patterns: &CompiledPatterns) -> Option<u64> {
+        match self {
+            AccessCondition::ValidUntil { .. } => self.lapsed_limit(now),
+            AccessCondition::Logic { operator: LogicOperator::Or, conditions } => {
+                // A branch that names the caller and has not lapsed means
+                // time is not what refused them, whatever another branch says.
+                if conditions.iter().any(|c| c.names_without_lapse(caller, now, patterns)) {
+                    return None;
+                }
+                conditions.iter().find_map(|c| c.lapsed_grant_in(caller, now, patterns))
             }
-            Err(_) => {
-                tracing::warn!(condition = "ValidUntil", until_ns = %until_ns, "time limit is not a number; denying");
-                false
+            AccessCondition::Logic { operator: LogicOperator::And, conditions } => {
+                // A leaf that names people and not this caller refused them by
+                // name; a date beside it is somebody else's.
+                if conditions.iter().any(|c| c.is_naming_leaf() && !c.names(caller, patterns)) {
+                    return None;
+                }
+                let names_caller = conditions.iter().any(|c| c.names(caller, patterns));
+                let lapsed_here = conditions.iter().find_map(|c| c.lapsed_limit(now));
+                match (names_caller, lapsed_here) {
+                    (true, Some(until)) => Some(until),
+                    // The caller's own dated branch may sit deeper.
+                    _ => conditions
+                        .iter()
+                        .filter(|c| matches!(c, AccessCondition::Logic { .. }))
+                        .find_map(|c| c.lapsed_grant_in(caller, now, patterns)),
+                }
             }
+            _ => None,
         }
     }
 
-    /// A time limit that has passed AND necessarily stands in the way, if any —
-    /// so a refusal can say "your grant lapsed at …" rather than only "denied".
-    /// A hint for a person; the verdict is [`Self::validate`]'s. Named only
-    /// where the lapse must be part of the reason: under `And` any lapsed leaf
-    /// denies the whole; under `Or` only when every branch carries one (a live
-    /// sibling branch means the caller was refused for something else); never
-    /// under `Not`, where a passed limit is what ADMITS.
-    pub fn lapsed_time_limit(&self, now: u64) -> Option<u64> {
+    /// A branch that names the caller and carries no lapsed limit: a leaf
+    /// that names them, or an `And` that names them beside limits still live.
+    fn names_without_lapse(&self, caller: &str, now: u64, patterns: &CompiledPatterns) -> bool {
+        match self {
+            AccessCondition::Logic { operator: LogicOperator::And, conditions } => {
+                conditions.iter().any(|c| c.names(caller, patterns))
+                    && !conditions.iter().any(|c| c.is_naming_leaf() && !c.names(caller, patterns))
+                    && conditions.iter().all(|c| c.lapsed_limit(now).is_none())
+            }
+            _ => self.names(caller, patterns),
+        }
+    }
+
+    /// A leaf whose whole job is to say WHO — or the negation of one.
+    fn is_naming_leaf(&self) -> bool {
+        match self {
+            AccessCondition::AllowAll | AccessCondition::Whitelist { .. } | AccessCondition::AccountPattern { .. } => true,
+            AccessCondition::Not { condition } => condition.is_naming_leaf(),
+            _ => false,
+        }
+    }
+
+    /// This leaf, lapsed at `now`.
+    fn lapsed_limit(&self, now: u64) -> Option<u64> {
         match self {
             AccessCondition::ValidUntil { until_ns } => until_ns.parse::<u64>().ok().filter(|until| *until <= now),
-            AccessCondition::Logic { operator: LogicOperator::And, conditions } => {
-                conditions.iter().find_map(|c| c.lapsed_time_limit(now))
-            }
-            AccessCondition::Logic { operator: LogicOperator::Or, conditions } => {
-                let lapsed: Vec<u64> = conditions.iter().filter_map(|c| c.lapsed_time_limit(now)).collect();
-                (!conditions.is_empty() && lapsed.len() == conditions.len()).then(|| lapsed[0])
-            }
             _ => None,
         }
     }
 
-    /// What a refused caller is told. Names a lapsed time limit when there is
-    /// one, because that is the one refusal the owner fixes by re-granting
-    /// rather than the caller by asking.
-    /// The first `AccountPattern` in this tree that is not a valid regular
-    /// expression, with the compiler's reason — `None` when every pattern
-    /// compiles. Any position counts: a leaf that cannot be evaluated makes
-    /// the whole condition unreadable, and an unreadable condition refuses the
-    /// owner's own runs rather than being guessed at. Under `Not` the guess
-    /// would ADMIT — a denying leaf negated — which is the wrong side to err on.
-    pub fn unparseable_pattern(&self) -> Option<(String, String)> {
+    /// Whether this leaf admits the caller BY NAME — the half of a dated grant
+    /// that says whose grant it is.
+    fn names(&self, caller: &str, patterns: &CompiledPatterns) -> bool {
         match self {
-            AccessCondition::AccountPattern { pattern } => compile_anchored_account_pattern(pattern)
-                .err()
-                .map(|e| (pattern.clone(), e.to_string())),
-            AccessCondition::Logic { conditions, .. } => conditions.iter().find_map(|c| c.unparseable_pattern()),
-            AccessCondition::Not { condition } => condition.unparseable_pattern(),
-            _ => None,
+            AccessCondition::AllowAll => true,
+            AccessCondition::Whitelist { accounts } => accounts.iter().any(|a| a == caller),
+            AccessCondition::AccountPattern { pattern } => patterns.get(pattern).map(|re| re.is_match(caller)).unwrap_or(false),
+            // "Everyone but bob" names alice.
+            AccessCondition::Not { condition } if condition.is_naming_leaf() => !condition.names(caller, patterns),
+            _ => false,
         }
     }
 
-    pub fn denial_message(&self) -> String {
-        match self.lapsed_time_limit(now_ns()) {
+    /// What a refused caller is told. Names the caller's own lapsed time
+    /// limit when that is what refused them, because that is the one refusal
+    /// the owner fixes by re-granting rather than the caller by asking.
+    #[cfg(test)]
+    pub(crate) fn denial_message_for(&self, caller: &str) -> String {
+        match self.compile_patterns() {
+            Ok(patterns) => self.denial_message_in(caller, &patterns),
+            Err(_) => "Access denied by access condition".to_string(),
+        }
+    }
+
+    /// [`Self::denial_message_for`] with the patterns already compiled.
+    pub fn denial_message_in(&self, caller: &str, patterns: &CompiledPatterns) -> String {
+        match now_ns().ok().and_then(|now| self.lapsed_grant_in(caller, now, patterns)) {
             Some(until) => format!(
                 "Access denied by access condition: its time limit passed at {}",
                 iso8601_utc(until)
@@ -468,16 +633,17 @@ mod tests {
     const T: u64 = 1_760_000_000_000_000_000; // 2025-10-09T08:53:20Z
 
     /// A time limit admits strictly before its instant and denies from it on;
-    /// one that does not parse denies rather than erroring.
+    /// one that is not a number cannot be evaluated and is an error — a plain
+    /// denial would admit under `Not`.
     #[test]
     fn a_time_limit_admits_before_and_denies_from_its_instant() {
         let until = T.to_string();
-        assert!(AccessCondition::valid_until_at(&until, T - 1));
-        assert!(!AccessCondition::valid_until_at(&until, T));
-        assert!(!AccessCondition::valid_until_at(&until, T + 1));
-        assert!(!AccessCondition::valid_until_at("soon", T - 1), "unparseable denies");
-        assert!(!AccessCondition::valid_until_at("", T - 1));
-        assert!(!AccessCondition::valid_until_at(&until, u64::MAX), "an untrusted clock (now_ns's fallback) denies");
+        assert!(AccessCondition::valid_until_at(&until, T - 1).unwrap());
+        assert!(!AccessCondition::valid_until_at(&until, T).unwrap());
+        assert!(!AccessCondition::valid_until_at(&until, T + 1).unwrap());
+        assert!(AccessCondition::valid_until_at("soon", T - 1).is_err(), "not a number: an error, not a verdict");
+        assert!(AccessCondition::valid_until_at("", T - 1).is_err());
+        assert!(!AccessCondition::valid_until_at(&until, u64::MAX).unwrap(), "at the end of time every limit has lapsed");
     }
 
     /// The contract writes `U64` as a decimal string; that is the shape read here.
@@ -492,7 +658,7 @@ mod tests {
     /// turns it into "valid after".
     #[tokio::test]
     async fn a_grant_with_a_time_limit_composes_with_a_whitelist() {
-        let far = (now_ns() + 3_600_000_000_000).to_string();
+        let far = (now_ns().unwrap() + 3_600_000_000_000).to_string();
         let past = "1".to_string();
         let grant = |until: &str| AccessCondition::Logic {
             operator: LogicOperator::And,
@@ -510,53 +676,123 @@ mod tests {
         assert!(after.validate("anyone.near", None).await.unwrap(), "Not over ValidUntil is valid-after");
     }
 
-    /// The refusal names a lapsed limit wherever it sits in the tree, and says
-    /// nothing about time when none has lapsed.
+    /// The refusal names a lapsed limit when it is THE CALLER's — the dated
+    /// branch that names them — and says nothing about time otherwise: not
+    /// for a caller another branch refused, not for a lapse in somebody
+    /// else's grant, never under Not.
     #[test]
-    fn a_lapsed_limit_is_found_in_the_tree_and_named() {
-        let nested = AccessCondition::Logic {
-            operator: LogicOperator::Or,
-            conditions: vec![
-                AccessCondition::Whitelist { accounts: vec![] },
-                AccessCondition::Logic {
-                    operator: LogicOperator::And,
-                    conditions: vec![
-                        AccessCondition::Whitelist { accounts: vec!["a.near".into()] },
-                        AccessCondition::ValidUntil { until_ns: T.to_string() },
-                    ],
-                },
-            ],
+    fn a_lapsed_limit_is_named_to_the_caller_it_bound() {
+        let wl = |a: &str| AccessCondition::Whitelist { accounts: vec![a.to_string()] };
+        let dated = |a: &str, until: u64| AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![wl(a), AccessCondition::ValidUntil { until_ns: until.to_string() }],
         };
-        // The other Or branch (an empty whitelist) carries no limit, so a caller
-        // refused here was refused for not being on it — the lapse is not named.
-        assert_eq!(nested.lapsed_time_limit(T + 5), None, "a live sibling branch means time was not the reason");
-        assert_eq!(nested.lapsed_time_limit(T - 5), None, "a live limit is not lapsed");
-        let and_only = AccessCondition::Logic {
+        // The shape every interface writes: the owner for ever, agents until a date.
+        let grants = AccessCondition::Logic {
+            operator: LogicOperator::Or,
+            conditions: vec![wl("owner.near"), dated("agent.near", T), dated("other.near", T + 100)],
+        };
+        assert_eq!(grants.lapsed_grant_for("agent.near", T + 5), Some(T), "the agent's own grant lapsed");
+        assert_eq!(grants.lapsed_grant_for("agent.near", T - 5), None, "a live limit is not lapsed");
+        assert_eq!(grants.lapsed_grant_for("other.near", T + 5), None, "the other agent's grant is live");
+        assert_eq!(grants.lapsed_grant_for("stranger.near", T + 5), None, "a stranger was refused for not being named, not for time");
+        // A lapsed date beside somebody ELSE's name is not this caller's reason.
+        assert_eq!(dated("bob.near", T).lapsed_grant_for("alice.near", T + 5), None);
+        assert_eq!(dated("bob.near", T).lapsed_grant_for("bob.near", T + 5), Some(T));
+        // A limit that binds everyone binds the caller.
+        assert_eq!(AccessCondition::ValidUntil { until_ns: T.to_string() }.lapsed_grant_for("anyone.near", T), Some(T));
+        let everyone_until = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![AccessCondition::AllowAll, AccessCondition::ValidUntil { until_ns: T.to_string() }],
+        };
+        assert_eq!(everyone_until.lapsed_grant_for("anyone.near", T + 1), Some(T));
+        // A pattern names whoever it matches.
+        let by_pattern = AccessCondition::Logic {
             operator: LogicOperator::And,
             conditions: vec![
-                AccessCondition::Whitelist { accounts: vec!["a.near".into()] },
+                AccessCondition::AccountPattern { pattern: r".*\.agents\.near".to_string() },
                 AccessCondition::ValidUntil { until_ns: T.to_string() },
             ],
         };
-        assert_eq!(and_only.lapsed_time_limit(T + 5), Some(T), "under And a lapsed leaf is the reason");
-        let all_lapsed = AccessCondition::Logic {
-            operator: LogicOperator::Or,
-            conditions: vec![and_only.clone(), AccessCondition::ValidUntil { until_ns: (T - 1).to_string() }],
+        assert_eq!(by_pattern.lapsed_grant_for("x.agents.near", T + 1), Some(T));
+        assert_eq!(by_pattern.lapsed_grant_for("x.near", T + 1), None);
+        // The caller's dated branch may sit under an outer And.
+        let deeper = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![AccessCondition::AllowAll, grants.clone()],
         };
-        assert_eq!(all_lapsed.lapsed_time_limit(T + 5), Some(T), "every Or branch lapsed: time is the reason");
+        assert_eq!(deeper.lapsed_grant_for("agent.near", T + 5), Some(T));
+        // A live branch that names the caller means time did not refuse them,
+        // whatever a lapsed sibling says: the agent re-granted until T2 is
+        // refused by the outer gate, not by the lapsed T1 grant.
+        let regranted = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![
+                AccessCondition::NearBalance { operator: ComparisonOperator::Gte, value: "1".into() },
+                AccessCondition::Logic {
+                    operator: LogicOperator::Or,
+                    conditions: vec![wl("owner.near"), dated("agent.near", T), dated("agent.near", T + 100)],
+                },
+            ],
+        };
+        assert_eq!(regranted.lapsed_grant_for("agent.near", T + 5), None, "the T2 grant is live");
+        let lapsed_beside_a_name = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![
+                AccessCondition::NearBalance { operator: ComparisonOperator::Gte, value: "1".into() },
+                AccessCondition::Logic {
+                    operator: LogicOperator::Or,
+                    conditions: vec![AccessCondition::ValidUntil { until_ns: T.to_string() }, wl("alice.near")],
+                },
+            ],
+        };
+        assert_eq!(lapsed_beside_a_name.lapsed_grant_for("alice.near", T + 5), None, "the Or admits alice by name");
+        // A name that is not the caller's, beside a nested lapsed limit, is a
+        // refusal by name.
+        let bobs = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![
+                wl("bob.near"),
+                AccessCondition::Logic { operator: LogicOperator::Or, conditions: vec![AccessCondition::ValidUntil { until_ns: T.to_string() }] },
+            ],
+        };
+        assert_eq!(bobs.lapsed_grant_for("alice.near", T + 5), None);
+        assert_eq!(bobs.lapsed_grant_for("bob.near", T + 5), Some(T), "bob's own grant, lapsed");
+        // The negation of a name is a name: "everyone but bob, until T" binds
+        // alice, and a branch that excludes alice by name is not her live grant.
+        let not_wl = |a: &str| AccessCondition::Not { condition: Box::new(wl(a)) };
+        let everyone_but_bob = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![AccessCondition::ValidUntil { until_ns: T.to_string() }, not_wl("bob.near")],
+        };
+        assert_eq!(everyone_but_bob.lapsed_grant_for("alice.near", T + 5), Some(T));
+        assert_eq!(everyone_but_bob.lapsed_grant_for("bob.near", T + 5), None, "bob is refused by name");
+        let excluded_then_dated = AccessCondition::Logic {
+            operator: LogicOperator::Or,
+            conditions: vec![
+                AccessCondition::Logic { operator: LogicOperator::And, conditions: vec![AccessCondition::AllowAll, not_wl("alice.near")] },
+                dated("alice.near", T),
+            ],
+        };
+        assert_eq!(excluded_then_dated.lapsed_grant_for("alice.near", T + 5), Some(T), "her own dated grant lapsed");
+        let self_contradictory = AccessCondition::Logic {
+            operator: LogicOperator::And,
+            conditions: vec![wl("alice.near"), AccessCondition::ValidUntil { until_ns: T.to_string() }, not_wl("alice.near")],
+        };
+        assert_eq!(self_contradictory.lapsed_grant_for("alice.near", T + 5), None, "re-granting the date would not admit her");
         let valid_after = AccessCondition::Not {
             condition: Box::new(AccessCondition::ValidUntil { until_ns: "1".to_string() }),
         };
-        assert_eq!(valid_after.lapsed_time_limit(T), None, "under Not a passed limit admits");
-        assert_eq!(AccessCondition::AllowAll.lapsed_time_limit(T), None);
-        let lapsed = AccessCondition::ValidUntil { until_ns: "1".to_string() };
+        assert_eq!(valid_after.lapsed_grant_for("anyone.near", T), None, "under Not a passed limit admits");
+        assert_eq!(AccessCondition::AllowAll.lapsed_grant_for("anyone.near", T), None);
         assert_eq!(
-            lapsed.denial_message(),
+            AccessCondition::ValidUntil { until_ns: "1".to_string() }.denial_message_for("anyone.near"),
             "Access denied by access condition: its time limit passed at 1970-01-01T00:00:00Z"
         );
         assert_eq!(
-            AccessCondition::Whitelist { accounts: vec![] }.denial_message(),
-            "Access denied by access condition"
+            dated("bob.near", 1).denial_message_for("alice.near"),
+            "Access denied by access condition",
+            "alice is told nothing about bob's date"
         );
     }
 
@@ -664,9 +900,10 @@ mod tests {
         let condition = AccessCondition::AccountPattern { pattern: "a)(b".to_string() };
         assert!(condition.validate("ab", None).await.unwrap());
         assert!(!condition.validate("xabx", None).await.unwrap());
-        // A pattern that unbalances the wrapper is invalid → fail-closed deny.
+        // A pattern that unbalances the wrapper cannot be compiled: an error,
+        // which refuses at every combinator, never a verdict.
         let broken = AccessCondition::AccountPattern { pattern: ")".to_string() };
-        assert!(!broken.validate("anything.near", None).await.unwrap());
+        assert!(broken.validate("anything.near", None).await.is_err());
     }
 
     #[tokio::test]
@@ -689,8 +926,10 @@ mod tests {
         let condition = AccessCondition::AccountPattern {
             pattern: "[invalid".to_string(), // unclosed bracket
         };
-        // Invalid regex should deny access
-        assert!(!condition.validate("alice.near", None).await.unwrap());
+        // An unreadable pattern is an error naming itself, not a denial.
+        let err = condition.validate("alice.near", None).await.expect_err("cannot be evaluated");
+        let unreadable = err.downcast_ref::<UnreadablePattern>().expect("typed, so the door can name it");
+        assert_eq!(unreadable.pattern, "[invalid");
     }
 
     #[tokio::test]
@@ -781,55 +1020,121 @@ mod near_sdk_format_tests {
 
 
 #[cfg(test)]
-mod an_unreadable_condition_refuses_wherever_it_sits {
-    //! Plan U12b: a malformed condition (a bad regex) refuses that owner's own
-    //! runs with a parse message. The parse check runs before evaluation
-    //! because evaluation alone gets one placement wrong: a bad pattern denies
-    //! as a leaf, and `Not` over a denying leaf ADMITS.
+mod a_condition_that_cannot_be_read_refuses_wherever_the_unreadable_leaf_sits {
+    //! A pattern the engine will not compile is an ERROR of `validate`, raised
+    //! while the tree's patterns are compiled — before any combinator runs, so
+    //! `Not` never sees a refused leaf to negate — and the door names the
+    //! pattern to the owner.
     use super::*;
 
     fn bad() -> AccessCondition {
         AccessCondition::AccountPattern { pattern: "(".to_string() }
     }
-    fn run<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    fn whitelist(a: &str) -> AccessCondition {
+        AccessCondition::Whitelist { accounts: vec![a.to_string()] }
     }
 
-    #[test]
-    fn a_bad_pattern_is_found_and_named() {
-        let (pattern, why) = bad().unparseable_pattern().expect("found");
-        assert_eq!(pattern, "(");
-        assert!(!why.is_empty(), "the compiler's reason travels with it");
+    #[tokio::test]
+    async fn a_bad_leaf_is_an_error_that_names_the_pattern() {
+        let err = bad().validate("anyone.near", None).await.expect_err("cannot be evaluated");
+        let u = err.downcast_ref::<UnreadablePattern>().expect("typed");
+        assert_eq!(u.pattern, "(");
+        assert!(!u.why.is_empty(), "the compiler's reason travels with it");
+        assert!(!u.why.contains('\n') && !u.why.contains("\\A"), "one line, the owner's pattern only: {}", u.why);
+        let shown = u.to_string();
+        assert!(shown.contains("AccountPattern `(`") && shown.contains("cannot be compiled"), "{shown}");
     }
 
-    #[test]
-    fn a_valid_pattern_is_not_reported() {
-        let ok = AccessCondition::AccountPattern { pattern: ".*\\.near".to_string() };
-        assert!(ok.unparseable_pattern().is_none());
-        assert!(AccessCondition::AllowAll.unparseable_pattern().is_none());
-    }
-
-    #[test]
-    fn found_under_and_or_and_not() {
-        let under_and = AccessCondition::Logic {
-            operator: LogicOperator::And,
-            conditions: vec![AccessCondition::AllowAll, bad()],
-        };
-        let under_or = AccessCondition::Logic {
-            operator: LogicOperator::Or,
-            conditions: vec![AccessCondition::AllowAll, bad()],
-        };
-        let under_not = AccessCondition::Not { condition: Box::new(bad()) };
-        for c in [under_and, under_or, under_not] {
-            assert_eq!(c.unparseable_pattern().map(|(p, _)| p).as_deref(), Some("("));
+    #[tokio::test]
+    async fn under_not_and_or_the_tree_is_refused_before_evaluation() {
+        let shapes = [
+            AccessCondition::Not { condition: Box::new(bad()) },
+            AccessCondition::Logic { operator: LogicOperator::And, conditions: vec![AccessCondition::AllowAll, bad()] },
+            AccessCondition::Logic { operator: LogicOperator::Or, conditions: vec![whitelist("bob.near"), bad()] },
+            AccessCondition::Not { condition: Box::new(AccessCondition::Logic { operator: LogicOperator::Or, conditions: vec![bad()] }) },
+        ];
+        for c in shapes {
+            let err = c.validate("anyone.near", None).await.expect_err("an unreadable leaf refuses the tree");
+            assert!(err.downcast_ref::<UnreadablePattern>().is_some(), "still the typed error after propagation: {err}");
         }
     }
 
+    #[tokio::test]
+    async fn an_unreadable_leaf_anywhere_refuses_everyone_before_anything_is_evaluated() {
+        // Even a branch that would decide the verdict on its own does not
+        // save the condition: nobody is judged by a tree that cannot be read,
+        // and the owner hears which pattern, whoever knocked.
+        let or = AccessCondition::Logic { operator: LogicOperator::Or, conditions: vec![AccessCondition::AllowAll, bad()] };
+        let err = or.validate("anyone.near", None).await.expect_err("AllowAll beside an unreadable leaf still refuses");
+        assert!(err.downcast_ref::<UnreadablePattern>().is_some(), "{err}");
+        let and = AccessCondition::Logic { operator: LogicOperator::And, conditions: vec![whitelist("bob.near"), bad()] };
+        assert!(and.validate("alice.near", None).await.is_err(), "alice is not told 'denied' — the row is unreadable");
+        assert!(and.validate("bob.near", None).await.is_err());
+        assert!(or.compile_patterns().is_err() && and.compile_patterns().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pattern_is_compiled_once_however_many_branches_name_it() {
+        let p = || AccessCondition::AccountPattern { pattern: r".*\.near".to_string() };
+        let tree = AccessCondition::Logic {
+            operator: LogicOperator::Or,
+            conditions: vec![p(), AccessCondition::Not { condition: Box::new(p()) }, AccessCondition::Logic { operator: LogicOperator::And, conditions: vec![p(), p()] }],
+        };
+        let compiled = tree.compile_patterns().unwrap();
+        assert_eq!(compiled.0.len(), 1, "one text, one regex");
+        assert!(tree.evaluate("alice.near", None, &compiled).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_valid_pattern_is_evaluated_not_reported() {
+        let ok = AccessCondition::AccountPattern { pattern: ".*\\.near".to_string() };
+        assert!(ok.validate("alice.near", None).await.unwrap());
+        assert!(!ok.validate("alice.testnet", None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_message_is_bounded_whatever_the_owner_wrote() {
+        let huge = AccessCondition::AccountPattern { pattern: "(".repeat(100_000) };
+        let err = huge.validate("anyone.near", None).await.expect_err("unclosed groups");
+        let shown = err.downcast_ref::<UnreadablePattern>().unwrap().to_string();
+        assert!(shown.len() < 2 * UnreadablePattern::CLIP + 200, "{} bytes", shown.len());
+        assert!(shown.contains('…'), "clipped, and says so");
+    }
+
+    #[tokio::test]
+    async fn a_pattern_too_large_to_compile_is_reported_as_such() {
+        let big = AccessCondition::AccountPattern { pattern: r"\pL{2000}".to_string() };
+        let err = big.validate("anyone.near", None).await.expect_err("exceeds the size limit");
+        let u = err.downcast_ref::<UnreadablePattern>().unwrap();
+        assert!(u.why.to_lowercase().contains("size limit"), "{}", u.why);
+    }
+
+    #[tokio::test]
+    async fn a_pattern_that_needs_megabytes_to_match_an_account_id_is_refused_and_a_real_one_is_not() {
+        // `\pL{200}` compiles to ~10 MB under the regex crate's default limit
+        // — one such leaf per row was a gigabyte of keystore memory across a
+        // few decrypts. Under the account-id-sized limit it does not compile
+        // at all; the shapes an owner actually writes do.
+        let heavy = AccessCondition::AccountPattern { pattern: r"\pL{200}".to_string() };
+        assert!(heavy.compile_patterns().is_err(), "a 10 MB program for a 64-byte id is refused");
+        for real in [r".*\.near", r"[a-z0-9-]{2,64}\.agents\.near", r"(alice|bob)\.near", &"a".repeat(64)] {
+            let ok = AccessCondition::AccountPattern { pattern: real.to_string() };
+            assert!(ok.compile_patterns().is_ok(), "{real}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chain_read_with_no_client_is_an_error_not_a_verdict() {
+        let balance = AccessCondition::NearBalance { operator: ComparisonOperator::Gte, value: "1".to_string() };
+        assert!(balance.validate("anyone.near", None).await.is_err());
+        let negated = AccessCondition::Not { condition: Box::new(balance) };
+        assert!(negated.validate("anyone.near", None).await.is_err(), "Not over an unevaluable leaf admits nobody");
+    }
+
     #[test]
-    fn evaluated_alone_a_bad_pattern_under_not_would_admit_everyone() {
-        // The reason the parse check exists: this is what `validate` says.
-        let under_not = AccessCondition::Not { condition: Box::new(bad()) };
-        let admitted = run(under_not.validate("anyone.near", None)).expect("validate answers");
-        assert!(admitted, "a denying leaf negated admits — so the door must refuse before evaluating");
+    fn clip_cuts_on_a_character_boundary() {
+        assert_eq!(clip("abc", 3), "abc");
+        assert_eq!(clip("abcd", 3), "abc…");
+        assert_eq!(clip("жжж", 3), "ж…");
     }
 }

@@ -259,8 +259,7 @@ impl TdxClient {
             .context("Failed to call dstack-sdk get_quote")?;
 
         tracing::info!("✅ Received TDX quote from dstack-sdk");
-        tracing::debug!("   quote (hex, first 100 chars): {}",
-            if response.quote.len() > 100 { &response.quote[..100] } else { &response.quote });
+        tracing::debug!("   quote (hex, first 100 chars): {}", crate::near_client::head(&response.quote, 100));
 
         // Decode HEX quote to bytes (dstack-sdk returns HEX string, not base64)
         let tdx_quote = hex::decode(&response.quote)

@@ -59,6 +59,11 @@ near call outlayer.testnet request_execution '{
 }' --accountId user.testnet --deposit 0.1
 ```
 
+`secrets_ref.profile` is checked at the door with the rule `store_secrets`
+applies to a profile name — 1–64 bytes of letters, digits, `-` or `_` — and a
+reference no row could match is refused before the request yields, naming
+that rule.
+
 #### `cancel_stale_execution`
 Cancel execution request after timeout (10 minutes).
 
@@ -176,7 +181,9 @@ near view outlayer.testnet get_config '{}'
 ### Secrets Management Functions
 
 #### `store_secrets`
-Store encrypted secrets for a repository.
+Store encrypted secrets for a repository. `profile` names the row: 1–64 bytes
+of letters, digits, `-` or `_`. The same rule refuses, at `request_execution`,
+a `secrets_ref` no row could match.
 
 **Important:** Always estimate storage cost first using `estimate_storage_cost` to attach the correct deposit.
 
@@ -283,9 +290,10 @@ near call outlayer.testnet update_access '{
 
 #### Access conditions
 `access` (on `store_secrets` and `update_access`) is an `AccessCondition`, evaluated
-by the keystore inside the TEE against the account that pays for the run (the
-transaction's signer, or a payment key's owner) — never against a name the call
-claims. Variants: `"AllowAll"`; `{"Whitelist": {"accounts": [...]}}` (exact match);
+by the keystore inside the TEE against the account the run is attributed to — the
+transaction's SIGNER on chain (a contract that relays `request_execution` is the
+predecessor and pays, but the signer is the one judged), a payment key's owner over
+HTTPS — never against a name the call claims. Variants: `"AllowAll"`; `{"Whitelist": {"accounts": [...]}}` (exact match);
 `{"AccountPattern": {"pattern": "..."}}` (a regex anchored to the whole id);
 `{"NearBalance": {"operator": "Gte", "value": "<yocto>"}}`; `{"FtBalance": {"contract",
 "operator", "value"}}`; `{"NftOwned": {"contract", "token_id"}}`; `{"DaoMember":
