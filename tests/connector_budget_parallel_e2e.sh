@@ -29,6 +29,14 @@
 #   GMAIL_TEST_TO      for G1: an address the owner's policy allows — it WILL
 #                      receive up to `max_per_day` real messages
 #
+# What this costs in QUOTA, which decides whose key can run it. Every call
+# here is a connector call, free or not, and the daily quota is counted per
+# (wallet, connector) on a ladder of the CALLER'S AGE — for an ordinary payment
+# key, the age of its owner's oldest key. At the defaults this makes about
+# `N + CAP + 6` calls, roughly nineteen, while a wallet minted today carries the
+# floor of ten. On such a wallet the suite cannot finish, and B2 says which
+# calls the quota took rather than blaming the counter.
+#
 # Run (dry-run prints the plan; --apply spends a little compute):
 #   PAYMENT_KEY=… ./tests/connector_budget_parallel_e2e.sh --apply
 
@@ -95,7 +103,16 @@ counter() {  # counter <run-id>  → the count on stdout, diagnostics on stderr
     out="$(probe "{\"operation\":\"budget\",\"mode\":\"read\",\"run\":\"$run\"}")"
     value="$(field "$out" 'o["count"]')"
     case "$value" in
-      ''|'<not json>'|'<missing>') sleep 3 ;;
+      ''|'<not json>'|'<missing>')
+        # A retry is for a TRANSIENT refusal. The daily quota is not one: it
+        # will refuse every attempt for the rest of the day and each attempt
+        # spends another tick of the window it is complaining about.
+        if [[ "$out" == *connector_quota_exceeded* ]]; then
+          printf '%s' "unread"
+          echo "        the counter cannot be read: this key's daily connector quota is spent — $(sed -n 's/.*"error":"\([^"]*\)".*/\1/p' <<<"$out" | head -c 120)" >&2
+          return 0
+        fi
+        sleep 3 ;;
       *) printf '%s' "$value"; return 0 ;;
     esac
   done
@@ -126,7 +143,7 @@ else
     probe "{\"operation\":\"budget\",\"mode\":\"reserve\",\"cap\":$CAP,\"run\":\"$RUN\"}" > "$WORK/b2.$i" &
   done
   wait
-  admitted=0; refused=0; contended=0; broken=0
+  admitted=0; refused=0; contended=0; broken=0; quota=0
   for i in $(seq 1 "$N"); do
     body="$(cat "$WORK/b2.$i")"
     case "$(field "$body" 'o["admitted"]')" in
@@ -137,10 +154,23 @@ else
         else
           refused=$((refused + 1))
         fi ;;
-      *) broken=$((broken + 1)); echo "        unreadable answer: ${body:0:200}" ;;
+      # The DAILY QUOTA answers before the module runs, so its refusal is the
+      # coordinator's JSON and not the module's — it has no `admitted` field and
+      # would otherwise be counted as an unreadable answer, failing the run with
+      # a message about the wrong thing. It is its own case because it means
+      # this run cannot be judged at all: the calls that were refused for the
+      # day never reached the counter under test.
+      *) if [[ "$body" == *connector_quota_exceeded* ]]; then
+           quota=$((quota + 1))
+         else
+           broken=$((broken + 1)); echo "        unreadable answer: ${body:0:200}"
+         fi ;;
     esac
   done
-  echo "        admitted=$admitted refused-by-cap=$refused refused-by-contention=$contended unreadable=$broken"
+  echo "        admitted=$admitted refused-by-cap=$refused refused-by-contention=$contended quota=$quota unreadable=$broken"
+  if [[ "$quota" -gt 0 ]]; then
+    fail "$quota of $N calls were refused by this key's DAILY CONNECTOR QUOTA, not by the cap — the counter under test never saw them. Use a key whose age tier has room (the quota is per wallet+connector and grows with the caller's age), or lower N."
+  fi
   [[ "$broken" -eq 0 ]] && pass "every call answered" || fail "$broken calls gave no readable answer"
   [[ "$admitted" -le "$CAP" ]] && pass "no more than the cap got through ($admitted ≤ $CAP)" \
                                  || fail "THE CAP WAS PASSED: $admitted admitted against $CAP"

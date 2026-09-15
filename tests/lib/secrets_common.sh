@@ -78,6 +78,12 @@ if [[ ( -z "${OUTLAYER_BIN:-}" || "${OUTLAYER_BIN:-}" == "outlayer" ) && -x "$OU
 fi
 OUTLAYER_BIN="${OUTLAYER_BIN:-outlayer}"
 OUTLAYER_BIN_PATH="$(command -v "$OUTLAYER_BIN" 2>/dev/null || echo "$OUTLAYER_BIN")"
+# The CLI reaches the chain itself, and its built-in endpoint is the FREE one.
+# That host is rate-limited, and a request it drops surfaces as
+# "error while sending payload" from inside `secrets set` — indistinguishable
+# from the product refusing. Hand the CLI the keyed endpoint this suite already
+# built (`lib/rpc.sh`), and never read the variable back: it carries the key.
+[[ -n "${RPC_URL:-}" ]] && export OUTLAYER_RPC_URL="${OUTLAYER_RPC_URL:-$RPC_URL}"
 # Counted, not `grep -q`: under `pipefail` a quiet grep exits at the first
 # match, `strings` dies of SIGPIPE, and the pipeline's 141 reads as "the symbol
 # is missing" — condemning the very binary that carries it.

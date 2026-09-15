@@ -35,6 +35,7 @@ You are a world-class expert. Apply these consistently across the session.
 
 ### NEVER Do
 - **Deployment**: Don't restart coordinator, deploy contract, or manage docker - human handles this
+- **Verifying a deployment**: when the human says he deployed the contract, restarted the keystore or the coordinator, or updated a component, that is a FACT - go straight to the work. No code-hash comparison, no `/health` version probe, no `git_sha` check. Verify a version only when a test fails in a way a stale build would explain, or when asked
 - **Summary files**: Don't create DOCUMENTATION_UPDATE_*.md, *_SUMMARY.md, CHANGES.md - human doesn't read them
 - **MVP/TODO code**: This is PRODUCTION. Don't leave TODO comments - implement features completely or ask human first. No "for MVP" placeholders
 - **Stub implementations**: Never return `vec![]` with "requires implementation" - every public function must work

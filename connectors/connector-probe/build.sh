@@ -105,6 +105,44 @@ if bad:
 print("Manifest vocabulary: ok")
 PY
 
+# The manifest, the code and the README must name the SAME operations.
+#
+# Three lists drift apart silently and each way costs something different. An
+# operation the code serves but the manifest omits is undeclared surface; one
+# the manifest declares and the code does not serve answers every caller with a
+# refusal that reads like a platform fault; one that no README documents is one
+# nobody will ever call. The module cannot be host-compiled to check this from
+# inside — `outlayer.manifest` is a wasm-only link section — so it is read off
+# the source here, where every build passes.
+python3 - "$(dirname "$0")" <<'OPSPY'
+import json, re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+manifest = set(json.load(open(root / "manifest.json")).get("operations", []))
+
+source = (root / "src" / "main.rs").read_text(encoding="utf-8")
+start = source.index("fn run(")
+end = source.index("\n}\n", start)
+# `run`'s own match only: `budget` holds a nested one whose arms are MODES.
+dispatched = set(re.findall(r'"([a-z_]+)" =>', source[start:end]))
+
+readme = (root / "README.md").read_text(encoding="utf-8")
+documented = {op for op in manifest | dispatched if re.search(r"`" + re.escape(op) + r"`", readme)}
+
+problems = []
+if dispatched - manifest:
+    problems.append("served but not declared in the manifest: %s" % sorted(dispatched - manifest))
+if manifest - dispatched:
+    problems.append("declared in the manifest but not served: %s" % sorted(manifest - dispatched))
+if manifest - documented:
+    problems.append("not documented in README.md: %s" % sorted(manifest - documented))
+if problems:
+    print("ERROR: the manifest, the code and the README disagree about the operations:")
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print("Operations: manifest, code and README agree (%d)" % len(manifest))
+OPSPY
+
 # The variables this probe reports on are the ones the worker injects. A
 # variable the worker gained and this list lacks is reported by `env` as
 # "unknown" — which is fine at runtime — but a list that drifted is a probe

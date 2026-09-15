@@ -68,11 +68,14 @@ with no price and no fee.
 |---|---|---|
 | `ping` | free | a free operation is still a REAL price: it runs only on a key that can pay, and is refused when the key cannot |
 | `whoami` | $0.01, share 0 | what the guest was TOLD about its caller — injected by the worker, not taken from the request. Priced with the whole fee staying with the platform, which is the shape of every connector we own ourselves |
+| `env` | free | every system variable the worker injects, one row each: whether it arrived, whether it is blank, and what it holds — the whole injected environment as the guest sees it |
 | `secret` | $0.01 | the owner's secret reached the guest, without printing it |
 | `author_secret` | free | the AUTHOR's secret (`PROBE_AUTHOR_SECRET`, manifest `author_secrets.profile = author`, stored by the publishing account) is in the environment of every run, with no header and no `secrets_ref` |
 | `burn` | $0.01 | compute costs something: `{"operation":"burn","rounds":50}` burns instructions on demand |
 | `fetch` | $0.015 | the declared host (`rpc.testnet.fastnear.com`) is reachable |
 | `forbidden_fetch` | $0.015 | an undeclared host (`example.com`) is NOT |
+| `vrf` | $0.01, share 0 | `near:vrf`: randomness with the alpha it is bound to, and the public key beside it. A key that cannot be read is reported, not fatal — the alpha is what the proof rests on. Share 0 because what it proves is not about money |
+| `refund` | $0.01, share 70% | `near:payment`: the module hands part of the fee back, and over-refunding is refused — `ok` stays true either way, because a refused refund is still a well-formed answer, and `refund_error` carries the outcome. The share is deliberately NOT zero: a refund comes out of the AUTHOR's earnings, so with no share there would be nothing for the ledger row to show |
 | `sockets` | free | raw TCP (`1.1.1.1:80`) and a DNS lookup are refused — `wasi:http` is the only way out |
 | `trap` | $0.01 | the module panics: the call fails, the fee is refunded, the author is paid nothing |
 | `fail` | $0.01 | the module answers `ok: false` and exits 1 — shows how a non-zero exit is reported and billed |

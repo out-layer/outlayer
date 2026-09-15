@@ -1313,6 +1313,40 @@ mod a_condition_past_the_bounds_is_not_stored {
         store(&mut contract, "reads", chain_reads(MAX_CHAIN_READ_LEAVES + 1));
     }
 
+    /// A QUOTE is a door too. `estimate_storage_cost` is what a client calls
+    /// to learn the deposit before it signs, so quoting a condition the store
+    /// would refuse sends the client to sign a transaction that panics — and
+    /// charges it the gas to find out. The rule is learned here instead.
+    #[test]
+    #[should_panic(expected = "asks the chain 6 times; at most 5 such leaves are judged")]
+    fn a_quote_is_refused_for_a_condition_the_store_would_refuse() {
+        let (contract, user) = contract_and_user();
+        contract.estimate_storage_cost(
+            SecretAccessor::Repo { repo: "github.com/alice/project".to_string(), branch: None },
+            "reads".to_string(),
+            user,
+            "base64encodeddata".to_string(),
+            chain_reads(MAX_CHAIN_READ_LEAVES + 1),
+            None,
+        );
+    }
+
+    /// The control: the quote still WORKS for a condition at the bound, so the
+    /// row above is the bound refusing and not the quote being broken.
+    #[test]
+    fn a_quote_for_a_condition_at_the_bound_is_still_a_number() {
+        let (contract, user) = contract_and_user();
+        let cost = contract.estimate_storage_cost(
+            SecretAccessor::Repo { repo: "github.com/alice/project".to_string(), branch: None },
+            "reads".to_string(),
+            user,
+            "base64encodeddata".to_string(),
+            chain_reads(MAX_CHAIN_READ_LEAVES),
+            None,
+        );
+        assert!(cost.0 > 0, "a storable condition must still be priced");
+    }
+
     #[test]
     #[should_panic(expected = "asks the chain 6 times")]
     fn the_chain_read_bound_holds_at_update_access_too() {

@@ -193,6 +193,14 @@ assert_denied "E8 refused" \
 
 # ── E9 the partner webhook ─────────────────────────────────────────────────
 log "E9 POST /binding/events — the shared secret is the ONLY thing guarding it"
+# The body is UNREADABLE on purpose. The door has to answer before the body is
+# parsed, and only an unparseable body can tell the two orders apart: parsed
+# first, this returns 422 naming `asset_account_id`, and 422 is not a free code
+# here — everywhere else in this API it means `OnChainTxFailed`, the chain
+# having answered and a receipt having failed. A partner routing on it would
+# read a malformed body as a chain fact. "Some 4xx" is not the assertion.
+api - POST /wallet/v1/binding/events '{}' >/dev/null
+H_JUNK=$HTTP; B_JUNK=$BODY
 api - POST /wallet/v1/binding/events "$(jq -nc --arg a "$ASSET" '{asset_account_id:$a, event:"revoked"}')" >/dev/null
 H_NONE=$HTTP; B_NONE=$BODY
 api - POST /wallet/v1/binding/events "$(jq -nc --arg a "$ASSET" '{asset_account_id:$a, event:"revoked"}')" \
@@ -204,9 +212,18 @@ if [[ "$H_NONE" == "503" ]]; then
   [[ "$H_WRONG" =~ ^[45] ]] \
     && pass "E9 a presented secret is still refused while unconfigured (HTTP $H_WRONG) — unconfigured never means open" \
     || fail "E9 an unconfigured deployment ACCEPTED an event (HTTP $H_WRONG)"
+  [[ "$H_JUNK" == "$H_NONE" ]] \
+    && pass "E9 an unreadable body answers the same as a readable one ($H_JUNK): the door runs first" \
+    || fail "E9 an unreadable body answered $H_JUNK where a readable one answered $H_NONE — the body is parsed before the door"
 else
-  [[ "$H_NONE" =~ ^4 ]] && pass "E9 no secret → refused $H_NONE" || fail "E9 no secret → $H_NONE, expected a refusal: $(msg_of "$B_NONE")"
-  [[ "$H_WRONG" =~ ^4 ]] && pass "E9 a wrong secret → refused $H_WRONG" || fail "E9 a wrong secret → $H_WRONG"
+  [[ "$H_NONE" == "401" ]] && pass "E9 no secret → 401" || fail "E9 no secret → $H_NONE, expected 401: $(msg_of "$B_NONE")"
+  [[ "$H_WRONG" == "401" ]] && pass "E9 a wrong secret → 401" || fail "E9 a wrong secret → $H_WRONG, expected 401"
+  [[ "$H_JUNK" == "401" ]] \
+    && pass "E9 an unreadable body with no secret → 401, not 422: the secret is checked before the body is read" \
+    || fail "E9 an unreadable body with no secret → $H_JUNK, expected 401. 422 here means the extractor parses first and answers an unauthenticated caller with our own field names: $(msg_of "$B_JUNK")"
+  grep -qi "asset_account_id\|missing field" <<<"$B_JUNK" \
+    && fail "E9 the refusal to an unauthenticated caller names our own schema: $(msg_of "$B_JUNK")" \
+    || pass "E9 and it says nothing about the shape it wanted"
 fi
 
 # ── E10 /binding/balance ───────────────────────────────────────────────────

@@ -973,4 +973,131 @@ mod tests {
             "RPC request is missing Content-Type: application/json — NEAR answers 415:\n{request}"
         );
     }
+    /// One JSON-RPC answer, served once from a throwaway socket.
+    ///
+    /// A chain read is judged on what the CONTRACT answered, and the answers
+    /// that decide the arms below are ones no correct contract gives. Serving
+    /// them is the only way to reach that code: a real NFT or DAO contract
+    /// answers properly, which is why a live run never exercises it.
+    fn serving(view_result: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "dontcare",
+                "result": {
+                    "block_hash": "11111111111111111111111111111111",
+                    "block_height": 1u64,
+                    "logs": [],
+                    "result": view_result.as_bytes().to_vec(),
+                }
+            })
+            .to_string();
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn client_talking_to(url: &str) -> NearClient {
+        NearClient::new(url, "outlayer.testnet").expect("client")
+    }
+
+    /// An answer that cannot be READ must not become a verdict.
+    ///
+    /// `NftOwned` and `DaoMember` sit under `Not` as readily as anywhere else,
+    /// and there a `false` ADMITS. So a token object with no owner, and a role
+    /// whose kind this build does not know, are errors — which refuse at every
+    /// combinator — and not "no".
+    #[tokio::test]
+    async fn an_nft_token_that_states_no_owner_cannot_be_read() {
+        let (url, server) = serving(r#"{"token_id":"7","metadata":{"title":"x"}}"#);
+        let err = client_talking_to(&url)
+            .check_nft_ownership("nft.testnet", "alice.testnet", Some("7"))
+            .await
+            .expect_err("a token with no owner_id is not an answer of `no`");
+        let message = format!("{err:#}");
+        assert!(message.contains("no owner_id"), "the refusal must say what could not be read: {message}");
+        let _ = server.join();
+    }
+
+    /// The control for the arm above: `null` IS the standard's "no such
+    /// token", so it stays a verdict. Without this, the test above would only
+    /// say "an answer we dislike is an error".
+    #[tokio::test]
+    async fn an_nft_token_that_does_not_exist_is_a_plain_no() {
+        let (url, server) = serving("null");
+        let owned = client_talking_to(&url)
+            .check_nft_ownership("nft.testnet", "alice.testnet", Some("7"))
+            .await
+            .expect("`null` is readable, and it means no");
+        assert!(!owned);
+        let _ = server.join();
+    }
+
+    #[tokio::test]
+    async fn an_nft_token_owned_by_the_caller_is_a_plain_yes() {
+        let (url, server) = serving(r#"{"token_id":"7","owner_id":"alice.testnet"}"#);
+        assert!(client_talking_to(&url)
+            .check_nft_ownership("nft.testnet", "alice.testnet", Some("7"))
+            .await
+            .expect("a readable answer"));
+        let _ = server.join();
+    }
+
+    #[tokio::test]
+    async fn a_dao_role_kind_this_build_does_not_know_cannot_be_read() {
+        let (url, server) = serving(r#"{"roles":[{"name":"council","kind":{"SomethingNewer":{"weight":1}}}]}"#);
+        let err = client_talking_to(&url)
+            .check_dao_membership("dao.testnet", "alice.testnet", "council")
+            .await
+            .expect_err("a role kind we cannot read is not an answer of `no`");
+        let message = format!("{err:#}");
+        assert!(message.contains("does not understand"), "{message}");
+        assert!(message.contains("council"), "the refusal must name the role: {message}");
+        let _ = server.join();
+    }
+
+    /// The control: a role that simply is not in the policy IS an answer, and
+    /// a `Group` role still decides who is in it.
+    #[tokio::test]
+    async fn a_role_that_is_not_in_the_policy_is_a_plain_no() {
+        let (url, server) = serving(r#"{"roles":[{"name":"council","kind":{"Group":["bob.testnet"]}}]}"#);
+        let member = client_talking_to(&url)
+            .check_dao_membership("dao.testnet", "alice.testnet", "treasury")
+            .await
+            .expect("a policy without the role is readable");
+        assert!(!member);
+        let _ = server.join();
+    }
+
+    #[tokio::test]
+    async fn a_group_role_says_who_is_in_it() {
+        let (url, server) = serving(r#"{"roles":[{"name":"council","kind":{"Group":["alice.testnet","bob.testnet"]}}]}"#);
+        assert!(client_talking_to(&url)
+            .check_dao_membership("dao.testnet", "alice.testnet", "council")
+            .await
+            .expect("a Group role is readable"));
+        let _ = server.join();
+
+        let (url, server) = serving(r#"{"roles":[{"name":"council","kind":{"Group":["bob.testnet"]}}]}"#);
+        assert!(!client_talking_to(&url)
+            .check_dao_membership("dao.testnet", "alice.testnet", "council")
+            .await
+            .expect("a Group role is readable"));
+        let _ = server.join();
+    }
 }

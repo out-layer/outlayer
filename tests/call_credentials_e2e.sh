@@ -249,17 +249,29 @@ else
     json-args "$(jq -nc --arg a "$ADDR" '{account_id:$a, registration_only:true}')" \
     prepaid-gas '30.0 Tgas' attached-deposit '0.00125 NEAR' \
     sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
-  near --quiet contract call-function as-transaction "$TOKEN_CONTRACT" ft_transfer \
+  FT_OUT=$(near --quiet contract call-function as-transaction "$TOKEN_CONTRACT" ft_transfer \
     json-args "$(jq -nc --arg a "$ADDR" --arg m "$AMT" '{receiver_id:$a, amount:$m}')" \
     prepaid-gas '30.0 Tgas' attached-deposit '1 yoctoNEAR' \
-    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1)
   # And gas. Creating a payment key is signed BY the wallet — a `store_secrets`
   # on chain plus an `ft_transfer_call` — so stablecoin alone leaves it able to
   # pay for the key and unable to send the transaction that buys it.
   near --quiet tokens "$PARENT" send-near "$ADDR" "$FUND_NEAR NEAR" \
     network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
-  note "sent $DEPOSIT_USDC of $TOKEN_CONTRACT and $FUND_NEAR NEAR to $ADDR"
   sleep 4
+  LANDED=$(curl -s -m 30 "$RPC_URL" -X POST -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg a "$TOKEN_CONTRACT" --arg b "$(printf '{"account_id":"%s"}' "$ADDR" | base64)" \
+          '{jsonrpc:"2.0",id:1,method:"query",params:{request_type:"call_function",finality:"final",account_id:$a,method_name:"ft_balance_of",args_base64:$b}}')" \
+    | jq -r '(.result.result | implode | fromjson) // "0"' | tr -d '"')
+  if [[ "${LANDED:-0}" == "$AMT" ]]; then
+    note "sent $DEPOSIT_USDC of $TOKEN_CONTRACT and $FUND_NEAR NEAR to $ADDR"
+  else
+    # Read back rather than announced: three transactions go out here and the
+    # only evidence that the middle one landed is the balance. A suite that
+    # says "sent" and then watches the key creation fail sends the reader to
+    # the coordinator for a fault that is on this line.
+    warn "the stablecoin did not arrive: $ADDR holds ${LANDED:-0} of $AMT. near-cli said: $(tail -2 <<<"$FT_OUT" | head -c 200)"
+  fi
 fi
 
 # ── the two keys ─────────────────────────────────────────────────────────────
@@ -271,7 +283,7 @@ TRIAL_SCOPE=$(jq -r '(.project_ids // []) | join(",")' <<<"$R")
 if [[ -n "$TRIAL" ]]; then
   note "trial claimed, scope: ${TRIAL_SCOPE:-<none>}"
 else
-  warn "trial not claimed: $(jq -r '.error // .message // .' <<<"$R" | head -c 160)"
+  warn "trial not claimed: $(jq -r '[.error, .message] | map(select(. != null)) | join(" — ")' <<<"$R" | head -c 220)"
 fi
 
 R=$(curl -sS -m 90 -X POST "$COORDINATOR_URL/wallet/v1/create-payment-key" \
@@ -282,7 +294,7 @@ PAID=$(jq -r '.payment_key // empty' <<<"$R")
 if [[ -n "$PAID" ]]; then
   note "payment key created, nonce $(jq -r '.nonce' <<<"$R")"
 else
-  warn "payment key not created: $(jq -r '.error // .message // .' <<<"$R" | head -c 160)"
+  warn "payment key not created: $(jq -r '[.error, .message] | map(select(. != null)) | join(" — ")' <<<"$R" | head -c 220)"
 fi
 
 # ── K3 / K4: the trial reaches connectors and nothing else ───────────────────

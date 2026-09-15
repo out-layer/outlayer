@@ -7955,7 +7955,7 @@ mod tests {
 
     // ============== AppState::ensure_customer_loaded gate ==============
 
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         let config = crate::config::Config {
             server_addr: "127.0.0.1:0".parse().unwrap(),
             near_network: "testnet".into(),
@@ -9269,5 +9269,100 @@ mod the_door_judges_one_condition_for_one_caller {
         assert!(matches!(judge_access(&balance, "anyone.near", None).await, Err(ApiError::InternalError(_))));
         let negated = AccessCondition::Not { condition: Box::new(balance) };
         assert!(matches!(judge_access(&negated, "anyone.near", None).await, Err(ApiError::InternalError(_))));
+    }
+}
+
+/// What `/decrypt-raw` will serve.
+///
+/// The handler derives a key from the seed the CALLER names and hands back the
+/// plaintext without consulting any access condition, so the set of seeds it
+/// answers for IS its access control. Every blob below is encrypted under the
+/// very seed the request carries, so it WOULD decrypt: a refusal here is the
+/// prefix refusing, not base64 or the AEAD, which is the only way this test
+/// says anything.
+#[cfg(test)]
+mod decrypt_raw_serves_the_top_up_flow_only {
+    use super::tests::test_state;
+    use super::*;
+
+    const PLAINTEXT: &[u8] = br#"{"owner":"alice.testnet","initial_balance":"1000000"}"#;
+
+    async fn decryptable_under(state: &AppState, seed: &str) -> DecryptRawRequest {
+        let blob = state
+            .keystore
+            .read()
+            .await
+            .encrypt(None, seed, PLAINTEXT)
+            .expect("the test's own blob must encrypt");
+        DecryptRawRequest {
+            seed: seed.to_string(),
+            encrypted_base64: base64::encode(&blob),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_top_up_seed_is_served_and_every_other_shape_is_refused() {
+        let state = test_state();
+        // A keystore that is not ready refuses everything with a different
+        // error, which would make every assertion below pass for nothing.
+        assert!(state.is_ready(), "the fixture must be past the readiness gate");
+
+        // The seed the top-up flow builds — `worker/src/main.rs`, and the
+        // `System` arm of `decrypt_handler`: system:payment_key:{owner}:{nonce}.
+        let req = decryptable_under(&state, "system:payment_key:alice.testnet:7").await;
+        let served = decrypt_raw_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(req))
+            .await
+            .expect("the flow this handler exists for must still work");
+        assert_eq!(
+            base64::decode(&served.0.plaintext_base64).expect("base64"),
+            PLAINTEXT,
+            "the served plaintext must be the blob's own"
+        );
+
+        // Every other seed this keystore derives keys for, in the shape the
+        // code writes it. Each names a row whose reader is decided by an access
+        // condition that THIS handler never reads.
+        for seed in [
+            "project:alice.testnet/app:alice.testnet",
+            "github.com/alice/app:alice.testnet",
+            "wasm_hash:d39dfee85c0085604e516d37f83032ed98abba4a43322ed4b5c455b33c13c8f7:alice.testnet",
+            "wallet-policy:0123456789abcdef",
+            // The narrowing: `system:` alone is not the pass. A system type
+            // added later is refused here until someone decides otherwise,
+            // rather than becoming readable the day it is introduced.
+            "system:something_later:alice.testnet:1",
+            "",
+        ] {
+            let req = decryptable_under(&state, seed).await;
+            match decrypt_raw_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(req)).await {
+                Err(ApiError::BadRequest(message)) => assert!(
+                    message.contains("system:payment_key:") && message.contains("/decrypt"),
+                    "the refusal must name the one seed this door serves and where a stored secret is read instead: {message}"
+                ),
+                Err(other) => panic!("{seed:?} was refused, but not by the prefix: {other:?}"),
+                Ok(_) => panic!("{seed:?} was SERVED: this handler reads it with no condition judged"),
+            }
+        }
+    }
+
+    /// The prefix is a prefix of the whole seed, not a substring of it: a seed
+    /// that merely CONTAINS the marker is not the top-up flow's.
+    #[tokio::test]
+    async fn the_marker_has_to_start_the_seed() {
+        let state = test_state();
+        for seed in [
+            "project:alice.testnet/system:payment_key:x:alice.testnet",
+            " system:payment_key:alice.testnet:7",
+            "SYSTEM:PAYMENT_KEY:alice.testnet:7",
+        ] {
+            let req = decryptable_under(&state, seed).await;
+            assert!(
+                matches!(
+                    decrypt_raw_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(req)).await,
+                    Err(ApiError::BadRequest(_))
+                ),
+                "{seed:?} must not pass as a payment-key seed"
+            );
+        }
     }
 }
