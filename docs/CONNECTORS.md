@@ -489,5 +489,5 @@ access; one that echoed secrets would make every test run a leak.
 * [`wasi-examples/CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md) — manifest reference
 * [`wasi-examples/WASI_TUTORIAL.md`](../wasi-examples/WASI_TUTORIAL.md) — writing and building a WASI guest
 * [`wasi-examples/WASM_ENV_VARS.md`](../wasi-examples/WASM_ENV_VARS.md) — every injected variable
-* [`connectors/SKILL.md`](../connectors/SKILL.md) — the library as an AGENT reads it: the call, the refusal codes, what a call costs, and one line per connector. Every connector ships its own `SKILL.md` next to its code; write one when you publish, because an agent that has to infer your operations from prose gets them wrong
+* [`skills.outlayer.ai/outlayer-connectors`](https://skills.outlayer.ai/outlayer-connectors/SKILL.md) — the library as an AGENT reads it: the call, the refusal codes, what a call costs, and one line per connector. Every connector publishes its own skill beside it (`https://skills.outlayer.ai/<connector>/SKILL.md`), with a pointer to that URL next to the code; write one when you publish, because an agent that has to infer your operations from prose gets them wrong
 * [`connectors/connector-probe/`](../connectors/connector-probe/) — a working connector to copy
