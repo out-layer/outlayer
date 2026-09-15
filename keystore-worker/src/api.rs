@@ -396,17 +396,69 @@ pub(crate) async fn judge_access(
     // many patterns a row holds, and each costs memory to compile.
     let shape = serde_json::to_value(condition)
         .map_err(|e| ApiError::InternalError(format!("Access condition could not be serialised: {e}")))?;
-    if let Err(why) = shared_tee_helpers::access_limits::account_pattern_bounds(&shape) {
+    if let Err(why) = shared_tee_helpers::access_limits::condition_bounds(&shape) {
         return Err(ApiError::Unauthorized(format!("Access denied by access condition: {why}")));
     }
     let patterns = match condition.compile_patterns() {
         Ok(patterns) => patterns,
         Err(unreadable) => return Err(ApiError::Unauthorized(unreadable.to_string())),
     };
-    match condition.evaluate(caller, near_client, &patterns).await {
+    // A deadline on the whole evaluation, not on the number of leaves.
+    // `NearBalance`, `FtBalance`, `NftOwned` and `DaoMember` are answered by a
+    // view call against a contract the ROW'S OWNER chose, one after another,
+    // on a client that waits 30s per call. Five of those is well under a
+    // second against a healthy chain and up to two and a half minutes against
+    // a slow or hostile one — and the caller's worker gives up after 30s,
+    // which marks THIS keystore instance down for a minute for every other
+    // job on that worker. Answering promptly with an error keeps the instance
+    // in the pool (a stall does not), so a condition nobody can evaluate in
+    // time costs its own row and nothing else.
+    let verdict = within_deadline(ACCESS_EVALUATION_DEADLINE, condition.evaluate(caller, near_client, &patterns)).await?;
+    match verdict {
         Ok(true) => Ok(()),
         Ok(false) => Err(ApiError::Unauthorized(condition.denial_message_in(caller, &patterns))),
         Err(e) => Err(ApiError::InternalError(format!("Access validation failed: {e}"))),
+    }
+}
+
+/// How long the whole of one condition may take to evaluate.
+///
+/// Sized against the consumer, not against the chain: the worker waits 30s for
+/// a decrypt in all (`worker/src/keystore_client.rs`), and a decrypt is more
+/// than this step. Five chain reads against a healthy RPC are under a second,
+/// so this leaves better than tenfold headroom for the honest case while
+/// keeping a slow one from spending the worker's whole window. Fifteen seconds
+/// is half of that window: enough that a merely sluggish RPC still answers,
+/// short enough that the worker is not left waiting on this step alone.
+const ACCESS_EVALUATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The deadline, applied. Separated so the three properties that matter can be
+/// tested: that it fires, that firing is a REFUSAL, and that it never turns
+/// into an admission.
+async fn within_deadline<T>(
+    deadline: std::time::Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, ApiError> {
+    tokio::time::timeout(deadline, fut).await.map_err(|_| {
+        ApiError::InternalError(format!(
+            "Access condition could not be evaluated within {}s: it asks the chain for answers that did not arrive. \
+             This is not a verdict about the caller — the condition's balance, NFT or DAO checks name contracts that are not answering.",
+            deadline.as_secs()
+        ))
+    })
+}
+
+/// A caller-written seed, as a log line may carry it.
+///
+/// The seed arrives in the request body, whose only bound is the body limit, so
+/// it is cut to a readable prefix BEFORE it reaches the log rather than filling
+/// it. The length is kept because it is the part worth seeing when a seed is
+/// not the shape it should be.
+fn seed_for_log(seed: &str) -> String {
+    const MOST: usize = 64;
+    match seed.char_indices().nth(MOST) {
+        Some((cut, _)) => format!("{}… ({} bytes in all)", &seed[..cut], seed.len()),
+        None => seed.to_string(),
     }
 }
 
@@ -1691,7 +1743,7 @@ async fn pubkey_handler(
         .map_err(|e| ApiError::InternalError(format!("Failed to derive public key: {}", e)))?;
 
     tracing::info!(
-        seed = %req.seed,
+        seed = %seed_for_log(&req.seed),
         num_secrets = secrets_map.len(),
         vault_id = ?customer,
         "Validated secrets and generated pubkey"
@@ -2619,7 +2671,7 @@ fn map_verify_error(
 /// Encrypt plaintext data
 ///
 /// Used by workers to re-encrypt secrets after TopUp:
-/// 1. Worker decrypts current Payment Key data via /decrypt
+/// 1. Worker decrypts current Payment Key data via /decrypt-raw
 /// 2. Worker parses JSON, updates initial_balance
 /// 3. Worker calls /encrypt to get new encrypted data
 /// 4. Worker calls promise_yield_resume with new encrypted data
@@ -2637,7 +2689,7 @@ async fn encrypt_handler(
     }
 
     tracing::info!(
-        seed = %req.seed,
+        seed = %seed_for_log(&req.seed),
         "Received encrypt request"
     );
 
@@ -2659,7 +2711,7 @@ async fn encrypt_handler(
     let encrypted_base64 = base64::encode(&encrypted_bytes);
 
     tracing::info!(
-        seed = %req.seed,
+        seed = %seed_for_log(&req.seed),
         plaintext_len = plaintext_bytes.len(),
         encrypted_len = encrypted_bytes.len(),
         "Successfully encrypted data"
@@ -2705,9 +2757,37 @@ async fn decrypt_raw_handler(
     }
 
     tracing::info!(
-        seed = %req.seed,
+        seed = %seed_for_log(&req.seed),
         "Received decrypt-raw request"
     );
+
+    // Who reaches this handler: a worker approved on the register contract,
+    // carrying a worker credential (`worker_auth_middleware`) and an attested
+    // TEE session (`tee_session_middleware`). The plaintext it returns travels
+    // enclave to enclave and is never visible to the host, to the coordinator
+    // or to an operator — the same path `/decrypt` uses for a run's secrets.
+    //
+    // What this handler serves is the top-up flow: a payment key's own blob is
+    // decrypted, its balance bumped, and the result re-encrypted.
+    //
+    // The prefix refuses every `Repo`, `WasmHash` and `Project` seed, which is
+    // every row this flow has no business reading. What it does NOT do is scope
+    // a worker to the rows of the job it is running: a `system:payment_key:`
+    // seed names a row its owner stored with a condition of their own, and this
+    // handler does not consult that condition. Inside the trust boundary that
+    // is a scoping gap, not an exposure — closing it needs either a per-task
+    // capability the keystore can check, or the top-up moving inside the
+    // enclave the way `update_user_secrets_handler` already works for a user's
+    // own secrets.
+    if !req.seed.starts_with("system:payment_key:") {
+        tracing::warn!(seed = %seed_for_log(&req.seed), "decrypt-raw refused: not a payment-key seed");
+        return Err(ApiError::BadRequest(
+            "decrypt-raw serves the top-up flow's `system:payment_key:` blobs only. A stored \
+             secret is read through /decrypt, where its access condition is judged against the \
+             caller."
+                .to_string(),
+        ));
+    }
 
     // Decode encrypted data from base64
     let encrypted_bytes = base64::decode(&req.encrypted_base64)
@@ -2727,7 +2807,7 @@ async fn decrypt_raw_handler(
     let plaintext_base64 = base64::encode(&plaintext_bytes);
 
     tracing::info!(
-        seed = %req.seed,
+        seed = %seed_for_log(&req.seed),
         encrypted_len = encrypted_bytes.len(),
         plaintext_len = plaintext_bytes.len(),
         "Successfully decrypted raw data"
@@ -2779,7 +2859,7 @@ async fn add_generated_secret_handler(
         .map_err(ApiError::from_customer_load)?;
 
     tracing::info!(
-        seed = %req.seed,
+        seed = %seed_for_log(&req.seed),
         num_new_secrets = req.new_secrets.len(),
         has_existing = req.encrypted_secrets_base64.is_some(),
         vault_id = ?customer,
@@ -2902,7 +2982,7 @@ async fn add_generated_secret_handler(
     let all_secret_keys: Vec<String> = secrets_map.keys().cloned().collect();
 
     tracing::info!(
-        seed = %req.seed,
+        seed = %seed_for_log(&req.seed),
         total_secrets = secrets_map.len(),
         newly_generated_count = generated_keys.len(),
         encrypted_size = encrypted_bytes.len(),
@@ -4892,9 +4972,12 @@ async fn wallet_sign_secret_store_handler(
         })?;
 
     // A condition the keystore would refuse to judge is not signed into a row.
-    if let Err(why) = shared_tee_helpers::access_limits::account_pattern_bounds(
-        &serde_json::to_value(&req.access).unwrap_or(serde_json::Value::Null),
-    ) {
+    // NOT `unwrap_or(Null)`: an unserialisable condition would then count as
+    // zero of everything and pass a bound whose whole job is to refuse.
+    let access_shape = serde_json::to_value(&req.access).map_err(|e| {
+        ApiError::InternalError(format!("Access condition could not be serialised: {e}"))
+    })?;
+    if let Err(why) = shared_tee_helpers::access_limits::condition_bounds(&access_shape) {
         return Err(ApiError::BadRequest(format!("access condition refused: {why}")));
     }
 
@@ -9115,6 +9198,69 @@ mod the_door_judges_one_condition_for_one_caller {
         }
         let sixteen = AccessCondition::Logic { operator: LogicOperator::Or, conditions: (0..16).map(leaf).chain([AccessCondition::AllowAll]).collect() };
         assert!(judge_access(&sixteen, "anyone.near", None).await.is_ok());
+    }
+
+    /// The deadline: it fires, firing is a REFUSAL, and a verdict that arrives
+    /// in time is passed through untouched. On a paused clock, so the test
+    /// costs no wall time and cannot flake.
+    #[tokio::test]
+    async fn the_evaluation_deadline_refuses_and_never_admits() {
+        let tiny = std::time::Duration::from_millis(5);
+        // Fires: a future that outlasts it yields an error, not a verdict —
+        // and the verdict it would have produced is an ADMISSION, so this is
+        // the case that must not leak through.
+        let slow = async {
+            tokio::time::sleep(tiny * 20).await;
+            Ok::<bool, anyhow::Error>(true)
+        };
+        match within_deadline(tiny, slow).await {
+            Err(ApiError::InternalError(m)) => {
+                assert!(m.contains("could not be evaluated within"), "{m}");
+                // Not a verdict about the caller: a 401 here would read as
+                // "denied by the condition", and an Ok would admit.
+            }
+            other => panic!("a deadline that fires must refuse: {other:?}"),
+        }
+
+        // Does not fire: a verdict inside the deadline arrives as it was.
+        let quick = async { Ok::<bool, anyhow::Error>(true) };
+        let inner = within_deadline(ACCESS_EVALUATION_DEADLINE, quick).await.expect("inside the deadline");
+        assert!(inner.expect("no error"), "a verdict must pass through untouched");
+
+        let refused = async { Ok::<bool, anyhow::Error>(false) };
+        assert!(!within_deadline(ACCESS_EVALUATION_DEADLINE, refused).await.unwrap().unwrap());
+    }
+
+    /// The chain-read bound is refused at the door, before the chain is asked
+    /// once — and the ORDER is the point: five leaves get past the bound and
+    /// fail on the missing client, six never reach it.
+    #[tokio::test]
+    async fn a_condition_past_the_chain_read_bound_never_asks_the_chain() {
+        let read = || AccessCondition::NearBalance {
+            operator: crate::types::ComparisonOperator::Gte,
+            value: "1".to_string(),
+        };
+        let tree = |n: usize| AccessCondition::Logic {
+            operator: LogicOperator::Or,
+            conditions: (0..n).map(|_| read()).collect(),
+        };
+
+        match judge_access(&tree(6), "anyone.near", None).await {
+            Err(ApiError::Unauthorized(m)) => {
+                assert!(m.contains("asks the chain 6 times"), "{m}");
+            }
+            other => panic!("six chain reads must be refused by the bound: {other:?}"),
+        }
+
+        // Five are within the bound, so the refusal that follows is the
+        // missing client — the bound did not answer for it.
+        match judge_access(&tree(5), "anyone.near", None).await {
+            Err(ApiError::InternalError(m)) => {
+                assert!(!m.contains("asks the chain"), "the bound answered for five: {m}");
+                assert!(m.contains("no NEAR client"), "{m}");
+            }
+            other => panic!("five chain reads must reach evaluation: {other:?}"),
+        }
     }
 
     #[tokio::test]

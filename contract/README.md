@@ -303,6 +303,22 @@ epoch, as a string>"}}` (admits strictly before that instant); `{"Logic": {"oper
 them. The contract stores the condition without evaluating it; the Borsh layout of
 `SecretProfile.access` is the variant order, so new variants are only ever appended.
 
+The contract stores no condition the keystore would refuse to judge, so both
+`store_secrets` and `update_access` refuse one past these bounds — and
+`estimate_storage_cost` quotes no such condition either:
+
+* at most **5** leaves that can only be answered by asking the chain
+  (`NearBalance`, `FtBalance`, `NftOwned`, `DaoMember`). They are asked one
+  after another from inside the enclave, against contracts the row's owner
+  chose, and a shared keystore waits for all of them;
+* at most **16** `AccountPattern` leaves and **4096 bytes** of pattern text in
+  all. A pattern's compiled size is not its text size, and the keystore
+  compiles every pattern of a condition before judging a decrypt.
+
+A whitelist is answered from the condition itself, so neither its size nor the
+number of whitelist leaves is bounded — the only cost is storage, which the
+row's owner pays for.
+
 #### `list_user_secrets`
 One PAGE of the secrets stored by an account. It reads storage per entry, so an
 unbounded answer would eventually exceed the view's gas and fail for everyone —

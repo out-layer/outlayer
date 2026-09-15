@@ -209,6 +209,12 @@ credential to a class of callers — everyone holding a particular NFT, every
 member of a DAO role — without naming them, and how a grant to one agent is
 made to lapse on its own: `And[Whitelist[agent], ValidUntil(lease end)]`.
 
+Those class checks ask the chain, one after another, while a shared keystore
+waits — so a condition may hold **at most five** of them (`NearBalance`,
+`FtBalance`, `NftOwned`, `DaoMember`), and at most sixteen `AccountPattern`
+leaves of four kibibytes in all. Naming accounts costs nothing: a `Whitelist`
+is answered from the condition itself, at any size.
+
 Decryption happens in the keystore TEE and the plaintext exists only inside the
 worker that runs your module. The coordinator never sees it.
 

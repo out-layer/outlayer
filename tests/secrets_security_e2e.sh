@@ -67,8 +67,13 @@
 #   U10b a 10 KB profile on the ON-CHAIN door → not-found or a clean refusal
 #   U12b an AccountPattern that is not a regex → the owner's own run refused
 #       with a parse message; a caller naming no row unaffected
-#   N3  an Or of 200 NearBalance leaves (chain reads) before the owner's own
-#       name → admitted in time, stranger refused, others unaffected
+#   N3  the chain-read bound: a sixth leaf that can only be answered by asking
+#       the chain is refused by the contract and the row is unchanged; five are
+#       stored, admit the owner, refuse the stranger, and leave others alone
+#   E1  a planted value reaches the GUEST and nowhere else: not in the call's
+#       answer, not in the stored call record, not in the coordinator's rows.
+#       The guest's own receipt is the control — a search that finds nothing
+#       because nothing arrived proves nothing
 #   H3  a stranger stores profile `author` under the owner's project accessor
 #       → the author path reads the owner's row; the planted one is never
 #       consulted, not even for the stranger's own call
@@ -132,6 +137,11 @@
 #   AGENT_WK             (P1) that wallet's wk_, for `secrets set-for-agent`
 #   AGENT2_PAYMENT_KEY / AGENT2_ACCOUNT   (C8) a SECOND custody wallet
 #   RUN_CONNECTOR_BODY=0 (P1) skip it against an older coordinator; default 1
+#   FRESH_CONNECTOR_AGENT=1   (P1) mint a wallet and a payment key for the
+#                        connector row, so it runs on an UNSPENT daily counter.
+#                        The allowance grows with a wallet's age, so a minted
+#                        one carries the floor — enough for P1, and it costs a
+#                        payment key's deposit
 #   AGENT_SECRET_MODE    run|skip (tests/lib/agent_secret_mode.sh); P1 is the
 #                        one case here that uses the agent-secret mode
 #
@@ -600,12 +610,26 @@ else
   log "P1 header AND body on $CONNECTOR_PROJECT: the body's row wins"
   HDR_TOKEN="from-header-$(openssl rand -hex 4)"
   BODY_TOKEN="from-body-$(openssl rand -hex 4)"
-  if ! OUTLAYER_WALLET_KEY="$AGENT_WK" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set-for-agent \
+  # This is the one row here that spends a connector quota, and the quota is a
+  # property of the WALLET's age. FRESH_CONNECTOR_AGENT=1 mints one with an
+  # unspent counter; otherwise it runs on the wallet the other rows used.
+  P1_WK="$AGENT_WK"; P1_KEY="$AGENT_PAYMENT_KEY"; P1_ACCOUNT="$AGENT_ACCOUNT"
+  P1_MINT_FAILED=false
+  if [[ "${FRESH_CONNECTOR_AGENT:-0}" == "1" ]]; then
+    if mint_agent_wallet; then
+      P1_WK="$MINTED_WK"; P1_KEY="$MINTED_PAYMENT_KEY"; P1_ACCOUNT="$MINTED_ACCOUNT"
+    else
+      # Falling back silently would skip below with "run with
+      # FRESH_CONNECTOR_AGENT=1" — advice the operator has already taken.
+      P1_MINT_FAILED=true
+    fi
+  fi
+  if ! OUTLAYER_WALLET_KEY="$P1_WK" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set-for-agent \
        "$(jq -nc --arg t "$HDR_TOKEN" '{PROBE_TOKEN:$t}')" --project "$CONNECTOR_PROJECT" >/dev/null 2>&1; then
     fail "P1 could not store the agent's own row with set-for-agent"
   else
-    store "$CONNECTOR_PROJECT" both "$(jq -nc --arg t "$BODY_TOKEN" '{PROBE_TOKEN:$t}')" "whitelist:$PARENT,$AGENT_ACCOUNT"
-    call_https "$AGENT_PAYMENT_KEY" "$CONNECTOR_PROJECT" "$PARENT/both" '{"operation":"secret"}' -H 'X-Use-Owner-Secret: 1'
+    store "$CONNECTOR_PROJECT" both "$(jq -nc --arg t "$BODY_TOKEN" '{PROBE_TOKEN:$t}')" "whitelist:$PARENT,$P1_ACCOUNT"
+    call_https "$P1_KEY" "$CONNECTOR_PROJECT" "$PARENT/both" '{"operation":"secret"}' -H 'X-Use-Owner-Secret: 1'
     GOT=$(jq -r '.secrets[]? | select(.key=="PROBE_TOKEN") | .sha256_prefix // empty' <<<"$RUN_OUT" 2>/dev/null)
     WANT=$(printf '%s' "$BODY_TOKEN" | shasum -a 256 | cut -c1-8)
     OTHER=$(printf '%s' "$HDR_TOKEN" | shasum -a 256 | cut -c1-8)
@@ -613,6 +637,10 @@ else
       pass "P1 the guest saw the BODY's token, not the header's"
     elif [[ "$GOT" == "$OTHER" ]]; then
       fail "P1 the header's row overrode the body's — the coordinator dropped what the body named"
+    elif quota_refused "$RUN_ERR" && [[ "$P1_MINT_FAILED" == true ]]; then
+      skip "P1 FRESH_CONNECTOR_AGENT=1 was asked for but the mint failed (its reason is above), so the row ran on the spent counter of $AGENT_ACCOUNT"
+    elif quota_refused "$RUN_ERR"; then
+      skip "P1 the wallet spent its connector calls for the day ($(head -c 90 <<<"$RUN_ERR")) — run with FRESH_CONNECTOR_AGENT=1 for an unspent counter"
     else
       fail "P1 success=$RUN_OK token=$GOT err='$RUN_ERR'"
     fi
@@ -1451,19 +1479,58 @@ if want U12b; then
   fi
 fi
 
-# ── N3 a WIDE condition: 200 chain-read leaves ───────────────────────────────
+# ── N3 how wide a condition may be: the chain-read bound ─────────────────────
 #
-# N1/N2 are depth (Not over Not, one leaf, no chain reads). This is width: an
-# Or of 200 NearBalance leaves, each a chain read inside the keystore, with the
-# owner's own whitelist LAST so every leaf is walked before the answer. The
-# same bar as U8: no hang, no 5xx, unrelated callers unaffected.
+# N1/N2 are depth (Not over Not, one leaf, no chain reads). This is width: how
+# many leaves a condition may hold that the keystore can only answer by asking
+# the chain, one view call after another, while a SHARED keystore waits. Five
+# are judged and a sixth is not stored, and the owner's own whitelist sits LAST
+# so the whole width is walked before the answer. What U8 asked of the wide
+# shape — no hang, no 5xx — the KEYSTORE now answers with a deadline on the
+# evaluation as a whole, which this row cannot reach at five healthy leaves;
+# what it pins here is the bound itself, and that unrelated callers are
+# unaffected either side of it.
 if want N3; then
-  log "N3 an Or of 200 NearBalance leaves before the owner's own name"
-  N3_COND=$(jq -nc --arg p "$PARENT" \
-    '{Logic:{operator:"Or",conditions:([range(200) | {NearBalance:{operator:"Gte",value:"1000000000000000000000000000000000"}}] + [{Whitelist:{accounts:[$p]}}])}}')
-  echo "        condition is $(printf '%s' "$N3_COND" | wc -c | tr -d ' ') bytes" >&2
-  if ! ( set_access "$PROJECT" "$ROW" "$N3_COND" ); then
-    fail "N3 the condition could not be stored (the update_access error is above)"
+  log "N3 the chain-read bound: five leaves are judged, a sixth is not stored"
+  # A leaf that asks the chain costs a view call from inside the enclave, and
+  # they are asked one after another — so the width of a condition is the
+  # length of time it holds a SHARED keystore. The bound is the door's answer
+  # to that, and this row walks both sides of it. Every leaf here is false for
+  # everyone (no account holds 10^33 yocto), so the owner's own name at the end
+  # is reached only after the whole width has been walked.
+  n3_cond() { # n3_cond <chain-read leaves>
+    jq -nc --arg p "$PARENT" --argjson n "$1" \
+      '{Logic:{operator:"Or",conditions:([range($n) | {NearBalance:{operator:"Gte",value:"1000000000000000000000000000000000"}}] + [{Whitelist:{accounts:[$p]}}])}}'
+  }
+
+  # `row_of` answers the row, the literal ERR, or nothing at all, and jq maps
+  # the last two to the same empty string — so a read that FAILED either side
+  # of the refusal would compare equal to a read that failed, and the one
+  # assertion guarding a live row would pass having inspected nothing. The
+  # contract's `access` is never absent on a healthy read, so demanding a
+  # non-empty value costs nothing and closes that.
+  N3_BEFORE=$(jq -Sc '.access // empty' <<<"$(row_of "$PROJECT" "$ROW")")
+  try_update_access "$PARENT" "$PROJECT" "$ROW" "$(n3_cond 6)"
+  if grep -qiE 'asks the chain 6 times' <<<"$TRY_OUT"; then
+    pass "N3 six chain-read leaves are refused by the contract, naming the count"
+  else
+    fail "N3 the contract did not refuse six chain-read leaves: $(head -c 200 <<<"$TRY_OUT")"
+  fi
+  N3_AFTER=$(jq -Sc '.access // empty' <<<"$(row_of "$PROJECT" "$ROW")")
+  if [[ -z "$N3_BEFORE" || -z "$N3_AFTER" ]]; then
+    fail "N3 the row could not be read either side of the refusal (before='${N3_BEFORE:-unread}' after='${N3_AFTER:-unread}') — whether it changed is unknown"
+  elif [[ "$N3_AFTER" == "$N3_BEFORE" ]]; then
+    pass "N3 and the row it refused is unchanged"
+  else
+    fail "N3 the refused edit changed the row anyway: $N3_BEFORE → $N3_AFTER"
+  fi
+
+  if ! ( set_access "$PROJECT" "$ROW" "$(n3_cond 5)" ); then
+    # Against a contract that predates the bound the refusal above LANDS, so
+    # the row may now hold the six-leaf condition. Put the fixture back before
+    # leaving, or every row after this one judges a condition it did not set.
+    fail "N3 the condition AT the bound could not be stored (the update_access error is above)"
+    restore_row
   else
     N3_T0=$SECONDS
     run_as "$PARENT" "$PARENT/$ROW"
@@ -1471,27 +1538,97 @@ if want N3; then
     if [[ "$RUN_OK" == "absent" ]]; then
       fail "N3 no completion event after ${N3_DT}s — the evaluation hung"
     elif [[ "$RUN_OK" == "true" && "$(secret_value USER_SECRET)" == "$USER_CANARY" ]]; then
-      pass "N3 the owner is admitted through 200 chain-read leaves, in ${N3_DT}s end to end"
+      pass "N3 the owner is admitted through five chain-read leaves, in ${N3_DT}s end to end"
     elif grep -qiE "failed to send|timed out|timeout|connection" <<<"$RUN_ERR"; then
-      # Not a verdict on the condition: the keystore did not answer inside the
-      # worker's window, and the caller was handed an infrastructure failure.
-      # No 5xx may surface to the caller; this is the 5xx of this door.
-      fail "N3 the keystore did not answer inside the worker's window (${N3_DT}s): '$(head -c 120 <<<"$RUN_ERR")' — 200 chain-read leaves amplify one call past the timeout, and the caller gets an infrastructure failure, not a verdict"
+      fail "N3 five chain reads did not answer inside the worker's window (${N3_DT}s): '$(head -c 120 <<<"$RUN_ERR")' — the bound is meant to keep this impossible"
     elif grep -qiE "denied|permission" <<<"$RUN_ERR"; then
       fail "N3 the owner was DENIED under a condition whose last branch names them (${N3_DT}s): $(head -c 160 <<<"$RUN_ERR")"
     else
       fail "N3 the owner's run failed for another reason (${N3_DT}s): $(head -c 160 <<<"$RUN_ERR")"
     fi
+    # The stranger walks the same five and is refused by the condition rather
+    # than by a timeout: the two times together say which happened.
+    N3_T1=$SECONDS
     run_as "$STRANGER" "$PARENT/$ROW"
-    [[ "$RUN_OK" == "false" ]] && grep -qiE "denied|permission" <<<"$RUN_ERR" \
-      && pass "N3 the stranger is refused through the same 200 leaves" \
-      || fail "N3 stranger: success=$RUN_OK err='$(head -c 120 <<<"$RUN_ERR")'"
+    N3_DT2=$((SECONDS - N3_T1))
+    if [[ "$RUN_OK" == "false" ]] && grep -qiE "denied|permission" <<<"$RUN_ERR"; then
+      pass "N3 the stranger is refused through the same five leaves, in ${N3_DT2}s"
+    elif grep -qiE "failed to send|timed out|timeout|connection" <<<"$RUN_ERR"; then
+      fail "N3 the stranger's evaluation did not answer inside the window (${N3_DT2}s, against the owner's ${N3_DT}s on the same five leaves): '$(head -c 120 <<<"$RUN_ERR")'"
+    else
+      fail "N3 stranger: success=$RUN_OK (${N3_DT2}s) err='$(head -c 120 <<<"$RUN_ERR")'"
+    fi
     run_as "$STRANGER"
     [[ "$RUN_OK" == "true" ]] \
       && pass "N3 and a caller naming no row is unaffected" \
       || fail "N3 an unrelated caller was refused: $(head -c 120 <<<"$RUN_ERR")"
     restore_row
   fi
+fi
+
+# ── E1 a secret reaches the guest and nowhere else ───────────────────────────
+#
+# The platform's promise is that a decrypted secret exists only inside the
+# enclave that runs the module: the keystore decrypts in its own, the worker
+# receives it in its own over an attested session, and nothing in between
+# writes it down. This row tries to catch the opposite — it plants a value
+# nobody could guess and then looks for it everywhere the platform DOES write:
+# the call's own answer, the stored call record, and the coordinator's rows.
+#
+# The vehicle is connector-probe's `secret` operation, which reports that a key
+# arrived and the first bytes of its HASH, never its value. A guest that echoed
+# its secrets (this suite's own example does, deliberately) would make the
+# search meaningless.
+if ! want E1; then
+  :
+elif [[ -z "$AGENT_PAYMENT_KEY" ]]; then
+  skip "E1 needs AGENT_PAYMENT_KEY (a wallet's key, to call the connector)"
+else
+  log "E1 a planted value must not appear outside the guest"
+  E1_CANARY="canary-$(openssl rand -hex 12)"
+  store "$CONNECTOR_PROJECT" expose "$(jq -nc --arg v "$E1_CANARY" '{PROBE_TOKEN:$v}')" "whitelist:$PARENT,$AGENT_ACCOUNT"
+  call_https "$AGENT_PAYMENT_KEY" "$CONNECTOR_PROJECT" "$PARENT/expose" '{"operation":"secret"}'
+
+  if quota_refused "$RUN_ERR"; then
+    skip "E1 the wallet spent its connector calls for the day — the sweep needs one call that ran"
+  elif [[ "$RUN_OK" != "true" ]]; then
+    fail "E1 the call did not run, so finding nothing proves nothing: $(head -c 140 <<<"$RUN_ERR")"
+  else
+    # The guest saw it: without this the three searches below are satisfied by
+    # a secret that never arrived.
+    [[ "$(jq -r '.secrets[]? | select(.key=="PROBE_TOKEN") | .found // empty' <<<"$RUN_OUT" | head -1)" == "true" ]] \
+      && pass "E1 the guest received the planted secret" \
+      || fail "E1 the guest did not receive it, so the sweep below would prove nothing: $(head -c 160 <<<"$RUN_OUT")"
+
+    grep -qF "$E1_CANARY" <<<"$ANS" \
+      && fail "E1 THE VALUE CAME BACK IN THE CALL'S OWN ANSWER" \
+      || pass "E1 the answer carries the hash of the secret, not the secret"
+
+    E1_ID=$(jq -r '.call_id // empty' <<<"$ANS" 2>/dev/null)
+    if [[ -n "$E1_ID" ]]; then
+      E1_RECORD=$(curl -sS --max-time 60 -H "X-Payment-Key: $AGENT_PAYMENT_KEY" "$COORDINATOR_URL/calls/$E1_ID" 2>/dev/null)
+      grep -qF "$E1_CANARY" <<<"$E1_RECORD" \
+        && fail "E1 THE VALUE IS IN THE STORED CALL RECORD ($E1_ID)" \
+        || pass "E1 the stored call record does not carry it"
+    else
+      skip "E1 the answer named no call id, so the stored record could not be read"
+    fi
+
+    if [[ -z "${PSQL_CMD:-}" ]]; then
+      skip "E1 the coordinator's own rows — set PSQL_CMD (.idea/TESTING-WITH-ADMIN.md §3)"
+    else
+      E1_HITS=$(sql "SELECT count(*) FROM https_calls WHERE input_data::text LIKE '%$E1_CANARY%' OR COALESCE(output_data::text,'') LIKE '%$E1_CANARY%'" 2>/dev/null | tr -d '[:space:]')
+      E1_REQ=$(sql "SELECT count(*) FROM execution_requests WHERE COALESCE(input_data,'') LIKE '%$E1_CANARY%'" 2>/dev/null | tr -d '[:space:]')
+      if [[ -z "$E1_HITS" || -z "$E1_REQ" ]]; then
+        fail "E1 the database could not be read, so its rows are unchecked (hits='$E1_HITS' requests='$E1_REQ')"
+      elif [[ "$E1_HITS" == "0" && "$E1_REQ" == "0" ]]; then
+        pass "E1 and the coordinator's own rows do not carry it either"
+      else
+        fail "E1 THE VALUE IS IN THE COORDINATOR'S ROWS (https_calls=$E1_HITS execution_requests=$E1_REQ)"
+      fi
+    fi
+  fi
+  set_access "$CONNECTOR_PROJECT" expose "$(whitelist "$PARENT")"
 fi
 
 # ── H3 a stranger's row under the owner's project accessor ───────────────────

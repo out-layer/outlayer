@@ -31,3 +31,8 @@ if [[ -z "${RPC_URL:-}" ]]; then
   fi
   unset _k
 fi
+
+# Printing the endpoint. The URL carries the key, so no suite prints $RPC_URL:
+# `rpc_url_public` prints the host and whether a key is on it, which is what a
+# reader of a log needs and all they may have.
+rpc_url_public() { printf '%s %s\n' "${RPC_URL%%\?*}" "$([[ "$RPC_URL" == *apiKey=* ]] && echo '(keyed)' || echo '(UNKEYED)')"; }

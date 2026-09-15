@@ -652,7 +652,7 @@ impl Contract {
         let mut profile_data = self.secrets_storage.get(&key)
             .expect("Secrets not found");
 
-        assert_account_pattern_bounds(&new_access);
+        assert_condition_bounds(&new_access);
 
         // Priced exactly as a store prices it, against the row's real
         // ciphertext and the NEW condition. The binding state is read rather
@@ -727,6 +727,9 @@ impl Contract {
         access: types::AccessCondition,
         vault_id: Option<AccountId>,
     ) -> U128 {
+        // A quote for a condition the store would refuse is a quote for
+        // nothing: the client learns the rule here, before it signs.
+        assert_condition_bounds(&access);
         // The estimate must price the slot the store will actually use.
         let accessor = canonical_accessor(accessor);
         let profile = canonical_profile(&accessor, profile);
@@ -1973,7 +1976,7 @@ impl Contract {
         let accessor = canonical_accessor(accessor);
         let profile = canonical_profile(&accessor, profile);
 
-        assert_account_pattern_bounds(&access);
+        assert_condition_bounds(&access);
 
         // Validate accessor
         match &accessor {
@@ -2380,20 +2383,37 @@ impl Contract {
 pub(crate) const MAX_ACCOUNT_PATTERNS: usize = 16;
 pub(crate) const MAX_ACCOUNT_PATTERN_BYTES: usize = 4096;
 
-fn account_pattern_count(access: &types::AccessCondition) -> (usize, usize) {
+/// The most leaves a condition may hold that are answered by ASKING THE CHAIN:
+/// `NearBalance`, `FtBalance`, `NftOwned`, `DaoMember`. The keystore asks them
+/// one after another from inside the enclave, so a wide condition holds a shared
+/// keystore for the length of that many round trips — the cost lands there and
+/// not on whoever wrote the row, which is why it is bounded here as well
+/// (`shared_tee_helpers::access_limits`, the same number).
+pub(crate) const MAX_CHAIN_READ_LEAVES: usize = 5;
+
+/// `(AccountPattern leaves, bytes of pattern text, leaves that ask the chain)`.
+fn condition_leaf_count(access: &types::AccessCondition) -> (usize, usize, usize) {
     match access {
-        types::AccessCondition::AccountPattern { pattern } => (1, pattern.len()),
+        types::AccessCondition::AccountPattern { pattern } => (1, pattern.len(), 0),
+        types::AccessCondition::NearBalance { .. }
+        | types::AccessCondition::FtBalance { .. }
+        | types::AccessCondition::NftOwned { .. }
+        | types::AccessCondition::DaoMember { .. } => (0, 0, 1),
         types::AccessCondition::Logic { conditions, .. } => conditions
             .iter()
-            .map(account_pattern_count)
-            .fold((0, 0), |(l, b), (l2, b2)| (l + l2, b + b2)),
-        types::AccessCondition::Not { condition } => account_pattern_count(condition),
-        _ => (0, 0),
+            .map(condition_leaf_count)
+            .fold((0, 0, 0), |(l, b, c), (l2, b2, c2)| (l + l2, b + b2, c + c2)),
+        types::AccessCondition::Not { condition } => condition_leaf_count(condition),
+        // Named rather than `_`: a variant added later that asks the chain must
+        // fail to compile here, not silently count as nothing.
+        types::AccessCondition::AllowAll
+        | types::AccessCondition::Whitelist { .. }
+        | types::AccessCondition::ValidUntil { .. } => (0, 0, 0),
     }
 }
 
-fn assert_account_pattern_bounds(access: &types::AccessCondition) {
-    let (leaves, bytes) = account_pattern_count(access);
+fn assert_condition_bounds(access: &types::AccessCondition) {
+    let (leaves, bytes, chain_reads) = condition_leaf_count(access);
     if leaves > MAX_ACCOUNT_PATTERNS {
         env::panic_str(&format!(
             "the condition holds {leaves} AccountPattern leaves; at most {MAX_ACCOUNT_PATTERNS} are judged"
@@ -2402,6 +2422,11 @@ fn assert_account_pattern_bounds(access: &types::AccessCondition) {
     if bytes > MAX_ACCOUNT_PATTERN_BYTES {
         env::panic_str(&format!(
             "the condition's AccountPattern text is {bytes} bytes in all; at most {MAX_ACCOUNT_PATTERN_BYTES} are judged"
+        ));
+    }
+    if chain_reads > MAX_CHAIN_READ_LEAVES {
+        env::panic_str(&format!(
+            "the condition asks the chain {chain_reads} times; at most {MAX_CHAIN_READ_LEAVES} such leaves are judged"
         ));
     }
 }

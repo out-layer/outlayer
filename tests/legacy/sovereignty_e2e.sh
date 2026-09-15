@@ -43,6 +43,8 @@
 #                   via `outlayer login`). Must have >= 5 NEAR for
 #                   atomic deploy + funding the wallet.
 #   MPC_PUBLIC_KEY  bls12381g2:base58 — same value keystore-worker uses.
+#   SECRET_PAYMENT_KEY  a payment key owned by SECRET_PROJECT_OWNER (default
+#                   zavodil2.testnet); the suite carries no key of its own.
 #                   Ask OutLayer ops or pull from keystore config.
 #   NETWORK         testnet (default). mainnet not supported by this
 #                   script (different MPC contract / API URL).
@@ -87,6 +89,16 @@ if [[ -z "${MPC_PUBLIC_KEY:-}" ]]; then
   echo "✗ MPC_PUBLIC_KEY env var is required (bls12381g2:base58)" >&2
   echo "  Ask OutLayer ops for the testnet value — same key the" >&2
   echo "  keystore-worker uses for its MPC client." >&2
+  exit 1
+fi
+
+# Asked for HERE rather than at step 3c, which is where it is used: by then the
+# suite has deployed a vault, minted a wallet and funded it, and there is no
+# trap to give any of that back.
+if [[ -z "${SECRET_PAYMENT_KEY:-}" ]]; then
+  echo "✗ SECRET_PAYMENT_KEY env var is required: a payment key owned by" >&2
+  echo "  SECRET_PROJECT_OWNER (default zavodil2.testnet). A key spends real" >&2
+  echo "  balance, so this suite carries none of its own." >&2
   exit 1
 fi
 
@@ -293,7 +305,7 @@ SECRET_PROJECT_NAME="test-vault"
 SECRET_PROJECT="${SECRET_PROJECT_OWNER}/${SECRET_PROJECT_NAME}"
 SECRET_PROFILE="sov-e2e-$(date +%s)"
 SECRET_VALUE="sovereign-secret-value-$(uuidgen 2>/dev/null || date +%s%N)"
-SECRET_PAYMENT_KEY="${SECRET_PAYMENT_KEY:-zavodil2.testnet:4:a9fadb63c45e3df305ad2bfe48bb5df6793fb9812e5201a4335891d3bfba101a}"
+# Required at the preflight above, so by here it is set.
 
 log "3c. Storing secret MY_TEST_SECRET (profile=$SECRET_PROFILE, vault=$VAULT_ID) under project $SECRET_PROJECT"
 outlayer secrets set \

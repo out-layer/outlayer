@@ -160,13 +160,37 @@ set_access() { # set_access <project> <profile> <access-json>
   note "$1/$2 access → $(jq -c 'if type=="string" then . else keys[0] end' <<<"$3")"
 }
 
+# row_is_gone <project> <profile> — true only on an ANSWER that carries no row.
+# An unreadable answer is not an answer: `row_of` yields the row, the literal
+# ERR, or nothing, and `.encrypted_secrets // empty` maps the last two to the
+# same empty string as a deleted row.
+row_is_gone() {
+  local r; r=$(row_of "$1" "$2")
+  jq empty >/dev/null 2>&1 <<<"$r" || return 1
+  [[ -z "$(jq -r '.encrypted_secrets // empty' <<<"$r")" ]]
+}
+
 delete_row() { # delete_row <project> <profile>
-  near --quiet contract call-function as-transaction "$CONTRACT_ID" delete_secrets \
-    json-args "$(jq -nc --argjson a "$(accessor_json "$1")" --arg pr "$2" '{accessor:$a, profile:$pr}')" \
-    prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' \
-    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1 \
-    || { echo "✗ delete_secrets failed for $1/$2" >&2; exit 1; }
-  local i
+  # The near-cli output is KEPT: a delete that fails for a nonce raced by the
+  # row above it and a delete the contract refused look identical once the
+  # message is thrown away, and the caller is told to remove the row by hand
+  # either way. One retry, because the first kind passes on its own — but the
+  # chain is asked first, because `delete_secrets` PANICS on a row that is
+  # already gone ("Secrets not found"), so retrying a delete that landed and
+  # merely lost its answer would turn a success into a fatal suite abort.
+  local out rc i
+  for i in 1 2; do
+    out=$(near --quiet contract call-function as-transaction "$CONTRACT_ID" delete_secrets \
+      json-args "$(jq -nc --argjson a "$(accessor_json "$1")" --arg pr "$2" '{accessor:$a, profile:$pr}')" \
+      prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' \
+      sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1); rc=$?
+    [[ $rc -eq 0 ]] && break
+    row_is_gone "$1" "$2" && { note "deleted $1/$2 (the answer was lost; the row is gone)"; return 0; }
+    [[ $i -eq 1 ]] && sleep 4
+  done
+  [[ $rc -eq 0 ]] || {
+    echo "✗ delete_secrets failed for $1/$2: $(grep -oE 'panic_msg: [^,}]*|[Ee]rror: .*' <<<"$out" | head -2 | tr '\n' ' ' | head -c 200)" >&2
+    exit 1; }
   for i in $(seq 1 15); do
     [[ -z "$(jq -r '.encrypted_secrets // empty' <<<"$(row_of "$1" "$2")")" ]] && { note "deleted $1/$2"; return 0; }
     sleep 2

@@ -132,7 +132,7 @@ SERVER_PORT=8081
 
 # NEAR Configuration
 NEAR_NETWORK=testnet
-NEAR_RPC_URL=https://rpc.testnet.fastnear.com?apiKey=FASTNEARDEVSUoeFIcg7PpuKnAcwlz4FGPMM2K7GTgWP
+NEAR_RPC_URL=https://rpc.testnet.fastnear.com/?apiKey=<your-fastnear-key>
 OFFCHAINVM_CONTRACT_ID=outlayer.testnet
 
 # Keystore account (must be authorized in contract)

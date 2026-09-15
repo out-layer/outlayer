@@ -92,7 +92,7 @@ create_subaccount "$ASSET" 1.2 || { echo "✗ $ASSET never appeared" >&2; exit 1
 api "$SEED" PUT /wallet/v1/binding "$(jq -nc --arg a "$ASSET" '{asset_account_id:$a, kind:"personal_account"}')" >/dev/null
 [[ "$HTTP" == "200" ]] || { echo "✗ PUT failed $HTTP: $BODY" >&2; exit 1; }
 install_wallet "$ASSET" "$EXECUTOR" || { echo "✗ the setup transaction did not land" >&2; exit 1; }
-fund_account "$EXECUTOR" "$STARVED_NEAR"
+fund_account "$EXECUTOR" "$STARVED_NEAR" || warn "the starving top-up did not land; the balance this suite reasons about is not the one on chain"
 
 ST=""
 for _ in 1 2 3 4 5 6 7 8; do
@@ -221,7 +221,7 @@ fi
 
 # ── F4 the control: the same envelope, once the executor can pay ───────────
 log "F4 topping the executor up and sending the identical envelope"
-fund_account "$EXECUTOR" "$FED_NEAR"
+fund_account "$EXECUTOR" "$FED_NEAR" || warn "the feeding top-up did not land; F4 would then fail for gas, not for the envelope"
 # The binding response caches the balance for 30 seconds (GAS_BALANCE_TTL_SECS),
 # so a read taken straight after the transfer is entitled to be the old one.
 sleep 35

@@ -18,8 +18,6 @@
 #       and is refused on the next — the owner decides whom to admit, and each
 #       admission carries its own allowance. Up to six real messages; needs
 #       AGENT2_PAYMENT_KEY and AGENT2_ACCOUNT, and both agents' connector quota
-#   (G3, the manifest's 400/day per wallet, is not run: the coordinator's
-#   counter is visible only at refusal, and reaching it costs 400 messages)
 #
 # Every send is a REAL email to GMAIL_TEST_TO: one for G2, one for G1, up to
 # six for G4. Whatever happens, the capped policy is put back on exit.
@@ -110,15 +108,30 @@ gmail() {
   https_post "${2:-$AGENT_PAYMENT_KEY}" "$GMAIL" \
     "$(jq -nc --argjson i "$1" --arg o "$PARENT" '{input:$i, secrets_ref:{account_id:$o, profile:"gmail"}}')"
 }
+# gmail is a connector, and a connector call is refused once the WALLET has
+# spent its calls for the day — an answer that says nothing about the policy
+# under test. `gmail_ready` makes the status call a row needs anyway and steps
+# the row aside when the quota is what answered; the rows that cannot start
+# with a status call ask `quota_refused` at each of their own refusals.
+gmail_ready() { # gmail_ready <row> [key] — leaves the status answer in RUN_*
+  gmail '{"operation":"status"}' "${2:-}"
+  quota_refused "$RUN_ERR" || return 0
+  skip "$1 the wallet spent its connector calls for the day ($(head -c 80 <<<"$RUN_ERR")) — run it on a wallet minted for the run"
+  return 1
+}
+
 RUN="$(date -u +%Y%m%dT%H%M%SZ)"
 
 log "Fixture: the owner's row, capped, granted to $AGENT_ACCOUNT"
 store_policy "$CAPPED"
 
 # ── G2 the delegated send ────────────────────────────────────────────────────
-if want G2; then
+if ! want G2; then
+  :
+elif ! gmail_ready G2; then
+  :
+else
   log "G2 the agent sends with the owner's credential"
-  gmail '{"operation":"status"}'
   G2_BEFORE=$(field .output.sent_today); G2_PREFIX=$(field .output.policy.subject_prefix)
   [[ "$RUN_OK" == "true" && "$(field .output.credential)" == "ok" ]] \
     && pass "G2 control: the agent reads the owner's row through the grant (credential=$(field .output.credential), sent_today=$G2_BEFORE)" \
@@ -153,13 +166,19 @@ if want G1; then
   gmail '{"operation":"status"}'
   # A policy that is PRESENT (its recipients read back) and has no cap — an
   # absent or unreadable policy has no max_per_day either.
-  [[ "$RUN_OK" == "true" && -n "$(field .output.policy.recipients)" && "$(field .output.policy.max_per_day)" == "" ]] \
-    && pass "G1 status reads the policy back with no cap" \
-    || fail "G1 status: success=$RUN_OK recipients='$(field .output.policy.recipients)' max_per_day='$(field .output.policy.max_per_day)' (expected a policy with no cap)"
+  if [[ "$RUN_OK" == "true" && -n "$(field .output.policy.recipients)" && "$(field .output.policy.max_per_day)" == "" ]]; then
+    pass "G1 status reads the policy back with no cap"
+  elif quota_refused "$RUN_ERR"; then
+    skip "G1 the wallet spent its connector calls for the day ($(head -c 80 <<<"$RUN_ERR")) — the capless policy is stored and unread"
+  else
+    fail "G1 status: success=$RUN_OK recipients='$(field .output.policy.recipients)' max_per_day='$(field .output.policy.max_per_day)' (expected a policy with no cap)"
+  fi
   gmail "$(jq -nc --arg to "$GMAIL_TEST_TO" --arg s "capless send $RUN" \
     --arg b "sent under a policy with no daily cap" \
     '{operation:"send", to:$to, subject:$s, body:$b}')"
-  if [[ "$RUN_OK" != "true" ]]; then
+  if quota_refused "$RUN_ERR"; then
+    skip "G1 the send never reached the connector: the wallet's calls for the day are spent"
+  elif [[ "$RUN_OK" != "true" ]]; then
     fail "G1 the send did not run: success=$RUN_OK HTTP $HTTP_CODE err='$(head -c 160 <<<"$RUN_ERR")'"
   else
     [[ -n "$(field .output.message_id)" ]] \
@@ -173,9 +192,13 @@ if want G1; then
   log "G1 the cap goes back — a live mailbox does not stay uncapped"
   store_policy "$CAPPED"
   gmail '{"operation":"status"}'
-  [[ "$RUN_OK" == "true" && "$(field .output.policy.max_per_day)" == "50" ]] \
-    && pass "G1 the capped policy is back (max_per_day=$(field .output.policy.max_per_day))" \
-    || fail "G1 THE CAP WAS NOT RESTORED: success=$RUN_OK max_per_day='$(field .output.policy.max_per_day)' — put it back by hand"
+  if [[ "$RUN_OK" == "true" && "$(field .output.policy.max_per_day)" == "50" ]]; then
+    pass "G1 the capped policy is back (max_per_day=$(field .output.policy.max_per_day))"
+  elif quota_refused "$RUN_ERR"; then
+    skip "G1 the restore was STORED but could not be read back — the wallet's calls for the day are spent; check max_per_day by hand"
+  else
+    fail "G1 THE CAP WAS NOT RESTORED: success=$RUN_OK max_per_day='$(field .output.policy.max_per_day)' — put it back by hand"
+  fi
 fi
 
 # ── G4 the cap is per calling agent ─────────────────────────────────────────
@@ -200,6 +223,7 @@ else
     # different rule and reads as "other".
     if [[ "$RUN_OK" == "true" && "$(field .success)" == "true" && -n "$(field .output.message_id)" ]]; then echo ok
     elif [[ "$(field .success)" == "false" ]] && grep -q "messages a day are used" <<<"$(field .error)"; then echo refused
+    elif quota_refused "$RUN_ERR"; then echo quota
     else echo "other: status=$RUN_OK success=$(field .success) error=$(field .error | head -c 90)"; fi
   }
   # g4_agent <who> <key> <room> — sends room+1 times: every send inside the
@@ -207,12 +231,13 @@ else
   # and G4_REFUSED_AT (the index of the refused send, or empty).
   g4_agent() {
     local who=$1 key=$2 room=$3 i r
-    G4_SENT=0; G4_REFUSED_AT=""
+    G4_SENT=0; G4_REFUSED_AT=""; G4_QUOTA=false
     for i in $(seq 1 $(( room + 1 ))); do
       r=$(g4_send "$who" "$key" "$i")
       case "$r" in
         ok)      G4_SENT=$((G4_SENT+1));;
         refused) G4_REFUSED_AT=$i; break;;
+        quota)   G4_QUOTA=true; break;;
         *)       fail "G4 $who send #$i: $r"; break;;
       esac
     done
@@ -223,14 +248,22 @@ else
   A1_ROOM=$(( 2 - ${G4_A1:-0} )); (( A1_ROOM < 0 )) && A1_ROOM=0
   A2_ROOM=$(( 2 - ${G4_A2:-0} )); (( A2_ROOM < 0 )) && A2_ROOM=0
 
+  G4_JUDGED=false
   g4_agent agent1 "$AGENT_PAYMENT_KEY" "$A1_ROOM"
-  [[ "$G4_SENT" == "$A1_ROOM" && "$G4_REFUSED_AT" == "$(( A1_ROOM + 1 ))" ]] \
-    && pass "G4 agent 1 sent its room ($A1_ROOM) and was refused by the cap on send #$G4_REFUSED_AT" \
-    || fail "G4 agent 1: sent $G4_SENT of room $A1_ROOM, refused at '${G4_REFUSED_AT:-never}' (expected #$(( A1_ROOM + 1 )))"
+  if [[ "$G4_QUOTA" == true ]]; then
+    skip "G4 agent 1: the wallet's connector calls for the day ran out after $G4_SENT of $A1_ROOM — the owner's cap is not what refused it"
+  elif [[ "$G4_SENT" == "$A1_ROOM" && "$G4_REFUSED_AT" == "$(( A1_ROOM + 1 ))" ]]; then
+    G4_JUDGED=true
+    pass "G4 agent 1 sent its room ($A1_ROOM) and was refused by the cap on send #$G4_REFUSED_AT"
+  else
+    fail "G4 agent 1: sent $G4_SENT of room $A1_ROOM, refused at '${G4_REFUSED_AT:-never}' (expected #$(( A1_ROOM + 1 )))"
+  fi
 
   # Agent 2 after agent 1 is capped: its own room, its own refusal past it.
   g4_agent agent2 "$AGENT2_PAYMENT_KEY" "$A2_ROOM"
-  if (( A2_ROOM > 0 )); then
+  if [[ "$G4_QUOTA" == true ]]; then
+    skip "G4 agent 2: the second wallet's connector calls for the day ran out after $G4_SENT of $A2_ROOM — the owner's cap is not what refused it"
+  elif (( A2_ROOM > 0 )); then
     [[ "$G4_SENT" == "$A2_ROOM" && "$G4_REFUSED_AT" == "$(( A2_ROOM + 1 ))" ]] \
       && pass "G4 agent 2 sent its own room ($A2_ROOM) after agent 1 was capped and was refused on send #$G4_REFUSED_AT — counted per agent" \
       || fail "G4 agent 2: sent $G4_SENT of room $A2_ROOM, refused at '${G4_REFUSED_AT:-never}' (expected #$(( A2_ROOM + 1 ))) — agent 1's spend reached agent 2's counter?"
@@ -242,7 +275,20 @@ else
       || fail "G4 agent 2 at its cap: refused at '${G4_REFUSED_AT:-never}', expected #1"
     skip "G4 agent 2 had no room left today (counter $G4_A2 of 2): that it still sends after agent 1 is capped needs a fresh day"
   fi
+  # The per-agent cap is what this suite exists to show. A run where it stepped
+  # aside is not a run that passed: say so with an exit code, not only a line.
+  if [[ "${G4_JUDGED:-false}" != true ]]; then
+    warn "G4 was not judged — the owner's cap per calling agent is unproven by this run"
+    G4_UNJUDGED=true
+  fi
   store_policy "$CAPPED"
 fi
 
-verdict "gmail delegation"
+verdict "gmail delegation"; RC=$?
+
+# A suite whose central row never ran exits 3 (NOTHING), the same code the
+# runner renders as "silent about what it covers". A real failure keeps its
+# own status: 3 is for a run that judged nothing, not for one that judged and
+# found something wrong.
+if [[ "${G4_UNJUDGED:-false}" == true && $RC -eq 0 ]]; then RC=3; fi
+exit $RC

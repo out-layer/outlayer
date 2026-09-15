@@ -198,7 +198,7 @@ log "L velocity TOCTOU — three concurrent spends against a cap that admits one
 SEED_L="hos-toctou-$(date +%s)-$$"
 read -r WID_L ADDR_L < <(wallet_address "$SEED_L")
 if [[ -n "$WID_L" ]]; then
-  fund_account "$ADDR_L" 0.15 && sleep 3
+  fund_account "$ADDR_L" 0.15 && sleep 3 || warn "the top-up did not land; a refusal below may be about gas rather than about the rule"
   POL_L=$(jq -nc --arg w "$WL" '{rules:{addresses:{mode:"whitelist",list:[$w]}, limits:{daily:{native:"600000000000000000000"}}}}')
   if store_policy "$SEED_L" "$WID_L" "$POL_L"; then
     BEFORE_L=$(account_field "$WL" amount)
@@ -272,7 +272,7 @@ read -r WID_N ADDR_N < <(wallet_address "$SEED_N")
 # store_policy also reveals the wallet's own public key, which is what
 # freeze_wallet is keyed on.
 if [[ -n "$WID_N" ]] && store_policy "$SEED_N" "$WID_N" '{"rules":{"addresses":{"mode":"none","list":[]}},"capabilities":{"evm_sign":{"allowed":true}}}'; then
-  fund_account "$ADDR_N" 0.05 && sleep 3
+  fund_account "$ADDR_N" 0.05 && sleep 3 || warn "the top-up did not land; a refusal below may be about gas rather than about the rule"
   api "$SEED_N" POST /wallet/v1/evm/sign-message '{"chain":"ethereum","message":"hi"}' >/dev/null
   assert_status "N0 control — the wallet signs while unfrozen" 200
   if near_tty "near contract call-function as-transaction $CONTRACT_ID freeze_wallet \

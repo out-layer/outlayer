@@ -48,8 +48,22 @@ fi
 
 SEED="hos-fixture-$(date +%s)-$$"
 log "Minting the custody wallet"
-read -r WALLET_ID EXECUTOR < <(wallet_address "$SEED")
-[[ -n "$WALLET_ID" ]] || { echo "✗ /address failed: $BODY" >&2; exit 1; }
+# The wallet routes carry ONE 100/min bucket per client address, and a full
+# family run — or anything else arriving from the same address — leaves it
+# spent for minutes. A fixture that dies on the first 429 has already created
+# an account and spends the next one on nothing, so the two calls that build it
+# wait the window out instead of failing the run.
+# `wallet_address` runs in a process substitution, so the HTTP status and body
+# it sets never reach this shell — it says what happened on stderr itself, and
+# printing $BODY here would blame /address for some earlier call's answer.
+for attempt in 1 2 3; do
+  read -r WALLET_ID EXECUTOR < <(wallet_address "$SEED")
+  [[ -n "$WALLET_ID" ]] && break
+  [[ $attempt -lt 3 ]] || break
+  warn "the mint did not answer with a wallet (its reason is above); waiting out the rate-limit window ($attempt/3)"
+  sleep 70
+done
+[[ -n "$WALLET_ID" ]] || { echo "✗ /address never answered with a wallet — see the reason above" >&2; exit 1; }
 note "wallet_id $WALLET_ID / executor $EXECUTOR"
 
 ASSET="hos-$(openssl rand -hex 3).$PARENT"
@@ -57,7 +71,13 @@ log "Creating the asset account $ASSET"
 create_subaccount "$ASSET" 0.6 || { echo "✗ $ASSET never appeared" >&2; exit 1; }
 
 log "PUT the binding"
-api "$SEED" PUT /wallet/v1/binding "$(jq -nc --arg a "$ASSET" '{asset_account_id:$a, kind:"personal_account"}')" >/dev/null
+for attempt in 1 2 3; do
+  api "$SEED" PUT /wallet/v1/binding "$(jq -nc --arg a "$ASSET" '{asset_account_id:$a, kind:"personal_account"}')" >/dev/null
+  [[ "$HTTP" != "429" ]] && break
+  [[ $attempt -lt 3 ]] || break
+  warn "the binding PUT was rate limited; waiting out the window ($attempt/3)"
+  sleep 70
+done
 [[ "$HTTP" == "200" ]] || { echo "✗ PUT failed $HTTP: $BODY" >&2; exit 1; }
 
 log "Installing the wallet contract + executor extension"

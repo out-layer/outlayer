@@ -258,7 +258,7 @@ api "$SEED_S" PUT /wallet/v1/binding \
 assert_status "the leased binding was accepted" 200
 
 set_status "$(status_json "$GRANT_OK")" || true
-fund_account "$EXEC_S" 0.25
+fund_account "$EXEC_S" 0.25 || warn "the executor was not funded; a refusal below may be about gas"
 # Empty of custody rules on purpose: whatever refuses below is the leased
 # profile speaking, not the address/limit engine §4 already covers.
 store_policy "$SEED_S" "$WID_S" '{"rules":{"addresses":{"mode":"none","list":[]}}}' \

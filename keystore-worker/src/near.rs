@@ -286,14 +286,19 @@ impl NearClient {
             let token: Option<serde_json::Value> = serde_json::from_slice(&result)
                 .context("Failed to parse NFT token response")?;
 
-            if let Some(token_data) = token {
-                // Check if owner_id matches account_id
-                if let Some(owner_id) = token_data.get("owner_id").and_then(|v| v.as_str()) {
-                    return Ok(owner_id == account_id);
-                }
+            match token {
+                // The standard's answer for a token that does not exist.
+                None => Ok(false),
+                Some(token_data) => match token_data.get("owner_id").and_then(|v| v.as_str()) {
+                    Some(owner_id) => Ok(owner_id == account_id),
+                    // A token that exists and states no owner is an answer we
+                    // cannot read, not an answer of "no". Under `Not` a false
+                    // here would ADMIT, so it is an error at every combinator.
+                    None => anyhow::bail!(
+                        "NftOwned cannot be evaluated: {nft_contract} answered token {specific_token_id:?} with no owner_id"
+                    ),
+                },
             }
-
-            Ok(false)
         } else {
             // Check if owns any token from this contract
             let args = json!({
@@ -438,12 +443,15 @@ impl NearClient {
                 );
             }
 
-            // Unknown role kind
-            tracing::warn!(
-                role_kind = %serde_json::to_string(kind).unwrap_or_default(),
-                "Unknown role kind in DAO policy"
+            // A role whose kind this build does not understand is an answer we
+            // cannot read. Under `Not` a false here would ADMIT everyone, so it
+            // refuses at every combinator instead.
+            anyhow::bail!(
+                "DaoMember cannot be evaluated: role '{}' on {} has kind {}, which this keystore does not understand",
+                role_name,
+                dao_contract,
+                serde_json::to_string(kind).unwrap_or_default()
             );
-            return Ok(false);
         }
 
         // Role not found in policy

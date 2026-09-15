@@ -285,6 +285,11 @@ impl AccessCondition {
     /// it sits), a chain read that failed or has no client, a time limit that
     /// is not a number — and an error refuses at every combinator: `Not`
     /// propagates it rather than negating a guess, `And`/`Or` stop at it.
+    /// Test-only, and deliberately so: it compiles and evaluates WITHOUT the
+    /// bounds `judge_access` applies first, so a production caller reaching
+    /// for it would be a door with no limit on how many patterns are compiled
+    /// or how many times the chain is asked. The door is `judge_access`.
+    #[cfg(test)]
     pub async fn validate(&self, caller: &str, near_client: Option<&crate::near::NearClient>) -> anyhow::Result<bool> {
         let patterns = self.compile_patterns().map_err(anyhow::Error::new)?;
         self.evaluate(caller, near_client, &patterns).await

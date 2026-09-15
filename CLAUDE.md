@@ -109,6 +109,27 @@ suite past that warning. A suite that only shells out to near-cli reads
 near-cli's own `rpc_url`, the keyed URL `rpc.sh` falls back to. A new suite
 sources `lib/rpc.sh` rather than spelling an RPC host of its own.
 
+## Secrets never reach the terminal
+A keyed RPC URL, a payment key, a `wk_` token, an admin bearer, a private key
+and the body of any `.env` are secrets. None of them is echoed, logged, or
+written to a tracked file — **not even through a redaction filter**: a filter
+runs on a value that is already interpolated, and one quoting slip prints it
+whole. Print a FACT about the secret instead — present or absent, its length,
+its first four characters — or the safe half of it: suites read the endpoint
+through `rpc_url_public` (the host, and whether a key is on it), never
+`$RPC_URL`.
+
+Reach a secret where it is consumed and nowhere else: `set -a; source <file>;
+set +a` in the same command that uses it. Pass it through the environment
+rather than a command line, which `ps` shows to every process on the box (the
+one decided exception is `outlayer secrets set`, whose argument is the
+product's own interface). A test fixture carries no default credential: a
+missing one is `${VAR:?...}`, never a literal.
+
+A secret that has reached a tracked file, a shared log or a transcript is
+ROTATED, not edited out — the old value stays in git history and in whatever
+already read it.
+
 ## Commands
 ```bash
 cd contract && ./build.sh                # Build contract

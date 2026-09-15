@@ -1203,12 +1203,13 @@ mod a_reference_the_contract_could_never_match {
 
 
 #[cfg(test)]
-mod a_condition_past_the_pattern_bounds_is_not_stored {
+mod a_condition_past_the_bounds_is_not_stored {
     //! The keystore refuses to judge a condition with more than
-    //! `MAX_ACCOUNT_PATTERNS` leaves or more than `MAX_ACCOUNT_PATTERN_BYTES`
-    //! of pattern text; both store doors refuse to store one.
+    //! `MAX_ACCOUNT_PATTERNS` leaves, more than `MAX_ACCOUNT_PATTERN_BYTES` of
+    //! pattern text, or more than `MAX_CHAIN_READ_LEAVES` leaves it can only
+    //! answer by asking the chain; both store doors refuse to store one.
     use super::*;
-    use crate::secrets::{MAX_ACCOUNT_PATTERNS, MAX_ACCOUNT_PATTERN_BYTES};
+    use crate::secrets::{MAX_ACCOUNT_PATTERNS, MAX_ACCOUNT_PATTERN_BYTES, MAX_CHAIN_READ_LEAVES};
     use crate::types::{AccessCondition, LogicOperatorV1};
     use near_sdk::test_utils::{accounts, VMContextBuilder};
     use near_sdk::{testing_env, NearToken};
@@ -1275,4 +1276,119 @@ mod a_condition_past_the_pattern_bounds_is_not_stored {
             or_of_patterns((0..=MAX_ACCOUNT_PATTERNS).map(|i| format!("a{i}\\.near")).collect()),
         );
     }
+
+    /// One leaf of each kind the keystore can only answer by asking the chain.
+    fn chain_reads(n: usize) -> AccessCondition {
+        let kinds = [0, 1, 2, 3];
+        AccessCondition::Logic {
+            operator: LogicOperatorV1::Or,
+            conditions: (0..n)
+                .map(|i| match kinds[i % 4] {
+                    0 => AccessCondition::NearBalance {
+                        operator: crate::types::ComparisonOperatorV1::Gte,
+                        value: NearToken::from_near(1),
+                    },
+                    1 => AccessCondition::FtBalance {
+                        contract: accounts(3),
+                        operator: crate::types::ComparisonOperatorV1::Gte,
+                        value: NearToken::from_near(1),
+                    },
+                    2 => AccessCondition::NftOwned { contract: accounts(4), token_id: None },
+                    _ => AccessCondition::DaoMember { dao_contract: accounts(5), role: "council".to_string() },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn five_chain_reads_are_stored() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "reads", chain_reads(MAX_CHAIN_READ_LEAVES));
+    }
+
+    #[test]
+    #[should_panic(expected = "asks the chain 6 times; at most 5 such leaves are judged")]
+    fn one_chain_read_past_the_bound_is_refused_at_store() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "reads", chain_reads(MAX_CHAIN_READ_LEAVES + 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "asks the chain 6 times")]
+    fn the_chain_read_bound_holds_at_update_access_too() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "row", AccessCondition::AllowAll);
+        contract.update_access(
+            SecretAccessor::Repo { repo: "github.com/alice/project".to_string(), branch: None },
+            "row".to_string(),
+            chain_reads(MAX_CHAIN_READ_LEAVES + 1),
+        );
+    }
+
+    /// A whitelist is answered from the condition itself: neither its size nor
+    /// the NUMBER of whitelist leaves may count against the chain-read bound.
+    /// Six of them would be refused if `Whitelist` ever joined that set.
+    #[test]
+    fn a_whitelist_asks_the_chain_nothing_however_many_there_are() {
+        let (mut contract, _) = contract_and_user();
+        let accounts_list: Vec<AccountId> =
+            (0..200).map(|i| format!("a{i}.near").parse().unwrap()).collect();
+        store(&mut contract, "wide", AccessCondition::Whitelist { accounts: accounts_list });
+        store(&mut contract, "many", AccessCondition::Logic {
+            operator: LogicOperatorV1::Or,
+            conditions: (0..6)
+                .map(|i| AccessCondition::Whitelist {
+                    accounts: vec![format!("a{i}.near").parse().unwrap()],
+                })
+                .collect(),
+        });
+    }
+
+    /// The counter walks `Not` and nested `Logic`. Without this, folding the
+    /// `Not` arm into the free variants would leave every test green here
+    /// while the keystore still refused the row — the two doors disagreeing
+    /// about one condition, which is the failure this pair of bounds exists
+    /// to prevent.
+    #[test]
+    #[should_panic(expected = "asks the chain 6 times")]
+    fn chain_reads_under_not_are_counted() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "notted", AccessCondition::Not {
+            condition: Box::new(chain_reads(MAX_CHAIN_READ_LEAVES + 1)),
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "asks the chain 6 times")]
+    fn chain_reads_in_a_nested_logic_are_counted() {
+        let (mut contract, _) = contract_and_user();
+        let nested = AccessCondition::Logic {
+            operator: LogicOperatorV1::And,
+            conditions: vec![
+                AccessCondition::Whitelist { accounts: vec![accounts(2)] },
+                AccessCondition::Logic {
+                    operator: LogicOperatorV1::Or,
+                    conditions: vec![
+                        chain_reads(3),
+                        AccessCondition::Not { condition: Box::new(chain_reads(3)) },
+                    ],
+                },
+            ],
+        };
+        store(&mut contract, "nested", nested);
+    }
+
+    /// The bound is on leaves, not on depth: five of them, however they are
+    /// wrapped, are stored.
+    #[test]
+    fn five_chain_reads_are_stored_however_they_are_wrapped() {
+        let (mut contract, _) = contract_and_user();
+        store(&mut contract, "wrapped", AccessCondition::Not {
+            condition: Box::new(AccessCondition::Logic {
+                operator: LogicOperatorV1::Or,
+                conditions: vec![chain_reads(2), AccessCondition::Not { condition: Box::new(chain_reads(3)) }],
+            }),
+        });
+    }
+
 }

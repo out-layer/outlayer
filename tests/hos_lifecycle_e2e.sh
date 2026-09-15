@@ -55,7 +55,7 @@ create_subaccount "$ACC" 0.7 || { echo "✗ $ACC never appeared" >&2; exit 1; }
 api "$SEED_L" PUT /wallet/v1/binding "$(jq -nc --arg a "$ACC" '{asset_account_id:$a, kind:"personal_account"}')" >/dev/null
 [[ "$HTTP" == "200" ]] || { echo "✗ PUT failed $HTTP: $BODY" >&2; exit 1; }
 install_wallet "$ACC" "$EXEC_L" || { echo "✗ the setup transaction did not land" >&2; exit 1; }
-fund_account "$EXEC_L" 0.25
+fund_account "$EXEC_L" 0.25 || warn "the executor was not funded; a refusal below may be about gas, not about the binding"
 store_policy "$SEED_L" "$WID_L" "$(jq -nc --arg a "$ACC" --arg w "$WL" \
   '{rules:{addresses:{mode:"whitelist",list:[$a,$w]},limits:{per_transaction:{native:"1000000000000000000000000"}}}}')" \
   || { echo "✗ policy not stored" >&2; exit 1; }
@@ -74,8 +74,10 @@ assert_status "R5a the lane works" 200
 # ── R5b/R5c the executor is cut from the control set ───────────────────────
 log "R5b the owner signs RemoveExtension(executor) directly on the account"
 REMOVE=$(jq -nc --arg e "$EXEC_L" '{request:{internal:[{op:"remove_extension",payload:{account_id:$e}}]}}')
+CUT_LANDED=false
 if extension_op "$ACC" "$REMOVE"; then
   pass "R5b the removal landed on chain"
+  CUT_LANDED=true
 else
   fail "R5b the removal transaction did not land — nothing below is judgeable"
 fi
@@ -85,16 +87,25 @@ fi
 CUT_AT=$(date +%s)
 call_ext "$SEED_L" "$ACC" "$(ext_transfer "$WL" "$TINY")" >/dev/null
 IMMEDIATE_HTTP=$HTTP; IMMEDIATE_CLASS=$(class_of)
+IMMEDIATE_ERR=$(jq -r '.error // empty' <<<"$BODY" 2>/dev/null)
 if [[ "$IMMEDIATE_HTTP" == "403" && "$IMMEDIATE_CLASS" == "executor_not_in_control_set" ]]; then
   pass "R5c refused $(( $(date +%s) - CUT_AT ))s after the cut, class '$IMMEDIATE_CLASS' — inside the 5 s window, so no cached permission outlived the fact"
-elif [[ "$IMMEDIATE_HTTP" == "200" ]]; then
-  # A cached allow inside the window is the documented behaviour, not a defect;
-  # what would be a defect is the refusal never arriving.
-  note "the call inside the cache window was still admitted — re-asking after the TTL"
+elif [[ "$IMMEDIATE_HTTP" == "200" || "$IMMEDIATE_ERR" == "onchain_tx_failed" ]]; then
+  # Two shapes, one cause: inside the window the gate still holds the cached
+  # ALLOW. Either it admits the call, or it sends it to the chain — which
+  # refuses it as a contract panic carrying no class and no terminal flag,
+  # because `onchain_tx_failed` has neither. Both are the cache speaking, not a
+  # verdict about the cut, so the row re-asks past the TTL and judges THAT.
+  [[ "$IMMEDIATE_HTTP" == "200" ]] \
+    && note "the call inside the cache window was still admitted — re-asking after the TTL" \
+    || note "inside the cache window the call reached the CHAIN and was refused there, unclassified — re-asking after the TTL"
   sleep 7
   call_ext "$SEED_L" "$ACC" "$(ext_transfer "$WL" "$TINY")" >/dev/null
   assert_class "R5c refused once the 5 s observation cache expired" "executor_not_in_control_set"
-  finding "a cut executor was still admitted for up to OBSERVATION_TTL_SECS (5 s) after RemoveExtension landed. That is the documented cache, and the partner's R5 wording is 'immediately' — worth stating to them explicitly as a bounded 5 s window rather than letting them discover it."
+  # Only when the executor really was cut AND the gate really did let the call
+  # through: an unlanded removal, or a wallet skipped at its custody cap, would
+  # otherwise file a report about a window nobody opened.
+  [[ "$CUT_LANDED" == true && "$(class_of)" == "executor_not_in_control_set" ]] && finding "a cut executor is still let through the GATE for up to OBSERVATION_TTL_SECS (5 s) after RemoveExtension landed: the call is either admitted or sent to the chain, which refuses it as \`onchain_tx_failed\` with no class and no terminal flag — so inside that window a client cannot route on the answer. That is the documented cache, and the partner's R5 wording is 'immediately' — worth stating to them as a bounded 5 s window rather than letting them discover it."
 else
   fail "R5c refused as HTTP $IMMEDIATE_HTTP class '${IMMEDIATE_CLASS:-none}', expected executor_not_in_control_set: $(msg_of)"
 fi

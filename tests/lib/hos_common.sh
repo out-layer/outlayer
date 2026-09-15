@@ -72,6 +72,9 @@ verdict() {
 # ── preflight ────────────────────────────────────────────────────────────────
 
 hos_require() {
+  # Which endpoint this run reads the chain through — the host and whether a
+  # key is on it, never the URL, which carries the key.
+  note "RPC: $(rpc_url_public)"
   local tool
   for tool in jq curl near openssl base64; do
     command -v "$tool" >/dev/null || { echo "✗ missing $tool" >&2; exit 1; }
@@ -183,7 +186,10 @@ msg_of()   { jq -r '.message // .error // ""' <<<"${1:-$BODY}" 2>/dev/null | hea
 # suite that reports one as a policy failure sends the reader to fix the wrong
 # thing — the mistake the admin runbook calls out by name.
 exhausted() {
-  grep -qiE "limit reached: [0-9]+ per (month|day) for custody|Daily connector quota reached|already has its trial key" <<<"$BODY"
+  # The connector quota is spelled once, in `quota_refused`; the rest are the
+  # allowances this helper knows about.
+  quota_refused "$BODY" && return 0
+  grep -qiE "limit reached: [0-9]+ per (month|day) for custody|already has its trial key" <<<"$BODY"
 }
 
 # assert_status <desc> <expected-http>
@@ -310,8 +316,24 @@ near_tty() {
 }
 
 fund_account() {
-  near --quiet tokens "$PARENT" send-near "$1" "$2 NEAR" \
-    network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+  # A transfer of NEAR is what CREATES an implicit account, so a silent failure
+  # here leaves an account that does not exist while everything downstream —
+  # a token balance, a registration — reads as ready. The message is kept and
+  # the status returned; one retry, because the usual cause is a nonce raced
+  # by the transaction before it on the same access key.
+  local out rc i
+  for i in 1 2; do
+    out=$(near --quiet tokens "$PARENT" send-near "$1" "$2 NEAR" \
+      network-config "$NETWORK" sign-with-keychain send 2>&1); rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    # Only what a retry can fix. A transfer whose ANSWER was lost may already
+    # be on chain, and sending it again doubles an amount some suites choose
+    # deliberately (a starved executor is starved by its balance).
+    grep -qiE 'expired|connection refused|dns error|could not resolve|failed to connect' <<<"$out" || break
+    [[ $i -eq 1 ]] && sleep 4
+  done
+  warn "could not send $2 NEAR to $1: $(grep -oE 'panic_msg: [^,}]*|[Ee]rror: .*' <<<"$out" | head -1 | head -c 160)"
+  return 1
 }
 
 create_subaccount() {
@@ -405,6 +427,13 @@ wallet_address() {
   local r
   api "$1" GET "/wallet/v1/address?chain=near" >/dev/null
   r="$BODY"
+  # The coordinator answers a rate limit and a gateway fault in PLAIN TEXT, and
+  # handing that to jq prints a parse error where the reason belongs — which is
+  # how a run whose fixture was merely rate-limited reads as a broken endpoint.
+  if [[ "$HTTP" != "200" ]] || ! jq -e . >/dev/null 2>&1 <<<"$r"; then
+    warn "/wallet/v1/address answered HTTP $HTTP: $(head -c 140 <<<"$r")"
+    return 1
+  fi
   printf '%s %s\n' "$(jq -r '.wallet_id // empty' <<<"$r")" "$(jq -r '.address // empty' <<<"$r")"
 }
 
@@ -427,7 +456,7 @@ new_bound_wallet() {
   api "$SEED" PUT /wallet/v1/binding "$(jq -nc --arg a "$ASSET" '{asset_account_id:$a, kind:"personal_account"}')" >/dev/null
   [[ "$HTTP" == "200" ]] || { warn "$tag: PUT failed $HTTP: $BODY"; return 1; }
   install_wallet "$ASSET" "$EXECUTOR" || { warn "$tag: the setup transaction did not land"; return 1; }
-  fund_account "$EXECUTOR" 0.3
+  fund_account "$EXECUTOR" 0.3 || warn "the executor was not topped up; a spend below may fail for gas rather than for the rule"
   local i
   for i in 1 2 3 4 5 6 7 8; do
     api "$SEED" GET /wallet/v1/binding >/dev/null
@@ -462,27 +491,57 @@ buy_payment_key() {
   local minimal="${FUND_USDC_MINIMAL:-1500000}" deposit="${DEPOSIT_USDC:-0.30}"
   PAID_KEY=""
 
-  near --quiet contract call-function as-transaction "$token" storage_deposit \
+  # The message is kept: a storage_deposit that never lands leaves the poll
+  # below to report "the token never registered the account", which names the
+  # symptom and hides the cause (a raced nonce, an expired block, a refusal).
+  local SD_OUT FT_OUT
+  SD_OUT=$(near --quiet contract call-function as-transaction "$token" storage_deposit \
     json-args "$(jq -nc --arg a "$addr" '{account_id:$a, registration_only:true}')" \
     prepaid-gas '30.0 Tgas' attached-deposit '0.00125 NEAR' \
-    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1) \
+    || warn "storage_deposit for $addr did not land: $(grep -oE 'panic_msg: [^,}]*|[Ee]rror: .*' <<<"$SD_OUT" | head -1 | head -c 160)"
   # The registration has to be FINAL before the tokens are sent: NEP-141 refuses
   # a transfer to an account it has not registered, and the two calls go out on
   # one access key back to back.
-  for i in $(seq 1 10); do
+  # "Not registered" and "could not ask" are different answers, and reporting
+  # the view's failure as the chain's verdict is how a fixture calls a landed
+  # storage_deposit a failure. The last ERR is remembered and named.
+  # A registration can take upwards of a minute to become visible through the
+  # view, so the wait is sized to that: a deposit that landed must never be
+  # reported as one that did not.
+  local last_err=""
+  for i in $(seq 1 24); do
     reg=$(near_view "$token" storage_balance_of "$(jq -nc --arg a "$addr" '{account_id:$a}')")
     [[ -n "$reg" && "$reg" != "null" && "$reg" != "ERR" ]] && break
-    reg=""; sleep 2
+    # `near_view` says ERR on an RPC error and NOTHING when curl or jq died;
+    # both mean "we could not ask", which is not "there is no registration".
+    [[ "$reg" == "ERR" || -z "$reg" ]] && last_err="the view itself did not answer"
+    reg=""; sleep 5
   done
-  [[ -n "$reg" ]] || { warn "$token never registered $addr — the storage_deposit did not land"; return 1; }
+  [[ -n "$reg" ]] || {
+    warn "$token still shows no registration for $addr after 2 minutes${last_err:+ — $last_err}"; return 1; }
 
-  near --quiet contract call-function as-transaction "$token" ft_transfer \
+  FT_OUT=$(near --quiet contract call-function as-transaction "$token" ft_transfer \
     json-args "$(jq -nc --arg a "$addr" --arg m "$minimal" '{receiver_id:$a, amount:$m}')" \
     prepaid-gas '30.0 Tgas' attached-deposit '1 yoctoNEAR' \
-    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1) \
+    || warn "ft_transfer to $addr did not land: $(grep -oE 'panic_msg: [^,}]*|[Ee]rror: .*' <<<"$FT_OUT" | head -1 | head -c 160)"
   # NEAR as well as tokens: the key is created by transactions the KEYSTORE
   # signs as this wallet, and they pay their own gas and storage deposits.
-  fund_account "$addr" 1.0
+  # A failed `fund_account` is not proof the account is absent: the send may
+  # have landed and lost its answer. Ask the chain before giving up on it.
+  if ! fund_account "$addr" 1.0 && ! account_exists "$addr"; then
+    warn "$addr was never funded and is not on chain — create-payment-key would refuse it as invisible"
+    return 1
+  fi
+  # The ACCOUNT has to exist, not merely hold tokens: a NEP-141 balance lives
+  # in the token contract and says nothing about the account being on chain,
+  # and it is the account the coordinator looks for when it signs as it.
+  for i in $(seq 1 10); do
+    account_exists "$addr" && break
+    [[ $i -eq 10 ]] && { warn "$addr is still not on chain after the transfer"; return 1; }
+    sleep 2
+  done
 
   for i in $(seq 1 10); do
     have=$(near_view "$token" ft_balance_of "$(jq -nc --arg a "$addr" '{account_id:$a}')" | tr -d '"')
@@ -499,6 +558,47 @@ buy_payment_key() {
   # instead of to the funding above.
   [[ -n "$PAID_KEY" ]] || { warn "create-payment-key refused (HTTP $HTTP): $(jq -r '.message // .error // .' <<<"$BODY" | head -c 200)"; return 1; }
   return 0
+}
+
+# ── the day's connector quota ────────────────────────────────────────────────
+# A connector call refused because the wallet has spent its calls for the day
+# reads exactly like one refused by an access condition, and the quota belongs
+# to the WALLET's age, not to the row under test. Every connector row asks this
+# before it judges a refusal, and skips itself rather than reporting a verdict
+# it cannot justify.
+quota_refused() { grep -qiE 'connector_quota_exceeded|daily connector quota' <<<"${1:-}"; }
+
+# mint_agent_wallet — a coordinator-minted wallet with a payment key of its own,
+# for a run that needs an UNSPENT connector counter. Sets MINTED_WK,
+# MINTED_ACCOUNT and MINTED_PAYMENT_KEY. A wallet minted today sits at the
+# FLOOR of the quota ladder (the allowance grows with the wallet's age), which
+# is a handful of calls — enough for the connector rows, never for a suite that
+# leans on volume. Signs as $PARENT to fund it, so nothing else may be signing.
+mint_agent_wallet() {
+  local r attempt
+  for attempt in 1 2; do
+    MINTED_WK=""; MINTED_ACCOUNT=""; MINTED_PAYMENT_KEY=""
+    r=$(curl -sS --max-time 60 -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d '{}')
+    MINTED_WK=$(jq -r '.api_key // empty' <<<"$r")
+    MINTED_ACCOUNT=$(jq -r '.near_account_id // empty' <<<"$r")
+    [[ -n "$MINTED_WK" && -n "$MINTED_ACCOUNT" ]] || {
+      warn "/register minted no wallet: $(jq -c 'del(.api_key)' <<<"$r" 2>/dev/null | head -c 200)"; return 1; }
+    if buy_payment_key "$MINTED_WK" "$MINTED_ACCOUNT"; then
+      MINTED_PAYMENT_KEY="$PAID_KEY"
+      note "minted ${MINTED_ACCOUNT:0:10}… for the connector rows (a wallet minted today carries the quota floor)"
+      return 0
+    fi
+    # The purchase is never retried on the SAME wallet: the coordinator refuses
+    # a transfer it could not confirm and says a second call would mint another
+    # key and pay another deposit whatever the first one did. Its own answer
+    # names the way to find out — `GET /public/payment-keys/{owner}/{nonce}/
+    # balance` answers for a key that exists, and the contract's
+    # `get_next_payment_key_nonce` names the next free nonce — which is worth
+    # having for a wallet somebody owns. A fixture's wallet is worth nothing:
+    # a fresh one costs the same deposit and leaves nothing half-done behind.
+    [[ $attempt -eq 1 ]] && { warn "the key purchase failed; starting over with a new wallet"; sleep 5; }
+  done
+  return 1
 }
 
 # ── the w_execute_extension envelope ─────────────────────────────────────────
