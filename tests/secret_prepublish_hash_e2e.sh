@@ -19,10 +19,14 @@
 #       worker uses. Two builds that disagree stop the suite: a number that is
 #       not reproducible cannot be locked to, and a suite that carried on would
 #       be testing a coincidence
-#   P1  the secret is stored locked to that hash BEFORE the project exists.
-#       The order is the point — a row written after a first run proves nothing
-#       about knowing the hash in advance
-#   P2  the project is published from the same repo and commit
+#   P1  the project is published from that repo and commit, and NOT run
+#   P2  the secret is stored locked to the hash while the project has never
+#       run. The order is the point — a row written after a first run proves
+#       nothing about knowing the hash in advance.
+#
+#       (A secret under a project accessor cannot be stored before the project
+#       exists: the contract refuses it, secrets.rs:2002. So publishing comes
+#       first. What must not come first is a RUN, and none does.)
 #   P3  the first run reads the secret. THE CLAIM
 #   P4  the attestation of that run names the same hash. P3 already implies it;
 #       this makes it readable, and catches a keystore that answered for some
@@ -112,32 +116,32 @@ pass "P0 two local builds agree on $LOCAL_HASH"
 # first hex digit rotated, so it is well formed and cannot collide.
 OTHER="$(printf '%x%s' "$(( (16#${LOCAL_HASH:0:1} + 1) % 16 ))" "${LOCAL_HASH:1}")"
 
-# ── P1 the secret, locked, before the project is published ───────────────────
-log "P1 storing the secret locked to that hash — before the project exists"
-store "$PROJECT" "$PROFILE" "$(jq -nc --arg v "$CANARY" '{USER_SECRET:$v}')" "whitelist:$PARENT"
-set_access "$PROJECT" "$PROFILE" "$(and_of "$(whitelist "$PARENT")" "$(build_leaf "$LOCAL_HASH")")"
-STORED=$(jq -c '.access // empty' <<<"$(row_of "$PROJECT" "$PROFILE")" 2>/dev/null)
-if grep -q "$LOCAL_HASH" <<<"$STORED"; then
-  pass "P1 the row on chain is locked to the locally computed build"
-else
-  fail "P1 the stored condition does not name the local hash: $(head -c 300 <<<"$STORED")"
-  verdict "pre-published build hash"; exit $?
-fi
-
-# ── P2 publish the same commit ───────────────────────────────────────────────
-log "P2 publishing the project from the same repo and commit"
+# ── P1 publish the commit, without running it ────────────────────────────────
+log "P1 publishing the project from the same repo and commit — no run yet"
 CLONE=$(mktemp -d)
 trap 'rm -rf "$CLONE"' EXIT
 if ! git clone -q "$SRC_REPO" "$CLONE" 2>/dev/null || ! git -C "$CLONE" checkout -q "$SRC_COMMIT" 2>/dev/null; then
-  skip "P2 could not clone $SRC_REPO at $SRC_COMMIT"
+  skip "P1 could not clone $SRC_REPO at $SRC_COMMIT"
   verdict "pre-published build hash"; exit $?
 fi
 DEPLOY_OUT=$(cd "$CLONE" && OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" deploy "$PROJECT_NAME" --github --target "$SRC_TARGET" 2>&1)
 if grep -qiE "error|failed" <<<"$DEPLOY_OUT" && ! grep -qiE "deployed|activated|version" <<<"$DEPLOY_OUT"; then
-  fail "P2 deploy failed: $(tail -3 <<<"$DEPLOY_OUT" | head -c 400)"
+  fail "P1 deploy failed: $(tail -3 <<<"$DEPLOY_OUT" | head -c 400)"
   verdict "pre-published build hash"; exit $?
 fi
-pass "P2 published $PROJECT at $SRC_COMMIT"
+pass "P1 published $PROJECT at $SRC_COMMIT"
+
+# ── P2 the secret, locked to the precomputed hash, before any run ────────────
+log "P2 storing the secret locked to that hash — before the project has ever run"
+store "$PROJECT" "$PROFILE" "$(jq -nc --arg v "$CANARY" '{USER_SECRET:$v}')" "whitelist:$PARENT"
+set_access "$PROJECT" "$PROFILE" "$(and_of "$(whitelist "$PARENT")" "$(build_leaf "$LOCAL_HASH")")"
+STORED=$(jq -c '.access // empty' <<<"$(row_of "$PROJECT" "$PROFILE")" 2>/dev/null)
+if grep -q "$LOCAL_HASH" <<<"$STORED"; then
+  pass "P2 the row on chain is locked to the locally computed build, and nothing has run"
+else
+  fail "P2 the stored condition does not name the local hash: $(head -c 300 <<<"$STORED")"
+  verdict "pre-published build hash"; exit $?
+fi
 
 # ── the run ──────────────────────────────────────────────────────────────────
 #

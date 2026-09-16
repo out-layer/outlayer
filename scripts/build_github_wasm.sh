@@ -44,7 +44,11 @@ set -euo pipefail
 # which is how the assumption survived a first test.) A hash computed on an
 # Apple laptop against the arm64 variant is therefore a number the platform will
 # never produce, and a secret locked to it would never open.
-DEFAULT_IMAGE="outlayer/wasmedge-compiler@sha256:5c996303f707381f463e591d7b0650e64816e63e7bc1d98ab72a62abf55b146e"
+# The amd64 member of outlayer/wasmedge-compiler:rust1.85-wasi25. The worker
+# pins the multi-arch list (…5c996303…), which resolves to this image on its
+# amd64 host; naming the member directly means a laptop cannot silently resolve
+# the same reference to the arm64 one, which compiles to different bytes.
+DEFAULT_IMAGE="outlayer/wasmedge-compiler@sha256:7ad28106a09918054f4254045b6789ef99e7f286aaa5bb503792c28b013516ee"
 
 REPO=""; COMMIT=""; DIR=""; TARGET="wasm32-wasip1"
 IMAGE="${OUTLAYER_COMPILER_IMAGE:-$DEFAULT_IMAGE}"
@@ -82,17 +86,18 @@ fi
 
 command -v docker >/dev/null || { echo "docker is required: the build runs in the platform's compiler image" >&2; exit 2; }
 
-# Pull the amd64 variant explicitly. `docker run --platform` refuses to sit
-# beside a digest reference, so the architecture is fixed at pull time instead,
-# and then checked — a silent fall back to the host's own architecture is
-# exactly the failure this guards against.
-docker pull -q --platform linux/amd64 "$IMAGE" >/dev/null 2>&1 || true
+# Fix the architecture by naming an amd64 image, then check it. `--platform`
+# cannot rescue a multi-arch reference here: docker stores one image per
+# reference, so a digest already pulled as arm64 stays arm64 and the flag is
+# refused beside a digest anyway.
+docker pull -q "$IMAGE" >/dev/null 2>&1 || docker pull -q --platform linux/amd64 "$IMAGE" >/dev/null 2>&1 || true
 ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}' 2>/dev/null || echo unknown)
 if [ "$ARCH" != "amd64" ]; then
   echo "the compiler image resolved to '$ARCH', not amd64." >&2
   echo "The platform compiles on amd64 and the bytes differ, so a hash from any" >&2
-  echo "other architecture is one the platform will never produce. Pull it with" >&2
-  echo "  docker pull --platform linux/amd64 $IMAGE" >&2
+  echo "other architecture is one the platform will never produce. Name the amd64" >&2
+  echo "image rather than a multi-arch one: a reference already pulled for this" >&2
+  echo "host keeps that architecture, and --platform will not move it." >&2
   exit 1
 fi
 
