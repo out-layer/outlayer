@@ -94,7 +94,7 @@ ORIGINAL_SIZE=$(stat -c%s /workspace/output/output.wasm 2>/dev/null || stat -f%z
 # Just strip debug info and optimize
 # Stripping is not optional: a component that skipped it is a different binary
 # with a different hash, and the skip would be silent.
-if ! command -v wasm-tools &> /dev/null; then
+if ! command -v wasm-tools >/dev/null 2>&1; then
     echo "ERROR: wasm-tools is missing from the compiler image. Stripping decides the compiled bytes, so a build without it is not the build this platform promises."
     exit 1
 fi
@@ -182,6 +182,14 @@ mod the_generated_shell_is_shell {
             "the generated script is not valid shell: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn the_p2_script_uses_no_bashisms() {
+        // See the note on the P1 compiler's test of the same name.
+        let script = compile_script();
+        assert!(!script.contains("&>"), "`&>` is bash; this runs under `sh -c`");
+        assert!(!script.contains("[["), "`[[` is bash; this runs under `sh -c`");
     }
 
     #[test]

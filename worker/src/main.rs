@@ -111,7 +111,9 @@ async fn main() -> Result<()> {
 
     info!("Worker ID: {}", config.worker_id);
     info!("Coordinator API: {}", config.api_base_url);
-    info!("NEAR RPC: {}", config.near_rpc_url);
+    // The host and whether a key is on it — never the URL itself, which carries
+    // the key in its query string.
+    info!("NEAR RPC: {}", crate::outlayer_rpc::rpc_url_public(&config.near_rpc_url));
     info!("Contract ID: {}", config.offchainvm_contract_id);
     info!("Event monitor enabled: {}", config.enable_event_monitor);
     info!("Worker capabilities: {:?}", config.capabilities.to_array());

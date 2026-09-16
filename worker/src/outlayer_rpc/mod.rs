@@ -191,16 +191,48 @@ impl RpcProxy {
     }
 
     pub fn get_rpc_url_masked(&self) -> String {
-        // Mask API key in URL if present
-        if let Some(pos) = self.rpc_url.find("api_key=") {
-            let end = self.rpc_url[pos..].find('&').unwrap_or(self.rpc_url.len() - pos);
-            format!("{}api_key=***{}", &self.rpc_url[..pos], &self.rpc_url[pos + end..])
-        } else if let Some(pos) = self.rpc_url.find("apikey=") {
-            let end = self.rpc_url[pos..].find('&').unwrap_or(self.rpc_url.len() - pos);
-            format!("{}apikey=***{}", &self.rpc_url[..pos], &self.rpc_url[pos + end..])
-        } else {
-            self.rpc_url.clone()
-        }
+        rpc_url_public(&self.rpc_url)
+    }
+}
+
+/// The RPC endpoint as it may be said aloud: scheme, host, and whether a key is
+/// on it. Never the query string, and never any `user:password@`.
+///
+/// This is deliberately not a redaction filter. A filter runs on a value that is
+/// already whole, so one spelling it does not know prints the secret in full —
+/// which is what happened: it matched `api_key=` and `apikey=` and never
+/// `apiKey=`, FastNEAR's spelling, so every worker start-up logged a live key.
+/// Building the safe half instead cannot fail that way, because the secret is
+/// never in the string it builds.
+pub fn rpc_url_public(url: &str) -> String {
+    let (before_query, query) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (url, None),
+    };
+
+    // Drop any `user:password@` from the authority, then keep scheme://host.
+    let (scheme, rest) = match before_query.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("", before_query),
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let base = if scheme.is_empty() {
+        host.to_string()
+    } else {
+        format!("{scheme}://{host}")
+    };
+
+    // Any query at all is treated as carrying a credential unless it plainly
+    // does not mention one — erring towards saying less about it.
+    let keyed = query
+        .map(|q| !q.is_empty())
+        .unwrap_or(false);
+
+    if keyed {
+        format!("{base} (keyed)")
+    } else {
+        base
     }
 }
 
@@ -269,8 +301,62 @@ mod tests {
         };
         let proxy = RpcProxy::new(config, "https://fallback.near.org").unwrap();
 
-        let masked = proxy.get_rpc_url_masked();
-        assert!(!masked.contains("secret123"));
-        assert!(masked.contains("api_key=***"));
+        // The whole query goes, not just the parameter a filter recognised.
+        // What is left says which endpoint it is and that a credential is on it.
+        let shown = proxy.get_rpc_url_masked();
+        assert!(!shown.contains("secret123"));
+        assert_eq!(shown, "https://rpc.near.org (keyed)");
+    }
+}
+
+/// A live API key reached a terminal because a redaction filter did not know
+/// FastNEAR's spelling of the parameter. These pin the replacement: it builds
+/// the safe half rather than trying to subtract the unsafe one.
+#[cfg(test)]
+mod the_endpoint_can_be_said_aloud {
+    use super::rpc_url_public;
+
+    #[test]
+    fn a_key_never_survives_in_any_spelling() {
+        const SECRET: &str = "OutLayerRPCsecretvalue";
+        for url in [
+            format!("https://rpc.testnet.fastnear.com?apiKey={SECRET}"),
+            format!("https://rpc.testnet.fastnear.com?api_key={SECRET}"),
+            format!("https://rpc.testnet.fastnear.com?apikey={SECRET}"),
+            format!("https://rpc.testnet.fastnear.com/?APIKEY={SECRET}&x=1"),
+            format!("https://rpc.mainnet.fastnear.com/v1?token={SECRET}"),
+            format!("https://user:{SECRET}@rpc.testnet.fastnear.com/"),
+        ] {
+            let shown = rpc_url_public(&url);
+            assert!(
+                !shown.contains(SECRET),
+                "the key survived in {shown:?} (from a url spelled {url:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn it_still_says_which_endpoint_and_whether_it_is_keyed() {
+        assert_eq!(
+            rpc_url_public("https://rpc.testnet.fastnear.com?apiKey=abc"),
+            "https://rpc.testnet.fastnear.com (keyed)"
+        );
+        assert_eq!(
+            rpc_url_public("https://rpc.testnet.fastnear.com"),
+            "https://rpc.testnet.fastnear.com"
+        );
+        assert_eq!(
+            rpc_url_public("https://rpc.testnet.fastnear.com/path"),
+            "https://rpc.testnet.fastnear.com",
+            "the path is not the endpoint's identity and may carry a token of its own"
+        );
+    }
+
+    #[test]
+    fn an_unkeyed_endpoint_is_not_reported_as_keyed() {
+        // The suites read this to decide whether they may run at all; calling an
+        // unkeyed host "keyed" would let a rate-limited run be read as product
+        // failure.
+        assert!(!rpc_url_public("http://localhost:3030").contains("keyed"));
     }
 }

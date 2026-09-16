@@ -116,7 +116,13 @@ echo "🔧 Optimizing WASM module with wasm-opt..."
 # would pull whatever version the distribution serves that day, and a different
 # optimizer rewrites the module differently — the same source would compile to a
 # different hash with nothing in the commit having changed.
-if ! command -v wasm-opt &> /dev/null; then
+#
+# The redirection is spelled the posix way on purpose. This script runs under
+# `sh -c` (compiler/docker.rs), where bash's combined-redirection shorthand is
+# read as "run in the background, then a command that is only a redirection" —
+# so the test decides on the wrong exit status while the real check is still
+# running. A guard that reads like a check and is not one.
+if ! command -v wasm-opt >/dev/null 2>&1; then
     echo "ERROR: wasm-opt is missing from the compiler image. It is part of what decides the compiled bytes, so it cannot be fetched at build time."
     exit 1
 fi
@@ -228,6 +234,27 @@ mod the_generated_shell_is_shell {
     }
 
     #[test]
+    fn the_script_uses_no_bashisms() {
+        // `sh -n` cannot catch this one: `cmd &> /dev/null` is VALID posix —
+        // it means "run cmd in the background, then a command that is only a
+        // redirection" — so it parses cleanly and then decides on the wrong
+        // exit status. It cost a broken testnet compile to find, and the only
+        // sign in the log was the trace of the real check appearing after the
+        // branch that had already been taken.
+        for target in ["wasm32-wasip1", "wasm32-wasi"] {
+            let script = compile_script(target);
+            assert!(
+                !script.contains("&>"),
+                "`&>` is bash; this script runs under `sh -c`. Use `>/dev/null 2>&1`."
+            );
+            assert!(
+                !script.contains("[["),
+                "`[[` is bash; this script runs under `sh -c`. Use `[ ]`."
+            );
+        }
+    }
+
+    #[test]
     fn the_p1_script_holds_the_project_to_its_lock_file() {
         let script = compile_script("wasm32-wasip1");
         assert!(
@@ -258,4 +285,5 @@ mod the_generated_shell_is_shell {
         );
     }
 }
+
 

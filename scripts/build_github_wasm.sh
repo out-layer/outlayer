@@ -35,9 +35,15 @@
 #
 set -euo pipefail
 
-# The compiler the deployed worker runs. Host architecture does not change the
-# result — the same commit gives the same hash from an arm64 or an amd64 host,
-# because the compiler targets wasm either way.
+# The compiler the deployed worker runs, on linux/amd64 — the architecture the
+# compiling worker runs on, and not a detail.
+#
+# Measured, because the opposite seemed obvious: out-layer/env-test-example at
+# 74fb4db6 compiles to f4712d4f… on amd64 and to c11e2a1b… on arm64, same image
+# digest, same recipe. (out-layer/echo-example happens to agree across both,
+# which is how the assumption survived a first test.) A hash computed on an
+# Apple laptop against the arm64 variant is therefore a number the platform will
+# never produce, and a secret locked to it would never open.
 DEFAULT_IMAGE="outlayer/wasmedge-compiler@sha256:5c996303f707381f463e591d7b0650e64816e63e7bc1d98ab72a62abf55b146e"
 
 REPO=""; COMMIT=""; DIR=""; TARGET="wasm32-wasip1"
@@ -75,6 +81,20 @@ else
 fi
 
 command -v docker >/dev/null || { echo "docker is required: the build runs in the platform's compiler image" >&2; exit 2; }
+
+# Pull the amd64 variant explicitly. `docker run --platform` refuses to sit
+# beside a digest reference, so the architecture is fixed at pull time instead,
+# and then checked — a silent fall back to the host's own architecture is
+# exactly the failure this guards against.
+docker pull -q --platform linux/amd64 "$IMAGE" >/dev/null 2>&1 || true
+ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}' 2>/dev/null || echo unknown)
+if [ "$ARCH" != "amd64" ]; then
+  echo "the compiler image resolved to '$ARCH', not amd64." >&2
+  echo "The platform compiles on amd64 and the bytes differ, so a hash from any" >&2
+  echo "other architecture is one the platform will never produce. Pull it with" >&2
+  echo "  docker pull --platform linux/amd64 $IMAGE" >&2
+  exit 1
+fi
 
 # The recipe, run inside the container. It mirrors
 # worker/src/compiler/wasm32_wasip1.rs and wasm32_wasip2.rs: the sources at
@@ -163,7 +183,7 @@ run_build() {
   docker "${args[@]}" "$IMAGE" sh -c "$RECIPE"
 }
 
-echo "compiler image: $IMAGE" >&2
+echo "compiler image: $IMAGE (amd64)" >&2
 echo "target:         $TARGET" >&2
 [ -n "$REPO" ] && echo "source:         $REPO @ $COMMIT" >&2
 [ -n "$DIR" ]  && echo "source:         $DIR (local)" >&2
