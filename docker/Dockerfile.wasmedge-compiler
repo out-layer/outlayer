@@ -25,14 +25,18 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     clang \
     llvm \
-    binaryen \
+    binaryen=120-4 \
     && rm -rf /var/lib/apt/lists/*
 # binaryen brings wasm-opt, which rewrites every wasip1 module and so decides
-# its hash the same way wasm-tools decides a component's. apt serves whatever
-# the archive holds on the day of the build, so a rebuild can move it: if the
-# published projects' hashes ever shift without a source change, this is the
-# first place to look. The base image is pinned by digest above; this is the
-# one input that is not.
+# its hash the same way wasm-tools decides a component's. Pinned to the exact
+# package, because apt otherwise serves whatever the archive holds on the day of
+# the build: the version moved 108 → 120 on its own when the base image was
+# bumped, and a move like that gives every wasip1 project a new hash with
+# nothing in its source having changed.
+#
+# When Debian drops 120-4 from the archive this build will fail. That is the
+# intended direction: a loud failure while someone is rebuilding the image,
+# rather than a quiet one later, in a project whose secret stopped opening.
 
 # Install WASI SDK for compiling C code (ring library) to WASM
 ENV WASI_VERSION=25

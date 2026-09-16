@@ -44,11 +44,18 @@ set -euo pipefail
 # which is how the assumption survived a first test.) A hash computed on an
 # Apple laptop against the arm64 variant is therefore a number the platform will
 # never produce, and a secret locked to it would never open.
-# The amd64 member of outlayer/wasmedge-compiler:rust1.85-wasi25. The worker
-# pins the multi-arch list (…5c996303…), which resolves to this image on its
-# amd64 host; naming the member directly means a laptop cannot silently resolve
-# the same reference to the arm64 one, which compiles to different bytes.
-DEFAULT_IMAGE="outlayer/wasmedge-compiler@sha256:7ad28106a09918054f4254045b6789ef99e7f286aaa5bb503792c28b013516ee"
+# outlayer/wasmedge-compiler:rust1.97-wasi25-b120, amd64 — the same image the
+# compiling worker is pinned to (worker/.env.testnet.worker1). Every input that
+# decides the bytes is fixed in it: the rust base by digest, wasm-tools and
+# cargo-component by version, and binaryen — whose wasm-opt rewrites every
+# wasip1 module — by exact package.
+#
+# amd64 is named, not merely preferred: the architecture changes the bytes.
+# out-layer/env-test-example at 74fb4db6 compiled to f4712d4f… on amd64 and to
+# c11e2a1b… on arm64 under the previous image, same digest and same recipe. A
+# hash worked out against an arm64 variant is one the platform will never
+# produce, and a secret locked to it would never open.
+DEFAULT_IMAGE="outlayer/wasmedge-compiler@sha256:d9eb7bd9bab6c46b77f309ec33e94ca112883268a848dd1929289fade799cd27"
 
 REPO=""; COMMIT=""; DIR=""; TARGET="wasm32-wasip1"
 IMAGE="${OUTLAYER_COMPILER_IMAGE:-$DEFAULT_IMAGE}"
