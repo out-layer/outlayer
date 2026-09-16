@@ -24,9 +24,9 @@ phala cvms create --name outlayer-testnet-keystore --compose ./docker-compose.ke
 cd docker 
 phala deploy --name outlayer-testnet-worker --compose docker-compose.phala.yml --env-file .env.testnet-worker-phala --vcpu 1 --memory 1G --disk-size 2G --kms-id phala-prod10
 
-# deploy worker-compiler to phala
-cd docker 
-phala deploy --name outlayer-testnet-worker-compiler --compose docker-compose.worker-compiler.phala.yml --env-file .env.testnet-worker-compiler-phala --vcpu 1 --memory 4G --disk-size 10G --kms-id phala-prod10
+# Compilation does not run in the enclave: the TEE workers execute only
+# (COMPILATION_ENABLED=false). A separate worker compiles, and pins the image it
+# compiles in by digest — see worker/.env.testnet.worker1.
 
 # whitelist measurements after code updates
 # use scripts/deploy_phala.sh which extracts all 5 TDX measurements (MRTD + RTMR0-3) automatically

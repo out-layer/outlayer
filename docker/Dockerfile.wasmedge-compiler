@@ -4,8 +4,16 @@
 # Pinned by digest, not by tag. This image decides which toolchain produces the wasm whose
 # hash the enclave attests, so a floating base would mean the same source can compile to a
 # different binary — the exact thing pinning Cargo.lock in every example is meant to prevent.
-# rust:1.85 as of 2025-03-19; bump deliberately, never implicitly.
-FROM rust:1.85@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4
+# rust:1.97 as of 2026-08-14, amd64; bump deliberately, never implicitly. A bump
+# gives every GitHub-built project a new hash, so it is also the moment to clear
+# the coordinator's wasm cache: that cache is keyed by repo:commit:build_target
+# and says nothing about the compiler, so a commit already built keeps serving
+# its old bytes while a fresh local build of the same commit gives the new hash.
+#
+# The digest names the amd64 image on purpose. Everyone — the server and anyone
+# checking a hash on a laptop — then compiles in the same image, emulated where
+# it has to be, and there is no second variant to explain a mismatch with.
+FROM rust:1.97@sha256:4277ce860337f6cfa1b679891bbf689a447f4b3f4f55701742614ad31321cee7
 
 # Install dependencies
 RUN apt-get update && apt-get install -y \
@@ -19,6 +27,12 @@ RUN apt-get update && apt-get install -y \
     llvm \
     binaryen \
     && rm -rf /var/lib/apt/lists/*
+# binaryen brings wasm-opt, which rewrites every wasip1 module and so decides
+# its hash the same way wasm-tools decides a component's. apt serves whatever
+# the archive holds on the day of the build, so a rebuild can move it: if the
+# published projects' hashes ever shift without a source change, this is the
+# first place to look. The base image is pinned by digest above; this is the
+# one input that is not.
 
 # Install WASI SDK for compiling C code (ring library) to WASM
 ENV WASI_VERSION=25
@@ -47,11 +61,18 @@ ENV CARGO_TARGET_WASM32_WASIP1_LINKER=${WASI_SDK_PATH}/bin/clang
 # Add WASM targets (wasip1 for WasmEdge, wasip2 for wasmtime)
 RUN rustup target add wasm32-wasip1 wasm32-wasip2
 
-# Install wasm-tools for WASI Preview 2 component optimization
-RUN cargo install wasm-tools
+# Install wasm-tools for WASI Preview 2 component optimization.
+#
+# Pinned, because this tool decides the bytes. A wasip2 component is stripped by
+# `wasm-tools strip` before it leaves the compiler, so the version installed here
+# is part of the hash an enclave measures and part of what a secret locked to a
+# build is judged against. An unpinned `cargo install` would give every rebuild
+# of this image a different stripper, and with it a new hash for every project
+# that had changed nothing.
+RUN cargo install wasm-tools --version 1.240.0 --locked
 
 # Install cargo-component for proper WASI Preview 2 CLI component builds
-RUN cargo install cargo-component
+RUN cargo install cargo-component --version 0.21.1 --locked
 
 # Download WASI Preview 1 to Preview 2 adapter for component conversion
 RUN mkdir -p /opt/wasi-adapters && \

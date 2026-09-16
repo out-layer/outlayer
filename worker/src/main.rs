@@ -2390,13 +2390,15 @@ async fn handle_execute_job(
             //
             // Carrying secrets across versions is much of the point of having
             // projects — publish v2 and it keeps working. A secret that must
-            // NOT carry over is expressed with the `WasmHash` accessor, which
-            // binds it to exact bytes; there is no project-plus-version
-            // accessor, deliberately, because it would complicate the one
-            // structure whose job is continuity to say something `WasmHash`
-            // already says.
+            // NOT carry over says so in its access condition: a `WasmHash`
+            // leaf admits one build only, judged by the keystore against the
+            // hash this worker measured on the bytes it is about to run
+            // (`executed_wasm_sha256`, sent with every decrypt). There is no
+            // project-plus-version accessor, deliberately: the condition
+            // already says it, and `update_access` moves it to the next build
+            // without re-encrypting.
             info!("📦 Decrypting project-based secrets for project: {}", proj_id);
-            keystore.decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id)).await
+            keystore.decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str())).await
         } else {
             // Non-project execution: use code_source type for secrets
             match code_source {
@@ -2420,13 +2422,13 @@ async fn handle_execute_job(
                     };
 
                     // Call keystore to decrypt secrets by repo
-                    keystore.decrypt_secrets_from_contract(repo, branch.as_deref(), &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id)).await
+                    keystore.decrypt_secrets_from_contract(repo, branch.as_deref(), &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str())).await
                 }
                 CodeSource::WasmUrl { hash, .. } => {
                     info!("📦 Decrypting wasm_hash-based secrets for WasmUrl source: {}", hash);
 
                     // Call keystore to decrypt secrets by wasm_hash
-                    keystore.decrypt_secrets_by_wasm_hash(hash, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id)).await
+                    keystore.decrypt_secrets_by_wasm_hash(hash, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str())).await
                 }
             }
         };
@@ -2471,6 +2473,7 @@ async fn handle_execute_job(
         keystore_client,
         user_account_id.map(|s| s.as_str()),
         &data_id,
+        &executed_wasm_sha256,
         user_secrets,
     )
     .await
@@ -2647,12 +2650,21 @@ async fn handle_execute_job(
         }
     });
 
-    // Execute WASM
+    // Execute WASM.
+    //
+    // The compiled cache is keyed by the CONTENT hash, never by `wasm_checksum`.
+    // For a GitHub source that checksum is `sha256(repo:commit:target)` — the
+    // coordinates, shared by every binary ever built from that commit — so a
+    // cache keyed on it can hand the engine native code compiled from other
+    // bytes than the ones measured just above. The measurement would then be
+    // honest about a wasm that did not run, which is exactly what an attested
+    // `executed_wasm_sha256` must never be, and what a secret locked to a build
+    // must never admit.
     info!("🚀 Executing WASM...");
     let exec_result = executor
         .execute(
             &wasm_bytes,
-            Some(wasm_checksum),
+            Some(executed_wasm_sha256.as_str()),
             input_data.as_bytes(),
             resource_limits,
             Some(env_vars),
@@ -3730,6 +3742,7 @@ async fn author_secrets_for_run(
     keystore_client: Option<&KeystoreClient>,
     caller: Option<&str>,
     data_id: &str,
+    executed_wasm_sha256: &str,
     agent_secrets: Option<std::collections::HashMap<String, String>>,
 ) -> std::result::Result<Option<std::collections::HashMap<String, String>>, (String, api_client::JobStatus)> {
     use api_client::JobStatus;
@@ -3771,7 +3784,7 @@ async fn author_secrets_for_run(
     );
     let caller = proven_sender(caller, &author.owner).map_err(|m| (m, JobStatus::AccessDenied))?;
     let decrypted = keystore
-        .decrypt_secrets_by_project(project_id, &author.profile, &author.owner, caller, Some(data_id))
+        .decrypt_secrets_by_project(project_id, &author.profile, &author.owner, caller, Some(data_id), Some(executed_wasm_sha256))
         .await
         .map_err(|e| {
             if keystore_client::SecretsNotFound::is_missing(&e) {
@@ -4673,6 +4686,7 @@ mod k2_a_keystore_that_cannot_answer_refuses_the_run {
             None,
             Some("bob.near"),
             "data-id",
+            "sha256-of-the-bytes-under-test",
             None,
         ));
         match out {
@@ -4700,6 +4714,7 @@ mod k2_a_keystore_that_cannot_answer_refuses_the_run {
                     Some(&keystore),
                     Some("bob.near"),
                     "data-id",
+                    "sha256-of-the-bytes-under-test",
                     None,
                 ),
             )
@@ -4716,5 +4731,54 @@ mod k2_a_keystore_that_cannot_answer_refuses_the_run {
             Ok(Err((msg, other))) => panic!("refused, but as {other:?} rather than Failed: {msg}"),
             Ok(Ok(_)) => panic!("the run proceeded without the author's credential"),
         }
+    }
+}
+
+/// The compiled cache is keyed by the bytes, not by the coordinates.
+///
+/// Read from the source rather than exercised, because the mistake this guards
+/// against is a single argument at a single call site, and the failure it
+/// produces is silent: the run succeeds, the attestation reports a hash, and
+/// the wasm that actually executed is whatever was compiled under the same
+/// coordinates earlier. Nothing downstream can notice — the keystore judges a
+/// build lock honestly, against a number describing code that did not run.
+#[cfg(test)]
+mod the_compiled_cache_is_keyed_by_content {
+    const SOURCE: &str = include_str!("main.rs");
+
+    /// The call that hands the engine its cache key must pass the measured
+    /// hash. `wasm_checksum` is `sha256(repo:commit:target)` for a GitHub
+    /// source — shared by every binary ever built from that commit.
+    #[test]
+    fn the_execute_call_passes_the_measured_hash() {
+        let call = SOURCE
+            .split_once(".execute(\n")
+            .map(|(_, rest)| rest.split_once(")\n").map(|(c, _)| c).unwrap_or(rest))
+            .expect("handle_execute_job still calls executor.execute");
+        let key_argument = call
+            .lines()
+            .nth(1)
+            .expect("the cache key is the second argument")
+            .trim();
+        assert_eq!(
+            key_argument, "Some(executed_wasm_sha256.as_str()),",
+            "the compiled cache key must be the hash measured from the bytes about to run"
+        );
+    }
+
+    /// And that hash must be measured from the buffer, not taken from the job.
+    #[test]
+    fn the_measured_hash_comes_from_the_bytes() {
+        let measured = SOURCE
+            .split_once("let executed_wasm_sha256 = {")
+            .expect("the measurement is still there")
+            .1;
+        // The block is three lines; a `use` inside it carries its own braces,
+        // so the window is taken by line count rather than by the next `}`.
+        let body: String = measured.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(
+            body.contains("Sha256::digest(&wasm_bytes)"),
+            "executed_wasm_sha256 must be the hash of the loaded buffer, not a value from the task: {body}"
+        );
     }
 }

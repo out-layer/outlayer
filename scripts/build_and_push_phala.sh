@@ -39,7 +39,7 @@ DOCKERFILE_TYPE="${3:-worker-compiler}"  # Default to worker-compiler
 # Determine Docker file and image name
 case "$DOCKERFILE_TYPE" in
     "worker-compiler")
-        DOCKERFILE="docker/Dockerfile.worker-compiler-phala"
+        DOCKERFILE="docker/Dockerfile.compiler-worker"
         IMAGE_NAME="$DOCKER_USERNAME/near-outlayer-worker-compiler"
         ;;
     "worker")

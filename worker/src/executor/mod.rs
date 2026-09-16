@@ -195,7 +195,8 @@ impl Executor {
     ///
     /// # Arguments
     /// * `wasm_bytes` - WASM binary to execute
-    /// * `wasm_checksum` - SHA256 checksum for compiled cache
+    /// * `wasm_content_sha256` - SHA256 OF THE WASM BYTES, the compiled cache's key.
+    ///   Never a coordinates-derived checksum: see `wasi_p2::execute`.
     /// * `input_data` - Input data passed to WASM via stdin
     /// * `limits` - Resource limits for execution
     /// * `env_vars` - Environment variables (from secrets)
@@ -208,7 +209,7 @@ impl Executor {
     pub async fn execute(
         &self,
         wasm_bytes: &[u8],
-        wasm_checksum: Option<&str>,
+        wasm_content_sha256: Option<&str>,
         input_data: &[u8],
         limits: &ResourceLimits,
         env_vars: Option<HashMap<String, String>>,
@@ -227,7 +228,7 @@ impl Executor {
         let start = Instant::now();
 
         // Try to execute with different WASI versions
-        let result = self.execute_async(wasm_bytes, wasm_checksum, input_data, limits, env_vars, build_target, storage_config, vrf_config, wallet_config, network_config).await;
+        let result = self.execute_async(wasm_bytes, wasm_content_sha256, input_data, limits, env_vars, build_target, storage_config, vrf_config, wallet_config, network_config).await;
 
         let execution_time_ms = start.elapsed().as_millis() as u64;
 
@@ -341,7 +342,7 @@ impl Executor {
     async fn execute_async(
         &self,
         wasm_bytes: &[u8],
-        wasm_checksum: Option<&str>,
+        wasm_content_sha256: Option<&str>,
         input_data: &[u8],
         limits: &ResourceLimits,
         env_vars: Option<HashMap<String, String>>,
@@ -397,7 +398,7 @@ impl Executor {
                     // Pass execution context (RPC proxy + storage) and compiled cache to P2 executor
                     return wasi_p2::execute(
                         wasm_bytes,
-                        wasm_checksum,
+                        wasm_content_sha256,
                         compiled_cache.as_ref(),
                         input_data,
                         limits,
@@ -425,7 +426,7 @@ impl Executor {
         // Try WASI P2 component first (with RPC proxy, storage, and compiled cache support)
         if let Ok(result) = wasi_p2::execute(
             wasm_bytes,
-            wasm_checksum,
+            wasm_content_sha256,
             compiled_cache.as_ref(),
             input_data,
             limits,

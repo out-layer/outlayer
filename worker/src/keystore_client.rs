@@ -30,7 +30,10 @@ pub enum SecretAccessor {
         #[serde(skip_serializing_if = "Option::is_none")]
         branch: Option<String>,
     },
-    /// Secrets bound to a specific WASM hash
+    /// Secrets bound to a specific WASM hash: the row a WasmUrl run reads
+    /// under. A project or repository run reads its own row instead; locking
+    /// that row to one build is the `WasmHash` access condition, not this
+    /// accessor.
     WasmHash {
         hash: String,
     },
@@ -751,7 +754,8 @@ impl KeystoreClient {
     /// This method:
     /// 1. Calls keystore /decrypt with accessor (Repo or WasmHash)
     /// 2. Keystore reads secrets from NEAR contract
-    /// 3. Keystore validates access conditions (using user_account_id as caller)
+    /// 3. Keystore validates access conditions (user_account_id as caller;
+    ///    executed_wasm_sha256 as the build a `WasmHash` leaf is judged against)
     /// 4. Keystore decrypts using derived key for seed
     /// 5. Returns HashMap of environment variables
     ///
@@ -763,6 +767,7 @@ impl KeystoreClient {
         owner: &str,
         user_account_id: &str,
         task_id: Option<&str>,
+        executed_wasm_sha256: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor_desc = match &accessor {
             SecretAccessor::Repo { repo, branch } => {
@@ -789,6 +794,10 @@ impl KeystoreClient {
             owner: String,
             user_account_id: String,
             task_id: Option<String>,
+            /// SHA-256 of the bytes this worker is about to run, measured on
+            /// the loaded buffer — what a `WasmHash` access condition is
+            /// judged against. Never a value the task or the guest supplied.
+            executed_wasm_sha256: Option<String>,
         }
 
         let request = DecryptRequest {
@@ -797,6 +806,7 @@ impl KeystoreClient {
             owner: owner.to_string(),
             user_account_id: user_account_id.to_string(),
             task_id: task_id.map(|s| s.to_string()),
+            executed_wasm_sha256: executed_wasm_sha256.map(|s| s.to_string()),
         };
 
         let (keystore, tee_session) = self.current_endpoint();
@@ -883,12 +893,13 @@ impl KeystoreClient {
         owner: &str,
         user_account_id: &str,
         task_id: Option<&str>,
+        executed_wasm_sha256: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor = SecretAccessor::Repo {
             repo: repo.to_string(),
             branch: branch.map(|s| s.to_string()),
         };
-        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id).await
+        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256).await
     }
 
     /// Decrypt secrets from contract by WASM hash (convenience wrapper for WasmHash accessor)
@@ -901,11 +912,12 @@ impl KeystoreClient {
         owner: &str,
         user_account_id: &str,
         task_id: Option<&str>,
+        executed_wasm_sha256: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor = SecretAccessor::WasmHash {
             hash: wasm_hash.to_string(),
         };
-        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id).await
+        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256).await
     }
 
     /// Decrypt secrets from contract by project ID (convenience wrapper for Project accessor)
@@ -919,11 +931,12 @@ impl KeystoreClient {
         owner: &str,
         user_account_id: &str,
         task_id: Option<&str>,
+        executed_wasm_sha256: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor = SecretAccessor::Project {
             project_id: project_id.to_string(),
         };
-        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id).await
+        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256).await
     }
 
     /// Encrypt data using keystore's derived key
@@ -1253,7 +1266,7 @@ mod tests {
         let client = KeystoreClient::new(vec![fake_keystore_answering(code, body)], "t".to_string())
             .expect("one url");
         client
-            .decrypt_secrets_by_project("a.near/p", "prod", "a.near", "a.near", None)
+            .decrypt_secrets_by_project("a.near/p", "prod", "a.near", "a.near", None, None)
             .await
             .expect_err("a non-2xx must be an error")
     }
@@ -1601,5 +1614,81 @@ mod access_denied_tests {
                 "{body}"
             );
         }
+    }
+}
+
+/// The build a run executes reaches the keystore, and is the worker's own
+/// measurement.
+///
+/// The whole lock rests on this one field: the keystore judges a `WasmHash`
+/// condition against what arrives here, so a decrypt that forgot to carry it
+/// turns every locked row into a 500, and one that carried a value from the
+/// task or the guest would let a caller name the build it wants to be.
+#[cfg(test)]
+mod the_decrypt_request_carries_the_executing_build {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    const EXECUTED: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// A keystore that answers once and keeps what it was asked.
+    fn capturing_keystore() -> (String, Arc<Mutex<String>>) {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let recorder = Arc::clone(&seen);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                let mut buf = [0u8; 16384];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                *recorder.lock().unwrap() = String::from_utf8_lossy(&buf[..read]).to_string();
+                // An empty secrets object: the call succeeds and the test judges
+                // the REQUEST, not the answer.
+                let body = r#"{"plaintext_secrets":"e30="}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{}", addr), seen)
+    }
+
+    /// The body of the request the keystore received, as JSON.
+    async fn request_body_of(executed: Option<&str>) -> serde_json::Value {
+        let (url, seen) = capturing_keystore();
+        let client = KeystoreClient::new(vec![url], "t".to_string()).expect("one url");
+        let _ = client
+            .decrypt_secrets_by_project("a.near/p", "prod", "a.near", "a.near", None, executed)
+            .await;
+        let raw = seen.lock().unwrap().clone();
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("the keystore was sent no JSON body ({e}): {raw}"))
+    }
+
+    #[tokio::test]
+    async fn the_hash_is_in_the_body_the_keystore_receives() {
+        let body = request_body_of(Some(EXECUTED)).await;
+        assert_eq!(
+            body["executed_wasm_sha256"].as_str(),
+            Some(EXECUTED),
+            "the field the keystore judges a build lock against is missing: {body}"
+        );
+        // And the rest of the request is unchanged, so an older keystore reads
+        // everything it always read.
+        assert_eq!(body["profile"].as_str(), Some("prod"));
+        assert_eq!(body["owner"].as_str(), Some("a.near"));
+        assert_eq!(body["accessor"]["type"].as_str(), Some("Project"));
+    }
+
+    /// A run with no measurement sends the field as null rather than omitting
+    /// the question: the keystore then refuses a locked row instead of judging
+    /// it against nothing.
+    #[tokio::test]
+    async fn no_measurement_sends_an_explicit_null() {
+        let body = request_body_of(None).await;
+        assert!(body["executed_wasm_sha256"].is_null(), "{body}");
     }
 }

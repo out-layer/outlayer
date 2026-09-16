@@ -16,12 +16,31 @@
 //!
 //! This is designed for TEE environments (Phala, Intel TDX) where
 //! advanced sandboxing (bubblewrap, pivot_root) is blocked by seccomp.
+//!
+//! ## The same commit compiles to the same bytes
+//!
+//! The hash of the compiled wasm is what an enclave measures before running the
+//! code and what a secret locked to a build is judged against, so a commit that
+//! compiled to different bytes on a rebuild would quietly lock its own project
+//! out. Three things here decide it: every rustc invocation is given a
+//! `--remap-path-prefix` so this compilation's randomly named directory — and
+//! the cargo registry under it, where every dependency's paths come from —
+//! reads the same everywhere; a project that ships a Cargo.lock is held to it;
+//! and when a project builds several binaries, the one that runs is chosen by
+//! name rather than by directory order.
+//!
+//! What is left outside this module: the toolchain. A different rustc, or a
+//! different wasi-sdk, compiles the same source to different bytes, so the
+//! guarantee is per compiler image. `scripts/build_github_wasm.sh` runs this
+//! same recipe in a named image, which is how a hash can be known before
+//! publishing.
 
 use anyhow::{Context, Result};
 use bollard::Docker;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
@@ -55,6 +74,10 @@ const MAX_PROCESSES: u32 = 1024;
 /// - Resource limits: 2GB RAM, 5min CPU time, 1024 processes (ulimit)
 /// - Build.rs validation: rejects projects with build scripts
 /// - Temporary directories: compilation isolated in /tmp/compile-{uuid}
+///
+/// # Determinism
+/// For one compiler image, the same commit yields the same bytes; see the
+/// module documentation.
 pub async fn compile(
     _docker: Option<&Docker>, // Unused in native mode
     repo: &str,
@@ -68,27 +91,50 @@ pub async fn compile(
     info!("⏱️  Timeout: {}s, Memory limit: {}MB", timeout, MAX_MEMORY_BYTES / 1024 / 1024);
 
     // 1. Create isolated working directory
-    let work_dir = create_temp_dir()?;
+    let work_dir = create_temp_dir("compile-")?;
     info!("📁 Work directory: {}", work_dir.display());
 
-    // 2. Clone repository (outside sandbox, faster)
-    clone_repo(repo, commit, &work_dir).await?;
+    // The rustc shim lives outside the cloned tree. Inside it, a repository
+    // that ships a file of the same name is written through — and if that file
+    // is a symlink, the write lands wherever it points, as the worker.
+    let tools_dir = create_temp_dir("outlayer-tools-")?;
 
-    // 3. Validate no build.rs (security check)
-    validate_no_build_scripts(&work_dir)?;
+    let result = async {
+        // 2. Clone repository (outside sandbox, faster)
+        clone_repo(repo, commit, &work_dir).await?;
 
-    // 4. Compile with env isolation + ulimit
-    let wasm_bytes = compile_with_isolation(&work_dir, build_target, timeout).await?;
+        // 3. Validate no build.rs (security check)
+        validate_no_build_scripts(&work_dir)?;
 
-    // 5. Cleanup
-    cleanup_dir(&work_dir)?;
+        // 4. Compile with env isolation + ulimit
+        compile_with_isolation(&work_dir, &tools_dir, build_target, timeout).await
+    }
+    .await;
 
-    info!("✅ Compilation successful: {} bytes", wasm_bytes.len());
+    // 5. Cleanup. Both directories go whether the build succeeded or not; a
+    // failed build reports through CompilationError, which already carries the
+    // compiler's stderr, so nothing is learned from the leftover tree.
+    for dir in [&work_dir, &tools_dir] {
+        if let Err(e) = cleanup_dir(dir) {
+            warn!("Failed to clean up {}: {}", dir.display(), e);
+        }
+    }
+
+    let wasm_bytes = result?;
+
+    // The hash of the bytes themselves — what the keystore judges a secret
+    // locked to a build against, and what a reproducible build must land on
+    // again. Named here so an operator can read it out of the compile log.
+    info!(
+        "✅ Compilation successful: {} bytes, sha256 {}",
+        wasm_bytes.len(),
+        hex::encode(Sha256::digest(&wasm_bytes))
+    );
     Ok(wasm_bytes)
 }
 
 /// Create temporary directory for compilation
-fn create_temp_dir() -> Result<PathBuf> {
+fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
     // Use `tempfile` instead of a hand-built `/tmp/compile-{uuid}` path. The native compiler
     // (git clone + cargo build) runs OUTSIDE the TEE, so it can share a host with other
     // processes; `/tmp` is world-writable and `compile-{uuid}` is a guessable name, which
@@ -97,7 +143,7 @@ fn create_temp_dir() -> Result<PathBuf> {
     // unguessable suffix. We `keep()` (persist past the guard's Drop) so the existing manual
     // `cleanup_dir()` lifecycle still applies — the caller removes it after compilation.
     let dir = tempfile::Builder::new()
-        .prefix("compile-")
+        .prefix(prefix)
         .tempdir()
         .context("Failed to create secure temp dir")?
         .keep();
@@ -292,6 +338,19 @@ fn validate_no_build_scripts(work_dir: &Path) -> Result<()> {
     let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
         .context("Failed to read Cargo.toml")?;
 
+    // Judge the manifest's code, not its prose. A `#` starts a TOML comment, and
+    // repositories routinely leave the rejected forms in one as a note to the
+    // reader — `# outlayer = { git = "https://…" }` is in an OutLayer example —
+    // so a match against the raw text refuses projects that declare nothing of
+    // the kind. Truncating at the first `#` can only ever make a line shorter,
+    // and a URL that really carried a fragment still matches on the half before
+    // it, so nothing that should be refused escapes.
+    let cargo_toml: String = cargo_toml
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     // Check for build = "build.rs" or build = 'build.rs' with flexible whitespace
     // Matches: build = "...", build="...", build  =  "...", etc.
     let build_patterns = [
@@ -345,6 +404,7 @@ fn validate_no_build_scripts(work_dir: &Path) -> Result<()> {
 /// Compile with env isolation and ulimit (TEE-friendly, no pivot_root)
 async fn compile_with_isolation(
     work_dir: &Path,
+    tools_dir: &Path,
     build_target: &str,
     timeout: u64,
 ) -> Result<Vec<u8>> {
@@ -355,16 +415,21 @@ async fn compile_with_isolation(
     std::fs::create_dir_all(&cargo_home)
         .context("Failed to create .cargo directory")?;
 
+    // The shim that keeps the work directory out of the compiled bytes.
+    let rustc_shim = write_rustc_shim(tools_dir, work_dir)?;
+
+    let locked = locked_flag(work_dir);
+
     // Build cargo command with resource limits
     // ulimit is executed inside bash, before cargo build
     // Export PATH explicitly so cargo can be found
-    // Note: We don't use --locked because user repos may not have Cargo.lock or it may be outdated
     let cargo_cmd = format!(
-        "export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin && export RUSTUP_HOME=/usr/local/rustup && ulimit -v {} && ulimit -t {} && ulimit -u {} && cargo build --target {} --release",
+        "export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin && export RUSTUP_HOME=/usr/local/rustup && ulimit -v {} && ulimit -t {} && ulimit -u {} && cargo build --target {} --release{}",
         MAX_MEMORY_BYTES / 1024, // ulimit -v expects KB
         timeout,
         MAX_PROCESSES,
-        build_target
+        build_target,
+        locked
     );
 
     info!("Cargo command: {}", cargo_cmd);
@@ -380,6 +445,7 @@ async fn compile_with_isolation(
     cmd.env("PATH", "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin");
     cmd.env("RUST_BACKTRACE", "1"); // For debugging compilation errors
     cmd.env("RUSTUP_HOME", "/usr/local/rustup"); // Rustup installation directory
+    cmd.env("RUSTC_WRAPPER", &rustc_shim); // see write_rustc_shim
 
     // WASI SDK environment (for C dependencies like ring, openssl-sys)
     cmd.env("CC_wasm32_wasip1", "/opt/wasi-sdk/bin/clang");
@@ -451,6 +517,80 @@ async fn compile_with_isolation(
     Ok(wasm_bytes)
 }
 
+/// `--locked`, when the repository pinned its dependencies.
+///
+/// Without a Cargo.lock cargo resolves against whatever crates.io offers at
+/// build time, so one commit compiles to different bytes on different days and
+/// a secret locked to a build stops opening for a project nobody touched. With
+/// one, the resolution is part of the commit and cargo is held to it.
+///
+/// A repository that ships no lock still builds. Refusing it would break
+/// projects that run today, and the damage it does is to liveness, not to
+/// safety: an unexpected rebuild fails to open the secret rather than opening
+/// it for the wrong bytes.
+fn locked_flag(work_dir: &Path) -> &'static str {
+    if work_dir.join("Cargo.lock").exists() {
+        " --locked"
+    } else {
+        warn!(
+            "⚠️  No Cargo.lock in the repository: dependency versions are resolved at build time, \
+             so this commit will not compile to the same bytes on a later day"
+        );
+        ""
+    }
+}
+
+/// What the build directory is called inside the compiled binary.
+///
+/// Any fixed string would do; the point is that it is the same one on every
+/// machine, so two builds of one commit agree.
+const REMAPPED_BUILD_DIR: &str = "/outlayer/build";
+
+/// Write the rustc shim that keeps the build directory out of the binary.
+///
+/// Dependency source paths reach the binary through debug info and through the
+/// line numbers a panic prints, and they are absolute — rooted at the cargo
+/// registry, which lives under this compilation's own randomly named
+/// directory. Two builds of the same commit therefore differ, which is enough
+/// to make a secret locked to a build unopenable. `--remap-path-prefix` rewrites
+/// that root to a constant.
+///
+/// A shim rather than `RUSTFLAGS`: cargo does not merge rustflags across
+/// layers — the highest-priority source wins outright — so exporting the
+/// variable would silently discard a `.cargo/config.toml` the repository ships,
+/// and a project that asks for a larger stack would compile into something that
+/// no longer runs. Flags appended by the shim compose with every layer instead
+/// of replacing one.
+fn write_rustc_shim(tools_dir: &Path, work_dir: &Path) -> Result<PathBuf> {
+    let from = work_dir
+        .to_str()
+        .context("Work directory path is not valid UTF-8")?;
+    // The path is interpolated into a shell script inside single quotes, so a
+    // quote or a newline in it would end the string and run as script. It comes
+    // from `tempfile` under the system temp directory and cannot normally hold
+    // either; refuse rather than assume.
+    if from.contains('\'') || from.contains('\n') {
+        anyhow::bail!("Work directory path contains a quote or newline: {}", from);
+    }
+
+    let script = format!(
+        "#!/bin/sh\n\
+         # Written by the OutLayer compiler. cargo runs this in place of rustc,\n\
+         # as `shim rustc <args>`, so the flag below is appended to every\n\
+         # invocation without replacing any the project set for itself.\n\
+         exec \"$@\" --remap-path-prefix='{from}'={REMAPPED_BUILD_DIR}\n"
+    );
+
+    let path = tools_dir.join("rustc-shim.sh");
+    std::fs::write(&path, script)
+        .with_context(|| format!("Failed to write rustc shim: {}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .context("Failed to make the rustc shim executable")?;
+
+    Ok(path)
+}
+
 /// Find compiled WASM file in target directory
 fn find_wasm_file(work_dir: &Path, build_target: &str) -> Result<PathBuf> {
     let target_dir = work_dir.join("target").join(build_target).join("release");
@@ -459,20 +599,36 @@ fn find_wasm_file(work_dir: &Path, build_target: &str) -> Result<PathBuf> {
         anyhow::bail!("Target directory not found: {}", target_dir.display());
     }
 
-    // Find .wasm file
-    let entries = std::fs::read_dir(&target_dir)
-        .with_context(|| format!("Failed to read target directory: {}", target_dir.display()))?;
+    // Collect every .wasm the build produced and sort them. Directory order is
+    // whatever the filesystem hands back, so a project that builds more than one
+    // binary would otherwise have one of them picked at random — a different one
+    // on a rebuild, and the hash of the bytes the enclave attests changing with
+    // it. Sorted, the choice is a property of the project rather than of the run.
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&target_dir)
+        .with_context(|| format!("Failed to read target directory: {}", target_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("wasm"))
+        .collect();
+    candidates.sort();
 
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
+    let chosen = candidates
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No .wasm file found in {}", target_dir.display()))?;
 
-        if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-            return Ok(path);
-        }
+    if candidates.len() > 1 {
+        let names: Vec<&str> = candidates
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        warn!(
+            "⚠️  The project built {} wasm binaries ({}); running the first by name. \
+             Build one binary per project if that is not the one you meant.",
+            candidates.len(),
+            names.join(", ")
+        );
     }
 
-    anyhow::bail!("No .wasm file found in {}", target_dir.display());
+    Ok(chosen.clone())
 }
 
 /// Classify compilation error for user-friendly message
@@ -486,6 +642,19 @@ fn classify_compilation_error(stderr: &str, exit_code: Option<i32>) -> (&'static
 
     if stderr_lower.contains("fatal: could not read username") || stderr_lower.contains("authentication") {
         return ("repository_access_denied", "Cannot access repository. The repository may be private or the URL may be incorrect. Only public repositories are supported.");
+    }
+
+    // The lock file does not match Cargo.toml. The build is refused rather than
+    // resolved afresh, because resolving afresh is what makes one commit compile
+    // to different bytes on different days.
+    if stderr_lower.contains("lock file") && stderr_lower.contains("needs to be updated") {
+        return ("lockfile_out_of_date", "Cargo.lock does not match Cargo.toml. Run `cargo update` (or `cargo build`) locally, commit the updated Cargo.lock, and publish that commit. The lock file is what makes your project compile to the same bytes every time, which is what a secret locked to a build depends on.");
+    }
+
+    // A project with no lock file at all resolves its dependencies at build
+    // time, so the same commit can stop compiling when a dependency publishes.
+    if stderr_lower.contains("no matching package named") && stderr_lower.contains("found") {
+        return ("dependency_not_found", "Dependency resolution failed. One or more dependencies in Cargo.toml could not be found. If your project has no Cargo.lock, commit one: without it the versions are chosen afresh on every build.");
     }
 
     // Rust compilation errors
@@ -673,5 +842,176 @@ serde_json = "1.0"
         assert!(validate_git_ref("foo;bar").is_err()); // outside safe charset
         assert!(validate_git_ref("foo$(id)").is_err());
         assert!(validate_git_ref("../../etc/passwd").is_err()); // '..'
+    }
+}
+
+/// A build of one commit must land on the same bytes every time — that is what
+/// a secret locked to a build is judged against, and what an attestation names.
+/// These cover the three things in this module that decide it: the paths the
+/// compiler bakes in, the dependency versions it picks, and which of the
+/// produced binaries is the one that runs.
+#[cfg(test)]
+mod the_same_commit_compiles_to_the_same_bytes {
+    use super::*;
+    use std::process::Command as SyncCommand;
+
+    #[test]
+    fn the_shim_runs_what_cargo_asked_for_and_appends_the_remap() {
+        let tools = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let shim = write_rustc_shim(tools.path(), work.path()).unwrap();
+
+        // cargo invokes a wrapper as `wrapper <program> <args…>`. Standing in
+        // for rustc with `echo` shows both that the program is run and that the
+        // arguments reach it untouched, with ours added at the end.
+        let out = SyncCommand::new(&shim)
+            .args(["echo", "--crate-name", "demo"])
+            .output()
+            .expect("the shim must be executable");
+        let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        assert_eq!(
+            printed,
+            format!(
+                "--crate-name demo --remap-path-prefix={}={}",
+                work.path().display(),
+                REMAPPED_BUILD_DIR
+            ),
+            "the shim must pass cargo's arguments through and append the remap"
+        );
+    }
+
+    #[test]
+    fn the_remap_covers_the_registry_the_dependencies_are_read_from() {
+        // Dependency paths are the ones that leak: they are absolute, and they
+        // are rooted at CARGO_HOME, which this compiler puts inside the work
+        // directory. A remap of the work directory only helps because it covers
+        // that too — if CARGO_HOME ever moves out, this test fails and says so.
+        let work = tempfile::tempdir().unwrap();
+        let cargo_home = work.path().join(".cargo");
+        assert!(
+            cargo_home.starts_with(work.path()),
+            "CARGO_HOME must sit under the remapped work directory"
+        );
+    }
+
+    #[test]
+    fn a_work_directory_that_cannot_be_quoted_is_refused() {
+        let tools = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        // A quote in the path would close the shell string the path is written
+        // into, and the rest of it would run as script.
+        let hostile = parent.path().join("it's-here");
+        std::fs::create_dir(&hostile).unwrap();
+
+        let err = write_rustc_shim(tools.path(), &hostile)
+            .expect_err("a path with a quote must be refused, not escaped by hand");
+        assert!(
+            err.to_string().contains("quote"),
+            "the refusal must say why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_lock_file_is_what_turns_on_locked() {
+        let work = tempfile::tempdir().unwrap();
+        assert_eq!(
+            locked_flag(work.path()),
+            "",
+            "a project with no lock file still builds"
+        );
+
+        std::fs::write(work.path().join("Cargo.lock"), "# pinned\n").unwrap();
+        assert_eq!(
+            locked_flag(work.path()),
+            " --locked",
+            "a pinned project must be held to its lock, not re-resolved"
+        );
+    }
+
+    #[test]
+    fn the_binary_that_runs_is_chosen_by_name_not_by_directory_order() {
+        let work = tempfile::tempdir().unwrap();
+        let release = work.path().join("target").join("wasm32-wasip1").join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        // Written in the reverse of the order they must be chosen in, so a
+        // function that returned whatever the directory listed first would have
+        // to get lucky to pass.
+        for name in ["zeta.wasm", "beta.wasm", "alpha.wasm", "notes.txt"] {
+            std::fs::write(release.join(name), b"\0asm").unwrap();
+        }
+
+        let chosen = find_wasm_file(work.path(), "wasm32-wasip1").unwrap();
+        assert_eq!(
+            chosen.file_name().unwrap(),
+            "alpha.wasm",
+            "with several binaries the choice must be a property of the project, \
+             not of the filesystem"
+        );
+    }
+
+    #[test]
+    fn a_build_that_produced_no_wasm_is_an_error() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("target/wasm32-wasip1/release")).unwrap();
+        assert!(find_wasm_file(work.path(), "wasm32-wasip1").is_err());
+    }
+
+    #[test]
+    fn a_rejected_form_inside_a_comment_is_not_a_rejected_form() {
+        // Taken from out-layer/test-secrets-example, which carries the git
+        // dependency form in a comment as a note for people copying the file.
+        // Refusing it would refuse one of the platform's own examples.
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(
+            work.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "example"
+version = "0.1.0"
+# build = "build.rs" is not allowed here
+[dependencies]
+# For external projects after publishing: outlayer = { git = "https://github.com/out-layer/outlayer" }
+outlayer = "0.1.0"
+"#,
+        )
+        .unwrap();
+        assert!(
+            validate_no_build_scripts(work.path()).is_ok(),
+            "a commented-out git dependency is prose, not a dependency"
+        );
+    }
+
+    #[test]
+    fn a_rejected_form_outside_a_comment_is_still_refused() {
+        for manifest in [
+            "[package]\nname = \"x\"\nbuild = \"build.rs\"\n",
+            "[dependencies]\nserde = { git = \"https://evil.example/serde\" }\n",
+            "[dependencies]\nserde = \"1\"  # pinned\nfoo = { git = \"https://evil.example/foo\" }\n",
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            std::fs::write(work.path().join("Cargo.toml"), manifest).unwrap();
+            assert!(
+                validate_no_build_scripts(work.path()).is_err(),
+                "not refused: {manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_lock_file_is_explained_rather_than_resolved_away() {
+        // What cargo says when `--locked` meets a Cargo.lock that no longer
+        // matches Cargo.toml. The user has to be told to commit the lock; the
+        // generic "check your code" message would send them looking in the
+        // wrong place.
+        let (category, message) = classify_compilation_error(
+            "error: the lock file /outlayer/build/Cargo.lock needs to be updated but --locked was passed to prevent this\n",
+            Some(101),
+        );
+        assert_eq!(category, "lockfile_out_of_date");
+        assert!(
+            message.contains("Cargo.lock"),
+            "the message must name the file to commit: {message}"
+        );
     }
 }

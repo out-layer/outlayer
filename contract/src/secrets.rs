@@ -2408,7 +2408,49 @@ fn condition_leaf_count(access: &types::AccessCondition) -> (usize, usize, usize
         // fail to compile here, not silently count as nothing.
         types::AccessCondition::AllowAll
         | types::AccessCondition::Whitelist { .. }
-        | types::AccessCondition::ValidUntil { .. } => (0, 0, 0),
+        | types::AccessCondition::ValidUntil { .. }
+        | types::AccessCondition::WasmHash { .. } => (0, 0, 0),
+    }
+}
+
+/// Every `WasmHash` leaf names a build the keystore could match: the SHA-256
+/// of the bytes as 64 lowercase hex characters, the form the worker reports.
+/// Refused at the door rather than stored — a leaf in any other form would
+/// compare equal to nothing and admit nobody, on a row whose owner would then
+/// hunt for the reason.
+fn assert_wasm_hash_leaves(access: &types::AccessCondition) {
+    match access {
+        types::AccessCondition::WasmHash { hash } => {
+            if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                env::panic_str(
+                    "a WasmHash condition must be the SHA-256 of the build as 64 lowercase hex characters",
+                );
+            }
+        }
+        types::AccessCondition::Logic { conditions, .. } => conditions.iter().for_each(assert_wasm_hash_leaves),
+        types::AccessCondition::Not { condition } => assert_wasm_hash_leaves(condition),
+        _ => {}
+    }
+}
+
+/// A `Logic` node holds at least one condition.
+///
+/// An `And` of nothing is TRUE — every keystore that evaluates one admits
+/// everybody — and it renders as `()` in both the CLI and the dashboard, so a
+/// row opened this way looks like a rule rather than the absence of one. An
+/// `Or` of nothing is the mirror: it admits nobody and cannot be told from a
+/// condition somebody meant. Neither is anything an owner can have intended,
+/// and the door that already refuses a malformed hash is the place to say so.
+fn assert_logic_is_not_empty(access: &types::AccessCondition) {
+    match access {
+        types::AccessCondition::Logic { conditions, .. } => {
+            if conditions.is_empty() {
+                env::panic_str("a Logic condition must hold at least one condition; an empty And admits everyone");
+            }
+            conditions.iter().for_each(assert_logic_is_not_empty);
+        }
+        types::AccessCondition::Not { condition } => assert_logic_is_not_empty(condition),
+        _ => {}
     }
 }
 
@@ -2429,6 +2471,8 @@ fn assert_condition_bounds(access: &types::AccessCondition) {
             "the condition asks the chain {chain_reads} times; at most {MAX_CHAIN_READ_LEAVES} such leaves are judged"
         ));
     }
+    assert_wasm_hash_leaves(access);
+    assert_logic_is_not_empty(access);
 }
 
 /// The shape of a profile name, as every refusal words it.

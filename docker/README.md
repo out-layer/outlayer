@@ -10,7 +10,12 @@ See [DOCKER_RELEASE.md](./DOCKER_RELEASE.md) for building verified Docker images
 
 - **Dockerfile.coordinator** - Production image for Coordinator API
 - **Dockerfile.worker** - Production image for Worker
-- **Dockerfile.compiler** - Sandboxed image for compiling user WASM code
+- **Dockerfile.wasmedge-compiler** - The image user code is compiled in. It fixes
+  the toolchain, and with it the bytes: the same commit compiles to the same
+  wasm only for a given image, so deployments pin it by digest
+  (`DOCKER_IMAGE=outlayer/wasmedge-compiler@sha256:…`)
+- **Dockerfile.compiler-worker** - Worker with the rust toolchain built in, for
+  compiling without a docker socket (`COMPILATION_MODE=native`)
 
 ## Building Images
 
@@ -31,8 +36,12 @@ docker build -f ../docker/Dockerfile.worker -t offchainvm-worker:latest .
 ### Compiler (for worker to use)
 
 ```bash
-docker build -f docker/Dockerfile.compiler -t offchainvm-compiler:latest .
+docker build -f docker/Dockerfile.wasmedge-compiler -t outlayer/wasmedge-compiler:rust1.85-wasi25 .
 ```
+
+See [BUILD.md](BUILD.md) for the digest to pin, and
+`scripts/build_github_wasm.sh` for computing a project's wasm hash in this same
+image before publishing it.
 
 ## Running with Docker Compose
 

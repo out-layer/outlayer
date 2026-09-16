@@ -16,7 +16,7 @@ fn get_context(predecessor: AccountId) -> VMContextBuilder {
 
 #[test]
 fn test_estimate_storage_cost() {
-    let context = get_context(accounts(1));
+    let mut context = get_context(accounts(1));
     testing_env!(context.build());
 
     let contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
@@ -404,7 +404,7 @@ fn test_delete_refunds_exact_amount() {
 
 #[test]
 fn test_access_condition_size_affects_cost() {
-    let context = get_context(accounts(1));
+    let mut context = get_context(accounts(1));
     testing_env!(context.build());
 
     let contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
@@ -918,4 +918,264 @@ fn a_long_profile_that_is_not_hex_is_still_ordinary() {
             accounts(1),
         )
         .is_some());
+}
+
+// ── A build lock is a condition, and the contract only stores ones that mean
+//    something ────────────────────────────────────────────────────────────────
+//
+// The keystore judges a `WasmHash` leaf by comparing it with the hash the
+// attested worker measured. A leaf in any other spelling therefore matches
+// nothing and admits nobody — a row its owner would then hunt through the
+// keystore's logs to explain. And an empty `Logic` is the opposite failure:
+// `And` of nothing is TRUE, so a row "protected" by one is open to everybody
+// while rendering as `()` in both the CLI and the dashboard. Both are refused
+// at the door, and these pin that they are refused at EVERY door.
+
+/// Every shape the keystore could never match.
+fn malformed_build_leaves() -> Vec<types::AccessCondition> {
+    let good = "ab".repeat(32);
+    [
+        String::new(),
+        good[..63].to_string(),
+        format!("{good}0"),
+        good.to_uppercase(),
+        format!("{}g", &good[..63]),
+        "не-хэш".to_string(),
+    ]
+    .into_iter()
+    .map(|hash| types::AccessCondition::WasmHash { hash })
+    .collect()
+}
+
+/// A `Repo` accessor deliberately: a `Project` one first asserts the project
+/// EXISTS, and a test that let that panic stand would pass for the wrong
+/// reason — which is the whole failure mode these tests are about.
+fn locked_row_accessor() -> SecretAccessor {
+    SecretAccessor::Repo { repo: "github.com/test/app".to_string(), branch: None }
+}
+
+/// Why a call refused, or `None` if it did not. The MESSAGE, because a test
+/// that only asks "did it panic" passes on any panic at all — including the
+/// unrelated one that made these tests green the first time they were run.
+fn refusal_from(f: impl FnOnce()) -> Option<String> {
+    let hushed = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(hushed);
+    match out {
+        Ok(()) => None,
+        Err(e) => Some(
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+fn store_with(contract: &mut Contract, access: types::AccessCondition) {
+    contract.store_secrets(
+        locked_row_accessor(),
+        "default".to_string(),
+        "ciphertext".to_string(),
+        access,
+        None,
+    );
+}
+
+#[test]
+fn a_build_lock_that_is_a_real_sha256_is_stored_and_read_back() {
+    let mut context = get_context(accounts(1));
+    testing_env!(context.attached_deposit(NearToken::from_near(1)).build());
+    let mut contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+
+    let hash = "ab".repeat(32);
+    let locked = types::AccessCondition::Logic {
+        operator: types::LogicOperatorV1::And,
+        conditions: vec![
+            types::AccessCondition::Whitelist { accounts: vec![accounts(1)] },
+            types::AccessCondition::WasmHash { hash: hash.clone() },
+        ],
+    };
+    store_with(&mut contract, locked.clone());
+
+    let stored = contract
+        .get_secrets(
+            locked_row_accessor(),
+            "default".to_string(),
+            accounts(1),
+        )
+        .expect("the row is there");
+    assert_eq!(stored.access, locked, "the condition survives the round trip unchanged");
+}
+
+#[test]
+fn a_build_lock_nested_under_not_and_logic_is_stored() {
+    let mut context = get_context(accounts(1));
+    testing_env!(context.attached_deposit(NearToken::from_near(1)).build());
+    let mut contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+
+    // The validator recurses, so a well-formed leaf must not be refused for
+    // sitting deep in a tree.
+    store_with(
+        &mut contract,
+        types::AccessCondition::Not {
+            condition: Box::new(types::AccessCondition::Logic {
+                operator: types::LogicOperatorV1::Or,
+                conditions: vec![types::AccessCondition::WasmHash { hash: "cd".repeat(32) }],
+            }),
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "64 lowercase hex")]
+fn store_secrets_refuses_a_malformed_build_leaf() {
+    let mut context = get_context(accounts(1));
+    testing_env!(context.attached_deposit(NearToken::from_near(1)).build());
+    let mut contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+    store_with(&mut contract, malformed_build_leaves().remove(1)); // 63 characters
+}
+
+#[test]
+fn every_malformed_build_leaf_is_refused_wherever_it_sits() {
+    for (i, leaf) in malformed_build_leaves().into_iter().enumerate() {
+        for (shape, access) in [
+            ("bare", leaf.clone()),
+            (
+                "under And",
+                types::AccessCondition::Logic {
+                    operator: types::LogicOperatorV1::And,
+                    conditions: vec![types::AccessCondition::AllowAll, leaf.clone()],
+                },
+            ),
+            ("under Not", types::AccessCondition::Not { condition: Box::new(leaf.clone()) }),
+        ] {
+            let why = refusal_from(|| {
+                let mut context = get_context(accounts(1));
+                testing_env!(context.attached_deposit(NearToken::from_near(1)).build());
+                let mut contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+                store_with(&mut contract, access);
+            });
+            let why = why.unwrap_or_else(|| panic!("malformed leaf #{i} was stored when it sat {shape}"));
+            assert!(
+                why.contains("64 lowercase hex"),
+                "malformed leaf #{i} sitting {shape} was refused for another reason: {why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_door_refuses_a_malformed_build_leaf() {
+    let bad = types::AccessCondition::WasmHash { hash: "too-short".to_string() };
+
+    // estimate_storage_cost is a VIEW, and the CLI and dashboard price a
+    // condition before storing it — so the refusal must arrive there too,
+    // before a wallet prompt rather than after one.
+    let priced = refusal_from(|| {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.build());
+        let contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        contract.estimate_storage_cost(
+            locked_row_accessor(),
+            "default".to_string(),
+            accounts(1),
+            "ciphertext".to_string(),
+            bad.clone(),
+            None,
+        );
+    });
+    assert!(
+        priced.is_some_and(|w| w.contains("64 lowercase hex")),
+        "the estimator priced a condition the store would refuse"
+    );
+
+    // update_access is the door a lock MOVES through, so it is the one an owner
+    // uses most often once a row is locked.
+    let moved = refusal_from(|| {
+        let mut context = get_context(accounts(1));
+        testing_env!(context.attached_deposit(NearToken::from_near(1)).build());
+        let mut contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        store_with(&mut contract, types::AccessCondition::AllowAll);
+        contract.update_access(
+            locked_row_accessor(),
+            "default".to_string(),
+            bad,
+        );
+    });
+    assert!(
+        moved.is_some_and(|w| w.contains("64 lowercase hex")),
+        "update_access moved a row to a leaf the keystore could never match"
+    );
+}
+
+#[test]
+#[should_panic(expected = "at least one condition")]
+fn an_empty_logic_is_refused_because_an_empty_and_admits_everyone() {
+    let mut context = get_context(accounts(1));
+    testing_env!(context.attached_deposit(NearToken::from_near(1)).build());
+    let mut contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+    store_with(
+        &mut contract,
+        types::AccessCondition::Logic { operator: types::LogicOperatorV1::And, conditions: vec![] },
+    );
+}
+
+#[test]
+fn an_empty_logic_is_refused_wherever_it_hides() {
+    let empty = types::AccessCondition::Logic {
+        operator: types::LogicOperatorV1::Or,
+        conditions: vec![],
+    };
+    for (shape, access) in [
+        (
+            "under And",
+            types::AccessCondition::Logic {
+                operator: types::LogicOperatorV1::And,
+                conditions: vec![types::AccessCondition::AllowAll, empty.clone()],
+            },
+        ),
+        ("under Not", types::AccessCondition::Not { condition: Box::new(empty.clone()) }),
+    ] {
+        let why = refusal_from(|| {
+            let mut context = get_context(accounts(1));
+            testing_env!(context.attached_deposit(NearToken::from_near(1)).build());
+            let mut contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
+            store_with(&mut contract, access);
+        });
+        let why = why.unwrap_or_else(|| panic!("an empty Logic was stored when it sat {shape}"));
+        assert!(why.contains("at least one condition"), "refused for another reason: {why}");
+    }
+}
+
+/// The Borsh layout is the variant ORDER, and `SecretProfile.access` is stored
+/// as Borsh of this enum directly. An appended variant leaves every row already
+/// on chain decoding by its old index; an inserted one silently re-reads every
+/// stored condition as a different rule. This is the test that makes "append
+/// only" enforceable rather than a comment.
+#[test]
+fn the_build_lock_is_the_last_variant_and_every_earlier_one_keeps_its_index() {
+    fn ordinal(c: &types::AccessConditionV1) -> u8 {
+        near_sdk::borsh::to_vec(c).expect("borsh")[0]
+    }
+    let a = || types::AccessConditionV1::AllowAll;
+    assert_eq!(ordinal(&types::AccessConditionV1::Logic { operator: types::LogicOperatorV1::And, conditions: vec![a()] }), 0);
+    assert_eq!(ordinal(&types::AccessConditionV1::Not { condition: Box::new(a()) }), 1);
+    assert_eq!(ordinal(&a()), 2);
+    assert_eq!(ordinal(&types::AccessConditionV1::Whitelist { accounts: vec![] }), 3);
+    assert_eq!(ordinal(&types::AccessConditionV1::AccountPattern { pattern: String::new() }), 4);
+    assert_eq!(
+        ordinal(&types::AccessConditionV1::NearBalance {
+            operator: types::ComparisonOperatorV1::Gte,
+            value: NearToken::from_yoctonear(0)
+        }),
+        5
+    );
+    assert_eq!(ordinal(&types::AccessConditionV1::ValidUntil { until_ns: near_sdk::json_types::U64(0) }), 9);
+    assert_eq!(
+        ordinal(&types::AccessConditionV1::WasmHash { hash: String::new() }),
+        10,
+        "WasmHash must stay LAST; anything else re-reads every stored condition"
+    );
 }

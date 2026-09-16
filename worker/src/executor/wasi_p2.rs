@@ -334,7 +334,12 @@ impl HostState {
 ///
 /// # Arguments
 /// * `wasm_bytes` - WASM component binary
-/// * `wasm_checksum` - SHA256 checksum of WASM bytes (for compiled cache key)
+/// * `wasm_content_sha256` - SHA256 **of the wasm bytes themselves**, the
+///   compiled cache's key. It must be the content hash and nothing else: a key
+///   that names coordinates (a repo and a commit) is shared by every build made
+///   from them, and the entry filed under it would then be served for bytes it
+///   was not compiled from. Content-keyed, a hit means byte-identical source by
+///   definition, so no separate check is needed and none can be forgotten.
 /// * `compiled_cache` - Optional compiled component cache for ~10x speedup
 /// * `input_data` - JSON input via stdin
 /// * `limits` - Resource limits (memory, instructions, time)
@@ -348,7 +353,7 @@ impl HostState {
 /// * `Err(_)` - Not a valid P2 component or execution failed
 pub async fn execute(
     wasm_bytes: &[u8],
-    wasm_checksum: Option<&str>,
+    wasm_content_sha256: Option<&str>,
     compiled_cache: Option<&Arc<Mutex<CompiledCache>>>,
     input_data: &[u8],
     limits: &ResourceLimits,
@@ -360,7 +365,7 @@ pub async fn execute(
     let engine = get_p2_engine();
 
     // Try to load from compiled cache first (if checksum provided)
-    let component = if let (Some(checksum), Some(cache)) = (wasm_checksum, compiled_cache) {
+    let component = if let (Some(checksum), Some(cache)) = (wasm_content_sha256, compiled_cache) {
         // Try cache hit
         let cached = cache.lock().ok().and_then(|mut c| c.get(checksum, &engine));
 

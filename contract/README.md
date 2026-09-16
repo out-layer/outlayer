@@ -298,7 +298,10 @@ HTTPS — never against a name the call claims. Variants: `"AllowAll"`; `{"White
 `{"NearBalance": {"operator": "Gte", "value": "<yocto>"}}`; `{"FtBalance": {"contract",
 "operator", "value"}}`; `{"NftOwned": {"contract", "token_id"}}`; `{"DaoMember":
 {"dao_contract", "role"}}`; `{"ValidUntil": {"until_ns": "<nanoseconds since the
-epoch, as a string>"}}` (admits strictly before that instant); `{"Logic": {"operator":
+epoch, as a string>"}}` (admits strictly before that instant); `{"WasmHash": {"hash":
+"<SHA-256 of the build, 64 lowercase hex>"}}` (admits only a run of that exact build —
+the keystore compares it with the hash the worker measured on the bytes it executes;
+`update_access` moves a row to the next build without re-encrypting); `{"Logic": {"operator":
 "And" | "Or", "conditions": [...]}}` and `{"Not": {"condition": ...}}` to combine
 them. The contract stores the condition without evaluating it; the Borsh layout of
 `SecretProfile.access` is the variant order, so new variants are only ever appended.

@@ -204,7 +204,8 @@ manifest because it is the artefact's, not the call's.
 Access to a stored secret is governed on chain by an `AccessCondition`, which is
 richer than a list: `AllowAll`, `Whitelist`, `AccountPattern`, `NearBalance`,
 `FtBalance`, `NftOwned`, `DaoMember`, `ValidUntil` (admits only before an
-instant), and `Logic`/`Not` to combine them. That is how you can hand a
+instant), `WasmHash` (admits only a run of one exact build), and `Logic`/`Not`
+to combine them. That is how you can hand a
 credential to a class of callers — everyone holding a particular NFT, every
 member of a DAO role — without naming them, and how a grant to one agent is
 made to lapse on its own: `And[Whitelist[agent], ValidUntil(lease end)]`.
@@ -258,6 +259,30 @@ payment key's holder addresses their own secrets through the body, as always.
 ### 4.3 How secrets reach your code
 
 As environment variables. Read them with `std::env::var`.
+
+**Locking a secret to one build.** A project's or repository's row carries
+across versions — publish v2 and it keeps working. A credential a new build
+must *not* inherit — a signing key that *is* the connector's identity, say —
+says so in its access condition: a `WasmHash` leaf admits only a run whose
+bytes hash to that SHA-256, ANDed with whoever may read the row:
+
+```json
+{"Logic": {"operator": "And", "conditions": [
+  {"Whitelist": {"accounts": ["alice.near"]}},
+  {"WasmHash": {"hash": "<sha256 of the build>"}}
+]}}
+```
+
+The keystore judges the leaf against the hash the worker measured on the
+bytes it is about to run, sent with every decrypt — never a value the call,
+the manifest or your guest supplies. A rebuild has a different hash and is
+refused with a message naming the build the row is locked to. The row and its
+ciphertext stay put: `update_access` moves the condition to the next build
+without re-encrypting, so a `PROTECTED_` key generated in the enclave keeps its
+value across the releases you approve. From the CLI: `outlayer secrets set
+--project … --build <sha256>` to store locked, `outlayer secrets access
+--project … --access … --build <new sha256>` to move it. The hash is shown as
+**Executed binary** in an execution's details on the dashboard.
 
 Two rules protect you from a caller who tries to impersonate the platform:
 

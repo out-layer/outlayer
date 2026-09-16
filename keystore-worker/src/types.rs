@@ -94,6 +94,26 @@ pub enum AccessCondition {
     ValidUntil {
         until_ns: String,
     },
+    /// Admit only a run of one exact build: the SHA-256 of the WebAssembly
+    /// bytes executing, as the attested worker measured them on the buffer it
+    /// loaded and reports in `DecryptRequest.executed_wasm_sha256`. Compared
+    /// case-insensitively; a request that reports no hash leaves this leaf
+    /// UNKNOWN, and a tree carrying one is then unknown — and so refused —
+    /// unless another branch settles the answer on its own, in which case the
+    /// admission owes this leaf nothing. Composed with the others:
+    /// `And[Whitelist[owner], WasmHash(h)]` is a secret a rebuild cannot open.
+    WasmHash {
+        hash: String,
+    },
+}
+
+/// Why a build refused a run, as the denial is worded.
+#[derive(Clone, Copy)]
+enum BuildRefusal<'a> {
+    /// A `WasmHash` leaf names a build that is not the one running.
+    LockedTo(&'a str),
+    /// A negated leaf names the build that IS running.
+    Refuses,
 }
 
 /// Nanoseconds since the epoch, by this host's clock. A clock that reads
@@ -292,7 +312,7 @@ impl AccessCondition {
     #[cfg(test)]
     pub async fn validate(&self, caller: &str, near_client: Option<&crate::near::NearClient>) -> anyhow::Result<bool> {
         let patterns = self.compile_patterns().map_err(anyhow::Error::new)?;
-        self.evaluate(caller, near_client, &patterns).await
+        self.evaluate(caller, near_client, &patterns, None).await
     }
 
     /// Evaluate against patterns already compiled by [`Self::compile_patterns`]
@@ -303,6 +323,7 @@ impl AccessCondition {
         caller: &str,
         near_client: Option<&crate::near::NearClient>,
         patterns: &CompiledPatterns,
+        executed_wasm_sha256: Option<&str>,
     ) -> anyhow::Result<bool> {
         match self {
             AccessCondition::AllowAll => {
@@ -343,25 +364,63 @@ impl AccessCondition {
             AccessCondition::Logic { operator, conditions } => {
                 match operator {
                     LogicOperator::And => {
-                        // All conditions must pass
+                        // All conditions must pass.
+                        //
+                        // A branch that cannot be evaluated is UNKNOWN, not a
+                        // refusal, and is carried rather than returned at once:
+                        // `false AND unknown` is false whichever order the two
+                        // were written in. Returning the error immediately made
+                        // the verdict depend on branch order for an operator
+                        // that is commutative — the same row admitting when
+                        // spelt one way and erroring when spelt the other.
+                        // Nothing is admitted on an unknown: an admission can
+                        // only come from branches that all genuinely passed.
+                        let mut unknown = None;
                         for condition in conditions {
-                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns));
-                            if !fut.await? {
-                                tracing::debug!("Logic::And - condition failed");
-                                return Ok(false);
+                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns, executed_wasm_sha256));
+                            match fut.await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    tracing::debug!("Logic::And - condition failed");
+                                    return Ok(false);
+                                }
+                                Err(e) => {
+                                    if unknown.is_none() {
+                                        unknown = Some(e);
+                                    }
+                                }
                             }
+                        }
+                        if let Some(e) = unknown {
+                            return Err(e);
                         }
                         tracing::debug!("Logic::And - all conditions passed");
                         Ok(true)
                     }
                     LogicOperator::Or => {
-                        // At least one condition must pass
+                        // At least one condition must pass. An unevaluable
+                        // branch is carried, not returned: `true OR unknown` is
+                        // true, and a branch that genuinely admits settles the
+                        // answer whatever the others could not decide. See the
+                        // `And` arm for why the order must not matter.
+                        let mut unknown = None;
                         for condition in conditions {
-                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns));
-                            if fut.await? {
-                                tracing::debug!("Logic::Or - condition passed");
-                                return Ok(true);
+                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns, executed_wasm_sha256));
+                            match fut.await {
+                                Ok(true) => {
+                                    tracing::debug!("Logic::Or - condition passed");
+                                    return Ok(true);
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    if unknown.is_none() {
+                                        unknown = Some(e);
+                                    }
+                                }
                             }
+                        }
+                        if let Some(e) = unknown {
+                            return Err(e);
                         }
                         tracing::debug!("Logic::Or - no conditions passed");
                         Ok(false)
@@ -370,7 +429,7 @@ impl AccessCondition {
             }
 
             AccessCondition::Not { condition } => {
-                let fut = Box::pin(condition.evaluate(caller, near_client, patterns));
+                let fut = Box::pin(condition.evaluate(caller, near_client, patterns, executed_wasm_sha256));
                 let result = fut.await?;
                 tracing::debug!(
                     inner_result = %result,
@@ -490,6 +549,18 @@ impl AccessCondition {
             }
 
             AccessCondition::ValidUntil { until_ns } => Self::valid_until_at(until_ns, now_ns()?),
+            AccessCondition::WasmHash { hash } => match executed_wasm_sha256 {
+                Some(executed) => {
+                    let granted = executed.eq_ignore_ascii_case(hash);
+                    tracing::debug!(condition = "WasmHash", expected = %hash, executed = %executed, granted = %granted, "Validated build");
+                    Ok(granted)
+                }
+                // A request that names no build cannot be judged against one:
+                // an error, refused at every combinator — never a guess.
+                None => Err(anyhow::anyhow!(
+                    "the condition admits one build, but this request reports no executing wasm hash"
+                )),
+            },
         }
     }
 
@@ -602,19 +673,75 @@ impl AccessCondition {
     #[cfg(test)]
     pub(crate) fn denial_message_for(&self, caller: &str) -> String {
         match self.compile_patterns() {
-            Ok(patterns) => self.denial_message_in(caller, &patterns),
+            Ok(patterns) => self.denial_message_in(caller, &patterns, None),
             Err(_) => "Access denied by access condition".to_string(),
         }
     }
 
-    /// [`Self::denial_message_for`] with the patterns already compiled.
-    pub fn denial_message_in(&self, caller: &str, patterns: &CompiledPatterns) -> String {
+    /// [`Self::denial_message_for`] with the patterns already compiled and the
+    /// executing build known. A build the condition is locked to is named
+    /// first: like a lapsed grant, it is the refusal the OWNER fixes — by
+    /// moving the row to the new build — rather than the caller by asking.
+    pub fn denial_message_in(&self, caller: &str, patterns: &CompiledPatterns, executed_wasm_sha256: Option<&str>) -> String {
+        if let Some(refusal) = self.build_refusal(executed_wasm_sha256) {
+            let running = executed_wasm_sha256.unwrap_or("not reported");
+            return match refusal {
+                BuildRefusal::LockedTo(locked_to) => format!(
+                    "Access denied by access condition: this secret is locked to build {locked_to} and the running build is {running}"
+                ),
+                BuildRefusal::Refuses => format!(
+                    "Access denied by access condition: this secret refuses the running build {running}"
+                ),
+            };
+        }
         match now_ns().ok().and_then(|now| self.lapsed_grant_in(caller, now, patterns)) {
             Some(until) => format!(
                 "Access denied by access condition: its time limit passed at {}",
                 iso8601_utc(until)
             ),
             None => "Access denied by access condition".to_string(),
+        }
+    }
+
+    /// Why a build refused this run, when a build is what refused it.
+    ///
+    /// Structural rather than a search for any `WasmHash` leaf, because a leaf
+    /// sitting somewhere in the tree is not the same as the tree refusing over
+    /// it: under `Or` another branch may have refused for its own reason, and
+    /// under `Not` a leaf that MATCHES is what refuses. Claiming a lock that is
+    /// not there sends the owner to re-point a row that was never locked.
+    fn build_refusal(&self, executed_wasm_sha256: Option<&str>) -> Option<BuildRefusal<'_>> {
+        // Nothing to say about a build when the request named none. The verdict
+        // on such a request is an ERROR, not a denial, so this is only reached
+        // when something ELSE refused — an old worker's call against a row whose
+        // whitelist excluded the caller, say — and blaming the build there sends
+        // the owner to re-point a lock that was never the reason.
+        let executed = executed_wasm_sha256?;
+        let names_running = |hash: &str| executed.eq_ignore_ascii_case(hash);
+        match self {
+            AccessCondition::WasmHash { hash } => (!names_running(hash)).then_some(BuildRefusal::LockedTo(hash)),
+            // "Any build but this one", refused by the one it names.
+            AccessCondition::Not { condition } => match condition.as_ref() {
+                AccessCondition::WasmHash { hash } => names_running(hash).then_some(BuildRefusal::Refuses),
+                _ => None,
+            },
+            // Every branch of an AND must pass, so the first a build refused is
+            // the reason the whole tree refused.
+            AccessCondition::Logic { operator: LogicOperator::And, conditions } => {
+                conditions.iter().find_map(|c| c.build_refusal(executed_wasm_sha256))
+            }
+            // An OR refuses over a build only when EVERY branch does. One
+            // branch that says nothing about builds refused for its own reason,
+            // and the tree is then not locked to anything.
+            AccessCondition::Logic { operator: LogicOperator::Or, conditions } => {
+                let mut first = None;
+                for condition in conditions {
+                    let refusal = condition.build_refusal(executed_wasm_sha256)?;
+                    first.get_or_insert(refusal);
+                }
+                first
+            }
+            _ => None,
         }
     }
 
@@ -1087,7 +1214,7 @@ mod a_condition_that_cannot_be_read_refuses_wherever_the_unreadable_leaf_sits {
         };
         let compiled = tree.compile_patterns().unwrap();
         assert_eq!(compiled.0.len(), 1, "one text, one regex");
-        assert!(tree.evaluate("alice.near", None, &compiled).await.unwrap());
+        assert!(tree.evaluate("alice.near", None, &compiled, None).await.unwrap());
     }
 
     #[tokio::test]
@@ -1141,5 +1268,238 @@ mod a_condition_that_cannot_be_read_refuses_wherever_the_unreadable_leaf_sits {
         assert_eq!(clip("abc", 3), "abc");
         assert_eq!(clip("abcd", 3), "abc…");
         assert_eq!(clip("жжж", 3), "ж…");
+    }
+}
+
+/// A `WasmHash` leaf admits one build, and the refusal says which.
+///
+/// Two things are pinned apart here, because they fail apart. The VERDICT is
+/// what admits or refuses a run; the MESSAGE is what the owner reads to fix a
+/// row. A message that claims a lock the tree does not carry sends them to
+/// re-point a row that was never locked, and one that stays silent where the
+/// build IS the reason leaves them with nothing to act on.
+#[cfg(test)]
+mod a_build_leaf_admits_one_build_and_says_so_when_it_refuses {
+    use super::*;
+
+    const RUNNING: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn build(hash: &str) -> AccessCondition {
+        AccessCondition::WasmHash { hash: hash.to_string() }
+    }
+    fn wl(account: &str) -> AccessCondition {
+        AccessCondition::Whitelist { accounts: vec![account.to_string()] }
+    }
+    fn and(conditions: Vec<AccessCondition>) -> AccessCondition {
+        AccessCondition::Logic { operator: LogicOperator::And, conditions }
+    }
+    fn or(conditions: Vec<AccessCondition>) -> AccessCondition {
+        AccessCondition::Logic { operator: LogicOperator::Or, conditions }
+    }
+    fn not(condition: AccessCondition) -> AccessCondition {
+        AccessCondition::Not { condition: Box::new(condition) }
+    }
+
+    async fn verdict(condition: &AccessCondition, executed: Option<&str>) -> anyhow::Result<bool> {
+        let patterns = condition.compile_patterns().expect("no patterns here");
+        condition.evaluate("alice.near", None, &patterns, executed).await
+    }
+
+    fn message(condition: &AccessCondition, executed: Option<&str>) -> String {
+        let patterns = condition.compile_patterns().expect("no patterns here");
+        condition.denial_message_in("alice.near", &patterns, executed)
+    }
+
+    #[tokio::test]
+    async fn the_running_build_is_admitted_and_any_other_is_not() {
+        assert!(verdict(&build(RUNNING), Some(RUNNING)).await.unwrap());
+        assert!(!verdict(&build(RUNNING), Some(OTHER)).await.unwrap());
+    }
+
+    /// The contract stores lowercase; the worker reports lowercase. Comparing
+    /// case-insensitively means a row that reached the chain by some other door
+    /// still decides the same way, rather than admitting nobody for a reason
+    /// nothing in the answer would name.
+    #[tokio::test]
+    async fn the_comparison_ignores_case() {
+        assert!(verdict(&build(&RUNNING.to_uppercase()), Some(RUNNING)).await.unwrap());
+    }
+
+    /// A request that names no build cannot be judged against one: the leaf is
+    /// an ERROR, not a denial, and an error stops `And`, `Or` and `Not` alike.
+    ///
+    /// Stated carefully, because the obvious phrasing overstates it. An
+    /// unevaluable leaf is UNKNOWN, and unknown combines the way it should:
+    /// `true OR unknown` is true, `false AND unknown` is false, and everything
+    /// else stays unknown. So a tree carrying a lock is unknown unless some
+    /// OTHER branch settles it on its own — which is the property that matters,
+    /// since an admission then owes nothing to the lock. Order-independence is
+    /// pinned separately by
+    /// [`a_skipped_lock_never_turns_a_denial_into_an_admission`].
+    #[tokio::test]
+    async fn a_request_that_reports_no_build_never_reaches_a_verdict_through_a_lock() {
+        // Nothing else to go on: unknown.
+        assert!(verdict(&build(RUNNING), None).await.is_err());
+        assert!(verdict(&not(build(RUNNING)), None).await.is_err());
+        // The lock is the only thing standing between the caller and the row.
+        assert!(verdict(&and(vec![AccessCondition::AllowAll, build(RUNNING)]), None).await.is_err());
+        assert!(verdict(&and(vec![wl("alice.near"), build(RUNNING)]), None).await.is_err());
+        // Settled without the lock: admitted by a branch that admits anyway,
+        // refused by one that refuses anyway. Neither owes anything to the lock.
+        assert_eq!(
+            verdict(&or(vec![build(RUNNING), AccessCondition::AllowAll]), None).await.unwrap(),
+            true
+        );
+        assert_eq!(
+            verdict(&and(vec![wl("bob.near"), build(RUNNING)]), None).await.unwrap(),
+            false
+        );
+    }
+
+    /// Short-circuiting must not make the verdict depend on the order branches
+    /// were written in — the operators are commutative and so is the answer.
+    /// The leaf is skipped only where the result is already decided, so the
+    /// same tree judges the same way whichever way round it is spelt.
+    #[tokio::test]
+    async fn a_skipped_lock_never_turns_a_denial_into_an_admission() {
+        let lock = build(RUNNING);
+        for (a, b) in [
+            (AccessCondition::AllowAll, lock.clone()),
+            (wl("bob.near"), lock.clone()),
+            (wl("alice.near"), lock.clone()),
+        ] {
+            let forwards = verdict(&or(vec![a.clone(), b.clone()]), None).await;
+            let backwards = verdict(&or(vec![b.clone(), a.clone()]), None).await;
+            assert_eq!(
+                forwards.as_ref().ok().copied(),
+                backwards.as_ref().ok().copied(),
+                "an Or judged differently depending on branch order"
+            );
+            // Whatever the order, a missing build never ADMITS through the lock:
+            // an admission here can only come from a branch that admits on its own.
+            if matches!(forwards, Ok(true)) {
+                assert!(
+                    verdict(&a, None).await.unwrap_or(false),
+                    "the Or admitted, but not because a build-free branch did"
+                );
+            }
+            let and_fwd = verdict(&and(vec![a.clone(), b.clone()]), None).await;
+            let and_bwd = verdict(&and(vec![b.clone(), a.clone()]), None).await;
+            assert_eq!(and_fwd.as_ref().ok().copied(), and_bwd.as_ref().ok().copied());
+            assert!(!matches!(and_fwd, Ok(true)), "an And with a lock admitted with no build reported");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lock_beside_a_whitelist_needs_both() {
+        let locked = and(vec![wl("alice.near"), build(RUNNING)]);
+        assert!(verdict(&locked, Some(RUNNING)).await.unwrap());
+        assert!(!verdict(&locked, Some(OTHER)).await.unwrap());
+
+        let stranger = and(vec![wl("bob.near"), build(RUNNING)]);
+        assert!(!verdict(&stranger, Some(RUNNING)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_negated_leaf_admits_every_build_but_the_one_it_names() {
+        assert!(!verdict(&not(build(RUNNING)), Some(RUNNING)).await.unwrap());
+        assert!(verdict(&not(build(RUNNING)), Some(OTHER)).await.unwrap());
+    }
+
+    #[test]
+    fn a_bare_leaf_names_the_build_it_is_locked_to() {
+        let m = message(&build(OTHER), Some(RUNNING));
+        assert!(m.contains(OTHER) && m.contains(RUNNING), "{m}");
+        assert!(m.contains("locked to build"), "{m}");
+    }
+
+    /// The build matched, so something else refused — and the message must not
+    /// send the owner after the build.
+    #[test]
+    fn a_matching_leaf_makes_no_claim_about_builds() {
+        let m = message(&and(vec![wl("bob.near"), build(RUNNING)]), Some(RUNNING));
+        assert_eq!(m, "Access denied by access condition", "{m}");
+    }
+
+    /// Under `Not`, the leaf that MATCHES is the one that refused. Reading the
+    /// tree as "a leaf matched, so the build is fine" is exactly backwards.
+    #[test]
+    fn a_negated_leaf_names_the_running_build_it_refuses() {
+        let m = message(&not(build(RUNNING)), Some(RUNNING));
+        assert!(m.contains("refuses the running build") && m.contains(RUNNING), "{m}");
+        assert!(!m.contains("locked to build"), "a negated leaf is not a lock: {m}");
+        // And the other way: a build it does not name was refused by something
+        // else, so no build claim at all.
+        assert_eq!(message(&not(build(OTHER)), Some(RUNNING)), "Access denied by access condition");
+    }
+
+    /// An `Or` with one branch that says nothing about builds is not locked to
+    /// anything: that branch refused for its own reason, whatever the build.
+    #[test]
+    fn an_or_with_a_build_free_branch_claims_no_lock() {
+        let m = message(&or(vec![wl("bob.near"), build(OTHER)]), Some(RUNNING));
+        assert_eq!(m, "Access denied by access condition", "{m}");
+    }
+
+    /// Every branch refused over a build, so the tree did.
+    #[test]
+    fn an_or_of_builds_alone_names_the_first() {
+        let third = "3333333333333333333333333333333333333333333333333333333333333333";
+        let m = message(&or(vec![build(OTHER), build(third)]), Some(RUNNING));
+        assert!(m.contains(OTHER), "the first branch is named: {m}");
+    }
+
+    /// A tree with no build leaf keeps the sentence it always had — the lapsed
+    /// grant here, which the build check must not shadow.
+    #[test]
+    fn a_time_limit_still_speaks_for_itself() {
+        let dated = and(vec![wl("alice.near"), AccessCondition::ValidUntil { until_ns: "1".into() }]);
+        assert!(message(&dated, Some(RUNNING)).contains("time limit passed"), "{}", message(&dated, Some(RUNNING)));
+    }
+
+    /// Both wrong: the build is named first, because it is the half the OWNER
+    /// fixes by re-pointing the row.
+    #[test]
+    fn a_wrong_build_beside_a_lapsed_grant_names_the_build() {
+        let both = and(vec![
+            wl("alice.near"),
+            build(OTHER),
+            AccessCondition::ValidUntil { until_ns: "1".into() },
+        ]);
+        assert!(message(&both, Some(RUNNING)).contains("locked to build"), "{}", message(&both, Some(RUNNING)));
+    }
+
+    /// The shape the contract writes, as the keystore must read it.
+    /// A request that named no build says nothing about builds. Reached in the
+    /// deploy window — an old worker, a row whose whitelist excluded the
+    /// caller — where blaming the build would send the owner to re-point a
+    /// lock that was never the reason.
+    #[test]
+    fn a_request_with_no_build_blames_no_build() {
+        assert_eq!(message(&and(vec![wl("bob.near"), build(RUNNING)]), None), "Access denied by access condition");
+        assert_eq!(message(&build(RUNNING), None), "Access denied by access condition");
+        assert_eq!(message(&not(build(RUNNING)), None), "Access denied by access condition");
+    }
+    /// An empty `Logic` is not a rule. The contract refuses to store one
+    /// (`assert_logic_is_not_empty`), and this pins WHY: an `And` of nothing
+    /// admits everybody, so a row opened that way would read as a condition
+    /// rather than as the absence of one — and it is why an edit that lifts a
+    /// lock out of a node must collapse the node rather than leave it empty.
+    #[tokio::test]
+    async fn an_empty_logic_node_is_not_a_rule() {
+        let empty_and = AccessCondition::Logic { operator: LogicOperator::And, conditions: vec![] };
+        let empty_or = AccessCondition::Logic { operator: LogicOperator::Or, conditions: vec![] };
+        assert!(verdict(&empty_and, Some(RUNNING)).await.unwrap(), "an And of nothing admits everyone");
+        assert!(!verdict(&empty_or, Some(RUNNING)).await.unwrap(), "an Or of nothing admits nobody");
+    }
+
+
+    #[test]
+    fn the_contracts_json_round_trips() {
+        let json = format!(r#"{{"WasmHash":{{"hash":"{RUNNING}"}}}}"#);
+        let parsed: AccessCondition = serde_json::from_str(&json).expect("the contract's shape");
+        assert_eq!(parsed, build(RUNNING));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
     }
 }

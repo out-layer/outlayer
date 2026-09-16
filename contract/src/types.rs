@@ -97,11 +97,22 @@ pub enum AccessConditionV1 {
     /// `Not { ValidUntil }` reads as "valid after". Evaluated by the keystore
     /// against its clock, like every other condition; stored here.
     ///
-    /// APPENDED LAST, and must stay last: `SecretProfile.access` is stored as
-    /// Borsh of this enum directly, so a variant's index is its position here,
-    /// and every row already on chain decodes by that position.
+    /// Every variant from here on is APPENDED, never inserted or reordered:
+    /// `SecretProfile.access` is stored as Borsh of this enum directly, so a
+    /// variant's index is its position here, and every row already on chain
+    /// decodes by that position.
     ValidUntil {
         until_ns: U64,
+    },
+    /// Admit only a run of one exact build: the SHA-256 of the WebAssembly
+    /// bytes that execute, 64 lowercase hex characters. Composed with the
+    /// others — `And[Whitelist[owner], WasmHash(h)]` is the owner's secret
+    /// that a rebuild cannot open; `update_access` moves it to the next build
+    /// without touching the ciphertext. The contract stores the hash; the
+    /// keystore judges it against the hash the attested worker measured on
+    /// the bytes it loaded, never one the call or the guest supplied.
+    WasmHash {
+        hash: String,
     },
 }
 

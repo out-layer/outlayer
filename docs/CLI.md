@@ -128,7 +128,9 @@ Encrypted client-side, decrypted only inside TEE.
 outlayer secrets set '{"API_KEY":"sk-...","DB_URL":"postgres://..."}'
 outlayer secrets set '{"API_KEY":"sk-..."}' --project alice.near/my-agent
 outlayer secrets set '{"API_KEY":"sk-..."}' --repo github.com/user/repo --branch main
-outlayer secrets set '{"API_KEY":"sk-..."}' --wasm-hash abc123...
+outlayer secrets set '{"API_KEY":"sk-..."}' --wasm-hash abc123...   # the row a raw WASM URL run reads under
+outlayer secrets set '{"SIGNING_KEY":"..."}' --project alice.near/oracle --build <sha256>   # locked to one build
+outlayer secrets access --project alice.near/oracle --access whitelist:alice.near --build <new sha256>   # move to the next release
 
 # Named profile
 outlayer secrets set '{"KEY":"val"}' --profile production
@@ -154,6 +156,21 @@ outlayer secrets delete --profile production
 ```
 
 Default accessor: `--project` auto-resolved from `outlayer.toml` if present.
+
+`--build <sha256>` locks a project's or repository's row to one build: the
+condition becomes `And[<access>, WasmHash(hash)]` (or the `WasmHash` leaf alone
+under `allow-all`), and the keystore admits only a run whose bytes hash to it.
+A rebuild is refused with the build named. The value stays; `secrets access
+--build <new sha256>` moves the row to the next release without re-storing, so
+a generated `PROTECTED_` key keeps its value — and with no `--access` it keeps
+the readers the row already has. `--wasm-hash` is different: it is the accessor
+a raw WASM URL run reads under, not a lock on a project row.
+
+On a locked row, `secrets set --access …` is refused: an explicit condition
+replaces the stored one, lock included, and unlocking a row is not what a
+command about readers should do silently. Pass `--build` to keep it locked, or
+`--drop-build` to remove the lock deliberately. The hash is **Executed binary**
+in an execution's details on the dashboard.
 
 ### Payment Keys
 
