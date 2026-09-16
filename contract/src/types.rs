@@ -114,6 +114,25 @@ pub enum AccessConditionV1 {
     WasmHash {
         hash: String,
     },
+    /// Judge the inner condition against the account that CALLED the
+    /// contract — `predecessor_account_id` — instead of the account that
+    /// signed the transaction. Every other leaf is judged against the
+    /// signer, so a contract the owner signs any transaction to can relay a
+    /// `request_execution` that names the owner's row: the signer is still
+    /// the owner, and the whitelist admits. This wrapper is the owner's way
+    /// to say who may stand in between. `And[Whitelist[me],
+    /// Predecessor{Whitelist[me]}]` admits only a call the owner makes
+    /// directly, with no contract in the way; `Predecessor{Whitelist[dao]}`
+    /// admits on-chain calls through that DAO and through no other contract.
+    /// Any leaf composes inside it — `DaoMember`, a balance, a pattern —
+    /// judged on the calling account. Over HTTPS there is no transaction and
+    /// nothing in between: the payer is judged as the calling account too,
+    /// so there `Predecessor{X}` is `X`. Evaluated by the keystore; stored here. The
+    /// calling account has no predecessor of its own, so a `Predecessor`
+    /// nested in a `Predecessor` judges the same account again.
+    Predecessor {
+        condition: Box<AccessConditionV1>,
+    },
 }
 
 // Versioned enums for future upgrades
@@ -197,9 +216,28 @@ mod tests {
             role: "council".to_string(),
         };
         let until = AccessCondition::ValidUntil { until_ns: U64(1_760_000_000_000_000_000) };
+        let build = AccessCondition::WasmHash { hash: "0".repeat(64) };
+        let via = AccessCondition::Predecessor { condition: Box::new(AccessCondition::AllowAll) };
         assert_eq!(borsh::to_vec(&dao).unwrap()[0], 8, "DaoMember is the ninth variant");
         assert_eq!(borsh::to_vec(&until).unwrap()[0], 9, "ValidUntil is appended after it");
+        assert_eq!(borsh::to_vec(&build).unwrap()[0], 10, "WasmHash after that");
+        assert_eq!(borsh::to_vec(&via).unwrap()[0], 11, "Predecessor after that");
         assert_eq!(borsh::to_vec(&AccessCondition::AllowAll).unwrap()[0], 2);
+    }
+
+    /// The JSON a client sends for a predecessor rule: the same shape as `Not`,
+    /// one nested condition under `condition`.
+    #[test]
+    fn a_predecessor_rule_wraps_one_condition_like_not_does() {
+        let json = r#"{"Predecessor":{"condition":{"Whitelist":{"accounts":["dao.near"]}}}}"#;
+        let parsed: AccessCondition = near_sdk::serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            AccessCondition::Predecessor {
+                condition: Box::new(AccessCondition::Whitelist { accounts: vec!["dao.near".parse().unwrap()] })
+            }
+        );
+        assert_eq!(near_sdk::serde_json::to_string(&parsed).unwrap(), json);
     }
 
     /// The JSON a client sends, round-tripped: a string for the time, since

@@ -292,8 +292,9 @@ near call outlayer.testnet update_access '{
 `access` (on `store_secrets` and `update_access`) is an `AccessCondition`, evaluated
 by the keystore inside the TEE against the account the run is attributed to — the
 transaction's SIGNER on chain (a contract that relays `request_execution` is the
-predecessor and pays, but the signer is the one judged), a payment key's owner over
-HTTPS — never against a name the call claims. Variants: `"AllowAll"`; `{"Whitelist": {"accounts": [...]}}` (exact match);
+predecessor and pays, but the signer is the one judged — unless the condition
+says otherwise with `Predecessor`), a payment key's owner over HTTPS — never
+against a name the call claims. Variants: `"AllowAll"`; `{"Whitelist": {"accounts": [...]}}` (exact match);
 `{"AccountPattern": {"pattern": "..."}}` (a regex anchored to the whole id);
 `{"NearBalance": {"operator": "Gte", "value": "<yocto>"}}`; `{"FtBalance": {"contract",
 "operator", "value"}}`; `{"NftOwned": {"contract", "token_id"}}`; `{"DaoMember":
@@ -301,7 +302,13 @@ HTTPS — never against a name the call claims. Variants: `"AllowAll"`; `{"White
 epoch, as a string>"}}` (admits strictly before that instant); `{"WasmHash": {"hash":
 "<SHA-256 of the build, 64 lowercase hex>"}}` (admits only a run of that exact build —
 the keystore compares it with the hash the worker measured on the bytes it executes;
-`update_access` moves a row to the next build without re-encrypting); `{"Logic": {"operator":
+`update_access` moves a row to the next build without re-encrypting);
+`{"Predecessor": {"condition": ...}}` (judges the condition it wraps on the account
+that CALLED the contract — `predecessor_account_id`: the relaying contract, or the
+signer on a direct call — so `And[Whitelist[me], Predecessor{Whitelist[me]}]` admits only
+the owner's own direct calls and `Predecessor{Whitelist[dao]}` only calls through that
+DAO; over HTTPS the payment key's owner is judged as the calling account too, so there
+the wrapper adds nothing); `{"Logic": {"operator":
 "And" | "Or", "conditions": [...]}}` and `{"Not": {"condition": ...}}` to combine
 them. The contract stores the condition without evaluating it; the Borsh layout of
 `SecretProfile.access` is the variant order, so new variants are only ever appended.

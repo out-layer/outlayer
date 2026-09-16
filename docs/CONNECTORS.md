@@ -204,11 +204,24 @@ manifest because it is the artefact's, not the call's.
 Access to a stored secret is governed on chain by an `AccessCondition`, which is
 richer than a list: `AllowAll`, `Whitelist`, `AccountPattern`, `NearBalance`,
 `FtBalance`, `NftOwned`, `DaoMember`, `ValidUntil` (admits only before an
-instant), `WasmHash` (admits only a run of one exact build), and `Logic`/`Not`
-to combine them. That is how you can hand a
-credential to a class of callers — everyone holding a particular NFT, every
-member of a DAO role — without naming them, and how a grant to one agent is
-made to lapse on its own: `And[Whitelist[agent], ValidUntil(lease end)]`.
+instant), `WasmHash` (admits only a run of one exact build), `Predecessor`
+(judges the condition it wraps on the account that *called* the contract
+rather than the signer), and `Logic`/`Not` to combine them. That is how you
+can hand a credential to a class of callers — everyone holding a particular
+NFT, every member of a DAO role — without naming them, and how a grant to one
+agent is made to lapse on its own: `And[Whitelist[agent], ValidUntil(lease
+end)]`.
+
+Every leaf but `Predecessor` is judged on the transaction's signer, so a
+contract the owner signs any transaction to is the predecessor when it relays
+`request_execution` naming the owner's row — and the owner's own whitelist
+admits it. `And[Whitelist[me], Predecessor{Whitelist[me]}]` closes that: a
+call is admitted only when the account that called the contract is the owner,
+with no contract in between. `Predecessor{Whitelist[dao]}` names the one relay
+calls may come through instead. Over HTTPS nothing relays a call, and the
+payment key's owner is judged as the caller too. A function-call access key on
+the owner's own account signs directly — predecessor and signer are both the
+owner — and no condition can see it.
 
 Those class checks ask the chain, one after another, while a shared keystore
 waits — so a condition may hold **at most five** of them (`NearBalance`,

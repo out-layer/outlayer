@@ -105,6 +105,34 @@ pub enum AccessCondition {
     WasmHash {
         hash: String,
     },
+    /// Judge the inner condition against the account that CALLED the
+    /// contract — the receipt's predecessor, which the worker reports in
+    /// `DecryptRequest.predecessor_id` — instead of the account that signed.
+    /// Every other leaf is judged against the signer, so a contract the
+    /// owner signs any transaction to can relay a request naming the owner's
+    /// row; this wrapper says who may stand in between. Any leaf composes
+    /// inside it, judged on the calling account: `And[Whitelist[me],
+    /// Predecessor{Whitelist[me]}]` admits only the owner's own direct call.
+    /// Over HTTPS there is no transaction and nothing in between: the worker
+    /// reports the payer as the calling account, so there `Predecessor{X}`
+    /// is `X`. A request that reports none leaves this leaf UNKNOWN —
+    /// refused, unless another branch admits on its own.
+    Predecessor {
+        condition: Box<AccessCondition>,
+    },
+}
+
+/// What the worker reported about the run beyond who signed for it: the
+/// facts a leaf other than a naming one is judged against. Each is `None` on
+/// a request from a worker that predates its field, and a leaf that needs
+/// one is then UNKNOWN — an error at every combinator, never a guess.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunFacts<'a> {
+    /// SHA-256 of the bytes about to run, as the worker measured them.
+    pub executed_wasm_sha256: Option<&'a str>,
+    /// The account that called the contract: the receipt's predecessor on
+    /// chain, the payer over HTTPS.
+    pub predecessor_id: Option<&'a str>,
 }
 
 /// Why a build refused a run, as the denial is worded.
@@ -291,7 +319,7 @@ impl AccessCondition {
                 Ok(())
             }
             AccessCondition::Logic { conditions, .. } => conditions.iter().try_for_each(|c| c.collect_patterns(into)),
-            AccessCondition::Not { condition } => condition.collect_patterns(into),
+            AccessCondition::Not { condition } | AccessCondition::Predecessor { condition } => condition.collect_patterns(into),
             _ => Ok(()),
         }
     }
@@ -312,7 +340,7 @@ impl AccessCondition {
     #[cfg(test)]
     pub async fn validate(&self, caller: &str, near_client: Option<&crate::near::NearClient>) -> anyhow::Result<bool> {
         let patterns = self.compile_patterns().map_err(anyhow::Error::new)?;
-        self.evaluate(caller, near_client, &patterns, None).await
+        self.evaluate(caller, near_client, &patterns, RunFacts::default()).await
     }
 
     /// Evaluate against patterns already compiled by [`Self::compile_patterns`]
@@ -323,7 +351,7 @@ impl AccessCondition {
         caller: &str,
         near_client: Option<&crate::near::NearClient>,
         patterns: &CompiledPatterns,
-        executed_wasm_sha256: Option<&str>,
+        facts: RunFacts<'_>,
     ) -> anyhow::Result<bool> {
         match self {
             AccessCondition::AllowAll => {
@@ -377,7 +405,7 @@ impl AccessCondition {
                         // only come from branches that all genuinely passed.
                         let mut unknown = None;
                         for condition in conditions {
-                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns, executed_wasm_sha256));
+                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns, facts));
                             match fut.await {
                                 Ok(true) => {}
                                 Ok(false) => {
@@ -405,7 +433,7 @@ impl AccessCondition {
                         // `And` arm for why the order must not matter.
                         let mut unknown = None;
                         for condition in conditions {
-                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns, executed_wasm_sha256));
+                            let fut = Box::pin(condition.evaluate(caller, near_client, patterns, facts));
                             match fut.await {
                                 Ok(true) => {
                                     tracing::debug!("Logic::Or - condition passed");
@@ -429,7 +457,7 @@ impl AccessCondition {
             }
 
             AccessCondition::Not { condition } => {
-                let fut = Box::pin(condition.evaluate(caller, near_client, patterns, executed_wasm_sha256));
+                let fut = Box::pin(condition.evaluate(caller, near_client, patterns, facts));
                 let result = fut.await?;
                 tracing::debug!(
                     inner_result = %result,
@@ -549,7 +577,7 @@ impl AccessCondition {
             }
 
             AccessCondition::ValidUntil { until_ns } => Self::valid_until_at(until_ns, now_ns()?),
-            AccessCondition::WasmHash { hash } => match executed_wasm_sha256 {
+            AccessCondition::WasmHash { hash } => match facts.executed_wasm_sha256 {
                 Some(executed) => {
                     let granted = executed.eq_ignore_ascii_case(hash);
                     tracing::debug!(condition = "WasmHash", expected = %hash, executed = %executed, granted = %granted, "Validated build");
@@ -559,6 +587,24 @@ impl AccessCondition {
                 // an error, refused at every combinator — never a guess.
                 None => Err(anyhow::anyhow!(
                     "the condition admits one build, but this request reports no executing wasm hash"
+                )),
+            },
+
+            // The same tree, judged with the calling account as its subject.
+            // The facts travel unchanged: a build lock inside reads the same
+            // build, and a nested `Predecessor` judges the same account again
+            // — the calling account has no predecessor of its own.
+            AccessCondition::Predecessor { condition } => match facts.predecessor_id {
+                Some(predecessor) => {
+                    let fut = Box::pin(condition.evaluate(predecessor, near_client, patterns, facts));
+                    let granted = fut.await?;
+                    tracing::debug!(condition = "Predecessor", predecessor = %predecessor, caller = %caller, granted = %granted, "Validated the calling account");
+                    Ok(granted)
+                }
+                // A request that names no calling account cannot be judged on
+                // one: an error, refused at every combinator — never a guess.
+                None => Err(anyhow::anyhow!(
+                    "the condition is judged on the account that called the contract, but this request reports none"
                 )),
             },
         }
@@ -673,18 +719,19 @@ impl AccessCondition {
     #[cfg(test)]
     pub(crate) fn denial_message_for(&self, caller: &str) -> String {
         match self.compile_patterns() {
-            Ok(patterns) => self.denial_message_in(caller, &patterns, None),
+            Ok(patterns) => self.denial_message_in(caller, &patterns, RunFacts::default()),
             Err(_) => "Access denied by access condition".to_string(),
         }
     }
 
     /// [`Self::denial_message_for`] with the patterns already compiled and the
-    /// executing build known. A build the condition is locked to is named
-    /// first: like a lapsed grant, it is the refusal the OWNER fixes — by
-    /// moving the row to the new build — rather than the caller by asking.
-    pub fn denial_message_in(&self, caller: &str, patterns: &CompiledPatterns, executed_wasm_sha256: Option<&str>) -> String {
-        if let Some(refusal) = self.build_refusal(executed_wasm_sha256) {
-            let running = executed_wasm_sha256.unwrap_or("not reported");
+    /// run's facts known. A build the condition is locked to is named first:
+    /// like a lapsed grant, it is the refusal the OWNER fixes — by moving the
+    /// row to the new build — rather than the caller by asking. A condition
+    /// that judges the calling account gets the facts of the call appended.
+    pub fn denial_message_in(&self, caller: &str, patterns: &CompiledPatterns, facts: RunFacts<'_>) -> String {
+        if let Some(refusal) = self.build_refusal(facts.executed_wasm_sha256) {
+            let running = facts.executed_wasm_sha256.unwrap_or("not reported");
             return match refusal {
                 BuildRefusal::LockedTo(locked_to) => format!(
                     "Access denied by access condition: this secret is locked to build {locked_to} and the running build is {running}"
@@ -694,12 +741,42 @@ impl AccessCondition {
                 ),
             };
         }
-        match now_ns().ok().and_then(|now| self.lapsed_grant_in(caller, now, patterns)) {
+        let sentence = match now_ns().ok().and_then(|now| self.lapsed_grant_in(caller, now, patterns)) {
             Some(until) => format!(
                 "Access denied by access condition: its time limit passed at {}",
                 iso8601_utc(until)
             ),
             None => "Access denied by access condition".to_string(),
+        };
+        // A condition that judges the calling account gets the FACTS appended —
+        // who signed, and which account called the contract — and nothing
+        // more. DO NOT add attribution for the calling account here: no "this
+        // secret admits direct calls only", no "X is not one it admits", no
+        // structural search for the Predecessor leaf that refused. Deciding
+        // which leaf was the reason means walking an owner-written tree of
+        // unbounded shape, and every attempt so far was either wrong on some
+        // shape (an OR of names, a wrapper in a wrapper, a lock inside the
+        // wrapper) or exponential on a crafted one — and it ran outside the
+        // evaluation deadline. The verdict is `evaluate`'s and is linear; the
+        // owner has the condition in front of them; the two facts are what
+        // they need to read it. Wording for a build lock and a lapsed date
+        // stays as it is above: linear, shipped, and not to be extended.
+        match facts.predecessor_id {
+            Some(predecessor) if self.judges_calling_account() => {
+                format!("{sentence} — signer {caller}, called from {predecessor}")
+            }
+            _ => sentence,
+        }
+    }
+
+    /// Whether a `Predecessor` sits anywhere in the tree: the one structural
+    /// question the wording asks, answered in one linear walk.
+    fn judges_calling_account(&self) -> bool {
+        match self {
+            AccessCondition::Predecessor { .. } => true,
+            AccessCondition::Logic { conditions, .. } => conditions.iter().any(|c| c.judges_calling_account()),
+            AccessCondition::Not { condition } => condition.judges_calling_account(),
+            _ => false,
         }
     }
 
@@ -1214,7 +1291,7 @@ mod a_condition_that_cannot_be_read_refuses_wherever_the_unreadable_leaf_sits {
         };
         let compiled = tree.compile_patterns().unwrap();
         assert_eq!(compiled.0.len(), 1, "one text, one regex");
-        assert!(tree.evaluate("alice.near", None, &compiled, None).await.unwrap());
+        assert!(tree.evaluate("alice.near", None, &compiled, RunFacts::default()).await.unwrap());
     }
 
     #[tokio::test]
@@ -1303,12 +1380,14 @@ mod a_build_leaf_admits_one_build_and_says_so_when_it_refuses {
 
     async fn verdict(condition: &AccessCondition, executed: Option<&str>) -> anyhow::Result<bool> {
         let patterns = condition.compile_patterns().expect("no patterns here");
-        condition.evaluate("alice.near", None, &patterns, executed).await
+        let facts = RunFacts { executed_wasm_sha256: executed, ..Default::default() };
+        condition.evaluate("alice.near", None, &patterns, facts).await
     }
 
     fn message(condition: &AccessCondition, executed: Option<&str>) -> String {
         let patterns = condition.compile_patterns().expect("no patterns here");
-        condition.denial_message_in("alice.near", &patterns, executed)
+        let facts = RunFacts { executed_wasm_sha256: executed, ..Default::default() };
+        condition.denial_message_in("alice.near", &patterns, facts)
     }
 
     #[tokio::test]
@@ -1500,6 +1579,163 @@ mod a_build_leaf_admits_one_build_and_says_so_when_it_refuses {
         let json = format!(r#"{{"WasmHash":{{"hash":"{RUNNING}"}}}}"#);
         let parsed: AccessCondition = serde_json::from_str(&json).expect("the contract's shape");
         assert_eq!(parsed, build(RUNNING));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+}
+
+/// A `Predecessor` leaf re-judges its condition on the account that called
+/// the contract, and the refusal says so only when that account was the
+/// reason.
+///
+/// Verdicts and messages are pinned apart, as for the build leaf: the VERDICT
+/// admits or refuses a run; the MESSAGE is what the owner reads to fix a row,
+/// and one that blames the calling account where a name refused sends them to
+/// edit the wrong half of the rule.
+#[cfg(test)]
+mod a_predecessor_leaf_is_judged_on_the_calling_account {
+    use super::*;
+
+    const OWNER: &str = "owner.near";
+    const DEPUTY: &str = "deputy.near";
+    const DEPUTY2: &str = "deputy2.near";
+    const STRANGER: &str = "stranger.near";
+
+    fn wl(account: &str) -> AccessCondition {
+        AccessCondition::Whitelist { accounts: vec![account.to_string()] }
+    }
+    fn via(condition: AccessCondition) -> AccessCondition {
+        AccessCondition::Predecessor { condition: Box::new(condition) }
+    }
+    fn and(conditions: Vec<AccessCondition>) -> AccessCondition {
+        AccessCondition::Logic { operator: LogicOperator::And, conditions }
+    }
+    fn or(conditions: Vec<AccessCondition>) -> AccessCondition {
+        AccessCondition::Logic { operator: LogicOperator::Or, conditions }
+    }
+    fn not(condition: AccessCondition) -> AccessCondition {
+        AccessCondition::Not { condition: Box::new(condition) }
+    }
+    fn from(predecessor: Option<&str>) -> RunFacts<'_> {
+        RunFacts { predecessor_id: predecessor, ..Default::default() }
+    }
+
+    async fn verdict(condition: &AccessCondition, caller: &str, predecessor: Option<&str>) -> anyhow::Result<bool> {
+        let patterns = condition.compile_patterns().expect("compiles");
+        condition.evaluate(caller, None, &patterns, from(predecessor)).await
+    }
+    fn message(condition: &AccessCondition, caller: &str, predecessor: Option<&str>) -> String {
+        let patterns = condition.compile_patterns().expect("compiles");
+        condition.denial_message_in(caller, &patterns, from(predecessor))
+    }
+
+    /// The owner's "direct calls only": admitted directly, refused through any
+    /// contract — and the relay is judged by the calling account, not by whose
+    /// signature carried it.
+    #[tokio::test]
+    async fn direct_calls_only_refuses_a_relay_under_the_owners_own_signature() {
+        let row = and(vec![wl(OWNER), via(wl(OWNER))]);
+        assert!(verdict(&row, OWNER, Some(OWNER)).await.unwrap(), "the owner calling directly");
+        assert!(!verdict(&row, OWNER, Some(DEPUTY)).await.unwrap(), "the owner's signature through a deputy");
+        assert!(!verdict(&row, STRANGER, Some(STRANGER)).await.unwrap(), "a stranger, directly");
+        assert!(!verdict(&row, STRANGER, Some(OWNER)).await.unwrap(), "a stranger through the owner's contract");
+    }
+
+    /// Composability through one named relay and no other.
+    #[tokio::test]
+    async fn a_named_relay_admits_and_an_unnamed_one_does_not() {
+        let row = and(vec![wl(OWNER), via(wl(DEPUTY))]);
+        assert!(verdict(&row, OWNER, Some(DEPUTY)).await.unwrap());
+        assert!(!verdict(&row, OWNER, Some(DEPUTY2)).await.unwrap());
+        assert!(!verdict(&row, OWNER, Some(OWNER)).await.unwrap(), "a direct call is not through the relay");
+    }
+
+    /// A request that names no calling account cannot be judged on one: an
+    /// error at every combinator, never a guess — and never an admission.
+    #[tokio::test]
+    async fn no_calling_account_is_an_error_not_a_verdict() {
+        assert!(verdict(&via(wl(OWNER)), OWNER, None).await.is_err());
+        assert!(verdict(&and(vec![wl(OWNER), via(wl(OWNER))]), OWNER, None).await.is_err());
+        assert!(verdict(&not(via(wl(DEPUTY))), OWNER, None).await.is_err(), "Not over unknown is unknown");
+        // An OR settles on a branch that genuinely admits, whatever the wrapper
+        // could not decide — and refuses as an error when no branch does.
+        assert!(verdict(&or(vec![wl(OWNER), via(wl(DEPUTY))]), OWNER, None).await.unwrap());
+        assert!(verdict(&or(vec![wl(OWNER), via(wl(DEPUTY))]), STRANGER, None).await.is_err());
+    }
+
+    /// Every leaf composes inside the wrapper, judged on the calling account:
+    /// a pattern is compiled wherever it sits, and a negation reads as
+    /// "not through this one". A nested wrapper judges the same account again.
+    #[tokio::test]
+    async fn any_leaf_inside_is_judged_on_the_calling_account() {
+        let pattern = AccessCondition::AccountPattern { pattern: r"deputy2?\.near".to_string() };
+        let row = and(vec![wl(OWNER), via(pattern)]);
+        assert!(verdict(&row, OWNER, Some(DEPUTY)).await.unwrap());
+        assert!(verdict(&row, OWNER, Some(DEPUTY2)).await.unwrap());
+        assert!(!verdict(&row, OWNER, Some(OWNER)).await.unwrap());
+
+        let not_through = and(vec![wl(OWNER), not(via(wl(DEPUTY)))]);
+        assert!(verdict(&not_through, OWNER, Some(OWNER)).await.unwrap());
+        assert!(verdict(&not_through, OWNER, Some(DEPUTY2)).await.unwrap());
+        assert!(!verdict(&not_through, OWNER, Some(DEPUTY)).await.unwrap());
+
+        let nested = via(via(wl(DEPUTY)));
+        assert!(verdict(&nested, OWNER, Some(DEPUTY)).await.unwrap());
+        assert!(!verdict(&nested, OWNER, Some(OWNER)).await.unwrap());
+    }
+
+    /// The wrapper alone admits: a signer named nowhere is admitted through the
+    /// contract the rule names.
+    #[tokio::test]
+    async fn the_wrapper_alone_can_admit() {
+        let row = or(vec![wl("nobody.near"), via(wl(DEPUTY))]);
+        assert!(verdict(&row, STRANGER, Some(DEPUTY)).await.unwrap());
+        assert!(!verdict(&row, STRANGER, Some(STRANGER)).await.unwrap());
+    }
+
+    /// What a refused caller reads: the sentence the row would give anyway,
+    /// with the two facts of the call appended — who signed, who called — and
+    /// no guess at which leaf was the reason. A row with no wrapper reads
+    /// exactly as before, whatever the request reports.
+    #[test]
+    fn the_message_states_the_facts_and_attributes_nothing() {
+        let row = and(vec![wl(OWNER), via(wl(OWNER))]);
+        let m = message(&row, OWNER, Some(DEPUTY));
+        assert_eq!(m, format!("Access denied by access condition — signer {OWNER}, called from {DEPUTY}"));
+        let m = message(&row, STRANGER, Some(STRANGER));
+        assert_eq!(m, format!("Access denied by access condition — signer {STRANGER}, called from {STRANGER}"));
+        assert!(!m.contains("admits") && !m.contains("directly"), "no attribution: {m}");
+        // A lapsed date keeps its own sentence, facts appended.
+        let lapsed = AccessCondition::ValidUntil { until_ns: "1".to_string() };
+        let agent = "agent.near";
+        let m = message(&or(vec![and(vec![wl(agent), lapsed]), via(wl("dao.near"))]), agent, Some(agent));
+        assert!(m.starts_with("Access denied by access condition: its time limit passed at "), "{m}");
+        assert!(m.ends_with(&format!("— signer {agent}, called from {agent}")), "{m}");
+        // No wrapper: byte-identical to what the row always said.
+        assert_eq!(message(&wl(OWNER), STRANGER, Some(DEPUTY)), "Access denied by access condition");
+        // No calling account reported: nothing to state.
+        assert_eq!(message(&row, OWNER, None), "Access denied by access condition");
+    }
+
+    /// A build lock inside the wrapper still reads the same build: the facts
+    /// travel unchanged.
+    #[tokio::test]
+    async fn the_facts_travel_into_the_wrapper() {
+        let hash = "1".repeat(64);
+        let row = via(AccessCondition::WasmHash { hash: hash.clone() });
+        let patterns = row.compile_patterns().unwrap();
+        let facts = RunFacts { executed_wasm_sha256: Some(&hash), predecessor_id: Some(DEPUTY) };
+        assert!(row.evaluate(OWNER, None, &patterns, facts).await.unwrap());
+        let other = "2".repeat(64);
+        let facts = RunFacts { executed_wasm_sha256: Some(&other), predecessor_id: Some(DEPUTY) };
+        assert!(!row.evaluate(OWNER, None, &patterns, facts).await.unwrap());
+    }
+
+    /// The contract's JSON shape, as stored: the same as `Not`'s.
+    #[test]
+    fn the_shape_is_the_contracts() {
+        let json = r#"{"Predecessor":{"condition":{"Whitelist":{"accounts":["dao.near"]}}}}"#;
+        let parsed: AccessCondition = serde_json::from_str(json).expect("the contract's shape");
+        assert_eq!(parsed, via(wl("dao.near")));
         assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
     }
 }

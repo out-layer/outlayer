@@ -2260,6 +2260,17 @@ async fn handle_execute_job(
         hex::encode(Sha256::digest(&wasm_bytes))
     };
 
+    // The account that called the contract, for a `Predecessor` access
+    // condition: on chain the receipt's predecessor as the contract's event
+    // named it, carried in the job's context; over HTTPS no contract relays
+    // the call, so the sender the condition is judged for is their own
+    // predecessor. Never a value the task body or the guest supplied.
+    let predecessor_id: Option<&str> = if is_https_call {
+        user_account_id.map(|s| s.as_str())
+    } else {
+        context.predecessor_id.as_deref()
+    };
+
     // The manifest of what actually ran: read once, from the bytes that run,
     // and used for the author's secrets, the network policy, the sub-key
     // gate and the report below.
@@ -2400,7 +2411,7 @@ async fn handle_execute_job(
             // already says it, and `update_access` moves it to the next build
             // without re-encrypting.
             info!("📦 Decrypting project-based secrets for project: {}", proj_id);
-            keystore.decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str())).await
+            keystore.decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
         } else {
             // Non-project execution: use code_source type for secrets
             match code_source {
@@ -2424,13 +2435,13 @@ async fn handle_execute_job(
                     };
 
                     // Call keystore to decrypt secrets by repo
-                    keystore.decrypt_secrets_from_contract(repo, branch.as_deref(), &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str())).await
+                    keystore.decrypt_secrets_from_contract(repo, branch.as_deref(), &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
                 }
                 CodeSource::WasmUrl { hash, .. } => {
                     info!("📦 Decrypting wasm_hash-based secrets for WasmUrl source: {}", hash);
 
                     // Call keystore to decrypt secrets by wasm_hash
-                    keystore.decrypt_secrets_by_wasm_hash(hash, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str())).await
+                    keystore.decrypt_secrets_by_wasm_hash(hash, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
                 }
             }
         };
@@ -2476,6 +2487,7 @@ async fn handle_execute_job(
         user_account_id.map(|s| s.as_str()),
         &data_id,
         &executed_wasm_sha256,
+        predecessor_id,
         user_secrets,
     )
     .await
@@ -3745,6 +3757,7 @@ async fn author_secrets_for_run(
     caller: Option<&str>,
     data_id: &str,
     executed_wasm_sha256: &str,
+    predecessor_id: Option<&str>,
     agent_secrets: Option<std::collections::HashMap<String, String>>,
 ) -> std::result::Result<Option<std::collections::HashMap<String, String>>, (String, api_client::JobStatus)> {
     use api_client::JobStatus;
@@ -3786,7 +3799,7 @@ async fn author_secrets_for_run(
     );
     let caller = proven_sender(caller, &author.owner).map_err(|m| (m, JobStatus::AccessDenied))?;
     let decrypted = keystore
-        .decrypt_secrets_by_project(project_id, &author.profile, &author.owner, caller, Some(data_id), Some(executed_wasm_sha256))
+        .decrypt_secrets_by_project(project_id, &author.profile, &author.owner, caller, Some(data_id), Some(executed_wasm_sha256), predecessor_id)
         .await
         .map_err(|e| {
             if keystore_client::SecretsNotFound::is_missing(&e) {
@@ -4690,6 +4703,7 @@ mod k2_a_keystore_that_cannot_answer_refuses_the_run {
             "data-id",
             "sha256-of-the-bytes-under-test",
             None,
+            None,
         ));
         match out {
             Err((msg, api_client::JobStatus::Failed)) => {
@@ -4717,6 +4731,7 @@ mod k2_a_keystore_that_cannot_answer_refuses_the_run {
                     Some("bob.near"),
                     "data-id",
                     "sha256-of-the-bytes-under-test",
+                    None,
                     None,
                 ),
             )
@@ -4782,5 +4797,44 @@ mod the_compiled_cache_is_keyed_by_content {
             body.contains("Sha256::digest(&wasm_bytes)"),
             "executed_wasm_sha256 must be the hash of the loaded buffer, not a value from the task: {body}"
         );
+    }
+}
+
+/// The calling account a `Predecessor` access condition is judged against
+/// reaches every decrypt, and comes from the right door: on chain the job's
+/// context (the contract's event), over HTTPS the payer. A source-shape test,
+/// as the sender check has, because the rule could be deleted from the job
+/// path and a unit test of a helper would keep passing.
+#[cfg(test)]
+mod the_calling_account_reaches_every_decrypt {
+    #[test]
+    fn the_branch_is_the_door_and_every_decrypt_carries_it() {
+        let src = include_str!("main.rs");
+        let at = src.find("let predecessor_id: Option<&str> = if is_https_call {").expect("the branch exists");
+        let window = &src[at..at + 300];
+        // The two arms in THIS order: the HTTPS arm reads the payer, the else
+        // arm reads the event's predecessor. Swapped, both strings would still
+        // be present.
+        let payer = window.find("user_account_id.map(|s| s.as_str())").expect("HTTPS: the payer is the calling account");
+        let otherwise = window.find("} else {").expect("the branch has an else");
+        let chain = window.find("context.predecessor_id.as_deref()").expect("on chain: the event's predecessor");
+        assert!(payer < otherwise && otherwise < chain, "the HTTPS arm reads the payer and the chain arm the event");
+        // The measurement comes first, the branch second, and both before any decrypt.
+        let measured = src.find("let executed_wasm_sha256 = {").expect("the measurement exists");
+        assert!(measured < at, "the calling account is settled beside the measured build");
+        // Nothing shadows it between the branch and the first decrypt.
+        let first_decrypt = src[at..].find("decrypt_secrets_by_project(proj_id").map(|n| at + n).expect("a decrypt follows");
+        assert_eq!(src[at + 20..first_decrypt].matches("let predecessor_id").count(), 0, "a second `let predecessor_id` would shadow the door's answer");
+        // Every decrypt call site in the job path carries it, the author's included.
+        let decrypts = ["decrypt_secrets_by_project(proj_id", "decrypt_secrets_from_contract(repo", "decrypt_secrets_by_wasm_hash(hash"];
+        for call in decrypts {
+            let site = src.find(call).unwrap_or_else(|| panic!("{call} exists"));
+            let line_end = src[site..].find('\n').map(|n| site + n).unwrap_or(src.len());
+            assert!(src[site..line_end].contains(", predecessor_id)"), "{call} carries the calling account");
+            assert!(site > at, "{call} comes after the branch");
+        }
+        let author = src.find("decrypt_secrets_by_project(project_id, &author.profile").expect("the author's decrypt exists");
+        let line_end = src[author..].find('\n').map(|n| author + n).unwrap();
+        assert!(src[author..line_end].contains(", predecessor_id)"), "the author's row is judged on the same calling account");
     }
 }

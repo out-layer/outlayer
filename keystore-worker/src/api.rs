@@ -385,16 +385,17 @@ impl AppState {
 /// the row. Then the verdict: a denial carries the condition's own sentence
 /// (`denial_message_in`, which names the caller's own lapsed time limit);
 /// an error from evaluation (a chain read that failed, no client, a `WasmHash`
-/// leaf on a request that reports no build) is this service's failure, a 500.
-/// Nothing is ever admitted on an error.
+/// leaf on a request that reports no build, a `Predecessor` leaf on one that
+/// reports no calling account) is this service's failure, a 500. Nothing is
+/// ever admitted on an error.
 ///
-/// `executed_wasm_sha256` is the build the request will run, as the attested
-/// worker measured it — what a `WasmHash` leaf is judged against.
+/// `facts` is what the worker reported about the run: the build it will run,
+/// as measured; the account that called the contract, as the receipt names it.
 pub(crate) async fn judge_access(
     condition: &crate::types::AccessCondition,
     caller: &str,
     near_client: Option<&crate::near::NearClient>,
-    executed_wasm_sha256: Option<&str>,
+    facts: crate::types::RunFacts<'_>,
 ) -> Result<(), ApiError> {
     // Bounds first: a condition the keystore will not judge in full is refused
     // whole, before a single pattern is compiled — nothing else bounds how
@@ -426,12 +427,12 @@ pub(crate) async fn judge_access(
     // this deadline covers the whole evaluation either way.
     let verdict = within_deadline(
         ACCESS_EVALUATION_DEADLINE,
-        condition.evaluate(caller, near_client, &patterns, executed_wasm_sha256),
+        condition.evaluate(caller, near_client, &patterns, facts),
     )
     .await?;
     match verdict {
         Ok(true) => Ok(()),
-        Ok(false) => Err(ApiError::Unauthorized(condition.denial_message_in(caller, &patterns, executed_wasm_sha256))),
+        Ok(false) => Err(ApiError::Unauthorized(condition.denial_message_in(caller, &patterns, facts))),
         Err(e) => Err(ApiError::InternalError(format!("Access validation failed: {e}"))),
     }
 }
@@ -633,6 +634,15 @@ pub struct DecryptRequest {
     /// other branch of the tree admits on its own.
     #[serde(default)]
     pub executed_wasm_sha256: Option<String>,
+
+    /// The account that called the contract: on chain the receipt's
+    /// predecessor, as the contract's own event names it; over HTTPS the
+    /// payer, since no contract relays that call. What a `Predecessor`
+    /// access condition is judged against. Absent on a request from a
+    /// worker that predates it, which leaves such a condition UNKNOWN:
+    /// refused, unless some other branch of the tree admits on its own.
+    #[serde(default)]
+    pub predecessor_id: Option<String>,
 }
 
 /// Response with decrypted secrets
@@ -2068,7 +2078,10 @@ async fn decrypt_handler(
         &access_condition,
         caller,
         state.near_client.as_ref().map(|c| c.as_ref()),
-        req.executed_wasm_sha256.as_deref(),
+        crate::types::RunFacts {
+            executed_wasm_sha256: req.executed_wasm_sha256.as_deref(),
+            predecessor_id: req.predecessor_id.as_deref(),
+        },
     )
     .await
     {
@@ -9159,7 +9172,7 @@ mod the_door_judges_one_condition_for_one_caller {
     //! a 401 that names it — wherever it sits — and nothing is admitted on an
     //! error.
     use super::*;
-    use crate::types::{AccessCondition, ComparisonOperator, LogicOperator};
+    use crate::types::{AccessCondition, ComparisonOperator, LogicOperator, RunFacts};
 
     fn bad() -> AccessCondition {
         AccessCondition::AccountPattern { pattern: "(".to_string() }
@@ -9168,7 +9181,7 @@ mod the_door_judges_one_condition_for_one_caller {
     #[tokio::test]
     async fn a_bad_pattern_under_not_is_a_401_naming_the_pattern() {
         let not_bad = AccessCondition::Not { condition: Box::new(bad()) };
-        match judge_access(&not_bad, "anyone.near", None, None).await {
+        match judge_access(&not_bad, "anyone.near", None, RunFacts::default()).await {
             Err(ApiError::Unauthorized(m)) => {
                 assert!(m.contains("AccountPattern `(`") && m.contains("cannot be compiled"), "{m}");
             }
@@ -9184,19 +9197,19 @@ mod the_door_judges_one_condition_for_one_caller {
         };
         let and = AccessCondition::Logic { operator: LogicOperator::And, conditions: vec![AccessCondition::AllowAll, bad()] };
         for c in [or, and] {
-            assert!(matches!(judge_access(&c, "alice.near", None, None).await, Err(ApiError::Unauthorized(m)) if m.contains("cannot be compiled")));
+            assert!(matches!(judge_access(&c, "alice.near", None, RunFacts::default()).await, Err(ApiError::Unauthorized(m)) if m.contains("cannot be compiled")));
         }
     }
 
     #[tokio::test]
     async fn a_denial_carries_the_conditions_own_sentence() {
         let wl = AccessCondition::Whitelist { accounts: vec!["bob.near".into()] };
-        match judge_access(&wl, "alice.near", None, None).await {
+        match judge_access(&wl, "alice.near", None, RunFacts::default()).await {
             Err(ApiError::Unauthorized(m)) => assert!(m.starts_with("Access denied by access condition"), "{m}"),
             other => panic!("{other:?}"),
         }
-        assert!(judge_access(&wl, "bob.near", None, None).await.is_ok());
-        assert!(judge_access(&AccessCondition::AllowAll, "anyone.near", None, None).await.is_ok());
+        assert!(judge_access(&wl, "bob.near", None, RunFacts::default()).await.is_ok());
+        assert!(judge_access(&AccessCondition::AllowAll, "anyone.near", None, RunFacts::default()).await.is_ok());
     }
 
     #[tokio::test]
@@ -9212,15 +9225,15 @@ mod the_door_judges_one_condition_for_one_caller {
             operator: LogicOperator::Or,
             conditions: vec![AccessCondition::Whitelist { accounts: vec!["owner.near".into()] }, dated("agent.near")],
         };
-        match judge_access(&grants, "agent.near", None, None).await {
+        match judge_access(&grants, "agent.near", None, RunFacts::default()).await {
             Err(ApiError::Unauthorized(m)) => assert!(m.ends_with("its time limit passed at 1970-01-01T00:00:00Z"), "{m}"),
             other => panic!("{other:?}"),
         }
-        match judge_access(&grants, "stranger.near", None, None).await {
+        match judge_access(&grants, "stranger.near", None, RunFacts::default()).await {
             Err(ApiError::Unauthorized(m)) => assert_eq!(m, "Access denied by access condition", "not named, so no date"),
             other => panic!("{other:?}"),
         }
-        assert!(judge_access(&grants, "owner.near", None, None).await.is_ok());
+        assert!(judge_access(&grants, "owner.near", None, RunFacts::default()).await.is_ok());
     }
 
     #[tokio::test]
@@ -9229,12 +9242,12 @@ mod the_door_judges_one_condition_for_one_caller {
         let mut seventeen: Vec<_> = (0..17).map(leaf).collect();
         seventeen.push(AccessCondition::AllowAll);
         let tree = AccessCondition::Logic { operator: LogicOperator::Or, conditions: seventeen };
-        match judge_access(&tree, "anyone.near", None, None).await {
+        match judge_access(&tree, "anyone.near", None, RunFacts::default()).await {
             Err(ApiError::Unauthorized(m)) => assert!(m.contains("17 AccountPattern leaves"), "{m}"),
             other => panic!("AllowAll beside 17 patterns must still refuse: {other:?}"),
         }
         let sixteen = AccessCondition::Logic { operator: LogicOperator::Or, conditions: (0..16).map(leaf).chain([AccessCondition::AllowAll]).collect() };
-        assert!(judge_access(&sixteen, "anyone.near", None, None).await.is_ok());
+        assert!(judge_access(&sixteen, "anyone.near", None, RunFacts::default()).await.is_ok());
     }
 
     /// The deadline: it fires, firing is a REFUSAL, and a verdict that arrives
@@ -9282,7 +9295,7 @@ mod the_door_judges_one_condition_for_one_caller {
             conditions: (0..n).map(|_| read()).collect(),
         };
 
-        match judge_access(&tree(6), "anyone.near", None, None).await {
+        match judge_access(&tree(6), "anyone.near", None, RunFacts::default()).await {
             Err(ApiError::Unauthorized(m)) => {
                 assert!(m.contains("asks the chain 6 times"), "{m}");
             }
@@ -9291,7 +9304,7 @@ mod the_door_judges_one_condition_for_one_caller {
 
         // Five are within the bound, so the refusal that follows is the
         // missing client — the bound did not answer for it.
-        match judge_access(&tree(5), "anyone.near", None, None).await {
+        match judge_access(&tree(5), "anyone.near", None, RunFacts::default()).await {
             Err(ApiError::InternalError(m)) => {
                 assert!(!m.contains("asks the chain"), "the bound answered for five: {m}");
                 assert!(m.contains("no NEAR client"), "{m}");
@@ -9303,9 +9316,9 @@ mod the_door_judges_one_condition_for_one_caller {
     #[tokio::test]
     async fn a_chain_read_that_cannot_run_is_this_services_failure_not_an_admission() {
         let balance = AccessCondition::NearBalance { operator: ComparisonOperator::Gte, value: "1".into() };
-        assert!(matches!(judge_access(&balance, "anyone.near", None, None).await, Err(ApiError::InternalError(_))));
+        assert!(matches!(judge_access(&balance, "anyone.near", None, RunFacts::default()).await, Err(ApiError::InternalError(_))));
         let negated = AccessCondition::Not { condition: Box::new(balance) };
-        assert!(matches!(judge_access(&negated, "anyone.near", None, None).await, Err(ApiError::InternalError(_))));
+        assert!(matches!(judge_access(&negated, "anyone.near", None, RunFacts::default()).await, Err(ApiError::InternalError(_))));
     }
 }
 
@@ -9413,10 +9426,15 @@ mod decrypt_raw_serves_the_top_up_flow_only {
 #[cfg(test)]
 mod the_door_judges_a_build_lock {
     use super::*;
-    use crate::types::{AccessCondition, LogicOperator};
+    use crate::types::{AccessCondition, LogicOperator, RunFacts};
 
     const RUNNING: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// A request that names the running build and no calling account.
+    fn running() -> RunFacts<'static> {
+        RunFacts { executed_wasm_sha256: Some(RUNNING), ..Default::default() }
+    }
 
     fn locked_to(hash: &str) -> AccessCondition {
         AccessCondition::Logic {
@@ -9430,8 +9448,8 @@ mod the_door_judges_a_build_lock {
 
     #[tokio::test]
     async fn the_running_build_passes_and_another_is_a_401_naming_both() {
-        assert!(judge_access(&locked_to(RUNNING), "alice.near", None, Some(RUNNING)).await.is_ok());
-        match judge_access(&locked_to(OTHER), "alice.near", None, Some(RUNNING)).await {
+        assert!(judge_access(&locked_to(RUNNING), "alice.near", None, running()).await.is_ok());
+        match judge_access(&locked_to(OTHER), "alice.near", None, running()).await {
             Err(ApiError::Unauthorized(m)) => {
                 assert!(m.contains(OTHER) && m.contains(RUNNING), "both builds are named: {m}");
             }
@@ -9445,7 +9463,7 @@ mod the_door_judges_a_build_lock {
     /// to any build at all.
     #[tokio::test]
     async fn a_request_without_a_build_is_a_500_not_an_admission() {
-        match judge_access(&locked_to(RUNNING), "alice.near", None, None).await {
+        match judge_access(&locked_to(RUNNING), "alice.near", None, RunFacts::default()).await {
             Err(ApiError::InternalError(m)) => assert!(m.contains("no executing wasm hash"), "{m}"),
             other => panic!("a locked row and no build must fail closed, got {other:?}"),
         }
@@ -9457,9 +9475,9 @@ mod the_door_judges_a_build_lock {
     #[tokio::test]
     async fn a_row_with_no_lock_is_unaffected_by_the_new_field() {
         let wl = AccessCondition::Whitelist { accounts: vec!["alice.near".into()] };
-        assert!(judge_access(&wl, "alice.near", None, None).await.is_ok());
-        assert!(judge_access(&wl, "alice.near", None, Some(RUNNING)).await.is_ok());
-        assert!(judge_access(&wl, "bob.near", None, Some(RUNNING)).await.is_err());
+        assert!(judge_access(&wl, "alice.near", None, RunFacts::default()).await.is_ok());
+        assert!(judge_access(&wl, "alice.near", None, running()).await.is_ok());
+        assert!(judge_access(&wl, "bob.near", None, running()).await.is_err());
     }
 
     /// An older worker sends no such field, and its requests must still parse.
@@ -9478,5 +9496,14 @@ mod the_door_judges_a_build_lock {
         ))
         .expect("a request that names the build");
         assert_eq!(new.executed_wasm_sha256.as_deref(), Some(RUNNING));
+        assert_eq!(new.predecessor_id, None, "a worker that names the build but not the caller's contract");
+
+        let full: DecryptRequest = serde_json::from_str(&format!(
+            r#"{{"accessor":{{"type":"Project","project_id":"a.near/p"}},"profile":"default",
+                 "owner":"a.near","user_account_id":"a.near","executed_wasm_sha256":"{RUNNING}",
+                 "predecessor_id":"dao.near"}}"#
+        ))
+        .expect("a request that names the calling account");
+        assert_eq!(full.predecessor_id.as_deref(), Some("dao.near"));
     }
 }

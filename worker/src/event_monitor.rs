@@ -144,6 +144,12 @@ pub struct RequestData {
     pub input_data_in_state: bool,
     #[serde(default)]
     pub secrets_ref: Option<crate::api_client::SecretsReference>,
+    /// The account that called the contract, as the contract itself saw it
+    /// (`env::predecessor_account_id()`): the relaying contract, or the signer
+    /// on a direct call. What a `Predecessor` access condition is judged
+    /// against.
+    #[serde(default)]
+    pub predecessor_id: Option<String>,
     pub payment: String,
     /// Payment to project developer (stablecoin, minimal token units)
     #[serde(default)]
@@ -1130,7 +1136,10 @@ impl EventMonitor {
             contract_id: Some(self.contract_id.to_string()),
             transaction_hash: event.transaction_hash.clone(),
             receipt_id: event.receipt_id.clone(),
-            predecessor_id: event.predecessor_id.clone(),
+            // The contract's own word on who called it, from the event it
+            // wrote; the receipt's predecessor is the same account, read off
+            // the feed, and stands in for an event that carries none.
+            predecessor_id: request_data.predecessor_id.clone().or_else(|| event.predecessor_id.clone()),
             signer_public_key: event.signer_public_key.clone(),
             gas_burnt: event.gas_burnt,
         };

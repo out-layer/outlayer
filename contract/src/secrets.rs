@@ -2403,7 +2403,9 @@ fn condition_leaf_count(access: &types::AccessCondition) -> (usize, usize, usize
             .iter()
             .map(condition_leaf_count)
             .fold((0, 0, 0), |(l, b, c), (l2, b2, c2)| (l + l2, b + b2, c + c2)),
-        types::AccessCondition::Not { condition } => condition_leaf_count(condition),
+        types::AccessCondition::Not { condition } | types::AccessCondition::Predecessor { condition } => {
+            condition_leaf_count(condition)
+        }
         // Named rather than `_`: a variant added later that asks the chain must
         // fail to compile here, not silently count as nothing.
         types::AccessCondition::AllowAll
@@ -2428,7 +2430,9 @@ fn assert_wasm_hash_leaves(access: &types::AccessCondition) {
             }
         }
         types::AccessCondition::Logic { conditions, .. } => conditions.iter().for_each(assert_wasm_hash_leaves),
-        types::AccessCondition::Not { condition } => assert_wasm_hash_leaves(condition),
+        types::AccessCondition::Not { condition } | types::AccessCondition::Predecessor { condition } => {
+            assert_wasm_hash_leaves(condition)
+        }
         _ => {}
     }
 }
@@ -2449,7 +2453,9 @@ fn assert_logic_is_not_empty(access: &types::AccessCondition) {
             }
             conditions.iter().for_each(assert_logic_is_not_empty);
         }
-        types::AccessCondition::Not { condition } => assert_logic_is_not_empty(condition),
+        types::AccessCondition::Not { condition } | types::AccessCondition::Predecessor { condition } => {
+            assert_logic_is_not_empty(condition)
+        }
         _ => {}
     }
 }

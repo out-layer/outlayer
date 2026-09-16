@@ -755,7 +755,9 @@ impl KeystoreClient {
     /// 1. Calls keystore /decrypt with accessor (Repo or WasmHash)
     /// 2. Keystore reads secrets from NEAR contract
     /// 3. Keystore validates access conditions (user_account_id as caller;
-    ///    executed_wasm_sha256 as the build a `WasmHash` leaf is judged against)
+    ///    executed_wasm_sha256 as the build a `WasmHash` leaf is judged
+    ///    against; predecessor_id as the calling account a `Predecessor`
+    ///    leaf is judged against)
     /// 4. Keystore decrypts using derived key for seed
     /// 5. Returns HashMap of environment variables
     ///
@@ -768,6 +770,7 @@ impl KeystoreClient {
         user_account_id: &str,
         task_id: Option<&str>,
         executed_wasm_sha256: Option<&str>,
+        predecessor_id: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor_desc = match &accessor {
             SecretAccessor::Repo { repo, branch } => {
@@ -798,6 +801,11 @@ impl KeystoreClient {
             /// the loaded buffer — what a `WasmHash` access condition is
             /// judged against. Never a value the task or the guest supplied.
             executed_wasm_sha256: Option<String>,
+            /// The account that called the contract — the receipt's
+            /// predecessor on chain, the payer over HTTPS — what a
+            /// `Predecessor` access condition is judged against. From the
+            /// contract's event, never from the task body or the guest.
+            predecessor_id: Option<String>,
         }
 
         let request = DecryptRequest {
@@ -807,6 +815,7 @@ impl KeystoreClient {
             user_account_id: user_account_id.to_string(),
             task_id: task_id.map(|s| s.to_string()),
             executed_wasm_sha256: executed_wasm_sha256.map(|s| s.to_string()),
+            predecessor_id: predecessor_id.map(|s| s.to_string()),
         };
 
         let (keystore, tee_session) = self.current_endpoint();
@@ -894,12 +903,13 @@ impl KeystoreClient {
         user_account_id: &str,
         task_id: Option<&str>,
         executed_wasm_sha256: Option<&str>,
+        predecessor_id: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor = SecretAccessor::Repo {
             repo: repo.to_string(),
             branch: branch.map(|s| s.to_string()),
         };
-        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256).await
+        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256, predecessor_id).await
     }
 
     /// Decrypt secrets from contract by WASM hash (convenience wrapper for WasmHash accessor)
@@ -913,11 +923,12 @@ impl KeystoreClient {
         user_account_id: &str,
         task_id: Option<&str>,
         executed_wasm_sha256: Option<&str>,
+        predecessor_id: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor = SecretAccessor::WasmHash {
             hash: wasm_hash.to_string(),
         };
-        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256).await
+        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256, predecessor_id).await
     }
 
     /// Decrypt secrets from contract by project ID (convenience wrapper for Project accessor)
@@ -932,11 +943,12 @@ impl KeystoreClient {
         user_account_id: &str,
         task_id: Option<&str>,
         executed_wasm_sha256: Option<&str>,
+        predecessor_id: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let accessor = SecretAccessor::Project {
             project_id: project_id.to_string(),
         };
-        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256).await
+        self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256, predecessor_id).await
     }
 
     /// Encrypt data using keystore's derived key
@@ -1266,7 +1278,7 @@ mod tests {
         let client = KeystoreClient::new(vec![fake_keystore_answering(code, body)], "t".to_string())
             .expect("one url");
         client
-            .decrypt_secrets_by_project("a.near/p", "prod", "a.near", "a.near", None, None)
+            .decrypt_secrets_by_project("a.near/p", "prod", "a.near", "a.near", None, None, None)
             .await
             .expect_err("a non-2xx must be an error")
     }
@@ -1658,10 +1670,14 @@ mod the_decrypt_request_carries_the_executing_build {
 
     /// The body of the request the keystore received, as JSON.
     async fn request_body_of(executed: Option<&str>) -> serde_json::Value {
+        request_body_with(executed, None).await
+    }
+
+    async fn request_body_with(executed: Option<&str>, predecessor: Option<&str>) -> serde_json::Value {
         let (url, seen) = capturing_keystore();
         let client = KeystoreClient::new(vec![url], "t".to_string()).expect("one url");
         let _ = client
-            .decrypt_secrets_by_project("a.near/p", "prod", "a.near", "a.near", None, executed)
+            .decrypt_secrets_by_project("a.near/p", "prod", "a.near", "a.near", None, executed, predecessor)
             .await;
         let raw = seen.lock().unwrap().clone();
         let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
@@ -1690,5 +1706,15 @@ mod the_decrypt_request_carries_the_executing_build {
     async fn no_measurement_sends_an_explicit_null() {
         let body = request_body_of(None).await;
         assert!(body["executed_wasm_sha256"].is_null(), "{body}");
+        assert!(body["predecessor_id"].is_null(), "{body}");
+    }
+
+    /// The calling account travels beside the build, under the name the
+    /// keystore judges a `Predecessor` leaf by.
+    #[tokio::test]
+    async fn the_calling_account_is_in_the_body_the_keystore_receives() {
+        let body = request_body_with(Some(EXECUTED), Some("dao.near")).await;
+        assert_eq!(body["predecessor_id"].as_str(), Some("dao.near"), "{body}");
+        assert_eq!(body["executed_wasm_sha256"].as_str(), Some(EXECUTED), "{body}");
     }
 }

@@ -854,8 +854,9 @@ wasm (`outlayer.manifest` custom section, see `CONNECTOR_MANIFEST.md`):
 ```
 
 The worker decrypts that profile into **every** run of the project; the call
-carries nothing. Its access condition is judged against the real caller, which
-makes it the project's admission gate: `AllowAll` for a public app, a
+carries nothing. Its access condition is judged against the real caller — the
+transaction's signer, or, where the condition says `Predecessor`, the account
+that called the contract — which makes it the project's admission gate: `AllowAll` for a public app, a
 `Whitelist` or `DaoMember` for a circle — a caller the condition refuses gets a
 refused run before anything executes. A declared profile nobody stored refuses
 the run too, with a message saying what to store. Two cautions: a manifest that
