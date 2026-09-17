@@ -27,5 +27,8 @@
       "max_count": 1000,
       "applies": "everyone"
     }
-  ]
+  ],
+  "author_secrets": {
+    "profile": "author"
+  }
 }

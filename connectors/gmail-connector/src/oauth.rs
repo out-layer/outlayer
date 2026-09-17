@@ -41,6 +41,26 @@ pub const CLIENT_ID_ENV: &str = "GMAIL_CLIENT_ID";
 pub const CLIENT_SECRET_ENV: &str = "GMAIL_CLIENT_SECRET";
 pub const REFRESH_TOKEN_ENV: &str = "GMAIL_REFRESH_TOKEN";
 
+/// Our own OAuth client, held as this connector's AUTHOR secret so that an
+/// account connected through the OutLayer app needs to store only its refresh
+/// token. Deliberately not the names above: a key defined by both the author
+/// and the caller refuses the run, and a user who brought their own client must
+/// keep working.
+pub const OUR_CLIENT_ID_ENV: &str = "GMAIL_OAUTH_CLIENT_ID";
+pub const OUR_CLIENT_SECRET_ENV: &str = "GMAIL_OAUTH_CLIENT_SECRET";
+
+/// The connector's own client, when its author stored one.
+pub fn our_client() -> Option<(String, String)> {
+    match (read(OUR_CLIENT_ID_ENV), read(OUR_CLIENT_SECRET_ENV)) {
+        (Some(id), Some(secret)) => Some((id, secret)),
+        _ => None,
+    }
+}
+
+fn read(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cached {
     access_token: String,
@@ -57,17 +77,32 @@ pub struct Credential {
 }
 
 impl Credential {
+    /// The credential this run sends with.
+    ///
+    /// Two shapes, and the caller's OWN client wins. Someone who brought their
+    /// own OAuth app keeps using it and nothing of ours enters their run. An
+    /// account connected through the OutLayer app stores only a refresh token,
+    /// and our client — the author secret — completes it.
     pub fn from_env() -> Result<Self, String> {
-        let get = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        match (get(CLIENT_ID_ENV), get(CLIENT_SECRET_ENV), get(REFRESH_TOKEN_ENV)) {
-            (Some(client_id), Some(client_secret), Some(refresh_token)) => {
-                Ok(Self { client_id, client_secret, refresh_token })
-            }
-            _ => Err(format!(
-                "this wallet has no Gmail credential. The OWNER stores three values for this \
-                 connector — {CLIENT_ID_ENV}, {CLIENT_SECRET_ENV} and {REFRESH_TOKEN_ENV} — with \
-                 `outlayer secrets set-for-agent`, and the call must carry `X-Use-Owner-Secret: 1` \
-                 to bring them into the run. Nothing a caller sends in the body can stand in for them."
+        let refresh_token = read(REFRESH_TOKEN_ENV).ok_or_else(|| {
+            format!(
+                "no Gmail credential reached this run. Connect an account at \
+                 https://app.outlayer.ai/connect/gmail — that stores {REFRESH_TOKEN_ENV} for you — \
+                 or store your own {CLIENT_ID_ENV}, {CLIENT_SECRET_ENV} and {REFRESH_TOKEN_ENV} \
+                 for this connector and name that row in the call's `secrets_ref`. Nothing a \
+                 caller sends in the body can stand in for them."
+            )
+        })?;
+        if let (Some(client_id), Some(client_secret)) = (read(CLIENT_ID_ENV), read(CLIENT_SECRET_ENV)) {
+            return Ok(Self { client_id, client_secret, refresh_token });
+        }
+        match our_client() {
+            Some((client_id, client_secret)) => Ok(Self { client_id, client_secret, refresh_token }),
+            None => Err(format!(
+                "a refresh token reached this run with no OAuth client to use it with. A token \
+                 only works with the client that issued it: store {CLIENT_ID_ENV} and \
+                 {CLIENT_SECRET_ENV} beside it, or connect the account through \
+                 https://app.outlayer.ai/connect/gmail, whose client this connector carries itself."
             )),
         }
     }
@@ -149,6 +184,65 @@ fn refresh(credential: &Credential) -> Result<(String, u64), String> {
     Ok((token, expires_in))
 }
 
+/// Turn Google's authorisation code into a refresh token.
+///
+/// The one place this connector uses an OAuth client of OURS, and the only
+/// place a code is ever seen. What comes back is long-lived: a refresh token is
+/// the whole of "this account is connected", which is why it leaves this module
+/// sealed and never as an answer.
+pub fn exchange_code(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<String, String> {
+    let body = format!(
+        "code={}&client_id={}&client_secret={}&redirect_uri={}&grant_type=authorization_code",
+        form(code),
+        form(client_id),
+        form(client_secret),
+        form(redirect_uri)
+    );
+    let response = HttpClient::new()
+        .post(TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body.as_bytes())
+        .connect_timeout(TIMEOUT)
+        .send()
+        .map_err(|e| format!("Google's token endpoint could not be reached: {e}"))?;
+    let status = response.status();
+    let bytes = response.body().map_err(|e| format!("token answer: {e}"))?;
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    if status != 200 {
+        let code_name = value.get("error").and_then(Value::as_str).unwrap_or("");
+        let described = value.get("error_description").and_then(Value::as_str).unwrap_or("");
+        // Every one of these means "start the consent again", and saying so
+        // beats a caller retrying a code that can never work twice.
+        if matches!(code_name, "invalid_grant" | "redirect_uri_mismatch") {
+            return Err(format!(
+                "consent_expired: Google refused this authorisation code ({code_name} {described}). \
+                 A code is single-use and lives minutes, and it only works with the exact \
+                 redirect_uri it was issued for. Start the connection again."
+            ));
+        }
+        return Err(format!("Google refused the code exchange: HTTP {status} {code_name} {described}"));
+    }
+
+    match value.get("refresh_token").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
+        Some(token) => Ok(token.to_string()),
+        // Google returns one only when the consent asked for offline access AND
+        // the account has not already granted this client. Without it there is
+        // nothing durable to store, and a run tomorrow would have no credential.
+        None => Err(
+            "Google returned no refresh token for this consent. Ask for it with \
+             `access_type=offline` and `prompt=consent` — an account that granted this app before \
+             is given one again only when the consent is forced."
+                .to_string(),
+        ),
+    }
+}
+
 /// Percent-encode a form value. The credential is not ours to assume anything
 /// about, and an unescaped `&` in a secret would silently send a different
 /// request.
@@ -186,3 +280,4 @@ mod tests {
         assert_eq!(form("1//04xyz"), "1%2F%2F04xyz", "Google's refresh tokens start like this");
     }
 }
+

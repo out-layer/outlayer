@@ -691,7 +691,7 @@ Base: `https://api.outlayer.ai` (mainnet) · `https://testnet-api.outlayer.ai` (
 | POST | `/wallet/v1/solana/sign-message` | Sign raw Solana message bytes (ed25519, base58 sig; `encoding: utf8\|hex\|base64`). Rejects bytes that parse as a valid tx message. Gated by `solana_sign` capability |
 | POST | `/wallet/v1/solana/sign-transaction` | Sign a Solana tx **message** — **client serializes** (web3.js `tx.serializeMessage()`, base64, ≤1232 bytes), keystore ed25519-signs the bytes as-is (no assembly/blockhash/broadcast). Gated by `solana_sign` + the `raw_tx` sub-flag |
 | POST | `/wallet/v1/auth-sign` | OutLayer NEAR-key auth signature (`{purpose: bearer\|register\|api-key, seed, vault_id?}` → `{auth_message, auth_timestamp, signature, public_key}`). Replaces the old `sign-message format:"raw"` |
-| GET | `/wallet/v1/policy` | View current policy (decrypted via keystore) |
+| GET | `/wallet/v1/policy` | View current policy (decrypted via keystore). `policy: none` — no policy stored, every operation allowed; `policy: stored` — the returned sections are the policy as written |
 | POST | `/wallet/v1/encrypt-policy` | Encrypt policy for on-chain storage |
 | POST | `/wallet/v1/sign-policy` | Keystore signs the policy message (domain + blob + `caller`) for `store_wallet_policy` |
 | POST | `/wallet/v1/invalidate-cache` | Clear negative policy cache |

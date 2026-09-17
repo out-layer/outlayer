@@ -67,3 +67,10 @@ CONNECTOR_TEST_LOG.md
 # HoS suite fixture coordinates (live testnet accounts and bearer seeds)
 tests/.hos_fixture.env
 tests/hos-status-stub/target/
+
+# A published artefact's dependency set is part of the artefact. A connector's
+# wasm hash goes on chain and is meant to be auditable, so what went into it has
+# to be readable here rather than resolved afresh at every build. These override
+# the global ignore, which is right for an application and wrong for these.
+!connectors/*/Cargo.lock
+!crates/*/Cargo.lock

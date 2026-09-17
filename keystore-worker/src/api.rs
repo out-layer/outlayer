@@ -5670,6 +5670,13 @@ fn build_transfer_intent_message(
 /// must appear in `capabilities.sign_message.allowed_recipients`; anything else is
 /// refused so an auth signature can never target a fund-moving verifier (named or
 /// future). `None` policy = single-sig wallet → unrestricted.
+///
+/// Feed this the STATED policy — the `Option` as `load_wallet_policy` returned it —
+/// and never the stand-in `policy_to_judge_by` builds for a wallet that has none.
+/// The chain below short-circuits on the first absent link, so a policy whose
+/// `sign_message` is unnamed denies EVERY recipient. That is correct for a policy
+/// the owner wrote and wrong for a wallet that has none: passing the stand-in here
+/// would close auth signing on every freshly registered wallet.
 fn sign_message_recipient_allowed(
     policy: Option<&shared_tee_helpers::wallet_policy::Policy>,
     recipient: &str,
@@ -5883,20 +5890,21 @@ async fn wallet_sign_handler(
     //    (usage = None); the coordinator enforces stateful velocity. No policy on-chain
     //    → single-sig wallet → the owner's rules are empty.
     //
-    //    Evaluated even then, against an EMPTY policy, because a few of the
-    //    engine's rules are not the owner's to relax. `w_execute_extension` is
-    //    the one that matters: it denies account-CONTROL operations
-    //    (`add_extension` hands a stranger the whole lane) and anything whose
-    //    effects cannot be stated. Those hold for every wallet — and a wallet
-    //    with no policy is the state every wallet is in right after
-    //    registration, so gating them behind "has a policy" would have left the
-    //    default open. Every other section is inert on an empty policy: no
-    //    rules, no capabilities, no approval block, not frozen — so this
-    //    changes nothing for any op that is not the extension door.
+    //    Evaluated even then, because a few of the engine's rules are not the
+    //    owner's to relax. `w_execute_extension` is the one that matters: it
+    //    denies account-CONTROL operations (`add_extension` hands a stranger
+    //    the whole lane) and anything whose effects cannot be stated. Those
+    //    hold for every wallet — and a wallet with no policy is the state every
+    //    wallet is in right after registration, so gating them behind "has a
+    //    policy" would leave the default open.
+    //
+    //    What it is evaluated AGAINST is `policy_to_judge_by`, not an empty
+    //    policy: rules, the approval block and `frozen` are all inert when
+    //    unset, but capabilities are not — five of them default to DENY.
     let policy = load_wallet_policy(&state, &req.wallet_id, customer.as_ref()).await?;
     {
-        let empty = wallet_policy::Policy::default();
-        let effective = policy.as_ref().unwrap_or(&empty);
+        let effective = policy_to_judge_by(policy.as_ref());
+        let effective = effective.as_ref();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -5922,9 +5930,10 @@ async fn wallet_sign_handler(
                 // path). See plan "Trusted ops under multisig".
                 let wallet_pubkey =
                     derive_wallet_ed25519_pubkey(&state, customer.as_ref(), &req.wallet_id).await?;
-                // `effective` IS the on-chain policy here: the empty stand-in
-                // has no approval block and no capabilities, and those are the
-                // only two things that can produce this decision.
+                // `effective` IS the on-chain policy here: the stand-in for an
+                // absent one names no `requires_approval` and carries no
+                // approval block, and those are the only two things that can
+                // produce this decision.
                 verify_approvals(
                     &state,
                     effective,
@@ -6215,6 +6224,10 @@ async fn sign_built(
 /// by `op.message_hash`) and `op.recipient`. The recipient must be in the policy's
 /// `sign_message.allowed_recipients` allowlist (default-deny under a policy); a wallet
 /// with no on-chain policy is single-sig and unrestricted.
+/// `policy` is the STATED policy (`None` = the owner has written none). It is NOT
+/// the stand-in from `policy_to_judge_by`: `sign_message_recipient_allowed` below
+/// reads it directly and treats "no policy" as unrestricted, which the stand-in
+/// would not reproduce.
 async fn sign_hash_pinned(
     state: &AppState,
     customer: Option<&near_primitives::types::AccountId>,
@@ -6417,6 +6430,63 @@ async fn sign_trusted(
     Ok(Json(resp))
 }
 
+/// The policy to judge a request by, given what the owner has STATED.
+///
+/// `None` — no policy on chain — is not the same statement as an empty policy,
+/// and standing one in for the other is what broke custody: `check_capabilities`
+/// falls back to each op's DEFAULT when no capability is named, and five of them
+/// (`raw_sign`, `confidential`, `payment_check`, `swap`, `cross_chain_withdraw`)
+/// default to DENY. Those defaults exist so a STATED policy cannot be walked
+/// around — a claimable link routes funds past a `to` whitelist, raw signing
+/// past the transaction-type gate. A wallet with no policy has no whitelist and
+/// no type gate to walk around, so there is nothing for them to protect: a fresh
+/// wallet may do anything, and the owner funds it and then states what it may
+/// not do.
+///
+/// An absent policy is still EVALUATED rather than short-circuited to `Allow`,
+/// because one rule is not the owner's to relax: `w_execute_extension` denies
+/// account-control operations and effects that cannot be stated, on every
+/// wallet. The capabilities named below do not touch it.
+///
+/// Both doors go through here so the substitution is made once and can be
+/// tested once.
+fn policy_to_judge_by(
+    stated: Option<&shared_tee_helpers::wallet_policy::Policy>,
+) -> std::borrow::Cow<'_, shared_tee_helpers::wallet_policy::Policy> {
+    use std::borrow::Cow;
+    let Some(stated) = stated else {
+        let open = || {
+            Some(shared_tee_helpers::wallet_policy::Capability {
+                allowed: Some(true),
+                ..Default::default()
+            })
+        };
+        return Cow::Owned(shared_tee_helpers::wallet_policy::Policy {
+            // Exactly the capabilities `check_capabilities` would otherwise
+            // default to DENY. `sign_message`, `evm_sign` and `solana_sign` are
+            // NOT named: their engines read the STATED policy directly (see
+            // `sign_message_recipient_allowed` and `chain_sign_decision`, both
+            // of which treat `None` as unrestricted), so naming them here would
+            // be dead code that also answers wrongly if it were ever reached —
+            // `chain_sign_decision` denies a raw transaction unless `raw_tx`
+            // is explicitly true.
+            capabilities: Some(shared_tee_helpers::wallet_policy::Capabilities {
+                raw_sign: open(),
+                confidential: open(),
+                payment_check: open(),
+                swap: open(),
+                cross_chain_withdraw: open(),
+                sign_message: None,
+                evm_sign: None,
+                solana_sign: None,
+            }),
+            ..Default::default()
+        });
+    };
+    Cow::Borrowed(stated)
+}
+
+
 /// Pre-flight policy check for a canonical `op` — the SAME engine `/wallet/sign` uses.
 ///
 /// Decrypts the on-chain policy (which NEVER leaves the keystore) and runs
@@ -6472,16 +6542,16 @@ async fn wallet_check_policy_handler(
         load_wallet_policy(&state, &req.wallet_id, customer.as_ref()).await?
     };
 
-    // No policy on-chain → an EMPTY policy, not a short-circuit to "allowed".
-    //
-    // Every section of the engine is inert on an empty policy, so the answer
-    // is the same "allow" for single-sig / quick onboarding — with one
-    // exception that must not be skipped: `w_execute_extension` is denied for
+    // No policy on-chain → judged by the stand-in (`policy_to_judge_by`), not a
+    // short-circuit to "allowed": `w_execute_extension` is denied for
     // account-control operations and for effects that cannot be stated,
     // whatever the owner did or did not configure. Returning early here would
     // also let the pre-flight answer "allowed" for a request the signing path
     // then refuses, which is exactly the split this endpoint exists to avoid.
-    let policy = policy.unwrap_or_default();
+    //
+    // The pre-flight and the signing path MUST make this substitution the same
+    // way, which is why both call the one function.
+    let policy = policy_to_judge_by(policy.as_ref()).into_owned();
 
     // Narrow carve-out surfaced to the coordinator (the rest of the policy stays here).
     let webhook_url = policy.webhook_url.clone();
@@ -9505,5 +9575,156 @@ mod the_door_judges_a_build_lock {
         ))
         .expect("a request that names the calling account");
         assert_eq!(full.predecessor_id.as_deref(), Some("dao.near"));
+    }
+}
+
+/// A wallet with no stored policy is unrestricted, except where the engine
+/// denies on everyone's behalf.
+///
+/// "No policy" and "an empty policy" are different statements: five capabilities
+/// fall back to DENY when none is named, so judging an absent policy by an empty
+/// one silently closes payment checks, raw signing, confidential ops, swaps and
+/// cross-chain withdrawals — the state every wallet is in right after
+/// registration. `policy_to_judge_by` is the one place that substitution is
+/// made, and these tests are on that function rather than on its output, so a
+/// call site that stops using it fails here.
+#[cfg(test)]
+mod a_wallet_with_no_policy_is_unrestricted {
+    use super::policy_to_judge_by;
+    use shared_tee_helpers::wallet_policy::{evaluate, Capabilities, Decision, Op, Policy};
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn allows(stated: Option<&Policy>, op: &Op) -> bool {
+        matches!(evaluate(&policy_to_judge_by(stated), op, None, NOW), Decision::Allow)
+    }
+
+    fn opt_in_ops() -> Vec<Op> {
+        vec![
+            Op::PaymentCheck { amount: "1".into(), token: "near".into() },
+            Op::Raw { chain: "near".into(), payload_hash: "00".into(), label: None },
+            Op::Confidential {
+                flow: "transfer".into(),
+                to: None,
+                amount: "1".into(),
+                token: "near".into(),
+                chain: None,
+                token_out: None,
+                min_amount_out: None,
+            },
+            Op::Swap {
+                token_in: "near".into(),
+                amount_in: "1".into(),
+                token_out: "usdc".into(),
+                min_out: "1".into(),
+            },
+            Op::CrossChainWithdraw {
+                to: "0xabc".into(),
+                amount: "1".into(),
+                token: "near".into(),
+                chain: "eth".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_opt_in_capability_is_open_when_the_owner_has_stated_nothing() {
+        for op in opt_in_ops() {
+            assert!(
+                allows(None, &op),
+                "a wallet with no policy was refused {:?} — the state every wallet is in right after registration",
+                op.primary_type()
+            );
+        }
+    }
+
+    /// The owner HAS spoken: an empty policy names no capability, and the
+    /// engine's defaults then apply. This is the line the stand-in must not
+    /// cross — and the reason the stand-in has to exist at all.
+    #[test]
+    fn a_stored_policy_that_names_nothing_still_denies_them() {
+        let stated = Policy::default();
+        for op in opt_in_ops() {
+            assert!(
+                !allows(Some(&stated), &op),
+                "a STATED policy admitted {:?}; the stand-in is leaking into the stated path",
+                op.primary_type()
+            );
+        }
+    }
+
+    /// A stated policy is passed through untouched — the substitution must not
+    /// add capabilities to what the owner wrote.
+    #[test]
+    fn a_stated_policy_is_returned_as_written() {
+        let stated = Policy {
+            capabilities: Some(Capabilities { payment_check: None, ..Default::default() }),
+            ..Default::default()
+        };
+        // `Policy` carries no `PartialEq`; compare the serialised form, which is
+        // what the engine reads anyway.
+        let judged = policy_to_judge_by(Some(&stated));
+        assert_eq!(
+            serde_json::to_value(&*judged).unwrap(),
+            serde_json::to_value(&stated).unwrap()
+        );
+    }
+
+    /// The one rule an absent policy does NOT relax, which is why the request is
+    /// evaluated instead of short-circuited to Allow. The envelope is real: an
+    /// unparseable one is refused before any rule is consulted, so a test built
+    /// on empty args would pass with the account-control rule deleted.
+    #[test]
+    fn the_extension_door_stays_shut() {
+        use base64::Engine;
+        let request = r#"{"request":{
+            "internal":[{"op":"add_extension","payload":{"account_id":"evil.near"}}],
+            "external":[{"receiver_id":"good.near",
+                         "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#;
+        let op = Op::Call {
+            to: "agent.tla".into(),
+            method: "w_execute_extension".into(),
+            args_base64: base64::engine::general_purpose::STANDARD.encode(request),
+            gas: "100000000000000".into(),
+            deposit: "1".into(),
+        };
+        match evaluate(&policy_to_judge_by(None), &op, None, NOW) {
+            Decision::Deny { reason } => {
+                assert!(reason.contains("add_extension"), "{reason}");
+                assert!(reason.contains("account-control"), "{reason}");
+            }
+            other => panic!("a wallet with no policy handed its lane to a stranger: {other:?}"),
+        }
+    }
+}
+
+/// Both doors make the absent-policy substitution the same way.
+///
+/// The fix for the mainnet custody outage was to stop standing an EMPTY policy
+/// in for an absent one. Extracting that into `policy_to_judge_by` removed the
+/// duplication; this keeps it removed. A call site that goes back to
+/// `Policy::default()` — or to any hand-rolled stand-in — evaluates a wallet
+/// with no policy as one that allows nothing, and no unit test on the helper
+/// would notice.
+#[cfg(test)]
+mod the_substitution_is_made_in_one_place {
+    #[test]
+    fn both_policy_doors_go_through_the_one_function() {
+        let src = include_str!("api.rs");
+        // Everything before the first test module — the assertions below quote
+        // the very strings they count, so they must not count themselves.
+        let product = &src[..src.find("mod a_wallet_with_no_policy_is_unrestricted").unwrap()];
+        // The signing path and the /wallet/check-policy pre-flight.
+        assert_eq!(
+            product.matches("policy_to_judge_by(policy.as_ref())").count(),
+            2,
+            "a policy door stopped using policy_to_judge_by"
+        );
+        // An empty policy is never a stand-in.
+        assert_eq!(
+            product.matches("Policy::default()").count(),
+            0,
+            "an empty policy is being used as a stand-in again"
+        );
     }
 }

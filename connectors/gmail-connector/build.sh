@@ -48,10 +48,12 @@ for limit in m.get("limits", []):
         bad.append(f"applies {limit.get('applies')!r}")
     if limit.get("operation", "").split(":")[0] not in declared:
         bad.append(f"limit on unknown operation {limit.get('operation')!r}")
-# This connector holds no credential of ours, so it must not ask for one: an
-# author_secrets here would be a profile nobody stored and every run refused.
-if "author_secrets" in m:
-    bad.append("author_secrets: this connector uses only the caller's own credential")
+# `connect` completes a Google consent with OUR OAuth client, which reaches a
+# run only as this connector's author secret. Declared but unstored refuses
+# every run of the project; undeclared and `connect` can never work at all.
+profile = (m.get("author_secrets") or {}).get("profile")
+if not isinstance(profile, str) or not profile.strip():
+    bad.append("author_secrets.profile: `connect` needs this connector's own OAuth client, and it arrives only as an author secret")
 if bad:
     print("ERROR:"); [print("  -", b) for b in bad]; sys.exit(1)
 print(f"Manifest: {len(declared)} operations agree with the code; limits are well formed")

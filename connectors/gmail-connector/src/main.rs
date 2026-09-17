@@ -1,8 +1,12 @@
 //! Gmail connector for OutLayer — an agent sends mail from the owner's own
 //! address, under the owner's policy, without ever holding the credential.
 //!
-//! The owner stores three values once (an OAuth client id and secret, and a
-//! refresh token for their account, granted the single scope `gmail.send`).
+//! The owner connects an account once, at
+//! <https://app.outlayer.ai/connect/gmail>: a Google consent screen, and one
+//! stored value — a refresh token for their account, granted the single scope
+//! `gmail.send`. This connector's own OAuth client completes it at run time and
+//! never enters anyone's stored row. An owner who brings their own OAuth app
+//! stores three values instead, and theirs wins.
 //! Everything after that happens inside the enclave: the refresh token is
 //! exchanged for an access token, the access token sends through Gmail's REST
 //! API, and neither ever appears in an answer.
