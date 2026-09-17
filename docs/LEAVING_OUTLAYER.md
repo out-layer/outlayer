@@ -54,10 +54,18 @@ deploy each vault and stash the result offline:
    `HMAC-SHA256(per_vault_master, "wallet:<wallet_id>:near")`, so
    without the UUID you cannot reach a specific wallet's key.
 4. **(Optional) `MPC_PUBLIC_KEY`** — the `bls12381g2:...` MPC
-   verification key. Same value the operator's keystore uses; ask
-   OutLayer support or pull it from
-   `docker/.env.{testnet,mainnet}-keystore-phala`. Pre-stash it so
-   the recovery script can run without network access to ops.
+   verification key, used to check that the master secret really
+   came from the MPC network. It is public and you read it off the
+   chain yourself, from the signer contract and domain your vault's
+   master was derived under:
+
+   ```bash
+   near contract call-function as-read-only v1.signer public_key \
+     json-args '{"domain_id": 2}' network-config mainnet now
+   ```
+
+   Pre-stash the answer so the recovery script needs no network at
+   all — nothing about it depends on OutLayer still being reachable.
 5. **Profile + project_id of every vault-bound secret you store** —
    needed to look up the encrypted ciphertext on chain after exit.
 
