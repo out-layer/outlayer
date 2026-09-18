@@ -35,4 +35,4 @@ unified suite — do not re-grow this folder.
 - `wallet_intents_e2e.sh`, `wallet_mode1_agent.sh`, `wallet_mode2_policy.sh` — `/tokens`, `/audit`, `/requests`, `/invalidate-cache`, idempotency-dedup, rate-limit (small deltas; partly covered by T14).
 - `vault_backward_compat.sh` — legacy non-vault `/register` default-master.
 
-(Everything else in `../` is infra: compilation, jobs, parallel, unit, integration, transactions, trial_tier, run_all, e2e, verify_jobs.)
+(Everything else in `../` is infra: compilation, jobs, parallel, unit, integration, transactions, run_all, e2e, verify_jobs.)

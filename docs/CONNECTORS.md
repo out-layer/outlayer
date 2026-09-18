@@ -455,9 +455,9 @@ than N per period" rule.
   since you started.
 * **applies** — `everyone`, `unpaid` (no purchased subscription), `covered`
   (calls paid from an allowance — trial and gift included).
-* **operation** — exact (`near-email:send`) or a whole-segment wildcard
-  (`near-email:*`). No general globbing: `near-email:*` matches
-  `near-email:send` and not `near-emailx:send`. These are the coordinator's own
+* **operation** — exact (`gmail:send`) or a whole-segment wildcard
+  (`gmail:*`). No general globbing: `gmail:*` matches
+  `gmail:send` and not `gmailx:send`. These are the coordinator's own
   rules, written with the connector id; **in your manifest you write it
   without** — see §5.3.
 
@@ -479,10 +479,10 @@ when the declaration is stored:
 // in your manifest
 { "operation": "send:external", "window": "day", "max_count": 3, "applies": "covered" }
 // what it becomes, and what the counter is keyed by
-"near-email:send:external"
+"gmail:send:external"
 ```
 
-Write the prefix yourself and you get `near-email:near-email:send:external`.
+Write the prefix yourself and you get `gmail:gmail:send:external`.
 Rules are matched exactly, so it caps nothing — and nothing tells you: no error,
 no log, no failing call. You would ship believing you had limited yourself. The
 id is added rather than accepted so a manifest cannot declare limits about a
@@ -522,7 +522,22 @@ Independent of anything you declare:
 
 ---
 
-## 6. Testing before you ship
+## 6. The owner's page
+
+A connector whose credential a person stores needs a page where they connect it
+and look after it afterwards. Every such page meets the same constraints — a
+wallet that only opens from a click, a two-step change where the first step
+looks finished, state that cannot be read back without a transaction, a reader
+who came to change one setting and not to learn about enclaves.
+
+Those constraints are written down as numbered rules at the top of
+`app/connect/gmail/page.tsx` in the dashboard, which is the reference
+implementation: copy the page and the rules together. The policy form itself is
+schema-driven — add `lib/policies/<connector>.ts` and the existing editor
+renders it, summarises it as permissions, and turns it into the JSON your
+connector reads.
+
+## 7. Testing before you ship
 
 `connectors/connector-probe` exists for exactly this. It is published,
 priced, metered and manifested like a real connector, and every operation
@@ -545,7 +560,7 @@ access; one that echoed secrets would make every test run a leak.
 
 ---
 
-## 7. Checklist
+## 8. Checklist
 
 1. Write the guest. Dispatch on a top-level `operation` string.
 2. Embed a manifest with `connector_id` and every host you need in

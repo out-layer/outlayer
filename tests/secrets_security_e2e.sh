@@ -137,11 +137,9 @@
 #   AGENT_WK             (P1) that wallet's wk_, for `secrets set-for-agent`
 #   AGENT2_PAYMENT_KEY / AGENT2_ACCOUNT   (C8) a SECOND custody wallet
 #   RUN_CONNECTOR_BODY=0 (P1) skip it against an older coordinator; default 1
-#   FRESH_CONNECTOR_AGENT=1   (P1) mint a wallet and a payment key for the
-#                        connector row, so it runs on an UNSPENT daily counter.
-#                        The allowance grows with a wallet's age, so a minted
-#                        one carries the floor — enough for P1, and it costs a
-#                        payment key's deposit
+#   FRESH_CONNECTOR_AGENT=1   (P1) mint a wallet and a funded payment key for
+#                        the connector row, so it runs as a caller nothing else
+#                        has touched. Costs a payment key's deposit
 #   AGENT_SECRET_MODE    run|skip (tests/lib/agent_secret_mode.sh); P1 is the
 #                        one case here that uses the agent-secret mode
 #
@@ -610,17 +608,16 @@ else
   log "P1 header AND body on $CONNECTOR_PROJECT: the body's row wins"
   HDR_TOKEN="from-header-$(openssl rand -hex 4)"
   BODY_TOKEN="from-body-$(openssl rand -hex 4)"
-  # This is the one row here that spends a connector quota, and the quota is a
-  # property of the WALLET's age. FRESH_CONNECTOR_AGENT=1 mints one with an
-  # unspent counter; otherwise it runs on the wallet the other rows used.
+  # FRESH_CONNECTOR_AGENT=1 mints a wallet of its own for this row; otherwise
+  # it runs on the wallet the other rows used.
   P1_WK="$AGENT_WK"; P1_KEY="$AGENT_PAYMENT_KEY"; P1_ACCOUNT="$AGENT_ACCOUNT"
   P1_MINT_FAILED=false
   if [[ "${FRESH_CONNECTOR_AGENT:-0}" == "1" ]]; then
     if mint_agent_wallet; then
       P1_WK="$MINTED_WK"; P1_KEY="$MINTED_PAYMENT_KEY"; P1_ACCOUNT="$MINTED_ACCOUNT"
     else
-      # Falling back silently would skip below with "run with
-      # FRESH_CONNECTOR_AGENT=1" — advice the operator has already taken.
+      # Said below rather than falling back silently: the operator asked for a
+      # fresh wallet and the row ran on the shared one.
       P1_MINT_FAILED=true
     fi
   fi
@@ -637,10 +634,10 @@ else
       pass "P1 the guest saw the BODY's token, not the header's"
     elif [[ "$GOT" == "$OTHER" ]]; then
       fail "P1 the header's row overrode the body's — the coordinator dropped what the body named"
-    elif quota_refused "$RUN_ERR" && [[ "$P1_MINT_FAILED" == true ]]; then
-      skip "P1 FRESH_CONNECTOR_AGENT=1 was asked for but the mint failed (its reason is above), so the row ran on the spent counter of $AGENT_ACCOUNT"
-    elif quota_refused "$RUN_ERR"; then
-      skip "P1 the wallet spent its connector calls for the day ($(head -c 90 <<<"$RUN_ERR")) — run with FRESH_CONNECTOR_AGENT=1 for an unspent counter"
+    elif trial_spent "$RUN_ERR" && [[ "$P1_MINT_FAILED" == true ]]; then
+      skip "P1 FRESH_CONNECTOR_AGENT=1 was asked for but the mint failed (its reason is above), and AGENT_PAYMENT_KEY is a spent TRIAL key — use a funded one"
+    elif trial_spent "$RUN_ERR"; then
+      skip "P1 AGENT_PAYMENT_KEY is a spent TRIAL key ($(head -c 90 <<<"$RUN_ERR")) — use a funded key, which has no call limit"
     else
       fail "P1 success=$RUN_OK token=$GOT err='$RUN_ERR'"
     fi
@@ -1029,12 +1026,11 @@ fi
 #
 # Such a call must die for the OPERATION, with nothing decrypted for it. From
 # outside, the evidence is which refusal comes back: a secrets message would
-# mean the lookup happened first. Uses the owner's key, because a custody
-# wallet's connector quota would answer before either check.
+# mean the lookup happened first. Uses the owner's key.
 if ! want C9; then
   :
 elif [[ -z "$OWNER_PAYMENT_KEY" ]]; then
-  skip "C9 needs OWNER_PAYMENT_KEY (a named account's key has no connector quota ceiling)"
+  skip "C9 needs OWNER_PAYMENT_KEY"
 else
   log "C9 a connector call naming a secret but no operation"
   https_post "$OWNER_PAYMENT_KEY" "$CONNECTOR_PROJECT" \
@@ -1589,8 +1585,8 @@ else
   store "$CONNECTOR_PROJECT" expose "$(jq -nc --arg v "$E1_CANARY" '{PROBE_TOKEN:$v}')" "whitelist:$PARENT,$AGENT_ACCOUNT"
   call_https "$AGENT_PAYMENT_KEY" "$CONNECTOR_PROJECT" "$PARENT/expose" '{"operation":"secret"}'
 
-  if quota_refused "$RUN_ERR"; then
-    skip "E1 the wallet spent its connector calls for the day — the sweep needs one call that ran"
+  if trial_spent "$RUN_ERR"; then
+    skip "E1 the key is a spent TRIAL — the sweep needs one call that ran; use a funded key"
   elif [[ "$RUN_OK" != "true" ]]; then
     fail "E1 the call did not run, so finding nothing proves nothing: $(head -c 140 <<<"$RUN_ERR")"
   else

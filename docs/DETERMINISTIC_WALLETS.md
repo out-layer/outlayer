@@ -38,7 +38,7 @@ Every deterministic wallet has the same capabilities as a regular wallet — all
 - **Policy engine** — spending limits, allowed actions, freeze thresholds, multisig approval
 - **Webhooks** — notifications on wallet events
 - **TEE attestation** — all wallet keys derived inside Intel TDX, verifiable on-chain
-- **Trial tier** — 100 free WASI executions per wallet, no payment setup needed
+- **Trial** — a wallet made by `POST /register` can claim ten connector calls in its first week (`POST /trial-key`), no payment setup needed
 
 ## Architecture
 
@@ -167,7 +167,7 @@ Deterministic. Same (account_id, seed) = same wallet_id = same NEAR implicit acc
 
 ```sql
 INSERT INTO wallet_accounts (wallet_id) VALUES ($1) ON CONFLICT DO NOTHING
--- rows_affected > 0 → new wallet, insert trial_quotas, derive address via keystore
+-- rows_affected > 0 → new wallet, derive address via keystore
 -- rows_affected = 0 → existing wallet, skip inserts, derive address (idempotent)
 ```
 
@@ -179,7 +179,7 @@ RPC access key check: only when creating (rows_affected > 0). Idempotent return 
 {
   "wallet_id": "uuid-string",
   "near_account_id": "hex64-implicit-account",
-  "trial": { "calls_remaining": 100, "expires_at": "...", "limits": {...} }
+  "trial": { "available": true, "calls": 10, "days": 7, "claim_url": "POST /trial-key", "scope": "connectors.outlayer.near/*" }
 }
 ```
 
@@ -232,7 +232,7 @@ What's NOT stored anywhere: auth credentials. Coordinator DB has zero secrets fo
 | `state.near_rpc_url` | `wallet/mod.rs:46` | RPC URL |
 | `ed25519-dalek`, `bs58` | `Cargo.toml` | Already in deps |
 | `keystore_derive_address()` | `wallet/handlers.rs` | Wallet address derivation |
-| `build_trial_info()` | `wallet/handlers.rs` | Trial quota response |
+| `build_trial_info()` | `wallet/handlers.rs` | The trial offer in the response |
 | `INSERT ON CONFLICT` pattern | current diff | Race condition safe |
 | `Bytes` body parsing | current diff | Backward compat |
 | `ApiKeyCache` pattern | `wallet/auth.rs` | Same DashMap + TTL pattern for AccessKeyCache |
@@ -298,7 +298,7 @@ Timestamp window: ±5 min. Raw ed25519 signature. RPC check for new wallets.
 1. Validate signature + timestamp (±5 min)
 2. NEAR RPC: check pubkey is on account (cached 60s, skip if wallet already exists)
 3. Derive wallet_id = `deterministic(account_id, seed)`
-4. Create wallet if not exists (INSERT ON CONFLICT DO NOTHING + trial_quotas)
+4. Create wallet if not exists (INSERT ON CONFLICT DO NOTHING)
 5. Store key_hash in wallet_api_keys (INSERT ON CONFLICT DO NOTHING — idempotent)
 6. Return wallet info
 
@@ -392,8 +392,7 @@ by the default-DENY `raw_sign` capability (with an optional per-chain allowlist)
 - Worker — unchanged (stateless proxy)
 - Keystore-worker — unchanged
 - All wallet/v1/* endpoint handlers — unchanged (only auth layer adds new path)
-- Trial quota logic — same rules for both wallet types
-- DB migrations — no new tables (wallet_accounts, trial_quotas, wallet_api_keys reused)
+- DB migrations — no new tables (wallet_accounts, wallet_api_keys reused)
   - wallet_api_keys used for random wallets (Flow 1) and delegate `wk_` keys (Flow 4), not for `Bearer near:...` auth
 
 ## Flow examples

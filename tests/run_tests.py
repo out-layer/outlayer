@@ -69,7 +69,6 @@ GROUPS: dict[str, list[str]] = {
         "gasless_e2e.sh",
         "payment_checks_e2e.sh",
         "wallet_intents_e2e.sh",
-        "trial_tier.sh",
     ],
     "local-infra": [
         "unit.sh",

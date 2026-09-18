@@ -24,20 +24,17 @@
 #                                   the reservation comes back exactly
 #   C6  the owner's secret        — nothing is fetched unless the call asks, and
 #                                   what arrives is the secret just stored
-#   C7  the daily quota           — free execution is still metered
+#   C7  the trial is ten calls    — and a funded key has no call limit
 #   C8  our own record            — the egress audit and the connector-call log
 #                                   say the same as the guest did
 #   C9  a call that never ran     — what a timed-out or unclaimed job costs
 #   C10 the trial key             — the way in for an agent that has never paid:
 #                                   an allowance scoped to the connectors, which
-#                                   pays the author nothing. Capped per ADDRESS
-#                                   (three), so it SKIP-notes once this machine
-#                                   has used its share
+#                                   pays the author nothing. SKIP-notes when
+#                                   no trial is on offer (`trial_unavailable`)
 #
-# C7 runs LAST because it spends the wallet's quota for the connector for the
-# rest of the day. A second --apply on the same wallet the same day will find
-# C6 refused by that quota rather than answered — use a fresh wallet, or run
-# `ONLY=C1,C2,C3,C4,C5,C8`.
+# C7 mints a wallet of its own and claims its trial, so it spends nothing of the
+# fixtures' and may run in any order.
 #
 # What this needs, and what SKIPS without it:
 #   CALLER      an account with a stablecoin balance INSIDE the contract
@@ -77,7 +74,7 @@ AUTHOR="${AUTHOR:-zavodil.testnet}"
 PROJECT_OWNER="${PROJECT_OWNER:-connectors.outlayer.testnet}"
 PAYMENT_KEY="${PAYMENT_KEY:-}"
 # A custody wallet's `wk_`, for the checks that are about an AGENT rather than
-# about a payment key: the owner's secret (C6) and the per-wallet quota (C7).
+# about a payment key: the owner's secret (C6).
 AGENT_WALLET_KEY="${AGENT_WALLET_KEY:-}"
 AGENT_PAYMENT_KEY="${AGENT_PAYMENT_KEY:-}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
@@ -88,8 +85,9 @@ C9_PHASE="${C9_PHASE:-}"
 # here rather than inferred, so a deployment that changes it fails loudly
 # instead of quietly agreeing with whatever came back.
 TIMEOUT_COMPUTE_BUDGET="${TIMEOUT_COMPUTE_BUDGET:-10000}"
-# C11 only. A claimed trial key, the agent's account id, and the token the
-# WORKER authenticates with — the delete route is internal, not a customer's.
+# A claimed trial key (C11, C14, C15, C17 — C14 and C15 spend four of its calls a
+# run), the agent's account id, and the token the WORKER authenticates with —
+# the delete route is internal, not a customer's.
 TRIAL_KEY="${TRIAL_KEY:-}"
 AGENT_ACCOUNT="${AGENT_ACCOUNT:-}"
 INTERNAL_TOKEN="${INTERNAL_TOKEN:-}"
@@ -129,6 +127,15 @@ fi
 # Otherwise lib/rpc.sh builds a keyed URL from FASTNEAR_API_KEY or near-cli's
 # config, or warns and uses the unkeyed host.
 source "$SCRIPT_DIR/lib/rpc.sh"
+
+# Response bodies land in a directory of this run's own and go with it: a fixed
+# path in /tmp is shared with every other run on the machine, and a body can
+# carry a key.
+RUN_TMP=$(mktemp -d)
+trap 'rm -rf "$RUN_TMP"' EXIT
+# The one thing that must OUTLIVE a run: C9's `queued` phase hands its call id to
+# a later `settled` run. A call id is not a secret.
+C9_STATE="${C9_STATE:-${TMPDIR:-/tmp}/outlayer_c9_call_id}"
 
 PASS=0; FAILED=0; SKIPPED=0; FAILED_NAMES=()
 log()  { printf '\n\033[36m▶ %s\033[0m\n' "$*" >&2; }
@@ -608,17 +615,16 @@ if want C6 && agent_secret_mode C6; then
       # A call that never RAN has no `output` at all, and `.output.secrets[]`
       # on null makes jq fail — which the old reading turned into "a secret
       # reached the guest", announcing a leak where there was not even a run.
-      # The commonest cause is this wallet's daily connector quota, which the
-      # suite itself spends in C7.
+      # On a TRIAL key the commonest cause is a trial that has made its calls.
       C6_SECRETS=$(echo "$R" | jq -c '.output.secrets // empty' 2>/dev/null)
       if [[ -z "$C6_SECRETS" ]]; then
-        # Only a spent quota is a reason to stand aside: this suite is one of
+        # Only a spent trial is a reason to stand aside: this suite is one of
         # the plan's "run unchanged" regressions, and any other refusal here is
         # the regression it exists to catch.
-        if echo "$R" | grep -qi "quota"; then
-          skip "C6 the call did not run (quota), so nothing can be said about what a guest saw: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 110)"
+        if echo "$R" | grep -qiE "trial_exhausted|trial_expired"; then
+          skip "C6 the call did not run (the trial key is spent), so nothing can be said about what a guest saw: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 110)"
         else
-          fail "C6 the call without the header did not run, and not for quota: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 160)"
+          fail "C6 the call without the header did not run, and not for a spent trial: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 160)"
         fi
         C6_DEAD=1
       elif [[ "$(echo "$C6_SECRETS" | jq -r '[.[].found] | any')" == false ]]; then
@@ -633,10 +639,10 @@ if want C6 && agent_secret_mode C6; then
       if [[ "${C6_DEAD:-0}" == "1" ]]; then
         skip "C6 with the header: not judged, the half without the header could not run"
       elif [[ -z "$GOT1" && -z "$GOT2" ]]; then
-        if echo "$R" | grep -qi "quota"; then
-          skip "C6 with the header: the call did not run (quota) — $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 110)"
+        if echo "$R" | grep -qiE "trial_exhausted|trial_expired"; then
+          skip "C6 with the header: the call did not run (the trial key is spent) — $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 110)"
         else
-          fail "C6 with the header the call did not run, and not for quota: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 160)"
+          fail "C6 with the header the call did not run, and not for a spent trial: $(echo "$R" | jq -r '.error // .reason // .' 2>/dev/null | head -c 160)"
         fi
       elif [[ "$GOT1" == "$P1" && "$GOT2" == "$P2" ]]; then
         # Not just "a secret arrived" — THE secret, hashed on the way out so the
@@ -652,9 +658,6 @@ if want C6 && agent_secret_mode C6; then
   fi
 fi
 
-# ── C7: the per-wallet daily quota ───────────────────────────────────────────
-# Free execution cannot also be unmetered. Counted per (wallet, connector), so
-# this burns the day's quota for whichever wallet AGENT_PAYMENT_KEY belongs to.
 # ── C8: what our own side recorded ───────────────────────────────────────────
 # The guest's word for "the undeclared host was refused" and ours must agree.
 # Seen from here it is the proof the allowlist was ENFORCED rather than merely
@@ -753,7 +756,7 @@ if want C9; then
                   | jq -r '.calls[0].call_id // empty')
           warn "C9 the request returned no JSON — the connection died before the coordinator answered"
         fi
-        echo "$CID" > /tmp/c9_call_id
+        echo "$CID" > "$C9_STATE"
 
         # Wait for the coordinator to settle it, and no longer than its own
         # window plus a margin.
@@ -786,7 +789,7 @@ if want C9; then
         ;;
       settled)
         log "C9 (settled) the late completion changes nothing — workers must be RUNNING again"
-        CID=$(cat /tmp/c9_call_id 2>/dev/null)
+        CID=$(cat "$C9_STATE" 2>/dev/null)
         if [[ -z "$CID" ]]; then
           fail "C9 no call id from the queued phase — run C9_PHASE=queued first"
         else
@@ -810,6 +813,9 @@ if want C9; then
             && pass "C9 nothing is left reserved once the late run has settled" \
             || fail "C9 $(( BAL - WD )) still reserved after the call settled"
           note "C9 the late run ended '$(echo "$ROW" | jq -r '.status')' and charged $(echo "$ROW" | jq -r '.charged_usd')"
+          # Judged, so spent: a later `settled` with no `queued` before it must
+          # find nothing, not this call again.
+          rm -f "$C9_STATE"
         fi
         ;;
       timeout)
@@ -876,21 +882,21 @@ if want C10; then
     T_CLAIM=$(curl -s -X POST "$COORDINATOR_URL/trial-key" -H "Authorization: Bearer $T_WK" -H 'Content-Type: application/json' -d '{}')
     T_PK=$(echo "$T_CLAIM" | jq -r '.payment_key // empty')
 
-    if [[ "$(echo "$T_CLAIM" | jq -r '.reason // empty')" == "trial_ip_limit" ]]; then
-      # Not a failure: the giveaway is capped per address, and this run has used
-      # its share. The cap is the feature — a test that cannot get its fixture
-      # says so rather than reporting the guard as a fault.
-      note "C10 SKIPPED: this address has used its trial allocation ($(echo "$T_CLAIM" | jq -r '.error')). Run from another address to exercise C10 again."
+    if [[ "$(echo "$T_CLAIM" | jq -r '.reason // empty')" == "trial_unavailable" ]]; then
+      # Not a failure: a trial is not always on offer, and a test that cannot
+      # get its fixture says so rather than reporting that as a fault.
+      note "C10 SKIPPED: no trial is on offer to this run ($(echo "$T_CLAIM" | jq -r '.error'))."
     elif [[ -z "$T_PK" ]]; then
       fail "C10 no trial key came back: $(echo "$T_CLAIM" | head -c 200)"
     else
-      NONCE=$(echo "$T_CLAIM" | jq -r '.nonce'); ALLOW=$(echo "$T_CLAIM" | jq -r '.allowance_usd')
+      NONCE=$(echo "$T_CLAIM" | jq -r '.nonce'); T10_CALLS=$(echo "$T_CLAIM" | jq -r '.calls // 0')
+      T10_ENDS=$(echo "$T_CLAIM" | jq -r '.expires_at // empty')
       SCOPE=$(echo "$T_CLAIM" | jq -r '.project_ids | join(",")')
       # Nonce zero is reserved for exactly this: a key with no on-chain record,
       # which is why it costs no gas to give away.
-      [[ "$NONCE" == "0" && "${ALLOW:-0}" -gt 0 ]] \
-        && pass "C10 claimed: nonce 0, allowance $ALLOW, $(echo "$T_CLAIM" | jq -r '.days') days" \
-        || fail "C10 claimed with nonce=$NONCE allowance=$ALLOW — expected nonce 0 and an allowance"
+      [[ "$NONCE" == "0" && "$T10_CALLS" =~ ^[1-9][0-9]*$ && -n "$T10_ENDS" ]] \
+        && pass "C10 claimed: nonce 0, $T10_CALLS calls, until $T10_ENDS" \
+        || fail "C10 claimed with nonce=$NONCE calls=$T10_CALLS expires_at='$T10_ENDS' — expected nonce 0, a number of calls and an end"
       [[ "$SCOPE" == *"$(dirname "$PROJECT")"* ]] \
         && pass "C10 scoped to the connector namespace and nothing else ($SCOPE)" \
         || fail "C10 scope is '$SCOPE' — it must not reach beyond the connectors"
@@ -934,19 +940,18 @@ if want C10; then
       # refusal rather than a second key.
       #
       # WHICH refusal depends on which guard is reached first: the account's own
-      # (`409 trial_already_claimed`) or the per-IP cap that stands in front of
-      # it (`429`). Both are the giveaway being protected, and a run that has
-      # already claimed a few from one address hits the second. What must never
-      # happen is a second key, so that is what this asserts.
-      AGAIN=$(curl -s -o /tmp/c10_again -w '%{http_code}' -X POST "$COORDINATOR_URL/trial-key" \
+      # (`409 trial_already_claimed`) or `403 trial_unavailable`, which stands in
+      # front of it. What must never happen is a second key, so that is what
+      # this asserts.
+      AGAIN=$(curl -s -o "$RUN_TMP"/c10_again -w '%{http_code}' -X POST "$COORDINATOR_URL/trial-key" \
                 -H "Authorization: Bearer $T_WK" -H 'Content-Type: application/json' -d '{}')
-      SECOND_KEY=$(jq -r '.payment_key // empty' /tmp/c10_again 2>/dev/null)
+      SECOND_KEY=$(jq -r '.payment_key // empty' "$RUN_TMP"/c10_again 2>/dev/null)
       if [[ -n "$SECOND_KEY" ]]; then
         fail "C10 a SECOND trial key was handed out — one per account is not being held"
-      elif [[ "$AGAIN" == "409" || "$AGAIN" == "429" ]]; then
-        pass "C10 a second claim is refused ($AGAIN: $(jq -r '.reason // "rate limited"' /tmp/c10_again 2>/dev/null))"
+      elif [[ "$AGAIN" == "409" || ( "$AGAIN" == "403" && "$(jq -r '.reason // empty' "$RUN_TMP"/c10_again 2>/dev/null)" == "trial_unavailable" ) ]]; then
+        pass "C10 a second claim is refused ($AGAIN: $(jq -r '.reason // "?"' "$RUN_TMP"/c10_again 2>/dev/null))"
       else
-        fail "C10 the second claim answered $AGAIN — expected 409 already-claimed or 429 per-IP"
+        fail "C10 the second claim answered $AGAIN — expected 409 trial_already_claimed or 403 trial_unavailable"
       fi
     fi
   fi
@@ -966,13 +971,13 @@ if want C11; then
     #    letting it be forwarded to somebody else would make the giveaway a
     #    money printer: claim, forward to an account you control, repeat.
     if [[ -n "$TRIAL_KEY" ]]; then
-      RC=$(curl -s -o /tmp/c11_a -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
+      RC=$(curl -s -o "$RUN_TMP"/c11_a -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
              -H "X-Payment-Key: $TRIAL_KEY" -H 'X-Attached-Deposit: 50000' \
              -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
-      if [[ "$RC" == "403" ]] && grep -qi "deposit" /tmp/c11_a; then
+      if [[ "$RC" == "403" ]] && grep -qi "deposit" "$RUN_TMP"/c11_a; then
         pass "C11 a trial key cannot send a deposit to an author (403)"
       else
-        fail "C11 a trial key with X-Attached-Deposit answered $RC — expected 403: $(head -c 160 /tmp/c11_a)"
+        fail "C11 a trial key with X-Attached-Deposit answered $RC — expected 403: $(head -c 160 "$RUN_TMP"/c11_a)"
       fi
     else
       note "C11 the trial-deposit refusal SKIPPED — set TRIAL_KEY to a claimed trial key"
@@ -1005,13 +1010,13 @@ if want C11; then
     #    a wallet pays with a key it owns and presents — and a caller asking for
     #    one must be told, not handed a different kind of key in silence.
     if [[ -n "$AGENT_WALLET_KEY" ]]; then
-      RC=$(curl -s -o /tmp/c11_c -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/create-payment-key" \
+      RC=$(curl -s -o "$RUN_TMP"/c11_c -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/create-payment-key" \
              -H "Authorization: Bearer $AGENT_WALLET_KEY" -H 'Content-Type: application/json' \
              -d '{"agent":true,"initial_deposit_usdc":"0.10"}')
-      if [[ "$RC" == 4?? ]] && grep -qi "no longer issued" /tmp/c11_c; then
+      if [[ "$RC" == 4?? ]] && grep -qi "no longer issued" "$RUN_TMP"/c11_c; then
         pass "C11 agent:true is refused and says why ($RC)"
       else
-        fail "C11 agent:true answered $RC: $(head -c 160 /tmp/c11_c)"
+        fail "C11 agent:true answered $RC: $(head -c 160 "$RUN_TMP"/c11_c)"
       fi
     else
       note "C11 the agent:true refusal SKIPPED — needs AGENT_WALLET_KEY"
@@ -1040,8 +1045,8 @@ if want C12 && agent_secret_mode C12; then
     # Three states, not two. A call the coordinator REFUSED never reached the
     # guest, so it says nothing at all about who may read a secret — and read as
     # a plain "no" it would turn every refusal into a passing isolation check.
-    # The daily quota is the one that bites: C7 spends it, and afterwards every
-    # call from that wallet is refused.
+    # A spent trial is the one that bites on a trial key: every call from it is
+    # then refused.
     secret_seen() {
       local r out
       r=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" "$@" -H 'X-Use-Owner-Secret: 1' \
@@ -1069,7 +1074,7 @@ if want C12 && agent_secret_mode C12; then
     if [[ "$MINE" == yes ]]; then
       pass "C12 the agent the secret is named after does read it"
     else
-      fail "C12 the agent cannot read its own secret ($MINE) — every refusal below would then pass for the wrong reason. Run C12 BEFORE C7, or on a wallet whose quota is intact."
+      fail "C12 the agent cannot read its own secret ($MINE) — every refusal below would then pass for the wrong reason. Use a funded key, or a trial key that still has calls."
       MINE=broken
     fi
 
@@ -1223,31 +1228,31 @@ if want C13; then
   fi
 fi
 
-# ── C14: the four refusals a key can hit before anything runs ────────────────
+# ── C14: the refusals a key can hit before anything runs, and one that is not ─
 #
 # Every one of these is a 4xx the caller is supposed to act on, so what matters
 # is not only THAT the call is refused but that the answer names a number the
 # caller can do something with.
 #
-# The fifth refusal in the enum, `TooManyConcurrentCalls`, has no case here
-# because it has no case anywhere: the variant is declared and mapped to a 429,
-# and nothing in the codebase ever constructs it. A test would have to fake it.
+# Its last row is the counterpart: a TRIAL is never refused for a sum, so an
+# oversized compute budget on one is clamped and the call runs. The one-call-at-
+# a-time refusal (`call_already_in_flight`) is judged in C16.
 if want C14; then
   if [[ "$APPLY" != true ]]; then
-    printf '\033[90m  (dry-run) insufficient balance, max_per_call, allowance+deposit, allowance too small\033[0m\n' >&2
+    printf '\033[90m  (dry-run) insufficient balance, max_per_call, allowance+deposit, allowance too small; an oversized compute budget on a trial key runs (spends one trial call)\033[0m\n' >&2
   else
     log "C14 the refusals that come before the work"
 
     # 1. No money at all. EMPTY_KEY must be a key with NO subscription either:
     #    an allowance pays for the call and there is nothing to refuse.
     if [[ -n "$EMPTY_KEY" ]]; then
-      RC=$(curl -s -o /tmp/c14_a -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
+      RC=$(curl -s -o "$RUN_TMP"/c14_a -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
              -H "X-Payment-Key: $EMPTY_KEY" -H 'Content-Type: application/json' \
              -d '{"input":{"operation":"secret"}}')
-      if [[ "$RC" == "402" ]] && grep -qi "insufficient balance" /tmp/c14_a; then
-        pass "C14 a key with nothing in it is refused with 402 ($(jq -r '.error' /tmp/c14_a 2>/dev/null | head -c 60))"
+      if [[ "$RC" == "402" ]] && grep -qi "insufficient balance" "$RUN_TMP"/c14_a; then
+        pass "C14 a key with nothing in it is refused with 402 ($(jq -r '.error' "$RUN_TMP"/c14_a 2>/dev/null | head -c 60))"
       else
-        fail "C14 an empty key answered $RC: $(head -c 160 /tmp/c14_a)"
+        fail "C14 an empty key answered $RC: $(head -c 160 "$RUN_TMP"/c14_a)"
       fi
     else
       note "C14 the balance refusal SKIPPED — needs EMPTY_KEY (registered, no balance, no subscription)"
@@ -1256,13 +1261,13 @@ if want C14; then
     # 2. A cap below what the call reserves. The cap is on the RESERVATION, so
     #    it has to sit below compute plus the fee, not below the fee alone.
     if [[ -n "$CAPPED_KEY" ]]; then
-      RC=$(curl -s -o /tmp/c14_c -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
+      RC=$(curl -s -o "$RUN_TMP"/c14_c -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
              -H "X-Payment-Key: $CAPPED_KEY" -H 'Content-Type: application/json' \
              -d '{"input":{"operation":"secret"}}')
-      if [[ "$RC" == "400" ]] && grep -qi "max per call exceeded" /tmp/c14_c; then
-        pass "C14 a call over the key's max_per_call is refused ($(jq -r '.error' /tmp/c14_c 2>/dev/null | head -c 60))"
+      if [[ "$RC" == "400" ]] && grep -qi "max per call exceeded" "$RUN_TMP"/c14_c; then
+        pass "C14 a call over the key's max_per_call is refused ($(jq -r '.error' "$RUN_TMP"/c14_c 2>/dev/null | head -c 60))"
       else
-        fail "C14 a capped key answered $RC: $(head -c 160 /tmp/c14_c)"
+        fail "C14 a capped key answered $RC: $(head -c 160 "$RUN_TMP"/c14_c)"
       fi
     else
       note "C14 max_per_call SKIPPED — need CAPPED_KEY (create one with max_per_call below the fee)"
@@ -1278,8 +1283,8 @@ if want C14; then
     # Read off the two refusals above rather than by funding a key to the quoted
     # figure: the operation and the compute limit are identical in both, so the
     # reservation is the same number either way, and this needs no money to move.
-    SAID=$(jq -r '.error' /tmp/c14_a 2>/dev/null | sed -n 's/.*required=\([0-9]*\).*/\1/p')
-    RESERVED=$(jq -r '.error' /tmp/c14_c 2>/dev/null | sed -n 's/.*requested=\([0-9]*\).*/\1/p')
+    SAID=$(jq -r '.error' "$RUN_TMP"/c14_a 2>/dev/null | sed -n 's/.*required=\([0-9]*\).*/\1/p')
+    RESERVED=$(jq -r '.error' "$RUN_TMP"/c14_c 2>/dev/null | sed -n 's/.*requested=\([0-9]*\).*/\1/p')
     if [[ -z "$SAID" || -z "$RESERVED" ]]; then
       note "C14 the two-figure check SKIPPED — needs both the balance and the max_per_call refusals to have run"
     elif [[ "$SAID" == "$RESERVED" ]]; then
@@ -1293,13 +1298,13 @@ if want C14; then
     #    reached, because a connector is paid by its fee and not by a deposit.
     #    That is why this needs a second project rather than the probe.
     if [[ -n "$SUB_KEY" && -n "$ORDINARY_PROJECT" ]]; then
-      RC=$(curl -s -o /tmp/c14_d -w '%{http_code}' --max-time 45 -X POST "$COORDINATOR_URL/call/$ORDINARY_PROJECT" \
+      RC=$(curl -s -o "$RUN_TMP"/c14_d -w '%{http_code}' --max-time 45 -X POST "$COORDINATOR_URL/call/$ORDINARY_PROJECT" \
              -H "X-Payment-Key: $SUB_KEY" -H 'X-Attached-Deposit: 50000' \
              -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
-      if [[ "$RC" == "402" ]] && grep -q "allowance_no_deposit" /tmp/c14_d; then
+      if [[ "$RC" == "402" ]] && grep -q "allowance_no_deposit" "$RUN_TMP"/c14_d; then
         pass "C14 an allowance cannot be paid to a developer (402 allowance_no_deposit)"
       else
-        fail "C14 a deposit on an allowance-covered call answered $RC: $(head -c 200 /tmp/c14_d)"
+        fail "C14 a deposit on an allowance-covered call answered $RC: $(head -c 200 "$RUN_TMP"/c14_d)"
       fi
     else
       note "C14 allowance+deposit SKIPPED — needs SUB_KEY and ORDINARY_PROJECT (a NON-connector project)"
@@ -1308,21 +1313,43 @@ if want C14; then
     # 4. An allowance too small for the job. Reached by asking for more compute
     #    than the allowance has left, rather than by draining it: the ceiling
     #    admission checks is the price PLUS the compute the caller authorised,
-    #    so a large job refuses itself against a small allowance. Draining a
-    #    dollar at a cent a call would be ninety calls to learn the same thing.
-    if [[ -n "$TRIAL_KEY" ]]; then
-      LEFT=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $TRIAL_KEY" | jq -r '.allowance_available_usd')
+    #    so a large job refuses itself against a small allowance. Judged on a
+    #    SUBSCRIBED key, whose allowance is a figure its holder is shown — and
+    #    one with NO money on it: a key that also holds a balance pays the call
+    #    from that instead of refusing.
+    if [[ -n "$SUB_KEY" ]]; then
+      LEFT=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $SUB_KEY" | jq -r '.allowance_available_usd // 0')
       BIG=$(( LEFT * 5 + 1000000 ))
-      RC=$(curl -s -o /tmp/c14_e -w '%{http_code}' --max-time 45 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-             -H "X-Payment-Key: $TRIAL_KEY" -H "X-Compute-Limit: $BIG" \
+      RC=$(curl -s -o "$RUN_TMP"/c14_e -w '%{http_code}' --max-time 45 -X POST "$COORDINATOR_URL/call/$PROJECT" \
+             -H "X-Payment-Key: $SUB_KEY" -H "X-Compute-Limit: $BIG" \
              -H 'Content-Type: application/json' -d '{"input":{"operation":"secret"}}')
-      if [[ "$RC" == "402" ]] && grep -q "insufficient_allowance" /tmp/c14_e; then
+      if [[ "$RC" == "402" ]] && grep -q "insufficient_allowance" "$RUN_TMP"/c14_e; then
         pass "C14 a job larger than the allowance is refused before it starts (asked $BIG, had $LEFT)"
       else
-        fail "C14 an oversized job on a $LEFT allowance answered $RC: $(head -c 200 /tmp/c14_e)"
+        fail "C14 an oversized job on a $LEFT allowance answered $RC: $(head -c 200 "$RUN_TMP"/c14_e)"
       fi
     else
-      note "C14 the allowance refusal SKIPPED — needs TRIAL_KEY"
+      note "C14 the allowance refusal SKIPPED — needs SUB_KEY"
+    fi
+
+    # 5. A TRIAL is never refused for a sum: its holder is shown calls, not
+    #    dollars, so a compute budget above what stands behind the trial is
+    #    clamped and the call runs. Spends one of the trial's calls.
+    if [[ -n "$TRIAL_KEY" ]]; then
+      RC=$(curl -s -o "$RUN_TMP"/c14_f -w '%{http_code}' --max-time 60 -X POST "$COORDINATOR_URL/call/$PROJECT" \
+             -H "X-Payment-Key: $TRIAL_KEY" -H "X-Compute-Limit: 1000000000" \
+             -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
+      if [[ "$RC" == "200" ]]; then
+        pass "C14 a trial call asking for an oversized compute budget is clamped and runs"
+      elif [[ "$(jq -r '.reason' "$RUN_TMP"/c14_f 2>/dev/null)" == "trial_expired" ]] \
+           || [[ "$(jq -r '.reason' "$RUN_TMP"/c14_f 2>/dev/null)" == "trial_exhausted" \
+                 && "$(jq -r '.used' "$RUN_TMP"/c14_f)" == "$(jq -r '.limit' "$RUN_TMP"/c14_f)" ]]; then
+        note "C14 the trial clamp SKIPPED — TRIAL_KEY is spent or past its week"
+      else
+        fail "C14 a trial call with an oversized compute budget answered $RC: $(head -c 200 "$RUN_TMP"/c14_f)"
+      fi
+    else
+      note "C14 the trial clamp SKIPPED — needs TRIAL_KEY"
     fi
   fi
 fi
@@ -1372,21 +1399,31 @@ if want C15; then
       KEY=$([[ "$CRED" == TRIAL ]] && echo "$TRIAL_KEY" || echo "$SUB_KEY")
       [[ -z "$KEY" ]] && { note "C15 $CRED SKIPPED — no key"; continue; }
       for OP in ping whoami secret; do
-        A=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $KEY" | jq -r '.allowance_available_usd')
-        RC=$(curl -s -o /tmp/c15_r -w '%{http_code}' --max-time 60 -X POST "$COORDINATOR_URL/call/$PROJECT" \
+        # A subscription is read in dollars; a trial in the only unit its holder
+        # is shown, calls. What neither may do — reach the author — is judged
+        # below from the ledger, for both.
+        C15_READ=$([[ "$CRED" == TRIAL ]] && echo '.trial.calls_used // 0' || echo '.allowance_available_usd // 0')
+        A=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $KEY" | jq -r "$C15_READ")
+        RC=$(curl -s -o "$RUN_TMP"/c15_r -w '%{http_code}' --max-time 60 -X POST "$COORDINATOR_URL/call/$PROJECT" \
           -H "X-Payment-Key: $KEY" -H 'Content-Type: application/json' \
           -d "{\"input\":{\"operation\":\"$OP\"}}")
         # A call that never ran spends nothing, and "spent nothing" is exactly
         # what this section reads as "the fee was not charged". They have to be
         # told apart or a refusal is reported as a pricing failure — which is
-        # what happened when the wallet's daily connector quota ran out mid-run.
+        # what a run on a spent trial key would otherwise produce.
         if [[ "$RC" != "200" ]]; then
-          note "C15 $CRED $OP INCONCLUSIVE — the call was refused ($RC $(jq -r '.reason // "?"' /tmp/c15_r 2>/dev/null)), so nothing was charged either way"
+          note "C15 $CRED $OP INCONCLUSIVE — the call was refused ($RC $(jq -r '.reason // "?"' "$RUN_TMP"/c15_r 2>/dev/null)), so nothing was charged either way"
           continue
         fi
         C15_RAN=$((C15_RAN + 1))
         sleep 5
-        B=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $KEY" | jq -r '.allowance_available_usd')
+        B=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $KEY" | jq -r "$C15_READ")
+        if [[ "$CRED" == TRIAL ]]; then
+          [[ $(( B - A )) -eq 1 ]] \
+            && pass "C15 TRIAL $OP counted as one trial call ($A → $B)" \
+            || fail "C15 TRIAL $OP moved calls_used $A → $B — one accepted call is one trial call"
+          continue
+        fi
         SPENT=$(( A - B ))
         # A free operation costs compute alone; a priced one costs the fee on
         # top of it. Stated as a comparison against the free reading rather than
@@ -1490,32 +1527,32 @@ if want C16; then
     SUB_MONEY=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $SUB_KEY" | jq -r '.balance')
 
     # 1. A second call on the SUBSCRIPTION while the first is still running.
-    RC_A=$(fire "$SUB_KEY" /tmp/c16_a)
+    RC_A=$(fire "$SUB_KEY" "$RUN_TMP"/c16_a)
     if [[ "$RC_A" != "200" ]]; then
-      fail "C16 the first subscription call was refused ($RC_A): $(head -c 160 /tmp/c16_a)"
-    elif ! still_pending /tmp/c16_a "$SUB_KEY"; then
+      fail "C16 the first subscription call was refused ($RC_A): $(head -c 160 "$RUN_TMP"/c16_a)"
+    elif ! still_pending "$RUN_TMP"/c16_a "$SUB_KEY"; then
       note "C16 INCONCLUSIVE: the first call finished before the second could be sent — nothing was in flight to collide with"
     else
-      RC_B=$(fire "$SUB_KEY" /tmp/c16_b)
+      RC_B=$(fire "$SUB_KEY" "$RUN_TMP"/c16_b)
       if [[ "$SUB_MONEY" -gt 0 ]]; then
         # Money in the same key: the second is ANSWERED rather than refused, out
         # of the balance. That is the fallback working, not a hole in the limit.
         [[ "$RC_B" == "200" ]] \
           && pass "C16 a subscription key holding money answers a second call — it comes out of the balance" \
-          || fail "C16 a funded subscription key refused the second call ($RC_B): $(head -c 160 /tmp/c16_b)"
+          || fail "C16 a funded subscription key refused the second call ($RC_B): $(head -c 160 "$RUN_TMP"/c16_b)"
         note "C16 the refusal half needs a subscription key with a ZERO balance; this one holds $SUB_MONEY"
       else
         [[ "$RC_B" == "429" ]] \
           && pass "C16 a second subscription call is refused while the first runs (429)" \
-          || fail "C16 a second concurrent subscription call answered $RC_B, not 429: $(head -c 200 /tmp/c16_b)"
+          || fail "C16 a second concurrent subscription call answered $RC_B, not 429: $(head -c 200 "$RUN_TMP"/c16_b)"
         # And the RIGHT 429: the IP rate limiter also answers 429 and would
         # satisfy the code above while meaning something else entirely.
-        if grep -q "call_already_in_flight" /tmp/c16_b 2>/dev/null; then
-          [[ "$(jq -r '.terminal' /tmp/c16_b)" == "false" ]] \
+        if grep -q "call_already_in_flight" "$RUN_TMP"/c16_b 2>/dev/null; then
+          [[ "$(jq -r '.terminal' "$RUN_TMP"/c16_b)" == "false" ]] \
             && pass "C16 the refusal is call_already_in_flight and says it is worth retrying" \
             || fail "C16 call_already_in_flight came back terminal — a client would stop instead of waiting"
         else
-          fail "C16 the refusal was not call_already_in_flight: $(head -c 200 /tmp/c16_b)"
+          fail "C16 the refusal was not call_already_in_flight: $(head -c 200 "$RUN_TMP"/c16_b)"
         fi
       fi
     fi
@@ -1526,19 +1563,19 @@ if want C16; then
     #
     #    Part 1's call has to be out of the way first, or the subscription call
     #    below is refused by part 1's own limit rather than running.
-    if ! wait_settled /tmp/c16_a "$SUB_KEY"; then
+    if ! wait_settled "$RUN_TMP"/c16_a "$SUB_KEY"; then
       note "C16 the first call never settled — skipping the money-key check rather than measuring it"
     else
-    RC_C=$(fire "$SUB_KEY" /tmp/c16_c)
+    RC_C=$(fire "$SUB_KEY" "$RUN_TMP"/c16_c)
     if [[ "$RC_C" != "200" ]]; then
-      fail "C16 the subscription call was refused ($RC_C): $(head -c 160 /tmp/c16_c)"
-    elif ! still_pending /tmp/c16_c "$SUB_KEY"; then
+      fail "C16 the subscription call was refused ($RC_C): $(head -c 160 "$RUN_TMP"/c16_c)"
+    elif ! still_pending "$RUN_TMP"/c16_c "$SUB_KEY"; then
       note "C16 INCONCLUSIVE: the subscription call finished before the money call was sent"
     else
-      RC_D=$(fire "$PAYMENT_KEY" /tmp/c16_d)
+      RC_D=$(fire "$PAYMENT_KEY" "$RUN_TMP"/c16_d)
       [[ "$RC_D" == "200" ]] \
         && pass "C16 a money key runs alongside a subscription call ($RC_D)" \
-        || fail "C16 the money key was refused ($RC_D) while a subscription call ran: $(head -c 160 /tmp/c16_d)"
+        || fail "C16 the money key was refused ($RC_D) while a subscription call ran: $(head -c 160 "$RUN_TMP"/c16_d)"
     fi
     fi
   fi
@@ -1589,15 +1626,15 @@ if want C17; then
       if ! near --quiet contract call-function as-transaction "$TOKEN_CONTRACT" ft_transfer_call \
         json-args "$BUY_ARGS" \
         prepaid-gas '300.0 Tgas' attached-deposit '1 yoctoNEAR' \
-        sign-as "$OWNER" network-config "$NETWORK" sign-with-keychain send >/tmp/c17_buy 2>&1
+        sign-as "$OWNER" network-config "$NETWORK" sign-with-keychain send >"$RUN_TMP"/c17_buy 2>&1
       then
-        fail "C17 the renewal transaction did not send: $(tail -c 200 /tmp/c17_buy)"
+        fail "C17 the renewal transaction did not send: $(tail -c 200 "$RUN_TMP"/c17_buy)"
       fi
       # The transfer answers with the amount USED. Zero means the contract
       # refused and handed it all back, which is a different failure from a
       # renewal that applied wrongly — and it must not be read as the latter.
-      if ! grep -q "$PLAN_PRICE" /tmp/c17_buy; then
-        note "C17 the renewal was not accepted by the contract: $(tail -c 200 /tmp/c17_buy)"
+      if ! grep -q "$PLAN_PRICE" "$RUN_TMP"/c17_buy; then
+        note "C17 the renewal was not accepted by the contract: $(tail -c 200 "$RUN_TMP"/c17_buy)"
       fi
       sleep 14
 
@@ -1651,7 +1688,7 @@ PY
       near --quiet contract call-function as-transaction "$TOKEN_CONTRACT" ft_transfer_call \
         json-args "$TOPUP_ARGS" \
         prepaid-gas '300.0 Tgas' attached-deposit '1 yoctoNEAR' \
-        sign-as "$CALLER" network-config "$NETWORK" sign-with-keychain send >/tmp/c17_topup 2>&1
+        sign-as "$CALLER" network-config "$NETWORK" sign-with-keychain send >"$RUN_TMP"/c17_topup 2>&1
       sleep 6
       U1=$(bal_of)
 
@@ -1725,13 +1762,13 @@ if want C18 && agent_secret_mode C18; then
     # Write a secret with the CLI, which owns the ECIES format. Encrypting in
     # this script would be a second implementation of it, and the one that
     # drifts.
-    # Output KEPT in /tmp/c18_write. Discarded, a write that never happened
+    # Output KEPT in "$RUN_TMP"/c18_write. Discarded, a write that never happened
     # reads downstream as "the ciphertext did not change", and this section then
     # reports a rotation failure about code that was never reached — which is
     # exactly what it did on its first two runs.
     write_with_cli() { # write_with_cli <wk_> <project> <plaintext-json>
       OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set-for-agent "$3" \
-        --project "$2" --api-key "$1" >/tmp/c18_write 2>&1
+        --project "$2" --api-key "$1" >"$RUN_TMP"/c18_write 2>&1
     }
 
     # Re-store a GIVEN ciphertext, prepared under <wk_> and paid by <payer>.
@@ -1750,7 +1787,7 @@ if want C18 && agent_secret_mode C18; then
       [[ -z "$args" ]] && return 1
       near --quiet contract call-function as-transaction "$CONTRACT_ID" store_agent_secret \
         json-args "$args" prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \
-        sign-as "$2" network-config "$NETWORK" sign-with-keychain send >/tmp/c18_pay 2>&1
+        sign-as "$2" network-config "$NETWORK" sign-with-keychain send >"$RUN_TMP"/c18_pay 2>&1
     }
 
     # ── 1. Rotating the wk_ must not strand the secret ──────────────────────
@@ -1789,17 +1826,17 @@ if want C18 && agent_secret_mode C18; then
       CT_BEFORE=$(ciphertext_after_write "$AGENT" "$C18_PROJECT" "")
 
       if [[ -z "$AGENT" || -z "$CT_BEFORE" ]]; then
-        note "C18 rotation INCONCLUSIVE — nothing landed for agent '''$AGENT''': $(tail -c 200 /tmp/c18_write)"
+        note "C18 rotation INCONCLUSIVE — nothing landed for agent '''$AGENT''': $(tail -c 200 "$RUN_TMP"/c18_write)"
       else
         pass "C18 a secret is on chain under the fresh agent ($AGENT)"
 
-        RV=$(curl -s -o /tmp/c18_rv -w '%{http_code}' -X DELETE \
+        RV=$(curl -s -o "$RUN_TMP"/c18_rv -w '%{http_code}' -X DELETE \
                "$COORDINATOR_URL/wallet/v1/api-key/$H_A" -H "Authorization: Bearer $WK_B")
         # The answer is READ, not discarded. A revoke that quietly refuses —
         # "cannot revoke the last active key" is a real answer here — would
         # leave everything below measuring the key that was supposed to be gone.
         if [[ "$RV" != 2?? ]]; then
-          fail "C18 the revoke was refused ($RV): $(head -c 140 /tmp/c18_rv)"
+          fail "C18 the revoke was refused ($RV): $(head -c 140 "$RUN_TMP"/c18_rv)"
         else
           OLD_RC=$(curl -s -o /dev/null -w '%{http_code}' \
                      "$COORDINATOR_URL/wallet/v1/address?chain=near" -H "Authorization: Bearer $WK_A")
@@ -1843,10 +1880,10 @@ if want C18 && agent_secret_mode C18; then
         # This half sends the call itself, so it is the first thing here to meet
         # the renamed method — the CLI half above goes through the coordinator,
         # which still names whatever is deployed.
-        if grep -q "MethodNotFound" /tmp/c18_pay; then
+        if grep -q "MethodNotFound" "$RUN_TMP"/c18_pay; then
           note "C18 the second-payer half SKIPPED — the chain has no store_agent_secret yet; deploy the contract and re-run"
         else
-          fail "C18 a second payer holding the same wk_ could not write: $(tail -c 220 /tmp/c18_pay)"
+          fail "C18 a second payer holding the same wk_ could not write: $(tail -c 220 "$RUN_TMP"/c18_pay)"
         fi
       else
         CT_END=$(ciphertext_after_write "$AGENT2" "$C18_PROJECT" "$CT_MID")
@@ -1911,7 +1948,7 @@ if want C19 && agent_secret_mode C19; then
         || fail "C19 the wasm scope sealed to '$C19_SEED', which is not what the read path rebuilds"
 
       OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set-for-agent '{"C19":"wasm-scoped"}' \
-        --wasm-hash "$C19_HASH" --api-key "$AGENT_WALLET_KEY" >/tmp/c19_store 2>&1
+        --wasm-hash "$C19_HASH" --api-key "$AGENT_WALLET_KEY" >"$RUN_TMP"/c19_store 2>&1
       # Output KEPT: a store that never happened reads downstream as "the chain
       # holds nothing", and this section would then report a contract problem
       # about code it never reached.
@@ -1925,7 +1962,7 @@ if want C19 && agent_secret_mode C19; then
       done
 
       if [[ -z "$C19_STORED" ]]; then
-        fail "C19 nothing landed under the wasm accessor: $(tail -c 220 /tmp/c19_store)"
+        fail "C19 nothing landed under the wasm accessor: $(tail -c 220 "$RUN_TMP"/c19_store)"
       else
         pass "C19 a wasm-scoped secret is on chain under WasmHash($(printf '%.8s' "$C19_HASH")…)"
 
@@ -1942,13 +1979,13 @@ if want C19 && agent_secret_mode C19; then
         # `--yes` because a script has no keyboard: without it the command waits
         # on a confirmation prompt that nothing will ever answer.
         OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets delete-for-agent --yes \
-          --wasm-hash "$C19_HASH" --api-key "$AGENT_WALLET_KEY" >/tmp/c19_del 2>&1
+          --wasm-hash "$C19_HASH" --api-key "$AGENT_WALLET_KEY" >"$RUN_TMP"/c19_del 2>&1
         C19_RC=$?
 
-        if [[ $C19_RC -ne 0 ]] && grep -qiE "unrecognized subcommand|404|not found" /tmp/c19_del; then
-          note "C19 the delete SKIPPED — this build has no delete route yet: $(tail -c 160 /tmp/c19_del)"
+        if [[ $C19_RC -ne 0 ]] && grep -qiE "unrecognized subcommand|404|not found" "$RUN_TMP"/c19_del; then
+          note "C19 the delete SKIPPED — this build has no delete route yet: $(tail -c 160 "$RUN_TMP"/c19_del)"
         elif [[ $C19_RC -ne 0 ]]; then
-          fail "C19 the delete was refused: $(tail -c 220 /tmp/c19_del)"
+          fail "C19 the delete was refused: $(tail -c 220 "$RUN_TMP"/c19_del)"
         else
           C19_LEFT="$C19_STORED"
           for _ in $(seq 1 12); do
@@ -1967,37 +2004,89 @@ if want C19 && agent_secret_mode C19; then
   fi
 fi
 
-# ── C7: the daily quota ──────────────────────────────────────────────────────
-# LAST, and that placement is the test. It calls until the wallet is refused,
-# so every later section calling the same connector from the same wallet would
-# be refused too — C12 read that as "the agent cannot see its own secret", C14
-# and C16 as product refusals, and C15 charged nothing because nothing ran.
-# The header has claimed this ordering since it was written; the block sat
-# seventh of nineteen until 2026-08-23, and four sections downstream of it were
-# reporting an exhausted quota as a defect.
+# ── C7: a trial is ten calls, and paying has no call limit ──────────────────
+# The whole of the count-based metering on a connector. A fresh wallet claims
+# its trial, makes every call the answer promised, and is refused on the next
+# one — for good (`terminal: true`), in calls and never in dollars. A funded key
+# is then called MORE times than a trial allows and none of those is refused:
+# a caller who pays is bounded by money and by nothing else.
+#
+# Mints its own wallet, so it spends nothing of the fixtures' and can run in any
+# order. It does claim a trial.
 if want C7; then
-  if [[ -z "$AGENT_PAYMENT_KEY" ]]; then
-    note "C7 SKIPPED: needs AGENT_PAYMENT_KEY, same as C6"
-  elif [[ "$APPLY" != true ]]; then
-    printf '\033[90m  (dry-run) call ping until the wallet is refused, and read the reason\033[0m\n' >&2
+  if [[ "$APPLY" != true ]]; then
+    printf '\033[90m  (dry-run) mint a wallet, claim its trial, call ping to the limit and once more; then pass the limit on a funded key\033[0m\n' >&2
   else
-    log "C7 the daily quota"
-    warn "C7 burns this wallet's quota for the connector for the rest of the day"
-    hit=""
-    # The limit is a tier, not a constant, and the wallet may have spent some of
-    # it already — so call until refused rather than counting to a number this
-    # script would have to keep in step with the coordinator's config.
-    for _ in $(seq 1 30); do
-      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $AGENT_PAYMENT_KEY" \
-            -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
-      if [[ "$(echo "$R" | jq -r '.reason // empty')" == "connector_quota_exceeded" ]]; then hit=$R; break; fi
-    done
-    if [[ -z "$hit" ]]; then
-      fail "C7 thirty calls and never refused — the quota is not being enforced"
-    elif echo "$hit" | jq -r '.error // empty' | grep -qE '[0-9]+[^0-9]{1,24}[0-9]+'; then
-      pass "C7 refused with connector_quota_exceeded, and the message names the numbers: $(echo "$hit" | jq -r '.error' | head -c 120)"
+    log "C7 a trial is ten calls; a funded key has no call limit"
+    REG=$(curl -sS --max-time 60 -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d '{}')
+    T_WK=$(jq -r '.api_key // empty' <<<"$REG")
+    OFFER=$(jq -c '.trial // {}' <<<"$REG")
+    if ! jq -e '(.calls | type == "number" and . > 0) and (.days | type == "number" and . > 0)' <<<"$OFFER" >/dev/null; then
+      fail "C7 /register does not offer a trial in calls and days: $OFFER"
+    elif jq -e 'has("allowance_usd") or has("claim_within_days")' <<<"$OFFER" >/dev/null; then
+      fail "C7 /register describes the trial in dollars or with a claim window: $OFFER"
     else
-      fail "C7 refused, but the message says neither what was used nor what the limit is: $(echo "$hit" | head -c 160)"
+      pass "C7 /register offers the trial in calls and days: $OFFER"
+    fi
+    CLAIM=$(curl -sS --max-time 60 -X POST "$COORDINATOR_URL/trial-key" -H "Authorization: Bearer $T_WK")
+    T_KEY=$(jq -r '.payment_key // empty' <<<"$CLAIM")
+    T_CALLS=$(jq -r '.calls // empty' <<<"$CLAIM")
+    C7_WHY=$(jq -r '.reason // empty' <<<"$CLAIM" 2>/dev/null)
+    if [[ -z "$T_KEY" && ( "$C7_WHY" == "trial_unavailable" || "$C7_WHY" == "trial_disabled" ) ]]; then
+      skip "C7 no trial is on offer ($C7_WHY)"
+    elif [[ -z "$T_KEY" ]]; then
+      fail "C7 a fresh wallet could not claim its trial: $(jq -c 'del(.payment_key)' <<<"$CLAIM" 2>/dev/null | head -c 200)"
+    elif [[ -z "$T_CALLS" ]] || jq -e 'has("allowance_usd")' <<<"$CLAIM" >/dev/null; then
+      fail "C7 the claim must answer with \`calls\` and no dollar figure: $(jq -c 'del(.payment_key)' <<<"$CLAIM")"
+    else
+      ran=0
+      for _ in $(seq 1 "$T_CALLS"); do
+        R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $T_KEY" \
+              -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
+        [[ "$(jq -r '.status // empty' <<<"$R")" == "completed" ]] && ran=$((ran + 1))
+      done
+      [[ "$ran" -eq "$T_CALLS" ]] && pass "C7 all $T_CALLS trial calls ran" \
+        || fail "C7 only $ran of the trial's $T_CALLS calls ran"
+
+      C7_BODY="$RUN_TMP/c7_over"
+      CODE=$(curl -s -o "$C7_BODY" -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $T_KEY" \
+               -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
+      OVER=$(cat "$C7_BODY")
+      if [[ "$CODE" == "402" && "$(jq -r '.reason' <<<"$OVER")" == "trial_exhausted" && "$(jq -r '.terminal' <<<"$OVER")" == "true" \
+            && "$(jq -r '.used' <<<"$OVER")" == "$T_CALLS" && "$(jq -r '.limit' <<<"$OVER")" == "$T_CALLS" ]]; then
+        pass "C7 the next call is 402 trial_exhausted, terminal, $T_CALLS of $T_CALLS: $(jq -r '.error' <<<"$OVER" | head -c 110)"
+      else
+        fail "C7 call $((T_CALLS + 1)) should be 402 trial_exhausted/terminal/used=limit=$T_CALLS, got HTTP $CODE: $(head -c 200 <<<"$OVER")"
+      fi
+      # A refused attempt is not a call: asking again must not move `used` past the limit.
+      AGAIN=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $T_KEY" \
+                -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
+      [[ "$(jq -r '.used' <<<"$AGAIN")" == "$T_CALLS" ]] && pass "C7 a refused attempt does not count: still $T_CALLS of $T_CALLS" \
+        || fail "C7 a refusal moved the count: $(jq -c '{used,limit}' <<<"$AGAIN")"
+
+      ST=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $T_KEY")
+      if [[ "$(jq -r '.trial.calls_left' <<<"$ST")" == "0" ]] && ! jq -e 'has("allowance_total_usd") or has("allowance_available_usd")' <<<"$ST" >/dev/null; then
+        pass "C7 /subscription/status reports the trial in calls (calls_left 0) and shows no allowance figures"
+      else
+        fail "C7 status should carry trial.calls_left=0 and no allowance_* for a trial key: $(jq -c '{trial, allowance_total_usd, allowance_available_usd}' <<<"$ST")"
+      fi
+
+      # The funded half judges a key with MONEY. A nonce-0 key is a trial, and
+      # running it here would report a trial's own limit as a paying caller's.
+      if [[ -n "$AGENT_PAYMENT_KEY" && "$(cut -d: -f2 <<<"$AGENT_PAYMENT_KEY")" == "0" ]]; then
+        note "C7 the funded-key half SKIPPED: AGENT_PAYMENT_KEY is a trial key (nonce 0) — set a funded one"
+      elif [[ -n "$AGENT_PAYMENT_KEY" ]]; then
+        refused=0
+        for _ in $(seq 1 $((T_CALLS + 2))); do
+          R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $AGENT_PAYMENT_KEY" \
+                -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
+          [[ "$(jq -r '.status // empty' <<<"$R")" == "completed" ]] || refused=$((refused + 1))
+        done
+        [[ "$refused" -eq 0 ]] && pass "C7 a funded key made $((T_CALLS + 2)) calls in a row — past a trial's count — and none was refused" \
+          || fail "C7 a funded key was refused $refused of $((T_CALLS + 2)) calls: $(head -c 200 <<<"$R")"
+      else
+        note "C7 the funded-key half SKIPPED: needs AGENT_PAYMENT_KEY"
+      fi
     fi
   fi
 fi

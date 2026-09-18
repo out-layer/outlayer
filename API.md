@@ -31,19 +31,20 @@ base URL that matches the network your project / wallet is deployed on.
 | Header | Used by | Meaning |
 |--------|---------|---------|
 | `X-Payment-Key: owner:nonce:secret` | Paid execution calls | Prepaid USD (stablecoin) balance |
-| `Authorization: Bearer wk_...` | Trial calls + all wallet endpoints | Wallet API key (free trial quota for `/call`) |
+| `Authorization: Bearer wk_...` | All wallet endpoints and `POST /trial-key`. It runs the wallet and does not pay: on `/call` it is refused as `401 wk_is_not_a_payer` | Wallet API key |
 | _(none)_ | `/register`, public read endpoints | No auth |
 
-> Only `X-Payment-Key` (paid) or `Authorization: Bearer wk_...` (trial / wallet)
+> Only `X-Payment-Key` (a funded key, a subscription, or the trial key) or `Authorization: Bearer wk_...` (wallet)
 > are accepted for authenticated calls. There is no `X-API-Key` header.
 
 ## Execution API
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| POST | `/call/{owner}/{project}` | `X-Payment-Key` or `Bearer wk_...` | Execute a WASI module (sync response) |
+| POST | `/call/{owner}/{project}` | `X-Payment-Key` | Execute a WASI module (sync response) |
 | GET | `/calls/{call_id}` | — | Poll an async execution by id |
-| GET | `/trial/status` | `Bearer wk_...` | Check remaining free trial quota |
+| POST | `/trial-key` | `Bearer wk_...` | Claim the wallet's trial: ten connector calls in its first week |
+| GET | `/subscription/status` | `X-Payment-Key` | What a key has left — for a trial key, `trial.calls_left` |
 
 Optional execution headers: `X-Compute-Limit` (max compute budget in USD
 micro-units), `X-Attached-Deposit` (payment forwarded to the project author,
@@ -56,7 +57,7 @@ All endpoints require `Authorization: Bearer wk_...`.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/register` | Register a wallet, get API key + trial quota (no auth) |
+| POST | `/register` | Register a wallet, get API key and the trial offer (no auth) |
 | GET | `/wallet/v1/balance` | Balance (NEAR or FT), per chain |
 | GET | `/wallet/v1/address` | Address for any supported chain |
 | GET | `/wallet/v1/tokens` | List supported tokens |
@@ -68,7 +69,7 @@ All endpoints require `Authorization: Bearer wk_...`.
 | POST | `/wallet/v1/intents/withdraw` | Withdrawal — same-chain (native NEAR / NEP-141) or cross-chain (gasless); `/dry-run` available · **mainnet only** |
 | POST | `/wallet/v1/intents/swap` | Swap tokens via Intents; `/swap/quote` for a quote · **mainnet only** |
 | POST | `/wallet/v1/intents/deposit/cross-chain` | Cross-chain deposit via 1Click (legacy alias `/wallet/v1/deposit-intent`); `/cross-chain/status` + `/cross-chain/list` available · **mainnet only** |
-| POST | `/wallet/v1/create-payment-key` | Upgrade trial → paid (USDC or NEAR deposit) |
+| POST | `/wallet/v1/create-payment-key` | A key with money on it — no call limit (USDC or NEAR deposit) |
 | POST | `/wallet/v1/policy` · `/sign-policy` · `/encrypt-policy` | Policy engine (spend limits, allowlists) |
 | GET/POST | `/wallet/v1/approval/*` · `/approve/*` · `/reject/*` · `/pending_approvals*` | Multisig approval flow |
 | GET | `/wallet/v1/requests/{id}` | Request status |

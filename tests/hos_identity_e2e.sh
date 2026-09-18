@@ -71,8 +71,8 @@ CLAIM=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/trial-key" -H "Authorization: B
   -H 'Content-Type: application/json' -d '{}' 2>/dev/null)
 PK=$(jq -r '.payment_key // empty' <<<"$CLAIM")
 
-# The trial quota is three keys per IP and it is not resettable from outside —
-# so a spent counter would cost this suite the whole HTTPS half of
+# A trial is not always on offer (`trial_unavailable`), and that is not
+# resettable from outside — so it would cost this suite the whole HTTPS half of
 # `use_bound_identity` — silently, on a run that then reports nothing wrong. A
 # wallet can buy its own key instead. The key it gets is owned by the same
 # implicit account the trial key would have been, which is what makes I1 land on
@@ -83,13 +83,13 @@ if [[ -z "$PK" ]]; then
 fi
 
 if [[ -z "$PK" ]]; then
-  skip "§5 — this wallet has no key to pay with: the trial quota for this address is spent and the stablecoin route did not go through either (see the warning above for which step)"
+  skip "§5 — this wallet has no key to pay with: no trial is on offer to this run and the stablecoin route did not go through either (see the warning above for which step)"
   # Exit 3, not 0: without a key this suite judges nothing, and §5 is where the
   # HTTPS half of `use_bound_identity` is judged at all. A zero here reads in
   # the runner's table as a suite that passed.
   verdict "§5 identity"; exit 3
 fi
-note "paying with ${PK:0:8}… ($(jq -r 'if .allowance_usd then "trial allowance \(.allowance_usd)" else "bought with stablecoin" end' <<<"$CLAIM" 2>/dev/null || echo "bought with stablecoin"))"
+note "paying with ${PK:0:8}… ($(jq -r 'if .calls then "a trial of \(.calls) calls" else "bought with stablecoin" end' <<<"$CLAIM" 2>/dev/null || echo "bought with stablecoin"))"
 
 ACC="hos-ident-$(openssl rand -hex 3).$PARENT"
 cleanup() {

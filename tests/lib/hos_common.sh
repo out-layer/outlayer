@@ -182,13 +182,13 @@ msg_of()   { jq -r '.message // .error // ""' <<<"${1:-$BODY}" 2>/dev/null | hea
 # ── assertions ───────────────────────────────────────────────────────────────
 
 # Has the wallet under test run out of allowance rather than been refused by a
-# rule? The monthly custody cap and the daily connector quota are LIMITS, and a
-# suite that reports one as a policy failure sends the reader to fix the wrong
-# thing — the mistake the admin runbook calls out by name.
+# rule? The monthly custody cap and a spent trial are LIMITS, and a suite that
+# reports one as a policy failure sends the reader to fix the wrong thing — the
+# mistake the admin runbook calls out by name.
 exhausted() {
-  # The connector quota is spelled once, in `quota_refused`; the rest are the
+  # A spent trial is spelled once, in `trial_spent`; the rest are the
   # allowances this helper knows about.
-  quota_refused "$BODY" && return 0
+  trial_spent "$BODY" && return 0
   grep -qiE "limit reached: [0-9]+ per (month|day) for custody|already has its trial key" <<<"$BODY"
 }
 
@@ -471,9 +471,8 @@ new_bound_wallet() {
 # buy_payment_key <wk_key> <wallet-near-address> — a payment key for a wallet
 # the coordinator MINTED, bought with stablecoin instead of claimed as a trial.
 #
-# The trial route is capped at three keys per IP and the counter is in the
-# coordinator's memory, so a suite that can only claim trials loses itself to a
-# quota — and §5, which judges the HTTPS half of `use_bound_identity`, is the
+# A trial is not always on offer (`trial_unavailable`), so a suite that can only
+# claim trials loses itself to that — and §5, which judges the HTTPS half of `use_bound_identity`, is the
 # suite that finds things. This route spends the PARENT's testnet USDC instead
 # and is not capped.
 #
@@ -560,20 +559,20 @@ buy_payment_key() {
   return 0
 }
 
-# ── the day's connector quota ────────────────────────────────────────────────
-# A connector call refused because the wallet has spent its calls for the day
-# reads exactly like one refused by an access condition, and the quota belongs
-# to the WALLET's age, not to the row under test. Every connector row asks this
-# before it judges a refusal, and skips itself rather than reporting a verdict
-# it cannot justify.
-quota_refused() { grep -qiE 'connector_quota_exceeded|daily connector quota' <<<"${1:-}"; }
+# ── a spent trial ────────────────────────────────────────────────────────────
+# The one count on connector calls is the trial's: ten calls, then
+# `402 trial_exhausted` for good. A row run on a TRIAL key that has made its ten
+# is refused for that and not for whatever the row tests, so it asks this before
+# it judges a refusal and skips itself. A funded key is never refused this way —
+# a caller who pays has no call limit — so on one this is always false.
+# Takes the raw body OR the sentence out of it (`RUN_ERR` is `.error`), so it
+# knows the refusal by its reason and by how the sentence opens.
+trial_spent() { grep -qiE 'trial_exhausted|trial_expired|This trial key' <<<"${1:-}"; }
 
-# mint_agent_wallet — a coordinator-minted wallet with a payment key of its own,
-# for a run that needs an UNSPENT connector counter. Sets MINTED_WK,
-# MINTED_ACCOUNT and MINTED_PAYMENT_KEY. A wallet minted today sits at the
-# FLOOR of the quota ladder (the allowance grows with the wallet's age), which
-# is a handful of calls — enough for the connector rows, never for a suite that
-# leans on volume. Signs as $PARENT to fund it, so nothing else may be signing.
+# mint_agent_wallet — a coordinator-minted wallet with a FUNDED payment key of
+# its own, for a run that wants a caller nothing else has touched. Sets
+# MINTED_WK, MINTED_ACCOUNT and MINTED_PAYMENT_KEY. Signs as $PARENT to fund it,
+# so nothing else may be signing.
 mint_agent_wallet() {
   local r attempt
   for attempt in 1 2; do
@@ -585,7 +584,7 @@ mint_agent_wallet() {
       warn "/register minted no wallet: $(jq -c 'del(.api_key)' <<<"$r" 2>/dev/null | head -c 200)"; return 1; }
     if buy_payment_key "$MINTED_WK" "$MINTED_ACCOUNT"; then
       MINTED_PAYMENT_KEY="$PAID_KEY"
-      note "minted ${MINTED_ACCOUNT:0:10}… for the connector rows (a wallet minted today carries the quota floor)"
+      note "minted ${MINTED_ACCOUNT:0:10}… with a funded key for the connector rows"
       return 0
     fi
     # The purchase is never retried on the SAME wallet: the coordinator refuses

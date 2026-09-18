@@ -108,19 +108,26 @@ connector it means the opposite: any recipient, any number of messages. Write th
 permission: *"an empty policy allows sending to anyone; `max_attachment_kb` is
 the only field that denies by default."*
 
-**Name the limit that actually binds.** A trial key holds a dollar and lives a
-week, and neither is what stops an agent — the daily connector quota does, at
-about ten calls. Publishing the dollar as the budget invites arithmetic that is
-wrong by an order of magnitude. If two limits exist, say which one is reached
-first.
+**Name the limit that actually binds, in the unit it is counted in — and no
+other number beside it.** A trial is ten calls. If the documentation also quotes
+a dollar figure that exists behind it, a reader does arithmetic on the dollars,
+concludes they have ninety calls, and is stopped at ten holding what looks like
+a balance. A figure the reader cannot act on is not context, it is a second
+answer to the same question. If two limits exist, say which one is reached
+first; if only one can be, do not mention the other.
 
 **Do not put an optional thing in a mandatory-looking template.** `X-Wallet-Id`
 in a call example, with no word that it is optional, sends an agent looking up a
 wallet id it never needed. Mark optional headers, or leave them out.
 
-**A counter counts attempts.** Where a quota or a cap is incremented before the
-limit is compared, refusals spend it too. Say so: otherwise "retry until it
-works" looks free and is not.
+**Say what counts.** "Ten calls" leaves open whether a refused attempt is one of
+them, whether a free operation is, whether a call that failed is. Each of those
+decides what an agent does next, so each is stated: for the trial, a call that
+was accepted counts — a free one included, and one whose run then failed or
+timed out — and an attempt refused up front does not. Where a
+counter does charge refusals (a connector's own technical cap is incremented
+before the limit is compared), say that too: otherwise "retry until it works"
+looks free and is not.
 
 **Placeholders for anything network-specific**, with the table. A connector's
 account differs between networks and the two never mix.

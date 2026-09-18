@@ -53,9 +53,8 @@
 #
 # Needs: PAYMENT_KEY — a funded payment key; CALLER (O8 only) — an account with
 # a stablecoin balance INSIDE the contract and NEAR for the compute deposit.
-# Nine connector calls over HTTPS, so the key's
-# daily quota (per wallet+connector, laddered by the caller's age) must have
-# room: a wallet minted today carries the floor of ten and would not finish.
+# Nine connector calls over HTTPS. A funded key has no call limit; a TRIAL key is
+# ten calls in all and would barely finish, so use a funded one.
 #
 # Run:
 #   PAYMENT_KEY=… ./tests/connector_probe_ops_e2e.sh --apply
@@ -90,15 +89,14 @@ call() {
   printf '%s' "$BODY"
 }
 out_field() { jq -r ".output.$1 // empty" <<<"$BODY" 2>/dev/null; }
-quota_hit() { [[ "$BODY" == *connector_quota_exceeded* ]]; }
 
 note "project: $PROJECT"
 
 # ── O1 the author's credential, from the manifest alone ──────────────────────
 log "O1 author_secret — no header, no secrets_ref, nothing in the request"
 call author_secret >/dev/null
-if quota_hit; then
-  skip "O1 — this key's daily connector quota is spent; every row below would report the quota, not the operation"
+if trial_spent "$BODY"; then  # a TRIAL key that has made its calls; a funded key is never refused this way
+  skip "O1 — this TRIAL key has made its calls; every row below would report that, not the operation — use a funded key"
   verdict "connector-probe operations"; exit 0
 fi
 FOUND=$(jq -r '.output.secrets // [] | map(select(.found)) | length' <<<"$BODY" 2>/dev/null)

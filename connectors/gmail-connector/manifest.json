@@ -18,13 +18,7 @@
     {
       "operation": "send",
       "window": "day",
-      "max_count": 400,
-      "applies": "everyone"
-    },
-    {
-      "operation": "status",
-      "window": "day",
-      "max_count": 1000,
+      "max_count": 500,
       "applies": "everyone"
     }
   ],

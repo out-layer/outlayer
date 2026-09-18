@@ -177,12 +177,10 @@ naming neither list, means anywhere. `subject_prefix` is added once when it is
 missing, so a recipient can tell agent mail from its owner's.
 
 `max_per_day` is the owner's own cap on a runaway agent, counted per calling
-wallet in UTC days, and it is optional: the platform's cap is the manifest's
-`send` limit, which the coordinator enforces per payment-key owner in a rolling
-day — union with its own rules, so a manifest can only tighten — because every
-user sends through the same published OAuth client, and Google caps the account
-itself. That counter is incremented before the call is judged, so a refused
-attempt spends it; the owner's does not.
+wallet in UTC days, and it is optional. The mailbox is the owner's and how much it
+sends is theirs to decide; the manifest's `send` limit of 500 a day per calling
+wallet is a technical ceiling against a loop, set below what Google itself allows
+an account, not a quota. An attempt that ceiling refuses still counts toward it.
 
 The day's count lives in project storage, per agent, in UTC days. A message's
 place is **reserved atomically before it is sent** and given back if the send
