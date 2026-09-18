@@ -3179,10 +3179,15 @@ async fn update_user_secrets_handler(
             }
         }
     } else {
-        tracing::warn!(
-            "NEAR client not configured - skipping access key ownership verification. \
-            This is a security risk! Set NEAR_RPC_URL and NEAR_CONTRACT_ID."
-        );
+        // A signature proves somebody holds a key; only the chain says whose
+        // account that key is on. Without the lookup any keypair could sign
+        // "for" any owner, so an unconfigured keystore refuses instead.
+        tracing::error!("update_user_secrets refused: no NEAR client to check key ownership with");
+        return Err(ApiError::InternalError(
+            "This keystore cannot check that the signing key belongs to the owner's account \
+             (NEAR_RPC_URL / NEAR_CONTRACT_ID are not set), so it will not update secrets."
+                .to_string(),
+        ));
     }
 
     // 4. Validate user secrets don't contain PROTECTED_ prefix
@@ -3633,10 +3638,48 @@ struct Nep413Payload {
 /// NEP-413 tag: 2^31 + 413
 const NEP413_TAG: u32 = 2147484061;
 
-/// Verify NEAR signature (NEP-413)
+/// The digest NEP-413 has a wallet sign, and the bytes it is a digest of:
+/// `SHA256(NEP413_TAG || Borsh(Nep413Payload))`.
+fn nep413_digest(message: &str, nonce: &str, recipient: &str) -> Result<([u8; 32], Vec<u8>), anyhow::Error> {
+    use sha2::{Digest, Sha256};
+
+    let nonce_bytes = base64::decode(nonce)
+        .map_err(|e| anyhow::anyhow!("Failed to decode nonce: {}", e))?;
+    let nonce_len = nonce_bytes.len();
+    let nonce_array: [u8; 32] = nonce_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid nonce length: {} (expected 32)", nonce_len))?;
+
+    let payload = Nep413Payload {
+        message: message.to_string(),
+        nonce: nonce_array,
+        recipient: recipient.to_string(),
+        callback_url: None,
+    };
+    let payload_bytes = borsh::to_vec(&payload)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize NEP-413 payload: {}", e))?;
+
+    let mut tagged = Vec::with_capacity(4 + payload_bytes.len());
+    tagged.extend_from_slice(&NEP413_TAG.to_le_bytes());
+    tagged.extend_from_slice(&payload_bytes);
+    Ok((Sha256::digest(&tagged).into(), tagged))
+}
+
+/// Verify a wallet's NEP-413 signature: ed25519, or ml-dsa-65 (FIPS-204).
 ///
-/// NEP-413 specifies that the signed payload is:
-/// SHA256(NEP413_TAG || Borsh(Nep413Payload))
+/// The scheme is the public key's own prefix, and only these two are accepted —
+/// they are the schemes a NEAR account's access key can be that a wallet signs
+/// messages with. Whether the key belongs to the account is a separate question,
+/// asked of the chain by the caller; the key string is compared there as it is
+/// here, so nothing about ownership depends on the scheme.
+///
+/// The signature arrives as wallets give it, base64 of the raw bytes, or in
+/// NEAR's canonical `<scheme>:<base58>`.
+///
+/// What is signed is NEP-413's digest. For ml-dsa-65 the tagged payload itself
+/// is accepted too: the scheme hashes its input internally, and a signer that
+/// therefore skips the outer SHA-256 has bound itself to exactly the same
+/// message, nonce and recipient.
 fn verify_near_signature(
     message: &str,
     signature: &str,
@@ -3644,90 +3687,47 @@ fn verify_near_signature(
     nonce: &str,
     recipient: &str,
 ) -> Result<(), anyhow::Error> {
-    use sha2::{Sha256, Digest};
+    use near_crypto::{KeyType, PublicKey, Signature};
+    use std::str::FromStr;
 
-    // Parse public key (format: "ed25519:base58...")
-    let pubkey_parts: Vec<&str> = public_key.split(':').collect();
-    if pubkey_parts.len() != 2 || pubkey_parts[0] != "ed25519" {
-        anyhow::bail!("Invalid public key format, expected 'ed25519:base58...'");
+    let pk = PublicKey::from_str(public_key).map_err(|e| {
+        anyhow::anyhow!("Invalid public key, expected 'ed25519:<base58>' or 'ml-dsa-65:<base58>': {}", e)
+    })?;
+    let key_type = pk.key_type();
+    if !matches!(key_type, KeyType::ED25519 | KeyType::MLDSA65) {
+        anyhow::bail!("Public key scheme {} is not accepted here; sign with an ed25519 or ml-dsa-65 key", key_type);
     }
 
-    let pubkey_bytes = bs58::decode(pubkey_parts[1])
-        .into_vec()
-        .map_err(|e| anyhow::anyhow!("Failed to decode public key: {}", e))?;
-
-    if pubkey_bytes.len() != 32 {
-        anyhow::bail!("Invalid public key length: {}", pubkey_bytes.len());
-    }
-
-    // Decode signature (base64)
-    let signature_bytes = base64::decode(signature)
-        .map_err(|e| anyhow::anyhow!("Failed to decode signature: {}", e))?;
-
-    if signature_bytes.len() != 64 {
-        anyhow::bail!("Invalid signature length: {}", signature_bytes.len());
-    }
-
-    // Decode nonce (base64) - must be exactly 32 bytes
-    let nonce_bytes = base64::decode(nonce)
-        .map_err(|e| anyhow::anyhow!("Failed to decode nonce: {}", e))?;
-
-    let nonce_len = nonce_bytes.len();
-    if nonce_len != 32 {
-        anyhow::bail!("Invalid nonce length: {} (expected 32)", nonce_len);
-    }
-
-    let nonce_array: [u8; 32] = nonce_bytes.try_into()
-        .map_err(|_| anyhow::anyhow!("Failed to convert nonce to array"))?;
-
-    // Build NEP-413 payload
-    let payload = Nep413Payload {
-        message: message.to_string(),
-        nonce: nonce_array,
-        recipient: recipient.to_string(),
-        callback_url: None,
+    let sig = if signature.contains(':') {
+        Signature::from_str(signature).map_err(|e| anyhow::anyhow!("Failed to parse signature: {}", e))?
+    } else {
+        let bytes = base64::decode(signature).map_err(|e| anyhow::anyhow!("Failed to decode signature: {}", e))?;
+        Signature::from_parts(key_type, &bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid {} signature of {} bytes: {}", key_type, bytes.len(), e))?
     };
+    let same_scheme = matches!(
+        (sig.key_type(), key_type),
+        (KeyType::ED25519, KeyType::ED25519) | (KeyType::MLDSA65, KeyType::MLDSA65)
+    );
+    if !same_scheme {
+        anyhow::bail!("The signature is {} and the public key is {}", sig.key_type(), key_type);
+    }
 
-    // Serialize payload with Borsh
-    let payload_bytes = borsh::to_vec(&payload)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize NEP-413 payload: {}", e))?;
-
-    // Build final message: tag (4 bytes LE) + payload
-    let mut to_hash = Vec::with_capacity(4 + payload_bytes.len());
-    to_hash.extend_from_slice(&NEP413_TAG.to_le_bytes());
-    to_hash.extend_from_slice(&payload_bytes);
-
-    // SHA256 hash the combined data
-    let hash = Sha256::digest(&to_hash);
+    let (digest, tagged) = nep413_digest(message, nonce, recipient)?;
 
     tracing::debug!(
         message = %message,
         recipient = %recipient,
-        nonce_len = nonce_len,
-        payload_len = payload_bytes.len(),
-        hash_hex = %hex::encode(&hash),
+        key_type = %key_type,
+        hash_hex = %hex::encode(digest),
         "NEP-413 signature verification"
     );
 
-    // Verify using ed25519
-    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-
-    let verifying_key = VerifyingKey::from_bytes(
-        &<[u8; 32]>::try_from(pubkey_bytes.as_slice())
-            .map_err(|_| anyhow::anyhow!("Invalid public key bytes"))?
-    ).map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
-
-    let signature = Signature::from_bytes(
-        &<[u8; 64]>::try_from(signature_bytes.as_slice())
-            .map_err(|_| anyhow::anyhow!("Invalid signature bytes"))?
-    );
-
-    // Verify signature against the hash
-    verifying_key
-        .verify(&hash, &signature)
-        .map_err(|e| anyhow::anyhow!("Signature verification failed: {}", e))?;
-
-    Ok(())
+    if sig.verify(&digest, &pk) || (matches!(key_type, KeyType::MLDSA65) && sig.verify(&tagged, &pk)) {
+        Ok(())
+    } else {
+        anyhow::bail!("Signature verification failed")
+    }
 }
 
 // =========================================================================
@@ -7236,6 +7236,106 @@ mod wallet_sign_tests {
             format!("ed25519:{}", bs58::encode(signing_key.verifying_key().to_bytes()).into_string()),
             base64::encode(nonce),
         )
+    }
+
+    /// A wallet whose access key is ml-dsa-65 signs NEP-413 like any other, and
+    /// the message, nonce and recipient bind its signature the same way.
+    #[test]
+    fn an_ml_dsa_wallet_signature_is_verified_and_bound_like_an_ed25519_one() {
+        use near_crypto::{KeyType, SecretKey, Signature};
+        let sk = SecretKey::from_random(KeyType::MLDSA65);
+        let pubkey = sk.public_key().to_string();
+        assert!(pubkey.starts_with("ml-dsa-65:"), "{}", &pubkey[..12]);
+        let nonce = base64::encode([7u8; 32]);
+        let (msg, recipient) = ("Update Outlayer secrets for a.near:gmail\nkeys:GMAIL_POLICY", "keystore.outlayer.near");
+        let (digest, tagged) = nep413_digest(msg, &nonce, recipient).unwrap();
+
+        let raw = |sig: &Signature| match sig {
+            Signature::MLDSA65(s) => base64::encode(s.as_ref()),
+            _ => unreachable!(),
+        };
+        let over_digest = sk.sign(&digest);
+        // As a wallet gives it (base64 of the raw bytes), and in canonical form.
+        assert!(verify_near_signature(msg, &raw(&over_digest), &pubkey, &nonce, recipient).is_ok());
+        assert!(verify_near_signature(msg, &over_digest.to_string(), &pubkey, &nonce, recipient).is_ok());
+        // A signer that leaves the hashing to ml-dsa signed the same payload.
+        assert!(verify_near_signature(msg, &raw(&sk.sign(&tagged)), &pubkey, &nonce, recipient).is_ok());
+
+        // Another message, nonce or recipient is another payload.
+        assert!(verify_near_signature("Update Outlayer secrets for a.near:gmail\nkeys:OTHER", &raw(&over_digest), &pubkey, &nonce, recipient).is_err());
+        assert!(verify_near_signature(msg, &raw(&over_digest), &pubkey, &base64::encode([8u8; 32]), recipient).is_err());
+        assert!(verify_near_signature(msg, &raw(&over_digest), &pubkey, &nonce, "elsewhere.near").is_err());
+        // Another key does not verify it.
+        let other = SecretKey::from_random(KeyType::MLDSA65).public_key().to_string();
+        assert!(verify_near_signature(msg, &raw(&over_digest), &other, &nonce, recipient).is_err());
+    }
+
+    /// What an attacker can put in the three fields they control. None of it
+    /// verifies, and none of it panics: every case is a refusal.
+    #[test]
+    fn nothing_an_attacker_can_type_into_key_or_signature_verifies() {
+        use near_crypto::{KeyType, SecretKey, Signature};
+        let nonce = base64::encode([3u8; 32]);
+        let (msg, recipient) = ("Update Outlayer secrets for victim.near:gmail\nkeys:GMAIL_POLICY", "keystore.outlayer.near");
+        let (digest, _) = nep413_digest(msg, &nonce, recipient).unwrap();
+        let pq = SecretKey::from_random(KeyType::MLDSA65);
+        let pq_pub = pq.public_key().to_string();
+        let good = match pq.sign(&digest) { Signature::MLDSA65(s) => s.as_ref().to_vec(), _ => unreachable!() };
+        let ed = SecretKey::from_random(KeyType::ED25519);
+        let ed_pub = ed.public_key().to_string();
+
+        let refused = |sig: &str, key: &str, nonce: &str| verify_near_signature(msg, sig, key, nonce, recipient).is_err();
+
+        // Empty and malformed keys.
+        for key in ["", " ", ":", "ml-dsa-65:", "ed25519:", "ml-dsa-65", "ml-dsa-65:0OIl", "ed25519:1111", "unknown:abcd"] {
+            assert!(refused(&base64::encode(&good), key, &nonce), "key {key:?}");
+        }
+        // Empty, truncated, over-long and all-zero signatures, under either scheme.
+        for sig in [String::new(), " ".into(), "!!!".into(), base64::encode(&good[..good.len() - 1]),
+                    base64::encode([good.clone(), vec![0]].concat()), base64::encode(vec![0u8; good.len()]),
+                    "ml-dsa-65:".into(), "ed25519:".into()] {
+            assert!(refused(&sig, &pq_pub, &nonce), "ml-dsa sig {:?}", &sig[..sig.len().min(12)]);
+        }
+        for sig in [String::new(), base64::encode([0u8; 64]), base64::encode([0u8; 63]), base64::encode([0u8; 65])] {
+            assert!(refused(&sig, &ed_pub, &nonce), "ed25519 sig len {}", sig.len());
+        }
+        // A good signature with one bit changed.
+        let mut flipped = good.clone();
+        flipped[100] ^= 1;
+        assert!(refused(&base64::encode(&flipped), &pq_pub, &nonce));
+        // A nonce that is not 32 bytes, or not base64.
+        for bad in ["", "AAAA", "not base64!", &base64::encode([3u8; 31]), &base64::encode([3u8; 33])] {
+            assert!(refused(&base64::encode(&good), &pq_pub, bad), "nonce {bad:?}");
+        }
+        // The control: untouched, it verifies.
+        assert!(!refused(&base64::encode(&good), &pq_pub, &nonce));
+    }
+
+    /// ed25519 must not get the unhashed fallback, a scheme outside the two is
+    /// refused by name, and a signature of one scheme never passes under a key
+    /// of the other.
+    #[test]
+    fn only_the_two_wallet_schemes_are_accepted_and_they_do_not_mix() {
+        use near_crypto::{KeyType, SecretKey, Signature};
+        let nonce = base64::encode([1u8; 32]);
+        let (msg, recipient) = ("m", "r.near");
+        let (digest, tagged) = nep413_digest(msg, &nonce, recipient).unwrap();
+
+        let ed = SecretKey::from_random(KeyType::ED25519);
+        let ed_raw = |s: Signature| match s { Signature::ED25519(s) => base64::encode(s.to_bytes()), _ => unreachable!() };
+        assert!(verify_near_signature(msg, &ed_raw(ed.sign(&digest)), &ed.public_key().to_string(), &nonce, recipient).is_ok());
+        assert!(verify_near_signature(msg, &ed_raw(ed.sign(&tagged)), &ed.public_key().to_string(), &nonce, recipient).is_err());
+
+        let secp = SecretKey::from_random(KeyType::SECP256K1);
+        let err = verify_near_signature(msg, &secp.sign(&digest).to_string(), &secp.public_key().to_string(), &nonce, recipient).unwrap_err();
+        assert!(err.to_string().contains("not accepted"), "{err}");
+
+        let pq = SecretKey::from_random(KeyType::MLDSA65);
+        let err = verify_near_signature(msg, &ed.sign(&digest).to_string(), &pq.public_key().to_string(), &nonce, recipient).unwrap_err();
+        assert!(err.to_string().contains("signature is"), "{err}");
+        // A bare key with no scheme is refused with the two that are expected.
+        let err = verify_near_signature(msg, "AAAA", "nokey", &nonce, recipient).unwrap_err();
+        assert!(err.to_string().contains("ml-dsa-65"), "{err}");
     }
 
     #[test]
