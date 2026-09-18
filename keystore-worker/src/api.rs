@@ -3126,7 +3126,7 @@ async fn update_user_secrets_handler(
     // 2. Verify NEAR signature (NEP-413)
     tracing::info!(
         message = %req.signed_message,
-        public_key = %req.public_key,
+        public_key = %crate::near::key_for_display(&req.public_key),
         nonce = %req.nonce,
         recipient = %req.recipient,
         signature_len = req.signature.len(),
@@ -3137,7 +3137,7 @@ async fn update_user_secrets_handler(
         Ok(()) => {
             tracing::info!(
                 owner = %req.owner,
-                public_key = %req.public_key,
+                public_key = %crate::near::key_for_display(&req.public_key),
                 "✅ NEP-413 signature verified successfully"
             );
         }
@@ -3145,7 +3145,7 @@ async fn update_user_secrets_handler(
             tracing::warn!(
                 error = %e,
                 message = %req.signed_message,
-                public_key = %req.public_key,
+                public_key = %crate::near::key_for_display(&req.public_key),
                 nonce = %req.nonce,
                 recipient = %req.recipient,
                 "❌ NEP-413 signature verification failed"
@@ -3161,21 +3161,18 @@ async fn update_user_secrets_handler(
             Ok(()) => {
                 tracing::info!(
                     owner = %req.owner,
-                    public_key = %req.public_key,
+                    public_key = %crate::near::key_for_display(&req.public_key),
                     "✅ Access key ownership verified via NEAR RPC"
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     owner = %req.owner,
-                    public_key = %req.public_key,
+                    public_key = %crate::near::key_for_display(&req.public_key),
                     error = %e,
                     "❌ Access key ownership verification failed"
                 );
-                return Err(ApiError::Unauthorized(format!(
-                    "Public key {} does not belong to account {}: {}",
-                    req.public_key, req.owner, e
-                )));
+                return Err(ApiError::Unauthorized(e.to_string()));
             }
         }
     } else {
@@ -3826,7 +3823,7 @@ async fn register_tee_handler(
 
     tracing::info!(
         session_id = %session_id,
-        public_key = %req.public_key,
+        public_key = %crate::near::key_for_display(&req.public_key),
         "TEE session registered on keystore"
     );
 

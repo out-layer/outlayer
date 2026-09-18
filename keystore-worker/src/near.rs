@@ -146,6 +146,24 @@ pub struct NearClient {
     contract_id: AccountId,
 }
 
+/// A public key for a log line or an error message: the form the chain lists it
+/// in, which for ml-dsa-65 is a 32-byte handle rather than 1952 bytes of key —
+/// and is the string to look for among the account's keys. What does not parse
+/// is shown cut short, never whole: it is the caller's text, of any length.
+pub fn key_for_display(public_key: &str) -> String {
+    on_chain_form(public_key).unwrap_or_else(|_| {
+        let shown: String = public_key.chars().take(48).collect();
+        format!("{shown}… ({} chars, not a public key)", public_key.chars().count())
+    })
+}
+
+/// A public key as `view_access_key_list` spells it: see `verify_access_key_owner`.
+fn on_chain_form(public_key: &str) -> Result<String> {
+    let parsed = near_crypto::PublicKey::from_str(public_key)
+        .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
+    Ok(near_crypto::PublicKeyHandle::from(&parsed).to_string())
+}
+
 impl NearClient {
     /// Create new NEAR client (read-only)
     ///
@@ -886,10 +904,11 @@ impl NearClient {
     ) -> Result<()> {
         let account_id_parsed = AccountId::from_str(account_id)
             .context("Invalid account ID")?;
+        let shown = key_for_display(public_key);
 
         tracing::debug!(
             account_id = %account_id,
-            public_key = %public_key,
+            public_key = %shown,
             "Verifying access key ownership"
         );
 
@@ -911,28 +930,32 @@ impl NearClient {
             _ => anyhow::bail!("Unexpected query response"),
         };
 
-        // Check if public_key is in the access key list
-        let key_found = access_keys.iter().any(|key| {
-            key.public_key.to_string() == public_key
-        });
+        // Compared in the form the chain keeps a key in. For ed25519 and
+        // secp256k1 that is the key itself; an ml-dsa-65 key is 1952 bytes, and
+        // the trie holds only its handle — SHA3-256 over a domain tag and the
+        // key, listed as `ml-dsa-65-hash:…`. The full key the wallet signed
+        // with is turned into that handle here; comparing the strings as they
+        // arrive would never match one.
+        let wanted = on_chain_form(public_key)?;
+        let key_found = access_keys.iter().any(|key| key.public_key.to_string() == wanted);
 
         if key_found {
             tracing::debug!(
                 account_id = %account_id,
-                public_key = %public_key,
+                public_key = %shown,
                 "✅ Access key verified"
             );
             Ok(())
         } else {
             tracing::warn!(
                 account_id = %account_id,
-                public_key = %public_key,
+                public_key = %shown,
                 keys_count = access_keys.len(),
                 "❌ Access key not found for account"
             );
             anyhow::bail!(
                 "Public key {} does not belong to account {}",
-                public_key, account_id
+                shown, account_id
             )
         }
     }
@@ -1099,5 +1122,39 @@ mod tests {
             .await
             .expect("a Group role is readable"));
         let _ = server.join();
+    }
+}
+
+#[cfg(test)]
+mod on_chain_form_tests {
+    use super::on_chain_form;
+    use near_crypto::{KeyType, SecretKey};
+
+    /// The chain lists an ml-dsa-65 access key by its handle, and every other
+    /// key by itself. A key is looked up in the form it is listed in.
+    #[test]
+    fn a_key_is_looked_up_in_the_form_the_chain_lists_it_in() {
+        let ed = SecretKey::from_random(KeyType::ED25519).public_key().to_string();
+        assert_eq!(on_chain_form(&ed).unwrap(), ed, "ed25519 is listed as itself");
+
+        let pq = SecretKey::from_random(KeyType::MLDSA65).public_key().to_string();
+        let listed = on_chain_form(&pq).unwrap();
+        assert!(listed.starts_with("ml-dsa-65-hash:"), "{listed}");
+        assert!(listed.len() < 70 && pq.len() > 2000, "a 32-byte handle for a 1952-byte key");
+        assert_eq!(on_chain_form(&pq).unwrap(), listed, "deterministic");
+        let other = SecretKey::from_random(KeyType::MLDSA65).public_key().to_string();
+        assert_ne!(on_chain_form(&other).unwrap(), listed, "another key, another handle");
+
+        for bad in ["", "ml-dsa-65:", "ml-dsa-65-hash:", "nokey"] {
+            assert!(on_chain_form(bad).is_err(), "{bad:?}");
+        }
+
+        // In a log or an error a key is shown as the chain lists it, and text
+        // that is not a key is cut short rather than echoed whole.
+        assert_eq!(super::key_for_display(&pq), listed);
+        assert_eq!(super::key_for_display(&ed), ed);
+        let junk = "x".repeat(5000);
+        let shown = super::key_for_display(&junk);
+        assert!(shown.len() < 100 && shown.contains("5000 chars"), "{shown}");
     }
 }
