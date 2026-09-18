@@ -21,6 +21,10 @@ wasi-http-client = "0.2"
 base64 = "0.21"
 # The token cache is keyed by a digest of the credential it was minted from.
 sha2 = "0.10"
+# Sealing the policy to a key the caller supplied, for runs whose output lands
+# on chain. The pair near.email runs on: `ecies` here, `eciesjs` in the browser.
+ecies = { version = "0.2", default-features = false, features = ["pure", "std"] }
+libsecp256k1 = "0.7"
 
 [profile.release]
 opt-level = "z"

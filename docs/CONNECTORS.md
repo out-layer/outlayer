@@ -99,6 +99,44 @@ Return JSON on stdout. The convention the playground and the connectors follow:
 
 The field is `error`, not `error_message`.
 
+### Answering on chain: seal what must not be public
+
+An answer over HTTPS is seen by its caller. An answer on chain is written into
+the transaction's result and is readable by anyone, for ever. So anything a
+connector would say freely over HTTPS but must not publish — an owner's policy,
+which names people, accounts or markets — is **withheld on chain unless the
+caller gave it a key to seal to**.
+
+The convention, so every connector's owner page can read every connector's
+policy the same way:
+
+* `status` takes an optional `reply_pubkey`: a secp256k1 public key in hex —
+  33 bytes compressed, the form `eciesjs` gives. Given one, the sensitive part
+  of the answer comes back sealed to it — `policy_sealed`, base64 — and the open
+  part says only `{"present": …, "sealed": true}`.
+* Without one, `OUTLAYER_EXECUTION_TYPE` decides: `HTTPS` answers in the clear;
+  anything else withholds the fields and says how to ask
+  (`{"present": …, "sealed": false, "note": …}`). Fail-closed: a missing
+  variable is treated as public.
+* The seal is the pair near.email runs on: the `ecies` crate in the guest
+  (`default-features = false, features = ["pure"]`), `eciesjs` in the browser —
+  secp256k1 ECDH → HKDF-SHA256 → AES-256-GCM, in a format the two libraries
+  keep compatible with each other, so nothing about the bytes is ours to get
+  wrong. The keystore's own ECIES (X25519) is the other direction, browser →
+  enclave, and the two never meet. Randomness comes from `getrandom`, which the
+  executor provides to a wasip2 guest.
+
+`openReply` in the dashboard's `lib/ecies.ts` opens it, and `test/ecies.test.mjs`
+shares a golden vector with the connector's sealer so the two cannot drift
+apart unnoticed. `connectors/gmail-connector/src/seal.rs` is the reference —
+copy it.
+
+Why a key from the caller and not a decrypt path in the keystore: the keystore
+never returns a plaintext to anyone, and a "read only these keys" door would be
+the first exception. Running the connector is already a door the owner may use,
+and it costs a transaction, which is the honest price of reading something the
+enclave holds.
+
 ---
 
 ## 3. Network: you declare it, the worker enforces it
@@ -524,6 +562,7 @@ access; one that echoed secrets would make every test run a leak.
 
 ## See also
 
+* [`CONNECTOR_DOCS.md`](CONNECTOR_DOCS.md) — writing a connector's documentation: which claim is read from which source, and what a diff forces you to re-check. Hand it to whoever (or whatever) writes the skill and the spec entry
 * [`wasi-examples/CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md) — manifest reference
 * [`wasi-examples/WASI_TUTORIAL.md`](../wasi-examples/WASI_TUTORIAL.md) — writing and building a WASI guest
 * [`wasi-examples/WASM_ENV_VARS.md`](../wasi-examples/WASM_ENV_VARS.md) — every injected variable

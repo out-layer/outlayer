@@ -13,7 +13,7 @@
 //!
 //! | `operation` | class | what it does |
 //! |---|---|---|
-//! | `status` | read | whether the credential works, the policy's caps, today's send count |
+//! | `status` | read | whether the credential works, the policy's caps, today's send count. On chain the policy comes back only sealed to the caller's `reply_pubkey` |
 //! | `send` | write | a message, policy-checked first |
 //!
 //! It only sends. `gmail.send` authorises sending and nothing else — not reading
@@ -30,7 +30,10 @@ mod gmail;
 mod mime;
 mod oauth;
 mod policy;
+mod seal;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use outlayer::env;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -64,6 +67,10 @@ struct Input {
     body: Option<String>,
     #[serde(default)]
     attachments: Vec<mime::Attachment>,
+    /// `status` only: a secp256k1 public key in hex (33 bytes compressed, as
+    /// `eciesjs` gives it) to seal the policy to. Required for the policy to be
+    /// shown at all when the run's output lands on chain.
+    reply_pubkey: Option<String>,
 }
 
 /// Everything this connector sells. A name not here is refused with the list.
@@ -96,7 +103,7 @@ fn main() {
 
 fn run(op: &str, input: &Input) -> Result<Value, String> {
     match op {
-        "status" => status(),
+        "status" => status(input),
         "send" => send(input),
         "" => Err(format!("no `operation` in the input. This connector sells: {}", OPERATIONS.join(", "))),
         other => Err(format!("unknown operation `{other}`. This connector sells: {}", OPERATIONS.join(", "))),
@@ -133,11 +140,47 @@ fn address_list(value: Option<&Value>, field: &str) -> Result<Vec<String>, Strin
 
 /// Is the credential alive, and what may the agent do with it? Getting an access
 /// token is the proof: it is the one thing a send-only credential can show.
-fn status() -> Result<Value, String> {
+fn status(input: &Input) -> Result<Value, String> {
+    // A key that is not one is refused before Google is asked for anything: the
+    // refusal is the caller's to fix, and it should not cost a token fetch.
+    if let Some(key) = input.reply_pubkey.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        seal::parse_pubkey(key)?;
+    }
     token()?;
     let day = policy::day_key(policy::now_ms());
     let sent = policy::sent_today(&day).unwrap_or(0);
-    let policy = match policy::load() {
+    let (policy, sealed) = policy_view(policy::load(), input.reply_pubkey.as_deref(), on_chain())?;
+    let mut answer = json!({
+        "credential": "ok",
+        "scope": "gmail.send: this connector sends as the connected account and cannot read its mailbox",
+        "policy": policy,
+        "sent_today": sent,
+        "next": "`send` with `to`, `subject` and `body`",
+    });
+    if let Some(sealed) = sealed {
+        answer["policy_sealed"] = Value::String(sealed);
+    }
+    Ok(answer)
+}
+
+/// Where this run's output goes. The worker names an HTTPS run in so many
+/// words; anything else is treated as public — the direction that leaks nothing
+/// when the variable is missing.
+fn on_chain() -> bool {
+    std::env::var("OUTLAYER_EXECUTION_TYPE").map(|v| v != "HTTPS").unwrap_or(true)
+}
+
+/// The policy as `status` reports it, and — when the caller gave a key — the
+/// same thing sealed to that key as base64.
+///
+/// Three cases, decided by two facts. With a `reply_pubkey`, the full policy is
+/// sealed and the open part says only whether one exists. Without one, over
+/// HTTPS the full policy goes in the clear, as the transport already is. Without
+/// one on chain the fields are withheld: the output of an on-chain run sits in
+/// the transaction for ever, and the policy names the people the owner's agent
+/// may write to.
+fn policy_view(loaded: policy::Loaded, reply_pubkey: Option<&str>, on_chain: bool) -> Result<(Value, Option<String>), String> {
+    let full = match loaded {
         policy::Loaded::Some(p) => json!({
             "present": true,
             "recipient_domains": p.recipient_domains,
@@ -153,13 +196,24 @@ fn status() -> Result<Value, String> {
         }),
         policy::Loaded::Unreadable(e) => json!({"present": true, "readable": false, "error": e}),
     };
-    Ok(json!({
-        "credential": "ok",
-        "scope": "gmail.send: this connector sends as the connected account and cannot read its mailbox",
-        "policy": policy,
-        "sent_today": sent,
-        "next": "`send` with `to`, `subject` and `body`",
-    }))
+    let present = full["present"].as_bool().unwrap_or(false);
+    match reply_pubkey.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(key) => {
+            let key = seal::parse_pubkey(key)?;
+            let blob = seal::seal(&key, full.to_string().as_bytes())?;
+            Ok((json!({"present": present, "sealed": true}), Some(BASE64.encode(blob))))
+        }
+        None if on_chain => Ok((
+            json!({
+                "present": present,
+                "sealed": false,
+                "note": "on chain the policy is returned only sealed: pass `reply_pubkey`, a secp256k1 \
+                         public key in hex (33 bytes compressed), and read it back from `policy_sealed`",
+            }),
+            None,
+        )),
+        None => Ok((full, None)),
+    }
 }
 
 fn send(input: &Input) -> Result<Value, String> {
@@ -231,6 +285,58 @@ mod tests {
             let err = run(bad, &Input::default()).unwrap_err();
             assert!(err.contains("This connector sells: status, send"), "{bad} → {err}");
         }
+    }
+
+    fn loaded(json: &str) -> policy::Loaded {
+        match serde_json::from_str::<policy::Policy>(json) {
+            Ok(p) => policy::Loaded::Some(p),
+            Err(e) => policy::Loaded::Unreadable(e.to_string()),
+        }
+    }
+
+    /// The policy names people. Over HTTPS it may travel in the clear; on chain
+    /// it leaves only sealed, and without a key it does not leave at all.
+    #[test]
+    fn the_policy_reaches_the_chain_only_sealed() {
+        let rules = r#"{"recipient_domains":["example.com"],"max_per_day":20}"#;
+
+        let (open, sealed) = policy_view(loaded(rules), None, false).unwrap();
+        assert_eq!(open["recipient_domains"], json!(["example.com"]), "HTTPS, no key: in the clear");
+        assert!(sealed.is_none());
+
+        let (open, sealed) = policy_view(loaded(rules), None, true).unwrap();
+        assert_eq!(open, json!({"present": true, "sealed": false, "note": open["note"]}), "on chain, no key: fields withheld — {open}");
+        assert!(open["note"].as_str().unwrap().contains("reply_pubkey"));
+        assert!(sealed.is_none());
+
+        let (sk, pk) = ecies::utils::generate_keypair();
+        let secret = sk.serialize();
+        let hex: String = pk.serialize_compressed().iter().map(|b| format!("{b:02x}")).collect();
+        for on_chain in [true, false] {
+            let (open, sealed) = policy_view(loaded(rules), Some(&hex), on_chain).unwrap();
+            assert_eq!(open, json!({"present": true, "sealed": true}), "with a key nothing else is open");
+            let blob = BASE64.decode(sealed.expect("a sealed policy")).unwrap();
+            let inside: Value = serde_json::from_slice(&seal::open(&secret, &blob).unwrap()).unwrap();
+            assert_eq!(inside["recipient_domains"], json!(["example.com"]));
+            assert_eq!(inside["max_per_day"], json!(20));
+        }
+
+        // A broken policy's error text is withheld on chain and sealed with a
+        // key, like the rest: a parse error quotes the field it choked on.
+        let (open, _) = policy_view(loaded(r#"{"surprise":1}"#), None, true).unwrap();
+        assert!(open.get("error").is_none(), "{open}");
+        let (open, sealed) = policy_view(loaded(r#"{"surprise":1}"#), Some(&hex), true).unwrap();
+        assert!(open.get("error").is_none());
+        let inside: Value = serde_json::from_slice(&seal::open(&secret, &BASE64.decode(sealed.unwrap()).unwrap()).unwrap()).unwrap();
+        assert!(inside["error"].as_str().unwrap().contains("surprise"));
+
+        // A key that is not one is refused before anything is sealed.
+        let err = policy_view(loaded(rules), Some("nope"), true).unwrap_err();
+        assert!(err.contains("secp256k1 public key"), "{err}");
+        // An empty key is no key.
+        let (open, _) = policy_view(loaded(rules), Some("  "), false).unwrap();
+        assert_eq!(open["present"], json!(true));
+        assert!(open.get("sealed").is_none());
     }
 
     #[test]

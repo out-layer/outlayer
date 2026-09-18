@@ -54,6 +54,16 @@ fn describe(status: u16, bytes: &[u8], path: &str) -> String {
             "scope_missing: the Gmail token was not granted what {path} needs ({message}). Consent \
              again with the gmail.send scope, then store the new refresh token."
         ),
+        // Before the rate-limit arm, because Google answers this with 403 too
+        // and the advice is the opposite: waiting never clears it, and an agent
+        // that reads `rate_limited` will retry until someone stops it.
+        403 if message.contains("has not been used in project")
+            || message.to_ascii_lowercase().contains("is disabled")
+            || message.contains("accessNotConfigured") => format!(
+            "api_disabled: the Gmail API is switched off in the Google Cloud project this \
+             connector's OAuth client belongs to ({message}). Its owner enables it once, at \
+             console.cloud.google.com/apis/library/gmail.googleapis.com — retrying will not help."
+        ),
         403 | 429 => format!(
             "rate_limited: Gmail is refusing more requests for now ({message}). Wait and retry; \
              nothing was changed."
@@ -101,6 +111,12 @@ mod tests {
         assert!(describe(403, scope, "/messages").starts_with("scope_missing:"));
         let quota = br#"{"error":{"message":"User-rate limit exceeded."}}"#;
         assert!(describe(429, quota, "/messages").starts_with("rate_limited:"));
+        // A project with the API switched off answers 403 as well, and telling
+        // that caller to wait would have it wait for ever.
+        let off = br#"{"error":{"message":"Gmail API has not been used in project 1 before or it is disabled."}}"#;
+        let said = describe(403, off, "/messages");
+        assert!(said.starts_with("api_disabled:"), "{said}");
+        assert!(said.contains("console.cloud.google.com"), "{said}");
         assert!(describe(401, b"{}", "/profile").starts_with("credential_rejected:"));
         assert!(describe(500, b"oops", "/messages").contains("HTTP 500"));
     }

@@ -48,12 +48,14 @@ for limit in m.get("limits", []):
         bad.append(f"applies {limit.get('applies')!r}")
     if limit.get("operation", "").split(":")[0] not in declared:
         bad.append(f"limit on unknown operation {limit.get('operation')!r}")
-# `connect` completes a Google consent with OUR OAuth client, which reaches a
-# run only as this connector's author secret. Declared but unstored refuses
-# every run of the project; undeclared and `connect` can never work at all.
+# An account connected through app.outlayer.ai/connect/gmail stores only a
+# refresh token, and OUR OAuth client completes it at run time. That client
+# reaches a run only as this connector's author secret: undeclared, every such
+# account is refused for want of a client; declared but unstored, every run of
+# the project is refused.
 profile = (m.get("author_secrets") or {}).get("profile")
 if not isinstance(profile, str) or not profile.strip():
-    bad.append("author_secrets.profile: `connect` needs this connector's own OAuth client, and it arrives only as an author secret")
+    bad.append("author_secrets.profile: a connected account brings only a refresh token, and the OAuth client that completes it arrives only as an author secret")
 if bad:
     print("ERROR:"); [print("  -", b) for b in bad]; sys.exit(1)
 print(f"Manifest: {len(declared)} operations agree with the code; limits are well formed")
