@@ -1,0 +1,120 @@
+{
+  "connector_id": "github",
+  "display": {
+    "name": "GitHub",
+    "author": "outlayer.near"
+  },
+  "operations": [
+    "status",
+    "repo_list",
+    "repo_get",
+    "dir_list",
+    "file_get",
+    "branch_list",
+    "issue_list",
+    "issue_get",
+    "pr_list",
+    "pr_get",
+    "pr_files",
+    "gist_list",
+    "gist_get",
+    "branch_create",
+    "file_put",
+    "commit",
+    "issue_create",
+    "issue_comment",
+    "issue_update",
+    "pr_create",
+    "pr_review",
+    "pr_merge",
+    "gist_create",
+    "gist_update",
+    "repo_star",
+    "repo_unstar"
+  ],
+  "capabilities": {
+    "network": [
+      "api.github.com"
+    ]
+  },
+  "limits": [
+    {
+      "operation": "branch_create",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "file_put",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "commit",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "issue_create",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "issue_comment",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "issue_update",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "pr_create",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "pr_review",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "pr_merge",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "gist_create",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "gist_update",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "repo_star",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    },
+    {
+      "operation": "repo_unstar",
+      "window": "day",
+      "max_count": 200,
+      "applies": "everyone"
+    }
+  ]
+}

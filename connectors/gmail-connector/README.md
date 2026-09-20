@@ -63,7 +63,7 @@ commas: a comma makes it a malformed address, not a list.
 | network | project | state |
 |---|---|---|
 | testnet | `connectors.outlayer.testnet/gmail` | live |
-| mainnet | `connectors.outlayer.near/gmail` | not published — the account does not exist yet |
+| mainnet | `connectors.outlayer.near/gmail` | live, same bytes as testnet |
 
 The active version, its source URL and the prices are on chain and are the only
 place to read them from:

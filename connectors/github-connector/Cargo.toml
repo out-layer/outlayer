@@ -1,0 +1,31 @@
+[package]
+name = "github-connector"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "OutLayer connector for GitHub: an agent works in the owner's GitHub account, as the owner, under the owner's policy"
+
+[[bin]]
+name = "github-connector"
+path = "src/main.rs"
+
+[dependencies]
+# Input, output and project storage (the day's write count).
+outlayer = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The only way out of the enclave: the worker's allowlist decides whether a
+# request leaves at all, and the manifest names one host.
+wasi-http-client = "0.2"
+base64 = "0.21"
+# Sealing the policy to a key the caller supplied, for runs whose output lands
+# on chain. `ecies` here, `eciesjs` in the browser — the pair the Gmail connector
+# and near.email run on.
+ecies = { version = "0.2", default-features = false, features = ["pure", "std"] }
+libsecp256k1 = "0.7"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
