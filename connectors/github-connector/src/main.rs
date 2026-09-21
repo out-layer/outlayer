@@ -251,7 +251,6 @@ fn policy_view(loaded: policy::Loaded, reply_pubkey: Option<&str>, on_chain: boo
             "branches": p.branches,
             "paths": p.paths,
             "max_writes_per_day": p.max_writes_per_day,
-            "max_files_per_commit": p.max_files_per_commit,
             "allow_merge": p.allow_merge,
             "allow_approve": p.allow_approve,
             "allow_public_gists": p.allow_public_gists,

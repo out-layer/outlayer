@@ -4358,7 +4358,7 @@ async fn wallet_derive_address_handler(
             }))
         }
         _ => Err(ApiError::BadRequest(format!(
-            "Unsupported chain: {}. Supported: near, solana, and EVM (ethereum, polygon, base, arbitrum, optimism, bsc, avalanche, hyperevm)",
+            "Unsupported chain: {}. Supported: near, solana, and EVM (ethereum, polygon, base, arbitrum, optimism, bsc, avalanche, hyperevm, hood)",
             chain
         ))),
     }
@@ -4386,7 +4386,7 @@ async fn evm_sign_digest(
     validate_wallet_id(wallet_id)?;
     if !is_evm_chain(chain) {
         return Err(ApiError::BadRequest(format!(
-            "'{}' is not an EVM chain (supported: ethereum, polygon, base, arbitrum, optimism, bsc, avalanche, hyperevm)",
+            "'{}' is not an EVM chain (supported: ethereum, polygon, base, arbitrum, optimism, bsc, avalanche, hyperevm, hood)",
             chain
         )));
     }
@@ -6996,7 +6996,7 @@ mod wallet_sign_tests {
         let id = "abc-123";
         let evm = [
             "ethereum", "eth", "polygon", "pol", "matic", "base", "arbitrum", "arb", "optimism",
-            "op", "bsc", "avalanche", "avax", "hyperevm",
+            "op", "bsc", "avalanche", "avax", "hyperevm", "hood",
         ];
         let canonical = wallet_seed(id, "ethereum");
         assert_eq!(canonical, format!("wallet:{}:evm", id));

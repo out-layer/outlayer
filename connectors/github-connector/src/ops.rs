@@ -371,8 +371,12 @@ pub fn commit(input: &Input) -> Result<Value, String> {
     if input.files.is_empty() {
         return Err("invalid: `files` is required: [{\"path\", \"content\"}] or [{\"path\", \"delete\": true}]".to_string());
     }
-    if input.files.len() > rules.max_files() {
-        return Err(format!("policy_denied: {} files in one commit; the owner's policy allows {}", input.files.len(), rules.max_files()));
+    if input.files.len() > policy::MAX_FILES_PER_COMMIT {
+        return Err(format!(
+            "too_large: {} files in one commit; a run has time for {}. Split it into several commits",
+            input.files.len(),
+            policy::MAX_FILES_PER_COMMIT
+        ));
     }
     for file in &input.files {
         rules.check_path(&file.path)?;

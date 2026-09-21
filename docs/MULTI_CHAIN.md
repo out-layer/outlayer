@@ -4,7 +4,7 @@ Agent Custody allows AI agents to hold and manage funds via TEE-secured wallets 
 
 ## Current Status
 
-| Component | NEAR | EVM (eth/polygon/base/arbitrum/optimism/bsc/avalanche/hyperevm) | Solana |
+| Component | NEAR | EVM (eth/polygon/base/arbitrum/optimism/bsc/avalanche/hyperevm/hood) | Solana |
 |-----------|------|---------------------|--------|
 | Key generation (keystore) | ed25519 | secp256k1 (one shared address across all EVM chains) | ed25519 (base58 address) |
 | Transaction signing (keystore) | ed25519 | ECDSA secp256k1 (keccak256 + sign; off-chain EIP-712 / EIP-191 / raw-tx hash) | ed25519 over the raw serialized message (no digest step) |
@@ -25,7 +25,7 @@ EVM signing is **live**. The model is deliberately narrow: **the client builds a
 
 ### Supported chains
 
-`ethereum`, `polygon`, `base`, `arbitrum`, `optimism`, `bsc`, `avalanche`, `hyperevm` — plus the 1Click-style aliases `eth`, `pol`, `matic`, `arb`, `op`, `avax`. **All EVM chains share ONE derived secp256k1 address** (a single EOA, seed `wallet:{id}:evm`). `GET /wallet/v1/address` serves any of these and returns that one `0x` address. `hyperevm` is Hyperliquid's EVM (chain id 999): signable like the rest, not a 1Click deposit or withdraw chain. Account delete stays NEAR-only.
+`ethereum`, `polygon`, `base`, `arbitrum`, `optimism`, `bsc`, `avalanche`, `hyperevm`, `hood` — plus the 1Click-style aliases `eth`, `pol`, `matic`, `arb`, `op`, `avax`. **All EVM chains share ONE derived secp256k1 address** (a single EOA, seed `wallet:{id}:evm`). `GET /wallet/v1/address` serves any of these and returns that one `0x` address. `hyperevm` is Hyperliquid's EVM (chain id 999): signable like the rest, not a 1Click deposit or withdraw chain. `hood` is Robinhood Chain, an Arbitrum L2: signable, and a 1Click deposit and withdraw chain like `base` or `arbitrum`. Account delete stays NEAR-only.
 
 ### Sub-keys
 

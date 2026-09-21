@@ -106,7 +106,7 @@ COORDINATOR_URL=http://localhost:8080 \
 ### EVM signing
 
 EVM signing v1 is shipped: `GET /wallet/v1/address` serves all supported EVM
-chains (ethereum, polygon, base, arbitrum, optimism, bsc, avalanche, plus
+chains (ethereum, polygon, base, arbitrum, optimism, bsc, avalanche, hood, plus
 aliases) returning one shared secp256k1 `0x` address, and three sign endpoints
 are live — `POST /wallet/v1/evm/sign-typed-data` (EIP-712 v4),
 `/wallet/v1/evm/sign-message` (EIP-191 `personal_sign`), and

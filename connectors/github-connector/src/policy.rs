@@ -29,10 +29,11 @@ pub const POLICY_ENV: &str = "GITHUB_POLICY";
 /// indistinguishable from the owner's own words.
 pub const DEFAULT_MARKER: &str = "\n\n— posted by an AI agent via OutLayer";
 
-/// More files than this never go into one commit, whatever the policy says: each
+/// Files in one commit. Not a policy field — the owner has nothing to decide
+/// here, since a commit is atomic and one of fifty files is no more dangerous
+/// than one of five. It is a run's budget: text rides in the tree itself, but a
 /// binary file is a request of its own, and a run has a fixed time to live.
-pub const MAX_FILES_HARD: usize = 20;
-const MAX_FILES_DEFAULT: usize = 10;
+pub const MAX_FILES_PER_COMMIT: usize = 50;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,8 +54,6 @@ pub struct Policy {
     /// in UTC days. Required for any write: a policy that allows writing without
     /// saying how much allows a loop to open a thousand issues in the owner's name.
     pub max_writes_per_day: Option<u32>,
-    /// Files one `commit` may carry. Absent: ten.
-    pub max_files_per_commit: Option<usize>,
     /// Whether `pr_merge` is allowed at all. Absent: no.
     pub allow_merge: Option<bool>,
     /// Whether `pr_review` may APPROVE. Absent: no — an approval in the owner's
@@ -196,10 +195,6 @@ impl Policy {
             }
         }
         Ok(())
-    }
-
-    pub fn max_files(&self) -> usize {
-        self.max_files_per_commit.unwrap_or(MAX_FILES_DEFAULT).min(MAX_FILES_HARD)
     }
 
     pub fn check_merge(&self) -> Result<(), String> {
@@ -564,9 +559,12 @@ mod tests {
         assert_eq!(day_key(1_789_862_400_000), "2026-09-20");
     }
 
+    /// The field is gone, and a policy carrying it is refused like any other
+    /// key this build does not know — silently ignoring it would leave an owner
+    /// believing a limit is in force.
     #[test]
-    fn a_commit_is_bounded_whatever_the_policy_says() {
-        assert_eq!(policy("{}").max_files(), 10);
-        assert_eq!(policy(r#"{"max_files_per_commit":500}"#).max_files(), MAX_FILES_HARD);
+    fn the_old_per_commit_field_is_not_quietly_accepted() {
+        let err = serde_json::from_str::<Policy>(r#"{"actions":["any"],"max_files_per_commit":5}"#).unwrap_err();
+        assert!(err.to_string().contains("max_files_per_commit"), "{err}");
     }
 }

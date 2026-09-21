@@ -41,7 +41,6 @@ repository is a disclosure too.
   "branches": ["agent/*"],           // writable branches; absent: no file writes
   "paths": ["docs/*", "notes/*"],    // writable paths; absent: any but `.github/`
   "max_writes_per_day": 40,          // required for any write
-  "max_files_per_commit": 10,        // default 10, hard ceiling 20
   "allow_merge": false,
   "allow_approve": false,
   "allow_public_gists": false,
@@ -78,7 +77,7 @@ Two rules worth stating on their own:
 |---|---|
 | `branch_create` | a branch, from the default branch or from `from` |
 | `file_put` | one file, one commit; `sha` to replace an existing one |
-| `commit` | several files in one commit, through the Git Data API |
+| `commit` | several files in one commit, through the Git Data API — up to 50, which is a run's budget and not a policy |
 | `issue_create`, `issue_comment`, `issue_update` | open, reply, retitle, label, close |
 | `pr_create` | a pull request from a branch the policy allows |
 | `pr_review` | `COMMENT`, `REQUEST_CHANGES`, or `APPROVE` when allowed — with comments on lines of the diff |

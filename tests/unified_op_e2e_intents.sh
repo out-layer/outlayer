@@ -1082,6 +1082,7 @@ if want T15 && intents_mainnet T15; then
       ethereum) echo "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near" ;;
       base)     echo "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near" ;;
       arbitrum) echo "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near" ;;
+      hood)     echo "nep141:hood-0x5fc5360d0400a0fd4f2af552add042d716f1d168.omft.near" ;;  # USDG — there is no USDC on Robinhood Chain
       solana)   echo "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near" ;;
       bitcoin)  echo "nep141:btc.omft.near" ;;
       *)        echo "" ;;
@@ -1092,7 +1093,7 @@ if want T15 && intents_mainnet T15; then
     local chain="$1" addr="$2"
     case "$chain" in
       near)                   [[ "$addr" =~ ^[0-9a-f]{64}$ ]] ;;
-      ethereum|base|arbitrum) [[ "$addr" =~ ^0x[0-9a-fA-F]{40}$ ]] ;;
+      ethereum|base|arbitrum|hood) [[ "$addr" =~ ^0x[0-9a-fA-F]{40}$ ]] ;;
       solana)                 [[ ${#addr} -ge 32 && ${#addr} -le 44 && "$addr" =~ ^[1-9A-HJ-NP-Za-km-z]+$ ]] ;;
       bitcoin)                [[ "$addr" =~ ^bc1 || "$addr" =~ ^[13] ]] ;;
       *) return 1 ;;
@@ -1100,7 +1101,7 @@ if want T15 && intents_mainnet T15; then
   }
 
   SEED="t15-$(date +%s)"; read -r _ _ < <(new_subwallet "$SEED")   # bearer wallet only; no policy / no funds needed
-  for chain in near ethereum base arbitrum solana bitcoin; do
+  for chain in near ethereum base arbitrum hood solana bitcoin; do
     T15_SRC=$(t15_src "$chain")
     if [[ "$chain" == "bitcoin" ]]; then
       T15_BODY=$(jq -nc --arg src "$T15_SRC" --arg dst "$T15_DEST" '{source_asset:$src, destination_asset:$dst, amount:"5000000", refund_address:"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"}')
