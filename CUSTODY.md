@@ -169,7 +169,7 @@ allowed to produce the artifact it signs:
 |-----------|-------|-------------------|
 | **Built** | `transfer`, `call`, `delete`, `withdraw` (+ `auth`) | Constructs the NEAR tx / NEP-413 intent / auth string FROM the op fields → artifact == approved op |
 | **Hash-pinned** | `raw`, `sign_message` | Op carries `payload_hash`/`message_hash`; signs the supplied bytes iff `sha256(bytes) == hash` |
-| **Trusted** | `swap`, `confidential`, `cross_chain_withdraw`, `payment_check` | Artifact (e.g. the 1Click quote / deposit address) can't exist at approval time; the keystore checks capability + policy + multisig on the op fields and pins the recipient, then signs the supplied artifact, **trusting the coordinator to have built it from the approved op**. The keystore does NOT itself re-verify the artifact's token/amount against the op — those are bound only by that coordinator-trust, the same trust as the coordinator-supplied off-chain deposit address (documented tradeoff) |
+| **Trusted** | `swap`, `confidential`, `cross_chain_withdraw`, `limit_order`, `payment_check` | Artifact (e.g. the 1Click quote / deposit address) can't exist at approval time; the keystore checks capability + policy + multisig on the op fields and pins the recipient, then signs the supplied artifact, **trusting the coordinator to have built it from the approved op**. The keystore does NOT itself re-verify the artifact's token/amount against the op — those are bound only by that coordinator-trust, the same trust as the coordinator-supplied off-chain deposit address (documented tradeoff) |
 
 The deposit family (`intents/deposit`, `storage-deposit`, cross-chain deposit) is all
 `Op::Call` — there is no finer deposit policy type. `auth` is non-fund (a domain-separated
@@ -453,6 +453,21 @@ Any subsequent wallet operation:
 
 No API gateway involvement needed. Owner can freeze directly on-chain. Latency: 2-5 seconds (blockchain confirmation).
 
+**What a freeze is.** It closes the agent's access to everything the policy gates: no new transfer,
+withdrawal, swap, signature or order. It does NOT unwind what the wallet already left on a venue — a
+**limit order resting on 1Click** was authorised once, under the policy of that moment, and keeps
+filling and paying out with no further signature; positions opened through a connector are the same.
+A freeze cannot promise otherwise: the number of open orders is unbounded, and closing them is the
+venue's own asynchronous business.
+
+So cleaning up is a separate step, and the methods for it are **never frozen and never
+policy-gated**. A freeze does not revoke the agent's API key — it refuses what the policy gates — so
+the SAME key keeps working for everything that only winds down: reading orders,
+`POST /wallet/v1/limit-orders/cancel-all`, cancelling order by order. After a freeze the agent (or the
+owner, with that key) goes through the venues and cancels what it left there. Cancelling only brings
+funds home. It is asynchronous,
+and 1Click may fill a last slice before a cancel lands. See [Limit Orders](#limit-orders).
+
 ### Multisig Approval
 
 ```
@@ -477,7 +492,7 @@ from the stored canonical op and verifies the signatures itself — the coordina
 but cannot forge or rebind them.
 
 **Multisig covers Trusted ops too.** On a wallet with an approval threshold, the Trusted kinds —
-`swap`, `confidential`, `cross_chain_withdraw` — also create a pending approval and execute only
+`swap`, `confidential`, `cross_chain_withdraw`, `limit_order` — also create a pending approval and execute only
 after the approvers confirm. What the approval actually binds is narrow: it binds *whether* the op
 runs (the keystore verifies the approver signatures over the canonical op, and pins the recipient).
 It does **not** bind the token/amount through the keystore — at execution the coordinator fetches
@@ -493,6 +508,47 @@ its creation is gated by the default-DENY `payment_check` capability + the per-t
 cap (cap-gated, not approval-gated, even on a multisig wallet).
 
 ---
+
+### What an approver signs — and why the request's origin does not matter
+
+*"When I sign a confirmation of my agent's action, I want to be sure the request came from the TEE."*
+The direct answer: a request never comes FROM the TEE. It comes from the agent, through the coordinator,
+and no signature could say otherwise — anyone able to submit an operation would receive the same
+"genuine" stamp. What the TEE guarantees is the part that matters: **nothing executes unless the policy
+allows it and the policy's approvers signed this exact operation.** So an approver does not need to
+trust where a request came from — only to read the operation in front of them. Four things make that true:
+
+1. **The vote is bound to the operation itself.** It signs
+   `approve:{approval_id}:{wallet_pubkey}:{request_hash}`, and `request_hash` is
+   `sha256(canonical_json(op))` — recipient, token, amount, and for an order its output terms and
+   recipient type. It cannot be replayed for another wallet or stretched to another operation.
+2. **The approver's browser checks that before signing.** Both approval endpoints
+   (`GET /wallet/v1/pending_approvals_by_pubkey`, `GET /wallet/v1/approval/{id}`) return `op_canonical` —
+   the exact string the hash is of. The dashboard hashes it itself, shows the parse of that same string,
+   and disables Approve on a mismatch or a missing string. What is on screen is what the signature covers.
+3. **The TEE decides again at execution.** The keystore, inside Intel TDX, decrypts the policy (encrypted
+   on chain; nothing else reads it), runs `evaluate` on the op once more — a forbidden op is refused
+   however many approvals it carries — and `verify_approvals` checks that enough signatures from the
+   approvers THE POLICY names cover THIS hash. Only then does it sign.
+4. **The keystore is itself verifiable**: its TDX measurements are approved on chain by the keystore DAO,
+   and the master secret is released only to an approved measurement.
+
+So a request somebody invented has exactly the power of a genuine one: none beyond what the policy allows
+and the approver knowingly signed. That is also why the keystore does not sign approval requests as
+"genuine": whoever can create a request — a holder of the agent's key through the API, or the coordinator
+calling `check-policy` — would be handed that signature too, so it would tell an approver nothing.
+
+Not covered: the agent chose the operation, and approving is a judgement of it — of the operation shown,
+never of text the agent attached. For Trusted operations the off-chain routing is built at execution
+(see the tradeoff above).
+
+Checking by hand:
+
+```bash
+A=https://api.outlayer.ai/wallet/v1/approval/$APPROVAL_ID
+curl -s $A | jq -j .op_canonical | shasum -a 256   # the hash of the operation
+curl -s $A | jq -r .request_hash                   # the hash the vote signs — must be equal
+```
 
 ## Policy Format
 
@@ -541,11 +597,22 @@ Stored encrypted on NEAR blockchain. Only keystore TEE can decrypt.
 ### `transaction_types` — the keystore op kinds
 
 `transfer`, `call`, `delete`, `withdraw` (same-chain intents withdrawal), `swap`,
-`cross_chain_withdraw`, `raw`, `sign_message`. The deposit family (`intents/deposit`,
+`cross_chain_withdraw`, `limit_order`, `raw`, `sign_message`. The deposit family (`intents/deposit`,
 `storage-deposit`, cross-chain deposit) all gate as **`call`** — there is no separate deposit type.
 Legacy deposit names (`intents_deposit`/`storage_deposit`/`cross_chain_deposit`) in a deployed
 policy are normalized to `call` so old policies keep matching. Note `cross_chain_withdraw` is its
 **own** type (NOT folded into `withdraw`) — a policy must list it explicitly to permit bridging out.
+`limit_order` is likewise its own type: permitting swaps, or cross-chain exits, does not permit
+resting an order that pays out unattended.
+
+### `addresses` — how a destination is matched
+
+An entry matches a destination when the two strings are equal, with one exception: an EVM address
+(`0x` + 40 hex digits) matches in any letter case, because its case is only the EIP-55 checksum — the
+same twenty bytes either way. Matched exactly, a `blacklist` holding `0xabc…` would let the agent
+reach that very account by writing `0xABC…`. Nothing else is folded: base58 (Solana, Bitcoin) and
+bech32 are case-sensitive by nature, and a NEAR account id is lower case only, so another spelling
+of one is not that account.
 
 ### Bound wallets: the fund lane faces the rules twice
 
@@ -630,6 +697,10 @@ unrestricted):
 - `swap` — 1Click swap (Trusted). Default-DENY even when `transaction_types` is absent.
 - `cross_chain_withdraw` — 1Click swap+bridge exit (Trusted, irreversible). Default-DENY; pairs
   with the `cross_chain_withdraw` type + the `to` whitelist + amount limit.
+- `limit_order` — a swap rested on 1Click at the owner's price (Trusted). Default-DENY; pairs with
+  the `limit_order` type + the `to` whitelist + amount limit, exactly like `cross_chain_withdraw`,
+  because an order priced through the market fills at once and is then simply an exit to its `recipient`.
+  The op binds `token_out` + `min_amount_out`, so multisig approvers sign the order's terms.
 - `payment_check` — claimable-link escrow (Trusted, whitelist-BYPASS: funds reach an arbitrary
   holder via the link). Default-DENY; gated by this capability + the per-transaction amount cap.
 
@@ -706,6 +777,61 @@ Base: `https://api.outlayer.ai` (mainnet) · `https://testnet-api.outlayer.ai` (
 |--------|------|-------------|
 | POST | `/internal/wallet-check` | Policy check for WASI execution |
 | POST | `/internal/wallet-audit` | Record audit event from WASI |
+
+---
+
+## Limit Orders
+
+A swap rested on 1Click (`/v0/orders`) at a price the owner sets, funded from the wallet's intents
+balance. It waits until it fills — partially or fully — is cancelled, or reaches its deadline
+(7 days unless set). Mainnet only. Full design: `docs/LIMIT_ORDERS.md` in the coordinator repo.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/wallet/v1/limit-orders` | Rest an order (`base_asset`, `quote_asset`, `side`, `quantity`, `price`, optional `recipient` / `recipient_type` (`intents` · `confidential_intents` · `destination_chain`) / `deadline` — 1Click's own parameters) |
+| GET | `/wallet/v1/limit-orders` | The wallet's orders as last recorded, newest first (`?open=true` → not recorded as finished; `limit` 1..100, default 50 — more is refused, not trimmed; `offset`). Never asks 1Click; the live state is the per-order read |
+| GET | `/wallet/v1/limit-orders/{order_id}` | One order — 1Click's order in snake_case with lower-case values, nothing renamed; 404 for another wallet's |
+| POST | `/wallet/v1/limit-orders/{order_id}/cancel` | Cancel one. Never policy-gated; works on a frozen wallet |
+| POST | `/wallet/v1/limit-orders/cancel-all` | Ask 1Click to cancel every unfinished limit order of THIS wallet (only those placed here; other venues are untouched). Filled output is still paid out, the remainder refunded to the intents balance. At most 50 orders per call, oldest first (`?offset=n` steps over a batch that keeps failing; `?limit=1..50` — after about a minute of a slow 1Click the call answers 503 with what was accepted, and the caller lowers it). Answers `{known, cancelled, failed, remaining, complete}`; `complete: false` → some are still resting, call again. Asynchronous. Never policy-gated; works on a frozen wallet with the same key |
+
+**The property that shapes it.** Every other exit is signed at the moment it moves money. A
+resting order is authorised ONCE and pays out later — possibly days later — with no further
+signature. So it is gated as the exit it can become (`Op::LimitOrder`: default-DENY capability,
+its own transaction type, the whitelist on `recipient`, the amount limit), and a freeze does not reach
+it: the owner cancels what is resting (see [Freeze](#freeze-emergency)). The whitelist covers the default recipient too: an
+order paying out to the wallet's own intents account needs that account on the list. The op carries the
+recipient type (`to_type`), which approvers sign over; `confidential_intents` additionally needs the
+`confidential` capability. An intents balance short of the order's input answers `insufficient_balance`
+before anything is created at 1Click.
+
+**Create, in order.** (1) The terms — what the wallet sends at most, what it must receive at
+least — are computed by the coordinator from the request and the assets' catalog decimals.
+(2) The keystore decides on those terms; a multisig wallet parks here until approvers sign them.
+(3) The order is created at 1Click, unfunded — this moves nothing. (4) 1Click's own figures are
+held to the authorised terms: it may ask for less and promise more, never the reverse; otherwise
+the order is cancelled and nothing is funded. (5) The wallet funds the order with the same
+keystore-signed intents transfer a cross-chain withdraw uses, for 1Click's amount.
+
+**Ownership.** 1Click's order list is scoped to our partner key and cannot be filtered by account,
+so the coordinator's `limit_orders` table is the only index from a wallet to its orders. The cancel
+sweep also pages 1Click's working orders and adopts any whose **refund account** is this wallet's —
+the refund side, because the output may be paid to an external address while the remainder always
+comes home to whoever funded the order.
+
+**The answer is 1Click's order, whole.** Every attribute of its `LimitOrderAttributes`
+(`https://1click.chaindefuser.com/docs/v0/openapi.yaml`) in snake_case with lower-case enumerated
+values — `fill_status`, `payout_status`, `is_payout_status_final`, `payouts`, `partial_fills` (the
+fills so far on a `partially_filled` order), `deposited_amount`, `swap_view`, `app_fees`,
+`estimated_withdraw_fee` / `estimated_refund_fee`, `order_type`, `deposit_mode`, `deposit_type`,
+`confidentiality`, `time_in_force`, … — plus the two fields that are ours: `transfer_intent_hash` and,
+on create, `request_id`. `payouts`, `partial_fills` and `app_fees` are passed through verbatim.
+
+**HTTP only, on purpose.** No `wallet.wit` host function and no CLI command, the same as payment
+checks: every surface that can rest an order is attack surface, and they are added when a user asks.
+
+**Not ours to set.** 1Click applies its own app fee to the input (reported back as `app_fees`, basis
+points) and a 0.1 USD minimum order value. `is_payout_status_final` is the only terminal signal: a
+`fill_status` of `canceled` or `filled` alone is not, and `pending_cancel` may still fill a last slice.
 
 ---
 

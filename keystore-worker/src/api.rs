@@ -6395,8 +6395,8 @@ async fn sign_trusted(
         .recipient
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("trusted op requires artifact.recipient".to_string()))?;
-    // Pin the NEP-413 recipient to the intents verifiers. Trusted ops are intents-only — all
-    // four kinds route through intents.near (the public shard: swap/cross_chain_withdraw/
+    // Pin the NEP-413 recipient to the intents verifiers. Trusted ops are intents-only — every
+    // kind routes through intents.near (the public shard: swap/cross_chain_withdraw/limit_order/
     // payment_check transfer intents) or intents.far (the confidential shard's generate-intent).
     // NEAR Intents is mainnet-only (no testnet solvers), so there is no testnet verifier here.
     // Without this, a Trusted op could emit a NEP-413 signature bound to ANY verifier (the very
@@ -6431,9 +6431,9 @@ async fn sign_trusted(
 ///
 /// `None` — no policy on chain — is not the same statement as an empty policy,
 /// and standing one in for the other is what broke custody: `check_capabilities`
-/// falls back to each op's DEFAULT when no capability is named, and five of them
-/// (`raw_sign`, `confidential`, `payment_check`, `swap`, `cross_chain_withdraw`)
-/// default to DENY. Those defaults exist so a STATED policy cannot be walked
+/// falls back to each op's DEFAULT when no capability is named, and six of them
+/// (`raw_sign`, `confidential`, `payment_check`, `swap`, `cross_chain_withdraw`,
+/// `limit_order`) default to DENY. Those defaults exist so a STATED policy cannot be walked
 /// around — a claimable link routes funds past a `to` whitelist, raw signing
 /// past the transaction-type gate. A wallet with no policy has no whitelist and
 /// no type gate to walk around, so there is nothing for them to protect: a fresh
@@ -6473,6 +6473,7 @@ fn policy_to_judge_by(
                 payment_check: open(),
                 swap: open(),
                 cross_chain_withdraw: open(),
+                limit_order: open(),
                 sign_message: None,
                 evm_sign: None,
                 solana_sign: None,
@@ -7490,6 +7491,7 @@ mod tests {
             Op::Confidential { flow: "withdraw".into(), to: Some("x".into()), amount: "1".into(), token: "near".into(), chain: Some("near".into()), token_out: None, min_amount_out: None },
             Op::CrossChainWithdraw { to: "0x".into(), amount: "1".into(), token: "nep141:usdt.tether-token.near".into(), chain: "ethereum".into() },
             Op::PaymentCheck { amount: "1".into(), token: "nep141:usdt.tether-token.near".into() },
+            Op::LimitOrder { to: "x".into(), to_type: shared_tee_helpers::wallet_policy::RecipientType::Intents, amount: "1".into(), token: "nep141:wrap.near".into(), token_out: "nep141:usdc.near".into(), min_amount_out: "1".into() },
         ];
         for op in &trusted {
             assert_eq!(bind_mode(op), BindMode::Trusted, "must be Trusted: {:?}", op);
@@ -9720,6 +9722,14 @@ mod a_wallet_with_no_policy_is_unrestricted {
                 amount: "1".into(),
                 token: "near".into(),
                 chain: "eth".into(),
+            },
+            Op::LimitOrder {
+                to: "0xabc".into(),
+                to_type: shared_tee_helpers::wallet_policy::RecipientType::DestinationChain,
+                amount: "1".into(),
+                token: "near".into(),
+                token_out: "usdc".into(),
+                min_amount_out: "1".into(),
             },
         ]
     }

@@ -184,7 +184,7 @@ log "4. Transfer 0.01 NEAR (approval-gated by policy) → pending_approval"
 T_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/transfer" \
   -H "Authorization: Bearer $WK_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d "$(jq -nc --arg to "$PARENT" '{chain: "near", receiver_id: $to, amount: "10000000000000000000000"}')")
+  -d "$(jq -nc --arg to "$PARENT" '{chain: "near", to: $to, amount: "10000000000000000000000"}')")
 echo "$T_RESP" | jq . >&2
 APPROVAL_ID=$(echo "$T_RESP" | jq -r '.approval_id // .approval.id // empty')
 REQUEST_ID=$(echo "$T_RESP"  | jq -r '.request_id  // .request.id  // empty')

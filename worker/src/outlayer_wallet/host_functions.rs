@@ -508,7 +508,7 @@ impl outlayer::wallet::api::Host for WalletHostState {
 
         let body = serde_json::json!({
             "chain": if chain.is_empty() { "near".to_string() } else { chain },
-            "receiver_id": to,
+            "to": to,
             "amount": amount,
         });
 

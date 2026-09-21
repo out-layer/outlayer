@@ -1,6 +1,6 @@
 #!/bin/bash
 # NOTE: the shared-helper section below is DUPLICATED in the sibling file (unified_op_e2e.sh ↔ unified_op_e2e_intents.sh) — fixes to any helper must be applied to BOTH.
-# Unified canonical-op e2e — INTENTS / MAINNET-only subset (T2,T3,T6,T8,T9,T10,T12) of the agent-custody unified-op refactor.
+# Unified canonical-op e2e — INTENTS / MAINNET-only subset (T2,T3,T6,T8,T9,T10,T12,T17) of the agent-custody unified-op refactor.
 # The testnet-runnable tests T1,T4,T5,T7,T11 live in the sibling unified_op_e2e.sh.
 #
 # Exercises the NEW surface end-to-end against a real MAINNET coordinator + keystore:
@@ -22,6 +22,10 @@
 #                                         + assert the creator's intents balance recovered; BATCH-CREATE two
 #                                         checks in one call + assert both created; status/peek read-backs.
 #                                         All sub-wallets live under our own vault — value never leaves us.
+#   T17 limit_order          [MAINNET]   — a swap rested on 1Click: default-DENY capability + type of its
+#                                         own (swap / cross_chain_withdraw do not stand in), `to` still
+#                                         gated; then a funded order at 3x spot rests, is read, is
+#                                         cancelled through cancel-all, and refunds in full.
 #
 # ── Test classes (what each needs) ────────────────────────────────────────────
 #   [MAINNET] NEAR Intents (regular + confidential) are MAINNET-ONLY — there are no testnet solvers and
@@ -128,7 +132,7 @@ for tool in jq curl outlayer near python3; do command -v "$tool" >/dev/null || {
 
 if [[ "$APPLY" != true ]]; then
   warn "Dry-run. Pass --apply to deploy a vault + exercise the unified-op surface on $NETWORK."
-  warn "INTENTS / MAINNET-only subset (T2,T3,T6,T8,T9,T10,T12):"
+  warn "INTENTS / MAINNET-only subset (T2,T3,T6,T8,T9,T10,T12,T17):"
   warn "       T2 cross_chain_withdraw[POLICY][MAINNET] T3 payment_check[FUNDS][MAINNET]"
   warn "       T6 FT-withdraw→external[FUNDS][MAINNET] T8 swap default-DENY capability[POLICY][MAINNET]"
   warn "       T9 swap-under-multisig→pending_approval+execute[SIG][MAINNET] T10 cross_chain_withdraw-under-multisig[SIG][MAINNET]"
@@ -1288,6 +1292,135 @@ if want T16 && intents_mainnet T16; then
         fi
       fi
     fi
+  fi
+fi
+
+# ════════════════════════════════════════════════════════════════════════════════
+# T17 — limit order: default-DENY gate, rest → read → cancel → refund  [POLICY] + [FUNDS]
+#       A limit order is authorised ONCE and pays out later with no further signature, so it
+#       is gated as the exit it can become: its own default-DENY `limit_order` capability AND
+#       transaction type, plus the address rules on `to`.
+#         17a  policy lists the type, capability OFF            → denied
+#         17b  `swap` + `cross_chain_withdraw` both ON          → STILL denied (neither stands in)
+#         17c  capability ON, `to` outside the whitelist        → denied (the capability does not
+#                                                                 excuse the destination)
+#         17e  capability ON, `confidential` OFF, recipient_type=confidential_intents → denied
+#         17d  [FUNDS] capability ON → the order RESTS at 3x the market (so it cannot fill),
+#              reports the deposit, is cancelled, and the refund comes home in full.
+#       17d's price is what makes it safe to run with real value: a SELL at 3x spot never
+#       matches, and the upstream refunds an unfilled order in full (fee 0, verified live).
+# ════════════════════════════════════════════════════════════════════════════════
+if want T17 && intents_mainnet T17; then
+  log "T17 [POLICY] limit_order — default-DENY capability; swap / cross_chain_withdraw do not stand in; `to` is still gated"
+  USDC_NEAR="nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
+  # 3x the catalog price, so the order cannot fill. Read live — a constant would one day be
+  # below the market, and then this test sells real wNEAR.
+  LO_SPOT=$(curl -s --max-time 20 https://1click.chaindefuser.com/v0/tokens | jq -r '[.[] | select(.assetId=="nep141:wrap.near")][0].price // empty')
+  if [[ -z "$LO_SPOT" ]]; then
+    note "T17 SKIPPED — could not read the wNEAR price from the 1Click catalog (a fixed price could fill)"
+  else
+    LO_PRICE=$(python3 -c "print(round(float('$LO_SPOT')*3, 2))")
+    # ~0.15 USD of wNEAR at the live price: over the upstream's 0.1 USD minimum whatever NEAR
+    # costs today. A fixed quantity would one day fall under it and fail as `order-rejected`.
+    LO_QTY=$(python3 -c "print(int(0.15/float('$LO_SPOT')*10**24))")
+    lo_body() { jq -nc --arg b "nep141:$WNEAR" --arg q "$USDC_NEAR" --arg n "$LO_QTY" --arg p "$LO_PRICE" --arg to "${1:-}" \
+      '{base_asset:$b, quote_asset:$q, side:"sell", quantity:$n, price:$p} + (if $to=="" then {} else {recipient:$to} end)'; }
+    lo_denied() { [[ "$HTTP" != "200" ]] && echo "$BODY" | grep -qiE "capability|limit_order|policy|forbidden|not allowed|whitelist|address"; }
+
+    SEED="t17a-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    store_policy "$SEED" "$WID" '{"rules":{"transaction_types":["limit_order"]}}' || fail "T17a store_policy"
+    post POST /wallet/v1/limit-orders "$SEED" "$(lo_body)"
+    if lo_denied; then pass "T17a type listed, capability OFF → denied ($HTTP): $(echo "$BODY"|head -c120)"
+    else fail "T17a limit order must be capability-denied without capabilities.limit_order, got $HTTP: $BODY"; fi
+
+    SEED="t17b-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    store_policy "$SEED" "$WID" '{"rules":{"transaction_types":["limit_order","swap","cross_chain_withdraw"]},"capabilities":{"swap":{"allowed":true},"cross_chain_withdraw":{"allowed":true}}}' || fail "T17b store_policy"
+    post POST /wallet/v1/limit-orders "$SEED" "$(lo_body)"
+    if lo_denied; then pass "T17b swap + cross_chain_withdraw ON → limit order STILL denied ($HTTP)"
+    else fail "T17b another capability must not stand in for limit_order, got $HTTP: $BODY"; fi
+
+    SEED="t17c-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    store_policy "$SEED" "$WID" "$(jq -nc --arg ok "$EXTERNAL_ACCT" '{rules:{transaction_types:["limit_order"], addresses:{mode:"whitelist", list:[$ok]}}, capabilities:{limit_order:{allowed:true}}}')" || fail "T17c store_policy"
+    post POST /wallet/v1/limit-orders "$SEED" "$(lo_body "someone-not-listed.near")"
+    if lo_denied; then pass "T17c capability ON, payout address not whitelisted → denied ($HTTP)"
+    else fail "T17c the capability must not excuse the destination, got $HTTP: $BODY"; fi
+
+    # The policy engine answers before any balance is looked at, so this row needs no funds.
+    SEED="t17e-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    store_policy "$SEED" "$WID" '{"rules":{"transaction_types":["limit_order"]},"capabilities":{"limit_order":{"allowed":true}}}' || fail "T17e store_policy"
+    post POST /wallet/v1/limit-orders "$SEED" "$(lo_body | jq -c '. + {recipient_type:"confidential_intents"}')"
+    if [[ "$HTTP" != "200" ]] && echo "$BODY" | grep -qi "confidential"; then pass "T17e limit_order ON, confidential OFF → an order bound for the confidential shard is denied ($HTTP)"
+    else fail "T17e a limit order must not be a way onto the confidential shard, got $HTTP: $BODY"; fi
+
+    log "T17d [FUNDS] limit order rests at $LO_PRICE USDC/NEAR (3x spot $LO_SPOT) → read → cancel → full refund"
+    MONEY=true; CUR_TEST=T17
+    SEED="t17d-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
+    # The order's quantity plus 0.03 NEAR for the wNEAR storage deposit and gas. Derived from
+    # LO_QTY, which follows the live price: a fixed figure would one day be smaller than the order.
+    LO_FUND=$(python3 -c "print(f'{int(\"$LO_QTY\")/10**24 + 0.03:.5f}')")
+    fund_near "$ADDR" "$LO_FUND NEAR" || warn "T17d funding"
+    for _ in $(seq 1 6); do curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$ADDR\"}}" | jq -e '.result.amount' >/dev/null && break; sleep 2; done
+    # Fund FIRST (these are `call`-ops), THEN store the limit_order-only policy — same ordering as T6.
+    post POST /wallet/v1/storage-deposit "$SEED" "$(jq -nc --arg t "$WNEAR" '{token:$t}')"; assert_funded "T17d storage-deposit"
+    post POST /wallet/v1/call "$SEED" "$(jq -nc --arg t "$WNEAR" --arg d "$LO_QTY" '{receiver_id:$t, method_name:"near_deposit", args:{}, gas:"30000000000000", deposit:$d}')"; assert_funded "T17d near_deposit"
+    post POST /wallet/v1/intents/deposit "$SEED" "$(jq -nc --arg t "nep141:$WNEAR" --arg d "$LO_QTY" '{token:$t, amount:$d}')"; assert_funded "T17d intents deposit"
+    store_policy "$SEED" "$WID" "$(jq -nc --arg t "nep141:$WNEAR" '{rules:{transaction_types:["limit_order","intents_withdraw"], limits:{per_transaction:{($t):"1000000000000000000000000000"}}}, capabilities:{limit_order:{allowed:true}}}')" || fail "T17d store_policy"
+    sleep 4
+    LO_BEFORE=$(intents_wnear "$ADDR")
+
+    post POST /wallet/v1/limit-orders "$SEED" "$(lo_body)"
+    if [[ "$HTTP" != "200" ]]; then fail "T17d create failed ($HTTP): $BODY"; fi
+    LO_ID=$(echo "$BODY" | jq -r '.order_id // empty')
+    [[ -n "$LO_ID" ]] || fail "T17d no order_id in: $(echo "$BODY"|head -c200)"
+    pass "T17d order created and funded: $LO_ID (intent=$(echo "$BODY" | jq -r '.transfer_intent_hash // "?"'))"
+    # The fee is the upstream's, never ours — but it comes out of the owner's input, so it is reported.
+    if [[ "$(echo "$BODY" | jq -r '.app_fees | type')" == "array" ]]; then pass "T17d app_fees reported: $(echo "$BODY" | jq -c '.app_fees')"
+    else fail "T17d app_fees missing from the answer"; fi
+
+    LO_OPEN=""
+    for attempt in $(seq 1 10); do
+      post GET "/wallet/v1/limit-orders/$LO_ID" "$SEED"
+      if [[ "$(echo "$BODY" | jq -r '.deposited_amount')" == "$LO_QTY" && "$(echo "$BODY" | jq -r '.fill_status')" == "open" ]]; then LO_OPEN=yes; break; fi
+      sleep 3
+    done
+    if [[ -n "$LO_OPEN" ]]; then pass "T17d order is open with the full deposit"
+    else fail "T17d order never reported the deposit: $(echo "$BODY"|head -c200)"; fi
+
+    # Another wallet must not be able to read or cancel it: an order id is not a bearer token.
+    SEED2="t17x-$(date +%s)"; read -r _ _ < <(new_subwallet "$SEED2")
+    post GET "/wallet/v1/limit-orders/$LO_ID" "$SEED2"
+    if [[ "$HTTP" == "404" ]]; then pass "T17d another wallet reading the order → 404"; else fail "T17d another wallet read someone else's order ($HTTP)"; fi
+    post POST "/wallet/v1/limit-orders/$LO_ID/cancel" "$SEED2" '{}'
+    if [[ "$HTTP" == "404" ]]; then pass "T17d another wallet cancelling the order → 404"; else fail "T17d another wallet cancelled someone else's order ($HTTP)"; fi
+
+    post GET "/wallet/v1/limit-orders?open=true" "$SEED"
+    if echo "$BODY" | jq -e --arg id "$LO_ID" 'any(.[]; .order_id==$id)' >/dev/null; then pass "T17d open list contains the order"
+    else fail "T17d open list does not contain $LO_ID: $(echo "$BODY"|head -c200)"; fi
+
+    # cancel-all rather than cancel: it is what an owner calls to clear orders after a freeze.
+    post POST /wallet/v1/limit-orders/cancel-all "$SEED" '{}'
+    if [[ "$HTTP" == "200" && "$(echo "$BODY" | jq -r '.complete')" == "true" && "$(echo "$BODY" | jq -r '.cancelled')" -ge 1 ]]; then
+      pass "T17d cancel-all reached the order: $BODY"
+    else fail "T17d cancel-all did not complete ($HTTP): $BODY"; fi
+
+    LO_DONE=""
+    for attempt in $(seq 1 20); do
+      post GET "/wallet/v1/limit-orders/$LO_ID" "$SEED"
+      if [[ "$(echo "$BODY" | jq -r '.is_payout_status_final')" == "true" ]]; then LO_DONE=yes; break; fi
+      sleep 4
+    done
+    # 1Click's own words, lower-cased: `canceled` (one l), and the refund leg it reports verbatim.
+    if [[ -n "$LO_DONE" && "$(echo "$BODY" | jq -r '.fill_status')" == "canceled" ]]; then pass "T17d order finished as canceled (refund leg: $(echo "$BODY" | jq -c '.payouts.refund'))"
+    else fail "T17d order did not finish as canceled: $(echo "$BODY"|head -c240)"; fi
+    # A finished order is served from the record — and must read the same the second time.
+    LO_FIRST="$BODY"; post GET "/wallet/v1/limit-orders/$LO_ID" "$SEED"
+    if [[ "$(echo "$BODY" | jq -cS .)" == "$(echo "$LO_FIRST" | jq -cS .)" ]]; then pass "T17d a finished order reads back unchanged"
+    else fail "T17d finished order changed between two reads"; fi
+
+    LO_AFTER=$(intents_wnear "$ADDR")
+    if [[ "$LO_AFTER" == "$LO_BEFORE" ]]; then pass "T17d refund came home in full (intents wNEAR $LO_BEFORE → $LO_AFTER)"
+    else fail "T17d intents wNEAR before=$LO_BEFORE after=$LO_AFTER — the refund is not whole"; fi
+    return_test_funds; MONEY=false
   fi
 fi
 

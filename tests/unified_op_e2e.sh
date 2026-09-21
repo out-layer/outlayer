@@ -519,7 +519,7 @@ if want T4; then
     SEED="t4a-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     fund_near "$ADDR" "0.01 NEAR" || warn "T4a funding"
     store_policy "$SEED" "$WID" "$(jq -nc --arg a "$APPROVER1" --arg ap "$A1_PUB" '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:1}, approvers:[{id:$a,pubkey:$ap}]}}')" || fail "T4a store_policy"
-    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", receiver_id:$to, amount:"2000000000000000000000"}')"
+    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"2000000000000000000000"}')"
     AID=$(echo "$BODY" | jq -r '.approval_id // empty'); RID=$(echo "$BODY" | jq -r '.request_id // empty')
     H=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID" | jq -r '.request_hash')
     [[ -n "$AID" && -n "$H" ]] || fail "T4a no approval queued: $BODY"
@@ -538,7 +538,7 @@ if want T4; then
     SEED="t4b-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     fund_near "$ADDR" "0.01 NEAR" || warn "T4b funding"
     store_policy "$SEED" "$WID" "$(jq -nc --arg a "$APPROVER1" --arg ap "$A1_PUB" '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:1}, approvers:[{id:$a,pubkey:$ap}]}}')" || fail "T4b store_policy"
-    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", receiver_id:$to, amount:"2000000000000000000000"}')"
+    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"2000000000000000000000"}')"
     AID=$(echo "$BODY" | jq -r '.approval_id // empty'); RID=$(echo "$BODY" | jq -r '.request_id // empty')
     H=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID" | jq -r '.request_hash')
     if [[ -n "$AID" ]]; then
@@ -553,7 +553,7 @@ if want T4; then
     SEED="t4c-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     fund_near "$ADDR" "0.01 NEAR" || warn "T4c funding"
     store_policy "$SEED" "$WID" "$(jq -nc --arg a1 "$APPROVER1" --arg p1 "$A1_PUB" --arg a2 "$PARENT" --arg p2 "$PARENT_PUB" '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:2}, approvers:[{id:$a1,pubkey:$p1},{id:$a2,pubkey:$p2}]}}')" || fail "T4c store_policy"
-    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", receiver_id:$to, amount:"2000000000000000000000"}')"
+    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"2000000000000000000000"}')"
     AID=$(echo "$BODY" | jq -r '.approval_id // empty'); RID=$(echo "$BODY" | jq -r '.request_id // empty')
     H=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID" | jq -r '.request_hash')
     if [[ -n "$AID" ]]; then
@@ -604,7 +604,7 @@ if want T7; then
     SEED="t7-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     fund_near "$ADDR" "0.01 NEAR" || warn "T7 funding"
     store_policy "$SEED" "$WID" "$(jq -nc --arg a "$APPROVER1" --arg ap "$A1_PUB" '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:1}, approvers:[{id:$a,pubkey:$ap}]}}')" || fail "T7 store_policy"
-    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", receiver_id:$to, amount:"2000000000000000000000"}')"
+    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"2000000000000000000000"}')"
     AID=$(echo "$BODY" | jq -r '.approval_id // empty'); RID=$(echo "$BODY" | jq -r '.request_id // empty')
     REAL_H=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID" | jq -r '.request_hash')
 
@@ -633,7 +633,7 @@ if want T7; then
     SEED_B="t7b2-$(date +%s)"; read -r WID_B ADDR_B < <(new_subwallet "$SEED_B")
     fund_near "$ADDR_B" "0.01 NEAR" || warn "T7c funding"
     store_policy "$SEED_B" "$WID_B" "$(jq -nc --arg a "$APPROVER1" --arg ap "$A1_PUB" '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:1}, approvers:[{id:$a,pubkey:$ap}]}}')" || fail "T7c store_policy"
-    post POST /wallet/v1/transfer "$SEED_B" "$(jq -nc --arg to "$PARENT" '{chain:"near", receiver_id:$to, amount:"2000000000000000000000"}')"
+    post POST /wallet/v1/transfer "$SEED_B" "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"2000000000000000000000"}')"
     AID_B=$(echo "$BODY" | jq -r '.approval_id // empty'); RID_B=$(echo "$BODY" | jq -r '.request_id // empty')
     H_B=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID_B" | jq -r '.request_hash')
     # Sign with wallet A's pubkey binding (WPK from T7's wallet) but submit to B's approval.
@@ -1023,7 +1023,7 @@ if want T17; then
         | jq -e '.result.amount' >/dev/null 2>&1 && break; sleep 2
     done
     store_policy "$SEED" "$WID" "$(jq -nc --arg a "$APPROVER1" --arg ap "$A1_PUB" '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:1}, approvers:[{id:$a,pubkey:$ap}]}}')" || fail "T17 store_policy"
-    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", receiver_id:$to, amount:"2000000000000000000000"}')"
+    post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"2000000000000000000000"}')"
     AID=$(echo "$BODY" | jq -r '.approval_id // empty'); RID=$(echo "$BODY" | jq -r '.request_id // empty')
     H=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID" | jq -r '.request_hash // empty')
     WPK=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID" | jq -r '.wallet_pubkey // empty')
