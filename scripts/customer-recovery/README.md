@@ -154,7 +154,8 @@ outlayer-cli v0.2 (older versions used the legacy format which
 the keystore could not decrypt — re-set those secrets via current
 CLI or the dashboard).
 
-Seed format per accessor (matches `keystore-worker/src/api.rs:1542`):
+Seed format per accessor (matches the seeds the keystore builds in
+`keystore-worker/src/api.rs`):
 
 | Accessor | Seed |
 |---|---|

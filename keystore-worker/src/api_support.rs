@@ -6,7 +6,7 @@ use super::*;
 /// 1. Add variant here in keystore-worker
 /// 2. Add variant in coordinator/src/handlers/github.rs (SecretAccessor enum)
 /// 3. Add variant in contract/src/lib.rs (SecretAccessor enum)
-/// 4. Update seed generation in decrypt_handler below
+/// 4. Update seed generation in `decrypt_handler` (`api.rs`)
 /// 5. Update near.rs get_secrets methods if needed
 /// 6. Update worker/src/keystore_client.rs decrypt methods
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ impl SystemSecretType {
     /// variants). Used by `accessor_to_contract_json` when forwarding
     /// the variant to a contract view method. **Centralised here so a
     /// future variant addition is one match arm**, not five scattered
-    /// across the file.
+    /// call sites.
     pub(super) fn as_contract_str(&self) -> &'static str {
         match self {
             SystemSecretType::PaymentKey => "PaymentKey",

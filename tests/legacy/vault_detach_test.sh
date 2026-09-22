@@ -124,9 +124,9 @@ LOGGED_IN=$(outlayer whoami 2>/dev/null | awk -F': *' '/^Account:/{print $2; exi
   fail "outlayer is logged in as '$LOGGED_IN', not PARENT='$PARENT'. Run 'outlayer login $NETWORK' as $PARENT."
 pass "logged in as $PARENT on $NETWORK"
 
-# Locally normalised seed (matches coordinator's /secrets/pubkey
-# path: keystore-worker/src/api.rs:1542 and
-# outlayer-coordinator/src/handlers/github.rs:523).
+# Locally normalised seed (matches the `project:{id}:{owner}` seed the
+# keystore builds in `keystore-worker/src/api.rs` and the coordinator's
+# /secrets/pubkey path in `outlayer-coordinator/src/handlers/github.rs`).
 SECRET_SEED="project:${SECRET_PROJECT}:${SECRET_OWNER}"
 
 # ─── 0. Capture encryption pubkey (PRE-RECOVERY only) ──────────────

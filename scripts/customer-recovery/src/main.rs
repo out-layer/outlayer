@@ -191,8 +191,8 @@ fn warn_sensitive_stdout(what: &str) {
 ///
 /// Encryption format matches `outlayer-cli/src/crypto.rs::encrypt_secrets`
 /// (the LEGACY path the CLI uses today):
-///     1. seed: e.g. "project:{owner}/{name}:{owner}"  (see
-///        keystore-worker/src/api.rs:1542)
+///     1. seed: e.g. "project:{owner}/{name}:{owner}"  (the same seed the
+///        keystore builds in keystore-worker/src/api.rs)
 ///     2. signing_key = HMAC-SHA256(master, seed)[..32]
 ///     3. verifying_key = ed25519::SigningKey(signing_key).public_key()
 ///     4. ChaCha20-Poly1305 key = verifying_key.to_bytes()  (32 bytes)

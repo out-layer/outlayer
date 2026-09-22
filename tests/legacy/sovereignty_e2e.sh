@@ -531,8 +531,9 @@ pass "fetched on-chain ciphertext (${#ENCRYPTED_B64} chars base64) for ($SECRET_
 #
 # `customer-recovery decrypt-secret` runs the same HMAC →
 # ed25519-public-key-as-ChaCha20-key flow that the keystore's
-# `decrypt_legacy` uses. Seed shape mirrors
-# keystore-worker/src/api.rs:1542 for Project accessors:
+# `decrypt_legacy` uses. Seed shape mirrors the `project:{id}:{owner}`
+# seed the keystore builds in `keystore-worker/src/api.rs`, for Project
+# accessors:
 #   seed = "project:<owner>/<name>:<owner>"
 
 SECRET_SEED="project:${SECRET_PROJECT}:${SECRET_PROJECT_OWNER}"

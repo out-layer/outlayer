@@ -13,8 +13,8 @@ mod wallet_sign_tests {
     /// and it is the controller's hard stop — the one setting whose whole
     /// purpose is to halt a wallet that is doing something its owner does not
     /// want. It was read with `unwrap_or(false)`: a value we could not parse
-    /// became "not frozen", which is the single worst direction to default in
-    /// this file.
+    /// became "not frozen", which is the single worst direction to default
+    /// anywhere in the keystore.
     ///
     /// Unreachable today — the contract types it `bool` and always serializes
     /// it — and that is exactly why it would have gone unnoticed on the day a

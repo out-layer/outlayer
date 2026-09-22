@@ -37,7 +37,7 @@ parent account can install full-access keys and migrate funds.
 | **Vault contract** | Per-customer NEAR sub-account holding the TEE function-call key + recovery state machine | `vault-contract/` |
 | **Keystore-DAO** | Whitelists vault WASM hashes (multisig-gated, see [F4 audit fix](#governance-fixes)), tracks `verified_vaults`, `banned_vaults`, `ceased_operations` | `keystore-dao-contract/src/lib.rs` |
 | **Vault-checker WASI** | Public open-source agent that re-verifies vault state in TEE and forwards to keystore-worker | `wasi-examples/vault-checker/` |
-| **Keystore-worker** | Multi-customer master cache with lazy MPC CKD load; `/sign-vault-verification` + `/admin/ban-vault` + `/admin/evict-customer` | `keystore-worker/src/api.rs` |
+| **Keystore-worker** | Multi-customer master cache with lazy MPC CKD load; `/sign-vault-verification` + `/admin/ban-vault` + `/admin/evict-customer` | `keystore-worker/src/api_support.rs` (cache and router in `api.rs`) |
 | **Coordinator** | `/customer/derive-tee-key` + `/customer/sign-verification` + `/customer/register` + `/internal/vault-event` proxies | `outlayer-coordinator/src/wallet/handlers.rs` (separate repo) |
 | **CLI** | `outlayer vault {init,resume,status,verify,initiate-recovery,...}` | `outlayer-cli/src/commands/vault.rs` (separate repo) |
 | **Dashboard** | `/vault` management page + `<VaultScopeToggle/>` on secrets/wallet pages | `dashboard/app/vault/page.tsx`, `dashboard/lib/vault.ts` |

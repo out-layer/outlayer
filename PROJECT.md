@@ -767,8 +767,8 @@ Multi-chain custody wallets for AI agents. Agent gets an API key, private keys l
 | `coordinator/src/wallet/auth.rs` | API key auth (SHA-256 hash lookup) |
 | `coordinator/src/wallet/policy.rs` | Negative cache, NEAR RPC `has_wallet_policy()` |
 | `coordinator/src/wallet/backend/intents.rs` | NEAR Intents integration |
-| `keystore-worker/src/api.rs:2439-2843` | Wallet endpoints: derive-address, sign-tx, check-policy |
-| `keystore-worker/src/crypto.rs:108` | `derive_keypair()` — HMAC-SHA256 from MPC master secret |
+| `keystore-worker/src/api.rs` | Wallet endpoints: `/wallet/derive-address`, `/wallet/sign`, `/wallet/{evm,solana}/sign-*`, `/wallet/*-policy`, `/wallet/sign-secret-*` |
+| `keystore-worker/src/crypto.rs` | `derive_keypair()` — HMAC-SHA256 from MPC master secret |
 | `contract/src/wallet.rs` | `WalletPolicyEntry`, store/freeze/unfreeze/has/get methods |
 | `worker/wit/deps/wallet.wit` | WASI WIT interface |
 | `dashboard/app/wallet/` | 5 pages: handoff, manage, approvals, approval detail, audit |
