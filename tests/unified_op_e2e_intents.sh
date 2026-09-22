@@ -322,6 +322,21 @@ sweep_one() {
     || warn "sweep: $addr — delete_wallet_policy failed (no policy or already removed?)"
 }
 
+# reclaim_policy — give a policy's storage deposit back the moment the probe that
+# needed it is finished, instead of waiting for the sweep at exit.
+#
+# `store_wallet_policy` holds 0.1 NEAR per wallet, and a run of back-to-back
+# POLICY probes holds one per probe: four of them keep 0.4 NEAR of PARENT's
+# balance locked for the whole suite, and the FUNDS probe that follows is paid
+# for out of whatever is left. That made T17 need a fuller wallet than the money
+# it actually spends. The sweep still reclaims at exit (step 6) — this is the
+# same call, made earlier, and "already removed" there is expected and harmless.
+reclaim_policy() {
+  local addr=$1
+  near_tty "near contract call-function as-transaction \"$CONTRACT_ID\" delete_wallet_policy json-args '$(jq -nc --arg pk "ed25519:$addr" '{wallet_pubkey:$pk}')' prepaid-gas '30 Tgas' attached-deposit '0 NEAR' sign-as \"$PARENT\" network-config \"$NETWORK\" sign-with-keychain send" \
+    || warn "reclaim_policy: $addr — delete_wallet_policy failed (the exit sweep will retry)"
+}
+
 # sweep_now — drain every sub-wallet currently in the WORKING set, then truncate it (so the same
 # wallet is never swept twice across the per-test / abort / final passes). No-op unless --apply.
 sweep_now() {
@@ -1327,37 +1342,52 @@ if want T17 && intents_mainnet T17; then
       '{base_asset:$b, quote_asset:$q, side:"sell", quantity:$n, price:$p} + (if $to=="" then {} else {recipient:$to} end)'; }
     lo_denied() { [[ "$HTTP" != "200" ]] && echo "$BODY" | grep -qiE "capability|limit_order|policy|forbidden|not allowed|whitelist|address"; }
 
-    SEED="t17a-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    SEED="t17a-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     store_policy "$SEED" "$WID" '{"rules":{"transaction_types":["limit_order"]}}' || fail "T17a store_policy"
     post POST /wallet/v1/limit-orders "$SEED" "$(lo_body)"
     if lo_denied; then pass "T17a type listed, capability OFF → denied ($HTTP): $(echo "$BODY"|head -c120)"
     else fail "T17a limit order must be capability-denied without capabilities.limit_order, got $HTTP: $BODY"; fi
+    reclaim_policy "$ADDR"
 
-    SEED="t17b-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    SEED="t17b-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     store_policy "$SEED" "$WID" '{"rules":{"transaction_types":["limit_order","swap","cross_chain_withdraw"]},"capabilities":{"swap":{"allowed":true},"cross_chain_withdraw":{"allowed":true}}}' || fail "T17b store_policy"
     post POST /wallet/v1/limit-orders "$SEED" "$(lo_body)"
     if lo_denied; then pass "T17b swap + cross_chain_withdraw ON → limit order STILL denied ($HTTP)"
     else fail "T17b another capability must not stand in for limit_order, got $HTTP: $BODY"; fi
+    reclaim_policy "$ADDR"
 
-    SEED="t17c-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    SEED="t17c-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     store_policy "$SEED" "$WID" "$(jq -nc --arg ok "$EXTERNAL_ACCT" '{rules:{transaction_types:["limit_order"], addresses:{mode:"whitelist", list:[$ok]}}, capabilities:{limit_order:{allowed:true}}}')" || fail "T17c store_policy"
     post POST /wallet/v1/limit-orders "$SEED" "$(lo_body "someone-not-listed.near")"
     if lo_denied; then pass "T17c capability ON, payout address not whitelisted → denied ($HTTP)"
     else fail "T17c the capability must not excuse the destination, got $HTTP: $BODY"; fi
+    reclaim_policy "$ADDR"
 
     # The policy engine answers before any balance is looked at, so this row needs no funds.
-    SEED="t17e-$(date +%s)"; read -r WID _ < <(new_subwallet "$SEED")
+    SEED="t17e-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
     store_policy "$SEED" "$WID" '{"rules":{"transaction_types":["limit_order"]},"capabilities":{"limit_order":{"allowed":true}}}' || fail "T17e store_policy"
     post POST /wallet/v1/limit-orders "$SEED" "$(lo_body | jq -c '. + {recipient_type:"confidential_intents"}')"
     if [[ "$HTTP" != "200" ]] && echo "$BODY" | grep -qi "confidential"; then pass "T17e limit_order ON, confidential OFF → an order bound for the confidential shard is denied ($HTTP)"
     else fail "T17e a limit order must not be a way onto the confidential shard, got $HTTP: $BODY"; fi
+    reclaim_policy "$ADDR"
 
     log "T17d [FUNDS] limit order rests at $LO_PRICE USDC/NEAR (3x spot $LO_SPOT) → read → cancel → full refund"
     MONEY=true; CUR_TEST=T17
     SEED="t17d-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
-    # The order's quantity plus 0.03 NEAR for the wNEAR storage deposit and gas. Derived from
-    # LO_QTY, which follows the live price: a fixed figure would one day be smaller than the order.
-    LO_FUND=$(python3 -c "print(f'{int(\"$LO_QTY\")/10**24 + 0.03:.5f}')")
+    # The order's quantity plus native headroom for the three calls that follow.
+    # The headroom is a GAS RESERVE, not gas spent: nearcore holds
+    # prepaid_gas x gas_price for the whole transaction and refunds the unused
+    # part afterwards, and the balance check sees the reserve, not the refund.
+    # Measured on mainnet 2026-09-22: the effective rate is 1e9 yocto/gas, ten
+    # times the 1e8 `gas_price` reports, so the reserve is
+    #   storage-deposit   30 Tgas -> 0.03   (+0.00125 deposit)
+    #   near_deposit      30 Tgas -> 0.03   (+ LO_QTY deposit)
+    #   intents deposit  150 Tgas -> 0.15   (FT_TRANSFER_CALL_GAS)
+    # and the last of those is the peak: it is needed AFTER LO_QTY has already
+    # left for wNEAR. Hence LO_QTY + 0.20, which leaves ~0.045 of margin. The
+    # order's own funding transfer is keystore-signed through the solver relay
+    # and costs this wallet no native NEAR at all.
+    LO_FUND=$(python3 -c "print(f'{int(\"$LO_QTY\")/10**24 + 0.20:.5f}')")
     fund_near "$ADDR" "$LO_FUND NEAR" || warn "T17d funding"
     for _ in $(seq 1 6); do curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$ADDR\"}}" | jq -e '.result.amount' >/dev/null && break; sleep 2; done
     # Fund FIRST (these are `call`-ops), THEN store the limit_order-only policy — same ordering as T6.
