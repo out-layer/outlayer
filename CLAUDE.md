@@ -156,6 +156,7 @@ cd keystore-worker && cargo run          # Run keystore
 - [docs/SCHEDULER.md](docs/SCHEDULER.md) - Scheduler spec
 - [self-hosted-scheduler/README.md](self-hosted-scheduler/README.md) - Scheduler setup & config
 - [outlayer-cli README](https://github.com/out-layer/cli) - CLI usage & commands
+- [Skills maintenance](../skills/outlayer-skills/CLAUDE.md) - `~/projects/skills/outlayer-skills`, served at `skills.outlayer.ai`. An endpoint, field, error code, limit, price or header that changes here changes a skill there — follow its CLAUDE.md, run its `scripts/check.sh`
 
 ## Key Database Tables (Coordinator)
 | Table | Description |
