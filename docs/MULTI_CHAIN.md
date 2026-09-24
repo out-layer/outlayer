@@ -25,7 +25,7 @@ EVM signing is **live**. The model is deliberately narrow: **the client builds a
 
 ### Supported chains
 
-`ethereum`, `polygon`, `base`, `arbitrum`, `optimism`, `bsc`, `avalanche`, `hyperevm`, `hood` — plus the 1Click-style aliases `eth`, `pol`, `matic`, `arb`, `op`, `avax`. **All EVM chains share ONE derived secp256k1 address** (a single EOA, seed `wallet:{id}:evm`). `GET /wallet/v1/address` serves any of these and returns that one `0x` address. `hyperevm` is Hyperliquid's EVM (chain id 999): signable like the rest, not a 1Click deposit or withdraw chain. `hood` is Robinhood Chain, an Arbitrum L2: signable, and a 1Click deposit and withdraw chain like `base` or `arbitrum`. Account delete stays NEAR-only.
+`ethereum`, `polygon`, `base`, `arbitrum`, `optimism`, `bsc`, `avalanche`, `hyperevm`, `hood` — plus the 1Click-style aliases `eth`, `pol`, `matic`, `arb`, `op`, `avax`. **All EVM chains share ONE derived secp256k1 address** (a single EOA, seed `wallet:{id}:evm`). `GET /wallet/v1/address` serves any of these and returns that one `0x` address. `hyperevm` is Hyperliquid's EVM (chain id 999): signable like the rest, not a 1Click deposit or withdraw chain. `hood` is Robinhood Chain, an Arbitrum L2: signable, and a 1Click deposit and withdraw chain like `base` or `arbitrum`. `hypercore` (Hyperliquid's L1) is the other way round: a 1Click deposit and withdraw chain (USDC, the spot HIP-1 token, 8 decimals) whose accounts are that same `0x` address, but nothing is signed on it through `/wallet/v1/evm/*` — a HyperCore action is signed as EIP-712 typed data by whoever trades there (the Hyperliquid connector does). Account delete stays NEAR-only.
 
 ### Sub-keys
 
