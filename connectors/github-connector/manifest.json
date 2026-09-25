@@ -258,6 +258,15 @@
             "name": "number",
             "type": "number",
             "required": true
+          },
+          {
+            "name": "page",
+            "type": "number",
+            "doc": "Page of the comments."
+          },
+          {
+            "name": "per_page",
+            "type": "number"
           }
         ]
       },
@@ -580,8 +589,7 @@
           {
             "name": "event",
             "type": "string",
-            "required": true,
-            "doc": "`COMMENT`, `REQUEST_CHANGES` or `APPROVE`."
+            "doc": "`COMMENT` (default), `REQUEST_CHANGES` or `APPROVE`."
           },
           {
             "name": "body",
@@ -611,7 +619,7 @@
           {
             "name": "merge_method",
             "type": "string",
-            "doc": "`merge`, `squash` or `rebase`."
+            "doc": "`squash` (default), `merge` or `rebase`."
           },
           {
             "name": "sha",
@@ -628,7 +636,7 @@
             "name": "files",
             "type": "FileChange[]",
             "required": true,
-            "doc": "{path, content}."
+            "doc": "{path, content, encoding?}."
           },
           {
             "name": "description",

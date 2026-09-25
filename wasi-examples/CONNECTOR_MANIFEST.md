@@ -94,8 +94,12 @@ answers to, and a page with its own copy of the list cannot exist to drift.
 | `params[]` | Every field the operation reads from the input, except `operation` itself. `type` is prose for a developer (`string`, `number`, `decimal string`, `string[]`, `object`), `required` defaults to false, `doc` is optional. |
 
 `build.sh` holds it to the code: every operation the guest dispatches is
-described and nothing else is; every parameter is a field of an input struct.
-A description that falls behind the code fails the build, not the page.
+described and nothing else is; every parameter is a field of an input struct
+(`Input`, `…Input`) or a name the code reads off the input (`input.get("…")`).
+It does not check that a parameter belongs to THAT operation, nor `required`:
+those stay the author's to get right, against the code.
+An operation added to the code and not described, or described and gone,
+fails the build; a parameter's owner and `required` are the author's to keep.
 
 ### The words `limits` may use
 

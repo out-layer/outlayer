@@ -549,9 +549,11 @@ same schema the `/connect/<id>` editor is built from.
 Write the block once, next to `operations`
 (`wasi-examples/CONNECTOR_MANIFEST.md` has the shape), and let `build.sh`
 hold it to the code: every operation `run` dispatches must be described and
-nothing else may be; every parameter must be a field of an input struct or a
-name the code reads off the JSON. A description that falls behind the code
-fails the build, so the page cannot lie about a version that was published.
+nothing else may be; every parameter must be a field of an input struct
+(`Input`, `…Input`) or a name the code reads off the input (`input.get("…")`).
+Which operation reads it, and whether it is required, the check cannot see —
+describe them against the code, not from memory. An operation the code gains
+or loses without its description fails the build; a parameter it gains does not.
 
 ## 7. Testing before you ship
 

@@ -74,3 +74,6 @@ tests/hos-status-stub/target/
 # the global ignore, which is right for an application and wrong for these.
 !connectors/*/Cargo.lock
 !crates/*/Cargo.lock
+
+# A separate git repository checked out here; not part of this tree.
+wasi-examples/private-token-ark/

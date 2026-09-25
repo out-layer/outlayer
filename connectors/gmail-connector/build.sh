@@ -67,14 +67,17 @@ if described != dispatched:
     bad.append(f"describe.operations {sorted(described)} vs dispatched {sorted(dispatched)}")
 if not isinstance(desc.get("summary"), str) or not desc.get("summary", "").strip():
     bad.append("describe.summary is missing")
+# Parameters are the fields of the input structs (`Input`, `…Input`) and the
+# names read straight off the input JSON (`input.get("…")`) — not the fields
+# of venue answers, checkpoints or the policy, which a parameter must never be
+# mistaken for.
 fields = set()
 for f in glob.glob("src/**/*.rs", recursive=True):
-    for body in re.findall(r'struct \w+\s*\{(.*?)\n\}', open(f).read(), re.S):
-        fields |= set(re.findall(r'^\s*(?:pub(?:\(crate\))? )?([a-z_][a-z0-9_]*)\s*:', body, re.M))
+    text = open(f).read()
+    for body in re.findall(r'struct \w*Input(?:<[^>]*>)?\s*\{(.*?)\n\s*\}', text, re.S):
+        fields |= set(re.findall(r'^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([a-z]+\))? )?([a-z_][a-z0-9_]*)\s*:', body, re.M))
         fields |= set(re.findall(r'#\[serde\(rename = "([a-z_]+)"', body))
-    # A field read straight off the JSON (`input.get("reply_pubkey")`) is a
-    # parameter too.
-    fields |= set(re.findall(r'\.get\("([a-z_]+)"\)', open(f).read()))
+    fields |= set(re.findall(r'\binput\s*\.get\("([a-z_]+)"\)', text))
 for name, o in (desc.get("operations") or {}).items():
     if o.get("class") not in {"read", "write"}:
         bad.append(f"describe.{name}.class {o.get('class')!r}")

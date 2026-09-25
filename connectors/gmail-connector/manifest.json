@@ -57,13 +57,12 @@
           {
             "name": "subject",
             "type": "string",
-            "required": true
+            "doc": "The owner's `subject_prefix`, when the policy sets one, is prepended unless the subject already starts with it; absent, the subject is the prefix alone, or empty without one."
           },
           {
             "name": "body",
             "type": "string",
-            "required": true,
-            "doc": "Plain text."
+            "doc": "Plain text; absent is sent empty."
           },
           {
             "name": "attachments",
