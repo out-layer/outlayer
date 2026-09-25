@@ -1,0 +1,22 @@
+{
+  "display": {
+    "name": "Signing-key probe (a vault key)"
+  },
+  "operations": [
+    "public_key",
+    "sign",
+    "sign_and_verify",
+    "sign_nep413",
+    "all_public_keys",
+    "what_i_can_see",
+    "attack",
+    "attacks"
+  ],
+  "capabilities": {
+    "network": []
+  },
+  "signing_keys": [
+    {"path": "alpha", "type": "ed25519"},
+    {"path": "treasury", "type": "ed25519", "vault": "vault.alice.near"}
+  ]
+}

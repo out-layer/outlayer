@@ -58,6 +58,7 @@ and exactly the ones priced on chain — see the next section.
 | `operations` | no | Documentation, and a cross-check against the price list. |
 | `limits` | **yes** | Caps this connector declares about itself. Unioned with the coordinator's own rules — every applicable one must pass — so a declaration can only ever tighten. |
 | `author_secrets` | **yes** | The author's own credential, for any project: the row `owner` stored under the accessor `Project(<this project id>)` and `profile`, decrypted into the environment on every run next to the caller's. `owner` defaults to the publishing account. The row's access condition is judged against the real caller, so it is who may run the project — `AllowAll` for everyone, a whitelist or DAO role for a circle. A name on both sides, or a profile nobody stored, refuses the run; a name the caller's row carries and the author never stored is added to the environment as the caller's — store every name your code reads, so no caller can supply it. A run with no project (a `Repo` source executed directly) cannot hold one. See `WASI_TUTORIAL.md` §3c and `docs/CONNECTORS.md` §4.1. |
+| `signing_keys` | **yes** | ed25519 keys the module signs with, by `path`. The keystore derives each for the run, bound to the caller and to the project or the exact code; the module reaches them only through the `outlayer:signing-keys` host functions. Any project may declare them. See `signing_keys` below. |
 | `display` | no | For the dashboard. |
 | `describe` | no | What each operation does and takes, for the developer page (`app.outlayer.ai/connectors/<id>`) — see the next section. |
 
@@ -142,6 +143,175 @@ Being read strictly cannot hurt anybody but this connector's own callers — a
 declaration is unioned with the coordinator's rules and every applicable rule
 must pass, so there is no value here that could widen a limit. Check your own
 manifest at build time; `connectors/connector-probe/build.sh` shows how.
+
+### `signing_keys`: keys the module signs with
+
+```jsonc
+"signing_keys": [
+  {"path": "records", "type": "ed25519"},
+  {"path": "votes", "type": "ed25519", "caller": "predecessor"},
+  {"path": "payouts", "type": "ed25519", "vault": "vault.alice.near"}
+]
+```
+
+Each entry is a key the module signs with. The keystore derives it inside the
+TEE from what the run IS — how its code is run, and its caller — never from
+anything the module says. The module never holds a key: it names one by `path`
+and calls the `outlayer:signing-keys` host interface
+(`worker/wit/deps/signing-keys.wit`):
+
+| Function | Answers |
+|---|---|
+| `public-key(path: string, vault: option<string>) -> result<list<u8>, string>` | the 32-byte ed25519 public key |
+| `sign(path: string, vault: option<string>, message: list<u8>) -> result<list<u8>, string>` | a 64-byte RFC 8032 signature over the raw message bytes — no prehash, no prefix. At most 65536 bytes of message; sign a digest to cover more |
+
+`vault` names the key's declared vault exactly: `none` for a key declared
+without one, `some("<vault>")` for a key declared with that vault. Any other
+combination, an undeclared `path`, and a message over the limit are an `err`
+carrying the reason, never a trap. A module that imports the interface and
+declares no key gets an `err` for every path.
+
+| Field | Allowed | Meaning |
+|---|---|---|
+| `path` | `[a-z0-9][a-z0-9_-]{0,31}`, unique in the list | The key's name and an input of its derivation. The same path gives the same key for as long as its binding holds; another path is another key. Renaming a path loses the key, any address made from its public key, and every signature checked against it. |
+| `type` | `ed25519` | The only type. |
+| `bind` | `project` (default) \| `wasm` | How the code must be run to get the key, and what the key belongs to besides the caller. There is no repository binding. |
+| `caller` | `signer` (default) \| `predecessor` | Which account of the run the key belongs to: the transaction's signer (the payment key's owner over HTTPS), or the account that called the contract. A segment of the derivation, so the two never derive one key. |
+| `vault` | a NEAR account id | `project` keys only: derive from that vault's master instead of the default one. |
+
+At most 3 keys. A key with an unknown field is refused, not read with the field
+dropped: a misspelled `vault` would derive from the default master, a
+misspelled `bind` would bind to the project, a misspelled `caller` to the
+signer. A `type`, `bind` or `caller` value outside its list is refused the same
+way.
+
+**The caller is part of every key**, and `caller` says which account of the
+run it is. The platform sets both accounts from the job; neither the code nor
+the input can.
+
+* `signer` (the default): the account in `NEAR_USER_ACCOUNT_ID` — the
+  transaction's signer on chain, the payment key's owner over HTTPS. Any
+  contract the signer ever transacts with can start a run under the signer's
+  key with input of its own — an `ft_transfer_call`, a DAO proposal, a wallet
+  contract's callback all execute as the signer — so a module must never treat
+  its input as the signer's intent.
+* `predecessor`: the account in `NEAR_PREDECESSOR_ID` — the account that
+  called the contract: the DAO or wallet contract itself when one relayed the
+  call, the signer when none did, and the signer over HTTPS. The key is that
+  contract's, not the signer's; on a payment through `ft_transfer_call` it
+  binds to the token contract. A run that carries no predecessor is refused
+  before it starts.
+
+Both are legitimate; the module author chooses per key. A signer key and a
+predecessor key for one account are two keys. A run with no caller account is
+refused: the worker's placeholder for a missing account is refused by name,
+before it could pass as an account id.
+
+**Keys are issued strictly by how the code is run:**
+
+| `bind` | Issued only to | The key belongs to | A new version of the code | The same key for |
+|---|---|---|---|---|
+| `project` (default) | a run through a project whose version is a `WasmUrl` version | the project's on-chain uuid + the chosen caller | keeps the key | that caller, running any version of that project |
+| `wasm` | a direct run from a wasm URL, with no project | the code's sha256 + the chosen caller | gets new keys | that caller, running that exact binary directly |
+
+**Who checks what.** The worker reads the run off the job the coordinator gave
+it — its `project_id`, its resolved code source, its signer and predecessor —
+never off the module, and sends the job's `user_account_id`, `predecessor_id`,
+`executed_wasm_sha256` and `project_id` with the key request. The request has no
+field saying how the run was started: a `project_id` makes it a project run,
+none a direct run. The keystore takes those four fields on the trust of the
+worker's TEE attestation, exactly as it does for secrets, and verifies on chain
+only what the chain can answer: for a project run, that the sha256 the worker
+measured on the running code is a `WasmUrl` version of that project and that
+the project exists with the owner its id names; for a `vault`, that it belongs
+to that owner. The worker checks every declared `bind` and `caller` against the
+run before any secret is decrypted; the keystore checks them again. One key
+that does not match refuses the whole run before it starts.
+
+A GitHub-sourced run is never issued signing keys — neither a project version
+built from a repository nor a repository run directly. Through a project, the
+keystore sees it: the contract's version for the build's hash has a GitHub
+source, or there is none. Directly, only the worker sees it — it holds the
+resolved code source, while the keystore holds nothing but the hash of the
+bytes — so the worker refuses a direct GitHub build before any request is made.
+A manifest that reaches the worker declaring keys on such a run refuses it; a
+module that reaches the worker with no declaration runs, and every signing call
+answers `err`.
+
+So one run never holds both kinds. The manifest is part of the wasm, so a
+binary that declares `project` keys runs only through a project, and one that
+declares `wasm` keys runs only directly: declare the one `bind` that matches how
+the module will be run.
+
+**`project`** belongs to the project's on-chain `uuid`, minted once at
+`create_project`, never to its `owner/name` id. So the key survives code
+upgrades — every later version signs with the same key, and whoever publishes
+versions of the project decides what they sign — and it survives a transfer of
+the project: the id changes, the uuid stays, and the keys stay with it. A
+project deleted and created again under the same name is another project with
+another uuid, and so other keys. Another project, or another caller, gets
+another key.
+
+**`wasm`** belongs to the code, not to a deployer: anyone who runs the exact
+binary directly gets keys for their own callers. So the code must never decide
+WHAT to sign from secrets, environment variables or configuration — whoever runs
+the binary controls those, and a user lured into calling someone else's run of
+the same code would sign under that runner's configuration. Decide what to sign
+from the input and the code alone.
+
+**`vault`** derives a `project` key from that vault's master instead of the
+default one. The vault must belong to the project's owner: it is a direct
+sub-account of the owner (`vault.alice.near` for `alice.near/app`), and its
+contract's `parent` is that owner. A vault not named directly under the owner
+is refused on the two names alone, before any chain read. A vault that is
+missing, unreadable, not the owner's, unfunded or not loadable refuses the run;
+the default master is never used in its place. A `wasm` key cannot name a
+vault: code has no owner to own one.
+
+**NEP-413 and the implicit account.** `sign` takes raw bytes, so a module can
+produce a NEP-413 (NEAR `signMessage`) signature: it signs
+`sha256(borsh(2^31 + 413 as u32 LE) ++ borsh(payload))`, 32 bytes. The key's
+public key, in lowercase hex, is a NEAR implicit account, so the signature
+verifies against that account with no registration. The copyable code and a
+Python verifier are in [`signing-key-probe`](signing-key-probe/README.md)
+(`sign_nep413`).
+
+That also makes the key a wallet nobody governs: it can sign NEAR transactions
+for its implicit account, and Solana ones for the same public key. Funds sent
+there are controlled only by the code, outside every wallet policy. Do not hold
+money on a signing key. EVM is not supported: it needs secp256k1.
+
+**Never sign caller-supplied bytes or digests verbatim.** For the same reason:
+a signature over bytes the caller chose is a signature over whatever those bytes
+are — a transaction that empties the implicit account, an authorization, a
+message the account never meant. Sign only messages the module composes itself,
+from fields it has parsed and checked, under a fixed prefix or structure of its
+own; an input that asks for a signature over raw bytes is refused.
+
+**Where the keys live.** The keystore derives them in the same request that
+decrypts the run's secrets and hands them to the worker for that one run. They
+live in that run's memory only — never in the environment, stdin or a log — and
+are dropped with it. The master never leaves the keystore.
+
+**Refused before the code runs:**
+
+* a WASI P1 module that declares keys — only a P2 component imports host
+  interfaces;
+* more than 3 keys, a `path` of the wrong shape or declared twice, an unknown
+  field, a `type`, `bind` or `caller` outside the lists above;
+* keys declared on a GitHub-sourced run, when the manifest reaches the worker;
+* a `project` key on a run with no project; a `wasm` key on a run through a
+  project;
+* a `predecessor` key on a run that carries no predecessor;
+* a project run whose running code is not a `WasmUrl` version of that project,
+  or whose project does not exist on the contract or is not owned by the
+  account its id names;
+* a `vault` on a `wasm` key; a `vault` not named directly under the project's
+  owner (refused by name, before any chain read); a `vault` that fails any
+  check above;
+* a run with no caller account — the worker's placeholder for a missing account
+  is refused by name;
+* a worker or keystore without signing-key support.
 
 ## How a request names its operation
 

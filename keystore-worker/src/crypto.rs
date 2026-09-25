@@ -443,6 +443,31 @@ impl Keystore {
         Ok(hex::encode(digest))
     }
 
+    /// The 32-byte seed of one signing key: `HMAC-SHA256(master, input)`.
+    ///
+    /// `input` is a [`crate::signing_keys::DerivationInput`], which only the
+    /// signing-keys module can build, from validated fields, under the
+    /// `signing-key:v1:` root — so this method cannot be made to derive under
+    /// any other seed. `vault = None` is the default master; `Some(v)` is that
+    /// vault's master and fails if it is not loaded — never the default master
+    /// in its place.
+    ///
+    /// Not cached: the seed is returned to the caller in a buffer that is
+    /// wiped when dropped, and no copy stays in this keystore.
+    pub fn derive_signing_key_seed(
+        &self,
+        vault: Option<&AccountId>,
+        input: &crate::signing_keys::DerivationInput,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        let master = zeroize::Zeroizing::new(self.master_for(vault)?);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(master.as_ref())
+            .expect("HMAC can take key of any size");
+        mac.update(input.as_bytes());
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        seed.copy_from_slice(&mac.finalize().into_bytes());
+        Ok(seed)
+    }
+
     /// Get X25519 public key as hex string for `(customer, seed)`
     /// (the key returned by `/pubkey`). Safe to expose publicly — it
     /// can only encrypt, not decrypt. Only the TEE holds the private key.
@@ -1746,5 +1771,283 @@ mod tests {
             "NEAR and EVM seeds must not share an HMAC input"
         );
     }
-}
 
+    // ============== Signing keys ==============
+
+    const H1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const H2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    const P1: &str = "p0000000000000001";
+    const P2: &str = "p0000000000000002";
+    /// Project `alice.near/app`, uuid P1 on the contract.
+    const APP: Option<(&str, &str)> = Some(("alice.near/app", P1));
+
+    /// The derivation string for one key, as the run its binding allows asks
+    /// for it: a `project` key on a run through `project` (its id and its
+    /// on-chain uuid), a `wasm` key on a direct run of build `wasm` (which
+    /// names no project). `signer` is the job's `user_account_id`,
+    /// `predecessor` its `predecessor_id`; `caller` picks which one the key
+    /// belongs to.
+    fn signing_key_input_as(
+        project: Option<(&str, &str)>,
+        caller: crate::signing_keys::CallerKind,
+        signer: &str,
+        predecessor: Option<&str>,
+        wasm: &str,
+        bind: crate::signing_keys::KeyBinding,
+        path: &str,
+    ) -> crate::signing_keys::DerivationInput {
+        use crate::signing_keys::{KeyBinding, ProjectUuid};
+        let request = crate::signing_keys::SigningKeyRequest {
+            path: path.to_string(),
+            key_type: crate::signing_keys::SigningKeyType::Ed25519,
+            bind,
+            caller,
+            vault: None,
+        };
+        let (project_id, uuid) = match bind {
+            KeyBinding::Project => {
+                let (id, uuid) = project.expect("a project key needs its project");
+                (Some(id), Some(ProjectUuid::parse(uuid).unwrap()))
+            }
+            KeyBinding::Wasm => {
+                assert!(project.is_none(), "a wasm key is issued only to a direct run, which has no project");
+                (None, None)
+            }
+        };
+        crate::signing_keys::validate_request(project_id, signer, predecessor, Some(wasm), &[request])
+            .unwrap()
+            .bind(uuid)
+            .unwrap()
+            .keys
+            .remove(0)
+            .input
+    }
+
+    /// A `signer` key of `account`, the run's signer.
+    fn signing_key_input(
+        project: Option<(&str, &str)>,
+        account: &str,
+        wasm: &str,
+        bind: crate::signing_keys::KeyBinding,
+        path: &str,
+    ) -> crate::signing_keys::DerivationInput {
+        signing_key_input_as(project, crate::signing_keys::CallerKind::Signer, account, None, wasm, bind, path)
+    }
+
+    fn signing_seed_hex(ks: &Keystore, input: &crate::signing_keys::DerivationInput) -> String {
+        hex::encode(ks.derive_signing_key_seed(None, input).unwrap().as_ref())
+    }
+
+    /// Pinned vectors: the seeds were computed with an independent HMAC-SHA256
+    /// and the public keys with an independent ed25519 implementation, over the
+    /// exact strings shown. A failure means the derivation changed — which
+    /// changes every signing key and every signature made with one. Do not
+    /// update the vectors; find what changed.
+    #[test]
+    fn signing_key_pinned_vectors() {
+        use crate::signing_keys::CallerKind::{Predecessor, Signer};
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        let cases = [
+            (
+                signing_key_input(APP, "bob.near", H1, Project, "records"),
+                format!("signing-key:v1:ed25519:project:{P1}:signer:bob.near:records"),
+                "f6f531d0b454d922a8e1f530f41f3a1cd008c56c496e36c958f2d4013358ac3d",
+                "c602d489e1818fba7a7964fd85e288404201a66efe76fadb91aa3a8941b573c2",
+            ),
+            (
+                signing_key_input(None, "bob.near", H1, Wasm, "records"),
+                format!("signing-key:v1:ed25519:wasm:{H1}:signer:bob.near:records"),
+                "c5ab41608101f4088be8bf73c83d37004744976cf2a15cc49b2e882dbc44ee16",
+                "a3568e4eb52ba412642546466db09264652d77e1f6c4ecee63ae2dd129b1fe65",
+            ),
+            (
+                signing_key_input(None, "bob.near", H2, Wasm, "records"),
+                format!("signing-key:v1:ed25519:wasm:{H2}:signer:bob.near:records"),
+                "97ed687fa7b55c4558ea87122334e0c856104e755a1c62cc08fa61989f6680ad",
+                "57a2ffb80c011b813bb8d379d83e185fd55d55e38dc7d7fac635dc8eb8c07d85",
+            ),
+            (
+                signing_key_input(Some(("carol.near/app", P2)), "bob.near", H1, Project, "records"),
+                format!("signing-key:v1:ed25519:project:{P2}:signer:bob.near:records"),
+                "a893de461a75e2e846a7d7fd3b3839e4aa747c529101d1806ddadc2a5578ce8f",
+                "96a8495ebd25243b247e7881fd5b1008583b3cfc71525177263b638eeb4604be",
+            ),
+            (
+                signing_key_input(APP, "dave.near", H1, Project, "records"),
+                format!("signing-key:v1:ed25519:project:{P1}:signer:dave.near:records"),
+                "20c6e49370bef527cc995a8ecd502c4b1c03f0f6890fe7745db88073a26faf0a",
+                "50aa94c01dc34a6dcad551a545c02e466d50821089ac0c726b853085fda03306",
+            ),
+            // A predecessor key: bob signed, the DAO called; the key is the DAO's.
+            (
+                signing_key_input_as(APP, Predecessor, "bob.near", Some("dao.near"), H1, Project, "records"),
+                format!("signing-key:v1:ed25519:project:{P1}:predecessor:dao.near:records"),
+                "564cad06f84721e12d167b6860c46170ec342f4c309a700bbfe8f7b25f7da397",
+                "ef698d816a8736b37d43f1c1eac73d1ee88776bb2f7ddb9496f00c498ced949b",
+            ),
+            // The same account as signer and as predecessor: two keys.
+            (
+                signing_key_input_as(APP, Predecessor, "bob.near", Some("bob.near"), H1, Project, "records"),
+                format!("signing-key:v1:ed25519:project:{P1}:predecessor:bob.near:records"),
+                "978a4ab49ca4f60607132ef5189ffcdf064f23c7e4517e166ff7dafeb927d533",
+                "aab7a891a1635655f4d288d665c8c31b72ed5b7d14a94609cf86596d183c7fef",
+            ),
+            (
+                signing_key_input_as(APP, Signer, "bob.near", Some("dao.near"), H1, Project, "records"),
+                format!("signing-key:v1:ed25519:project:{P1}:signer:bob.near:records"),
+                "f6f531d0b454d922a8e1f530f41f3a1cd008c56c496e36c958f2d4013358ac3d",
+                "c602d489e1818fba7a7964fd85e288404201a66efe76fadb91aa3a8941b573c2",
+            ),
+        ];
+        for (input, string, seed, public_key) in cases {
+            assert_eq!(input.as_str(), string);
+            let derived = ks.derive_signing_key_seed(None, &input).unwrap();
+            assert_eq!(hex::encode(derived.as_ref()), seed, "{string}");
+            let vk = SigningKey::from_bytes(&derived).verifying_key();
+            assert_eq!(hex::encode(vk.as_bytes()), public_key, "{string}");
+        }
+    }
+
+    #[test]
+    fn two_projects_and_two_callers_get_different_project_keys() {
+        use crate::signing_keys::KeyBinding::Project;
+        let ks = Keystore::generate();
+        let k = |p: (&str, &str), a: &str, n: &str| signing_seed_hex(&ks, &signing_key_input(Some(p), a, H1, Project, n));
+        let all = [
+            k(("alice.near/app", P1), "bob.near", "k"),
+            // The same name, created again: another uuid, another key.
+            k(("alice.near/app", P2), "bob.near", "k"),
+            k(("carol.near/app", "p0000000000000003"), "bob.near", "k"),
+            k(("alice.near/app", P1), "dave.near", "k"),
+            k(("alice.near/app", P1), "bob.near", "k2"),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two different tuples derived one key");
+            }
+        }
+    }
+
+    #[test]
+    fn two_callers_and_two_builds_get_different_wasm_keys() {
+        use crate::signing_keys::KeyBinding::Wasm;
+        let ks = Keystore::generate();
+        let k = |a: &str, h: &str, n: &str| signing_seed_hex(&ks, &signing_key_input(None, a, h, Wasm, n));
+        let all = [k("bob.near", H1, "k"), k("dave.near", H1, "k"), k("bob.near", H2, "k"), k("bob.near", H1, "k2")];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two different tuples derived one key");
+            }
+        }
+    }
+
+    #[test]
+    fn the_binding_decides_what_the_key_follows() {
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let ks = Keystore::generate();
+        let seed = |p: Option<(&str, &str)>, h: &str, b| signing_seed_hex(&ks, &signing_key_input(p, "bob.near", h, b, "k"));
+        let app = APP;
+        // One (type, account, path), two bindings: two keys.
+        assert_ne!(seed(app, H1, Project), seed(None, H1, Wasm));
+        // A wasm key is the build's: the same build is the same key, another
+        // build another key.
+        assert_eq!(seed(None, H1, Wasm), seed(None, H1, Wasm));
+        assert_ne!(seed(None, H1, Wasm), seed(None, H2, Wasm));
+        // A project key is the project's: a new build keeps it.
+        assert_eq!(seed(app, H1, Project), seed(app, H2, Project));
+    }
+
+    #[test]
+    fn a_signing_key_uses_the_vaults_master_and_never_falls_back() {
+        use crate::signing_keys::KeyBinding::Project;
+        let ks = Keystore::generate();
+        let vault: AccountId = "vault.alice.near".parse().unwrap();
+        let input = signing_key_input(APP, "bob.near", H1, Project, "k");
+
+        // Not loaded: refused, not the default master's key.
+        assert!(ks.derive_signing_key_seed(Some(&vault), &input).is_err());
+
+        ks.add_customer(vault.clone(), [9u8; 32]);
+        let under_vault = hex::encode(ks.derive_signing_key_seed(Some(&vault), &input).unwrap().as_ref());
+        let under_default = signing_seed_hex(&ks, &input);
+        assert_ne!(under_vault, under_default, "a vault key must come from the vault's master");
+
+        ks.evict_customer(&vault);
+        assert!(
+            ks.derive_signing_key_seed(Some(&vault), &input).is_err(),
+            "an evicted vault must refuse, never fall back to the default master"
+        );
+    }
+
+    #[test]
+    fn a_signing_key_signs_and_verifies() {
+        use crate::signing_keys::KeyBinding::Project;
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        let input = signing_key_input(APP, "bob.near", H1, Project, "records");
+        let seed = ks.derive_signing_key_seed(None, &input).unwrap();
+        let sk = SigningKey::from_bytes(&seed);
+        let sig = sk.sign(b"record #1");
+        assert!(sk.verifying_key().verify(b"record #1", &sig).is_ok());
+        assert!(sk.verifying_key().verify(b"record #2", &sig).is_err());
+        // The same signature an independent ed25519 implementation makes.
+        assert_eq!(
+            hex::encode(sig.to_bytes()),
+            "44383725b38816424b14d0f8d8d020b9de480c3631ad7a9ba675c56d67fbaa28447814aac6e1e37659828e426bab2d9a44a67df7a998b68c2e0b71632a61450a"
+        );
+    }
+
+    /// A signing key is never cached: nothing of it stays in the keystore.
+    #[test]
+    fn a_signing_key_leaves_no_copy_in_the_cache() {
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let ks = Keystore::generate();
+        for (project, bind) in [(APP, Project), (None, Wasm)] {
+            let input = signing_key_input(project, "bob.near", H1, bind, "k");
+            let _ = ks.derive_signing_key_seed(None, &input).unwrap();
+        }
+        assert!(ks.keypair_cache.read().unwrap().is_empty());
+    }
+
+    /// Derivation at trace level logs nothing of the seed or the master.
+    #[test]
+    fn deriving_a_signing_key_logs_nothing_of_the_seed() {
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || LogSink(buf.clone())
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(writer)
+            .finish();
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        let mut seeds = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("capture is live");
+            for (project, bind) in [(APP, Project), (None, Wasm)] {
+                let input = signing_key_input(project, "bob.near", H1, bind, "records");
+                seeds.push(hex::encode(ks.derive_signing_key_seed(None, &input).unwrap().as_ref()));
+            }
+        });
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("capture is live"), "the capture must be working: {logged:?}");
+        for seed in seeds {
+            assert!(!logged.contains(&seed[..16]), "a seed reached the log");
+        }
+        assert!(!logged.contains(&hex::encode(fixed_master())[..16]), "the master reached the log");
+    }
+
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+}

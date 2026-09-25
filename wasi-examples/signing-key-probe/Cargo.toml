@@ -1,0 +1,45 @@
+[package]
+name = "signing-key-probe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A WASI module whose only job is exercising the outlayer:signing-keys host functions"
+
+[[bin]]
+name = "signing-key-probe"
+path = "src/main.rs"
+
+[features]
+# Which manifest the build embeds — exactly one of `project`, `wasm`,
+# `project-vault`. `project` is the default, so a plain `cargo build`, and a
+# build of the repository on the platform (which passes no features), embeds it.
+default = ["project"]
+project = []
+wasm = []
+project-vault = []
+# The same code and manifest with one constant changed: another sha256, for
+# "a new version" and "another build".
+v2 = []
+
+[dependencies]
+# The signing-key host functions are not in the `outlayer` SDK crate. The
+# bindings are generated from `wit/signing-keys.wit`, a copy of the worker's
+# own `worker/wit/deps/signing-keys.wit`; the SDK crate stays out, as in
+# wallet-probe, so its generated `outlayer` module cannot collide with this one.
+wit-bindgen = "0.36"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+# Verification inside the guest (`sign_and_verify`, `message_at_cap`).
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+# `sign_nep413`: the NEP-413 payload, its hash, and the wallet-style encodings.
+borsh = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+bs58 = "0.5"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

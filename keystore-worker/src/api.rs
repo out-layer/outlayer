@@ -8,7 +8,7 @@
 //! - GET /vrf/pubkey - Get VRF public key for verification
 //!
 //! ### Worker-only endpoints (ALLOWED_WORKER_TOKEN_HASHES):
-//! - POST /decrypt - Decrypt secrets from contract
+//! - POST /decrypt - Decrypt secrets from contract, and derive declared signing keys
 //! - POST /encrypt - Encrypt data (for TopUp flow)
 //! - POST /decrypt-raw - Decrypt raw data with seed
 //! - POST /storage/encrypt - Encrypt persistent storage data
@@ -512,9 +512,37 @@ pub enum ApiError {
     /// "send NEAR and it will work" would be a remedy we cannot know applies.
     ChainRefused(String),
     InternalError(String),
+    /// The secret row a `/decrypt` request names is not on the contract. On the
+    /// wire it is a 400 with the message, byte for byte what `BadRequest`
+    /// answers — the answer the worker has always run on without secrets. Its
+    /// own variant so that a keyed request reports this outcome beside the keys
+    /// by type, and no other 400 is mistaken for it.
+    SecretsNotFound(String),
+    /// The signing keys a `/decrypt` request names cannot be served: a field,
+    /// the project or build, or a vault. Answered with its status and the code
+    /// `signing_keys_refused`, so the worker can tell it from a secret's
+    /// refusal and from a keystore that could not answer.
+    SigningKeysRefused(StatusCode, String),
 }
 
+/// The `code` of a refused signing-key request.
+pub(crate) const SIGNING_KEYS_REFUSED: &str = "signing_keys_refused";
+
 impl ApiError {
+    /// The message, whatever the variant.
+    pub fn message(&self) -> &str {
+        match self {
+            ApiError::BadRequest(m)
+            | ApiError::Unauthorized(m)
+            | ApiError::Forbidden(m)
+            | ApiError::PaymentRequired(m)
+            | ApiError::ChainRefused(m)
+            | ApiError::InternalError(m)
+            | ApiError::SecretsNotFound(m)
+            | ApiError::SigningKeysRefused(_, m) => m,
+        }
+    }
+
     /// Map an `ensure_customer_loaded` / CKD failure to an API error.
     ///
     /// An underfunded vault (the vault can't pay the MPC gas prepayment) is a
@@ -534,7 +562,7 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::BadRequest(msg) | ApiError::SecretsNotFound(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::PaymentRequired(msg) => (StatusCode::PAYMENT_REQUIRED, msg),
@@ -543,6 +571,10 @@ impl IntoResponse for ApiError {
             // own remedy.
             ApiError::ChainRefused(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::SigningKeysRefused(status, msg) => {
+                return (status, Json(serde_json::json!({"error": msg, "code": SIGNING_KEYS_REFUSED})))
+                    .into_response()
+            }
         };
 
         (status, Json(serde_json::json!({"error": message}))).into_response()
@@ -974,38 +1006,281 @@ fn enforce_agent_secret(caller: &str, owner: &str, profile: &str) -> Result<(), 
 }
 
 
-/// Decrypt secrets from contract for authorized TEE worker
+/// Decrypt secrets from contract for authorized TEE worker — and, for a request
+/// that names them, derive the job's signing keys in the same answer.
+///
+/// Which of the two a request is, is decided on its body before either shape is
+/// parsed: a body with a `signing_keys` member other than `null` or `[]` is a
+/// [`KeyedDecryptRequest`]; every other body is a [`DecryptRequest`], read by
+/// the same extractor as always, so its answer — status, body, and every
+/// rejection — is the answer it always got.
 async fn decrypt_handler(
     State(state): State<AppState>,
     worker: Option<axum::Extension<WorkerIdentity>>,
-    Json(req): Json<DecryptRequest>,
+    request: axum::extract::Request,
+) -> Response {
+    use axum::extract::FromRequest;
+
+    // A body that is not JSON-typed is never read here: the extractor refuses
+    // it first, as it always did.
+    if !json_content_type(request.headers()) {
+        return match Json::<DecryptRequest>::from_request(request, &state).await {
+            Ok(Json(req)) => decrypt_secrets_only(state, worker, req).await.into_response(),
+            Err(rejection) => rejection.into_response(),
+        };
+    }
+    let bytes = match axum::body::Bytes::from_request(request, &state).await {
+        Ok(bytes) => bytes,
+        Err(rejection) => return rejection.into_response(),
+    };
+    match body_shape(&bytes) {
+        BodyShape::Keyed => match Json::<KeyedDecryptRequest>::from_bytes(&bytes) {
+            Ok(Json(req)) => decrypt_with_signing_keys(state, worker, req).await.into_response(),
+            Err(rejection) => rejection.into_response(),
+        },
+        BodyShape::SecretsOnly => match Json::<DecryptRequest>::from_bytes(&bytes) {
+            Ok(Json(req)) => decrypt_secrets_only(state, worker, req).await.into_response(),
+            Err(rejection) => rejection.into_response(),
+        },
+        BodyShape::Ambiguous(reason) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the request body cannot be read as either a secrets request or a signing-key request: \
+                     {reason}. A body names `signing_keys` at most once."
+                )
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// The content-type test the JSON extractor applies, so a body it would refuse
+/// for its type is handed to it untouched and refused exactly as before.
+fn json_content_type(headers: &axum::http::HeaderMap) -> bool {
+    let Some(content_type) = headers.get(axum::http::header::CONTENT_TYPE) else {
+        return false;
+    };
+    let Ok(content_type) = content_type.to_str() else {
+        return false;
+    };
+    let Ok(mime) = content_type.parse::<mime::Mime>() else {
+        return false;
+    };
+    mime.type_() == "application"
+        && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+}
+
+/// Which request a `/decrypt` body is.
+enum BodyShape {
+    /// A `signing_keys` member other than `null` or an empty array.
+    Keyed,
+    /// No such member — or not a JSON object at all, or not JSON: the
+    /// secrets-only extractor answers it as it always has.
+    SecretsOnly,
+    /// A JSON object the probe could not read as data — `signing_keys` named
+    /// twice. Neither parser is trusted with it: a duplicate member is read
+    /// differently by different readers, so which shape the body "is" would
+    /// depend on which reader looked. Refused with the reason.
+    Ambiguous(String),
+}
+
+fn body_shape(body: &[u8]) -> BodyShape {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        signing_keys: Option<serde_json::Value>,
+    }
+    match serde_json::from_slice::<Probe>(body) {
+        Ok(Probe { signing_keys: Some(serde_json::Value::Array(a)) }) if a.is_empty() => BodyShape::SecretsOnly,
+        Ok(Probe { signing_keys: Some(serde_json::Value::Null) }) | Ok(Probe { signing_keys: None }) => {
+            BodyShape::SecretsOnly
+        }
+        Ok(Probe { signing_keys: Some(_) }) => BodyShape::Keyed,
+        // A data error on a well-formed object is the probe's one field named
+        // more than once; a data error on anything else (an array, a string) is
+        // the extractor's to refuse, as it always did.
+        Err(e) if e.classify() == serde_json::error::Category::Data && is_json_object(body) => {
+            BodyShape::Ambiguous(e.to_string())
+        }
+        Err(_) => BodyShape::SecretsOnly,
+    }
+}
+
+/// Is `body` one JSON object (whatever its members, repeated or not)?
+fn is_json_object(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body).is_ok()
+}
+
+fn not_ready() -> ApiError {
+    tracing::warn!("Decrypt request rejected - keystore not ready (waiting for DAO approval and MPC key)");
+    ApiError::Unauthorized("Keystore not ready. Waiting for DAO approval and master key from MPC.".to_string())
+}
+
+/// Which worker instance asked. Absent only in dev mode (`TeeMode::None`),
+/// where sessions are not enforced at all.
+fn worker_key(worker: &Option<axum::Extension<WorkerIdentity>>) -> String {
+    worker
+        .as_ref()
+        .map(|w| w.0 .0.clone())
+        .unwrap_or_else(|| "no-session".to_string())
+}
+
+/// A request that names a secret row and no keys: the row, decrypted.
+async fn decrypt_secrets_only(
+    state: AppState,
+    worker: Option<axum::Extension<WorkerIdentity>>,
+    req: DecryptRequest,
 ) -> Result<Json<DecryptResponse>, ApiError> {
     // Check if keystore is ready (has master key from MPC)
     if !state.is_ready() {
-        tracing::warn!("Decrypt request rejected - keystore not ready (waiting for DAO approval and MPC key)");
-        return Err(ApiError::Unauthorized(
-            "Keystore not ready. Waiting for DAO approval and master key from MPC.".to_string()
-        ));
+        return Err(not_ready());
     }
+    let worker_key = worker_key(&worker);
+    let plaintext_secrets = decrypt_secret_row(
+        &state,
+        &worker_key,
+        SecretRow {
+            accessor: &req.accessor,
+            profile: &req.profile,
+            owner: &req.owner,
+            user_account_id: &req.user_account_id,
+            task_id: req.task_id.as_deref(),
+            executed_wasm_sha256: req.executed_wasm_sha256.as_deref(),
+            predecessor_id: req.predecessor_id.as_deref(),
+        },
+    )
+    .await?;
+    Ok(Json(DecryptResponse { plaintext_secrets }))
+}
 
+/// A request that names signing keys, and the job's secret row if it has one.
+///
+/// The two are judged independently, and neither decides for the other: the
+/// keys by [`authorize_signing_keys`] (every key's binding against how the job
+/// was started, the job's project and build on the contract, the vaults'
+/// owner), the row by its own access condition, exactly as for a secrets-only
+/// request. The keys are judged first and in full; a
+/// refusal answers the whole request with the `signing_keys_refused` code
+/// before the row is read, so no secret leaves beside a refused key. Then the
+/// row: an outcome that would let the run continue without secrets is reported
+/// in `secrets` and the keys still come back; any other failure of the row
+/// fails the request with the same status and message a secrets-only request
+/// gets. Only then are the seeds derived.
+async fn decrypt_with_signing_keys(
+    state: AppState,
+    worker: Option<axum::Extension<WorkerIdentity>>,
+    req: KeyedDecryptRequest,
+) -> Result<Json<KeyedDecryptResponse>, ApiError> {
+    if !state.is_ready() {
+        return Err(not_ready());
+    }
+    let worker_key = worker_key(&worker);
     let task_id_str = req.task_id.as_deref().unwrap_or("unknown");
-    // Which worker instance asked. Absent only in dev mode (`TeeMode::None`), where sessions
-    // are not enforced at all.
-    let worker_key = worker
-        .as_ref()
-        .map(|w| w.0 .0.as_str())
-        .unwrap_or("no-session");
+
+    let row = match (&req.accessor, &req.profile, &req.owner) {
+        (Some(accessor), Some(profile), Some(owner)) => Some(SecretRow {
+            accessor,
+            profile,
+            owner,
+            user_account_id: &req.user_account_id,
+            task_id: req.task_id.as_deref(),
+            executed_wasm_sha256: req.executed_wasm_sha256.as_deref(),
+            predecessor_id: req.predecessor_id.as_deref(),
+        }),
+        (None, None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "accessor, profile and owner name one secret row together: send all three, or none \
+                 for a request that only derives signing keys"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let bound = authorize_signing_keys(&state, &req).await.inspect_err(|e| {
+        tracing::warn!(
+            task_id = %task_id_str,
+            worker = %worker_key,
+            project_id = ?req.project_id.as_deref().map(seed_for_log),
+            caller = %seed_for_log(&req.user_account_id),
+            predecessor = ?req.predecessor_id.as_deref().map(seed_for_log),
+            "Signing keys refused: {}",
+            crate::signing_keys::bounded(e.message(), crate::signing_keys::MOST_QUOTED_ERROR)
+        );
+    })?;
+
+    let secrets = match row {
+        None => None,
+        Some(row) => Some(match decrypt_secret_row(&state, &worker_key, row).await {
+            Ok(plaintext_secrets) => SecretsOutcome::Decrypted { plaintext_secrets },
+            // The one refusal the worker runs on past, reported beside the keys.
+            Err(ApiError::SecretsNotFound(error)) => {
+                tracing::info!(task_id = %task_id_str, "Secret row reported as not found beside the signing keys");
+                SecretsOutcome::NotFound { error }
+            }
+            Err(e) => return Err(e),
+        }),
+    };
+
+    let signing_keys = derive_signing_keys(&state, &bound).await?;
+    tracing::info!(
+        task_id = %task_id_str,
+        worker = %worker_key,
+        project_id = ?bound.project.as_ref().map(|p| p.id.as_str()),
+        project_uuid = ?bound.project.as_ref().map(|p| p.uuid.as_str()),
+        executed_wasm_sha256 = %bound.wasm_sha256.as_str(),
+        signer = %bound.signer,
+        predecessor = ?bound.predecessor.as_ref().map(|p| p.as_str()),
+        signing_keys = ?bound
+            .keys
+            .iter()
+            .map(|k| format!(
+                "{}({}, bind={}, caller={}={}, vault={})",
+                k.path.as_str(),
+                k.key_type.label(),
+                k.bind.label(),
+                k.caller.label(),
+                k.account,
+                k.vault.as_ref().map(|v| v.as_str()).unwrap_or("default")
+            ))
+            .collect::<Vec<_>>(),
+        "Signing keys derived"
+    );
+    Ok(Json(KeyedDecryptResponse { secrets, signing_keys }))
+}
+
+/// One secret row, as a `/decrypt` request names it, with the facts of the run
+/// its access condition is judged against.
+struct SecretRow<'a> {
+    accessor: &'a SecretAccessor,
+    profile: &'a str,
+    owner: &'a str,
+    user_account_id: &'a str,
+    task_id: Option<&'a str>,
+    executed_wasm_sha256: Option<&'a str>,
+    predecessor_id: Option<&'a str>,
+}
+
+/// Read one secret row from the contract, judge its access condition against
+/// the job's caller, and decrypt it. Returns the plaintext, base64.
+async fn decrypt_secret_row(
+    state: &AppState,
+    worker_key: &str,
+    row: SecretRow<'_>,
+) -> Result<String, ApiError> {
+    let task_id_str = row.task_id.unwrap_or("unknown");
 
     // Log request based on accessor type
-    match &req.accessor {
+    match row.accessor {
         SecretAccessor::Repo { repo, branch } => {
             tracing::info!(
                 task_id = %task_id_str,
                 worker = %worker_key,
                 repo = %repo,
                 branch = ?branch,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Received decrypt request (Repo)"
             );
         }
@@ -1014,8 +1289,8 @@ async fn decrypt_handler(
                 task_id = %task_id_str,
                 worker = %worker_key,
                 wasm_hash = %hash,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Received decrypt request (WasmHash)"
             );
         }
@@ -1024,8 +1299,8 @@ async fn decrypt_handler(
                 task_id = %task_id_str,
                 worker = %worker_key,
                 project_id = %project_id,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Received decrypt request (Project)"
             );
         }
@@ -1034,8 +1309,8 @@ async fn decrypt_handler(
                 task_id = %task_id_str,
                 worker = %worker_key,
                 secret_type = ?secret_type,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Received decrypt request (System)"
             );
         }
@@ -1052,9 +1327,9 @@ async fn decrypt_handler(
     let near_client = state.near_client.as_ref()
         .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
 
-    let accessor_json = accessor_to_contract_json(&req.accessor);
+    let accessor_json = accessor_to_contract_json(row.accessor);
     let combined = near_client
-        .get_secret_with_vault(accessor_json, &req.profile, &req.owner)
+        .get_secret_with_vault(accessor_json, row.profile, row.owner)
         .await
         .map_err(|e| {
             tracing::error!(task_id = %task_id_str, error = %e, "Failed to read secrets from contract");
@@ -1066,38 +1341,38 @@ async fn decrypt_handler(
         // Per-variant log fields for grep-friendliness — operators
         // search by repo/wasm_hash/project_id/secret_type, so we don't
         // dump the whole accessor as Debug.
-        match &req.accessor {
+        match row.accessor {
             SecretAccessor::Repo { repo, branch } => tracing::warn!(
                 task_id = %task_id_str,
                 repo = %repo,
                 branch = ?branch,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Secrets not found in contract"
             ),
             SecretAccessor::WasmHash { hash } => tracing::warn!(
                 task_id = %task_id_str,
                 wasm_hash = %hash,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Secrets not found in contract"
             ),
             SecretAccessor::Project { project_id } => tracing::warn!(
                 task_id = %task_id_str,
                 project_id = %project_id,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Secrets not found in contract"
             ),
             SecretAccessor::System { secret_type } => tracing::warn!(
                 task_id = %task_id_str,
                 secret_type = ?secret_type,
-                profile = %req.profile,
-                owner = %req.owner,
+                profile = %row.profile,
+                owner = %row.owner,
                 "Secrets not found in contract"
             ),
         }
-        ApiError::BadRequest("Secrets not found in contract".to_string())
+        ApiError::SecretsNotFound("Secrets not found in contract".to_string())
     })?;
 
     // Parse the on-chain vault binding into an AccountId, then ensure
@@ -1115,12 +1390,12 @@ async fn decrypt_handler(
     );
 
     // 2. A secret named by an agent belongs to that agent alone.
-    enforce_agent_secret(&req.user_account_id, &req.owner, &req.profile).inspect_err(|_| {
+    enforce_agent_secret(row.user_account_id, row.owner, row.profile).inspect_err(|_| {
         tracing::warn!(
             task_id = %task_id_str,
-            caller = %req.user_account_id,
-            owner = %req.owner,
-            profile = %req.profile,
+            caller = %row.user_account_id,
+            owner = %row.owner,
+            profile = %row.profile,
             "Access denied - secret is not this agent's"
         );
     })?;
@@ -1133,15 +1408,15 @@ async fn decrypt_handler(
         })?;
 
     // Use user_account_id (who requested execution) as caller for access control
-    let caller = &req.user_account_id;
+    let caller = row.user_account_id;
 
     if let Err(refusal) = judge_access(
         &access_condition,
         caller,
         state.near_client.as_ref().map(|c| c.as_ref()),
         crate::types::RunFacts {
-            executed_wasm_sha256: req.executed_wasm_sha256.as_deref(),
-            predecessor_id: req.predecessor_id.as_deref(),
+            executed_wasm_sha256: row.executed_wasm_sha256,
+            predecessor_id: row.predecessor_id,
         },
     )
     .await
@@ -1184,7 +1459,7 @@ async fn decrypt_handler(
     // never logged. Logging the seed at debug level helps support
     // hunt seed-mismatch bugs (caller computed seed != keystore's
     // computed seed) without exposing any cryptographic material.
-    let seed = match &req.accessor {
+    let seed = match row.accessor {
         SecretAccessor::Repo { repo, branch: request_branch } => {
             let normalized_repo = crate::utils::normalize_repo_url(repo);
             // The contract's `SecretProfileView`
@@ -1227,15 +1502,15 @@ async fn decrypt_handler(
 
             // Build seed using branch from secret profile (critical for correct decryption)
             let seed = if let Some(b) = secret_branch {
-                format!("{}:{}:{}", normalized_repo, req.owner, b)
+                format!("{}:{}:{}", normalized_repo, row.owner, b)
             } else {
-                format!("{}:{}", normalized_repo, req.owner)
+                format!("{}:{}", normalized_repo, row.owner)
             };
 
             tracing::debug!(
                 task_id = %task_id_str,
                 repo_normalized = %normalized_repo,
-                owner = %req.owner,
+                owner = %row.owner,
                 secret_branch = ?secret_branch,
                 seed = %seed,
                 "🔓 DECRYPTION SEED (Repo)"
@@ -1244,12 +1519,12 @@ async fn decrypt_handler(
             seed
         }
         SecretAccessor::WasmHash { hash } => {
-            let seed = format!("wasm_hash:{}:{}", hash, req.owner);
+            let seed = format!("wasm_hash:{}:{}", hash, row.owner);
 
             tracing::debug!(
                 task_id = %task_id_str,
                 wasm_hash = %hash,
-                owner = %req.owner,
+                owner = %row.owner,
                 seed = %seed,
                 "🔓 DECRYPTION SEED (WasmHash)"
             );
@@ -1257,12 +1532,12 @@ async fn decrypt_handler(
             seed
         }
         SecretAccessor::Project { project_id } => {
-            let seed = format!("project:{}:{}", project_id, req.owner);
+            let seed = format!("project:{}:{}", project_id, row.owner);
 
             tracing::debug!(
                 task_id = %task_id_str,
                 project_id = %project_id,
-                owner = %req.owner,
+                owner = %row.owner,
                 seed = %seed,
                 "🔓 DECRYPTION SEED (Project)"
             );
@@ -1272,13 +1547,13 @@ async fn decrypt_handler(
         SecretAccessor::System { secret_type } => {
             // Seed format: system:{type}:{owner}:{nonce}
             // nonce is stored in profile field
-            let seed = format!("system:{}:{}:{}", secret_type.as_seed_str(), req.owner, req.profile);
+            let seed = format!("system:{}:{}:{}", secret_type.as_seed_str(), row.owner, row.profile);
 
             tracing::debug!(
                 task_id = %task_id_str,
                 secret_type = ?secret_type,
-                owner = %req.owner,
-                nonce = %req.profile,
+                owner = %row.owner,
+                nonce = %row.profile,
                 seed = %seed,
                 "🔓 DECRYPTION SEED (System)"
             );
@@ -1310,9 +1585,226 @@ async fn decrypt_handler(
         "Successfully decrypted secrets"
     );
 
-    Ok(Json(DecryptResponse {
-        plaintext_secrets: plaintext_b64,
-    }))
+    Ok(plaintext_b64)
+}
+
+/// The seeds of keys that passed [`authorize_signing_keys`], by path. Never
+/// cached here; the seeds leave in the response and nowhere else.
+async fn derive_signing_keys(
+    state: &AppState,
+    bound: &crate::signing_keys::BoundKeys,
+) -> Result<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>, ApiError> {
+    let keystore = state.keystore.read().await;
+    let mut out = std::collections::BTreeMap::new();
+    for key in &bound.keys {
+        // A vault evicted since it was checked fails here — never the default
+        // master in its place.
+        let seed = keystore.derive_signing_key_seed(key.vault.as_ref(), &key.input).map_err(|e| {
+            ApiError::SigningKeysRefused(
+                StatusCode::BAD_REQUEST,
+                format!("Signing keys refused: key {:?} could not be derived: {e}", key.path.as_str()),
+            )
+        })?;
+        out.insert(key.path.as_str().to_string(), crate::signing_keys::SeedHex::from_seed(&seed));
+    }
+    Ok(out)
+}
+
+/// Every check a signing-key request must pass before anything is derived.
+///
+/// 1. The fields: [`crate::signing_keys::validate_request`] — every key's
+///    binding against the run (`project` keys only with a `project_id`, `wasm`
+///    keys only without one), the shapes that keep `:` out of every segment,
+///    the count, the build hash, the signer and predecessor, no vault on a
+///    `wasm` key. A direct run ends here: its `wasm` keys are bound to the
+///    hash the worker reports, the same trust a `WasmHash` access condition on
+///    a secret gives it (`types.rs`, `RunFacts::executed_wasm_sha256`).
+/// 2. The project, for a project run — two reads of the contract, made
+///    together since both are needed:
+///    * `get_version(project_id, executed_wasm_sha256)`: the build the worker
+///      measured on the bytes it is about to run must be a version of the
+///      project whose source is a `WasmUrl` with that hash. A job cannot name
+///      a project its code is not published under. A GitHub-sourced version is
+///      keyed by `repo@commit` on chain, has no hash to check, and is refused;
+///      so is any version whose source is not a `WasmUrl`.
+///    * `get_project(project_id)`: the project exists, is owned by the account
+///      its id names ([`project_owner`]), and has a well-formed `uuid`
+///      ([`project_uuid`]) — what every `project` key is bound to. Read on
+///      every project run and never cached: a project deleted and created
+///      again under the same name is another project with another uuid, and a
+///      cache would hand the new project the old one's keys for as long as the
+///      entry lived.
+/// 3. Each vault a key names: it is a direct sub-account of the project's
+///    owner ([`crate::signing_keys::vault_is_named_under`]) — decided on the
+///    names alone, BEFORE the vault is read, so a vault that is not the owner's
+///    costs no RPC — then its own `get_state` names that owner as its parent
+///    ([`crate::signing_keys::vault_belongs_to`]), checked BEFORE the vault's
+///    master is loaded — a first load is paid for by the vault — and then it is
+///    loaded through the same gate as every per-vault operation (verified on
+///    the DAO, not unlocked). What the chain or the keystore SAYS about the
+///    vault — another parent, not verified, unlocked, underfunded (402) —
+///    refuses the request; a chain that could not be asked, or a master that
+///    could not be loaded for any other reason, is `InternalError` — the
+///    keystore's own outage, as for `get_version` and `get_project` — since
+///    nothing the author or caller does clears it. Either way the default
+///    master is never used for a key that names a vault.
+///
+/// Text from the RPC or the contract never reaches a message or a log line
+/// whole: it is cut to [`crate::signing_keys::MOST_QUOTED_ERROR`] characters.
+async fn authorize_signing_keys(
+    state: &AppState,
+    req: &KeyedDecryptRequest,
+) -> Result<crate::signing_keys::BoundKeys, ApiError> {
+    use crate::signing_keys::{bounded, MOST_QUOTED_ERROR};
+
+    let validated = crate::signing_keys::validate_request(
+        req.project_id.as_deref(),
+        &req.user_account_id,
+        req.predecessor_id.as_deref(),
+        req.executed_wasm_sha256.as_deref(),
+        &req.signing_keys,
+    )
+    .map_err(|m| ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("Signing keys refused: {m}")))?;
+
+    let Some(project) = validated.project.clone() else {
+        return validated.bind(None).map_err(|m| {
+            ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("Signing keys refused: {m}"))
+        });
+    };
+    let near_client = state
+        .near_client
+        .as_ref()
+        .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
+    let project_id = project.as_str();
+    let wasm = validated.wasm_sha256.as_str();
+
+    let (version, project_view) = tokio::join!(
+        near_client.view_call_json(
+            near_client.contract_id(),
+            "get_version",
+            serde_json::json!({ "project_id": project_id, "version_key": wasm }),
+        ),
+        near_client.view_call_json(near_client.contract_id(), "get_project", serde_json::json!({ "project_id": project_id })),
+    );
+    let version = version.map_err(|e| {
+        let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
+        tracing::warn!(project_id = %project_id, "Signing keys: the project version could not be read: {said}");
+        ApiError::InternalError(format!("Signing keys: the project version could not be read: {said}"))
+    })?;
+    if !project_version_matches(&version, wasm) {
+        return Err(ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!(
+            "Signing keys refused: the running build (sha256 {wasm}) is not a WasmUrl version of \
+             project {project_id} on the contract. A project run gets keys only when its code is \
+             published under the project as a WasmUrl version whose hash is this build's; a version \
+             built from a GitHub repository gets none."
+        )));
+    }
+    let project_view = project_view.map_err(|e| {
+        let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
+        tracing::warn!(project_id = %project_id, "Signing keys: the project could not be read: {said}");
+        ApiError::InternalError(format!("Signing keys: the project could not be read: {said}"))
+    })?;
+    let owner = project_owner(&project_view, &project)
+        .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
+    let uuid = project_uuid(&project_view, &project)
+        .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
+
+    let vaults = validated.vaults();
+    // Every vault's name against the owner's, before any vault is read.
+    for vault in &vaults {
+        crate::signing_keys::vault_is_named_under(&owner, vault)
+            .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
+    }
+    for vault in &vaults {
+        let vault_state = near_client
+            .view_call_json(vault, "get_state", serde_json::json!({}))
+            .await
+            .map_err(|e| {
+                let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
+                tracing::warn!(vault = %vault, "Signing keys: vault could not be read: {said}");
+                ApiError::InternalError(format!(
+                    "Signing keys: vault {vault} could not be read, so its owner cannot be established: {said}"
+                ))
+            })?;
+        crate::signing_keys::vault_belongs_to(&owner, vault, &vault_state)
+            .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
+    }
+    for vault in &vaults {
+        state
+            .ensure_customer_loaded(Some(vault))
+            .await
+            .map_err(|e| match ApiError::from_customer_load(e) {
+                ApiError::PaymentRequired(m) => {
+                    ApiError::SigningKeysRefused(StatusCode::PAYMENT_REQUIRED, format!("Signing keys refused: {m}"))
+                }
+                other => {
+                    let said = bounded(other.message(), MOST_QUOTED_ERROR);
+                    tracing::warn!(vault = %vault, "Signing keys: vault could not be loaded: {said}");
+                    ApiError::InternalError(format!("Signing keys: vault {vault} is not available: {said}"))
+                }
+            })?;
+    }
+    validated
+        .bind(Some(uuid))
+        .map_err(|m| ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("Signing keys refused: {m}")))
+}
+
+/// Is `version` (the contract's `get_version` answer) a WasmUrl version whose
+/// hash is `wasm`? Both the key it was found by and its source must say so:
+/// `null` — no such project or no such version — is not, and neither is a
+/// version whose source is a GitHub repository, whatever it is keyed by.
+fn project_version_matches(version: &serde_json::Value, wasm: &str) -> bool {
+    let keyed_by_this_build = version.get("wasm_hash").and_then(|h| h.as_str()) == Some(wasm);
+    let published_as_this_wasm = version
+        .get("source")
+        .and_then(|s| s.get("WasmUrl"))
+        .and_then(|w| w.get("hash"))
+        .and_then(|h| h.as_str())
+        == Some(wasm);
+    keyed_by_this_build && published_as_this_wasm
+}
+
+/// The project's owner from the contract's `get_project` answer, which must be
+/// the owner its id names: a project is created as `{caller}/{name}` and a
+/// transfer renames it, so the two disagree only on an answer this keystore
+/// does not understand — refused rather than guessed at.
+fn project_owner(
+    project: &serde_json::Value,
+    id: &crate::signing_keys::ProjectId,
+) -> Result<near_primitives::types::AccountId, String> {
+    if project.is_null() {
+        return Err(format!("project {} does not exist on the contract", id.as_str()));
+    }
+    let owner = project
+        .get("owner")
+        .and_then(|o| o.as_str())
+        .ok_or_else(|| format!("project {}: the contract names no owner", id.as_str()))?;
+    let owner: near_primitives::types::AccountId = owner
+        .parse()
+        .map_err(|e| format!("project {}: the contract's owner is not an account id ({e})", id.as_str()))?;
+    if &owner != id.owner() {
+        return Err(format!(
+            "project {}: the contract names {owner} as its owner, not {}",
+            id.as_str(),
+            id.owner()
+        ));
+    }
+    Ok(owner)
+}
+
+/// The project's uuid from the contract's `get_project` answer: `p{16 hex}`,
+/// minted once at `create_project`. What a `project` key is bound to. An
+/// answer without one, or with one of another shape, is refused — never
+/// derived from the id in its place.
+fn project_uuid(
+    project: &serde_json::Value,
+    id: &crate::signing_keys::ProjectId,
+) -> Result<crate::signing_keys::ProjectUuid, String> {
+    let uuid = project
+        .get("uuid")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| format!("project {}: the contract names no uuid", id.as_str()))?;
+    crate::signing_keys::ProjectUuid::parse(uuid).map_err(|m| format!("project {}: {m}", id.as_str()))
 }
 
 /// Encrypt plaintext data

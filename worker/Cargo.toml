@@ -73,6 +73,7 @@ hex = "0.4"
 bs58 = "0.5"
 base64 = "0.22"
 ed25519-dalek = "2.1"
+zeroize = "1.8"  # signing-key seeds are wiped when dropped
 
 # Utils
 uuid = { version = "1.0", features = ["v4"] }

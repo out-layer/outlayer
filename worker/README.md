@@ -242,7 +242,8 @@ Memory layout:
 ### Host functions
 
 WASI P2 components import host interfaces from `wit/` (`near:rpc`,
-`near:storage`, `near:payment`, `near:vrf`, `outlayer:wallet`). The wallet
+`near:storage`, `near:payment`, `near:vrf`, `outlayer:wallet`,
+`outlayer:signing-keys`). The wallet
 interface is provided only when the execution carries a wallet (`X-Wallet-Id`);
 a component that imports it without one is refused before `main`. Its EVM
 signing functions take a sub-key `label`; the worker maps it to the keystore
@@ -252,6 +253,24 @@ project name (`connector_manifest::sub_key_connector_id`), so a guest can only
 name its own connector's keys. The empty label is the sub-key `default`; the
 wallet's own EVM key is not reachable from a guest at all. Each execution has
 a budget of 200 wallet host calls.
+
+`outlayer:signing-keys` serves the ed25519 keys a component declares in its
+manifest (`signing_keys`, at most 3), by `path` and declared `vault`
+(`src/signing_keys/`). How the run was started is read off the job — its
+`project_id`, the variant of its resolved `code_source` and its predecessor —
+and the run's one `/decrypt` request carries the `project_id` (present for a
+run through a project, absent for a direct run of a wasm URL), the declared
+keys (`path`, `type`, `bind`, `caller`, `vault`), the caller, the predecessor
+and the measured build, beside its secret row. The keystore checks what the
+chain can answer (the project's version, owner and uuid, the vault's
+ownership) and takes the rest on this worker's attestation; the one rule only
+this worker can apply — no key for code built from GitHub, which reaches the
+keystore as nothing but a hash — is applied here. A declaration whose `bind`
+does not match how the code is run, a `caller: "predecessor"` key on a run
+with no predecessor, or any key on code built from GitHub, refuses the run
+before any secret is decrypted; the executor refuses a component that declares
+keys and was handed none. The seeds stay in that run's memory and are dropped
+with it.
 
 ### Routes this node will not run
 

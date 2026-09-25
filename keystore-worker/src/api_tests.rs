@@ -3141,3 +3141,1160 @@ mod the_substitution_is_made_in_one_place {
         );
     }
 }
+
+/// The signing-key root against every other seed this keystore derives.
+///
+/// Every key here is `HMAC-SHA256(master, input)`, so two families collide
+/// exactly when one can spell the other's HMAC input. A signing key's input is
+/// always `signing-key:v1:{type}:{project|wasm}:{uuid|sha256}:{signer|predecessor}:…`
+/// built from fields that hold no `:`. The other inputs, by family:
+///
+/// * fixed-root seeds fed to the HMAC bare (`derive_keypair`,
+///   `derive_secp256k1_keypair`) — every key this keystore signs with or
+///   exports: `wallet:…`, `subkey:…`, `vrf-key`, `outlayer.near:{vault}`;
+/// * the secret and storage seeds (`project:…`, `wasm_hash:…`, `system:…`,
+///   `storage:…`, `storage:wasm:…`, `wallet-policy:…`) and the caller-written
+///   seeds (`/pubkey`, `/encrypt`, `/add_generated_secret`, a `Repo`
+///   accessor's `{repo}:{owner}[:{branch}]`) — these reach the master as
+///   `ecies:` + seed, and through the legacy decrypt as a bare seed whose
+///   PUBLIC key is the only thing ever used;
+/// * `secret-path:` + seed (`vault-master:{vault}`).
+///
+/// So: no fixed root is a prefix of `signing-key:v1:` or the other way round,
+/// and no tagged input (`ecies:`, `secret-path:`) can start with it. A
+/// caller-written seed CAN spell a signing-key string — the contract lets a
+/// `Repo` row name any repository and branch — and such a seed is only ever
+/// derived as `ecies:` + seed, or bare for its public key alone, which reveals
+/// nothing a guest's own `public-key` call does not.
+#[cfg(test)]
+mod signing_key_seed_audit {
+    use super::*;
+    use crate::signing_keys::{
+        validate_request, CallerKind, KeyBinding, ProjectUuid, SigningKeyRequest, SigningKeyType, MAX_SIGNING_KEYS,
+        SIGNING_KEY_LABEL,
+    };
+
+    const H: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// Signing-key inputs across both shapes — `project` keys on a project run,
+    /// `wasm` keys on a direct run — and both callers, with fields chosen to
+    /// look like other families' segments.
+    fn signing_inputs() -> Vec<String> {
+        let mut out = Vec::new();
+        let paths = ["near", "evm", "check", "vrf-key", "storage", "project", "wasm_hash", "k", "wallet", "ecies", "signer", "predecessor"];
+        let runs = [
+            (Some(("wallet.near/evm", "p0000000000000001")), KeyBinding::Project),
+            (Some(("subkey.near/project", "pffffffffffffffff")), KeyBinding::Project),
+            (Some(("alice.near/app", "p0000000000000001")), KeyBinding::Project),
+            (None, KeyBinding::Wasm),
+        ];
+        for (project, bind) in runs {
+            for account in ["wallet.near", "ecies.near", "project.near", "signer.near", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] {
+                for caller in [CallerKind::Signer, CallerKind::Predecessor] {
+                    for chunk in paths.chunks(MAX_SIGNING_KEYS) {
+                        let keys: Vec<SigningKeyRequest> = chunk
+                            .iter()
+                            .map(|p| SigningKeyRequest {
+                                path: p.to_string(),
+                                key_type: SigningKeyType::Ed25519,
+                                bind,
+                                caller,
+                                vault: None,
+                            })
+                            .collect();
+                        let uuid = project.map(|(_, u)| ProjectUuid::parse(u).unwrap());
+                        let bound = validate_request(project.map(|(id, _)| id), account, Some("predecessor.near"), Some(H), &keys)
+                            .unwrap()
+                            .bind(uuid)
+                            .unwrap();
+                        for k in bound.keys {
+                            out.push(String::from_utf8(k.input.as_bytes().to_vec()).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every other family's HMAC input as this keystore builds it, including
+    /// adversarial fields where the family allows them.
+    fn other_inputs() -> Vec<String> {
+        let mut seeds: Vec<String> = Vec::new();
+        for id in ["abc-123", "signing-key", "v1", "signer", "predecessor"] {
+            for chain in ["near", "solana", "ethereum", "evm", "signing-key:v1"] {
+                seeds.push(wallet_seed(id, chain));
+                // The exporter's shape, from request strings.
+                seeds.push(format!("wallet:{id}:{chain}:check:0"));
+                seeds.push(format!("wallet:{id}:{chain}:signing-key:v1:ed25519"));
+            }
+            seeds.push(subkey_seed(id, "connector.hl.trading"));
+            seeds.push(subkey_seed(id, "signing-key"));
+            seeds.push(format!("wallet-policy:{id}"));
+        }
+        seeds.push("vrf-key".to_string());
+        seeds.push("outlayer.near:vault.alice.near".to_string());
+        for owner in ["alice.near", "v1", "signing-key", "signer", "predecessor"] {
+            seeds.push(format!("project:alice.near/app:{owner}"));
+            seeds.push(format!("project:signing-key:v1:{owner}"));
+            seeds.push(format!("wasm_hash:{H}:{owner}"));
+            seeds.push(format!("system:payment_key:{owner}:0"));
+            seeds.push(format!("storage:p0000000000000001:{owner}"));
+            seeds.push(format!("storage:wasm:{H}:{owner}"));
+        }
+        // Tagged inputs: the tag is part of what the HMAC reads.
+        let mut inputs: Vec<String> = seeds.iter().map(|s| format!("ecies:{s}")).collect();
+        inputs.push("secret-path:vault-master:vault.alice.near".to_string());
+        // A caller-written seed spelling a signing-key string reaches the HMAC
+        // with its tag in front.
+        inputs.push(format!("ecies:{}", signing_inputs()[0]));
+        inputs.extend(seeds);
+        inputs
+    }
+
+    /// The fixed roots of every other family.
+    const OTHER_ROOTS: &[&str] = &[
+        "wallet:",
+        "subkey:",
+        "vrf-key",
+        "outlayer.near:",
+        "wallet-policy:",
+        "project:",
+        "wasm_hash:",
+        "system:",
+        "storage:",
+        "ecies:",
+        "secret-path:",
+        "vault-master:",
+    ];
+
+    #[test]
+    fn no_other_input_equals_a_signing_key_input() {
+        let signing = signing_inputs();
+        assert!(signing.iter().any(|s| s.contains(":project:")) && signing.iter().any(|s| s.contains(":wasm:")));
+        assert!(signing.iter().any(|s| s.contains(":signer:")) && signing.iter().any(|s| s.contains(":predecessor:")));
+        for other in other_inputs() {
+            assert!(!other.starts_with(SIGNING_KEY_LABEL), "{other} starts with the signing-key root");
+            for s in &signing {
+                assert_ne!(&other, s, "{other} is a signing-key input");
+            }
+        }
+    }
+
+    #[test]
+    fn no_signing_key_input_starts_with_another_root() {
+        for s in signing_inputs() {
+            assert!(s.starts_with(SIGNING_KEY_LABEL));
+            for root in OTHER_ROOTS {
+                assert!(!s.starts_with(root), "{s} starts with {root}");
+            }
+        }
+        // And no root is a prefix of the signing-key root, nor it of them.
+        for root in OTHER_ROOTS {
+            assert!(!SIGNING_KEY_LABEL.starts_with(root) && !root.starts_with(SIGNING_KEY_LABEL), "{root}");
+        }
+    }
+
+    #[test]
+    fn the_signing_key_root_is_not_an_exportable_or_signing_seed() {
+        // The exporter builds `wallet:{id}:{chain}:{sub_path}`; the signers use
+        // `wallet:` / `subkey:` / `vrf-key` / `outlayer.near:`. None of those
+        // can begin with the signing-key root, whatever the request strings.
+        for id in ["signing-key", "a"] {
+            for chain in ["v1", "near"] {
+                for sub in ["ed25519:project:p0000000000000001:signer:bob.near:k", "0"] {
+                    assert!(!format!("wallet:{id}:{chain}:{sub}").starts_with(SIGNING_KEY_LABEL));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_repo_secret_seed_can_spell_a_signing_key_string_and_reaches_the_master_tagged() {
+        // The contract accepts any non-empty repository and any branch up to
+        // 255 bytes, so a `Repo` row's seed can spell a signing-key string.
+        let spelled = format!("{}:{}:{}", crate::utils::normalize_repo_url("signing-key"), "v1", "ed25519:project:p0000000000000001:signer:bob.near:k");
+        assert!(spelled.starts_with(SIGNING_KEY_LABEL));
+        // What the secret path derives from it is `ecies:` + seed — never the
+        // signing key's input — and the ECIES key it yields is not the signing
+        // key's public key.
+        let ks = crate::crypto::Keystore::generate();
+        let x25519 = ks.public_key_hex(None, &spelled).unwrap();
+        let v = validate_request(
+            Some("alice.near/app"),
+            "bob.near",
+            None,
+            Some(H),
+            &[SigningKeyRequest {
+                path: "k".into(),
+                key_type: SigningKeyType::Ed25519,
+                bind: KeyBinding::Project,
+                caller: CallerKind::Signer,
+                vault: None,
+            }],
+        )
+        .unwrap()
+        .bind(Some(ProjectUuid::parse("p0000000000000001").unwrap()))
+        .unwrap();
+        let seed = ks.derive_signing_key_seed(None, &v.keys[0].input).unwrap();
+        let signing_public = hex::encode(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().as_bytes());
+        assert_ne!(x25519, signing_public);
+    }
+}
+
+/// `/decrypt` with signing keys, end to end through the handler, against a
+/// chain served from a local socket.
+#[cfg(test)]
+mod signing_keys_at_the_door {
+    use super::*;
+    use crate::signing_keys::{CallerKind, KeyBinding, SigningKeyRequest, SigningKeyType};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const H1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const H2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const H3: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    /// A version of `alice.near/app` that the chain in these tests answers for
+    /// by this hash while its source is a GitHub repository. The contract keys
+    /// a GitHub version by `repo@commit`, never by a hash; this pins that the
+    /// keystore reads the source itself rather than trusting the key alone.
+    const H4: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+    /// The uuid the contract of these tests holds for `alice.near/app`.
+    const P1: &str = "p0000000000000001";
+
+    type Answer = dyn Fn(&str, &str, &serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync;
+
+    /// A chain that answers view calls with `answer(account, method, args)`;
+    /// `Err` is served as the RPC's "account does not exist" error.
+    async fn chain(answer: Arc<Answer>) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let answer = answer.clone();
+                async move {
+                    let params = &body["params"];
+                    let account = params["account_id"].as_str().unwrap_or_default().to_string();
+                    let method = params["method_name"].as_str().unwrap_or_default().to_string();
+                    let args = base64::decode(params["args_base64"].as_str().unwrap_or_default())
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok())
+                        .unwrap_or(json!({}));
+                    let id = body["id"].clone();
+                    Json(match answer(&account, &method, &args) {
+                        Ok(v) => json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "block_hash": "11111111111111111111111111111111",
+                                "block_height": 1u64,
+                                "logs": [],
+                                "result": v.to_string().into_bytes(),
+                            }
+                        }),
+                        Err(msg) => json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {
+                                "name": "HANDLER_ERROR",
+                                "cause": { "name": "UNKNOWN_ACCOUNT", "info": { "requested_account_id": account } },
+                                "code": -32000, "message": "Server error", "data": msg,
+                            }
+                        }),
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn state_with(keystore: crate::crypto::Keystore, rpc: Option<&str>) -> AppState {
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: rpc.unwrap_or("http://127.0.0.1:1").into(),
+            offchainvm_contract_id: "outlayer.test".into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let near_client = rpc.map(|url| crate::near::NearClient::new(url, "outlayer.test").unwrap());
+        AppState::new(keystore, config, near_client)
+    }
+
+    fn state_on(rpc: Option<&str>) -> AppState {
+        state_with(crate::crypto::Keystore::generate(), rpc)
+    }
+
+    /// What the contract of these tests holds.
+    ///
+    /// Project `alice.near/app`, owned by `alice.near`, uuid `uuid` (P1 unless
+    /// a test changes it; hidden altogether while `project_hidden`), with
+    /// WasmUrl versions H1 and H2 and a GitHub-sourced version found by H4.
+    /// Vault `vault.alice.near` (parent alice), `vault.mallory.near` (parent
+    /// mallory), `other.alice.near` (a sub-account whose parent says mallory);
+    /// `gone.alice.near` answers with a very long RPC error. Secret rows, by
+    /// owner: `alice.near` — `sealed`, open to all; `carol.near` — `sealed`,
+    /// open to `carol.near` only; anyone else — none. Every
+    /// `get_secret_with_vault`, `get_project` and vault `get_state` is counted.
+    struct World {
+        sealed: std::sync::Mutex<String>,
+        uuid: std::sync::Mutex<String>,
+        project_hidden: std::sync::atomic::AtomicBool,
+        secret_reads: AtomicUsize,
+        project_reads: AtomicUsize,
+        vault_reads: AtomicUsize,
+    }
+
+    fn the_chain(world: Arc<World>) -> Arc<Answer> {
+        Arc::new(move |account: &str, method: &str, args: &serde_json::Value| match (account, method) {
+            ("outlayer.test", "get_version") => {
+                let key = args["version_key"].as_str().unwrap_or_default();
+                Ok(match (args["project_id"].as_str(), key) {
+                    (Some("alice.near/app"), H1 | H2) => json!({
+                        "wasm_hash": key,
+                        "source": { "WasmUrl": { "url": format!("https://x.fastfs.io/outlayer.test/{key}.wasm"), "hash": key, "build_target": "wasm32-wasip2" } },
+                        "added_at": 0, "is_active": key == H1
+                    }),
+                    (Some("alice.near/app"), H4) => json!({
+                        "wasm_hash": key,
+                        "source": { "GitHub": { "repo": "https://github.com/alice/app", "commit": "abc", "build_target": "wasm32-wasip2" } },
+                        "added_at": 0, "is_active": false
+                    }),
+                    _ => serde_json::Value::Null,
+                })
+            }
+            ("outlayer.test", "get_project") => {
+                world.project_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(if args["project_id"] == "alice.near/app" && !world.project_hidden.load(Ordering::SeqCst) {
+                    let uuid = world.uuid.lock().unwrap().clone();
+                    json!({ "uuid": uuid, "owner": "alice.near", "name": "app", "project_id": "alice.near/app",
+                            "active_version": H1, "created_at": 0, "storage_deposit": "0" })
+                } else {
+                    serde_json::Value::Null
+                })
+            }
+            ("outlayer.test", "get_secret_with_vault") => {
+                world.secret_reads.fetch_add(1, Ordering::SeqCst);
+                let sealed = world.sealed.lock().unwrap().clone();
+                Ok(match args["owner"].as_str() {
+                    Some("alice.near") => json!({ "profile": { "encrypted_secrets": sealed, "access": "AllowAll" }, "vault_id": null }),
+                    Some("carol.near") => json!({
+                        "profile": { "encrypted_secrets": sealed, "access": { "Whitelist": { "accounts": ["carol.near"] } } },
+                        "vault_id": null
+                    }),
+                    _ => json!({ "profile": null, "vault_id": null }),
+                })
+            }
+            (_, "get_state") => {
+                world.vault_reads.fetch_add(1, Ordering::SeqCst);
+                match account {
+                    "vault.alice.near" => Ok(json!({ "parent": "alice.near", "unlocked": false })),
+                    "vault.mallory.near" => Ok(json!({ "parent": "mallory.near", "unlocked": false })),
+                    "other.alice.near" => Ok(json!({ "parent": "mallory.near", "unlocked": false })),
+                    "gone.alice.near" => Err(format!("account {account} does not exist while viewing {}", "x".repeat(5000))),
+                    _ => Err(format!("account {account} does not exist while viewing")),
+                }
+            }
+            _ => Err(format!("account {account} does not exist while viewing")),
+        })
+    }
+
+    const SECRET_JSON: &[u8] = br#"{"API_KEY":"x"}"#;
+
+    /// A chain holding the rows above, sealed under `keystore`.
+    async fn world_with(keystore: crate::crypto::Keystore) -> (AppState, Arc<World>) {
+        let world = Arc::new(World {
+            sealed: Default::default(),
+            uuid: std::sync::Mutex::new(P1.to_string()),
+            project_hidden: Default::default(),
+            secret_reads: AtomicUsize::new(0),
+            project_reads: AtomicUsize::new(0),
+            vault_reads: AtomicUsize::new(0),
+        });
+        let url = chain(the_chain(world.clone())).await;
+        let state = state_with(keystore, Some(&url));
+        {
+            let ks = state.keystore.read().await;
+            // Sealed to alice's row. carol's row is refused by its condition
+            // before any decryption, so it never needs a blob of its own.
+            let ct = ks.encrypt(None, "project:alice.near/app:alice.near", SECRET_JSON).unwrap();
+            *world.sealed.lock().unwrap() = base64::encode(&ct);
+        }
+        (state, world)
+    }
+
+    async fn world() -> (AppState, Arc<World>) {
+        world_with(crate::crypto::Keystore::generate()).await
+    }
+
+    fn key(path: &str, bind: KeyBinding, vault: Option<&str>) -> SigningKeyRequest {
+        SigningKeyRequest {
+            path: path.into(),
+            key_type: SigningKeyType::Ed25519,
+            bind,
+            caller: CallerKind::Signer,
+            vault: vault.map(Into::into),
+        }
+    }
+
+    fn pkey(path: &str) -> SigningKeyRequest {
+        key(path, KeyBinding::Project, None)
+    }
+
+    fn wkey(path: &str) -> SigningKeyRequest {
+        key(path, KeyBinding::Wasm, None)
+    }
+
+    /// A project key of the run's predecessor.
+    fn predkey(path: &str) -> SigningKeyRequest {
+        SigningKeyRequest { caller: CallerKind::Predecessor, ..pkey(path) }
+    }
+
+    /// A keyed request naming no row: a project run when `project` is named, a
+    /// direct run otherwise. `caller` signed; `predecessor` called.
+    fn keyed_as(
+        project: Option<&str>,
+        caller: &str,
+        predecessor: Option<&str>,
+        wasm: &str,
+        keys: Vec<SigningKeyRequest>,
+    ) -> KeyedDecryptRequest {
+        serde_json::from_value(json!({
+            "user_account_id": caller,
+            "task_id": "t1",
+            "executed_wasm_sha256": wasm,
+            "predecessor_id": predecessor,
+            "project_id": project,
+            "signing_keys": keys,
+        }))
+        .unwrap()
+    }
+
+    fn keyed(project: Option<&str>, caller: &str, wasm: &str, keys: Vec<SigningKeyRequest>) -> KeyedDecryptRequest {
+        keyed_as(project, caller, None, wasm, keys)
+    }
+
+    /// A run through project `alice.near/app`.
+    fn project_run(caller: &str, wasm: &str, keys: Vec<SigningKeyRequest>) -> KeyedDecryptRequest {
+        keyed(Some("alice.near/app"), caller, wasm, keys)
+    }
+
+    /// A direct run of a wasm URL.
+    fn direct_run(caller: &str, wasm: &str, keys: Vec<SigningKeyRequest>) -> KeyedDecryptRequest {
+        keyed(None, caller, wasm, keys)
+    }
+
+    /// A keyed request of a run through `project` (a direct run when none),
+    /// naming the project-accessor row of `owner` too.
+    fn keyed_with_row_as(
+        project: Option<&str>,
+        owner: &str,
+        caller: &str,
+        wasm: &str,
+        keys: Vec<SigningKeyRequest>,
+    ) -> KeyedDecryptRequest {
+        serde_json::from_value(json!({
+            "accessor": { "type": "Project", "project_id": "alice.near/app" },
+            "profile": "default",
+            "owner": owner,
+            "user_account_id": caller,
+            "task_id": "t1",
+            "executed_wasm_sha256": wasm,
+            "project_id": project,
+            "signing_keys": keys,
+        }))
+        .unwrap()
+    }
+
+    /// A project run's keyed request that also names the project-accessor row of `owner`.
+    fn keyed_with_row(owner: &str, caller: &str, wasm: &str, keys: Vec<SigningKeyRequest>) -> KeyedDecryptRequest {
+        keyed_with_row_as(Some("alice.near/app"), owner, caller, wasm, keys)
+    }
+
+    async fn ask(state: &AppState, req: KeyedDecryptRequest) -> Result<KeyedDecryptResponse, ApiError> {
+        decrypt_with_signing_keys(state.clone(), None, req).await.map(|Json(r)| r)
+    }
+
+    fn seed_of(response: &KeyedDecryptResponse, path: &str) -> String {
+        let value = serde_json::to_value(&response.signing_keys).unwrap();
+        value[path].as_str().expect("the key by path").to_string()
+    }
+
+    async fn answer_of(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_else(|_| json!(String::from_utf8_lossy(&body))))
+    }
+
+    /// A refusal as the worker reads it: status and body.
+    async fn refused(result: Result<KeyedDecryptResponse, ApiError>) -> (StatusCode, serde_json::Value) {
+        answer_of(result.expect_err("must be refused").into_response()).await
+    }
+
+    fn is_key_refusal(body: &serde_json::Value) -> bool {
+        body["code"] == SIGNING_KEYS_REFUSED
+    }
+
+    /// The master of `crypto.rs`'s pinned vectors.
+    fn pinned_master() -> [u8; 32] {
+        let mut m = [0u8; 32];
+        m.copy_from_slice(b"M-1 regression fixture .........");
+        m
+    }
+
+    #[tokio::test]
+    async fn a_keyed_request_naming_half_a_row_is_refused() {
+        let state = state_on(None);
+        let half: KeyedDecryptRequest = serde_json::from_value(json!({
+            "user_account_id": "bob.near",
+            "accessor": { "type": "Project", "project_id": "alice.near/app" },
+            "signing_keys": [{ "path": "k", "type": "ed25519", "bind": "wasm" }],
+            "executed_wasm_sha256": H1,
+        }))
+        .unwrap();
+        assert!(matches!(ask(&state, half).await, Err(ApiError::BadRequest(_))));
+    }
+
+    /// A direct run: its wasm key comes from the build the worker reports,
+    /// with no chain read at all (this state has no chain).
+    #[tokio::test]
+    async fn a_wasm_key_for_a_direct_run_is_derived_from_the_reported_build() {
+        let state = state_on(None);
+        let response = ask(&state, direct_run("bob.near", H3, vec![wkey("records")])).await.expect("derived");
+        assert!(response.secrets.is_none());
+        let wire = serde_json::to_value(&response).unwrap();
+        assert!(wire.get("secrets").is_none(), "a keys-only answer carries no secrets part: {wire}");
+        assert_eq!(wire["signing_keys"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["records"], "{wire}");
+
+        let expected = {
+            let v = crate::signing_keys::validate_request(None, "bob.near", None, Some(H3), &[wkey("records")])
+                .unwrap()
+                .bind(None)
+                .unwrap();
+            let ks = state.keystore.read().await;
+            hex::encode(ks.derive_signing_key_seed(None, &v.keys[0].input).unwrap().as_ref())
+        };
+        assert_eq!(seed_of(&response, "records"), expected);
+
+        // sign → verify with what came back
+        let seed: [u8; 32] = hex::decode(seed_of(&response, "records")).unwrap().try_into().unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        use ed25519_dalek::{Signer, Verifier};
+        let sig = sk.sign(b"hello");
+        assert!(sk.verifying_key().verify(b"hello", &sig).is_ok());
+    }
+
+    /// The handler answers the pinned vectors of `crypto.rs`, byte for byte:
+    /// the derivation strings are unchanged by how a request names a key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_handler_answers_the_pinned_vectors() {
+        let ks = crate::crypto::Keystore::from_master_secret(&pinned_master()).unwrap();
+        let (state, _) = world_with(ks).await;
+        let project = ask(&state, project_run("bob.near", H1, vec![pkey("records")])).await.expect("project key");
+        assert_eq!(seed_of(&project, "records"), "f6f531d0b454d922a8e1f530f41f3a1cd008c56c496e36c958f2d4013358ac3d");
+        let direct = ask(&state, direct_run("bob.near", H1, vec![wkey("records")])).await.expect("wasm key");
+        assert_eq!(seed_of(&direct, "records"), "c5ab41608101f4088be8bf73c83d37004744976cf2a15cc49b2e882dbc44ee16");
+        let other_build = ask(&state, direct_run("bob.near", H2, vec![wkey("records")])).await.expect("wasm key");
+        assert_eq!(seed_of(&other_build, "records"), "97ed687fa7b55c4558ea87122334e0c856104e755a1c62cc08fa61989f6680ad");
+        let other_caller = ask(&state, project_run("dave.near", H2, vec![pkey("records")])).await.expect("project key");
+        assert_eq!(seed_of(&other_caller, "records"), "20c6e49370bef527cc995a8ecd502c4b1c03f0f6890fe7745db88073a26faf0a");
+        // bob signed, the DAO called: the predecessor key is the DAO's.
+        let dao = ask(&state, keyed_as(Some("alice.near/app"), "bob.near", Some("dao.near"), H1, vec![predkey("records")]))
+            .await
+            .expect("predecessor key");
+        assert_eq!(seed_of(&dao, "records"), "564cad06f84721e12d167b6860c46170ec342f4c309a700bbfe8f7b25f7da397");
+        // The same account as signer and as predecessor: two keys.
+        let bob_as_predecessor =
+            ask(&state, keyed_as(Some("alice.near/app"), "bob.near", Some("bob.near"), H1, vec![predkey("records")]))
+                .await
+                .expect("predecessor key");
+        assert_eq!(seed_of(&bob_as_predecessor, "records"), "978a4ab49ca4f60607132ef5189ffcdf064f23c7e4517e166ff7dafeb927d533");
+    }
+
+    /// A project key follows the project's uuid: the same name created again
+    /// on the contract is another project, with other keys — read on every
+    /// run, never remembered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recreated_project_has_new_keys_and_the_uuid_is_read_every_run() {
+        let (state, world) = world().await;
+        let reads = || world.project_reads.load(Ordering::SeqCst);
+        let before = reads();
+        let first = seed_of(&ask(&state, project_run("bob.near", H1, vec![pkey("k")])).await.expect("derived"), "k");
+        assert_eq!(reads(), before + 1, "a project run reads the project");
+        let again = seed_of(&ask(&state, project_run("bob.near", H1, vec![pkey("k")])).await.expect("derived"), "k");
+        assert_eq!(reads(), before + 2, "every project run reads the project — nothing is cached");
+        assert_eq!(first, again);
+        // A vault-less run still read it (above); a direct run never does.
+        ask(&state, direct_run("bob.near", H1, vec![wkey("k")])).await.expect("derived");
+        assert_eq!(reads(), before + 2);
+
+        *world.uuid.lock().unwrap() = "p0000000000000002".to_string();
+        let recreated = seed_of(&ask(&state, project_run("bob.near", H1, vec![pkey("k")])).await.expect("derived"), "k");
+        assert_ne!(first, recreated, "the same name under another uuid must be another key");
+    }
+
+    /// The project must exist and be the id's owner's, on every project run —
+    /// and its uuid must have the contract's shape, or nothing is derived.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_the_contract_does_not_hold_gets_no_key() {
+        let (state, world) = world().await;
+        world.project_hidden.store(true, Ordering::SeqCst);
+        let (status, body) = refused(ask(&state, project_run("bob.near", H1, vec![pkey("k")])).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(is_key_refusal(&body), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("does not exist on the contract"), "{body}");
+        world.project_hidden.store(false, Ordering::SeqCst);
+
+        for bad in ["p1", "", "P0000000000000001", "p0000000000000001:x", "0000000000000001"] {
+            *world.uuid.lock().unwrap() = bad.to_string();
+            let (status, body) = refused(ask(&state, project_run("bob.near", H1, vec![pkey("k")])).await).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{bad:?}: {body}");
+            assert!(is_key_refusal(&body), "{bad:?}: {body}");
+            assert!(body["error"].as_str().unwrap().contains("uuid"), "{bad:?}: {body}");
+        }
+    }
+
+    /// A predecessor key needs the run's predecessor, and belongs to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_predecessor_key_is_the_predecessors_and_needs_one() {
+        let (state, _) = world().await;
+        let app = Some("alice.near/app");
+        let dao = seed_of(&ask(&state, keyed_as(app, "bob.near", Some("dao.near"), H1, vec![predkey("k")])).await.unwrap(), "k");
+        // Whoever signed, the DAO's key is the DAO's.
+        let via_carol = seed_of(&ask(&state, keyed_as(app, "carol.near", Some("dao.near"), H1, vec![predkey("k")])).await.unwrap(), "k");
+        assert_eq!(dao, via_carol);
+        // The signer's key does not move with the predecessor.
+        let bob = seed_of(&ask(&state, keyed_as(app, "bob.near", Some("dao.near"), H1, vec![pkey("k")])).await.unwrap(), "k");
+        let bob_alone = seed_of(&ask(&state, project_run("bob.near", H1, vec![pkey("k")])).await.unwrap(), "k");
+        assert_eq!(bob, bob_alone);
+        assert_ne!(bob, dao);
+        // One account both ways: two keys.
+        let bob_as_predecessor =
+            seed_of(&ask(&state, keyed_as(app, "bob.near", Some("bob.near"), H1, vec![predkey("k")])).await.unwrap(), "k");
+        assert_ne!(bob, bob_as_predecessor);
+        // Both in one request: each is what it is when asked for alone.
+        let both = ask(&state, keyed_as(app, "bob.near", Some("dao.near"), H1, vec![pkey("mine"), predkey("theirs")])).await.unwrap();
+        let mine = seed_of(&ask(&state, project_run("bob.near", H1, vec![pkey("mine")])).await.unwrap(), "mine");
+        let theirs = seed_of(&ask(&state, keyed_as(app, "carol.near", Some("dao.near"), H1, vec![predkey("theirs")])).await.unwrap(), "theirs");
+        assert_eq!(seed_of(&both, "mine"), mine);
+        assert_eq!(seed_of(&both, "theirs"), theirs);
+        assert_ne!(mine, theirs);
+        // No predecessor on the request: refused, coded, before any chain read.
+        let bare = state_on(None);
+        for (project, keys) in [(app, vec![predkey("k")]), (None, vec![SigningKeyRequest { bind: KeyBinding::Wasm, ..predkey("k") }])] {
+            let (status, body) = refused(ask(&bare, keyed_as(project, "bob.near", None, H1, keys)).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(is_key_refusal(&body), "{body}");
+            assert!(body["error"].as_str().unwrap().contains("carries no predecessor_id"), "{body}");
+        }
+        // An unknown caller value is not even a request.
+        for bad in ["sender", "Signer", "", "both"] {
+            let body = json!({
+                "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app",
+                "signing_keys": [{ "path": "k", "type": "ed25519", "caller": bad }],
+            });
+            assert!(serde_json::from_value::<KeyedDecryptRequest>(body).is_err(), "caller {bad:?}");
+        }
+    }
+
+    /// The worker's placeholder for a missing sender is not a caller a key can
+    /// belong to.
+    #[tokio::test]
+    async fn a_placeholder_caller_is_refused_with_the_code() {
+        let state = state_on(None);
+        for req in [
+            project_run("anonymous", H1, vec![pkey("k")]),
+            direct_run("anonymous", H1, vec![wkey("k")]),
+            keyed_as(Some("alice.near/app"), "bob.near", Some("anonymous"), H1, vec![predkey("k")]),
+            keyed_as(Some("alice.near/app"), "bob.near", Some("anonymous"), H1, vec![pkey("k")]),
+        ] {
+            let (status, body) = refused(ask(&state, req).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(is_key_refusal(&body), "{body}");
+            assert!(body["error"].as_str().unwrap().contains("needs a real caller"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_keys_are_refused_with_the_code_before_any_chain_read() {
+        // No chain: every one of these must be refused on its fields alone.
+        let state = state_on(None);
+        let app = Some("alice.near/app");
+        let four: Vec<_> = (0..4).map(|i| pkey(&format!("k{i}"))).collect();
+        let cases: Vec<(Option<&str>, &str, Option<&str>, &str, Vec<SigningKeyRequest>)> = vec![
+            (app, "bob.near", None, H1, vec![pkey("")]),
+            (app, "bob.near", None, H1, vec![pkey(&"a".repeat(33))]),
+            (app, "bob.near", None, H1, vec![pkey("a:b")]),
+            (app, "bob.near", None, H1, vec![pkey("../k")]),
+            (app, "bob.near", None, H1, vec![pkey("k"), pkey("k")]),
+            (app, "bob.near", None, H1, four),
+            (Some("alice.near/a:pp"), "bob.near", None, H1, vec![pkey("k")]),
+            (Some("alice.near:x/app"), "bob.near", None, H1, vec![pkey("k")]),
+            (app, "bob:near", None, H1, vec![pkey("k")]),
+            (app, "bob.near", Some("dao:near"), H1, vec![pkey("k")]),
+            (app, "anonymous", None, H1, vec![pkey("k")]),
+            (None, "bob.near", None, "11:1", vec![wkey("k")]),
+            (app, "bob.near", None, H1, vec![key("k", KeyBinding::Project, Some("vault.alice.near:x"))]),
+            (app, "bob.near", None, H1, vec![key("k", KeyBinding::Project, Some(""))]),
+            (None, "bob.near", None, H1, vec![key("k", KeyBinding::Wasm, Some("vault.alice.near"))]),
+            // A key whose binding does not match how the code is run.
+            (app, "bob.near", None, H1, vec![wkey("k")]),
+            (None, "bob.near", None, H1, vec![pkey("k")]),
+            // A predecessor key on a run with no predecessor.
+            (app, "bob.near", None, H1, vec![predkey("k")]),
+        ];
+        for (project, caller, predecessor, wasm, keys) in cases {
+            let label = format!("{project:?} {caller} {predecessor:?} {wasm} {keys:?}");
+            let (status, body) = refused(ask(&state, keyed_as(project, caller, predecessor, wasm, keys)).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+            assert!(is_key_refusal(&body), "{label}: {body}");
+            assert!(body["error"].as_str().unwrap().starts_with("Signing keys refused"), "{label}: {body}");
+            assert!(body.get("signing_keys").is_none() && body.get("secrets").is_none(), "{label}: {body}");
+        }
+        // An unknown type, an unknown bind, an unknown caller, the old `name`
+        // field, or a field no key has, is not even a request.
+        for bad in [
+            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "secp256k1" }] }),
+            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "ed25519", "bind": "hash" }] }),
+            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "ed25519", "caller": "sender" }] }),
+            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "name": "k", "type": "ed25519" }] }),
+            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "ed25519", "source_kind": "project" }] }),
+        ] {
+            assert!(serde_json::from_value::<KeyedDecryptRequest>(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    /// Three keys are served; a fourth refuses the whole request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn three_keys_are_served_and_four_refused() {
+        let (state, world) = world().await;
+        let three = ask(&state, project_run("bob.near", H1, vec![pkey("a"), pkey("b"), pkey("c")])).await.expect("three");
+        assert_eq!(serde_json::to_value(&three.signing_keys).unwrap().as_object().unwrap().len(), 3);
+        let before = world.secret_reads.load(Ordering::SeqCst);
+        let (status, body) = refused(
+            ask(&state, keyed_with_row("alice.near", "bob.near", H1, vec![pkey("a"), pkey("b"), pkey("c"), pkey("d")])).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(is_key_refusal(&body) && body["error"].as_str().unwrap().contains("at most 3"), "{body}");
+        assert_eq!(world.secret_reads.load(Ordering::SeqCst), before, "a refused request must not read the row");
+    }
+
+    /// Every way a key can disagree with how the code is run refuses the whole
+    /// request — coded, before the secret row is read — including a manifest
+    /// where only one key of several disagrees. (A run built from GitHub is
+    /// refused by the worker, which holds the resolved code source; through a
+    /// project the contract shows it — `a_build_that_is_not_a_wasm_url_version…`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_bind_and_source_mismatch_refuses_the_whole_request_before_the_row() {
+        let (state, world) = world().await;
+        let app = Some("alice.near/app");
+        let cases: Vec<(&str, Option<&str>, Vec<SigningKeyRequest>)> = vec![
+            ("a wasm key on a project run", app, vec![wkey("k")]),
+            ("a project key on a direct run", None, vec![pkey("k")]),
+            ("mixed: two project keys and one wasm key on a project run", app, vec![pkey("a"), pkey("b"), wkey("c")]),
+            ("mixed: the wasm key first", app, vec![wkey("c"), pkey("a")]),
+            ("mixed: two wasm keys and one project key on a direct run", None, vec![wkey("a"), wkey("b"), pkey("c")]),
+            ("a predecessor key on a run with no predecessor", app, vec![pkey("a"), predkey("b")]),
+        ];
+        for (label, project, keys) in cases {
+            let before = world.secret_reads.load(Ordering::SeqCst);
+            let (status, body) =
+                refused(ask(&state, keyed_with_row_as(project, "alice.near", "bob.near", H1, keys)).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+            assert!(is_key_refusal(&body), "{label}: {body}");
+            assert!(body.get("secrets").is_none() && body.get("signing_keys").is_none(), "{label}: {body}");
+            assert_eq!(world.secret_reads.load(Ordering::SeqCst), before, "{label}: the row must not be read");
+        }
+        // And each run's own kind of key, alone, is served.
+        ask(&state, project_run("bob.near", H1, vec![pkey("a"), pkey("b")])).await.expect("project keys on a project run");
+        ask(&state, direct_run("bob.near", H1, vec![wkey("a"), wkey("b")])).await.expect("wasm keys on a direct run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_build_that_is_not_a_wasm_url_version_of_the_project_gets_no_key() {
+        let (state, world) = world().await;
+        // A build that is no version of the project.
+        let (status, body) = refused(ask(&state, project_run("bob.near", H3, vec![pkey("k")])).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(is_key_refusal(&body), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("is not a WasmUrl version of project alice.near/app"), "{body}");
+        // A version found by this hash whose source is a GitHub repository.
+        let before = world.secret_reads.load(Ordering::SeqCst);
+        let (status, body) =
+            refused(ask(&state, keyed_with_row("alice.near", "bob.near", H4, vec![pkey("k")])).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(is_key_refusal(&body), "{body}");
+        assert_eq!(world.secret_reads.load(Ordering::SeqCst), before, "the row must not be read");
+        // Another project's name cannot be borrowed by a build that is not its.
+        let (status, body) =
+            refused(ask(&state, keyed(Some("carol.near/app"), "bob.near", H1, vec![pkey("k")])).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(is_key_refusal(&body));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_key_survives_a_new_version_and_is_the_callers_own() {
+        let (state, _) = world().await;
+        let project = |wasm: &'static str, caller: &'static str| {
+            let state = state.clone();
+            async move { seed_of(&ask(&state, project_run(caller, wasm, vec![pkey("k")])).await.expect("derived"), "k") }
+        };
+        let direct = |wasm: &'static str, caller: &'static str| {
+            let state = state.clone();
+            async move { seed_of(&ask(&state, direct_run(caller, wasm, vec![wkey("k")])).await.expect("derived"), "k") }
+        };
+        assert_eq!(project(H1, "bob.near").await, project(H2, "bob.near").await);
+        assert_ne!(project(H1, "bob.near").await, project(H1, "dave.near").await);
+        assert_eq!(direct(H1, "bob.near").await, direct(H1, "bob.near").await);
+        assert_ne!(direct(H1, "bob.near").await, direct(H2, "bob.near").await);
+        assert_ne!(direct(H1, "bob.near").await, direct(H1, "dave.near").await);
+        assert_ne!(project(H1, "bob.near").await, direct(H1, "bob.near").await);
+        // Two paths, two keys.
+        let two = ask(&state, project_run("bob.near", H1, vec![pkey("alpha"), pkey("beta")])).await.unwrap();
+        assert_ne!(seed_of(&two, "alpha"), seed_of(&two, "beta"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vault_that_is_not_the_project_owners_is_refused() {
+        let (state, world) = world().await;
+        // Someone else's vault — refused on its name, without reading it.
+        let before = world.vault_reads.load(Ordering::SeqCst);
+        let (status, body) = refused(
+            ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("vault.mallory.near"))])).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(is_key_refusal(&body), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("does not belong to alice.near"), "{body}");
+        assert_eq!(world.vault_reads.load(Ordering::SeqCst), before, "a vault that is not the owner's is never read");
+        // Two vaults, one of them not the owner's: neither is read.
+        let (status, _) = refused(
+            ask(
+                &state,
+                project_run(
+                    "bob.near",
+                    H1,
+                    vec![key("a", KeyBinding::Project, Some("vault.alice.near")), key("b", KeyBinding::Project, Some("vault.mallory.near"))],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(world.vault_reads.load(Ordering::SeqCst), before, "no vault is read while one of them is not the owner's");
+        // A sub-account of the owner whose vault names another parent: read, then refused.
+        let (status, body) = refused(
+            ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("other.alice.near"))])).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("its parent is mallory.near"), "{body}");
+        assert_eq!(world.vault_reads.load(Ordering::SeqCst), before + 1);
+    }
+
+    /// A vault the chain cannot answer for is the keystore's outage, not a
+    /// refusal: no keys, a 500 without the refusal code — as when the project
+    /// itself cannot be read — and the chain's own words reach the message cut
+    /// short, never whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vault_the_chain_cannot_answer_for_is_an_outage_not_a_refusal() {
+        let (state, _) = world().await;
+        let result = ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("gone.alice.near"))])).await;
+        assert!(matches!(result, Err(ApiError::InternalError(_))), "{:?}", result.as_ref().err());
+        let (status, body) = refused(result).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(!is_key_refusal(&body), "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("gone.alice.near could not be read"), "{body}");
+        assert!(error.chars().count() < 500, "the RPC's text is bounded: {} chars", error.chars().count());
+        assert!(!error.contains(&"x".repeat(300)), "{body}");
+    }
+
+    /// The owner's own vault, whose master this keystore cannot load (no MPC
+    /// here): the keystore's outage, a 500 without the refusal code — and in
+    /// particular NOT answered from the default master.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vault_that_cannot_be_loaded_never_falls_back_to_the_default_master() {
+        let (state, _) = world().await;
+        let result = ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("vault.alice.near"))])).await;
+        assert!(matches!(result, Err(ApiError::InternalError(_))), "{:?}", result.as_ref().err());
+        let (status, body) = refused(result).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(!is_key_refusal(&body), "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("vault vault.alice.near is not available"), "{body}");
+        assert!(error.chars().count() < 500, "the load's text is bounded: {} chars", error.chars().count());
+    }
+
+    // ---- One request, two independent parts ---------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_secret_row_and_keys_come_back_together() {
+        let (state, _) = world().await;
+        let response = ask(&state, keyed_with_row("alice.near", "bob.near", H1, vec![pkey("records")])).await.expect("both");
+        match response.secrets {
+            Some(SecretsOutcome::Decrypted { ref plaintext_secrets }) => {
+                assert_eq!(base64::decode(plaintext_secrets).unwrap(), SECRET_JSON)
+            }
+            ref other => panic!("expected decrypted secrets, got {other:?}"),
+        }
+        assert_eq!(seed_of(&response, "records").len(), 64);
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["secrets"]["status"], "decrypted");
+        assert!(wire["signing_keys"].is_object());
+        assert_eq!(wire.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["secrets", "signing_keys"]);
+    }
+
+    /// No secret row: the keys still come back, and the row is reported as not
+    /// found — the outcome a secrets-only request answers with a 400 the worker
+    /// runs on without secrets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_secret_is_reported_beside_the_keys() {
+        let (state, _) = world().await;
+        let response = ask(&state, keyed_with_row("nobody.near", "bob.near", H1, vec![pkey("records")]))
+            .await
+            .expect("keys despite no secret");
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["secrets"], json!({ "status": "not_found", "error": "Secrets not found in contract" }));
+        assert_eq!(seed_of(&response, "records").len(), 64);
+    }
+
+    /// Valid keys do not release a secret its condition refuses: the request
+    /// fails with the secret's own refusal, uncoded, and carries no keys.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_secret_fails_the_request_even_with_valid_keys() {
+        let (state, _) = world().await;
+        // The keys alone are fine for this caller.
+        ask(&state, project_run("bob.near", H1, vec![pkey("records")])).await.expect("the keys on their own are served");
+        let (status, body) =
+            refused(ask(&state, keyed_with_row("carol.near", "bob.near", H1, vec![pkey("records")])).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(!is_key_refusal(&body), "a secret's refusal is not a key refusal: {body}");
+        assert!(body.get("signing_keys").is_none() && body.get("secrets").is_none(), "{body}");
+    }
+
+    /// A secret its condition admits does not carry refused keys: the request
+    /// fails with the key refusal, and the row is not even read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_keys_fail_the_request_even_with_an_open_secret() {
+        let (state, world) = world().await;
+        let before = world.secret_reads.load(Ordering::SeqCst);
+        let (status, body) =
+            refused(ask(&state, keyed_with_row("alice.near", "bob.near", H3, vec![pkey("records")])).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(is_key_refusal(&body), "{body}");
+        assert!(body.get("secrets").is_none(), "{body}");
+        assert_eq!(world.secret_reads.load(Ordering::SeqCst), before, "a refused key request must not read the row");
+        // And the same row, asked for without keys, is served — the refusal was the keys'.
+        let Json(plain) = decrypt_secrets_only(
+            state.clone(),
+            None,
+            serde_json::from_value(json!({
+                "accessor": { "type": "Project", "project_id": "alice.near/app" },
+                "profile": "default", "owner": "alice.near", "user_account_id": "bob.near",
+                "executed_wasm_sha256": H3,
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("served without keys");
+        assert_eq!(base64::decode(plain.plaintext_secrets).unwrap(), SECRET_JSON);
+    }
+
+    // ---- The door: which shape a body is -------------------------------------
+
+    fn door(state: AppState) -> axum::Router {
+        axum::Router::new().route("/decrypt", axum::routing::post(decrypt_handler)).with_state(state)
+    }
+
+    async fn post(state: &AppState, content_type: Option<&str>, body: String) -> (StatusCode, Vec<u8>) {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder().method("POST").uri("/decrypt");
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let response = door(state.clone()).oneshot(builder.body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+        let status = response.status();
+        (status, axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec())
+    }
+
+    /// What the secrets-only extractor answers for `body`, as it always has.
+    async fn as_always(content_type: Option<&str>, body: &str) -> (StatusCode, Vec<u8>) {
+        use axum::extract::FromRequest;
+        let mut builder = axum::http::Request::builder().method("POST").uri("/decrypt");
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let request = builder.body(axum::body::Body::from(body.to_string())).unwrap();
+        let rejection = Json::<DecryptRequest>::from_request(request, &()).await.err().expect("a rejection");
+        let response = rejection.into_response();
+        let status = response.status();
+        (status, axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec())
+    }
+
+    /// A body without keys is answered exactly as before: the same bytes for
+    /// a decrypted row, for a missing row, and for every extractor rejection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_without_keys_is_answered_exactly_as_before() {
+        let (state, _) = world().await;
+        let json = Some("application/json");
+        let row = |owner: &str, extra: &str| {
+            format!(
+                r#"{{"accessor":{{"type":"Project","project_id":"alice.near/app"}},"profile":"default","owner":"{owner}","user_account_id":"bob.near"{extra}}}"#
+            )
+        };
+
+        let (status, body) = post(&state, json, row("alice.near", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["plaintext_secrets"]);
+        assert_eq!(base64::decode(v["plaintext_secrets"].as_str().unwrap()).unwrap(), SECRET_JSON);
+
+        let (status, body) = post(&state, json, row("nobody.near", "")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, br#"{"error":"Secrets not found in contract"}"#);
+
+        // `signing_keys` absent, null or empty — or only the fields that go
+        // with it, or another member's name — is not a keyed request.
+        for extra in [
+            r#","signing_keys":null"#,
+            r#","signing_keys":[]"#,
+            r#","project_id":"alice.near/app""#,
+            r#","project_id":"alice.near/app","signing_keys":[]"#,
+            r#","keys":[{"path":"k","type":"ed25519"}]"#,
+        ] {
+            let (status, body) = post(&state, json, row("nobody.near", extra)).await;
+            assert_eq!((status, body.as_slice()), (StatusCode::BAD_REQUEST, &br#"{"error":"Secrets not found in contract"}"#[..]), "{extra}");
+            let (status, body) = post(&state, json, row("alice.near", extra)).await;
+            assert_eq!(status, StatusCode::OK, "{extra}");
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["plaintext_secrets"], "{extra}");
+        }
+
+        // Rejections: the extractor's own answer, byte for byte.
+        for (ct, body) in [
+            (json, r#"{"profile":"default","owner":"a.near","user_account_id":"b.near"}"#.to_string()),
+            (json, "{not json".to_string()),
+            (json, "[1,2]".to_string()),
+            (json, "".to_string()),
+            (None, row("alice.near", "")),
+            (Some("text/plain"), row("alice.near", "")),
+            (Some("text/plain"), row("alice.near", r#","project_id":"alice.near/app","signing_keys":[{"path":"k","type":"ed25519"}]"#)),
+            // Malformed JSON that happens to spell `signing_keys` twice: the
+            // extractor's own rejection, as for any malformed body.
+            (json, r#"{"signing_keys":[{"path":"k"}],"signing_keys":[]"#.to_string()),
+        ] {
+            assert_eq!(post(&state, ct, body.clone()).await, as_always(ct, &body).await, "{ct:?} {body}");
+        }
+    }
+
+    /// A well-formed object naming `signing_keys` twice is neither request: the
+    /// two parsers could read it two ways, so it is refused before either
+    /// looks, with the reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_naming_signing_keys_twice_is_refused_as_neither_request() {
+        let (state, world) = world().await;
+        let json = Some("application/json");
+        let secret_reads = || world.secret_reads.load(Ordering::SeqCst);
+        let row = |first: &str, second: &str| {
+            format!(
+                r#"{{"accessor":{{"type":"Project","project_id":"alice.near/app"}},"profile":"default","owner":"alice.near","user_account_id":"bob.near","executed_wasm_sha256":"{H1}","project_id":"alice.near/app","signing_keys":{first},"signing_keys":{second}}}"#
+            )
+        };
+        let keys = r#"[{"path":"k","type":"ed25519"}]"#;
+        for body in [row("[]", keys), row(keys, "[]"), row("null", keys), row(keys, "null"), row(keys, keys), row("[]", "[]")] {
+            let before = secret_reads();
+            let (status, bytes) = post(&state, json, body.clone()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let error = v["error"].as_str().unwrap();
+            assert!(error.contains("duplicate field `signing_keys`") && error.contains("at most once"), "{body}: {v}");
+            assert!(v.get("plaintext_secrets").is_none() && v.get("signing_keys").is_none() && v.get("secrets").is_none(), "{v}");
+            assert_eq!(secret_reads(), before, "nothing is read for a body neither parser is trusted with");
+        }
+        // The same duplicate in a body whose type the extractor refuses: its
+        // rejection, as always.
+        let body = row("[]", keys);
+        assert_eq!(post(&state, Some("text/plain"), body.clone()).await, as_always(Some("text/plain"), &body).await);
+    }
+
+    /// `SecretsNotFound` is, on the wire, the 400 a missing row has always
+    /// answered with — byte for byte what `BadRequest` answers.
+    #[tokio::test]
+    async fn a_missing_row_answers_the_same_bytes_as_always() {
+        let message = "Secrets not found in contract";
+        let typed = answer_of(ApiError::SecretsNotFound(message.to_string()).into_response()).await;
+        let plain = answer_of(ApiError::BadRequest(message.to_string()).into_response()).await;
+        assert_eq!(typed, plain);
+        assert_eq!(typed.0, StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(ApiError::SecretsNotFound(message.to_string()).into_response().into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), br#"{"error":"Secrets not found in contract"}"#);
+        assert_eq!(ApiError::SecretsNotFound(message.to_string()).message(), message);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_with_keys_gets_the_two_part_answer() {
+        let (state, _) = world().await;
+        let body = format!(
+            r#"{{"accessor":{{"type":"Project","project_id":"alice.near/app"}},"profile":"default","owner":"nobody.near",
+                "user_account_id":"bob.near","executed_wasm_sha256":"{H1}","project_id":"alice.near/app",
+                "signing_keys":[{{"path":"records","type":"ed25519"}}]}}"#
+        );
+        let (status, bytes) = post(&state, Some("application/json"), body).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["secrets"]["status"], "not_found");
+        assert_eq!(v["signing_keys"]["records"].as_str().unwrap().len(), 64);
+
+        // A malformed keys member is a keyed request, refused as one.
+        let (status, _) =
+            post(&state, Some("application/json"), r#"{"user_account_id":"b.near","signing_keys":"records"}"#.into()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        // A keyed body naming no project is a direct run: its wasm key is served.
+        let (status, bytes) = post(
+            &state,
+            Some("application/json"),
+            format!(r#"{{"user_account_id":"b.near","executed_wasm_sha256":"{H1}","signing_keys":[{{"path":"k","type":"ed25519","bind":"wasm"}}]}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["signing_keys"]["k"].as_str().unwrap().len(), 64);
+        assert!(v.get("secrets").is_none());
+    }
+
+    /// Old worker → new keystore: the request it sends still parses, and the
+    /// answer still has exactly the one field it reads.
+    #[test]
+    fn an_old_workers_request_and_answer_are_unchanged() {
+        let old: DecryptRequest = serde_json::from_str(
+            r#"{"accessor":{"type":"Project","project_id":"a.near/p"},"profile":"default",
+                "owner":"a.near","user_account_id":"a.near","task_id":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.owner, "a.near");
+        let answer = DecryptResponse { plaintext_secrets: "e30=".into() };
+        assert_eq!(serde_json::to_string(&answer).unwrap(), r#"{"plaintext_secrets":"e30="}"#);
+    }
+
+    /// The derivation string cannot be supplied by a request: it is not a
+    /// field, and an unknown field inside a key is refused.
+    #[test]
+    fn a_request_cannot_carry_its_own_derivation_string() {
+        let parsed: Result<KeyedDecryptRequest, _> = serde_json::from_value(json!({
+            "user_account_id": "bob.near", "executed_wasm_sha256": H1,
+            "signing_keys": [{ "path": "k", "type": "ed25519", "bind": "wasm", "seed": "wallet:abc:near" }],
+        }));
+        assert!(parsed.is_err());
+    }
+}

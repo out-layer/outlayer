@@ -1,0 +1,83 @@
+package outlayer:signing-keys@0.1.0;
+
+/// Signing keys for OutLayer WASI components.
+///
+/// A component declares the keys it signs with in its `outlayer.manifest`
+/// custom section, at most three:
+///
+///     "signing_keys": [
+///       {"path": "records", "type": "ed25519"},
+///       {"path": "votes", "type": "ed25519", "caller": "predecessor"},
+///       {"path": "payouts", "type": "ed25519", "vault": "vault.owner.near"}
+///     ]
+///
+/// The keystore derives each key inside the TEE, for this run only, from how
+/// the code is run and the account that called for the run — never from
+/// anything the component says at runtime:
+///
+/// - `bind: "project"` (the default): issued only to a run through a project
+///   whose running version is published as a WasmUrl. The key belongs to the
+///   project (its on-chain uuid, so a project deleted and created again under
+///   the same name has new keys) and the caller; every version of the project
+///   signs with it, so it survives a code upgrade.
+/// - `bind: "wasm"`: issued only to a direct run of a wasm URL, with no
+///   project. The key belongs to this exact build and the caller; a new build
+///   signs with a new key.
+///
+/// A run built from a GitHub repository gets no key, and one declared key
+/// whose `bind` does not match how the code is run refuses the whole run
+/// before it starts.
+///
+/// `caller` chooses which account the key belongs to:
+///
+/// - `"signer"` (the default): the transaction signer on chain
+///   (`NEAR_USER_ACCOUNT_ID`), the payment-key owner over HTTPS. Any contract
+///   the signer ever transacts with can start a run under the signer's key
+///   with input of its own choosing — a `ft_transfer_call`, a DAO proposal,
+///   a wallet contract's callback all execute as the signer — so a module
+///   must never treat its input as the signer's intent.
+/// - `"predecessor"`: the account that actually called the contract
+///   (`NEAR_PREDECESSOR_ID`) — the DAO or wallet contract itself when one
+///   relayed the call, the signer when none did, and the signer over HTTPS.
+///   The key is that contract's, not the signer's; on a payment path through
+///   `ft_transfer_call` it binds to the token contract. A run with no
+///   predecessor is refused before it starts.
+///
+/// With `bind: "wasm"` the key belongs to the code, so the code must not
+/// decide WHAT to sign from its secrets, environment or configuration —
+/// whoever runs the binary controls those.
+///
+/// **Never sign caller-supplied bytes or digests verbatim.** The key's public
+/// key is a real NEAR implicit account (and a Solana address): a signature over
+/// bytes the caller chose is a signature over anything those bytes are — a
+/// transaction that empties the account, an authorization, a message the
+/// account never meant. Sign only messages this module composes itself, from
+/// fields it has parsed and checked, under a fixed prefix or structure of its
+/// own; an input that asks for a signature over raw bytes is refused.
+///
+/// `vault` (only with `bind: "project"`) derives the key from that vault's
+/// master; the vault must belong to the project's owner.
+///
+/// The component never sees a key: it names one by `path` and the host signs.
+/// A call names the key's declared vault exactly: `none` for a key declared
+/// without one, `some(<vault>)` for a key declared with that vault. An
+/// undeclared path, a vault that is not the declared one, a key of a type the
+/// call does not serve, or a message over 65536 bytes is an `err` carrying the
+/// reason, never a trap.
+interface api {
+    /// The public key of the declared key at `path`.
+    ///
+    /// ed25519: the 32-byte public key.
+    public-key: func(path: string, vault: option<string>) -> result<list<u8>, string>;
+
+    /// Sign `message` with the declared key at `path`.
+    ///
+    /// ed25519: an RFC 8032 signature (64 bytes) over the raw message bytes —
+    /// no prehash, no prefix. At most 65536 bytes of message; sign a digest to
+    /// cover more.
+    sign: func(path: string, vault: option<string>, message: list<u8>) -> result<list<u8>, string>;
+}
+
+world signing-keys-host {
+    import api;
+}

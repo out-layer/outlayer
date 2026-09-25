@@ -3852,6 +3852,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "zeroize",
 ]
 
 [[package]]

@@ -33,6 +33,7 @@ mod mpc_ckd;
 mod tee_registration;
 mod tdx_attestation;
 mod vault_verifier;
+mod signing_keys;
 
 use anyhow::{Context, Result};
 use config::{Config, TeeMode};

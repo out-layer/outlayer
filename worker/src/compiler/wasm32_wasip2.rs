@@ -2,7 +2,8 @@
 //!
 //! Compiles Rust code to wasm32-wasip2 target using:
 //! - cargo build --release --target wasm32-wasip2
-//! - wasm-tools strip for optimization
+//! - wasm-tools strip for optimization (the `outlayer.manifest` section is kept),
+//!   then a check that no other custom section survived
 
 use anyhow::Result;
 use bollard::Docker;
@@ -101,9 +102,19 @@ fi
 
 echo "🔧 Optimizing WASI P2 CLI component..."
 
-# Strip debug information from component
-wasm-tools strip /workspace/output/output.wasm -o /workspace/output/output_optimized.wasm
+# Strip debug information and build metadata from the component, by name. A
+# bare `strip` deletes every custom section it does not know, and that takes
+# `outlayer.manifest` with it — the module's network allowlist, author secrets,
+# limits and signing keys. Everything else a bare strip removes is listed here.
+wasm-tools strip --delete '^(\.debug_.*|producers|target_features|linking|reloc\..*|sourceMappingURL|external_debug_info|component-name)$' /workspace/output/output.wasm -o /workspace/output/output_optimized.wasm
 mv /workspace/output/output_optimized.wasm /workspace/output/output.wasm
+# What is left after the strip, by section name. Only what this platform
+# expects may remain — `name`, `component-type*` and `dylink.0`, which
+# wasm-tools keeps by design, and `outlayer.manifest` — so a section the
+# delete list does not name fails the build with its name rather than
+# shipping in the bytes.
+STRAY=$(wasm-tools objdump /workspace/output/output.wasm | sed -n "s/^ *custom \"\([^\"]*\)\".*/\1/p" | sort -u | grep -v -E "^(name|component-type.*|dylink\.0|outlayer\.manifest)$" || true)
+[ -z "$STRAY" ] || {{ echo "ERROR: custom sections survived the strip: $STRAY"; exit 1; }}
 
 OPTIMIZED_SIZE=$(stat -c%s /workspace/output/output.wasm 2>/dev/null || stat -f%z /workspace/output/output.wasm)
 SAVED=$((ORIGINAL_SIZE - OPTIMIZED_SIZE))
@@ -190,6 +201,69 @@ mod the_generated_shell_is_shell {
         let script = compile_script();
         assert!(!script.contains("&>"), "`&>` is bash; this runs under `sh -c`");
         assert!(!script.contains("[["), "`[[` is bash; this runs under `sh -c`");
+    }
+
+    #[test]
+    fn the_p2_script_keeps_the_manifest() {
+        // The manifest is a custom section; a bare `wasm-tools strip` removes
+        // it, and a repository build would then run with no network, no author
+        // secrets, no limits and no signing keys — silently.
+        let script = compile_script();
+        let strip = script
+            .lines()
+            .find(|l| l.trim_start().starts_with("wasm-tools strip"))
+            .expect("the script strips the component");
+        assert!(strip.contains("--delete"), "a bare strip deletes outlayer.manifest: {strip}");
+        assert!(!strip.contains("--all"), "--all deletes outlayer.manifest: {strip}");
+        assert!(!strip.contains("outlayer"), "the delete list must not name the manifest: {strip}");
+        // And what survives the strip is checked against a list the manifest
+        // is on and `component-name` — deleted above — is not.
+        let (stray, fail) = check_lines(&script);
+        assert!(stray.contains("outlayer\\.manifest"), "the check must let the manifest through: {stray}");
+        assert!(!stray.contains("component-name"), "a deleted section has no place on the allowlist: {stray}");
+        assert!(fail.contains("exit 1"), "a stray section must fail the build: {fail}");
+        assert!(fail.contains("$STRAY"), "the failure must name the sections: {fail}");
+        let strip_at = script.find("wasm-tools strip").unwrap();
+        let check_at = script.find("STRAY=$(").unwrap();
+        assert!(strip_at < check_at, "the check reads the stripped bytes");
+    }
+
+    /// The post-strip check: the line that lists what survived, and the line
+    /// that fails on it.
+    fn check_lines(text: &str) -> (String, String) {
+        let line = |prefix: &str| {
+            text.lines()
+                .map(str::trim_start)
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("a line starting with {prefix}"))
+                .to_string()
+        };
+        (line("STRAY=$("), line("[ -z \"$STRAY\" ]"))
+    }
+
+    /// `scripts/build_github_wasm.sh` reproduces this build locally so a secret
+    /// can be locked to the hash before the first run. Its strip must be this
+    /// one, character for character, or the two hashes part — and its check of
+    /// what survived, too, or a build passes locally and fails on the
+    /// platform. `scripts/test_compiler.sh` runs the same check (its strip
+    /// line is the same regex under the quoting its `bash -c` allows).
+    #[test]
+    fn the_local_build_script_strips_the_same_way() {
+        fn strip_args(text: &str) -> String {
+            let line = text
+                .lines()
+                .map(str::trim_start)
+                .find(|l| l.starts_with("wasm-tools strip"))
+                .expect("a wasm-tools strip line");
+            // Everything up to the input path; the output file names differ.
+            line.split(" /workspace/").next().unwrap().to_string()
+        }
+        let script = compile_script();
+        let local = include_str!("../../../scripts/build_github_wasm.sh");
+        let tester = include_str!("../../../scripts/test_compiler.sh");
+        assert_eq!(strip_args(local), strip_args(&script));
+        assert_eq!(check_lines(local), check_lines(&script));
+        assert_eq!(check_lines(tester), check_lines(&script));
     }
 
     #[test]

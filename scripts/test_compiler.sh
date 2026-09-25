@@ -164,8 +164,15 @@ if [ "$BUILD_TARGET" = "wasm32-wasip2" ]; then
         echo "🔧 Optimizing WASI P2 CLI component..."
 
         # Strip debug information from component
-        wasm-tools strip /workspace/output/output.wasm -o /workspace/output/output_optimized.wasm
+        wasm-tools strip --delete "^(\.debug_.*|producers|target_features|linking|reloc\..*|sourceMappingURL|external_debug_info|component-name)$" /workspace/output/output.wasm -o /workspace/output/output_optimized.wasm
         mv /workspace/output/output_optimized.wasm /workspace/output/output.wasm
+        # What is left after the strip, by section name. Only what this platform
+        # expects may remain — `name`, `component-type*` and `dylink.0`, which
+        # wasm-tools keeps by design, and `outlayer.manifest` — so a section the
+        # delete list does not name fails the build with its name rather than
+        # shipping in the bytes.
+        STRAY=$(wasm-tools objdump /workspace/output/output.wasm | sed -n "s/^ *custom \"\([^\"]*\)\".*/\1/p" | sort -u | grep -v -E "^(name|component-type.*|dylink\.0|outlayer\.manifest)$" || true)
+        [ -z "$STRAY" ] || { echo "ERROR: custom sections survived the strip: $STRAY"; exit 1; }
 
         OPTIMIZED_SIZE=$(stat -c%s /workspace/output/output.wasm 2>/dev/null || stat -f%z /workspace/output/output.wasm)
         SAVED=$((ORIGINAL_SIZE - OPTIMIZED_SIZE))

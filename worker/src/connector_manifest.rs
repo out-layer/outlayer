@@ -75,6 +75,15 @@ pub struct ProjectManifest {
     /// is still evaluated against the caller.
     #[serde(default)]
     pub author_secrets: Option<AuthorSecrets>,
+    /// Signing keys the artefact signs with, by path, at most three — see
+    /// [`crate::signing_keys`] and `wit/deps/signing-keys.wit`. The keystore
+    /// derives each for the run from how the code is run, the job's project or
+    /// build and its caller; the guest reaches them only through the
+    /// `outlayer:signing-keys` host functions. A declaration that breaks the
+    /// rules of [`crate::signing_keys::check_declarations`] does not parse, and
+    /// one the run cannot be served refuses the run.
+    #[serde(default, deserialize_with = "crate::signing_keys::deserialize_declared")]
+    pub signing_keys: Option<Vec<crate::signing_keys::ManifestKey>>,
 }
 
 /// `author_secrets` in the manifest — see [`ProjectManifest::author_secrets`].
@@ -237,8 +246,16 @@ impl ProjectManifest {
             .or(self.network.as_deref())
     }
 
+    /// Read a manifest, or say why it is not one. The reason is kept: a
+    /// manifest is public, author-written text, and "unknown variant
+    /// `secp256k1`" is what its author needs.
+    pub fn read(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice::<Self>(bytes).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
     pub fn parse(bytes: &[u8]) -> Option<Self> {
-        serde_json::from_slice::<Self>(bytes).ok()
+        Self::read(bytes).ok()
     }
 }
 
@@ -497,9 +514,9 @@ pub fn manifest_from_wasm(wasm: &[u8]) -> Result<Option<ProjectManifest>, String
                     reader.data().len()
                 ));
             }
-            return match ProjectManifest::parse(reader.data()) {
-                Some(m) => Ok(Some(m)),
-                None => Err(format!("the {MANIFEST_SECTION} section does not parse as a manifest")),
+            return match ProjectManifest::read(reader.data()) {
+                Ok(m) => Ok(Some(m)),
+                Err(e) => Err(format!("the {MANIFEST_SECTION} section does not parse as a manifest: {e}")),
             };
         }
     }

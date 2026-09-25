@@ -67,6 +67,7 @@ use crate::outlayer_storage::{StorageClient, StorageHostState, add_storage_to_li
 use crate::outlayer_payment::{PaymentHostState, add_payment_to_linker};
 use crate::outlayer_vrf::{VrfHostState, add_vrf_to_linker};
 use crate::outlayer_wallet::{WalletHostState, add_wallet_to_linker};
+use crate::signing_keys::{SigningKeys, SigningKeysHostState, add_signing_keys_to_linker};
 
 use super::ExecutionContext;
 
@@ -92,6 +93,9 @@ struct HostState {
     vrf_state: Option<VrfHostState>,
     /// Wallet state (only present if wallet_id in execution request)
     wallet_state: Option<WalletHostState>,
+    /// This run's signing keys (only present if the component imports
+    /// `outlayer:signing-keys/api`). Dropped with the store, at the end of the run.
+    signing_keys_state: Option<SigningKeysHostState>,
     /// Counter for timed-out HTTP requests (shared with spawned tasks)
     http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
     /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
@@ -328,6 +332,11 @@ impl HostState {
     fn wallet_state_mut(&mut self) -> &mut WalletHostState {
         self.wallet_state.as_mut().expect("Wallet state not initialized")
     }
+
+    /// Get signing-keys host state (for host function callbacks)
+    fn signing_keys_state_mut(&mut self) -> &mut SigningKeysHostState {
+        self.signing_keys_state.as_mut().expect("Signing keys state not initialized")
+    }
 }
 
 /// Execute WASI Preview 2 component
@@ -346,6 +355,7 @@ impl HostState {
 /// * `env_vars` - Environment variables (from encrypted secrets, includes ATTACHED_USD)
 /// * `print_stderr` - Print WASM stderr to worker logs
 /// * `exec_ctx` - Execution context with optional RPC proxy
+/// * `signing_keys` - This run's declared signing keys, if it declares any
 ///
 /// # Returns
 /// * `Ok((output, fuel_consumed, refund_usd))` - Execution succeeded
@@ -360,6 +370,7 @@ pub async fn execute(
     env_vars: Option<HashMap<String, String>>,
     print_stderr: bool,
     exec_ctx: Option<&ExecutionContext>,
+    signing_keys: Option<SigningKeys>,
 ) -> Result<(Vec<u8>, u64, Option<u64>)> {
     // Use global P2 engine (avoids ~50-100ms overhead per execution)
     let engine = get_p2_engine();
@@ -566,6 +577,25 @@ pub async fn execute(
         None
     };
 
+    // Signing keys: reachable only through the host functions, never through
+    // the environment or stdin. A component that imports the interface without
+    // declaring a key gets an empty set, so every path answers "not declared".
+    let has_signing_keys_import = component.component_type().imports(&engine)
+        .any(|(name, _)| name.contains("outlayer:signing-keys/api"));
+
+    let signing_keys_state = if has_signing_keys_import {
+        let keys = signing_keys.unwrap_or_else(SigningKeys::none);
+        debug!("Adding signing-key host functions to linker, paths={:?}", keys.paths().collect::<Vec<_>>());
+        add_signing_keys_to_linker(&mut linker, |state: &mut HostState| state.signing_keys_state_mut())?;
+        Some(SigningKeysHostState::new(keys))
+    } else {
+        if signing_keys.as_ref().is_some_and(|k| !k.is_empty()) {
+            debug!("Component declares signing keys but does not import outlayer:signing-keys/api; they go unused");
+        }
+        drop(signing_keys);
+        None
+    };
+
     // Prepare stdin/stdout/stderr pipes
     let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
     let stdout_pipe =
@@ -632,6 +662,7 @@ pub async fn execute(
         payment_state,
         vrf_state,
         wallet_state,
+        signing_keys_state,
         http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         engine_handle: engine,
         network_policy,

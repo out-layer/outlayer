@@ -162,6 +162,47 @@ impl ExecutionContext {
     }
 }
 
+/// One execution carrying its signing keys — see [`Executor::with_signing_keys`].
+pub struct RunWithKeys<'a> {
+    executor: &'a Executor,
+    signing_keys: Option<crate::signing_keys::SigningKeys>,
+}
+
+impl RunWithKeys<'_> {
+    /// As [`Executor::execute`], with this run's signing keys.
+    pub async fn execute(
+        self,
+        wasm_bytes: &[u8],
+        wasm_content_sha256: Option<&str>,
+        input_data: &[u8],
+        limits: &ResourceLimits,
+        env_vars: Option<HashMap<String, String>>,
+        build_target: Option<&str>,
+        response_format: &ResponseFormat,
+        storage_config: Option<StorageConfig>,
+        vrf_config: Option<VrfConfig>,
+        wallet_config: Option<WalletConfig>,
+        network_config: Option<NetworkConfig>,
+    ) -> Result<ExecutionResult> {
+        self.executor
+            .execute_run(
+                wasm_bytes,
+                wasm_content_sha256,
+                input_data,
+                limits,
+                env_vars,
+                build_target,
+                response_format,
+                storage_config,
+                vrf_config,
+                wallet_config,
+                network_config,
+                self.signing_keys,
+            )
+            .await
+    }
+}
+
 /// WASM executor supporting multiple WASI versions
 pub struct Executor {
     /// Maximum instructions allowed per execution (default)
@@ -206,6 +247,11 @@ impl Executor {
     /// * `vrf_config` - Optional per-execution VRF config (overrides context)
     /// * `wallet_config` - Optional per-execution wallet config (overrides context)
     /// * `network_config` - Per-execution outbound allowlist + egress audit sink
+    ///
+    /// A run with signing keys goes through [`Executor::with_signing_keys`],
+    /// which is how the job path calls it; this is the entry for everything
+    /// else (tests, tools).
+    #[allow(dead_code)]
     pub async fn execute(
         &self,
         wasm_bytes: &[u8],
@@ -220,6 +266,45 @@ impl Executor {
         wallet_config: Option<WalletConfig>,
         network_config: Option<NetworkConfig>,
     ) -> Result<ExecutionResult> {
+        self.execute_run(
+            wasm_bytes,
+            wasm_content_sha256,
+            input_data,
+            limits,
+            env_vars,
+            build_target,
+            response_format,
+            storage_config,
+            vrf_config,
+            wallet_config,
+            network_config,
+            None,
+        )
+        .await
+    }
+
+    /// One run with this run's signing keys: they are moved in, reachable only
+    /// through the `outlayer:signing-keys` host functions, and dropped with the
+    /// run — never part of the long-lived execution context.
+    pub fn with_signing_keys(&self, signing_keys: Option<crate::signing_keys::SigningKeys>) -> RunWithKeys<'_> {
+        RunWithKeys { executor: self, signing_keys }
+    }
+
+    async fn execute_run(
+        &self,
+        wasm_bytes: &[u8],
+        wasm_content_sha256: Option<&str>,
+        input_data: &[u8],
+        limits: &ResourceLimits,
+        env_vars: Option<HashMap<String, String>>,
+        build_target: Option<&str>,
+        response_format: &ResponseFormat,
+        storage_config: Option<StorageConfig>,
+        vrf_config: Option<VrfConfig>,
+        wallet_config: Option<WalletConfig>,
+        network_config: Option<NetworkConfig>,
+        signing_keys: Option<crate::signing_keys::SigningKeys>,
+    ) -> Result<ExecutionResult> {
         info!(
             "Starting WASM execution: {} instructions, {} MB memory, {} seconds, target: {:?}, format: {:?}",
             limits.max_instructions, limits.max_memory_mb, limits.max_execution_seconds, build_target, response_format
@@ -228,7 +313,7 @@ impl Executor {
         let start = Instant::now();
 
         // Try to execute with different WASI versions
-        let result = self.execute_async(wasm_bytes, wasm_content_sha256, input_data, limits, env_vars, build_target, storage_config, vrf_config, wallet_config, network_config).await;
+        let result = self.execute_async(wasm_bytes, wasm_content_sha256, input_data, limits, env_vars, build_target, storage_config, vrf_config, wallet_config, network_config, signing_keys).await;
 
         let execution_time_ms = start.elapsed().as_millis() as u64;
 
@@ -351,7 +436,12 @@ impl Executor {
         vrf_config: Option<VrfConfig>,
         wallet_config: Option<WalletConfig>,
         network_config: Option<NetworkConfig>,
+        signing_keys: Option<crate::signing_keys::SigningKeys>,
     ) -> Result<(Vec<u8>, u64, Option<u64>)> {
+        // A module runs with exactly the signing keys it declares, or not at
+        // all — checked on these bytes before anything is instantiated.
+        crate::signing_keys::check_run_keys(wasm_bytes, signing_keys.as_ref()).map_err(anyhow::Error::msg)?;
+
         // Create effective execution context with per-execution overrides
         let has_overrides = storage_config.is_some()
             || vrf_config.is_some()
@@ -405,12 +495,14 @@ impl Executor {
                         env_vars,
                         self.print_wasm_stderr,
                         effective_ctx.as_ref(),
+                        signing_keys,
                     ).await;
                 }
                 "wasm32-wasip1" | "wasm32-wasi" => {
                     tracing::debug!("🔹 Trying WASI P1 executor (target: {})", target);
                     // When target is known, return error directly (don't fallback to other formats)
-                    // P1 does not support RPC proxy, storage, or compiled cache (no component model)
+                    // P1 does not support RPC proxy, storage, signing keys, or compiled cache
+                    // (no component model); a P1 run that declares keys is refused before here.
                     return wasi_p1::execute(wasm_bytes, input_data, limits, env_vars, self.print_wasm_stderr).await;
                 }
                 _ => {
@@ -433,6 +525,7 @@ impl Executor {
             env_vars.clone(),
             self.print_wasm_stderr,
             effective_ctx.as_ref(),
+            signing_keys,
         ).await
         {
             return Ok(result);

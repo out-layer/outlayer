@@ -13,7 +13,7 @@ This module provides compilation from GitHub repositories to WASM for different 
 ### WASI Preview 2 (P2)
 - **Targets**: `wasm32-wasip2`
 - **Module**: `wasm32_wasip2.rs`
-- **Optimization**: `wasm-tools strip` for debug info removal
+- **Optimization**: `wasm-tools strip --delete …` removes debug info and build metadata by name, keeping `outlayer.manifest`; the build then fails if any custom section other than `name`, `component-type*`, `dylink.0` or `outlayer.manifest` survived, naming it
 - **Output**: WASM component with CLI interface
 
 ## Architecture

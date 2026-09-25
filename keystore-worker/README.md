@@ -391,13 +391,15 @@ endpoint asked for it. The seed namespace is flat, and what keeps families of
 keys apart is only the shape of their strings. Three consequences for anyone
 adding a family:
 
-1. **Know which endpoints hand out private material.** Today exactly one does:
-   `/wallet/derive-ephemeral-key` (payment checks). It builds
+1. **Know which endpoints hand out private material.** Two do:
+   `/wallet/derive-ephemeral-key` (payment checks) and `/decrypt` when it names
+   `signing_keys` (signing keys, to a TEE worker). The exporter builds
    `wallet:{id}:{chain}:{sub_path}` from two request strings and returns the
    private key. Any signing key whose seed that endpoint could spell is a
    signing key it can export. The families it cannot reach are: two-segment
    seeds under `wallet:` (it always appends a non-empty third segment), and
-   anything under a different root.
+   anything under a different root. `/decrypt` builds its strings itself, from
+   validated fields, only under `signing-key:v1:` — see "Signing keys" below.
 
 2. **Give a new signing family its own root, not a level under `wallet:`.**
    EVM sub-keys are `subkey:{id}:evm:{sub_path}` for this reason alone — under
@@ -416,6 +418,83 @@ adding a family:
 
 `no_exportable_seed_can_name_a_signing_key` in `api.rs` encodes the invariant:
 add the new family's seed to that test before adding the family.
+
+### Signing keys
+
+A WebAssembly artefact may declare signing keys in its manifest
+(`signing_keys`); the guest signs with them through the `outlayer:signing-keys`
+host interface, never seeing the seed.
+
+```text
+bind "project": HMAC-SHA256(master, "signing-key:v1:{type}:project:{project_uuid}:{caller}:{account_id}:{path}")
+bind "wasm":    HMAC-SHA256(master, "signing-key:v1:{type}:wasm:{wasm_sha256}:{caller}:{account_id}:{path}")
+```
+
+No other binding exists; any other `bind` value is refused.
+
+- `type` is `ed25519`; `path` is `[a-z0-9][a-z0-9_-]{0,31}`; `project_uuid` is
+  the contract's `p{16 hex}` for the project, read through `get_project` on
+  every run and never cached (a project deleted and created again under the
+  same name is another uuid, and so other keys); `caller` is `signer` or
+  `predecessor`; `account_id` is the job's `user_account_id` for a `signer`
+  key and its `predecessor_id` for a `predecessor` key; `wasm_sha256` 64
+  lowercase hex. No field can hold a `:`, so the string parses back uniquely.
+  The keystore builds it (`src/signing_keys.rs`); a request never supplies one,
+  and the project's `owner/name` id is not part of it. At most 3 keys per
+  request.
+- **Issued strictly by how the code is run.** A request that names a
+  `project_id` is a project run and holds `project` keys only; one that names
+  none is a direct run of a wasm URL and holds `wasm` keys only. There is no
+  field saying how the run was started. A run built from GitHub is refused
+  through a project by the contract's version (below), and directly by the
+  worker, which holds the resolved code source; the keystore sees only the
+  hash. A `predecessor` key on a request with no `predecessor_id`, or a
+  caller that is the worker's placeholder for a missing account
+  (`anonymous`), is refused. One key that does not match refuses the whole
+  request.
+- **Trusted, not verified:** `user_account_id`, `predecessor_id`,
+  `executed_wasm_sha256` and `project_id` come from the worker on the trust of
+  its TEE attestation, exactly as for secrets. Verified on chain: the project's
+  version and owner, the vault's ownership.
+- **One request per run.** A `/decrypt` body with a `signing_keys` member
+  (other than `null` or `[]`) is a `KeyedDecryptRequest`: the job's secret row
+  if it has one (`accessor` + `profile` + `owner`, all or none), plus
+  `signing_keys: [{path, type, bind?, caller?, vault?}]`, `project_id`,
+  `executed_wasm_sha256`, `user_account_id`, `predecessor_id`. Every other body
+  is read by the same extractor as always and answered byte for byte as before;
+  an object naming `signing_keys` twice is neither and is refused (422) before
+  either parser reads it. The answer is an object with independent parts:
+  `{"secrets": {"status": "decrypted", "plaintext_secrets": …} | {"status": "not_found", "error": …}, "signing_keys": {path: seed_hex}}`
+  (`secrets` only when a row was named).
+- **Independent checks.** The keys are judged first and in full; any refusal
+  fails the whole request with `{"error": …, "code": "signing_keys_refused"}`
+  before the row is read. The row is then judged by its own access condition,
+  exactly as without keys: a row that does not exist (`ApiError::SecretsNotFound`,
+  on the wire the same 400 as always) is reported as
+  `secrets.status = "not_found"` beside the keys; any other refusal of the row
+  fails the request with the status and message it always had.
+- A project run must run a `WasmUrl` version of its project:
+  `get_version(project_id, executed_wasm_sha256)` on the contract must answer
+  with a `WasmUrl` source of that hash, and `get_project(project_id)` must
+  exist, be owned by the id's owner and carry a well-formed `uuid`; both are
+  read together on every project run. A GitHub-sourced version is keyed by
+  `repo@commit` and is refused. A direct run's `wasm` keys come from the hash
+  the worker reports. Text from the RPC or the contract reaches a refusal or a
+  log line cut to 200 characters.
+- `vault` (on `project` keys only) selects that vault's master. The vault must
+  be a direct sub-account of the project's owner — decided on the names, before
+  the vault is read, so a vault that is not the owner's costs no RPC — AND name
+  that owner as its `parent`; it is then loaded through the usual gate. What
+  the chain or the gate says about the vault (another parent, not verified,
+  underfunded: 402) refuses; a chain that could not be asked or a master that
+  could not be loaded is a 500 without the code, the keystore's own outage.
+  Either way the default master is never used in its place. A `wasm` key
+  cannot name a vault.
+- `signing_key_seed_audit` in `api_tests.rs` pins the root against every other
+  family, for both string shapes. A caller-written seed (a `Repo` secret
+  accessor's repository and branch are free strings on chain) can spell a
+  signing-key string, but such a seed only ever reaches the master as
+  `ecies:` + seed, or bare for its public key alone.
 
 ## Troubleshooting
 

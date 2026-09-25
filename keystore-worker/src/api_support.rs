@@ -108,6 +108,79 @@ pub struct DecryptResponse {
     pub plaintext_secrets: String,
 }
 
+/// A `/decrypt` request that names signing keys: the job's secret row, if it
+/// has one, and the keys its artefact declares, answered together.
+///
+/// Only a request whose body carries a `signing_keys` member (other than
+/// `null` or `[]`) is read as this; every other request is a [`DecryptRequest`]
+/// and is answered exactly as it always was. `accessor` + `profile` + `owner`
+/// name one secret row, all three or none; `signing_keys` must not be empty.
+#[derive(Debug, Deserialize)]
+pub struct KeyedDecryptRequest {
+    #[serde(default)]
+    pub accessor: Option<SecretAccessor>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+
+    /// Who requested execution: the account a secret's access condition is
+    /// judged for, and the account every signing key is bound to.
+    pub user_account_id: String,
+    pub task_id: Option<String>,
+
+    /// SHA-256 of the bytes the worker is about to run. Required: a
+    /// `wasm`-bound key is derived from it, and for a project run it must be a
+    /// version of `project_id` on the contract.
+    #[serde(default)]
+    pub executed_wasm_sha256: Option<String>,
+
+    /// As in [`DecryptRequest`]: what a `Predecessor` condition is judged against.
+    #[serde(default)]
+    pub predecessor_id: Option<String>,
+
+    /// The project the job runs, as the worker read it off the job the
+    /// coordinator gave it. Present: a project run, which holds `project` keys
+    /// only, and whose build must be a WasmUrl version of this project on the
+    /// contract. Absent: a direct run of a wasm URL, which holds `wasm` keys
+    /// only. A `project` key is bound to the project's on-chain uuid, read
+    /// through `get_project(project_id)`.
+    #[serde(default)]
+    pub project_id: Option<String>,
+
+    /// The signing keys the running artefact's manifest declares.
+    pub signing_keys: Vec<crate::signing_keys::SigningKeyRequest>,
+}
+
+/// The answer to a [`KeyedDecryptRequest`]: two independent parts.
+///
+/// `signing_keys` is always present — a request whose keys cannot be served is
+/// refused whole, with the `signing_keys_refused` code, and nothing else is
+/// returned. `secrets` is present exactly when the request named a secret row.
+#[derive(Debug, Serialize)]
+pub struct KeyedDecryptResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretsOutcome>,
+    /// One 32-byte signing-key seed per requested key, hex, by key path.
+    pub signing_keys: std::collections::BTreeMap<String, crate::signing_keys::SeedHex>,
+}
+
+/// What became of the secret row a keyed request named.
+///
+/// A row that does not exist — the outcome a [`DecryptRequest`] answers with
+/// `ApiError::SecretsNotFound`, the one 400 the worker runs on past — is
+/// reported here rather than failing the request, so the keys still arrive.
+/// Every other failure of the row fails the request, with the same status and
+/// message a [`DecryptRequest`] gets.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SecretsOutcome {
+    /// Decrypted secrets, base64 — as `plaintext_secrets` in [`DecryptResponse`].
+    Decrypted { plaintext_secrets: String },
+    /// No secret to decrypt; the keystore's reason.
+    NotFound { error: String },
+}
+
 /// Request to get public key (includes secrets for validation)
 #[derive(Debug, Deserialize)]
 pub struct PubkeyRequest {

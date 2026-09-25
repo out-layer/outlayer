@@ -12,7 +12,7 @@
 # The build runs inside the same image the platform's compiler runs in, pinned
 # by digest, and follows the same recipe as
 # worker/src/compiler/wasm32_wasip{1,2}.rs: cargo build --release, then wasm-opt
-# for P1 or wasm-tools strip for P2. Building with your own toolchain gives a
+# for P1 or wasm-tools strip (keeping outlayer.manifest) for P2. Building with your own toolchain gives a
 # different, equally valid binary — and a different hash.
 #
 # Usage:
@@ -168,8 +168,15 @@ cp "$WASM" /workspace/output/output.wasm
 # binary with a different hash, so a missing tool is an error, never a skip.
 if [ "$TARGET_TO_ADD" = "wasm32-wasip2" ]; then
   command -v wasm-tools >/dev/null || { echo "wasm-tools missing from the compiler image" >&2; exit 1; }
-  wasm-tools strip /workspace/output/output.wasm -o /workspace/output/stripped.wasm
+  wasm-tools strip --delete '^(\.debug_.*|producers|target_features|linking|reloc\..*|sourceMappingURL|external_debug_info|component-name)$' /workspace/output/output.wasm -o /workspace/output/stripped.wasm
   mv /workspace/output/stripped.wasm /workspace/output/output.wasm
+  # What is left after the strip, by section name. Only what this platform
+  # expects may remain — `name`, `component-type*` and `dylink.0`, which
+  # wasm-tools keeps by design, and `outlayer.manifest` — so a section the
+  # delete list does not name fails the build with its name rather than
+  # shipping in the bytes.
+  STRAY=$(wasm-tools objdump /workspace/output/output.wasm | sed -n "s/^ *custom \"\([^\"]*\)\".*/\1/p" | sort -u | grep -v -E "^(name|component-type.*|dylink\.0|outlayer\.manifest)$" || true)
+  [ -z "$STRAY" ] || { echo "ERROR: custom sections survived the strip: $STRAY"; exit 1; }
 else
   command -v wasm-opt >/dev/null || { echo "wasm-opt missing from the compiler image" >&2; exit 1; }
   wasm-opt -Oz --strip-dwarf --strip-producers --enable-sign-ext --enable-bulk-memory \

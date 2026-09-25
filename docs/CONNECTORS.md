@@ -428,6 +428,50 @@ so the only record of which sub-keys a wallet ever used is the coordinator's
 log. Pick labels by purpose and keep them stable — a renamed label is a new
 address with an empty balance.
 
+### 4.6 Keys of your own: signing keys
+
+Any project, a connector included, can declare ed25519 keys in its manifest
+(`signing_keys`) and sign with them through the `outlayer:signing-keys` host
+functions. The keystore derives each key for the run, bound to the project's
+on-chain uuid and to one account of the run, chosen per key with `caller`:
+`signer` (the default — the transaction's signer, the payment key's owner over
+HTTPS) or `predecessor` (the account that called the contract — a DAO, a wallet
+contract, the token contract on an `ft_transfer_call`). Your code names the key
+by `path` and gets a signature back, never the key. The key follows the uuid,
+so it survives code upgrades and a transfer of the project.
+
+Use one when somebody must be able to check what your connector said or did
+without trusting the path it travelled: sign the record you return — a venue's
+answer, a fill, a receipt — and publish the public key. Because a key is per
+caller and per project, it is also a stable identity for that caller: its public
+key in hex is a NEAR implicit account, and `sign` over raw bytes is enough for a
+NEP-413 (`signMessage`) signature that verifies against that account.
+
+Keep money off it. The key can sign NEAR transactions for its implicit account,
+and Solana ones for the same public key, so funds sent there are controlled only
+by your code, outside every wallet policy. Funds a connector holds belong under
+a sub-key (§4.5) or the wallet's policy-metered operations, where the owner's
+limits apply. EVM is not supported: it needs secp256k1.
+
+For the same reason, never sign caller-supplied bytes or digests verbatim: a
+signature over bytes the caller chose can be a transaction from that account.
+Sign only messages your code composes from fields it has parsed and checked.
+And with a `signer` key, any contract the signer ever transacts with can start a
+run under the signer's key with input of its own — the input is not the
+signer's intent. A `predecessor` key binds to that contract instead; both are
+legitimate, and you choose.
+
+What a signing key has that a sub-key does not: it needs no wallet, so it works
+from `request_execution` as well as over HTTPS, and nothing outside a run of
+your code signs with it.
+
+Keys are issued strictly by how the code is run. A connector always runs through
+its project, so its keys are `bind: "project"` (the default), and only on a
+version published as a `WasmUrl`; a `wasm` key refuses the run before it
+starts, and a GitHub-sourced version is never issued signing keys. Fields,
+bindings, `caller`, vaults, NEP-413 and every refusal:
+[`CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md), `signing_keys`.
+
 ---
 
 ## 5. Limits

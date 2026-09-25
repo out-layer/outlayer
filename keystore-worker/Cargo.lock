@@ -2784,6 +2784,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "k256",
+ "mime",
  "near-crypto",
  "near-jsonrpc-client",
  "near-jsonrpc-primitives",
@@ -2806,6 +2807,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
