@@ -109,9 +109,9 @@ permission: *"an empty policy allows sending to anyone; `max_attachment_kb` is
 the only field that denies by default."*
 
 **Name the limit that actually binds, in the unit it is counted in — and no
-other number beside it.** A trial is ten calls. If the documentation also quotes
+other number beside it.** A trial is fifty calls. If the documentation also quotes
 a dollar figure that exists behind it, a reader does arithmetic on the dollars,
-concludes they have ninety calls, and is stopped at ten holding what looks like
+concludes they have ninety calls, and is stopped at fifty holding what looks like
 a balance. A figure the reader cannot act on is not context, it is a second
 answer to the same question. If two limits exist, say which one is reached
 first; if only one can be, do not mention the other.
@@ -120,7 +120,7 @@ first; if only one can be, do not mention the other.
 in a call example, with no word that it is optional, sends an agent looking up a
 wallet id it never needed. Mark optional headers, or leave them out.
 
-**Say what counts.** "Ten calls" leaves open whether a refused attempt is one of
+**Say what counts.** "Fifty calls" leaves open whether a refused attempt is one of
 them, whether a free operation is, whether a call that failed is. Each of those
 decides what an agent does next, so each is stated: for the trial, a call that
 was accepted counts — a free one included, and one whose run then failed or

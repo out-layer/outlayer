@@ -24,7 +24,7 @@
 #                                   the reservation comes back exactly
 #   C6  the owner's secret        — nothing is fetched unless the call asks, and
 #                                   what arrives is the secret just stored
-#   C7  the trial is ten calls    — and a funded key has no call limit
+#   C7  the trial is fifty calls  — and a funded key has no call limit
 #   C8  our own record            — the egress audit and the connector-call log
 #                                   say the same as the guest did
 #   C9  a call that never ran     — what a timed-out or unclaimed job costs

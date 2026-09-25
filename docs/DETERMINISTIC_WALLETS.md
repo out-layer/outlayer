@@ -38,7 +38,7 @@ Every deterministic wallet has the same capabilities as a regular wallet — all
 - **Policy engine** — spending limits, allowed actions, freeze thresholds, multisig approval
 - **Webhooks** — notifications on wallet events
 - **TEE attestation** — all wallet keys derived inside Intel TDX, verifiable on-chain
-- **Trial** — a wallet made by `POST /register` can claim ten connector calls in its first week (`POST /trial-key`), no payment setup needed
+- **Trial** — a wallet made by `POST /register` can claim fifty connector calls in its first week (`POST /trial-key`), no payment setup needed
 
 ## Architecture
 
@@ -179,7 +179,7 @@ RPC access key check: only when creating (rows_affected > 0). Idempotent return 
 {
   "wallet_id": "uuid-string",
   "near_account_id": "hex64-implicit-account",
-  "trial": { "available": true, "calls": 10, "days": 7, "claim_url": "POST /trial-key", "scope": "connectors.outlayer.near/*" }
+  "trial": { "available": true, "calls": 50, "days": 7, "claim_url": "POST /trial-key", "scope": "connectors.outlayer.near/*" }
 }
 ```
 
