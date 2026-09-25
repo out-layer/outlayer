@@ -116,5 +116,571 @@
       "max_count": 200,
       "applies": "everyone"
     }
-  ]
+  ],
+  "describe": {
+    "summary": "Work in the owner's GitHub account, as the owner: issues, comments, files, commits, pull requests, reviews and gists, inside the repositories the app is installed on and under the owner's policy.",
+    "operations": {
+      "status": {
+        "class": "read",
+        "doc": "Who the token acts as, which repositories it reaches, the policy, the day's writes.",
+        "params": [
+          {
+            "name": "reply_pubkey",
+            "type": "hex string",
+            "doc": "secp256k1 public key (33 bytes compressed) to seal the policy to when the answer lands on chain."
+          }
+        ]
+      },
+      "repo_list": {
+        "class": "read",
+        "doc": "Repositories the credential reaches, filtered by the policy.",
+        "params": [
+          {
+            "name": "page",
+            "type": "number"
+          },
+          {
+            "name": "per_page",
+            "type": "number"
+          }
+        ]
+      },
+      "repo_get": {
+        "class": "read",
+        "doc": "One repository.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true,
+            "doc": "`owner/name`."
+          }
+        ]
+      },
+      "dir_list": {
+        "class": "read",
+        "doc": "A directory listing at a ref.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "path",
+            "type": "string",
+            "doc": "Directory path; empty for the root."
+          },
+          {
+            "name": "ref",
+            "type": "string",
+            "doc": "Branch, tag or sha; absent: the default branch."
+          }
+        ]
+      },
+      "file_get": {
+        "class": "read",
+        "doc": "One file, up to 256 KB, at a ref.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "path",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "ref",
+            "type": "string"
+          }
+        ]
+      },
+      "branch_list": {
+        "class": "read",
+        "doc": "Branches and their heads.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "page",
+            "type": "number"
+          },
+          {
+            "name": "per_page",
+            "type": "number"
+          }
+        ]
+      },
+      "issue_list": {
+        "class": "read",
+        "doc": "Issues of a repository.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "doc": "`open` (default), `closed` or `all`."
+          },
+          {
+            "name": "labels",
+            "type": "string[]"
+          },
+          {
+            "name": "page",
+            "type": "number"
+          },
+          {
+            "name": "per_page",
+            "type": "number"
+          }
+        ]
+      },
+      "issue_get": {
+        "class": "read",
+        "doc": "One issue with a page of its comments.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "number",
+            "type": "number",
+            "required": true
+          }
+        ]
+      },
+      "pr_list": {
+        "class": "read",
+        "doc": "Pull requests of a repository.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "state",
+            "type": "string"
+          },
+          {
+            "name": "page",
+            "type": "number"
+          },
+          {
+            "name": "per_page",
+            "type": "number"
+          }
+        ]
+      },
+      "pr_get": {
+        "class": "read",
+        "doc": "One pull request.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "number",
+            "type": "number",
+            "required": true
+          }
+        ]
+      },
+      "pr_files": {
+        "class": "read",
+        "doc": "The files and patches of a pull request.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "number",
+            "type": "number",
+            "required": true
+          },
+          {
+            "name": "page",
+            "type": "number"
+          },
+          {
+            "name": "per_page",
+            "type": "number"
+          }
+        ]
+      },
+      "gist_list": {
+        "class": "read",
+        "doc": "The owner's gists.",
+        "params": [
+          {
+            "name": "page",
+            "type": "number"
+          },
+          {
+            "name": "per_page",
+            "type": "number"
+          }
+        ]
+      },
+      "gist_get": {
+        "class": "read",
+        "doc": "One gist with its files.",
+        "params": [
+          {
+            "name": "gist_id",
+            "type": "string",
+            "required": true
+          }
+        ]
+      },
+      "branch_create": {
+        "class": "write",
+        "doc": "A new branch.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "branch",
+            "type": "string",
+            "required": true,
+            "doc": "The branch to create."
+          },
+          {
+            "name": "from",
+            "type": "string",
+            "doc": "The branch to start from; absent: the default branch."
+          }
+        ]
+      },
+      "file_put": {
+        "class": "write",
+        "doc": "One file in one commit.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "path",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "content",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "encoding",
+            "type": "string",
+            "doc": "`utf-8` (default) or `base64`."
+          },
+          {
+            "name": "message",
+            "type": "string",
+            "required": true,
+            "doc": "The commit message."
+          },
+          {
+            "name": "branch",
+            "type": "string",
+            "required": true,
+            "doc": "The branch to write to."
+          },
+          {
+            "name": "sha",
+            "type": "string",
+            "doc": "The sha of the file being replaced; absent for a new file."
+          }
+        ]
+      },
+      "commit": {
+        "class": "write",
+        "doc": "Several files in one commit, up to 50.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "branch",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "message",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "files",
+            "type": "FileChange[]",
+            "required": true,
+            "doc": "{path, content?, encoding?, delete?}."
+          }
+        ]
+      },
+      "issue_create": {
+        "class": "write",
+        "doc": "Open an issue.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "title",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "body",
+            "type": "string"
+          },
+          {
+            "name": "labels",
+            "type": "string[]"
+          },
+          {
+            "name": "assignees",
+            "type": "string[]"
+          }
+        ]
+      },
+      "issue_comment": {
+        "class": "write",
+        "doc": "Reply on an issue or pull request.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "number",
+            "type": "number",
+            "required": true
+          },
+          {
+            "name": "body",
+            "type": "string",
+            "required": true
+          }
+        ]
+      },
+      "issue_update": {
+        "class": "write",
+        "doc": "Retitle, relabel, reassign or close an issue.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "number",
+            "type": "number",
+            "required": true
+          },
+          {
+            "name": "title",
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "type": "string"
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "doc": "`open` or `closed`."
+          },
+          {
+            "name": "labels",
+            "type": "string[]"
+          },
+          {
+            "name": "assignees",
+            "type": "string[]"
+          }
+        ]
+      },
+      "pr_create": {
+        "class": "write",
+        "doc": "A pull request from a branch the policy allows.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "title",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "head",
+            "type": "string",
+            "required": true,
+            "doc": "The branch with the changes."
+          },
+          {
+            "name": "base",
+            "type": "string",
+            "required": true,
+            "doc": "The branch to merge into."
+          },
+          {
+            "name": "body",
+            "type": "string"
+          },
+          {
+            "name": "draft",
+            "type": "boolean"
+          }
+        ]
+      },
+      "pr_review": {
+        "class": "write",
+        "doc": "A review: comment, request changes, or approve when allowed.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "number",
+            "type": "number",
+            "required": true
+          },
+          {
+            "name": "event",
+            "type": "string",
+            "required": true,
+            "doc": "`COMMENT`, `REQUEST_CHANGES` or `APPROVE`."
+          },
+          {
+            "name": "body",
+            "type": "string"
+          },
+          {
+            "name": "comments",
+            "type": "ReviewComment[]",
+            "doc": "{path, line, side?, body} on lines of the diff."
+          }
+        ]
+      },
+      "pr_merge": {
+        "class": "write",
+        "doc": "Merge a pull request, when the policy allows merging.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "number",
+            "type": "number",
+            "required": true
+          },
+          {
+            "name": "merge_method",
+            "type": "string",
+            "doc": "`merge`, `squash` or `rebase`."
+          },
+          {
+            "name": "sha",
+            "type": "string",
+            "doc": "The head sha the merge must match."
+          }
+        ]
+      },
+      "gist_create": {
+        "class": "write",
+        "doc": "A gist, secret unless the policy allows public ones.",
+        "params": [
+          {
+            "name": "files",
+            "type": "FileChange[]",
+            "required": true,
+            "doc": "{path, content}."
+          },
+          {
+            "name": "description",
+            "type": "string"
+          },
+          {
+            "name": "public",
+            "type": "boolean"
+          }
+        ]
+      },
+      "gist_update": {
+        "class": "write",
+        "doc": "Change a gist's files or description.",
+        "params": [
+          {
+            "name": "gist_id",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "files",
+            "type": "FileChange[]"
+          },
+          {
+            "name": "description",
+            "type": "string"
+          }
+        ]
+      },
+      "repo_star": {
+        "class": "write",
+        "doc": "Star a repository.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          }
+        ]
+      },
+      "repo_unstar": {
+        "class": "write",
+        "doc": "Unstar a repository.",
+        "params": [
+          {
+            "name": "repo",
+            "type": "string",
+            "required": true
+          }
+        ]
+      }
+    }
+  }
 }

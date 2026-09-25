@@ -24,5 +24,54 @@
   ],
   "author_secrets": {
     "profile": "author"
+  },
+  "describe": {
+    "summary": "Send mail from the owner's own Gmail address, to the recipients the policy allows; it cannot read the mailbox.",
+    "operations": {
+      "status": {
+        "class": "read",
+        "doc": "Whether the credential works, the policy's caps, today's send count.",
+        "params": [
+          {
+            "name": "reply_pubkey",
+            "type": "hex string",
+            "doc": "secp256k1 public key (33 bytes compressed) to seal the policy to when the answer lands on chain."
+          }
+        ]
+      },
+      "send": {
+        "class": "write",
+        "doc": "One message, policy-checked, then sent under the owner's address.",
+        "params": [
+          {
+            "name": "to",
+            "type": "string | string[]",
+            "required": true,
+            "doc": "Bare addresses only: no display names, no angle brackets."
+          },
+          {
+            "name": "cc",
+            "type": "string | string[]",
+            "doc": "Same rules as `to`."
+          },
+          {
+            "name": "subject",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "body",
+            "type": "string",
+            "required": true,
+            "doc": "Plain text."
+          },
+          {
+            "name": "attachments",
+            "type": "Attachment[]",
+            "doc": "{filename, content_type, data: base64}; the policy decides whether attachments go."
+          }
+        ]
+      }
+    }
   }
 }

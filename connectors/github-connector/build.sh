@@ -48,6 +48,35 @@ for limit in m.get("limits", []):
         bad.append(f"applies {limit.get('applies')!r}")
     if limit.get("operation", "").split(":")[0] not in declared:
         bad.append(f"limit on unknown operation {limit.get('operation')!r}")
+# `describe`: what the developer page shows. Held to the code here — every
+# dispatched operation described and nothing else, every parameter a field
+# some input struct declares — so a description that falls behind the code
+# fails the build rather than the page.
+import glob
+desc = m.get("describe") or {}
+described = set((desc.get("operations") or {}).keys())
+if described != dispatched:
+    bad.append(f"describe.operations {sorted(described)} vs dispatched {sorted(dispatched)}")
+if not isinstance(desc.get("summary"), str) or not desc.get("summary", "").strip():
+    bad.append("describe.summary is missing")
+fields = set()
+for f in glob.glob("src/**/*.rs", recursive=True):
+    for body in re.findall(r'struct \w+\s*\{(.*?)\n\}', open(f).read(), re.S):
+        fields |= set(re.findall(r'^\s*(?:pub(?:\(crate\))? )?([a-z_][a-z0-9_]*)\s*:', body, re.M))
+        fields |= set(re.findall(r'#\[serde\(rename = "([a-z_]+)"', body))
+    # A field read straight off the JSON (`input.get("reply_pubkey")`) is a
+    # parameter too.
+    fields |= set(re.findall(r'\.get\("([a-z_]+)"\)', open(f).read()))
+for name, o in (desc.get("operations") or {}).items():
+    if o.get("class") not in {"read", "write"}:
+        bad.append(f"describe.{name}.class {o.get('class')!r}")
+    if not isinstance(o.get("doc"), str) or not o["doc"].strip():
+        bad.append(f"describe.{name}.doc is missing")
+    for prm in o.get("params", []):
+        if prm.get("name") not in fields:
+            bad.append(f"describe.{name}: parameter {prm.get('name')!r} is not a field of any input struct")
+        if not isinstance(prm.get("type"), str):
+            bad.append(f"describe.{name}.{prm.get('name')}: no type")
 if bad:
     print("ERROR:"); [print("  -", b) for b in bad]; sys.exit(1)
 print(f"Manifest: {len(declared)} operations agree with the code; limits are well formed")

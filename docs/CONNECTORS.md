@@ -537,6 +537,22 @@ schema-driven — add `lib/policies/<connector>.ts` and the existing editor
 renders it, summarises it as permissions, and turns it into the JSON your
 connector reads.
 
+## 6b. The developer page: `describe`
+
+`app.outlayer.ai/connectors/<id>` shows what your connector does and takes —
+every operation with its parameters, and the owner's policy in brief. Nothing
+on it is written by hand: the operations come from the `describe` block of
+your manifest, read by the coordinator out of the ACTIVE version's wasm
+(`GET /public/connectors/{id}/describe`), and the policy section renders the
+same schema the `/connect/<id>` editor is built from.
+
+Write the block once, next to `operations`
+(`wasi-examples/CONNECTOR_MANIFEST.md` has the shape), and let `build.sh`
+hold it to the code: every operation `run` dispatches must be described and
+nothing else may be; every parameter must be a field of an input struct or a
+name the code reads off the JSON. A description that falls behind the code
+fails the build, so the page cannot lie about a version that was published.
+
 ## 7. Testing before you ship
 
 `connectors/connector-probe` exists for exactly this. It is published,

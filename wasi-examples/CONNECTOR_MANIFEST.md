@@ -59,6 +59,43 @@ and exactly the ones priced on chain — see the next section.
 | `limits` | **yes** | Caps this connector declares about itself. Unioned with the coordinator's own rules — every applicable one must pass — so a declaration can only ever tighten. |
 | `author_secrets` | **yes** | The author's own credential, for any project: the row `owner` stored under the accessor `Project(<this project id>)` and `profile`, decrypted into the environment on every run next to the caller's. `owner` defaults to the publishing account. The row's access condition is judged against the real caller, so it is who may run the project — `AllowAll` for everyone, a whitelist or DAO role for a circle. A name on both sides, or a profile nobody stored, refuses the run; a name the caller's row carries and the author never stored is added to the environment as the caller's — store every name your code reads, so no caller can supply it. A run with no project (a `Repo` source executed directly) cannot hold one. See `WASI_TUTORIAL.md` §3c and `docs/CONNECTORS.md` §4.1. |
 | `display` | no | For the dashboard. |
+| `describe` | no | What each operation does and takes, for the developer page (`app.outlayer.ai/connectors/<id>`) — see the next section. |
+
+### `describe`: the operations, for a reader
+
+```jsonc
+"describe": {
+  "summary": "Send mail from the owner's own address, to the recipients the policy allows.",
+  "operations": {
+    "send": {
+      "class": "write",
+      "doc": "One message, policy-checked, then sent.",
+      "params": [
+        {"name": "to", "type": "string | string[]", "required": true, "doc": "Bare addresses, no display names."},
+        {"name": "subject", "type": "string", "required": true},
+        {"name": "attachments", "type": "Attachment[]", "doc": "{filename, content_type, data: base64}."}
+      ]
+    }
+  }
+}
+```
+
+The dashboard's page for a connector is rendered from this block of the
+ACTIVE version's wasm — the coordinator reads the section out of the bytes it
+serves to workers — so what a developer reads is what the deployed code
+answers to, and a page with its own copy of the list cannot exist to drift.
+
+| Field | Meaning |
+|---|---|
+| `summary` | One sentence: what an agent can do with the connector. |
+| `operations.<name>` | One entry per operation, keyed exactly as `operations` lists them. |
+| `class` | `read` or `write` — the same word the price list uses. |
+| `doc` | One sentence, what the operation does. |
+| `params[]` | Every field the operation reads from the input, except `operation` itself. `type` is prose for a developer (`string`, `number`, `decimal string`, `string[]`, `object`), `required` defaults to false, `doc` is optional. |
+
+`build.sh` holds it to the code: every operation the guest dispatches is
+described and nothing else is; every parameter is a field of an input struct.
+A description that falls behind the code fails the build, not the page.
 
 ### The words `limits` may use
 

@@ -133,7 +133,7 @@ have to.
 | network | project | state |
 |---|---|---|
 | testnet | `connectors.outlayer.testnet/github` | live |
-| mainnet | `connectors.outlayer.near/github` | not published yet |
+| mainnet | `connectors.outlayer.near/github` | live |
 
 The active version, its source URL and the prices are on chain and are the only
 place to read them from.
