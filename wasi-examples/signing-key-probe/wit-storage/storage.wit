@@ -1,0 +1,138 @@
+package near:storage@0.1.0;
+
+/// Persistent storage API for OutLayer projects
+///
+/// Storage is persisted across executions and shared across versions of a project.
+/// `set`/`get` and the conditional writes store records encrypted by the keystore;
+/// the `-raw` functions store the caller's bytes as given. Each record keeps the
+/// mode it was written in: a function of the other mode refuses it with an error.
+///
+/// Every function outside the `-worker` ones reads and writes one account's cell
+/// of the project. The worker fixes that account before the run starts, from the
+/// manifest's `storage_account` and the job: `signer` (the default) is the
+/// transaction's signer on chain and the payment key's owner over HTTPS;
+/// `predecessor` is the account that called the contract on chain (a relaying
+/// contract, not the user who signed) and the payment key's owner over HTTPS,
+/// and a run with no predecessor is refused. No function here takes an account.
+interface api {
+    // ==================== Basic Storage ====================
+
+    /// Store a value by key
+    /// Returns empty string on success or error message on failure
+    /// (including when the key holds a raw record)
+    set: func(key: string, value: list<u8>) -> string;
+
+    /// Get a value by key
+    /// Returns (value, error) - value is empty list if not found;
+    /// error if the key holds a raw record (read it with get-raw)
+    get: func(key: string) -> tuple<list<u8>, string>;
+
+    /// Check if a key exists
+    has: func(key: string) -> bool;
+
+    /// Delete a key
+    /// Returns true if key existed and was deleted
+    delete: func(key: string) -> bool;
+
+    /// List all keys with optional prefix filter
+    /// Returns JSON array of key strings
+    list-keys: func(prefix: string) -> tuple<string, string>;
+
+    // ==================== Conditional Writes ====================
+
+    /// Set a key only if it doesn't already exist
+    /// Returns (inserted: bool, error: string)
+    /// inserted=true if value was stored, false if key already held a record (in either mode)
+    set-if-absent: func(key: string, value: list<u8>) -> tuple<bool, string>;
+
+    /// Set a key only if current value equals expected (compare-and-swap)
+    /// Returns (success: bool, current_value: list<u8>, error: string)
+    /// success=true if value was updated
+    /// On failure, current_value contains the actual current value for retry
+    /// error if the key holds a raw record
+    set-if-equals: func(key: string, expected: list<u8>, new-value: list<u8>) -> tuple<bool, list<u8>, string>;
+
+    // ==================== Raw Storage ====================
+    // Raw records hold the bytes as given, in the same per-account storage as
+    // `set`/`get`: same account's cell, same project, same key namespace. The key name
+    // and the value are stored in plaintext, and the operator can read them.
+    // Encrypt the value first (with `outlayer:encryption-keys`) and keep secrets
+    // out of key names.
+    //
+    // A key holds one record in one mode. `get-raw` on a key written with `set`
+    // (or `get` on a key written with `set-raw`) is an error, and no write
+    // converts a record from one mode to the other: delete it first.
+    // `has`, `delete` and `list-keys` work on records of both modes.
+    // No keystore call is made on any raw function.
+
+    /// Store bytes as given. Returns empty string on success or error message
+    /// (including when the key holds an encrypted record).
+    set-raw: func(key: string, value: list<u8>) -> string;
+
+    /// Get the bytes stored by `set-raw`.
+    /// Returns (value, error) - value is empty list if not found;
+    /// error if the key holds an encrypted record.
+    get-raw: func(key: string) -> tuple<list<u8>, string>;
+
+    /// Store bytes as given only if the key holds no record, in either mode.
+    /// Returns (inserted: bool, error: string).
+    set-if-absent-raw: func(key: string, value: list<u8>) -> tuple<bool, string>;
+
+    /// Compare-and-swap on raw bytes: replace the value only if the stored bytes
+    /// equal `expected` exactly.
+    /// Returns (success: bool, current_value: list<u8>, error: string).
+    /// On failure, current_value holds the stored bytes for retry (empty if the
+    /// key holds no record); error if the key holds an encrypted record.
+    set-if-equals-raw: func(key: string, expected: list<u8>, new-value: list<u8>) -> tuple<bool, list<u8>, string>;
+
+    /// Atomically increment a numeric value
+    /// If key doesn't exist, creates it with the delta as initial value
+    /// Returns (new_value: s64, error: string)
+    /// Works on encrypted records; error if the key holds a raw record
+    increment: func(key: string, delta: s64) -> tuple<s64, string>;
+
+    /// Atomically decrement a numeric value
+    /// If key doesn't exist, creates it with -delta as initial value
+    /// Returns (new_value: s64, error: string)
+    /// Works on encrypted records; error if the key holds a raw record
+    decrement: func(key: string, delta: s64) -> tuple<s64, string>;
+
+    // ==================== Worker Storage ====================
+    // These functions store data with "@worker" as account_id
+    // This data is only accessible within WASM, not by the user
+    // Can be public (is_encrypted=false) for cross-project reads (e.g., oracle price feeds)
+
+    /// Store worker data
+    /// is_encrypted: true (default) = encrypted, only this project can read
+    ///               false = plaintext, other projects can read via get-worker with project param
+    set-worker: func(key: string, value: list<u8>, is-encrypted: option<bool>) -> string;
+
+    /// Get worker data
+    /// project: none = read from current project (any encryption type)
+    ///          some(project) = read public data from another project, named either
+    ///            by its name "owner.near/project-name" or by its uuid
+    ///            "p0000000000000001" (p + 16 lowercase hex, OUTLAYER_PROJECT_UUID there)
+    /// Cross-project: empty list = no such key or no such project; an error for a
+    /// key that is stored encrypted, and for a project in neither form
+    get-worker: func(key: string, project: option<string>) -> tuple<list<u8>, string>;
+
+    // ==================== Version Migration ====================
+
+    /// Get data from a specific WASM version (for migration)
+    /// wasm-hash: SHA256 hash of the specific version's WASM
+    get-by-version: func(key: string, wasm-hash: string) -> tuple<list<u8>, string>;
+
+    // ==================== Cleanup ====================
+
+    /// Clear all storage of the current project in this run's account cell
+    /// This is called by __outlayer_clear_all_storage export
+    clear-all: func() -> string;
+
+    /// Clear storage written by a specific WASM version
+    /// This is called by __outlayer_clear_storage_for_version export
+    clear-version: func(wasm-hash: string) -> string;
+}
+
+world storage-host {
+    import api;
+}

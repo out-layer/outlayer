@@ -2892,6 +2892,101 @@ mod decrypt_raw_serves_the_top_up_flow_only {
     }
 }
 
+/// A seed a caller spells never starts at a declared-key root: a `Repo`
+/// accessor's repo, or a raw seed, that does is refused wherever the keystore
+/// would derive from it; every other one derives as before.
+#[cfg(test)]
+mod a_caller_seed_cannot_start_at_a_declared_key_root {
+    use super::tests::test_state;
+    use super::*;
+    use crate::encryption_keys::ENCRYPTION_KEY_LABEL;
+    use crate::signing_keys::SIGNING_KEY_LABEL;
+
+    const REFUSED_REPOS: &[&str] = &[
+        "signing-key",
+        "encryption-key",
+        "signing-key:v1:ed25519:project:p0000000000000001",
+        "https://encryption-key:v1:project:p0000000000000001",
+        "  encryption-key:v1:wasm.git",
+    ];
+
+    #[test]
+    fn the_roots_are_the_declared_families_roots() {
+        assert!(SIGNING_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[0]));
+        assert!(ENCRYPTION_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[1]));
+    }
+
+    #[test]
+    fn a_repo_at_a_root_is_refused_and_every_other_is_normalized_as_before() {
+        for repo in REFUSED_REPOS {
+            match repo_seed_root(repo) {
+                Err(ApiError::BadRequest(m)) => assert!(m.contains("is not a repository URL") && m.contains("-key:`"), "{m}"),
+                other => panic!("{repo:?}: {other:?}"),
+            }
+        }
+        for repo in [
+            "https://github.com/alice/project",
+            "git@github.com:alice/project.git",
+            "github.com/signing-key:v1",
+            "signing-key/v1",
+            "git@encryption-key:v1",
+            "Signing-Key:v1:ed25519",
+        ] {
+            assert_eq!(repo_seed_root(repo).unwrap(), crate::utils::normalize_repo_url(repo), "{repo}");
+        }
+    }
+
+    #[test]
+    fn a_raw_seed_at_a_root_is_refused() {
+        for seed in ["signing-key:v1:ed25519:wasm:ab:signer:bob.near:k", "encryption-key:v1:project:p1:signer:bob.near:k", "signing-key:"] {
+            assert!(matches!(refuse_declared_key_seed(seed), Err(ApiError::BadRequest(_))), "{seed}");
+        }
+        for seed in ["github.com/alice/app:alice.near", "project:alice.near/app:alice.near", "system:payment_key:alice.near:0", ""] {
+            assert!(refuse_declared_key_seed(seed).is_ok(), "{seed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pubkey_encrypt_and_add_generated_secret_refuse_a_seed_at_a_root() {
+        let state = test_state();
+        for (seed, refused) in [
+            ("encryption-key:v1:project:p0000000000000001:signer:bob.near:k", true),
+            ("signing-key:v1:ed25519:project:p0000000000000001:signer:bob.near:k", true),
+            ("github.com/alice/app:alice.near", false),
+        ] {
+            let pubkey = pubkey_handler(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(PubkeyRequest { seed: seed.into(), secrets_json: "{}".into(), vault_id: None }),
+            )
+            .await;
+            let encrypt = encrypt_handler(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(EncryptRequest { seed: seed.into(), plaintext_base64: base64::encode(b"x") }),
+            )
+            .await;
+            let generated = add_generated_secret_handler(
+                State(state.clone()),
+                Json(AddGeneratedSecretRequest {
+                    seed: seed.into(),
+                    encrypted_secrets_base64: None,
+                    new_secrets: vec![GeneratedSecretSpec { name: "PROTECTED_K".into(), generation_type: "hex32".into() }],
+                    vault_id: None,
+                }),
+            )
+            .await;
+            if !refused {
+                assert!(pubkey.is_ok() && encrypt.is_ok() && generated.is_ok(), "an ordinary seed is served: {seed}");
+            }
+            let at_root = |r: Option<ApiError>| matches!(r, Some(ApiError::BadRequest(m)) if m.contains("cannot start with"));
+            assert_eq!(at_root(pubkey.err()), refused, "/pubkey {seed}");
+            assert_eq!(at_root(encrypt.err()), refused, "/encrypt {seed}");
+            assert_eq!(at_root(generated.err()), refused, "/add_generated_secret {seed}");
+        }
+    }
+}
+
 /// The decrypt door, where a build lock decides whether a run sees a secret.
 ///
 /// `judge_access` is the only door; the tests above cover the other leaves.
@@ -3147,7 +3242,8 @@ mod the_substitution_is_made_in_one_place {
 /// Every key here is `HMAC-SHA256(master, input)`, so two families collide
 /// exactly when one can spell the other's HMAC input. A signing key's input is
 /// always `signing-key:v1:{type}:{project|wasm}:{uuid|sha256}:{signer|predecessor}:…`
-/// built from fields that hold no `:`. The other inputs, by family:
+/// — `{type}` `ed25519` or `secp256k1` — built from fields that hold no `:`.
+/// The other inputs, by family:
 ///
 /// * fixed-root seeds fed to the HMAC bare (`derive_keypair`,
 ///   `derive_secp256k1_keypair`) — every key this keystore signs with or
@@ -3161,11 +3257,13 @@ mod the_substitution_is_made_in_one_place {
 /// * `secret-path:` + seed (`vault-master:{vault}`).
 ///
 /// So: no fixed root is a prefix of `signing-key:v1:` or the other way round,
-/// and no tagged input (`ecies:`, `secret-path:`) can start with it. A
-/// caller-written seed CAN spell a signing-key string — the contract lets a
-/// `Repo` row name any repository and branch — and such a seed is only ever
-/// derived as `ecies:` + seed, or bare for its public key alone, which reveals
-/// nothing a guest's own `public-key` call does not.
+/// and no tagged input (`ecies:`, `secret-path:`) can start with it. The
+/// contract lets a `Repo` row name any repository and branch, so a
+/// caller-written seed could spell a signing-key string; the keystore refuses
+/// every caller-written seed that starts at a declared-key root
+/// (`DECLARED_KEY_ROOTS`). Were one derived, it would reach the master only as
+/// `ecies:` + seed, or bare for its public key alone, which reveals nothing a
+/// guest's own `public-key` call does not.
 #[cfg(test)]
 mod signing_key_seed_audit {
     use super::*;
@@ -3177,38 +3275,43 @@ mod signing_key_seed_audit {
     const H: &str = "abababababababababababababababababababababababababababababababab";
 
     /// Signing-key inputs across both shapes — `project` keys on a project run,
-    /// `wasm` keys on a direct run — and both callers, with fields chosen to
-    /// look like other families' segments.
+    /// `wasm` keys on a direct run — both callers and every type, with fields
+    /// chosen to look like other families' segments.
     fn signing_inputs() -> Vec<String> {
         let mut out = Vec::new();
-        let paths = ["near", "evm", "check", "vrf-key", "storage", "project", "wasm_hash", "k", "wallet", "ecies", "signer", "predecessor"];
+        let paths = [
+            "near", "evm", "check", "vrf-key", "storage", "project", "wasm_hash", "k", "wallet", "ecies", "signer", "predecessor",
+            "ed25519", "secp256k1", "ethereum",
+        ];
         let runs = [
             (Some(("wallet.near/evm", "p0000000000000001")), KeyBinding::Project),
             (Some(("subkey.near/project", "pffffffffffffffff")), KeyBinding::Project),
             (Some(("alice.near/app", "p0000000000000001")), KeyBinding::Project),
             (None, KeyBinding::Wasm),
         ];
-        for (project, bind) in runs {
-            for account in ["wallet.near", "ecies.near", "project.near", "signer.near", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] {
-                for caller in [CallerKind::Signer, CallerKind::Predecessor] {
-                    for chunk in paths.chunks(MAX_SIGNING_KEYS) {
-                        let keys: Vec<SigningKeyRequest> = chunk
-                            .iter()
-                            .map(|p| SigningKeyRequest {
-                                path: p.to_string(),
-                                key_type: SigningKeyType::Ed25519,
-                                bind,
-                                caller,
-                                vault: None,
-                            })
-                            .collect();
-                        let uuid = project.map(|(_, u)| ProjectUuid::parse(u).unwrap());
-                        let bound = validate_request(project.map(|(id, _)| id), account, Some("predecessor.near"), Some(H), &keys)
-                            .unwrap()
-                            .bind(uuid)
-                            .unwrap();
-                        for k in bound.keys {
-                            out.push(String::from_utf8(k.input.as_bytes().to_vec()).unwrap());
+        for key_type in SigningKeyType::ALL {
+            for (project, bind) in runs {
+                for account in ["wallet.near", "ecies.near", "project.near", "signer.near", "secp256k1.near", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] {
+                    for caller in [CallerKind::Signer, CallerKind::Predecessor] {
+                        for chunk in paths.chunks(MAX_SIGNING_KEYS) {
+                            let keys: Vec<SigningKeyRequest> = chunk
+                                .iter()
+                                .map(|p| SigningKeyRequest {
+                                    path: p.to_string(),
+                                    key_type,
+                                    bind,
+                                    caller,
+                                    vault: None,
+                                })
+                                .collect();
+                            let uuid = project.map(|(_, u)| ProjectUuid::parse(u).unwrap());
+                            let bound = validate_request(project.map(|(id, _)| id), account, Some("predecessor.near"), Some(H), &keys)
+                                .unwrap()
+                                .bind(uuid)
+                                .unwrap();
+                            for k in bound.keys {
+                                out.push(String::from_utf8(k.input.as_bytes().to_vec()).unwrap());
+                            }
                         }
                     }
                 }
@@ -3227,6 +3330,7 @@ mod signing_key_seed_audit {
                 // The exporter's shape, from request strings.
                 seeds.push(format!("wallet:{id}:{chain}:check:0"));
                 seeds.push(format!("wallet:{id}:{chain}:signing-key:v1:ed25519"));
+                seeds.push(format!("wallet:{id}:{chain}:signing-key:v1:secp256k1"));
             }
             seeds.push(subkey_seed(id, "connector.hl.trading"));
             seeds.push(subkey_seed(id, "signing-key"));
@@ -3273,10 +3377,44 @@ mod signing_key_seed_audit {
         let signing = signing_inputs();
         assert!(signing.iter().any(|s| s.contains(":project:")) && signing.iter().any(|s| s.contains(":wasm:")));
         assert!(signing.iter().any(|s| s.contains(":signer:")) && signing.iter().any(|s| s.contains(":predecessor:")));
+        for t in SigningKeyType::ALL {
+            let segment = format!("{SIGNING_KEY_LABEL}{}:", t.label());
+            assert!(signing.iter().any(|s| s.starts_with(&segment)), "the audit covers {segment}");
+        }
         for other in other_inputs() {
             assert!(!other.starts_with(SIGNING_KEY_LABEL), "{other} starts with the signing-key root");
             for s in &signing {
                 assert_ne!(&other, s, "{other} is a signing-key input");
+            }
+        }
+    }
+
+    /// The inputs of the two types are disjoint, and none is a prefix of
+    /// another: after the root, the type segment is one of two labels, neither
+    /// a prefix of the other, followed by `:`.
+    #[test]
+    fn the_two_types_never_spell_one_string() {
+        let labels: Vec<&str> = SigningKeyType::ALL.iter().map(|t| t.label()).collect();
+        for a in &labels {
+            for b in &labels {
+                assert!(a == b || !a.starts_with(b), "{a} / {b}");
+            }
+        }
+        let by_type: Vec<std::collections::HashSet<String>> = labels
+            .iter()
+            .map(|l| {
+                let segment = format!("{SIGNING_KEY_LABEL}{l}:");
+                signing_inputs().into_iter().filter(|s| s.starts_with(&segment)).collect()
+            })
+            .collect();
+        assert_eq!(by_type.iter().map(|s| s.len()).sum::<usize>(), signing_inputs().iter().collect::<std::collections::HashSet<_>>().len());
+        for (i, a) in by_type.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in &by_type[i + 1..] {
+                for s in a {
+                    assert!(!b.contains(s), "{s} is an input of two types");
+                    assert!(!b.iter().any(|t| t.starts_with(s.as_str()) || s.starts_with(t.as_str())), "{s}");
+                }
             }
         }
     }
@@ -3310,11 +3448,14 @@ mod signing_key_seed_audit {
     }
 
     #[test]
-    fn a_repo_secret_seed_can_spell_a_signing_key_string_and_reaches_the_master_tagged() {
+    fn a_repo_seed_spelling_a_signing_key_string_is_refused_and_would_reach_the_master_tagged() {
         // The contract accepts any non-empty repository and any branch up to
-        // 255 bytes, so a `Repo` row's seed can spell a signing-key string.
+        // 255 bytes, so a `Repo` row's seed could spell a signing-key string.
         let spelled = format!("{}:{}:{}", crate::utils::normalize_repo_url("signing-key"), "v1", "ed25519:project:p0000000000000001:signer:bob.near:k");
         assert!(spelled.starts_with(SIGNING_KEY_LABEL));
+        // The keystore builds no seed from such a repo, nor takes one raw.
+        assert!(repo_seed_root("signing-key").is_err());
+        assert!(refuse_declared_key_seed(&spelled).is_err());
         // What the secret path derives from it is `ecies:` + seed — never the
         // signing key's input — and the ECIES key it yields is not the signing
         // key's public key.
@@ -3342,6 +3483,321 @@ mod signing_key_seed_audit {
     }
 }
 
+/// The encryption-key root against every other seed this keystore derives —
+/// the signing-key root among them.
+///
+/// An encryption key is `HMAC-SHA256(master, input)` like every other key here,
+/// with `input` always `encryption-key:v1:{project|wasm}:{uuid|sha256}:
+/// {signer|predecessor}:{account}:{path}` built from fields that hold no `:` —
+/// no type segment: an encryption key has none. The argument is the signing
+/// keys' (see `signing_key_seed_audit`):
+///
+/// * no other fixed root is a prefix of `encryption-key:v1:` or the other way
+///   round. `signing-key:v1:` included: the two roots differ in their first
+///   byte, so no encryption-key string equals, starts, or is started by a
+///   signing-key string, whatever follows either root — a signing key's type
+///   segment (`ed25519`) and an encryption key's binding (`project`, `wasm`)
+///   never meet;
+/// * no tagged input (`ecies:`, `secret-path:`) can start with it;
+/// * after the root, exactly five `:`-free segments, the first always the
+///   binding — so the string parses back to one tuple, and two tuples never
+///   spell one string;
+/// * a caller-written seed that starts at `encryption-key:` is refused
+///   (`DECLARED_KEY_ROOTS`); were one derived, it would reach the master only
+///   as `ecies:` + seed, or bare for its public key alone, and the one-way
+///   public key says nothing of the key.
+#[cfg(test)]
+mod encryption_key_seed_audit {
+    use super::*;
+    use crate::encryption_keys::{EncryptionKeyRequest, ENCRYPTION_KEY_LABEL, MAX_ENCRYPTION_KEYS};
+    use crate::signing_keys::{
+        validate_request, CallerKind, KeyBinding, ProjectUuid, SigningKeyRequest, SigningKeyType, SIGNING_KEY_LABEL,
+    };
+
+    const H: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// Paths spelled like other families' segments — a signing type and the
+    /// binding tags among them.
+    const PATHS: &[&str] = &[
+        "near", "evm", "check", "vrf-key", "storage", "project", "wasm", "wasm_hash", "k", "wallet", "ecies", "signer",
+        "predecessor", "records", "signing-key", "encryption-key", "v1", "v2", "ed25519", "secp256k1",
+    ];
+
+    const RUNS: &[(Option<(&str, &str)>, KeyBinding)] = &[
+        (Some(("wallet.near/evm", "p0000000000000001")), KeyBinding::Project),
+        (Some(("signing-key.near/v1", "pffffffffffffffff")), KeyBinding::Project),
+        (Some(("alice.near/app", "p0000000000000001")), KeyBinding::Project),
+        (None, KeyBinding::Wasm),
+    ];
+
+    const ACCOUNTS: &[&str] = &[
+        "wallet.near",
+        "ecies.near",
+        "signing-key.near",
+        "encryption-key.near",
+        "ed25519.near",
+        "signer.near",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ];
+
+    /// One key's fields as the string spells them: binding, what it is bound
+    /// to, caller, account, path.
+    type Tuple = [String; 5];
+
+    fn inputs_of<D: crate::signing_keys::KeyDeclaration>(
+        make: impl Fn(&str, KeyBinding, CallerKind) -> D,
+        most: usize,
+    ) -> Vec<(Tuple, String)> {
+        let mut out = Vec::new();
+        for (project, bind) in RUNS {
+            for account in ACCOUNTS {
+                for caller in [CallerKind::Signer, CallerKind::Predecessor] {
+                    for chunk in PATHS.chunks(most) {
+                        let keys: Vec<D> = chunk.iter().map(|p| make(p, *bind, caller)).collect();
+                        let uuid = project.map(|(_, u)| ProjectUuid::parse(u).unwrap());
+                        let bound = validate_request(project.map(|(id, _)| id), account, Some("predecessor.near"), Some(H), &keys)
+                            .unwrap()
+                            .bind(uuid)
+                            .unwrap();
+                        for k in bound.keys {
+                            let bound_to = match (bind, project) {
+                                (KeyBinding::Project, Some((_, u))) => u.to_string(),
+                                _ => H.to_string(),
+                            };
+                            let tuple = [
+                                bind.label().to_string(),
+                                bound_to,
+                                caller.label().to_string(),
+                                k.account.to_string(),
+                                k.path.as_str().to_string(),
+                            ];
+                            out.push((tuple, String::from_utf8(k.input.as_bytes().to_vec()).unwrap()));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Encryption-key inputs across both bindings and both callers, with
+    /// fields chosen to look like other families' segments.
+    fn encryption_tuples() -> Vec<(Tuple, String)> {
+        inputs_of(|p, bind, caller| EncryptionKeyRequest { path: p.to_string(), bind, caller, vault: None }, MAX_ENCRYPTION_KEYS)
+    }
+
+    fn encryption_inputs() -> Vec<String> {
+        encryption_tuples().into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// Signing-key inputs of one type over the same runs, callers and paths.
+    fn signing_inputs_of(key_type: SigningKeyType) -> Vec<String> {
+        inputs_of(
+            |p, bind, caller| SigningKeyRequest { path: p.to_string(), key_type, bind, caller, vault: None },
+            crate::signing_keys::MAX_SIGNING_KEYS,
+        )
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect()
+    }
+
+    /// Signing-key inputs of every type.
+    fn signing_inputs() -> Vec<String> {
+        SigningKeyType::ALL.into_iter().flat_map(signing_inputs_of).collect()
+    }
+
+    /// Every other family's HMAC input as this keystore builds it, including
+    /// adversarial fields where the family allows them, and every signing-key
+    /// input.
+    fn other_inputs() -> Vec<String> {
+        let mut seeds: Vec<String> = Vec::new();
+        for id in ["abc-123", "encryption-key", "v1", "signer", "predecessor", "project", "wasm"] {
+            for chain in ["near", "solana", "ethereum", "evm", "encryption-key:v1", "encryption-key:v1:project"] {
+                seeds.push(wallet_seed(id, chain));
+                seeds.push(format!("wallet:{id}:{chain}:check:0"));
+                seeds.push(format!("wallet:{id}:{chain}:encryption-key:v1:project"));
+                seeds.push(format!("wallet:{id}:{chain}:encryption-key:v1:wasm"));
+            }
+            seeds.push(subkey_seed(id, "connector.hl.trading"));
+            seeds.push(subkey_seed(id, "encryption-key"));
+            seeds.push(format!("wallet-policy:{id}"));
+        }
+        seeds.push("vrf-key".to_string());
+        seeds.push("outlayer.near:vault.alice.near".to_string());
+        for owner in ["alice.near", "v1", "encryption-key", "signer", "predecessor", "project"] {
+            seeds.push(format!("project:alice.near/app:{owner}"));
+            seeds.push(format!("project:encryption-key:v1:{owner}"));
+            seeds.push(format!("wasm_hash:{H}:{owner}"));
+            seeds.push(format!("system:payment_key:{owner}:0"));
+            seeds.push(format!("storage:p0000000000000001:{owner}"));
+            seeds.push(format!("storage:wasm:{H}:{owner}"));
+        }
+        let mut inputs: Vec<String> = seeds.iter().map(|s| format!("ecies:{s}")).collect();
+        inputs.push("secret-path:vault-master:vault.alice.near".to_string());
+        inputs.push(format!("ecies:{}", encryption_inputs()[0]));
+        inputs.extend(seeds);
+        inputs.extend(signing_inputs());
+        inputs
+    }
+
+    /// The fixed roots of every other family, the signing-key root included.
+    const OTHER_ROOTS: &[&str] = &[
+        "wallet:",
+        "subkey:",
+        "vrf-key",
+        "outlayer.near:",
+        "wallet-policy:",
+        "project:",
+        "wasm_hash:",
+        "system:",
+        "storage:",
+        "ecies:",
+        "secret-path:",
+        "vault-master:",
+        SIGNING_KEY_LABEL,
+    ];
+
+    #[test]
+    fn the_encryption_key_root_is_pinned() {
+        assert_eq!(ENCRYPTION_KEY_LABEL, "encryption-key:v1:");
+        assert_eq!(SIGNING_KEY_LABEL, "signing-key:v1:");
+        assert_ne!(ENCRYPTION_KEY_LABEL.as_bytes()[0], SIGNING_KEY_LABEL.as_bytes()[0], "the roots part at their first byte");
+    }
+
+    #[test]
+    fn no_other_input_equals_an_encryption_key_input() {
+        let encryption = encryption_inputs();
+        assert!(encryption.iter().any(|s| s.contains(":project:")) && encryption.iter().any(|s| s.contains(":wasm:")));
+        assert!(encryption.iter().any(|s| s.contains(":signer:")) && encryption.iter().any(|s| s.contains(":predecessor:")));
+        let others = other_inputs();
+        assert!(others.iter().any(|s| s.starts_with(SIGNING_KEY_LABEL)), "the signing-key inputs are in the audit");
+        let set: std::collections::HashSet<&String> = encryption.iter().collect();
+        for other in &others {
+            assert!(!other.starts_with(ENCRYPTION_KEY_LABEL), "{other} starts with the encryption-key root");
+            assert!(!set.contains(other), "{other} is an encryption-key input");
+        }
+    }
+
+    /// Neither equal nor a prefix, either way round: an encryption-key input
+    /// against every other input, the signing-key inputs among them.
+    #[test]
+    fn no_encryption_key_input_is_a_prefix_of_another_input_or_the_other_way_round() {
+        let encryption = encryption_inputs();
+        let others = other_inputs();
+        for e in &encryption {
+            for o in &others {
+                assert!(!e.starts_with(o.as_str()) && !o.starts_with(e.as_str()), "{e} / {o}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_encryption_key_input_starts_with_another_root() {
+        for s in encryption_inputs() {
+            assert!(s.starts_with(ENCRYPTION_KEY_LABEL));
+            for root in OTHER_ROOTS {
+                assert!(!s.starts_with(root), "{s} starts with {root}");
+            }
+        }
+        for root in OTHER_ROOTS {
+            assert!(!ENCRYPTION_KEY_LABEL.starts_with(root) && !root.starts_with(ENCRYPTION_KEY_LABEL), "{root}");
+        }
+    }
+
+    /// After the root: exactly the five fields, the binding first — never a
+    /// type — so a string parses back to the one tuple that made it, and two
+    /// tuples never spell one string.
+    #[test]
+    fn the_string_is_the_root_and_five_segments_the_binding_first() {
+        let tuples = encryption_tuples();
+        let mut seen: std::collections::HashMap<&str, &Tuple> = std::collections::HashMap::new();
+        for (tuple, s) in &tuples {
+            let rest = s.strip_prefix(ENCRYPTION_KEY_LABEL).unwrap();
+            let segments: Vec<&str> = rest.split(':').collect();
+            assert_eq!(segments, tuple.iter().map(String::as_str).collect::<Vec<_>>(), "{s}");
+            assert!(segments[0] == "project" || segments[0] == "wasm", "{s}");
+            for t in SigningKeyType::ALL {
+                assert_ne!(segments[0], t.label(), "{s}");
+            }
+            if let Some(earlier) = seen.insert(s.as_str(), tuple) {
+                assert_eq!(earlier, tuple, "two tuples spell {s}");
+            }
+        }
+        // The signing strings keep their type after their own root.
+        for t in SigningKeyType::ALL {
+            for s in signing_inputs_of(t) {
+                let rest = s.strip_prefix(SIGNING_KEY_LABEL).unwrap();
+                assert_eq!(rest.split(':').count(), 6, "{s}");
+                let project = format!("{}:project:", t.label());
+                let wasm = format!("{}:wasm:", t.label());
+                assert!(rest.starts_with(&project) || rest.starts_with(&wasm), "{s}");
+            }
+        }
+    }
+
+    /// One (run, caller, path) in both families: the strings differ in the
+    /// root and the signing key's type and nowhere else — pinned.
+    #[test]
+    fn the_same_tuple_in_both_families_differs_by_the_root_and_the_signing_type() {
+        let enc = encryption_inputs();
+        for t in SigningKeyType::ALL {
+            let sig = signing_inputs_of(t);
+            assert_eq!(enc.len(), sig.len());
+            let type_segment = format!("{}:", t.label());
+            for (e, s) in enc.iter().zip(&sig) {
+                assert_ne!(e, s);
+                let e_rest = e.strip_prefix(ENCRYPTION_KEY_LABEL).unwrap();
+                let s_rest = s.strip_prefix(SIGNING_KEY_LABEL).unwrap().strip_prefix(type_segment.as_str()).unwrap();
+                assert_eq!(e_rest, s_rest);
+            }
+        }
+    }
+
+    #[test]
+    fn the_encryption_key_root_is_not_an_exportable_or_signing_seed() {
+        for id in ["encryption-key", "a"] {
+            for chain in ["v1", "near"] {
+                for sub in ["project:p0000000000000001:signer:bob.near:k", "0"] {
+                    assert!(!format!("wallet:{id}:{chain}:{sub}").starts_with(ENCRYPTION_KEY_LABEL));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_repo_seed_spelling_an_encryption_key_string_is_refused_and_would_reach_the_master_tagged() {
+        let spelled = format!(
+            "{}:{}:{}",
+            crate::utils::normalize_repo_url("encryption-key"),
+            "v1",
+            "project:p0000000000000001:signer:bob.near:k"
+        );
+        assert!(spelled.starts_with(ENCRYPTION_KEY_LABEL));
+        // The keystore builds no seed from such a repo, nor takes one raw.
+        assert!(repo_seed_root("encryption-key").is_err());
+        assert!(refuse_declared_key_seed(&spelled).is_err());
+        let ks = crate::crypto::Keystore::generate();
+        let x25519 = ks.public_key_hex(None, &spelled).unwrap();
+        let v = validate_request(
+            Some("alice.near/app"),
+            "bob.near",
+            None,
+            Some(H),
+            &[EncryptionKeyRequest { path: "k".into(), bind: KeyBinding::Project, caller: CallerKind::Signer, vault: None }],
+        )
+        .unwrap()
+        .bind(Some(ProjectUuid::parse("p0000000000000001").unwrap()))
+        .unwrap();
+        assert_eq!(v.keys[0].input.as_bytes(), spelled.as_bytes(), "the seed spells the key's string exactly");
+        let key = ks.derive_encryption_key(None, &v.keys[0].input).unwrap();
+        // The ECIES key the secret path derives is under `ecies:` — not the
+        // encryption key, nor anything that reveals it.
+        assert_ne!(x25519, hex::encode(key.as_ref()));
+        let x_secret_from_key = x25519_dalek::StaticSecret::from(*key);
+        assert_ne!(x25519, hex::encode(x25519_dalek::PublicKey::from(&x_secret_from_key).as_bytes()));
+    }
+}
+
 /// `/decrypt` with signing keys, end to end through the handler, against a
 /// chain served from a local socket.
 #[cfg(test)]
@@ -3363,10 +3819,18 @@ mod signing_keys_at_the_door {
     /// The uuid the contract of these tests holds for `alice.near/app`.
     const P1: &str = "p0000000000000001";
 
-    type Answer = dyn Fn(&str, &str, &serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync;
+    /// The block a view call is answered from: height and hash.
+    type Block = (u64, String);
 
-    /// A chain that answers view calls with `answer(account, method, args)`;
-    /// `Err` is served as the RPC's "account does not exist" error.
+    /// `answer(account, method, args, params)`: the view's value and the block
+    /// it was read at. `params` is the whole query, with its block reference
+    /// (`finality`, or a pinned `block_id`).
+    type Answer = dyn Fn(&str, &str, &serde_json::Value, &serde_json::Value) -> Result<(serde_json::Value, Block), String>
+        + Send
+        + Sync;
+
+    /// A chain that answers view calls with `answer`; `Err` is served as the
+    /// RPC's "account does not exist" error.
     async fn chain(answer: Arc<Answer>) -> String {
         let app = axum::Router::new().route(
             "/",
@@ -3381,12 +3845,12 @@ mod signing_keys_at_the_door {
                         .and_then(|b| serde_json::from_slice(&b).ok())
                         .unwrap_or(json!({}));
                     let id = body["id"].clone();
-                    Json(match answer(&account, &method, &args) {
-                        Ok(v) => json!({
+                    Json(match answer(&account, &method, &args, params) {
+                        Ok((v, (height, hash))) => json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": {
-                                "block_hash": "11111111111111111111111111111111",
-                                "block_height": 1u64,
+                                "block_hash": hash,
+                                "block_height": height,
                                 "logs": [],
                                 "result": v.to_string().into_bytes(),
                             }
@@ -3443,17 +3907,82 @@ mod signing_keys_at_the_door {
     /// owner: `alice.near` — `sealed`, open to all; `carol.near` — `sealed`,
     /// open to `carol.near` only; anyone else — none. Every
     /// `get_secret_with_vault`, `get_project` and vault `get_state` is counted.
+    ///
+    /// The DAO `dao.test` verifies `vault.alice.near` (unless
+    /// `vault_unverified`) and `open.alice.near`, which is unlocked; asked
+    /// about `flaky.alice.near` it does not answer.
+    ///
+    /// Blocks: every read at `final` is answered from block [`BLOCK_A`] —
+    /// except the method named by `moved`, whose `final` read lands on
+    /// [`BLOCK_B`], one block later, where `alice.near/app` has been deleted
+    /// and created again: no versions, uuid [`P2`]. A read pinned to a block
+    /// hash is answered from that block. Every read's block reference is kept
+    /// in `refs`, as `(method, "final" | "hash:{hash}")`.
     struct World {
         sealed: std::sync::Mutex<String>,
         uuid: std::sync::Mutex<String>,
         project_hidden: std::sync::atomic::AtomicBool,
+        vault_unverified: std::sync::atomic::AtomicBool,
+        moved: std::sync::Mutex<Option<&'static str>>,
+        refs: std::sync::Mutex<Vec<(String, String)>>,
         secret_reads: AtomicUsize,
         project_reads: AtomicUsize,
         vault_reads: AtomicUsize,
     }
 
+    /// The uuid of the project created again under `alice.near/app` at [`BLOCK_B`].
+    const P2: &str = "p0000000000000002";
+
+    /// The final block, and the one after it.
+    const BLOCK_A: u64 = 10;
+    const BLOCK_B: u64 = 11;
+    fn block_a() -> Block {
+        (BLOCK_A, near_primitives::hash::CryptoHash::default().to_string())
+    }
+    fn block_b() -> Block {
+        (BLOCK_B, near_primitives::hash::CryptoHash([7u8; 32]).to_string())
+    }
+
+    impl World {
+        /// The block a read is answered from, recorded in `refs`.
+        fn block_for(&self, method: &str, params: &serde_json::Value) -> Block {
+            let (reference, block) = match params["block_id"].as_str() {
+                Some(hash) => {
+                    let block = [block_a(), block_b()]
+                        .into_iter()
+                        .find(|(_, h)| h == hash)
+                        .unwrap_or_else(|| panic!("a read pinned to a block this chain never named: {hash}"));
+                    (format!("hash:{hash}"), block)
+                }
+                None => {
+                    let reference = params["finality"].as_str().unwrap_or("none").to_string();
+                    let moved = *self.moved.lock().unwrap() == Some(method) && reference == "final";
+                    (reference, if moved { block_b() } else { block_a() })
+                }
+            };
+            self.refs.lock().unwrap().push((method.to_string(), reference));
+            block
+        }
+    }
+
     fn the_chain(world: Arc<World>) -> Arc<Answer> {
-        Arc::new(move |account: &str, method: &str, args: &serde_json::Value| match (account, method) {
+        Arc::new(move |account: &str, method: &str, args: &serde_json::Value, params: &serde_json::Value| {
+            let block = world.block_for(method, params);
+            let recreated = block.0 == BLOCK_B;
+            the_chain_at(&world, recreated, account, method, args).map(|v| (v, block))
+        })
+    }
+
+    /// What the chain of [`World`] answers at a block, `recreated` at [`BLOCK_B`].
+    fn the_chain_at(
+        world: &World,
+        recreated: bool,
+        account: &str,
+        method: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        match (account, method) {
+            ("outlayer.test", "get_version") if recreated => Ok(serde_json::Value::Null),
             ("outlayer.test", "get_version") => {
                 let key = args["version_key"].as_str().unwrap_or_default();
                 Ok(match (args["project_id"].as_str(), key) {
@@ -3473,7 +4002,7 @@ mod signing_keys_at_the_door {
             ("outlayer.test", "get_project") => {
                 world.project_reads.fetch_add(1, Ordering::SeqCst);
                 Ok(if args["project_id"] == "alice.near/app" && !world.project_hidden.load(Ordering::SeqCst) {
-                    let uuid = world.uuid.lock().unwrap().clone();
+                    let uuid = if recreated { P2.to_string() } else { world.uuid.lock().unwrap().clone() };
                     json!({ "uuid": uuid, "owner": "alice.near", "name": "app", "project_id": "alice.near/app",
                             "active_version": H1, "created_at": 0, "storage_deposit": "0" })
                 } else {
@@ -3496,14 +4025,22 @@ mod signing_keys_at_the_door {
                 world.vault_reads.fetch_add(1, Ordering::SeqCst);
                 match account {
                     "vault.alice.near" => Ok(json!({ "parent": "alice.near", "unlocked": false })),
+                    "open.alice.near" => Ok(json!({ "parent": "alice.near", "unlocked": true })),
+                    "flaky.alice.near" => Ok(json!({ "parent": "alice.near", "unlocked": false })),
                     "vault.mallory.near" => Ok(json!({ "parent": "mallory.near", "unlocked": false })),
                     "other.alice.near" => Ok(json!({ "parent": "mallory.near", "unlocked": false })),
                     "gone.alice.near" => Err(format!("account {account} does not exist while viewing {}", "x".repeat(5000))),
                     _ => Err(format!("account {account} does not exist while viewing")),
                 }
             }
+            ("dao.test", "is_vault_verified") => match args["vault_id"].as_str() {
+                Some("vault.alice.near") => Ok(json!(!world.vault_unverified.load(Ordering::SeqCst))),
+                Some("open.alice.near") => Ok(json!(true)),
+                Some("flaky.alice.near") => Err("the DAO did not answer".to_string()),
+                _ => Ok(json!(false)),
+            },
             _ => Err(format!("account {account} does not exist while viewing")),
-        })
+        }
     }
 
     const SECRET_JSON: &[u8] = br#"{"API_KEY":"x"}"#;
@@ -3514,6 +4051,9 @@ mod signing_keys_at_the_door {
             sealed: Default::default(),
             uuid: std::sync::Mutex::new(P1.to_string()),
             project_hidden: Default::default(),
+            vault_unverified: Default::default(),
+            moved: Default::default(),
+            refs: Default::default(),
             secret_reads: AtomicUsize::new(0),
             project_reads: AtomicUsize::new(0),
             vault_reads: AtomicUsize::new(0),
@@ -3619,7 +4159,7 @@ mod signing_keys_at_the_door {
     }
 
     async fn ask(state: &AppState, req: KeyedDecryptRequest) -> Result<KeyedDecryptResponse, ApiError> {
-        decrypt_with_signing_keys(state.clone(), None, req).await.map(|Json(r)| r)
+        decrypt_with_keys(state.clone(), None, req).await.map(|Json(r)| r)
     }
 
     fn seed_of(response: &KeyedDecryptResponse, path: &str) -> String {
@@ -3716,6 +4256,17 @@ mod signing_keys_at_the_door {
                 .await
                 .expect("predecessor key");
         assert_eq!(seed_of(&bob_as_predecessor, "records"), "978a4ab49ca4f60607132ef5189ffcdf064f23c7e4517e166ff7dafeb927d533");
+        // secp256k1 keys: the same machinery under their own type segment,
+        // beside an ed25519 key in one request.
+        let secp = |k: SigningKeyRequest| SigningKeyRequest { key_type: SigningKeyType::Secp256k1, ..k };
+        let mixed = ask(&state, project_run("bob.near", H1, vec![pkey("ed"), secp(pkey("records"))])).await.expect("both types");
+        assert_eq!(seed_of(&mixed, "records"), "772890cc14851d53236ca8223391e336f711aedaaca1ee1922e9ad6452661b90");
+        let direct = ask(&state, direct_run("bob.near", H1, vec![secp(wkey("records"))])).await.expect("wasm key");
+        assert_eq!(seed_of(&direct, "records"), "eca5d0f77b791ab4165da888811f52130b61a594f1efba0015c473da48efee50");
+        let dao = ask(&state, keyed_as(Some("alice.near/app"), "bob.near", Some("dao.near"), H1, vec![secp(predkey("records"))]))
+            .await
+            .expect("predecessor key");
+        assert_eq!(seed_of(&dao, "records"), "710b7427d36f8d365372be9c950b88486524586838e452d8f1ff24d220f66938");
     }
 
     /// A project key follows the project's uuid: the same name created again
@@ -3861,7 +4412,8 @@ mod signing_keys_at_the_door {
         // An unknown type, an unknown bind, an unknown caller, the old `name`
         // field, or a field no key has, is not even a request.
         for bad in [
-            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "secp256k1" }] }),
+            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "secp256r1" }] }),
+            json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "Secp256k1" }] }),
             json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "ed25519", "bind": "hash" }] }),
             json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "path": "k", "type": "ed25519", "caller": "sender" }] }),
             json!({ "user_account_id": "bob.near", "executed_wasm_sha256": H1, "project_id": "alice.near/app", "signing_keys": [{ "name": "k", "type": "ed25519" }] }),
@@ -4032,6 +4584,155 @@ mod signing_keys_at_the_door {
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("vault vault.alice.near is not available"), "{body}");
         assert!(error.chars().count() < 500, "the load's text is bounded: {} chars", error.chars().count());
+    }
+
+    /// `state` as a keystore registered with the DAO `dao.test`: the gate every
+    /// per-vault operation passes through runs against the chain of [`World`].
+    /// No MPC is reached by these tests — a vault they load is loaded already.
+    fn with_the_dao(state: &AppState) {
+        let secret_key = near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519);
+        state.set_mpc_context(
+            crate::mpc_ckd::MpcCkdConfig {
+                mpc_contract_id: "v1.signer.test".parse().unwrap(),
+                mpc_domain_id: 2,
+                mpc_public_key: "unused".into(),
+                near_rpc_url: state.config.near_rpc_url.clone(),
+                keystore_dao_id: "dao.test".parse().unwrap(),
+            },
+            near_crypto::InMemorySigner {
+                account_id: "dao.test".parse().unwrap(),
+                public_key: secret_key.public_key(),
+                secret_key,
+            },
+        );
+    }
+
+    async fn load_vault(state: &AppState, vault: &str, master: [u8; 32]) {
+        state.keystore.read().await.add_customer(vault.parse().unwrap(), master);
+    }
+
+    /// A vault the DAO does not verify — never verified, or banned — is a
+    /// standing answer about the vault, not the keystore's outage: refused
+    /// with the refusal code and a 403 naming the reason, and no keys.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vault_the_dao_does_not_verify_is_refused_not_an_outage() {
+        let (state, world) = world().await;
+        with_the_dao(&state);
+        world.vault_unverified.store(true, Ordering::SeqCst);
+        // Loaded before the DAO withdrew it: the gate still refuses, and evicts.
+        load_vault(&state, "vault.alice.near", [9u8; 32]).await;
+        let result = ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("vault.alice.near"))])).await;
+        assert!(
+            matches!(result, Err(ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, _))),
+            "{:?}",
+            result.as_ref().err()
+        );
+        let (status, body) = refused(result).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(is_key_refusal(&body), "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.starts_with("Signing keys refused: "), "{body}");
+        assert!(error.contains("vault vault.alice.near is not verified on keystore-dao (or has been banned)"), "{body}");
+        assert!(body.get("signing_keys").is_none(), "{body}");
+        assert!(!state.keystore.read().await.has_customer(&"vault.alice.near".parse().unwrap()));
+    }
+
+    /// An unlocked vault — recovery completed, its parent holds a FullAccess
+    /// key — is refused the same way: 403 with the refusal code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unlocked_vault_is_refused_not_an_outage() {
+        let (state, _) = world().await;
+        with_the_dao(&state);
+        let (status, body) = refused(
+            ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("open.alice.near"))])).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(is_key_refusal(&body), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("vault open.alice.near is unlocked"), "{body}");
+    }
+
+    /// The gate's own read failing is still the keystore's outage — a 500
+    /// without the refusal code — and only the typed answers refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dao_that_does_not_answer_is_an_outage_not_a_refusal() {
+        let (state, _) = world().await;
+        with_the_dao(&state);
+        let result =
+            ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("flaky.alice.near"))])).await;
+        assert!(matches!(result, Err(ApiError::InternalError(_))), "{:?}", result.as_ref().err());
+        let (status, body) = refused(result).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(!is_key_refusal(&body), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("vault flaky.alice.near is not available"), "{body}");
+    }
+
+    /// The control: a verified, locked vault whose master is in memory passes
+    /// the gate, and its key comes from its own master.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verified_loaded_vault_is_served_from_its_own_master() {
+        let (state, _) = world().await;
+        with_the_dao(&state);
+        load_vault(&state, "vault.alice.near", [9u8; 32]).await;
+        let under_vault = ask(&state, project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("vault.alice.near"))]))
+            .await
+            .expect("a verified, locked, loaded vault is served");
+        let under_default = ask(&state, project_run("bob.near", H1, vec![pkey("k")])).await.expect("default master");
+        assert_ne!(seed_of(&under_vault, "k"), seed_of(&under_default, "k"));
+    }
+
+    /// A vault whose master leaves memory after the checks passed — evicted
+    /// between [`authorize_keys`] and [`derive_keys`] — is a race, not a
+    /// verdict: a 503 without the refusal code, never a key from the default
+    /// master.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vault_evicted_after_the_checks_is_unavailable_not_refused() {
+        let (state, _) = world().await;
+        with_the_dao(&state);
+        load_vault(&state, "vault.alice.near", [9u8; 32]).await;
+        let req = project_run("bob.near", H1, vec![key("k", KeyBinding::Project, Some("vault.alice.near"))]);
+        let authorized = authorize_keys(&state, &req).await.expect("the vault passes the checks");
+        state.keystore.read().await.evict_customer(&"vault.alice.near".parse().unwrap());
+
+        let result = derive_keys(&state, authorized.signing.as_ref().unwrap(), &authorized.what).await;
+        assert!(matches!(result, Err(ApiError::Unavailable(_))), "{:?}", result.as_ref().err());
+        let (status, body) = answer_of(result.unwrap_err().into_response()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(!is_key_refusal(&body), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("vault vault.alice.near"), "{body}");
+    }
+
+    /// `get_version` and `get_project` are read at one final block. Here the
+    /// final head moves between them: the project is deleted and created again
+    /// one block later, with no versions and another uuid. The two answers are
+    /// reconciled at the older block, whichever of the two read the newer —
+    /// so the key is the one of the project the build was checked against, not
+    /// the new project's uuid under the old project's build.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_version_and_the_project_are_read_at_one_block() {
+        let (state, world) = world().await;
+        let request = || project_run("bob.near", H1, vec![pkey("records")]);
+        let steady = seed_of(&ask(&state, request()).await.expect("one block"), "records");
+        {
+            let refs = world.refs.lock().unwrap();
+            let reads: Vec<_> = refs.iter().filter(|(m, _)| m == "get_version" || m == "get_project").collect();
+            assert_eq!(reads.len(), 2, "one read each when both answer from one block: {reads:?}");
+            assert!(reads.iter().all(|(_, at)| at == "final"), "both at final: {reads:?}");
+        }
+        let (_, a) = block_a();
+
+        for moved in ["get_project", "get_version"] {
+            world.refs.lock().unwrap().clear();
+            *world.moved.lock().unwrap() = Some(moved);
+            let response = ask(&state, request()).await.unwrap_or_else(|e| panic!("{moved} newer: {}", e.message()));
+            assert_eq!(seed_of(&response, "records"), steady, "{moved} read one block later: the key must be the old project's");
+            let refs = world.refs.lock().unwrap().clone();
+            assert!(
+                refs.contains(&(moved.to_string(), format!("hash:{a}"))),
+                "{moved} is read again at the older block: {refs:?}"
+            );
+            assert_eq!(refs.iter().filter(|(_, at)| at.starts_with("hash:")).count(), 1, "one read again, no more: {refs:?}");
+        }
     }
 
     // ---- One request, two independent parts ---------------------------------
@@ -4296,5 +4997,372 @@ mod signing_keys_at_the_door {
             "signing_keys": [{ "path": "k", "type": "ed25519", "bind": "wasm", "seed": "wallet:abc:near" }],
         }));
         assert!(parsed.is_err());
+    }
+
+    // ---- Encryption keys ----------------------------------------------------
+
+    fn ekey(path: &str, bind: KeyBinding, vault: Option<&str>) -> crate::encryption_keys::EncryptionKeyRequest {
+        crate::encryption_keys::EncryptionKeyRequest {
+            path: path.into(),
+            bind,
+            caller: CallerKind::Signer,
+            vault: vault.map(Into::into),
+        }
+    }
+
+    fn pekey(path: &str) -> crate::encryption_keys::EncryptionKeyRequest {
+        ekey(path, KeyBinding::Project, None)
+    }
+
+    fn wekey(path: &str) -> crate::encryption_keys::EncryptionKeyRequest {
+        ekey(path, KeyBinding::Wasm, None)
+    }
+
+    /// A keyed request naming both families (either list may be empty) and no
+    /// row, or the row of `owner` when one is named.
+    fn both(
+        project: Option<&str>,
+        owner: Option<&str>,
+        caller: &str,
+        predecessor: Option<&str>,
+        wasm: &str,
+        signing: Vec<SigningKeyRequest>,
+        encryption: Vec<crate::encryption_keys::EncryptionKeyRequest>,
+    ) -> KeyedDecryptRequest {
+        let mut body = json!({
+            "user_account_id": caller,
+            "task_id": "t1",
+            "executed_wasm_sha256": wasm,
+            "predecessor_id": predecessor,
+            "project_id": project,
+            "signing_keys": signing,
+            "encryption_keys": encryption,
+        });
+        if let Some(owner) = owner {
+            body["accessor"] = json!({ "type": "Project", "project_id": "alice.near/app" });
+            body["profile"] = json!("default");
+            body["owner"] = json!(owner);
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    fn enc_of(response: &KeyedDecryptResponse, path: &str) -> String {
+        let value = serde_json::to_value(&response.encryption_keys).unwrap();
+        value[path].as_str().expect("the key by path").to_string()
+    }
+
+    /// Encryption keys alone: the answer carries `encryption_keys` and nothing
+    /// of the signing family, and the handler answers `crypto.rs`'s pinned
+    /// vectors byte for byte.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encryption_keys_alone_answer_the_pinned_vectors() {
+        let ks = crate::crypto::Keystore::from_master_secret(&pinned_master()).unwrap();
+        let (state, _) = world_with(ks).await;
+        let project = ask(&state, both(Some("alice.near/app"), None, "bob.near", None, H1, vec![], vec![pekey("records")]))
+            .await
+            .expect("project key");
+        let wire = serde_json::to_value(&project).unwrap();
+        assert_eq!(wire.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["encryption_keys"], "{wire}");
+        assert_eq!(enc_of(&project, "records"), "4324b148cb409d9a56e27a37c0cfbc4787481db4dec90cfcd2219a091c4a5d0a");
+        let direct = ask(&state, both(None, None, "bob.near", None, H1, vec![], vec![wekey("records")])).await.expect("wasm key");
+        assert_eq!(enc_of(&direct, "records"), "d5c8e2c2561e2102cfc400e8e3a7c3031745e55e7820d9d2a298b8e1a977e65d");
+        let dao = ask(
+            &state,
+            both(
+                Some("alice.near/app"),
+                None,
+                "bob.near",
+                Some("dao.near"),
+                H1,
+                vec![],
+                vec![crate::encryption_keys::EncryptionKeyRequest { caller: CallerKind::Predecessor, ..pekey("records") }],
+            ),
+        )
+        .await
+        .expect("predecessor key");
+        assert_eq!(enc_of(&dao, "records"), "54e18ce04f69672782a9f53e4b98b473fd311ddd798c37f60ac718d88f87df50");
+    }
+
+    /// Both families in one request, one path in both: two unrelated keys, the
+    /// project read once, and each family's answer under its own member.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_request_serves_both_families_and_one_path_is_two_keys() {
+        let ks = crate::crypto::Keystore::from_master_secret(&pinned_master()).unwrap();
+        let (state, world) = world_with(ks).await;
+        let reads = world.project_reads.load(Ordering::SeqCst);
+        let response = ask(
+            &state,
+            both(Some("alice.near/app"), Some("alice.near"), "bob.near", None, H1, vec![pkey("records")], vec![pekey("records"), pekey("inbox")]),
+        )
+        .await
+        .expect("both families");
+        assert_eq!(world.project_reads.load(Ordering::SeqCst), reads + 1, "one project read for both families");
+        assert_eq!(seed_of(&response, "records"), "f6f531d0b454d922a8e1f530f41f3a1cd008c56c496e36c958f2d4013358ac3d");
+        assert_eq!(enc_of(&response, "records"), "4324b148cb409d9a56e27a37c0cfbc4787481db4dec90cfcd2219a091c4a5d0a");
+        assert_eq!(enc_of(&response, "inbox").len(), 64);
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["encryption_keys", "secrets", "signing_keys"]);
+        assert_eq!(wire["signing_keys"].as_object().unwrap().len(), 1);
+        assert_eq!(wire["encryption_keys"].as_object().unwrap().len(), 2);
+        assert_eq!(wire["secrets"]["status"], "decrypted");
+    }
+
+    /// One family's refusal refuses the whole request — the other family's
+    /// keys and the row included — with the one code, before the row is read,
+    /// and the message says which family.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_familys_refusal_refuses_the_whole_request_before_the_row() {
+        let (state, world) = world().await;
+        let secret_reads = || world.secret_reads.load(Ordering::SeqCst);
+        let cases: Vec<(&str, KeyedDecryptRequest, StatusCode, &str)> = vec![
+            (
+                "a wasm encryption key on a project run",
+                both(Some("alice.near/app"), Some("alice.near"), "bob.near", None, H1, vec![pkey("a")], vec![wekey("b")]),
+                StatusCode::BAD_REQUEST,
+                "Encryption keys refused: key \"b\" is bound to the build",
+            ),
+            (
+                "a project encryption key on a direct run",
+                both(None, Some("alice.near"), "bob.near", None, H1, vec![wkey("a")], vec![pekey("b")]),
+                StatusCode::BAD_REQUEST,
+                "Encryption keys refused: key \"b\" is bound to the project",
+            ),
+            (
+                "a predecessor encryption key with no predecessor",
+                both(
+                    Some("alice.near/app"),
+                    Some("alice.near"),
+                    "bob.near",
+                    None,
+                    H1,
+                    vec![],
+                    vec![crate::encryption_keys::EncryptionKeyRequest { caller: CallerKind::Predecessor, ..pekey("b") }],
+                ),
+                StatusCode::BAD_REQUEST,
+                "carries no predecessor_id",
+            ),
+            (
+                "four encryption keys",
+                both(Some("alice.near/app"), Some("alice.near"), "bob.near", None, H1, vec![], (0..4).map(|i| pekey(&format!("k{i}"))).collect()),
+                StatusCode::BAD_REQUEST,
+                "4 encryption keys were requested; at most 3",
+            ),
+            (
+                "a placeholder caller",
+                both(Some("alice.near/app"), None, "anonymous", None, H1, vec![], vec![pekey("b")]),
+                StatusCode::BAD_REQUEST,
+                "an encryption key needs a real caller",
+            ),
+            (
+                "a GitHub version of the project",
+                both(Some("alice.near/app"), Some("alice.near"), "bob.near", None, H4, vec![pkey("a")], vec![pekey("b")]),
+                StatusCode::FORBIDDEN,
+                "Signing and encryption keys refused: the running build",
+            ),
+            (
+                "an encryption vault that is not the owner's",
+                both(Some("alice.near/app"), Some("alice.near"), "bob.near", None, H1, vec![pkey("a")], vec![ekey("b", KeyBinding::Project, Some("vault.mallory.near"))]),
+                StatusCode::FORBIDDEN,
+                "does not belong to alice.near",
+            ),
+            (
+                "an encryption vault on a wasm key",
+                both(None, None, "bob.near", None, H1, vec![], vec![ekey("b", KeyBinding::Wasm, Some("vault.alice.near"))]),
+                StatusCode::BAD_REQUEST,
+                "cannot name a vault",
+            ),
+        ];
+        for (label, req, status_expected, says) in cases {
+            let before = secret_reads();
+            let (status, body) = refused(ask(&state, req).await).await;
+            assert_eq!(status, status_expected, "{label}: {body}");
+            assert!(is_key_refusal(&body), "{label}: {body}");
+            assert!(body["error"].as_str().unwrap().contains(says), "{label}: {body}");
+            assert!(body.get("signing_keys").is_none() && body.get("encryption_keys").is_none() && body.get("secrets").is_none(), "{label}: {body}");
+            assert_eq!(secret_reads(), before, "{label}: the row is not read beside refused keys");
+        }
+        // Three of each family is within both limits.
+        let three = ask(
+            &state,
+            both(
+                Some("alice.near/app"),
+                None,
+                "bob.near",
+                None,
+                H1,
+                (0..3).map(|i| pkey(&format!("k{i}"))).collect(),
+                (0..3).map(|i| pekey(&format!("k{i}"))).collect(),
+            ),
+        )
+        .await
+        .expect("three and three");
+        assert_eq!(serde_json::to_value(&three.encryption_keys).unwrap().as_object().unwrap().len(), 3);
+        assert_eq!(serde_json::to_value(&three.signing_keys).unwrap().as_object().unwrap().len(), 3);
+    }
+
+    /// A vault both families name is checked once; a vault this keystore
+    /// cannot load is the keystore's outage, never the default master.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vault_named_by_both_families_is_read_once_and_never_falls_back() {
+        let (state, world) = world().await;
+        let before = world.vault_reads.load(Ordering::SeqCst);
+        let result = ask(
+            &state,
+            both(
+                Some("alice.near/app"),
+                None,
+                "bob.near",
+                None,
+                H1,
+                vec![key("a", KeyBinding::Project, Some("vault.alice.near"))],
+                vec![ekey("a", KeyBinding::Project, Some("vault.alice.near"))],
+            ),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::InternalError(_))), "{:?}", result.as_ref().err());
+        assert_eq!(world.vault_reads.load(Ordering::SeqCst), before + 1, "one read for the vault both families name");
+        let (_, body) = refused(result).await;
+        assert!(body["error"].as_str().unwrap().contains("vault vault.alice.near is not available"), "{body}");
+    }
+
+    /// A `Repo` row whose repo starts at a declared-key root is refused on
+    /// `/decrypt` — even with a blob that would open under the seed it spells —
+    /// and an ordinary repo decrypts as it always did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repo_row_at_a_declared_key_root_is_refused() {
+        let (state, world) = world().await;
+        let json = Some("application/json");
+        let row = |repo: &str| {
+            format!(
+                r#"{{"accessor":{{"type":"Repo","repo":"{repo}"}},"profile":"default","owner":"alice.near","user_account_id":"bob.near"}}"#
+            )
+        };
+        let seal_for = |repo: &str| {
+            let state = state.clone();
+            let world = world.clone();
+            let seed = format!("{}:alice.near", crate::utils::normalize_repo_url(repo));
+            async move {
+                let ct = state.keystore.read().await.encrypt(None, &seed, SECRET_JSON).unwrap();
+                *world.sealed.lock().unwrap() = base64::encode(&ct);
+            }
+        };
+        for repo in ["https://github.com/alice/app.git", "github.com/encryption-key:v1"] {
+            seal_for(repo).await;
+            let (status, body) = post(&state, json, row(repo)).await;
+            assert_eq!(status, StatusCode::OK, "{repo}: {}", String::from_utf8_lossy(&body));
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(base64::decode(v["plaintext_secrets"].as_str().unwrap()).unwrap(), SECRET_JSON);
+        }
+        for repo in ["encryption-key", "signing-key", "https://encryption-key:v1:project"] {
+            seal_for(repo).await;
+            let (status, body) = post(&state, json, row(repo)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{repo}");
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let error = v["error"].as_str().unwrap();
+            assert!(error.contains("is not a repository URL"), "{repo}: {error}");
+            assert!(v.get("plaintext_secrets").is_none());
+        }
+    }
+
+    /// The body decides the shape: an `encryption_keys` member makes a keyed
+    /// request exactly as `signing_keys` does, an empty or null one does not,
+    /// a null one beside a named family is no keys of its own, and one named
+    /// twice is refused as neither.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_body_shape_reads_encryption_keys_too() {
+        let (state, world) = world().await;
+        let json = Some("application/json");
+        let row = |owner: &str, extra: &str| {
+            format!(
+                r#"{{"accessor":{{"type":"Project","project_id":"alice.near/app"}},"profile":"default","owner":"{owner}","user_account_id":"bob.near"{extra}}}"#
+            )
+        };
+        for extra in [
+            r#","encryption_keys":null"#,
+            r#","encryption_keys":[]"#,
+            r#","signing_keys":[],"encryption_keys":[]"#,
+            r#","signing_keys":null,"encryption_keys":null"#,
+            r#","signing_keys":null,"encryption_keys":[]"#,
+        ] {
+            let (status, body) = post(&state, json, row("nobody.near", extra)).await;
+            assert_eq!((status, body.as_slice()), (StatusCode::BAD_REQUEST, &br#"{"error":"Secrets not found in contract"}"#[..]), "{extra}");
+            let (status, body) = post(&state, json, row("alice.near", extra)).await;
+            assert_eq!(status, StatusCode::OK, "{extra}");
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["plaintext_secrets"], "{extra}");
+        }
+        // One family named, the other `null`: a keyed request for the named
+        // family alone, answered as if the `null` member were absent.
+        let signing = r#"[{"path":"k","type":"ed25519","bind":"wasm"}]"#;
+        let encryption = r#"[{"path":"k","bind":"wasm"}]"#;
+        for (signing_keys, encryption_keys, answered) in
+            [("null", encryption, "encryption_keys"), (signing, "null", "signing_keys")]
+        {
+            let body = |mixed: bool| {
+                let members = match (mixed, answered) {
+                    (true, _) => format!(r#""signing_keys":{signing_keys},"encryption_keys":{encryption_keys}"#),
+                    (false, "signing_keys") => format!(r#""signing_keys":{signing_keys}"#),
+                    (false, _) => format!(r#""encryption_keys":{encryption_keys}"#),
+                };
+                format!(r#"{{"user_account_id":"b.near","executed_wasm_sha256":"{H1}",{members}}}"#)
+            };
+            let (status, bytes) = post(&state, json, body(true)).await;
+            assert_eq!(status, StatusCode::OK, "{}: {}", body(true), String::from_utf8_lossy(&bytes));
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec![answered], "{v}");
+            assert_eq!(v[answered]["k"].as_str().unwrap().len(), 64);
+            let (status, alone) = post(&state, json, body(false)).await;
+            assert_eq!((status, alone), (StatusCode::OK, bytes), "the `null` member changes nothing");
+        }
+        let (status, bytes) = post(
+            &state,
+            json,
+            format!(r#"{{"user_account_id":"b.near","executed_wasm_sha256":"{H1}","encryption_keys":[{{"path":"k","bind":"wasm"}}]}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["encryption_keys"], "{v}");
+        assert_eq!(v["encryption_keys"]["k"].as_str().unwrap().len(), 64);
+        // Named twice: refused before anything is read.
+        let keys = r#"[{"path":"k"}]"#;
+        let twice = |a: &str, b: &str| {
+            format!(
+                r#"{{"accessor":{{"type":"Project","project_id":"alice.near/app"}},"profile":"default","owner":"alice.near","user_account_id":"bob.near","executed_wasm_sha256":"{H1}","project_id":"alice.near/app","encryption_keys":{a},"encryption_keys":{b}}}"#
+            )
+        };
+        for body in [twice("[]", keys), twice(keys, "null"), twice("[]", "[]")] {
+            let before = world.secret_reads.load(Ordering::SeqCst);
+            let (status, bytes) = post(&state, json, body.clone()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let error = v["error"].as_str().unwrap();
+            assert!(error.contains("duplicate field `encryption_keys`") && error.contains("at most once"), "{body}: {v}");
+            assert_eq!(world.secret_reads.load(Ordering::SeqCst), before);
+        }
+        // An encryption key has no type: a `type` member — any value, a
+        // signing type included — is an unknown field, refused before
+        // anything is read, and the refusal names it and the fields there are.
+        for ty in ["xchacha20poly1305", "ed25519"] {
+            let before = world.secret_reads.load(Ordering::SeqCst);
+            let (status, bytes) = post(
+                &state,
+                json,
+                format!(r#"{{"user_account_id":"b.near","executed_wasm_sha256":"{H1}","encryption_keys":[{{"path":"k","type":"{ty}","bind":"wasm"}}]}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{ty}");
+            let said = String::from_utf8_lossy(&bytes);
+            assert!(
+                said.contains("unknown field `type`") && said.contains("expected one of `path`, `bind`, `caller`, `vault`"),
+                "{ty}: {said}"
+            );
+            assert_eq!(world.secret_reads.load(Ordering::SeqCst), before);
+        }
+        let parsed: Result<KeyedDecryptRequest, _> = serde_json::from_value(json!({
+            "user_account_id": "bob.near", "executed_wasm_sha256": H1,
+            "encryption_keys": [{ "path": "k", "bind": "wasm", "seed": "wallet:abc:near" }],
+        }));
+        assert!(parsed.is_err(), "an encryption key cannot carry its own derivation string");
     }
 }

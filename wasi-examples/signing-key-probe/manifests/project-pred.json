@@ -1,0 +1,23 @@
+{
+  "display": {
+    "name": "Signing-key probe (a predecessor signing key)"
+  },
+  "operations": [
+    "public_key",
+    "sign",
+    "sign_and_verify",
+    "sign_nep413",
+    "host_nep413",
+    "evm_address",
+    "all_public_keys",
+    "what_i_can_see",
+    "attack",
+    "attacks"
+  ],
+  "capabilities": {
+    "network": []
+  },
+  "signing_keys": [
+    {"path": "alpha", "type": "ed25519", "caller": "predecessor"}
+  ]
+}

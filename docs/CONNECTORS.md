@@ -430,8 +430,8 @@ address with an empty balance.
 
 ### 4.6 Keys of your own: signing keys
 
-Any project, a connector included, can declare ed25519 keys in its manifest
-(`signing_keys`) and sign with them through the `outlayer:signing-keys` host
+Any project, a connector included, can declare ed25519 or secp256k1 keys in
+its manifest (`signing_keys`) and sign with them through the `outlayer:signing-keys` host
 functions. The keystore derives each key for the run, bound to the project's
 on-chain uuid and to one account of the run, chosen per key with `caller`:
 `signer` (the default — the transaction's signer, the payment key's owner over
@@ -444,17 +444,22 @@ Use one when somebody must be able to check what your connector said or did
 without trusting the path it travelled: sign the record you return — a venue's
 answer, a fill, a receipt — and publish the public key. Because a key is per
 caller and per project, it is also a stable identity for that caller: its public
-key in hex is a NEAR implicit account, and `sign` over raw bytes is enough for a
-NEP-413 (`signMessage`) signature that verifies against that account.
+key in hex is a NEAR implicit account, and `sign-nep413` answers a NEP-413
+(`signMessage`) signature that verifies against that account. A `secp256k1` key
+signs a 32-byte prehash for EVM (`r ‖ s ‖ v`, `v + 27` for EVM), and its public
+key is an EVM address. A run's attestation proves a key is the project's
+(recipe: [app.outlayer.ai/docs/signing-keys#prove-key](https://app.outlayer.ai/docs/signing-keys#prove-key)).
 
-Keep money off it. The key can sign NEAR transactions for its implicit account,
-and Solana ones for the same public key, so funds sent there are controlled only
-by your code, outside every wallet policy. Funds a connector holds belong under
-a sub-key (§4.5) or the wallet's policy-metered operations, where the owner's
-limits apply. EVM is not supported: it needs secp256k1.
+Keep money off it. An ed25519 key can sign NEAR transactions for its implicit
+account and Solana ones for the same public key, a secp256k1 key EVM ones for
+its address, so funds sent there are controlled only by your code, outside every
+wallet policy. Funds a connector holds belong under a sub-key (§4.5) or the
+wallet's policy-metered operations, where the owner's limits apply.
 
 For the same reason, never sign caller-supplied bytes or digests verbatim: a
-signature over bytes the caller chose can be a transaction from that account.
+signature over bytes the caller chose can be a transaction from that account,
+and a caller-chosen 32-byte digest under a secp256k1 key can be the hash of any
+EVM transaction or permit.
 Sign only messages your code composes from fields it has parsed and checked.
 And with a `signer` key, any contract the signer ever transacts with can start a
 run under the signer's key with input of its own — the input is not the
@@ -472,6 +477,65 @@ starts, and a GitHub-sourced version is never issued signing keys. Fields,
 bindings, `caller`, vaults, NEP-413 and every refusal:
 [`CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md), `signing_keys`.
 
+### 4.7 Keys of your own: encryption keys, and sealed records
+
+A connector that keeps records between calls — a cursor, a session, a venue's
+answer it will need again — keeps them in the caller's own storage. The
+ordinary `set`/`get` encrypt through the keystore; the raw functions
+(`set-raw`, `get-raw`, `set-if-absent-raw`, `set-if-equals-raw` in
+`near:storage`) store the bytes as given, in the same storage — per caller, per
+project, one key namespace — with no keystore on the path. The storage's
+operator can read a raw record's key name and bytes, so a raw record is sealed
+by your code first.
+
+That is what `encryption_keys` are for. Declare one in the manifest
+(`{"path": "records"}` — no `type`; at most 3, counted apart from signing keys;
+a namespace of its own, so an encryption key and a signing key at one path are
+two secrets) and seal through the `outlayer:encryption-keys` host functions:
+`encrypt(path, vault, plaintext, aad)`, `decrypt(path, vault, ciphertext, aad)`
+and `mac(path, vault, data)`. The key is derived and issued exactly like a
+signing key — `bind`, `caller`, `vault`, the GitHub refusal — so a connector's
+keys are `bind: "project"` and follow the project's uuid: every later version
+opens what an earlier one sealed. The `path` is an input of the derivation;
+renaming it loses everything sealed under it.
+
+The recipe for a sealed record:
+
+* **its storage key** is `mac(path, vault, name)` in hex, not `name` — the
+  operator sees storage keys, and the same name always maps to the same tag;
+* **its value** is `encrypt(path, vault, value, aad = name)` — a ciphertext
+  copied onto another record fails to open instead of being read as that
+  record's;
+* **it is written and read with the raw functions**; a compare-and-swap
+  (`set-if-equals-raw`) compares the stored ciphertext bytes.
+
+The Rust SDK provides helpers for this pattern.
+
+**Whose cell the records are in.** The manifest's `storage_account` picks the
+account whose cell of the connector's storage a run reads and writes; the
+guest never names one. `signer` (the default) is the transaction's signer on
+chain; `predecessor` is the account that called the contract on chain — a
+relaying contract rather than the user who signed. Over HTTPS both are the
+payment key's owner. A run with no predecessor under `predecessor` is refused
+before it executes. A connector whose keys are `caller: "predecessor"` declares
+`storage_account: "predecessor"` too, so the records sit in the cell of the
+account their key belongs to — the calling account, which for a direct or
+HTTPS call is the agent itself. Hyperliquid and Polymarket declare
+`predecessor` for both. The `@worker` storage is not affected.
+
+Rules that come with it. A key holds one record in one mode: `get` on a raw
+record, `get-raw` on an encrypted one, and a write in the other mode are errors,
+and no write converts a record — delete it first. `has`, `delete` and
+`list-keys` work on both; `increment` and `decrement` only on encrypted
+records. `decrypt` answers every failure to open with exactly `decryption
+failed`. Inputs are capped at 256 KiB. And with a `signer` key, any contract the
+signer transacts with can start a run under that key with input of its own: a
+connector never hands back what it opens just because the input asked — and an
+on-chain answer is public (§2, "Answering on chain").
+
+Format, limits and every refusal:
+[`CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md), `encryption_keys`.
+
 ---
 
 ## 5. Limits
@@ -485,8 +549,7 @@ Per operation, in the contract's pricing table, with the author's share and the
 account it pays to alongside it. The chain enforces it: `request_execution`
 refuses a call that does not attach the operation's exact price.
 
-You do not set this in your manifest. A manifest may state a *recommended*
-price; the on-chain one is what is charged.
+You do not set this in your manifest: it carries no price.
 
 ### 5.2 Operation limits (the coordinator)
 

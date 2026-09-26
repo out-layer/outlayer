@@ -347,7 +347,7 @@ fn cmd_set_public(key: &str, value: &str) -> Output {
 /// Get public storage from another project (cross-project read)
 fn cmd_get_public_cross(key: &str, project: &str) -> Output {
     if project.is_empty() {
-        return error_output("get_public_cross", "project parameter is required (project_uuid, e.g., 'p0000000000000001')");
+        return error_output("get_public_cross", "project parameter is required: the project's name (e.g., 'owner.near/name') or its uuid (e.g., 'p0000000000000001')");
     }
 
     match storage::get_worker_from_project(key, Some(project)) {

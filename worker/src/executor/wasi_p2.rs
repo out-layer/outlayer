@@ -68,6 +68,7 @@ use crate::outlayer_payment::{PaymentHostState, add_payment_to_linker};
 use crate::outlayer_vrf::{VrfHostState, add_vrf_to_linker};
 use crate::outlayer_wallet::{WalletHostState, add_wallet_to_linker};
 use crate::signing_keys::{SigningKeys, SigningKeysHostState, add_signing_keys_to_linker};
+use crate::encryption_keys::{EncryptionKeys, EncryptionKeysHostState, add_encryption_keys_to_linker};
 
 use super::ExecutionContext;
 
@@ -96,6 +97,9 @@ struct HostState {
     /// This run's signing keys (only present if the component imports
     /// `outlayer:signing-keys/api`). Dropped with the store, at the end of the run.
     signing_keys_state: Option<SigningKeysHostState>,
+    /// This run's encryption keys (only present if the component imports
+    /// `outlayer:encryption-keys/api`). Dropped with the store, at the end of the run.
+    encryption_keys_state: Option<EncryptionKeysHostState>,
     /// Counter for timed-out HTTP requests (shared with spawned tasks)
     http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
     /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
@@ -337,6 +341,11 @@ impl HostState {
     fn signing_keys_state_mut(&mut self) -> &mut SigningKeysHostState {
         self.signing_keys_state.as_mut().expect("Signing keys state not initialized")
     }
+
+    /// Get encryption-keys host state (for host function callbacks)
+    fn encryption_keys_state_mut(&mut self) -> &mut EncryptionKeysHostState {
+        self.encryption_keys_state.as_mut().expect("Encryption keys state not initialized")
+    }
 }
 
 /// Execute WASI Preview 2 component
@@ -355,7 +364,7 @@ impl HostState {
 /// * `env_vars` - Environment variables (from encrypted secrets, includes ATTACHED_USD)
 /// * `print_stderr` - Print WASM stderr to worker logs
 /// * `exec_ctx` - Execution context with optional RPC proxy
-/// * `signing_keys` - This run's declared signing keys, if it declares any
+/// * `keys` - This run's declared signing and encryption keys, if it declares any
 ///
 /// # Returns
 /// * `Ok((output, fuel_consumed, refund_usd))` - Execution succeeded
@@ -370,8 +379,9 @@ pub async fn execute(
     env_vars: Option<HashMap<String, String>>,
     print_stderr: bool,
     exec_ctx: Option<&ExecutionContext>,
-    signing_keys: Option<SigningKeys>,
+    keys: super::RunKeys,
 ) -> Result<(Vec<u8>, u64, Option<u64>)> {
+    let super::RunKeys { signing: signing_keys, encryption: encryption_keys } = keys;
     // Use global P2 engine (avoids ~50-100ms overhead per execution)
     let engine = get_p2_engine();
 
@@ -596,6 +606,24 @@ pub async fn execute(
         None
     };
 
+    // Encryption keys: the same, through their own interface, linked only
+    // when the component imports it.
+    let has_encryption_keys_import = component.component_type().imports(&engine)
+        .any(|(name, _)| name.contains("outlayer:encryption-keys/api"));
+
+    let encryption_keys_state = if has_encryption_keys_import {
+        let keys = encryption_keys.unwrap_or_else(EncryptionKeys::none);
+        debug!("Adding encryption-key host functions to linker, paths={:?}", keys.paths().collect::<Vec<_>>());
+        add_encryption_keys_to_linker(&mut linker, |state: &mut HostState| state.encryption_keys_state_mut())?;
+        Some(EncryptionKeysHostState::new(keys))
+    } else {
+        if encryption_keys.as_ref().is_some_and(|k| !k.is_empty()) {
+            debug!("Component declares encryption keys but does not import outlayer:encryption-keys/api; they go unused");
+        }
+        drop(encryption_keys);
+        None
+    };
+
     // Prepare stdin/stdout/stderr pipes
     let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
     let stdout_pipe =
@@ -663,6 +691,7 @@ pub async fn execute(
         vrf_state,
         wallet_state,
         signing_keys_state,
+        encryption_keys_state,
         http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         engine_handle: engine,
         network_policy,

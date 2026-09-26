@@ -59,14 +59,21 @@ impl Contract {
         // Resolve ExecutionSource to CodeSource (and get project_uuid if applicable)
         let (resolved_source, project_uuid) = self.resolve_execution_source(&source);
 
+        // A source given inline is held to the rule a project version is; a
+        // project's version was held to it when it was added.
+        if !matches!(source, ExecutionSource::Project { .. }) {
+            crate::projects::assert_code_source(&resolved_source);
+        }
+
         // Use provided limits or defaults (for execute mode)
         let limits = resource_limits.clone().unwrap_or_default();
 
-        // Get params or defaults, but override project_uuid if resolved from Project source
+        // The storage namespace is the contract's to name: the uuid of the
+        // Project source, and none for code given inline. A caller's own
+        // `params.project_uuid` would otherwise run any code inside another
+        // project's storage.
         let mut request_params = params.unwrap_or_default();
-        if project_uuid.is_some() {
-            request_params.project_uuid = project_uuid;
-        }
+        request_params.project_uuid = project_uuid;
 
         // Determine if this is compile-only mode
         let compile_only = request_params.compile_only || resource_limits.is_none();
@@ -623,15 +630,17 @@ impl Contract {
                                 }
                             };
 
-                            // Log for debugging (with type info, truncated to avoid log limit)
+                            // Log for debugging (with type info, truncated to avoid log limit).
+                            // The text is the WASM's own and is quoted, so a line break in it
+                            // stays inside this one log line.
                             let log_preview = match &output {
                                 ExecutionOutput::Bytes(bytes) => format!("Bytes({} bytes)", bytes.len()),
                                 ExecutionOutput::Text(text) => {
                                     let preview: String = text.chars().take(100).collect();
                                     if text.len() > 100 {
-                                        format!("Text({} bytes): {}...", text.len(), preview)
+                                        format!("Text({} bytes): {:?}...", text.len(), preview)
                                     } else {
-                                        format!("Text: {}", text)
+                                        format!("Text: {:?}", text)
                                     }
                                 }
                                 ExecutionOutput::Json(value) => {
@@ -719,7 +728,7 @@ impl Contract {
 
                         // Log the failure (don't panic - state changes must persist!)
                         log!(
-                            "Execution failed: {}. Resources: {{ instructions: {}, time_ms: {} }}. Refunded {} yoctoNEAR",
+                            "Execution failed: {:?}. Resources: {{ instructions: {}, time_ms: {} }}. Refunded {} yoctoNEAR",
                             error_msg,
                             exec_response.resources_used.instructions,
                             exec_response.resources_used.time_ms,
@@ -909,7 +918,7 @@ impl Contract {
                     .expect("Version not found");
 
                 log!(
-                    "Resolved project: {}, version: {}, source: {:?}, uuid: {}",
+                    "Resolved project: {}, version: {:?}, source: {:?}, uuid: {}",
                     project_id, version_to_use, version_info.source, project.uuid
                 );
 

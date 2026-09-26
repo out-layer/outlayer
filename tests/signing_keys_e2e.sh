@@ -30,6 +30,15 @@
 #   S12 sign_nep413 → the wallet-style answer, verified HERE against a NEP-413
 #       hash rebuilt independently (struct + hashlib); a tampered message,
 #       recipient or nonce does not verify
+#   S22 caller predecessor (the `project-pred` build, a version of the project):
+#       on a direct call the predecessor key at alpha is NOT the signer key at
+#       alpha, though the account is one (the caller kind is a derivation
+#       segment); $CALLER2 gets another. Relayed through $RELAY_CONTRACT: the
+#       guest sees the relay as NEAR_PREDECESSOR_ID and the signer as
+#       NEAR_USER_ACCOUNT_ID; the key is neither of $PARENT's; $CALLER2 through
+#       the same relay gets the SAME key — the relay contract's; it signs, and
+#       the signature verifies HERE; the `project` build relayed keeps the
+#       signer's alpha. Without RELAY_CONTRACT the relayed half SKIPS, loudly
 #
 # SKIPs loudly, whole, when the keystore or the worker predates signing keys.
 #
@@ -39,14 +48,21 @@
 # with PyNaCl or `cryptography`,
 # near, outlayer, jq, curl, cargo + wasm-tools (the build). The RPC is keyed
 # through tests/lib/rpc.sh.
+# For S22's relayed half: RELAY_CONTRACT, the testnet account of the deployed
+# wasi-examples/test-storage-ark/relay-contract (its `outlayer()` must be
+# $CONTRACT_ID).
 #
-# Money: four FastFS uploads (~230 KB each), project storage, and one on-chain
-# run per probe at $DEPOSIT (~20 runs).
+# Env: OFFLINE=1 (dry run only: no chain or GitHub reads; ignored with --apply).
+#
+# Money: five FastFS uploads (~230 KB each), project storage, and one on-chain
+# run per probe at $DEPOSIT (~27 runs; a relayed run's unused deposit comes
+# back to its signer, as a direct run's does).
 #
 # Run:
 #   PARENT=you.testnet CALLER2=friend.testnet ./tests/signing_keys_e2e.sh            # dry run: checks, no writes
 #   PARENT=you.testnet CALLER2=friend.testnet ./tests/signing_keys_e2e.sh --apply    # build, upload, publish, run
 #   … GITHUB_PROBE_REPO=https://github.com/you/signing-key-probe GITHUB_PROBE_COMMIT=<sha> … --apply
+#   … RELAY_CONTRACT=relay.you.testnet … --apply                                     # with S22's relayed half
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,6 +80,9 @@ DEPOSIT="${DEPOSIT:-0.1 NEAR}"
 GITHUB_PROBE_REPO="${GITHUB_PROBE_REPO:-}"
 GITHUB_PROBE_COMMIT="${GITHUB_PROBE_COMMIT:-}"
 GITHUB_PROJECT_VERSION="${GITHUB_PROJECT_VERSION:-0}"
+RELAY_CONTRACT="${RELAY_CONTRACT:-}"
+OFFLINE="${OFFLINE:-0}"
+[[ "$APPLY" == true ]] && OFFLINE=0
 PROBE_DIR="$REPO_ROOT/wasi-examples/signing-key-probe"
 VARIANTS="$PROBE_DIR/target/variants"
 export OUTLAYER_NETWORK="$NETWORK"
@@ -106,10 +125,11 @@ signer_flag() { [[ "$1" == "$PARENT" ]] && echo with-keychain || echo with-legac
 
 # One contract call, its whole transcript on stdout — the logs and the return
 # value included, which is where a run's event and answer are read from.
-call() { # call <signer> <method> <args-json> <deposit>
-  near contract call-function as-transaction "$CONTRACT_ID" "$2" json-args "$3" \
-    prepaid-gas '300.0 Tgas' attached-deposit "$4" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1
+call_on() { # call_on <signer> <receiver> <method> <args-json> <deposit>
+  near contract call-function as-transaction "$2" "$3" json-args "$4" \
+    prepaid-gas '300.0 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1
 }
+call() { call_on "$1" "$CONTRACT_ID" "$2" "$3" "$4"; } # call <signer> <method> <args-json> <deposit>
 
 # ── one run, on chain ────────────────────────────────────────────────────────
 #
@@ -117,14 +137,20 @@ call() { # call <signer> <method> <args-json> <deposit>
 # absent), RUN_ERR (the refusal) and RUN_OUT (the probe's own answer), and
 # appends everything that came back to $ANSWERS. The completion event is read
 # from the send's own transcript, or polled from the transaction when the run
-# outlives it (a GitHub source compiles first).
+# outlives it (a GitHub source compiles first). `run_relayed` is the same run
+# reached through $RELAY_CONTRACT: its predecessor is the relay, its signer
+# `<signer>`, and the relay returns the run's answer as its own.
 RUN_OK=""; RUN_ERR=""; RUN_OUT=""
-run_src() {
-  local signer=$1 source=$2 input=$3 args out tx ev logs i
-  args=$(jq -nc --argjson s "$source" --arg i "$input" \
+exec_args() { # exec_args <source-json> <input-json>
+  jq -nc --argjson s "$1" --arg i "$2" \
     '{source:$s, input_data:$i, response_format:"Json",
-      resource_limits:{max_instructions:10000000000,max_memory_mb:128,max_execution_seconds:60}}')
-  out=$(call "$signer" request_execution "$args" "$DEPOSIT")
+      resource_limits:{max_instructions:10000000000,max_memory_mb:128,max_execution_seconds:60}}'
+}
+run_src()     { run_on "$1" "$CONTRACT_ID" request_execution "$(exec_args "$2" "$3")"; }
+run_relayed() { run_on "$1" "$RELAY_CONTRACT" relay "$(exec_args "$2" "$3")"; }
+run_on() { # run_on <signer> <receiver> <method> <args-json>
+  local signer=$1 out tx ev logs="" i
+  out=$(call_on "$signer" "$2" "$3" "$4" "$DEPOSIT")
   printf '%s\n' "$out" >> "$ANSWERS"
   ev=$(grep -o 'EVENT_JSON:.*execution_completed.*' <<<"$out" | sed 's/^EVENT_JSON://' | head -1)
   tx=$(grep -oE 'Transaction ID: *[1-9A-HJ-NP-Za-km-z]{40,50}' <<<"$out" | grep -oE '[1-9A-HJ-NP-Za-km-z]{40,50}' | head -1)
@@ -136,14 +162,23 @@ run_src() {
       ev=$(jq -r '[.result.receipts_outcome[]?.outcome.logs[]?] | join("\n")' <<<"$logs" 2>/dev/null \
         | grep -o 'EVENT_JSON:.*execution_completed.*' | sed 's/^EVENT_JSON://' | head -1)
       [[ -n "$ev" ]] && break
+      # A receipt that failed before a run was asked for: no event will come.
+      jq -e '[.result.receipts_outcome[]?.outcome.status | select(has("Failure"))] | length > 0' <<<"$logs" >/dev/null 2>&1 && break
       (( i % 9 == 0 )) && note "still working… ~$((i*20))s"
       sleep 20
     done
   fi
   RUN_OUT=$(awk '/Function execution return value/{getline; print}' <<<"$out" \
     | jq -c 'select(. != null) | if type=="string" then fromjson else . end' 2>/dev/null)
+  if [[ -z "$RUN_OUT" && -n "$logs" ]]; then
+    RUN_OUT=$(jq -r '.result.status.SuccessValue // empty | @base64d' <<<"$logs" 2>/dev/null \
+      | jq -c 'select(. != null) | if type=="string" then fromjson else . end' 2>/dev/null)
+  fi
   if [[ -z "$ev" ]]; then
-    RUN_OK=absent; RUN_ERR=$(grep -iE 'error|panick' <<<"$out" | head -2 | tr '\n' ' ' | head -c 300)
+    RUN_OK=absent
+    RUN_ERR=$( { grep -iE 'error|panick|failed' <<<"$out" | head -2
+                 [[ -n "$logs" ]] && jq -r '.result.receipts_outcome[]?.outcome.status.Failure? // empty | tostring' <<<"$logs" 2>/dev/null | head -2
+               } | tr '\n' ' ' | head -c 300)
     return 0
   fi
   RUN_OK=$(jq -r '.data[0] | if has("success") then (.success|tostring) else "absent" end' <<<"$ev" 2>/dev/null)
@@ -240,14 +275,21 @@ fi
 [[ -n "$PARENT" && -n "$CALLER2" ]] || { echo "USAGE: PARENT=you.testnet CALLER2=friend.testnet $0 [--apply]" >&2; exit 1; }
 [[ "$PARENT" != "$CALLER2" ]] || { echo "✗ CALLER2 must be another account than PARENT" >&2; exit 1; }
 CREDS_DIR="$HOME/.near-credentials/$NETWORK"
+CREDS_MISSING=""
 for acct in "$PARENT" "$CALLER2"; do
-  [[ -f "$CREDS_DIR/$acct.json" ]] || { echo "✗ no key for $acct in $CREDS_DIR" >&2; exit 1; }
+  [[ -f "$CREDS_DIR/$acct.json" ]] || CREDS_MISSING+="$acct "
 done
+if [[ -n "$CREDS_MISSING" ]]; then
+  if [[ "$APPLY" == true ]]; then echo "✗ no key in $CREDS_DIR for: $CREDS_MISSING" >&2; exit 1; fi
+  warn "no key in $CREDS_DIR for: ${CREDS_MISSING}— --apply will stop here"
+fi
 
 # The GitHub row's commit must be one the platform can fetch.
 GITHUB_READY=false
 GITHUB_WHY="GITHUB_PROBE_REPO and GITHUB_PROBE_COMMIT are unset"
-if [[ -n "$GITHUB_PROBE_REPO" && -n "$GITHUB_PROBE_COMMIT" ]]; then
+if [[ -n "$GITHUB_PROBE_REPO" && -n "$GITHUB_PROBE_COMMIT" && "$OFFLINE" == 1 ]]; then
+  GITHUB_WHY="OFFLINE=1: $GITHUB_PROBE_REPO@${GITHUB_PROBE_COMMIT:0:12} not checked"
+elif [[ -n "$GITHUB_PROBE_REPO" && -n "$GITHUB_PROBE_COMMIT" ]]; then
   slug=$(sed -E 's#^https://github.com/##; s#\.git$##; s#/$##' <<<"$GITHUB_PROBE_REPO")
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://api.github.com/repos/$slug/commits/$GITHUB_PROBE_COMMIT")
   if [[ "$code" == "200" ]]; then
@@ -257,21 +299,43 @@ if [[ -n "$GITHUB_PROBE_REPO" && -n "$GITHUB_PROBE_COMMIT" ]]; then
   fi
 fi
 
+# S22's relayed half needs the relay deployed, relaying to this contract. A
+# relay named but unusable stops --apply: the rows it was named for would not run.
+RELAY_READY=false
+if [[ -z "$RELAY_CONTRACT" ]]; then
+  RELAY_WHY="RELAY_CONTRACT is unset — deploy wasi-examples/test-storage-ark/relay-contract (its README) and export its account"
+elif [[ "$OFFLINE" == 1 ]]; then
+  RELAY_WHY="OFFLINE=1: $RELAY_CONTRACT not checked"
+else
+  relay_target=$(view "$RELAY_CONTRACT" outlayer '{}' | jq -r 'select(type == "string")' 2>/dev/null)
+  if [[ "$relay_target" == "$CONTRACT_ID" ]]; then
+    RELAY_READY=true
+  else
+    RELAY_WHY="$RELAY_CONTRACT does not relay to $CONTRACT_ID (its outlayer(): '${relay_target:-unreadable}')"
+    [[ "$APPLY" == true ]] && { echo "✗ $RELAY_WHY" >&2; exit 1; }
+  fi
+fi
+
 if [[ "$APPLY" != true ]]; then
   log "dry run — nothing is built, uploaded, published or run"
-  sed -n '3,49p' "$0" >&2
-  note "project: $PROJECT ($(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{project_id:$p}')" | jq -r 'if .project_id then "on chain, active " + .active_version else "not on chain yet" end' 2>/dev/null || echo 'unreadable'))"
-  for v in project project-v2 wasm wasm-v2; do
+  sed -n '3,/^$/p' "$0" >&2
+  if [[ "$OFFLINE" == 1 ]]; then
+    note "OFFLINE=1: the project and its versions are not read from the chain"
+  else
+    note "project: $PROJECT ($(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{project_id:$p}')" | jq -r 'if .project_id then "on chain, active " + .active_version else "not on chain yet" end' 2>/dev/null || echo 'unreadable'))"
+  fi
+  for v in project project-v2 project-pred wasm wasm-v2; do
     f="$VARIANTS/signing-key-probe-$v.wasm"
     if [[ -f "$f" ]]; then
       h=$(sha_of "$f")
-      kind=$(version_on_chain "$h")
+      if [[ "$OFFLINE" == 1 ]]; then kind="(not read)"; else kind=$(version_on_chain "$h"); fi
       note "$v: built locally, sha256 $h; as a version of $PROJECT: ${kind:-absent}"
     else
       note "$v: not built yet (--apply runs $PROBE_DIR/build.sh)"
     fi
   done
   if [[ "$GITHUB_READY" == true ]]; then note "S8: $GITHUB_PROBE_REPO@${GITHUB_PROBE_COMMIT:0:12} is pushed"; else warn "S8 will SKIP: $GITHUB_WHY"; fi
+  if [[ "$RELAY_READY" == true ]]; then note "S22 relayed: $RELAY_CONTRACT relays to $CONTRACT_ID"; else warn "S22 relayed half will SKIP: $RELAY_WHY"; fi
   echo "  Pass --apply to run." >&2
   exit 0
 fi
@@ -280,13 +344,13 @@ fi
 
 log "build the probe"
 (cd "$PROBE_DIR" && ./build.sh >/dev/null) || { echo "✗ $PROBE_DIR/build.sh failed" >&2; exit 1; }
-for v in project project-v2 wasm wasm-v2; do
+for v in project project-v2 project-pred wasm wasm-v2; do
   set_for hash "$v" "$(sha_of "$VARIANTS/signing-key-probe-$v.wasm")"
   note "$v sha256 $(get_for hash "$v")"
 done
 
 log "upload to FastFS"
-for v in project project-v2 wasm wasm-v2; do
+for v in project project-v2 project-pred wasm wasm-v2; do
   up=$(OUTLAYER_RPC_URL="$RPC_URL" outlayer upload "$VARIANTS/signing-key-probe-$v.wasm" 2>&1)
   url=$(grep -oE 'https://[A-Za-z0-9._-]+\.fastfs\.io/[^[:space:]"]+\.wasm' <<<"$up" | head -1)
   if [[ -z "$url" ]]; then
@@ -297,7 +361,7 @@ for v in project project-v2 wasm wasm-v2; do
   set_for url "$v" "$url"
   note "$v at $url"
 done
-H_P=$(get_for hash project); H_P2=$(get_for hash project-v2); H_W=$(get_for hash wasm); H_W2=$(get_for hash wasm-v2)
+H_P=$(get_for hash project); H_P2=$(get_for hash project-v2); H_PP=$(get_for hash project-pred); H_W=$(get_for hash wasm); H_W2=$(get_for hash wasm-v2)
 U_P=$(get_for url project); U_W=$(get_for url wasm); U_W2=$(get_for url wasm-v2)
 
 log "publish $PROJECT"
@@ -305,15 +369,16 @@ if [[ -z "$(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{proje
   out=$(call "$PARENT" create_project "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$U_P" "$H_P")" '{name:$n, source:$s}')" '0.3 NEAR')
   sleep 4
 fi
-# project v1 active; v2 and the wasm build as inactive versions of the same project.
-for v in project project-v2 wasm; do
+# project v1 active; v2, the predecessor build and the wasm build as inactive
+# versions of the same project.
+for v in project project-v2 project-pred wasm; do
   [[ -n "$(version_on_chain "$(get_for hash "$v")")" ]] && continue
   active=false; [[ "$v" == project ]] && active=true
   out=$(call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$(get_for url "$v")" "$(get_for hash "$v")")" --argjson a "$active" \
     '{project_name:$n, source:$s, set_active:$a}')" '0.1 NEAR')
   sleep 4
 done
-for v in project project-v2 wasm; do
+for v in project project-v2 project-pred wasm; do
   [[ "$(version_on_chain "$(get_for hash "$v")")" == "WasmUrl" ]] || { echo "✗ $(get_for hash "$v") ($v) is not a WasmUrl version of $PROJECT" >&2; exit 1; }
 done
 call "$PARENT" set_active_version "$(jq -nc --arg n "$PROJECT_NAME" --arg v "$H_P" '{project_name:$n, version_key:$v}')" '0 NEAR' >/dev/null
@@ -494,8 +559,8 @@ if ran_ok "S9 attacks"; then
   [[ -z "$bad" ]] && pass "S9 $(jq '.results | length' <<<"$RUN_OUT") attacks, each with a status and a message" || fail "S9 without a status or message: $bad"
   unexpected=$(jq -r '.results[] | select(
       (.name == "message_at_cap" or .name == "determinism") and .status != "ok"
-      or ((.name | test("^vault_(missing|wrong)_when_declared$")) and .status != "n/a")
-      or ((.name | test("^(message_at_cap|determinism|vault_missing_when_declared|vault_wrong_when_declared)$") | not) and .status != "err")
+      or ((.name | test("^(vault_(missing|wrong)_when_declared|secp_message_not_32|nep413_wrong_type)$")) and .status != "n/a")
+      or ((.name | test("^(message_at_cap|determinism|vault_missing_when_declared|vault_wrong_when_declared|secp_message_not_32|nep413_wrong_type)$") | not) and .status != "err")
     ) | "\(.name)=\(.status)"' <<<"$RUN_OUT" 2>/dev/null | tr '\n' ' ')
   [[ -z "$unexpected" ]] && pass "S9 every refusal is an err, at the cap and determinism are ok" || fail "S9 unexpected: $unexpected"
 fi
@@ -542,6 +607,52 @@ print('ed25519:'+'1'*(len(b)-len(b.lstrip(b'\0')))+o)" "$ALPHA")
   done
   [[ -z "$verified_tampered" ]] && pass "S12 a tampered message, recipient or nonce does not verify" \
     || fail "S12 a tampered payload verifies: $verified_tampered"
+fi
+
+# ── S22 caller predecessor ──────────────────────────────────────────────────
+
+log "S22 a predecessor key: not the signer's; through a relay, the relay's"
+PRED=""
+run_src "$PARENT" "$(project_src "$H_PP")" '{"operation":"all_public_keys"}'
+if ran_ok "S22 direct all_public_keys"; then
+  remember_keys
+  PRED=$(out_field .keys.alpha.public_key)
+  [[ "$PRED" =~ ^[0-9a-f]{64}$ && "$PRED" != "$ALPHA" ]] \
+    && pass "S22 on a direct call (predecessor = signer = $PARENT) the predecessor key at alpha ≠ the signer key at alpha" \
+    || fail "S22 the predecessor key at alpha is '$PRED' (the signer key: $ALPHA)"
+fi
+run_src "$CALLER2" "$(project_src "$H_PP")" '{"operation":"all_public_keys"}'
+ran_ok "S22 $CALLER2 direct all_public_keys" && { remember_keys
+  [[ -n "$PRED" && "$(out_field .keys.alpha.public_key)" != "$PRED" ]] && pass "S22 another predecessor, another key" || fail "S22 two predecessors, one key"; }
+if [[ "$RELAY_READY" != true ]]; then
+  skip "S22 relayed through a contract — $RELAY_WHY"
+else
+  run_relayed "$PARENT" "$(project_src "$H_PP")" '{"operation":"what_i_can_see"}'
+  ran_ok "S22 relayed what_i_can_see" && {
+    [[ "$(out_field .env.NEAR_PREDECESSOR_ID)/$(out_field .env.NEAR_USER_ACCOUNT_ID)" == "$RELAY_CONTRACT/$PARENT" ]] \
+      && pass "S22 the relayed run's predecessor is $RELAY_CONTRACT, its signer $PARENT" \
+      || fail "S22 the relayed run sees predecessor '$(out_field .env.NEAR_PREDECESSOR_ID)', signer '$(out_field .env.NEAR_USER_ACCOUNT_ID)'"; }
+  RELAYED=""
+  run_relayed "$PARENT" "$(project_src "$H_PP")" '{"operation":"all_public_keys"}'
+  if ran_ok "S22 relayed all_public_keys"; then
+    remember_keys
+    RELAYED=$(out_field .keys.alpha.public_key)
+    [[ "$RELAYED" =~ ^[0-9a-f]{64}$ && "$RELAYED" != "$PRED" && "$RELAYED" != "$ALPHA" ]] \
+      && pass "S22 relayed, the predecessor key is neither $PARENT's predecessor key nor its signer key" \
+      || fail "S22 relayed, the predecessor key is '$RELAYED' ($PARENT's predecessor key $PRED, signer key $ALPHA)"
+  fi
+  run_relayed "$CALLER2" "$(project_src "$H_PP")" '{"operation":"all_public_keys"}'
+  ran_ok "S22 $CALLER2 relayed all_public_keys" && { remember_keys
+    [[ -n "$RELAYED" && "$(out_field .keys.alpha.public_key)" == "$RELAYED" ]] \
+      && pass "S22 $CALLER2 through the same relay gets the same key: the relay contract's, whoever signs" \
+      || fail "S22 two signers through one relay, two keys: $RELAYED and $(out_field .keys.alpha.public_key)"; }
+  run_relayed "$PARENT" "$(project_src "$H_PP")" "$(jq -nc --arg m "$MSG_HEX" '{operation:"sign",path:"alpha",message_hex:$m}')"
+  ran_ok "S22 relayed sign" && { [[ -n "$RELAYED" && "$(verify_local "$RELAYED" "$MSG_HEX" "$(out_field .signature)")" == ok ]] \
+    && pass "S22 the relay's key signs, verified here" || fail "S22 the relayed signature does not verify under '$RELAYED'"; }
+  run_relayed "$PARENT" "$(project_src "$H_P")" '{"operation":"all_public_keys"}'
+  ran_ok "S22 relayed project build" && { [[ -n "$ALPHA" && "$(out_field .keys.alpha.public_key)" == "$ALPHA" ]] \
+    && pass "S22 a signer key does not move with the relay: the project build relayed holds $PARENT's alpha" \
+    || fail "S22 the project build relayed holds $(out_field .keys.alpha.public_key), not $PARENT's alpha $ALPHA"; }
 fi
 
 # ── S11 no seed anywhere ─────────────────────────────────────────────────────

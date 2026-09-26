@@ -1,0 +1,103 @@
+package outlayer:encryption-keys@0.1.0;
+
+/// Encryption keys for OutLayer WASI components: symmetric keys that seal data
+/// only the component itself can open again.
+///
+/// A component declares the keys it encrypts with in its `outlayer.manifest`
+/// custom section, at most three:
+///
+///     "encryption_keys": [
+///       {"path": "records"},
+///       {"path": "inbox", "caller": "predecessor"},
+///       {"path": "vault-data", "vault": "vault.owner.near"}
+///     ]
+///
+/// An encryption key has no `type`, and a declaration that names one is
+/// refused as an unknown field. A key is 32 bytes; which algorithm uses them
+/// is the platform's choice, identified by the first byte of every ciphertext
+/// — its format marker. Today's format is `0x01` (below). A future format
+/// would get a new marker, and the key would stay the same.
+///
+/// The keystore derives each key inside the TEE, for this run only, from how
+/// the code is run and the account that called for the run — never from
+/// anything the component says at runtime. The rules are the signing keys'
+/// (`outlayer:signing-keys`), key for key:
+///
+/// - `bind: "project"` (the default): issued only to a run through a project
+///   whose running version is published as a WasmUrl. The key belongs to the
+///   project (its on-chain uuid, so a project deleted and created again under
+///   the same name has new keys) and the caller; every version of the project
+///   opens what an earlier version sealed, so data survives a code upgrade.
+/// - `bind: "wasm"`: issued only to a direct run of a wasm URL, with no
+///   project. The key belongs to this exact build and the caller; a new build
+///   has a new key and cannot open what the old one sealed.
+///
+/// A run built from a GitHub repository gets no key, and one declared key
+/// whose `bind` does not match how the code is run refuses the whole run
+/// before it starts.
+///
+/// `caller` chooses which account the key belongs to: `"signer"` (the default)
+/// — the transaction signer on chain, the payment-key owner over HTTPS — or
+/// `"predecessor"` — the account that actually called the contract, the
+/// signer over HTTPS; a run with no predecessor is refused before it starts.
+/// Any contract the signer transacts with can start a run under the signer's
+/// key with input of its own choosing, so `decrypt` must never hand back a
+/// plaintext to whoever asks: a module decides from what it has checked who
+/// may read what it opens.
+///
+/// `vault` (only with `bind: "project"`) derives the key from that vault's
+/// master; the vault must belong to the project's owner.
+///
+/// `path` is an input of the derivation: renaming it loses the key, and with
+/// it everything the key sealed. Encryption keys are a namespace of their own:
+/// an encryption key and a signing key declared at the same path are two
+/// unrelated secrets.
+///
+/// The component never sees a key: it names one by `path` and the host
+/// encrypts, decrypts or authenticates. A call names the key's declared vault
+/// exactly: `none` for a key declared without one, `some(<vault>)` for a key
+/// declared with that vault. An undeclared path, a vault that is not the
+/// declared one, or an input over 262144 bytes is an `err` carrying the
+/// reason, never a trap.
+///
+/// **Binding a ciphertext to its record.** A ciphertext opens under any `aad`
+/// only if it was sealed under the same `aad`. Pass the name of the record the
+/// ciphertext is stored under (the storage key, a record id) as `aad`: a
+/// ciphertext copied onto another record by whoever holds the storage then
+/// fails to decrypt instead of being read as that record's data.
+///
+/// **Hiding what the records are called.** Storage keys are visible to the
+/// operator of the storage. Store records under `mac(path, vault, name)` (hex
+/// or base64 of it) instead of `name`: the same name always maps to the same
+/// key, and the operator cannot tell which name it is.
+interface api {
+    /// Seal `plaintext` under the declared key at `path`, bound to `aad`.
+    ///
+    /// Format `0x01`: XChaCha20-Poly1305 with a fresh random 24-byte nonce
+    /// from the host's CSPRNG. Output: `0x01 || nonce (24 bytes) ||
+    /// ciphertext || tag (16 bytes)` — 41 bytes longer than the plaintext. The
+    /// first byte is the format marker, not a key version. Two calls on the
+    /// same input never return the same bytes. At most 262144 bytes of
+    /// plaintext, and at most 262144 bytes of `aad`.
+    encrypt: func(path: string, vault: option<string>, plaintext: list<u8>, aad: list<u8>) -> result<list<u8>, string>;
+
+    /// Open what `encrypt` sealed under the same `path`, `vault` and `aad`.
+    ///
+    /// Any failure to open — an unknown format marker, a truncated or tampered
+    /// ciphertext, another key, another `aad` — is `err("decryption failed")`
+    /// and nothing more: which of these it was is not said. An undeclared
+    /// path, a vault that is not the declared one, or an input over the limit
+    /// is refused with its reason, as for `encrypt`.
+    decrypt: func(path: string, vault: option<string>, ciphertext: list<u8>, aad: list<u8>) -> result<list<u8>, string>;
+
+    /// HMAC-SHA256 of `data` (32 bytes) under a key derived from the declared
+    /// key at `path` for this purpose alone — never the key `encrypt` uses, so
+    /// a tag reveals nothing about a ciphertext and no ciphertext about a tag.
+    /// Deterministic: the same `data` under the same key is the same tag in
+    /// every run that holds the key. At most 262144 bytes of data.
+    mac: func(path: string, vault: option<string>, data: list<u8>) -> result<list<u8>, string>;
+}
+
+world encryption-keys-host {
+    import api;
+}

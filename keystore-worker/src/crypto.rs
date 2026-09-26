@@ -30,6 +30,22 @@ type HmacSha256 = Hmac<Sha256>;
 /// Maximum size for encrypted data (10 MB)
 const MAX_ENCRYPTED_SIZE: usize = 10 * 1024 * 1024;
 
+/// A key was asked for under a vault whose master is not in memory: never
+/// loaded, or evicted since. The caller loads it (`mpc_ckd::add_customer`
+/// through the lazy-load gate) and asks again; nothing is ever derived from
+/// the default master in its place. Typed so a caller can tell this condition
+/// of the keystore's memory from every other derivation failure.
+#[derive(Debug)]
+pub struct VaultMasterNotLoaded(pub AccountId);
+
+impl std::fmt::Display for VaultMasterNotLoaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "per-customer master not loaded for {}; run mpc_ckd::add_customer first", self.0)
+    }
+}
+
+impl std::error::Error for VaultMasterNotLoaded {}
+
 /// Keystore holds master secrets and caches derived keypairs.
 ///
 /// The single `master_secret` is split into:
@@ -208,8 +224,8 @@ impl Keystore {
     /// be used as the HMAC key for derivation.
     ///
     /// * `None` ⇒ `default_master`.
-    /// * `Some(c)` ⇒ master from the `masters` map; bail with a
-    ///   diagnostic error if missing — the lazy-load layer must run
+    /// * `Some(c)` ⇒ master from the `masters` map; a
+    ///   [`VaultMasterNotLoaded`] if missing — the lazy-load layer must run
     ///   `add_customer` before invoking any derive_* method.
     fn master_for(&self, customer: Option<&AccountId>) -> Result<[u8; 32]> {
         let masters = self.masters.read().unwrap();
@@ -227,12 +243,10 @@ impl Keystore {
     ) -> Result<[u8; 32]> {
         match customer {
             None => Ok(default_master),
-            Some(c) => masters.get(c).copied().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "per-customer master not loaded for {c}; \
-                     run mpc_ckd::add_customer first"
-                )
-            }),
+            Some(c) => masters
+                .get(c)
+                .copied()
+                .ok_or_else(|| anyhow::Error::new(VaultMasterNotLoaded(c.clone()))),
         }
     }
 
@@ -448,13 +462,41 @@ impl Keystore {
     /// `input` is a [`crate::signing_keys::DerivationInput`], which only the
     /// signing-keys module can build, from validated fields, under the
     /// `signing-key:v1:` root — so this method cannot be made to derive under
-    /// any other seed. `vault = None` is the default master; `Some(v)` is that
-    /// vault's master and fails if it is not loaded — never the default master
-    /// in its place.
+    /// any other seed; an input of the encryption family is refused. `vault =
+    /// None` is the default master; `Some(v)` is that vault's master and fails
+    /// if it is not loaded — never the default master in its place.
     ///
     /// Not cached: the seed is returned to the caller in a buffer that is
     /// wiped when dropped, and no copy stays in this keystore.
     pub fn derive_signing_key_seed(
+        &self,
+        vault: Option<&AccountId>,
+        input: &crate::signing_keys::DerivationInput,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        if input.family() != crate::signing_keys::KeyFamily::Signing {
+            anyhow::bail!("an encryption-key input cannot be derived as a signing key");
+        }
+        self.derive_declared_key(vault, input)
+    }
+
+    /// The 32 bytes of one encryption key: `HMAC-SHA256(master, input)`, with
+    /// `input` `encryption-key:v1:{project|wasm}:…` — no algorithm in it; the
+    /// worker's host picks what uses the bytes. Exactly as
+    /// [`Self::derive_signing_key_seed`] for its own family, whose inputs it
+    /// refuses. Never cached; wiped when dropped.
+    pub fn derive_encryption_key(
+        &self,
+        vault: Option<&AccountId>,
+        input: &crate::signing_keys::DerivationInput,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        if input.family() != crate::signing_keys::KeyFamily::Encryption {
+            anyhow::bail!("a signing-key input cannot be derived as an encryption key");
+        }
+        self.derive_declared_key(vault, input)
+    }
+
+    /// `HMAC-SHA256(master, input)` for a declared key of either family.
+    fn derive_declared_key(
         &self,
         vault: Option<&AccountId>,
         input: &crate::signing_keys::DerivationInput,
@@ -1797,10 +1839,25 @@ mod tests {
         bind: crate::signing_keys::KeyBinding,
         path: &str,
     ) -> crate::signing_keys::DerivationInput {
+        signing_key_input_typed(crate::signing_keys::SigningKeyType::Ed25519, project, caller, signer, predecessor, wasm, bind, path)
+    }
+
+    /// [`signing_key_input_as`] for a key of `key_type`.
+    #[allow(clippy::too_many_arguments)]
+    fn signing_key_input_typed(
+        key_type: crate::signing_keys::SigningKeyType,
+        project: Option<(&str, &str)>,
+        caller: crate::signing_keys::CallerKind,
+        signer: &str,
+        predecessor: Option<&str>,
+        wasm: &str,
+        bind: crate::signing_keys::KeyBinding,
+        path: &str,
+    ) -> crate::signing_keys::DerivationInput {
         use crate::signing_keys::{KeyBinding, ProjectUuid};
         let request = crate::signing_keys::SigningKeyRequest {
             path: path.to_string(),
-            key_type: crate::signing_keys::SigningKeyType::Ed25519,
+            key_type,
             bind,
             caller,
             vault: None,
@@ -1910,6 +1967,71 @@ mod tests {
         }
     }
 
+    /// Pinned vectors for secp256k1 keys: the same derivation machinery under
+    /// the `secp256k1` type segment. The seeds were computed with Python's
+    /// `hmac` over the exact strings shown, under the fixture master; the
+    /// public keys — `x ‖ y`, the uncompressed SEC1 point without its `0x04`
+    /// prefix — with `coincurve` (libsecp256k1) and checked with
+    /// `cryptography`. The keystore hands back the seed; the worker reads it as
+    /// the secret scalar. Do not update the vectors; find what changed.
+    #[test]
+    fn secp256k1_signing_key_pinned_vectors() {
+        use crate::signing_keys::CallerKind::{Predecessor, Signer};
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        use crate::signing_keys::SigningKeyType::Secp256k1;
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        let cases = [
+            (
+                signing_key_input_typed(Secp256k1, APP, Signer, "bob.near", None, H1, Project, "records"),
+                format!("signing-key:v1:secp256k1:project:{P1}:signer:bob.near:records"),
+                "772890cc14851d53236ca8223391e336f711aedaaca1ee1922e9ad6452661b90",
+                "ed426f3507c4c5d16edaa292cc2a60e3bdb4a92724613c4d242c97f51ff47d677ca9bd17bd777ecddbe30fc984d124f0b189ebac9c40e322da396b5fd217c5e3",
+            ),
+            (
+                signing_key_input_typed(Secp256k1, None, Signer, "bob.near", None, H1, Wasm, "records"),
+                format!("signing-key:v1:secp256k1:wasm:{H1}:signer:bob.near:records"),
+                "eca5d0f77b791ab4165da888811f52130b61a594f1efba0015c473da48efee50",
+                "ad0a99c4c37c0f69cce104532f8fa3b59534d5c259891c37e1e8e4180e85b458f065d5678b11500966b320b7d1f0ce607c84d6fe0962ce3bcb5dc874bea81783",
+            ),
+            (
+                signing_key_input_typed(Secp256k1, APP, Predecessor, "bob.near", Some("dao.near"), H1, Project, "records"),
+                format!("signing-key:v1:secp256k1:project:{P1}:predecessor:dao.near:records"),
+                "710b7427d36f8d365372be9c950b88486524586838e452d8f1ff24d220f66938",
+                "047a0a45812a4df2288eea96732d821555f007846c1a9a4b5a0982e3e1a2bae331c40be9e861d83955800e91d2acdb1130251500f239006a2fe9b04eea219893",
+            ),
+        ];
+        for (input, string, seed, public_key) in cases {
+            assert_eq!(input.as_str(), string);
+            let derived = ks.derive_signing_key_seed(None, &input).unwrap();
+            assert_eq!(hex::encode(derived.as_ref()), seed, "{string}");
+            let sk = k256::ecdsa::SigningKey::from_slice(derived.as_ref()).unwrap();
+            let point = sk.verifying_key().to_encoded_point(false);
+            assert_eq!(hex::encode(&point.as_bytes()[1..]), public_key, "{string}");
+        }
+        // The ed25519 key of the same tuple is another key: the type is a segment.
+        let ed = signing_seed_hex(&ks, &signing_key_input(APP, "bob.near", H1, Project, "records"));
+        assert_eq!(ed, "f6f531d0b454d922a8e1f530f41f3a1cd008c56c496e36c958f2d4013358ac3d");
+        assert_ne!(ed, "772890cc14851d53236ca8223391e336f711aedaaca1ee1922e9ad6452661b90");
+    }
+
+    /// Every type, every binding: one (run, caller, path) under two types is
+    /// two keys, and never a copy in the cache.
+    #[test]
+    fn the_type_is_an_input_of_the_derivation() {
+        use crate::signing_keys::CallerKind::Signer;
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        use crate::signing_keys::SigningKeyType;
+        let ks = Keystore::generate();
+        for (project, bind) in [(APP, Project), (None, Wasm)] {
+            let seeds: Vec<String> = SigningKeyType::ALL
+                .iter()
+                .map(|t| signing_seed_hex(&ks, &signing_key_input_typed(*t, project, Signer, "bob.near", None, H1, bind, "k")))
+                .collect();
+            assert_ne!(seeds[0], seeds[1], "two types derived one key");
+        }
+        assert!(ks.keypair_cache.read().unwrap().is_empty());
+    }
+
     #[test]
     fn two_projects_and_two_callers_get_different_project_keys() {
         use crate::signing_keys::KeyBinding::Project;
@@ -1966,8 +2088,10 @@ mod tests {
         let vault: AccountId = "vault.alice.near".parse().unwrap();
         let input = signing_key_input(APP, "bob.near", H1, Project, "k");
 
-        // Not loaded: refused, not the default master's key.
-        assert!(ks.derive_signing_key_seed(Some(&vault), &input).is_err());
+        // Not loaded: refused, not the default master's key — and refused as
+        // a master that is not in memory, which a caller tells apart by type.
+        let not_loaded = ks.derive_signing_key_seed(Some(&vault), &input).unwrap_err();
+        assert!(not_loaded.downcast_ref::<VaultMasterNotLoaded>().is_some(), "{not_loaded:#}");
 
         ks.add_customer(vault.clone(), [9u8; 32]);
         let under_vault = hex::encode(ks.derive_signing_key_seed(Some(&vault), &input).unwrap().as_ref());
@@ -1975,10 +2099,26 @@ mod tests {
         assert_ne!(under_vault, under_default, "a vault key must come from the vault's master");
 
         ks.evict_customer(&vault);
-        assert!(
-            ks.derive_signing_key_seed(Some(&vault), &input).is_err(),
-            "an evicted vault must refuse, never fall back to the default master"
-        );
+        let evicted = ks
+            .derive_signing_key_seed(Some(&vault), &input)
+            .expect_err("an evicted vault must refuse, never fall back to the default master");
+        match evicted.downcast_ref::<VaultMasterNotLoaded>() {
+            Some(VaultMasterNotLoaded(v)) => assert_eq!(v, &vault),
+            None => panic!("an evicted vault must fail as not loaded: {evicted:#}"),
+        }
+    }
+
+    /// Only a master missing from memory is [`VaultMasterNotLoaded`]: an input
+    /// of the other family fails as something else, even under a vault that is
+    /// not loaded.
+    #[test]
+    fn only_a_missing_master_is_not_loaded() {
+        use crate::signing_keys::KeyBinding::Project;
+        let ks = Keystore::generate();
+        let vault: AccountId = "vault.alice.near".parse().unwrap();
+        let signing = signing_key_input(APP, "bob.near", H1, Project, "k");
+        let wrong_family = ks.derive_encryption_key(Some(&vault), &signing).unwrap_err();
+        assert!(wrong_family.downcast_ref::<VaultMasterNotLoaded>().is_none(), "{wrong_family:#}");
     }
 
     #[test]
@@ -2038,6 +2178,169 @@ mod tests {
             assert!(!logged.contains(&seed[..16]), "a seed reached the log");
         }
         assert!(!logged.contains(&hex::encode(fixed_master())[..16]), "the master reached the log");
+    }
+
+    // ============== Encryption keys ==============
+
+    /// As [`signing_key_input_as`], for an encryption key.
+    fn encryption_key_input_as(
+        project: Option<(&str, &str)>,
+        caller: crate::signing_keys::CallerKind,
+        signer: &str,
+        predecessor: Option<&str>,
+        wasm: &str,
+        bind: crate::signing_keys::KeyBinding,
+        path: &str,
+    ) -> crate::signing_keys::DerivationInput {
+        use crate::signing_keys::{KeyBinding, ProjectUuid};
+        let request = crate::encryption_keys::EncryptionKeyRequest {
+            path: path.to_string(),
+            bind,
+            caller,
+            vault: None,
+        };
+        let (project_id, uuid) = match bind {
+            KeyBinding::Project => {
+                let (id, uuid) = project.expect("a project key needs its project");
+                (Some(id), Some(ProjectUuid::parse(uuid).unwrap()))
+            }
+            KeyBinding::Wasm => (None, None),
+        };
+        crate::signing_keys::validate_request(project_id, signer, predecessor, Some(wasm), &[request])
+            .unwrap()
+            .bind(uuid)
+            .unwrap()
+            .keys
+            .remove(0)
+            .input
+    }
+
+    fn encryption_key_input(
+        project: Option<(&str, &str)>,
+        account: &str,
+        wasm: &str,
+        bind: crate::signing_keys::KeyBinding,
+        path: &str,
+    ) -> crate::signing_keys::DerivationInput {
+        encryption_key_input_as(project, crate::signing_keys::CallerKind::Signer, account, None, wasm, bind, path)
+    }
+
+    /// Pinned vectors: the keys were computed with Python's `hmac` over the
+    /// exact strings shown, under the fixture master. A failure means the
+    /// derivation changed — which changes every encryption key, and nothing a
+    /// key ever sealed opens again. Do not update the vectors; find what
+    /// changed. The strings carry no algorithm: an encryption key has no type.
+    #[test]
+    fn encryption_key_pinned_vectors() {
+        use crate::signing_keys::CallerKind::{Predecessor, Signer};
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        let cases = [
+            (
+                encryption_key_input(APP, "bob.near", H1, Project, "records"),
+                format!("encryption-key:v1:project:{P1}:signer:bob.near:records"),
+                "4324b148cb409d9a56e27a37c0cfbc4787481db4dec90cfcd2219a091c4a5d0a",
+            ),
+            (
+                encryption_key_input(None, "bob.near", H1, Wasm, "records"),
+                format!("encryption-key:v1:wasm:{H1}:signer:bob.near:records"),
+                "d5c8e2c2561e2102cfc400e8e3a7c3031745e55e7820d9d2a298b8e1a977e65d",
+            ),
+            (
+                encryption_key_input(None, "bob.near", H2, Wasm, "records"),
+                format!("encryption-key:v1:wasm:{H2}:signer:bob.near:records"),
+                "070db0b5ad8a6028a1125a3162cec09243edd7b80884f7571b8dcdae9bc5267f",
+            ),
+            (
+                encryption_key_input(Some(("carol.near/app", P2)), "bob.near", H1, Project, "records"),
+                format!("encryption-key:v1:project:{P2}:signer:bob.near:records"),
+                "d10873f9ffc383dd93d022f58d807c148b6d9c9055eca2af6c7efd35013ffd11",
+            ),
+            (
+                encryption_key_input(APP, "dave.near", H1, Project, "records"),
+                format!("encryption-key:v1:project:{P1}:signer:dave.near:records"),
+                "0f88ba7e7a919d4d53d3dc4764b651623d3b39d77e48c6229b5dcf2967b7acaf",
+            ),
+            (
+                encryption_key_input_as(APP, Predecessor, "bob.near", Some("dao.near"), H1, Project, "records"),
+                format!("encryption-key:v1:project:{P1}:predecessor:dao.near:records"),
+                "54e18ce04f69672782a9f53e4b98b473fd311ddd798c37f60ac718d88f87df50",
+            ),
+            (
+                encryption_key_input_as(APP, Predecessor, "bob.near", Some("bob.near"), H1, Project, "records"),
+                format!("encryption-key:v1:project:{P1}:predecessor:bob.near:records"),
+                "27b1c2fba90e6749bb959d381068fdeac8cee7468e93441506a9bd7f3a2ff6a8",
+            ),
+            (
+                encryption_key_input_as(APP, Signer, "bob.near", Some("dao.near"), H1, Project, "records"),
+                format!("encryption-key:v1:project:{P1}:signer:bob.near:records"),
+                "4324b148cb409d9a56e27a37c0cfbc4787481db4dec90cfcd2219a091c4a5d0a",
+            ),
+        ];
+        for (input, string, key) in cases {
+            assert_eq!(input.as_str(), string);
+            let derived = ks.derive_encryption_key(None, &input).unwrap();
+            assert_eq!(hex::encode(derived.as_ref()), key, "{string}");
+        }
+    }
+
+    /// The two families are two keys for one (run, caller, path), and neither
+    /// derivation takes the other family's input.
+    #[test]
+    fn the_families_are_independent() {
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        for (project, bind) in [(APP, Project), (None, Wasm)] {
+            let enc = encryption_key_input(project, "bob.near", H1, bind, "records");
+            let sig = signing_key_input(project, "bob.near", H1, bind, "records");
+            let enc_key = hex::encode(ks.derive_encryption_key(None, &enc).unwrap().as_ref());
+            let sig_seed = signing_seed_hex(&ks, &sig);
+            assert_ne!(enc_key, sig_seed, "one path in both families must be two secrets");
+            assert!(ks.derive_signing_key_seed(None, &enc).is_err(), "an encryption input derived as a signing key");
+            assert!(ks.derive_encryption_key(None, &sig).is_err(), "a signing input derived as an encryption key");
+        }
+    }
+
+    #[test]
+    fn an_encryption_key_uses_the_vaults_master_and_never_falls_back() {
+        use crate::signing_keys::KeyBinding::Project;
+        let ks = Keystore::generate();
+        let vault: AccountId = "vault.alice.near".parse().unwrap();
+        let input = encryption_key_input(APP, "bob.near", H1, Project, "k");
+        assert!(ks.derive_encryption_key(Some(&vault), &input).is_err());
+        ks.add_customer(vault.clone(), [9u8; 32]);
+        let under_vault = hex::encode(ks.derive_encryption_key(Some(&vault), &input).unwrap().as_ref());
+        let under_default = hex::encode(ks.derive_encryption_key(None, &input).unwrap().as_ref());
+        assert_ne!(under_vault, under_default, "a vault key must come from the vault's master");
+        ks.evict_customer(&vault);
+        assert!(ks.derive_encryption_key(Some(&vault), &input).is_err(), "an evicted vault must refuse");
+    }
+
+    /// Never cached, and nothing of it logged.
+    #[test]
+    fn an_encryption_key_leaves_no_copy_and_no_log() {
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || LogSink(buf.clone())
+        };
+        let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).with_writer(writer).finish();
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        let mut keys = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("capture is live");
+            for (project, bind) in [(APP, Project), (None, Wasm)] {
+                let input = encryption_key_input(project, "bob.near", H1, bind, "records");
+                keys.push(hex::encode(ks.derive_encryption_key(None, &input).unwrap().as_ref()));
+            }
+        });
+        assert!(ks.keypair_cache.read().unwrap().is_empty());
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("capture is live"), "{logged:?}");
+        for key in keys {
+            assert!(!logged.contains(&key[..16]), "a key reached the log");
+        }
     }
 
     struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);

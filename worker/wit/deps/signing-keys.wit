@@ -8,8 +8,12 @@ package outlayer:signing-keys@0.1.0;
 ///     "signing_keys": [
 ///       {"path": "records", "type": "ed25519"},
 ///       {"path": "votes", "type": "ed25519", "caller": "predecessor"},
-///       {"path": "payouts", "type": "ed25519", "vault": "vault.owner.near"}
+///       {"path": "payouts", "type": "secp256k1", "vault": "vault.owner.near"}
 ///     ]
+///
+/// `type` is `"ed25519"` or `"secp256k1"`. The type is an input of the
+/// derivation: one path under two types would be two keys, and a path is
+/// declared once.
 ///
 /// The keystore derives each key inside the TEE, for this run only, from how
 /// the code is run and the account that called for the run — never from
@@ -47,13 +51,20 @@ package outlayer:signing-keys@0.1.0;
 /// decide WHAT to sign from its secrets, environment or configuration —
 /// whoever runs the binary controls those.
 ///
-/// **Never sign caller-supplied bytes or digests verbatim.** The key's public
-/// key is a real NEAR implicit account (and a Solana address): a signature over
-/// bytes the caller chose is a signature over anything those bytes are — a
-/// transaction that empties the account, an authorization, a message the
-/// account never meant. Sign only messages this module composes itself, from
+/// **Never sign caller-supplied bytes or digests verbatim.** An ed25519 key's
+/// public key is a real NEAR implicit account (and a Solana address); a
+/// secp256k1 key's is an EVM address. A signature over bytes the caller chose
+/// is a signature over anything those bytes are — a transaction that empties
+/// the account, an authorization, a message the account never meant — and a
+/// secp256k1 key signs a 32-byte digest as it is, so a caller-chosen digest is
+/// the hash of any EVM transaction, EIP-712 permit or `personal_sign` message
+/// the caller likes. Sign only messages this module composes itself, from
 /// fields it has parsed and checked, under a fixed prefix or structure of its
-/// own; an input that asks for a signature over raw bytes is refused.
+/// own, and compute the digest here from those bytes; an input that asks for a
+/// signature over raw bytes or a digest is refused. The same holds for
+/// `sign-nep413`: its tag keeps the bytes from being a transaction, but a
+/// caller-chosen `message` and `recipient` is a login, as the key's account,
+/// to whatever site the caller names.
 ///
 /// `vault` (only with `bind: "project"`) derives the key from that vault's
 /// master; the vault must belong to the project's owner.
@@ -62,12 +73,27 @@ package outlayer:signing-keys@0.1.0;
 /// A call names the key's declared vault exactly: `none` for a key declared
 /// without one, `some(<vault>)` for a key declared with that vault. An
 /// undeclared path, a vault that is not the declared one, a key of a type the
-/// call does not serve, or a message over 65536 bytes is an `err` carrying the
-/// reason, never a trap.
+/// call does not serve, or a message the key's type does not take is an `err`
+/// carrying the reason, never a trap.
 interface api {
+    /// A NEP-413 signature in the shape a NEAR wallet's `signMessage` answers.
+    record nep413-signature {
+        /// The key's NEAR implicit account: its 32-byte public key, lowercase
+        /// hex (64 characters).
+        account-id: string,
+        /// `ed25519:` followed by the base58 of the 32-byte public key.
+        public-key: string,
+        /// The 64-byte ed25519 signature, standard base64 with padding.
+        signature: string,
+    }
+
     /// The public key of the declared key at `path`.
     ///
     /// ed25519: the 32-byte public key.
+    ///
+    /// secp256k1: 64 bytes, `x ‖ y` — the uncompressed SEC1 point without its
+    /// `0x04` prefix, as NEAR's `secp256k1:` public keys carry it. The key's
+    /// EVM address is the last 20 bytes of keccak256 of these 64 bytes.
     public-key: func(path: string, vault: option<string>) -> result<list<u8>, string>;
 
     /// Sign `message` with the declared key at `path`.
@@ -75,7 +101,28 @@ interface api {
     /// ed25519: an RFC 8032 signature (64 bytes) over the raw message bytes —
     /// no prehash, no prefix. At most 65536 bytes of message; sign a digest to
     /// cover more.
+    ///
+    /// secp256k1: `message` must be exactly 32 bytes, a prehash, signed as it
+    /// is — no further hashing; any other length is an `err`. ECDSA with an RFC
+    /// 6979 nonce, so one key and one prehash give one signature. 65 bytes out,
+    /// `r ‖ s ‖ v`: `r` and `s` big-endian, `s` in the low half of the group
+    /// order, `v` the recovery id, 0 or 1 — NEAR's secp256k1 signature and the
+    /// input `ecrecover` takes. EVM wants `v + 27`.
     sign: func(path: string, vault: option<string>, message: list<u8>) -> result<list<u8>, string>;
+
+    /// Sign a NEP-413 message (NEAR `signMessage`) with the declared ed25519
+    /// key at `path`.
+    ///
+    /// The host builds the signed bytes itself: `sha256(borsh(2^31 + 413) ‖
+    /// borsh(payload))`, the payload `{message: string, nonce: [u8; 32],
+    /// recipient: string, callback_url: option<string>}` in that order, and
+    /// signs the 32-byte hash with ed25519. Anything that verifies a wallet's
+    /// NEP-413 signature verifies this one against `public-key`.
+    ///
+    /// An `err`: a key that is not ed25519, a `nonce` that is not exactly 32
+    /// bytes, a `message` over 65536 bytes, a `recipient` or `callback-url`
+    /// over 2048 bytes.
+    sign-nep413: func(path: string, vault: option<string>, message: string, recipient: string, nonce: list<u8>, callback-url: option<string>) -> result<nep413-signature, string>;
 }
 
 world signing-keys-host {

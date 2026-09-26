@@ -3,20 +3,49 @@ name = "signing-key-probe"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "A WASI module whose only job is exercising the outlayer:signing-keys host functions"
+description = "A WASI module whose only job is exercising the outlayer:signing-keys and outlayer:encryption-keys host functions"
 
 [[bin]]
 name = "signing-key-probe"
 path = "src/main.rs"
 
 [features]
-# Which manifest the build embeds — exactly one of `project`, `wasm`,
-# `project-vault`. `project` is the default, so a plain `cargo build`, and a
-# build of the repository on the platform (which passes no features), embeds it.
+# Which manifest the build embeds — exactly one of `project`, `project-pred`,
+# `wasm`, `project-vault`, `project-secp`, `wasm-secp`, `encryption`,
+# `encryption-storage`, `encryption-storage-pred`, `encryption-wasm`, `encryption-vault`,
+# `encryption-pred`, `encryption-typed`.
+# `project` is the default, so a plain `cargo build`, and a build of the
+# repository on the platform (which passes no features), embeds it.
 default = ["project"]
 project = []
+# A signing key with `caller: "predecessor"`, bind project.
+project-pred = []
 wasm = []
 project-vault = []
+# The secp256k1 builds: a secp256k1 key beside an ed25519 one on a project
+# run, and a secp256k1 key alone on a direct run.
+project-secp = []
+wasm-secp = []
+# The encryption-key builds: their manifests declare `encryption_keys`, and
+# only they import `outlayer:encryption-keys` (through `enc-api`).
+encryption = ["enc-api"]
+# The `encryption` build's keys, plus `near:storage` (through `storage-api`)
+# for the raw-storage operations. A build of its own: storage exists only on a
+# run through a project — the worker refuses a module that imports it on a
+# direct run — and a module that imports it cannot run in the worker's
+# executor tests without a storage client.
+encryption-storage = ["enc-api", "storage-api"]
+# The `encryption-storage` manifest with `storage_account: "predecessor"`: the
+# same keys and operations, its storage in the predecessor's cell.
+encryption-storage-pred = ["enc-api", "storage-api"]
+encryption-wasm = ["enc-api"]
+encryption-vault = ["enc-api"]
+# An encryption key with `caller: "predecessor"`, bind project.
+encryption-pred = ["enc-api"]
+# A manifest that names a `type` on an encryption key: refused before it runs.
+encryption-typed = ["enc-api"]
+enc-api = []
+storage-api = []
 # The same code and manifest with one constant changed: another sha256, for
 # "a new version" and "another build".
 v2 = []
@@ -26,6 +55,9 @@ v2 = []
 # bindings are generated from `wit/signing-keys.wit`, a copy of the worker's
 # own `worker/wit/deps/signing-keys.wit`; the SDK crate stays out, as in
 # wallet-probe, so its generated `outlayer` module cannot collide with this one.
+# The encryption-key bindings come from `wit-encryption/encryption-keys.wit`,
+# a copy of `worker/wit/deps/encryption-keys.wit`; the storage bindings from
+# `wit-storage/storage.wit`, a copy of `worker/wit/deps/storage.wit`.
 wit-bindgen = "0.36"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -37,6 +69,10 @@ borsh = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 bs58 = "0.5"
 base64 = "0.22"
+# secp256k1 in the guest (`sign_and_verify` on a secp256k1 key): verification
+# and recovery; keccak256 for the EVM address (`evm_address`).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+sha3 = { version = "0.10", default-features = false }
 
 [profile.release]
 opt-level = "z"

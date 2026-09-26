@@ -79,6 +79,8 @@ impl Contract {
         self.next_project_id += 1;
         let uuid = format!("p{:016x}", self.next_project_id);
 
+        assert_code_source(&source);
+
         // Get version key from source
         let version_key = Self::get_version_key(&source);
 
@@ -170,6 +172,8 @@ impl Contract {
             project.owner, caller,
             "Only project owner can add versions"
         );
+
+        assert_code_source(&source);
 
         let version_key = Self::get_version_key(&source);
 
@@ -267,7 +271,7 @@ impl Contract {
         self.projects.insert(&project_id, &project);
 
         log!(
-            "Active version changed: project={}, version={}",
+            "Active version changed: project={}, version={:?}",
             project_id, version_key
         );
     }
@@ -319,7 +323,7 @@ impl Contract {
         }
 
         log!(
-            "Version removed: project={}, version={}, refund={}",
+            "Version removed: project={}, version={:?}, refund={}",
             project_id, version_key, version_info.storage_deposit
         );
     }
@@ -433,6 +437,14 @@ impl Contract {
             "Project transferred: {} -> {}, uuid={}",
             old_project_id, new_project_id, project.uuid
         );
+
+        self.emit_system_event(crate::payment::SystemEvent::ProjectTransferred {
+            old_project_id,
+            new_project_id,
+            project_uuid: project.uuid,
+            old_owner: caller,
+            new_owner,
+        });
     }
 
     // =========================================================================
@@ -528,6 +540,13 @@ impl Contract {
             .collect()
     }
 
+    /// Whether a live project holds this uuid, under whatever name it has now.
+    /// A deleted project's uuid is gone for good (uuids are never reused), so
+    /// `false` is what allows the storage of that uuid to be erased.
+    pub fn has_project_uuid(&self, project_uuid: String) -> bool {
+        self.project_versions.contains_key(&project_uuid)
+    }
+
     /// Get total number of versions for a project
     pub fn get_version_count(&self, project_id: String) -> u64 {
         let project = match self.projects.get(&project_id) {
@@ -581,5 +600,100 @@ impl Contract {
             + 64  // version_key
             + 8   // added_at
             + 16  // storage_deposit
+    }
+}
+
+/// Longest `WasmUrl.url` accepted.
+const MAX_WASM_URL_LEN: usize = 2048;
+/// Longest `GitHub.repo` accepted.
+const MAX_REPO_LEN: usize = 512;
+/// Longest `GitHub.commit` accepted.
+const MAX_COMMIT_LEN: usize = 256;
+/// Longest `build_target` accepted.
+const MAX_BUILD_TARGET_LEN: usize = 64;
+
+/// Why a code source cannot be stored or run, or `None` when it is well formed.
+///
+/// Its fields become the version key (`hash`, or `repo@commit`), which the
+/// contract writes into its logs, and they reach the worker's `git` and HTTP
+/// client. Each is held to the shape the worker can actually use:
+/// - `hash`: the SHA-256 of the WASM as 64 lowercase hex characters, the form
+///   the worker compares the downloaded bytes against;
+/// - `url`: `https://`, no whitespace or control characters;
+/// - `repo`: letters, digits, `.`, `_`, `-`, `/`, `:`; no leading `-`, no `..`;
+/// - `commit`: a git ref as the worker accepts it (`validate_git_ref`): letters,
+///   digits, `.`, `_`, `/`, `-`, `+`; no leading `-`, no `..`;
+/// - `build_target`: letters, digits, `.`, `_`, `-`.
+///
+/// No field admits whitespace or a line break, and `EVENT_JSON` is refused by
+/// name. `url` may still hold `{` and `"`: every log prints it with `{:?}`, and
+/// events carry it JSON-escaped.
+pub(crate) fn code_source_error(source: &CodeSource) -> Option<String> {
+    let (build_target, err) = match source {
+        CodeSource::WasmUrl { url, hash, build_target } => {
+            let err = if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                Some("source.hash must be the SHA-256 of the WASM as 64 lowercase hex characters".to_string())
+            } else if !url.starts_with("https://") || url.len() <= "https://".len() {
+                Some("source.url must be an https:// URL".to_string())
+            } else if url.len() > MAX_WASM_URL_LEN {
+                Some(format!("source.url is longer than {MAX_WASM_URL_LEN} bytes"))
+            } else if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                Some("source.url must not contain whitespace or control characters".to_string())
+            } else {
+                None
+            };
+            (build_target, err.or_else(|| names_an_event("source.url", url)))
+        }
+        CodeSource::GitHub { repo, commit, build_target } => {
+            let err = if repo.is_empty() || repo.len() > MAX_REPO_LEN {
+                Some(format!("source.repo must be 1–{MAX_REPO_LEN} bytes"))
+            } else if repo.starts_with('-')
+                || repo.contains("..")
+                || !repo.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b':'))
+            {
+                Some("source.repo must be a GitHub repository (letters, digits, '.', '_', '-', '/', ':'; no leading '-', no '..')".to_string())
+            } else if commit.is_empty() || commit.len() > MAX_COMMIT_LEN {
+                Some(format!("source.commit must be 1–{MAX_COMMIT_LEN} bytes"))
+            } else if commit.starts_with('-')
+                || commit.contains("..")
+                || !commit.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-' | b'+'))
+            {
+                Some("source.commit must be a commit hash, branch or tag (letters, digits, '.', '_', '/', '-', '+'; no leading '-', no '..')".to_string())
+            } else {
+                None
+            };
+            let err = err
+                .or_else(|| names_an_event("source.repo", repo))
+                .or_else(|| names_an_event("source.commit", commit));
+            (build_target, err)
+        }
+    };
+    err.or_else(|| {
+        let t = build_target.as_deref()?;
+        if t.is_empty()
+            || t.len() > MAX_BUILD_TARGET_LEN
+            || !t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            Some(format!(
+                "source.build_target must be 1–{MAX_BUILD_TARGET_LEN} bytes of letters, digits, '.', '_' or '-'"
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+/// `EVENT_JSON` opens every NEP-297 event log; no field of a code source has a
+/// reason to spell it.
+fn names_an_event(field: &str, value: &str) -> Option<String> {
+    value
+        .contains("EVENT_JSON")
+        .then(|| format!("{field} must not contain 'EVENT_JSON'"))
+}
+
+/// Panics with the reason when `source` is not well formed (`code_source_error`).
+pub(crate) fn assert_code_source(source: &CodeSource) {
+    if let Some(why) = code_source_error(source) {
+        env::panic_str(&why);
     }
 }

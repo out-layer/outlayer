@@ -126,9 +126,9 @@ pub struct RequestParams {
     #[serde(default)]
     pub compile_only: bool,
 
-    /// Project UUID for project-based execution
-    /// Set automatically by request_execution_project
-    /// Used by worker to enable persistent storage for the project
+    /// Project UUID for project-based execution: the storage namespace the
+    /// worker runs the code in. The contract sets it from a Project source and
+    /// clears it for any other; a value the caller supplies is ignored.
     #[serde(default)]
     pub project_uuid: Option<String>,
 

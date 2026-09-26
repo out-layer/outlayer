@@ -254,9 +254,12 @@ name its own connector's keys. The empty label is the sub-key `default`; the
 wallet's own EVM key is not reachable from a guest at all. Each execution has
 a budget of 200 wallet host calls.
 
-`outlayer:signing-keys` serves the ed25519 keys a component declares in its
-manifest (`signing_keys`, at most 3), by `path` and declared `vault`
-(`src/signing_keys/`). How the run was started is read off the job — its
+`outlayer:signing-keys` serves the ed25519 and secp256k1 keys a component
+declares in its manifest (`signing_keys`, at most 3), by `path` and declared
+`vault` (`src/signing_keys/`): `public-key`, `sign` (ed25519 over the raw
+message; secp256k1 over a 32-byte prehash, 65 bytes `r ‖ s ‖ v`, low-s,
+`v ∈ {0,1}`) and `sign-nep413` (ed25519 only; the host builds the NEP-413
+bytes). How the run was started is read off the job — its
 `project_id`, the variant of its resolved `code_source` and its predecessor —
 and the run's one `/decrypt` request carries the `project_id` (present for a
 run through a project, absent for a direct run of a wasm URL), the declared

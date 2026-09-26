@@ -432,7 +432,9 @@ bind "wasm":    HMAC-SHA256(master, "signing-key:v1:{type}:wasm:{wasm_sha256}:{c
 
 No other binding exists; any other `bind` value is refused.
 
-- `type` is `ed25519`; `path` is `[a-z0-9][a-z0-9_-]{0,31}`; `project_uuid` is
+- `type` is `ed25519` or `secp256k1` — the keystore returns the 32-byte HMAC
+  output for either, and the worker reads it as an ed25519 seed or a
+  secp256k1 secret scalar; `path` is `[a-z0-9][a-z0-9_-]{0,31}`; `project_uuid` is
   the contract's `p{16 hex}` for the project, read through `get_project` on
   every run and never cached (a project deleted and created again under the
   same name is another uuid, and so other keys); `caller` is `signer` or
@@ -477,7 +479,8 @@ No other binding exists; any other `bind` value is refused.
   `get_version(project_id, executed_wasm_sha256)` on the contract must answer
   with a `WasmUrl` source of that hash, and `get_project(project_id)` must
   exist, be owned by the id's owner and carry a well-formed `uuid`; both are
-  read together on every project run. A GitHub-sourced version is keyed by
+  read together, at one final block, on every project run — two answers from
+  different blocks are reconciled at the older one. A GitHub-sourced version is keyed by
   `repo@commit` and is refused. A direct run's `wasm` keys come from the hash
   the worker reports. Text from the RPC or the contract reaches a refusal or a
   log line cut to 200 characters.
@@ -485,16 +488,21 @@ No other binding exists; any other `bind` value is refused.
   be a direct sub-account of the project's owner — decided on the names, before
   the vault is read, so a vault that is not the owner's costs no RPC — AND name
   that owner as its `parent`; it is then loaded through the usual gate. What
-  the chain or the gate says about the vault (another parent, not verified,
-  underfunded: 402) refuses; a chain that could not be asked or a master that
-  could not be loaded is a 500 without the code, the keystore's own outage.
-  Either way the default master is never used in its place. A `wasm` key
-  cannot name a vault.
+  the chain or the gate says about the vault refuses with the code: another
+  parent, not verified on keystore-dao or banned, unlocked — 403; underfunded —
+  402. A chain that could not be asked or a master that could not be loaded is
+  a 500 without the code, the keystore's own outage; a master that leaves
+  memory between the checks and the derivation is a 503 without the code — a
+  retry loads it again. Either way the default master is never used
+  in its place. A `wasm` key cannot name a vault.
 - `signing_key_seed_audit` in `api_tests.rs` pins the root against every other
-  family, for both string shapes. A caller-written seed (a `Repo` secret
-  accessor's repository and branch are free strings on chain) can spell a
-  signing-key string, but such a seed only ever reaches the master as
-  `ecies:` + seed, or bare for its public key alone.
+  family, for both string shapes. A caller-written seed — a raw seed sent to
+  `/pubkey`, `/encrypt` or `/add_generated_secret`, or a `Repo` secret
+  accessor's `{repo}:{owner}[:{branch}]`, whose repository and branch are free
+  strings on chain — that starts with `signing-key:` or `encryption-key:` is
+  refused with a 400; a repository URL never starts there. Were one derived,
+  it would reach the master only as `ecies:` + seed, or bare for its public
+  key alone.
 
 ## Troubleshooting
 

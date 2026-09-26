@@ -16,6 +16,7 @@ mod outlayer_payment;
 mod outlayer_vrf;
 mod outlayer_wallet;
 mod signing_keys;
+mod encryption_keys;
 mod tdx_attestation;
 mod wasm_cache;
 
@@ -1167,8 +1168,8 @@ come from the coordinator's own flow. contract={:?} task={:?}",
 /// so it slots in ahead of the fallback. For every request that carries no
 /// binding the three are the same account and nothing changes at all — which
 /// is also why this cannot be observed as a regression by anything running
-/// today. Storage already resolves its account this way (see
-/// `storage_account_id` below); this brings VRF back in line with it.
+/// today. Storage's default (`signer`) cell resolves its account the same way
+/// (see `outlayer_storage::cell_account`); this keeps VRF in line with it.
 fn vrf_domain_identity(
     payment_key_owner: Option<&String>,
     user_account_id: Option<&String>,
@@ -2383,10 +2384,63 @@ async fn handle_execute_job(
             return Ok(());
         }
     };
-    if !declared_keys.is_empty() && !signing_keys_reachable(code_source, &wasm_bytes) {
-        let msg = "The component declares signing keys, which are reached only through the \
-                   outlayer:signing-keys host interface, and a WASI P1 module cannot import one. Build it \
-                   for wasm32-wasip2. Nothing was executed."
+    // Encryption keys the artefact declares: the same rules, the same moment,
+    // their own namespace.
+    let declared_encryption_keys =
+        match encryption_keys::declared_encryption_keys(declared_manifest.as_ref(), &run_source) {
+            Ok(keys) => keys,
+            Err(reason) => {
+                let msg = format!("The component's encryption keys cannot be served: {reason}. Nothing was executed.");
+                error!("❌ {}", msg);
+                report_refusal(
+                    api_client,
+                    near_client,
+                    job,
+                    request_id,
+                    is_https_call,
+                    call_id.map(|s| s.as_str()),
+                    msg,
+                    Some(api_client::JobStatus::Custom),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    // The account whose storage cell this run reads and writes: the
+    // manifest's `storage_account` picks which account of the job, and the
+    // job supplies it — the signer, or the same predecessor the secrets and
+    // the keys are judged for. Settled before anything is decrypted, so a
+    // `predecessor` cell on a run with no predecessor refuses the run instead
+    // of falling back to the signer or `anonymous`.
+    let storage_cell_account = match outlayer_storage::cell_account(
+        declared_manifest.as_ref().map(|m| m.storage_account).unwrap_or_default(),
+        user_account_id.map(|s| s.as_str()),
+        predecessor_id,
+    ) {
+        Ok(account) => account,
+        Err(reason) => {
+            let msg = format!("The component's storage cannot be served: {reason}. Nothing was executed.");
+            error!("❌ {}", msg);
+            report_refusal(
+                api_client,
+                near_client,
+                job,
+                request_id,
+                is_https_call,
+                call_id.map(|s| s.as_str()),
+                msg,
+                Some(api_client::JobStatus::Custom),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if (!declared_keys.is_empty() || !declared_encryption_keys.is_empty())
+        && !declared_keys_reachable(code_source, &wasm_bytes)
+    {
+        let msg = "The component declares signing or encryption keys, which are reached only through the \
+                   outlayer:signing-keys and outlayer:encryption-keys host interfaces, and a WASI P1 module \
+                   cannot import one. Build it for wasm32-wasip2. Nothing was executed."
             .to_string();
         error!("❌ {}", msg);
         report_refusal(
@@ -2403,14 +2457,17 @@ async fn handle_execute_job(
         return Ok(());
     }
 
-    // The run's secrets request carries its signing keys: one keystore call for
-    // both, judged independently by the keystore. A run with keys and no
-    // secrets request makes a keys-only call below instead.
-    let keys_request = (!declared_keys.is_empty()).then(|| keystore_client::KeysRequest {
-        project_id: run_source.project_id,
-        keys: &declared_keys,
+    // The run's secrets request carries its declared keys, both families: one
+    // keystore call for all of it, judged independently by the keystore. A run
+    // with keys and no secrets request makes a keys-only call below instead.
+    let keys_request = (!declared_keys.is_empty() || !declared_encryption_keys.is_empty()).then(|| {
+        keystore_client::KeysRequest {
+            project_id: run_source.project_id,
+            keys: &declared_keys,
+            encryption_keys: &declared_encryption_keys,
+        }
     });
-    let mut run_keys: Option<signing_keys::SigningKeys> = None;
+    let mut run_keys: Option<executor::RunKeys> = None;
 
     let user_secrets = if let (Some(secrets_ref), Some(keystore)) = (secrets_ref, keystore_client) {
         // A reference the contract could never hold is refused here, naming
@@ -2470,7 +2527,7 @@ async fn handle_execute_job(
             // already says it, and `update_access` moves it to the next build
             // without re-encrypting.
             info!("📦 Decrypting project-based secrets for project: {}", proj_id);
-            keystore.with_signing_keys(keys_request.as_ref()).decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
+            keystore.with_keys(keys_request.as_ref()).decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
         } else {
             // Non-project execution: use code_source type for secrets
             match code_source {
@@ -2494,13 +2551,13 @@ async fn handle_execute_job(
                     };
 
                     // Call keystore to decrypt secrets by repo
-                    keystore.with_signing_keys(keys_request.as_ref()).decrypt_secrets_from_contract(repo, branch.as_deref(), &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
+                    keystore.with_keys(keys_request.as_ref()).decrypt_secrets_from_contract(repo, branch.as_deref(), &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
                 }
                 CodeSource::WasmUrl { hash, .. } => {
                     info!("📦 Decrypting wasm_hash-based secrets for WasmUrl source: {}", hash);
 
                     // Call keystore to decrypt secrets by wasm_hash
-                    keystore.with_signing_keys(keys_request.as_ref()).decrypt_secrets_by_wasm_hash(hash, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
+                    keystore.with_keys(keys_request.as_ref()).decrypt_secrets_by_wasm_hash(hash, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
                 }
             }
         };
@@ -2513,7 +2570,7 @@ async fn handle_execute_job(
                         info!("✅ Secrets decrypted successfully: {} environment variables", secrets.len());
                         Some(secrets)
                     }
-                    // The row does not exist, reported beside the signing keys:
+                    // The row does not exist, reported beside the declared keys:
                     // the same outcome as the typed "not found" below.
                     None => {
                         info!("ℹ️  No secrets configured for this project/source, continuing without secrets");
@@ -2536,14 +2593,14 @@ async fn handle_execute_job(
                     // The keys were refused, and with them the whole request:
                     // a declaration, a project or a vault the author or caller
                     // can fix.
-                    error!("❌ Signing keys refused: {}", error_msg);
+                    error!("❌ Declared keys refused: {}", error_msg);
                     report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), error_msg, Some(api_client::JobStatus::Custom)).await?;
                     return Ok(());
                 } else if keystore_client::SigningKeysUnserved::is_unserved(&e) {
                     // The keystore could not serve keys at all — it predates
                     // them, or sent other seeds than the declared ones. Nothing
                     // the author or caller can fix: infrastructure.
-                    error!("❌ Signing keys not served: {}", error_msg);
+                    error!("❌ Declared keys not served: {}", error_msg);
                     report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), error_msg, Some(api_client::JobStatus::Failed)).await?;
                     return Ok(());
                 } else {
@@ -2558,18 +2615,19 @@ async fn handle_execute_job(
         None
     };
 
-    // The declared signing keys, for this run only: bound by the keystore to
-    // how the run was started, the job's project (or build) and caller, never
-    // to anything the guest says. They arrived with the secrets, or — for a run
-    // that made no secrets request — are asked for alone, once, and settled
-    // before the author's secrets are read. They go into the execution by value
-    // and are dropped with it — never into the environment, stdin or a log.
-    let signing_keys = if declared_keys.is_empty() {
-        None
+    // The declared signing and encryption keys, for this run only: bound by the
+    // keystore to how the run was started, the job's project (or build) and
+    // caller, never to anything the guest says. They arrived with the secrets,
+    // or — for a run that made no secrets request — are asked for alone, once,
+    // and settled before the author's secrets are read. They go into the
+    // execution by value and are dropped with it — never into the environment,
+    // stdin or a log.
+    let declared_run_keys = if keys_request.is_none() {
+        executor::RunKeys::default()
     } else if let Some(keys) = run_keys {
-        Some(keys)
+        keys
     } else {
-        match signing_keys_for_run(
+        match keys_for_run(
             keystore_client,
             keys_request.as_ref(),
             user_account_id.map(|s| s.as_str()),
@@ -2579,9 +2637,9 @@ async fn handle_execute_job(
         )
         .await
         {
-            Ok(keys) => Some(keys),
+            Ok(keys) => keys,
             Err((msg, category)) => {
-                error!("❌ Signing keys: {}", msg);
+                error!("❌ Declared keys: {}", msg);
                 report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(category)).await?;
                 return Ok(());
             }
@@ -2653,10 +2711,8 @@ async fn handle_execute_job(
         (Some(kc), Some(keystore_token), Some(uuid)) => {
             // The instance serving now and the session held on it, fixed for this job.
             let (keystore_url, keystore_tee_session_id) = kc.current_endpoint();
-            // Determine account_id for storage (user who triggered execution)
-            let storage_account_id = user_account_id
-                .cloned()
-                .unwrap_or_else(|| "anonymous".to_string());
+            // The cell settled above, from the manifest and the job.
+            let storage_account_id = storage_cell_account;
 
             info!(
                 "📦 Storage enabled: project_uuid={}, wasm_hash={}, account={}",
@@ -2790,7 +2846,7 @@ async fn handle_execute_job(
     // must never admit.
     info!("🚀 Executing WASM...");
     let exec_result = executor
-        .with_signing_keys(signing_keys)
+        .with_keys(declared_run_keys)
         .execute(
             &wasm_bytes,
             Some(executed_wasm_sha256.as_str()),
@@ -3939,10 +3995,10 @@ async fn author_secrets_for_run(
         .map_err(|m| (m, JobStatus::Custom))
 }
 
-/// Can a run of this code reach signing keys at all? Only a WASI P2 component
+/// Can a run of this code reach declared keys at all? Only a WASI P2 component
 /// imports host interfaces; a P1 module has none. Both the target the run is
 /// executed as and the bytes themselves must say component.
-fn signing_keys_reachable(code_source: &CodeSource, wasm_bytes: &[u8]) -> bool {
+fn declared_keys_reachable(code_source: &CodeSource, wasm_bytes: &[u8]) -> bool {
     let target = match code_source {
         CodeSource::GitHub { build_target, .. } => build_target.as_str(),
         CodeSource::WasmUrl { build_target, .. } => build_target.as_str(),
@@ -3950,55 +4006,61 @@ fn signing_keys_reachable(code_source: &CodeSource, wasm_bytes: &[u8]) -> bool {
     !matches!(target, "wasm32-wasip1" | "wasm32-wasi") && wasmparser::Parser::is_component(wasm_bytes)
 }
 
-/// The signing keys of a run that made no secrets request, from the keystore
-/// in one keys-only call carrying both accounts of the run — the signer and
-/// the calling account, as a secrets request does — or the refusal with the
-/// job status it is reported under: what the keystore refused with the
-/// `signing_keys_refused` code is `Custom` (a declaration, a project or a
-/// vault the author or caller can fix); a run with no caller to bind a key to
-/// is `AccessDenied`; a keystore that is missing, could not answer, predates
-/// signing keys or served other seeds than the declared ones is `Failed` —
-/// nothing the author or caller can fix.
-async fn signing_keys_for_run(
+/// The declared keys — signing and encryption — of a run that made no secrets
+/// request, from the keystore in one keys-only call carrying both accounts of
+/// the run — the signer and the calling account, as a secrets request does —
+/// or the refusal with the job status it is reported under: what the keystore
+/// refused with the `signing_keys_refused` code is `Custom` (a declaration, a
+/// project or a vault the author or caller can fix); a run with no caller to
+/// bind a key to is `AccessDenied`; a keystore that is missing, could not
+/// answer, predates a family asked for or served other keys than the declared
+/// ones is `Failed` — nothing the author or caller can fix.
+async fn keys_for_run(
     keystore_client: Option<&KeystoreClient>,
     keys: Option<&keystore_client::KeysRequest<'_>>,
     caller: Option<&str>,
     predecessor_id: Option<&str>,
     data_id: &str,
     executed_wasm_sha256: &str,
-) -> std::result::Result<signing_keys::SigningKeys, (String, api_client::JobStatus)> {
+) -> std::result::Result<executor::RunKeys, (String, api_client::JobStatus)> {
     use api_client::JobStatus;
     let Some(keys) = keys else {
-        return Err(("no signing keys were declared".to_string(), JobStatus::Custom));
+        return Err(("no keys were declared".to_string(), JobStatus::Custom));
     };
     let Some(keystore) = keystore_client else {
         return Err((
-            "the component declares signing keys, but this worker has no keystore to derive them with".to_string(),
+            "the component declares signing or encryption keys, but this worker has no keystore to derive \
+             them with"
+                .to_string(),
             JobStatus::Failed,
         ));
     };
     let Some(caller) = caller else {
         return Err((
-            "the component declares signing keys, and this run carries no caller to bind them to, so none \
-             were derived"
+            "the component declares signing or encryption keys, and this run carries no caller to bind them \
+             to, so none were derived"
                 .to_string(),
             JobStatus::AccessDenied,
         ));
     };
     let derived = keystore
-        .derive_signing_keys(caller, Some(data_id), executed_wasm_sha256, predecessor_id, keys)
+        .derive_keys(caller, Some(data_id), executed_wasm_sha256, predecessor_id, keys)
         .await
         .map_err(|e| {
             let category = if keystore_client::SigningKeysRefused::is_refusal(&e) {
                 JobStatus::Custom
             } else {
-                // Unreachable, predating signing keys, or serving the wrong
-                // seeds: the keystore, not the configuration.
+                // Unreachable, predating a family asked for, or serving the
+                // wrong keys: the keystore, not the configuration.
                 JobStatus::Failed
             };
             (format!("{e:#}"), category)
         })?;
-    info!("🔑 Signing keys ready: {:?}", derived.paths().collect::<Vec<_>>());
+    info!(
+        "🔑 Declared keys ready: signing {:?}, encryption {:?}",
+        derived.signing.iter().flat_map(|k| k.paths()).collect::<Vec<_>>(),
+        derived.encryption.iter().flat_map(|k| k.paths()).collect::<Vec<_>>()
+    );
     Ok(derived)
 }
 
@@ -5035,8 +5097,16 @@ mod signing_keys_in_the_job_path {
         let secrets = src.find("let user_secrets = if let (Some(secrets_ref), Some(keystore))").expect("the secrets block");
         assert!(check < secrets, "a declaration that cannot be served must refuse before secrets are decrypted");
         assert!(src[check..check + 900].contains("report_refusal("), "the refusal goes through the refusal path");
-        let p1 = src.find("!signing_keys_reachable(code_source, &wasm_bytes)").expect("the P1 check");
+        let p1 = src.find("!declared_keys_reachable(code_source, &wasm_bytes)").expect("the P1 check");
         assert!(p1 < secrets && src[p1..p1 + 900].contains("report_refusal("));
+        // The encryption keys: judged against the same run, at the same point.
+        let enc = src
+            .find("encryption_keys::declared_encryption_keys(declared_manifest.as_ref(), &run_source)")
+            .expect("the encryption-key check");
+        assert!(enc < secrets && enc < p1, "encryption keys are judged before secrets and before the P1 check");
+        assert!(src[enc..enc + 900].contains("report_refusal("));
+        let p1_condition = &src[p1 - 120..p1];
+        assert!(p1_condition.contains("!declared_encryption_keys.is_empty()"), "a P1 module declaring encryption keys is refused too: {p1_condition}");
     }
 
     /// How the run was started is read off the job — its project, its
@@ -5061,9 +5131,11 @@ mod signing_keys_in_the_job_path {
         let src = src();
         // The request is the manifest's keys, how the job was started and its
         // own project.
-        let built = src.find("let keys_request = (!declared_keys.is_empty()).then(|| keystore_client::KeysRequest {").expect("the request");
-        let request = &src[built..built + 250];
-        for field in ["project_id: run_source.project_id", "keys: &declared_keys"] {
+        let built = src
+            .find("let keys_request = (!declared_keys.is_empty() || !declared_encryption_keys.is_empty()).then(|| {")
+            .expect("the request");
+        let request = &src[built..built + 350];
+        for field in ["project_id: run_source.project_id", "keys: &declared_keys", "encryption_keys: &declared_encryption_keys"] {
             assert!(request.contains(field), "the key request must carry {field}: {request}");
         }
         assert!(!request.contains("source_kind"), "the request says nothing about how the run was started: {request}");
@@ -5071,14 +5143,14 @@ mod signing_keys_in_the_job_path {
         for call in ["decrypt_secrets_by_project(proj_id", "decrypt_secrets_from_contract(repo", "decrypt_secrets_by_wasm_hash(hash"] {
             let site = src.find(call).unwrap_or_else(|| panic!("{call}"));
             let line = &src[src[..site].rfind('\n').unwrap()..site];
-            assert!(line.contains("keystore.with_signing_keys(keys_request.as_ref())."), "{call} does not carry the keys: {line}");
+            assert!(line.contains("keystore.with_keys(keys_request.as_ref())."), "{call} does not carry the keys: {line}");
         }
         // A refusal of the keys in that call refuses the run.
         let refused = src.find("keystore_client::SigningKeysRefused::is_refusal(&e)").expect("the keys' refusal is read");
         assert!(src[refused..refused + 600].contains("report_refusal("));
         // Only a run that made no secrets request asks for the keys alone,
         // with the caller and the measured build.
-        let at = src.find("match signing_keys_for_run(").expect("the keys-only request");
+        let at = src.find("match keys_for_run(").expect("the keys-only request");
         assert!(src[at - 200..at].contains("} else if let Some(keys) = run_keys {"), "the keys-only call is the fallback");
         let call = &src[at..at + 300];
         for arg in ["keys_request.as_ref()", "user_account_id.map(|s| s.as_str())", "predecessor_id,", "&executed_wasm_sha256"] {
@@ -5102,8 +5174,91 @@ mod signing_keys_in_the_job_path {
         let env = src.find("let mut env_vars = merge_env_vars(").expect("the environment");
         let env_end = env + src[env..].find(");").expect("its end");
         assert!(!src[env..env_end].contains("signing_keys"), "keys must never reach the guest's environment");
+        assert!(!src[env..env_end].contains("encryption_keys"), "keys must never reach the guest's environment");
+        assert!(!src[env..env_end].contains("run_keys"), "keys must never reach the guest's environment");
         let exec = src.find(".execute(\n").expect("the executor call");
-        assert!(src[exec - 60..exec].contains(".with_signing_keys(signing_keys)"), "the keys go into the run by value");
-        assert_eq!(src.matches("(signing_keys)").count(), 1, "one hand-over, to the executor");
+        assert!(src[exec - 60..exec].contains(".with_keys(declared_run_keys)"), "the keys go into the run by value");
+        assert_eq!(src.matches("(declared_run_keys)").count(), 1, "one hand-over, to the executor");
+    }
+}
+
+/// Whose storage cell a run gets is decided by the manifest of the bytes that
+/// run and by the job, before execution, and by nothing else. Source-shape
+/// tests, as for the calling account: the rule lives in the job path, and a
+/// unit test of `outlayer_storage::cell_account` would keep passing if the
+/// path stopped calling it.
+#[cfg(test)]
+mod the_storage_cell_comes_from_the_manifest_and_the_job {
+    const CALL: &str = "let storage_cell_account = match outlayer_storage::cell_account(\n";
+
+    fn code() -> &'static str {
+        let all = include_str!("main.rs");
+        &all[..all.find("#[cfg(test)]").expect("tests follow the code")]
+    }
+
+    #[test]
+    fn the_cell_is_resolved_once_from_the_manifest_and_the_job() {
+        let src = code();
+        assert_eq!(src.matches(CALL).count(), 1, "one resolution of the cell account");
+        let at = src.find(CALL).unwrap() + CALL.len();
+        let args: Vec<&str> = src[at..].lines().take(3).map(str::trim).collect();
+        assert_eq!(
+            args,
+            [
+                "declared_manifest.as_ref().map(|m| m.storage_account).unwrap_or_default(),",
+                "user_account_id.map(|s| s.as_str()),",
+                "predecessor_id,",
+            ],
+            "the manifest's choice, the job's signer and the job's predecessor — nothing else"
+        );
+        // Each input is the one the job path settled: the manifest read from
+        // the bytes that run, and the door's predecessor, neither shadowed.
+        let manifest = src
+            .find("let declared_manifest = match connector_manifest::manifest_from_wasm(&wasm_bytes)")
+            .expect("the manifest comes from the bytes");
+        let predecessor = src
+            .find("let predecessor_id: Option<&str> = if is_https_call {")
+            .expect("the door's predecessor");
+        assert!(manifest < at && predecessor < at);
+        for name in ["let declared_manifest", "let predecessor_id", "let user_account_id"] {
+            assert_eq!(src[predecessor.max(manifest) + 20..at].matches(name).count(), 0, "`{name}` is not shadowed before the cell is resolved");
+        }
+        // Settled before anything is decrypted or executed, and a refusal
+        // returns rather than falling through.
+        let first_decrypt = src.find("decrypt_secrets_by_project(proj_id").expect("a decrypt");
+        let exec = src.find(".execute(\n").expect("the executor call");
+        assert!(at < first_decrypt && at < exec, "the cell is settled before decrypting and executing");
+        let refusal = &src[at..at + 1200];
+        assert!(refusal.contains("Err(reason) =>") && refusal.contains("report_refusal(") && refusal.contains("return Ok(());"));
+    }
+
+    #[test]
+    fn the_storage_config_takes_the_resolved_cell_and_nothing_else() {
+        let src = code();
+        assert_eq!(src.matches("StorageConfig {").count(), 1, "one storage config in the job path");
+        assert_eq!(src.matches("let storage_account_id = storage_cell_account;").count(), 1);
+        assert_eq!(src.matches("account_id: storage_account_id,").count(), 1);
+        let config = src.find("StorageConfig {").unwrap();
+        let resolved = src.find(CALL).unwrap();
+        assert!(resolved < config, "the config is built from the resolved cell");
+        // No second spelling of the account: no fallback name of its own.
+        assert!(!src.contains(concat!("\"anony", "mous\"")), "the fallback lives in cell_account only");
+    }
+
+    /// The guest reaches storage only through the host functions, and they
+    /// never name an account: the cell is the config's, or `@worker`.
+    #[test]
+    fn no_host_function_takes_an_account() {
+        let host = include_str!("outlayer_storage/host_functions.rs");
+        assert!(!host.contains("account"), "a storage host function names an account");
+        let client = include_str!("outlayer_storage/client.rs");
+        let client = &client[..client.find("#[cfg(test)]").unwrap_or(client.len())];
+        for line in client.lines().filter(|l| l.contains("\"account_id\":")) {
+            let v = line.split("\"account_id\":").nth(1).unwrap().trim();
+            assert!(
+                v.starts_with("account_id") || v.starts_with("self.config.account_id") || v.starts_with("\"@worker\""),
+                "a storage request names an account other than the config's or @worker: {line}"
+            );
+        }
     }
 }

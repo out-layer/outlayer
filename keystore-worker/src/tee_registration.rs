@@ -23,7 +23,7 @@ use tracing::{info, warn, error};
 /// Keystore registration client
 pub struct RegistrationClient {
     /// NEAR RPC client
-    rpc_client: JsonRpcClient,
+    rpc_client: crate::near::RpcClient,
 
     /// DAO contract ID
     dao_contract_id: AccountId,
@@ -69,7 +69,7 @@ impl RegistrationClient {
         init_secret_key: SecretKey,
         key_type: KeyType,
     ) -> Result<Self> {
-        let rpc_client = JsonRpcClient::connect(&near_rpc_url);
+        let rpc_client = crate::near::RpcClient::new(JsonRpcClient::connect(&near_rpc_url));
 
         let init_signer = InMemorySigner {
             account_id: init_account_id,

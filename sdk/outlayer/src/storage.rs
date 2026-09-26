@@ -1,7 +1,10 @@
 //! Persistent storage API for OutLayer WASM components
 //!
-//! Storage is encrypted and persisted across executions. For projects, storage
-//! is shared across all versions (same encryption key derived from project UUID).
+//! Storage is persisted across executions. For projects, storage is shared
+//! across all versions. `set`/`get` and the conditional writes store records
+//! encrypted by the keystore; the `_raw` functions store the component's bytes
+//! as given. Each record keeps the mode it was written in, and a function of the
+//! other mode refuses it with an error.
 //!
 //! ## Basic Usage
 //!
@@ -26,6 +29,22 @@
 //!
 //! // List keys with prefix
 //! let keys = storage::list_keys("prefix:")?;
+//! ```
+//!
+//! ## Whose cell
+//!
+//! Every function outside the `_worker` ones reads and writes one account's
+//! cell of the project, and no function takes an account: the worker fixes it
+//! before the run starts, from the manifest's `storage_account` and the job.
+//! `"signer"` (the default) is the transaction's signer on chain and the
+//! payment key's owner over HTTPS. `"predecessor"` is the account that called
+//! the contract on chain — a relaying contract, not the user who signed — and
+//! the payment key's owner over HTTPS; a run with no predecessor is refused.
+//! Records sealed with a `caller: "predecessor"` encryption key belong in the
+//! `"predecessor"` cell, so the key and the cell name one account.
+//!
+//! ```json
+//! { "storage_account": "predecessor" }
 //! ```
 //!
 //! ## Worker-Private Storage
@@ -53,8 +72,32 @@
 //! // Read from previous WASM version (by its SHA256 hash)
 //! let old_data = storage::get_by_version("my-key", "abc123...")?;
 //! ```
+//!
+//! ## Raw Storage
+//!
+//! [`set_raw`], [`get_raw`], [`set_if_absent_raw`] and [`set_if_equals_raw`]
+//! store bytes as given, in the same per-account storage and key namespace as
+//! [`set`]/[`get`], with no keystore call. The key name and the value are stored
+//! in plaintext and the operator can read both: encrypt the value first (with
+//! `encryption_keys`) and keep secrets out of key names. `storage::sealed`
+//! (feature `encryption-keys`) does both.
+//!
+//! A key holds one record in one mode: [`get_raw`] on a key written with [`set`]
+//! (or [`get`] on a key written with [`set_raw`]) is an error, and no write
+//! converts a record from one mode to the other — delete it first. [`has`],
+//! [`delete`] and [`list_keys`] work on records of both modes.
+//!
+//! ```rust,ignore
+//! use outlayer::storage;
+//!
+//! storage::set_raw("blob", &ciphertext)?;
+//! let blob = storage::get_raw("blob")?;
+//! ```
 
 use crate::near::storage::api as raw;
+
+#[cfg(feature = "encryption-keys")]
+pub mod sealed;
 
 /// Storage error
 #[derive(Debug, Clone)]
@@ -131,7 +174,10 @@ pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
 ///
 /// # Returns
 /// * `true` - Key exists
-/// * `false` - Key doesn't exist
+/// * `false` - Key doesn't exist, **or the storage call failed**: the host
+///   answers both with `false`, so this is not proof of absence. Where absence
+///   decides anything, read the key with [`get`] or [`get_raw`], which return a
+///   failed call as `Err`.
 ///
 /// # Example
 /// ```rust,ignore
@@ -152,7 +198,10 @@ pub fn has(key: &str) -> bool {
 ///
 /// # Returns
 /// * `true` - Key existed and was deleted
-/// * `false` - Key didn't exist
+/// * `false` - Nothing was deleted: the key didn't exist, **or the storage call
+///   failed** — the host answers both with `false`, so this is not proof that
+///   the key is gone. Read it back with [`get`] or [`get_raw`] where that
+///   matters.
 ///
 /// # Example
 /// ```rust,ignore
@@ -261,24 +310,29 @@ pub fn get_worker(key: &str) -> Result<Option<Vec<u8>>> {
 ///
 /// # Arguments
 /// * `key` - The key to retrieve
-/// * `project_uuid` - None = current project, Some("p0000000000000001") = read from another project by UUID
+/// * `project` - None = current project; Some(project) = read public data from
+///   another project, named either by its name `"owner.near/project-name"` or by
+///   its uuid `"p0000000000000001"` (`p` + 16 lowercase hex; the project's own
+///   code sees it as `OUTLAYER_PROJECT_UUID`)
 ///
 /// # Returns
 /// * `Ok(Some(bytes))` - Value found
-/// * `Ok(None)` - Key doesn't exist or is encrypted (for cross-project reads)
-/// * `Err(StorageError)` - Storage operation failed
+/// * `Ok(None)` - Key doesn't exist, or (cross-project) no such project
+/// * `Err(StorageError)` - Storage operation failed; cross-project, also a key
+///   stored encrypted (not public) and a project in neither form
 ///
 /// # Example
 /// ```rust,ignore
-/// // Read public oracle price from another project (by UUID)
-/// // Get project UUID via contract's get_project("oracle.near/price-feed") view call
-/// if let Some(price_data) = storage::get_worker_from_project("price:ETH", Some("p0000000000000042"))? {
+/// // Read a public oracle price from another project, by name
+/// if let Some(price_data) = storage::get_worker_from_project("price:ETH", Some("oracle.near/price-feed"))? {
 ///     let price = f64::from_le_bytes(price_data.try_into()?);
 ///     println!("ETH price: ${}", price);
 /// }
+/// // ...or by uuid
+/// let same = storage::get_worker_from_project("price:ETH", Some("p0000000000000042"))?;
 /// ```
-pub fn get_worker_from_project(key: &str, project_uuid: Option<&str>) -> Result<Option<Vec<u8>>> {
-    let (data, error) = raw::get_worker(key, project_uuid);
+pub fn get_worker_from_project(key: &str, project: Option<&str>) -> Result<Option<Vec<u8>>> {
+    let (data, error) = raw::get_worker(key, project);
     if !error.is_empty() {
         return Err(StorageError(error));
     }
@@ -325,7 +379,7 @@ pub fn get_by_version(key: &str, wasm_hash: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// Clear all storage for the current project/account
+/// Clear all storage of the current project in this run's account cell
 ///
 /// **WARNING**: This deletes ALL data. Use with caution!
 ///
@@ -462,6 +516,119 @@ pub fn get_json<T: serde::de::DeserializeOwned>(key: &str) -> Result<Option<T>> 
                 .map_err(|e| StorageError(format!("JSON deserialization failed: {}", e)))
         }
         None => Ok(None),
+    }
+}
+
+// ==================== Raw Operations ====================
+
+/// Store bytes as given, with no keystore encryption
+///
+/// The key name and the value are stored in plaintext: the storage operator can
+/// read both. Encrypt the value first (with `encryption_keys`, or use
+/// `storage::sealed`) and keep secrets out of key names.
+///
+/// # Returns
+/// * `Ok(())` - Value stored successfully
+/// * `Err(StorageError)` - Storage operation failed, or the key holds a record
+///   written with [`set`]
+///
+/// # Example
+/// ```rust,ignore
+/// storage::set_raw("blob", &ciphertext)?;
+/// ```
+pub fn set_raw(key: &str, value: &[u8]) -> Result<()> {
+    let error = raw::set_raw(key, value);
+    if error.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError(error))
+    }
+}
+
+/// Get the bytes stored by [`set_raw`]
+///
+/// # Returns
+/// * `Ok(Some(bytes))` - Value found
+/// * `Ok(None)` - Key doesn't exist
+/// * `Err(StorageError)` - Storage operation failed, or the key holds a record
+///   written with [`set`]
+///
+/// # Example
+/// ```rust,ignore
+/// if let Some(blob) = storage::get_raw("blob")? {
+///     // decrypt blob
+/// }
+/// ```
+pub fn get_raw(key: &str) -> Result<Option<Vec<u8>>> {
+    let (data, error) = raw::get_raw(key);
+    if !error.is_empty() {
+        return Err(StorageError(error));
+    }
+    if data.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(data))
+    }
+}
+
+/// Store bytes as given only if the key holds no record, in either mode
+///
+/// The key name and the value are stored in plaintext, as with [`set_raw`].
+///
+/// # Returns
+/// * `Ok(true)` - Value was inserted
+/// * `Ok(false)` - Key already held a record (value not changed)
+/// * `Err(StorageError)` - Storage operation failed
+///
+/// # Example
+/// ```rust,ignore
+/// if storage::set_if_absent_raw("blob", &ciphertext)? {
+///     println!("Stored");
+/// }
+/// ```
+pub fn set_if_absent_raw(key: &str, value: &[u8]) -> Result<bool> {
+    let (inserted, error) = raw::set_if_absent_raw(key, value);
+    if !error.is_empty() {
+        return Err(StorageError(error));
+    }
+    Ok(inserted)
+}
+
+/// Compare-and-swap on raw bytes: replace the value only if the stored bytes
+/// equal `expected` exactly
+///
+/// The key name and the value are stored in plaintext, as with [`set_raw`].
+/// Ciphertexts from `encryption_keys::encrypt` are randomized, so `expected`
+/// must be the stored bytes as read, never a fresh encryption of the same
+/// plaintext.
+///
+/// # Returns
+/// * `Ok((true, None))` - Value was updated
+/// * `Ok((false, Some(current)))` - Stored bytes didn't match; returns them for retry
+/// * `Ok((false, None))` - Key doesn't exist
+/// * `Err(StorageError)` - Storage operation failed, or the key holds a record
+///   written with [`set`]
+///
+/// # Example
+/// ```rust,ignore
+/// let current = storage::get_raw("blob")?.unwrap_or_default();
+/// match storage::set_if_equals_raw("blob", &current, &next)? {
+///     (true, _) => {}                   // Updated
+///     (false, Some(actual)) => { /* retry with actual */ }
+///     (false, None) => { /* key was deleted */ }
+/// }
+/// ```
+pub fn set_if_equals_raw(key: &str, expected: &[u8], new_value: &[u8]) -> Result<(bool, Option<Vec<u8>>)> {
+    let (success, current, error) = raw::set_if_equals_raw(key, expected, new_value);
+    if !error.is_empty() {
+        return Err(StorageError(error));
+    }
+    if success {
+        Ok((true, None))
+    } else if current.is_empty() {
+        Ok((false, None))
+    } else {
+        Ok((false, Some(current)))
     }
 }
 

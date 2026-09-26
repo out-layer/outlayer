@@ -3,7 +3,8 @@
 //! Handles reading secrets from NEAR contract (read-only).
 
 use anyhow::{Context, Result};
-use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_jsonrpc_client::errors::JsonRpcError;
+use near_jsonrpc_client::{methods, JsonRpcClient, MethodCallResult};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_primitives::types::{AccountId, Balance, BlockReference, Gas};
 use serde_json::json;
@@ -27,6 +28,47 @@ fn raw_rpc_client() -> &'static reqwest::Client {
     })
 }
 
+/// A NEAR JSON-RPC client whose errors never name the endpoint.
+///
+/// The RPC URL can carry the provider's API key (`?apiKey=…`), and a reqwest
+/// transport error's `Display` includes the request URL. Those errors reach
+/// warn logs and `InternalError` bodies, so every error this client returns has
+/// the URL stripped where it is created, and no caller has to remember to.
+#[derive(Clone)]
+pub struct RpcClient(JsonRpcClient);
+
+impl RpcClient {
+    /// Wrap a client built elsewhere (e.g. `JsonRpcClient::connect`).
+    pub fn new(inner: JsonRpcClient) -> Self {
+        Self(inner)
+    }
+
+    /// [`JsonRpcClient::call`], with the URL stripped from any transport error.
+    pub async fn call<M>(&self, method: M) -> MethodCallResult<M::Response, M::Error>
+    where
+        M: methods::RpcMethod,
+    {
+        self.0.call(method).await.map_err(rpc_error_without_url)
+    }
+}
+
+/// The same error, minus the request URL inside any reqwest error it holds.
+fn rpc_error_without_url<E>(e: JsonRpcError<E>) -> JsonRpcError<E> {
+    use near_jsonrpc_client::errors::{
+        JsonRpcTransportRecvError as Recv, JsonRpcTransportSendError as Send,
+        RpcTransportError as Transport,
+    };
+    match e {
+        JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e))) => {
+            JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e.without_url())))
+        }
+        JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e))) => {
+            JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e.without_url())))
+        }
+        other => other,
+    }
+}
+
 /// Read-path RPC client: view calls, access keys, block queries.
 ///
 /// `JsonRpcClient::connect` builds its reqwest client with headers only and **no timeout**
@@ -38,7 +80,7 @@ fn raw_rpc_client() -> &'static reqwest::Client {
 ///
 /// 30s is far above a healthy view call (~100-300ms) and these sit on the signing hot path, so
 /// they should fail fast rather than hold a request open.
-pub fn rpc_client(rpc_url: &str) -> JsonRpcClient {
+pub fn rpc_client(rpc_url: &str) -> RpcClient {
     build_rpc_client(rpc_url, 30)
 }
 
@@ -50,15 +92,15 @@ pub fn rpc_client(rpc_url: &str) -> JsonRpcClient {
 /// A short timeout here would abort a derivation whose transaction is already on-chain and
 /// will succeed: the caller would see a failure, the vault would be charged gas, and the
 /// keystore would derive again on the next attempt.
-pub fn rpc_client_tx(rpc_url: &str) -> JsonRpcClient {
+pub fn rpc_client_tx(rpc_url: &str) -> RpcClient {
     build_rpc_client(rpc_url, 240)
 }
 
 /// Both clients are built once per (url, timeout) and cloned afterwards: `JsonRpcClient` is
 /// cheap to clone and keeps its connection pool, whereas building one allocates a fresh TLS
 /// connector and pool that is then thrown away. Callers construct these per cold-vault load.
-fn build_rpc_client(rpc_url: &str, timeout_secs: u64) -> JsonRpcClient {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<(String, u64, JsonRpcClient)>>> =
+fn build_rpc_client(rpc_url: &str, timeout_secs: u64) -> RpcClient {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<(String, u64, RpcClient)>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
 
@@ -87,7 +129,7 @@ fn build_rpc_client(rpc_url: &str, timeout_secs: u64) -> JsonRpcClient {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("Failed to build NEAR RPC HTTP client");
-    let client = JsonRpcClient::with(http).connect(rpc_url);
+    let client = RpcClient::new(JsonRpcClient::with(http).connect(rpc_url));
     entries.push((rpc_url.to_string(), timeout_secs, client.clone()));
     client
 }
@@ -132,12 +174,12 @@ pub struct SecretWithVault {
 /// NEAR client for reading secrets from contract (read-only)
 pub struct NearClient {
     /// JSON-RPC client for queries
-    rpc_client: JsonRpcClient,
+    rpc_client: RpcClient,
     /// Patient client for `broadcast_tx_commit`. `mark_vault_verified` / `ban_vault` are plain
     /// calls that normally land in seconds, but giving up early on a transaction that is
     /// already included reports a failure for work that succeeded — and consumes the signer
     /// nonce either way. Waiting for the real answer is strictly more informative.
-    rpc_client_tx: JsonRpcClient,
+    rpc_client_tx: RpcClient,
     /// Raw RPC URL — kept around for handcrafted JSON-RPC calls that
     /// the typed `near-primitives 0.26` bindings can't decode (NEP-591
     /// global-contract account fields).
@@ -162,6 +204,14 @@ fn on_chain_form(public_key: &str) -> Result<String> {
     let parsed = near_crypto::PublicKey::from_str(public_key)
         .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
     Ok(near_crypto::PublicKeyHandle::from(&parsed).to_string())
+}
+
+/// A view call's answer and the block the RPC read it at.
+#[derive(Debug, Clone)]
+pub struct ViewAt {
+    pub value: serde_json::Value,
+    pub block_height: near_primitives::types::BlockHeight,
+    pub block_hash: near_primitives::hash::CryptoHash,
 }
 
 impl NearClient {
@@ -663,9 +713,11 @@ impl NearClient {
             .json(&body)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("view_account({account_id}): RPC POST failed"))?
             .json()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("view_account({account_id}): RPC body not JSON"))?;
 
         if let Some(err) = resp.get("error") {
@@ -863,8 +915,24 @@ impl NearClient {
         method_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.view_call_json_at(contract_id, method_name, args, BlockReference::latest())
+            .await
+            .map(|view| view.value)
+    }
+
+    /// [`Self::view_call_json`] at the block `at` names, with the block the
+    /// RPC answered from. Two reads that must see one state are made at one
+    /// block: the hash of the first answer, passed as
+    /// `BlockReference::BlockId(BlockId::Hash(..))`, pins the second.
+    pub async fn view_call_json_at(
+        &self,
+        contract_id: &AccountId,
+        method_name: &str,
+        args: serde_json::Value,
+        at: BlockReference,
+    ) -> Result<ViewAt> {
         let query = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::latest(),
+            block_reference: at,
             request: near_primitives::views::QueryRequest::CallFunction {
                 account_id: contract_id.clone(),
                 method_name: method_name.to_string(),
@@ -883,14 +951,15 @@ impl NearClient {
             _ => anyhow::bail!("Unexpected query response for {}.{}", contract_id, method_name),
         };
 
-        serde_json::from_slice(&result_bytes).with_context(|| {
+        let value = serde_json::from_slice(&result_bytes).with_context(|| {
             format!(
                 "view_call_json: response from {}.{} was not valid JSON: {}",
                 contract_id,
                 method_name,
                 String::from_utf8_lossy(&result_bytes)
             )
-        })
+        })?;
+        Ok(ViewAt { value, block_height: response.block_height, block_hash: response.block_hash })
     }
 
     /// Verify that a public key belongs to an account
@@ -964,6 +1033,45 @@ impl NearClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An endpoint nothing listens on, with a key in its query string.
+    const KEYED_DEAD_URL: &str = "http://127.0.0.1:9/?apiKey=SECRET";
+
+    /// A transport error from the RPC client names neither the URL nor its key,
+    /// in `Display` (what bodies and warn logs carry) or `Debug`.
+    #[tokio::test]
+    async fn rpc_client_errors_carry_no_url() {
+        // The unwrapped crate client does put the URL in its error: the check
+        // below is not vacuous.
+        let raw = JsonRpcClient::connect(KEYED_DEAD_URL)
+            .call(methods::status::RpcStatusRequest)
+            .await
+            .expect_err("nothing listens on port 9");
+        assert!(format!("{raw:#}").contains("apiKey"), "{raw:#}");
+
+        for client in [rpc_client(KEYED_DEAD_URL), rpc_client_tx(KEYED_DEAD_URL)] {
+            let e = client
+                .call(methods::status::RpcStatusRequest)
+                .await
+                .expect_err("nothing listens on port 9");
+            let text = format!("{e:#} {e:?}");
+            let text = format!("{text} {:#}", anyhow::Error::new(e));
+            assert!(!text.contains("apiKey") && !text.contains("SECRET"), "{text}");
+        }
+    }
+
+    /// The handcrafted JSON-RPC read strips the URL the same way.
+    #[tokio::test]
+    async fn raw_rpc_errors_carry_no_url() {
+        let client = NearClient::new(KEYED_DEAD_URL, "outlayer.testnet").expect("client");
+        let account: AccountId = "outlayer.testnet".parse().unwrap();
+        let e = client
+            .view_account_code_hash(&account)
+            .await
+            .expect_err("nothing listens on port 9");
+        let text = format!("{e:#} {e:?}");
+        assert!(!text.contains("apiKey") && !text.contains("SECRET"), "{text}");
+    }
 
     /// The RPC client must send `Content-Type: application/json`.
     ///

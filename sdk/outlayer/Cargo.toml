@@ -1,6 +1,6 @@
 [package]
 name = "outlayer"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "SDK for OutLayer off-chain WASM execution on NEAR"
 license = "MIT OR Apache-2.0"
@@ -15,6 +15,10 @@ serde_json = "1.0"
 
 [features]
 default = []
+# `outlayer:signing-keys`: the `signing_keys` module.
+signing-keys = []
+# `outlayer:encryption-keys`: the `encryption_keys` module and `storage::sealed`.
+encryption-keys = []
 
 [package.metadata.docs.rs]
 all-features = true

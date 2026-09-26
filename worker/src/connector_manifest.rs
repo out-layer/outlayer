@@ -36,8 +36,12 @@ use serde::Deserialize;
 /// larger is either a mistake or an attempt to make us buffer a repository.
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
-/// The parts of `manifest.json` this worker acts on.
+/// The manifest: the members this worker acts on, and those it accepts for
+/// other readers. A member outside this list refuses the run, naming the
+/// member and the ones that exist — a misspelling must not quietly become the
+/// default it was written to override.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectManifest {
     /// Stable connector identity. Never contains a version — the version is a
     /// property of the code, not of who the connector is.
@@ -84,6 +88,53 @@ pub struct ProjectManifest {
     /// one the run cannot be served refuses the run.
     #[serde(default, deserialize_with = "crate::signing_keys::deserialize_declared")]
     pub signing_keys: Option<Vec<crate::signing_keys::ManifestKey>>,
+    /// Encryption keys the artefact seals data with, by path, at most three —
+    /// see [`crate::encryption_keys`] and `wit/deps/encryption-keys.wit`.
+    /// Issued under the signing keys' rules, in a namespace of their own: a
+    /// path may name a signing key and an encryption key at once, and they
+    /// are two unrelated secrets. The guest reaches them only through the
+    /// `outlayer:encryption-keys` host functions. A declaration that breaks
+    /// the rules does not parse, and one the run cannot be served refuses the
+    /// run.
+    #[serde(default, deserialize_with = "crate::encryption_keys::deserialize_declared")]
+    pub encryption_keys: Option<Vec<crate::encryption_keys::EncryptionManifestKey>>,
+    /// Whose per-account storage cell the run reads and writes — see
+    /// [`StorageAccount`]. Absent means `signer`. A value other than the two
+    /// spellings does not parse, and a manifest that does not parse refuses
+    /// the run.
+    #[serde(default)]
+    pub storage_account: StorageAccount,
+    /// The operation names, for the dashboard and the price-list check.
+    #[serde(default, rename = "operations")]
+    _operations: Option<serde::de::IgnoredAny>,
+    /// Name and author, for the dashboard.
+    #[serde(default, rename = "display")]
+    _display: Option<serde::de::IgnoredAny>,
+    /// What each operation does and takes, served by the coordinator.
+    #[serde(default, rename = "describe")]
+    _describe: Option<serde::de::IgnoredAny>,
+}
+
+/// `storage_account` in the manifest: which account of the job owns the
+/// run's per-account storage cell (`near:storage`'s `set`/`get`, the `-raw`
+/// functions and everything else outside the `@worker` cell). Chosen by the
+/// artefact, resolved against the job by
+/// [`crate::outlayer_storage::cell_account`]; the guest never names an
+/// account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageAccount {
+    /// The job's `user_account_id`: the transaction signer on chain, the
+    /// payment-key owner over HTTPS; `anonymous` on a run that carries
+    /// neither.
+    #[default]
+    Signer,
+    /// The job's `predecessor_id`, the account the secrets and the
+    /// `caller: "predecessor"` keys are judged for: the account that called
+    /// the contract on chain — a DAO, a wallet contract, a relaying contract —
+    /// and the payment-key owner over HTTPS. A run that carries no
+    /// predecessor is refused before it executes.
+    Predecessor,
 }
 
 /// `author_secrets` in the manifest — see [`ProjectManifest::author_secrets`].
@@ -777,15 +828,48 @@ mod tests {
     }
 
     #[test]
-    fn an_unrelated_manifest_declares_no_allowlist() {
-        // `manifest.json` is a common filename (web app manifests, for one).
-        // One that says nothing about the network must not be read as saying
-        // something about it.
-        let web = ProjectManifest::parse(
-            br#"{"name":"My App","icons":[],"start_url":"/"}"#,
+    fn an_unknown_member_refuses_the_run_naming_it_and_the_known_ones() {
+        // Read with the member dropped, a misspelled `storage_account` would
+        // quietly mean the signer's cell.
+        let wasm = core_module(&[custom_section(MANIFEST_SECTION, br#"{"storage_acount":"predecessor"}"#)]);
+        let err = manifest_from_wasm(&wasm).expect_err("an unknown member refuses the run");
+        assert!(err.contains("`storage_acount`"), "{err}");
+        for known in ["storage_account", "capabilities", "describe"] {
+            assert!(err.contains(&format!("`{known}`")), "{err}");
+        }
+        // The members only other readers use are accepted, whatever they hold.
+        let other = ProjectManifest::parse(
+            br#"{"operations":["a"],"display":{"name":"A"},"describe":{"summary":"s","operations":{}}}"#,
         )
         .unwrap();
-        assert_eq!(web.allowlist(), None);
+        assert_eq!(other.allowlist(), None);
+    }
+
+    /// Every manifest this repository builds into a wasm still parses. The
+    /// private connector submodules are read when they are checked out.
+    #[test]
+    fn every_manifest_in_the_tree_parses() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        for dir in ["connectors", "connectors/rejected", "wasi-examples"] {
+            for project in std::fs::read_dir(root.join(dir)).into_iter().flatten().flatten() {
+                files.push(project.path().join("manifest.json"));
+                let variants = std::fs::read_dir(project.path().join("manifests")).into_iter().flatten().flatten();
+                files.extend(variants.map(|v| v.path()));
+            }
+        }
+        files.retain(|f| f.is_file());
+        assert!(files.len() >= 15, "found only {files:?}");
+        for file in files {
+            let bytes = std::fs::read(&file).expect("read");
+            match ProjectManifest::read(&bytes) {
+                Ok(_) => {}
+                // The probe's deliberately refused variant: a `type` on an
+                // encryption key.
+                Err(e) if file.ends_with("encryption-typed.json") => assert!(e.contains("`type`"), "{e}"),
+                Err(e) => panic!("{}: {e}", file.display()),
+            }
+        }
     }
 
     #[test]
@@ -1076,7 +1160,7 @@ mod tests {
         );
 
         // An ordinary project that says nothing is still unaffected.
-        let plain = ProjectManifest::parse(br#"{"name":"My App"}"#).unwrap();
+        let plain = ProjectManifest::parse(br#"{"display":{"name":"My App"}}"#).unwrap();
         assert!(!plain.declares_connector());
         assert_eq!(
             resolve_network_policy(false, Some(&plain)),

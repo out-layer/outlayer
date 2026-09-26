@@ -14,6 +14,7 @@ pub mod outlayer_payment;
 pub mod outlayer_vrf;
 pub mod outlayer_wallet;
 pub mod signing_keys;
+pub mod encryption_keys;
 pub mod wasm_cache;
 pub mod compiled_cache;
 pub mod event_monitor;

@@ -418,6 +418,49 @@ impl TerminalRelay {
     }
 }
 
+/// The pauses between the attempts [`retry_relay`] makes: eight attempts
+/// within about a hundred seconds, enough to ride out a coordinator redeploy
+/// or a 503 while it cannot yet read the contract.
+pub const RELAY_RETRY_DELAYS: [Duration; 7] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(32),
+    Duration::from_secs(32),
+];
+
+/// How long one attempt of an event relay [`retry_relay`] repeats may take:
+/// with the pauses, a coordinator that hangs holds the scan three minutes at
+/// most.
+pub const RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `relay` until it succeeds or fails with a [`TerminalRelay`], pausing
+/// `delays[i]` after the `i`-th failure; the error of the last attempt is
+/// returned once the delays run out. `what` names the relay in the log line
+/// each retry writes.
+pub async fn retry_relay<T, F, Fut>(what: &str, delays: &[Duration], mut relay: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut delays = delays.iter();
+    loop {
+        match relay().await {
+            Ok(value) => return Ok(value),
+            Err(e) if TerminalRelay::is_terminal(&e) => return Err(e),
+            Err(e) => match delays.next() {
+                Some(delay) => {
+                    tracing::warn!("{} failed, retrying in {:?}: {:#}", what, delay, e);
+                    tokio::time::sleep(*delay).await;
+                }
+                None => return Err(e),
+            },
+        }
+    }
+}
+
 /// `GET /wasm/exists/{checksum}`: whether the coordinator has the artefact,
 /// when it was first stored, and the sha256 of the bytes it holds now.
 #[derive(Debug, Clone, Deserialize)]
@@ -436,6 +479,8 @@ pub struct ApiClient {
     auth_token: String,
     /// TEE session ID (set after successful TEE registration)
     tee_session_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Per-attempt timeout of the event relays [`retry_relay`] repeats.
+    relay_timeout: Duration,
 }
 
 impl ApiClient {
@@ -454,7 +499,14 @@ impl ApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_token,
             tee_session_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            relay_timeout: RELAY_ATTEMPT_TIMEOUT,
         })
+    }
+
+    #[cfg(test)]
+    fn with_relay_timeout(mut self, timeout: Duration) -> Self {
+        self.relay_timeout = timeout;
+        self
     }
 
     /// Add standard auth headers (bearer token + optional TEE session)
@@ -2021,14 +2073,50 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Create a project storage cleanup task in coordinator queue
+    /// Drop the coordinator's cached name → uuid entries for `project_ids`
+    /// (`owner/name`). Idempotent: a name with no entry is not an error. A 4xx
+    /// is a [`TerminalRelay`].
+    pub async fn invalidate_project_uuid_cache(&self, project_ids: &[String]) -> Result<()> {
+        let url = format!("{}/projects/cache/invalidate", self.base_url);
+
+        let response = self
+            .add_auth_headers(self.client.post(&url))
+            .timeout(self.relay_timeout)
+            .json(&serde_json::json!({ "project_ids": project_ids }))
+            .send()
+            .await
+            .context("Failed to send project uuid cache invalidation")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            let message = format!(
+                "Project uuid cache invalidation failed with status {}: {}",
+                status, error_text
+            );
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(TerminalRelay).context(message));
+            }
+            anyhow::bail!(message)
+        }
+        Ok(())
+    }
+
+    /// Create a project storage cleanup task in the coordinator's queue.
     ///
-    /// Called by event monitor when ProjectStorageCleanup event is detected.
-    /// Worker will poll for these tasks and process them.
+    /// Called by the event monitor for a `ProjectStorageCleanup` event written
+    /// in `block_height`; the coordinator confirms the deletion on the contract
+    /// at that block. A 4xx — among them the 409 of a project the contract
+    /// still holds — is a [`TerminalRelay`] carrying the coordinator's reason;
+    /// a 2xx whose body does not parse is retried.
     pub async fn create_project_storage_cleanup_task(
         &self,
         project_id: &str,
         project_uuid: &str,
+        block_height: u64,
     ) -> Result<Option<i64>> {
         let url = format!("{}/projects/cleanup-task/create", self.base_url);
 
@@ -2036,6 +2124,7 @@ impl ApiClient {
         struct CreateCleanupTaskRequest {
             project_id: String,
             project_uuid: String,
+            block_height: u64,
         }
 
         #[derive(Deserialize)]
@@ -2047,28 +2136,42 @@ impl ApiClient {
         let request = CreateCleanupTaskRequest {
             project_id: project_id.to_string(),
             project_uuid: project_uuid.to_string(),
+            block_height,
         };
 
         tracing::info!(
-            "📝 Creating ProjectStorageCleanup task: project_id={} uuid={}",
-            project_id, project_uuid
+            "📝 Creating ProjectStorageCleanup task: project_id={} uuid={} block={}",
+            project_id, project_uuid, block_height
         );
 
         let response = self.add_auth_headers(self.client.post(&url))
+            .timeout(self.relay_timeout)
             .json(&request)
             .send()
             .await
             .context("Failed to create project storage cleanup task")?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
             let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            anyhow::bail!("Create cleanup task failed: {}", error_text)
+            let message = format!("Create cleanup task failed with status {}: {}", status, error_text);
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(TerminalRelay).context(message));
+            }
+            anyhow::bail!(message)
         }
 
-        let result: CreateCleanupTaskResponse = response.json().await?;
+        // A body that does not parse is transient: a proxy in front of the
+        // coordinator can answer 200 with a page of its own.
+        let result: CreateCleanupTaskResponse = response.json().await.map_err(|e| {
+            anyhow::anyhow!(
+                "Create cleanup task answered with a body that does not parse: {}",
+                e.without_url()
+            )
+        })?;
         if result.created {
             Ok(Some(result.task_id))
         } else {
@@ -2251,8 +2354,9 @@ impl ApiClient {
 
     /// Resolve project_id to project_uuid via coordinator
     ///
-    /// Calls coordinator's project API with Redis caching.
-    /// UUIDs are cached forever since they never change.
+    /// Calls coordinator's project API, which caches name → uuid in Redis
+    /// until a delete or transfer of that project drops the entry, and for at
+    /// most 24 hours.
     ///
     /// # Arguments
     /// * `project_id` - Project ID in format "owner.near/name"
@@ -2744,5 +2848,126 @@ mod tests {
             !TerminalRelay::is_terminal(&refused),
             "a coordinator that is not up yet is the most transient failure there is: {refused:#}"
         );
+    }
+
+    /// What `retry_relay` repeats: anything but a refusal, and only as often
+    /// as it has pauses for.
+    #[tokio::test]
+    async fn a_relay_is_retried_until_it_is_refused_or_the_pauses_run_out() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let no_pause = [Duration::ZERO; 4];
+
+        let calls = AtomicU32::new(0);
+        let passed = retry_relay("test", &no_pause, || async {
+            if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                anyhow::bail!("503")
+            }
+            Ok(7)
+        })
+        .await
+        .unwrap();
+        assert_eq!((passed, calls.load(Ordering::SeqCst)), (7, 3), "a transient failure is asked again");
+
+        let calls = AtomicU32::new(0);
+        let refused = retry_relay("test", &no_pause, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(anyhow::Error::new(TerminalRelay).context("409: project still exists"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a refusal is not asked again");
+        assert!(format!("{refused:#}").contains("409: project still exists"));
+
+        let calls = AtomicU32::new(0);
+        let failed = retry_relay("test", &no_pause, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(anyhow::anyhow!("connection refused"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "one attempt, then one per pause");
+        assert!(!TerminalRelay::is_terminal(&failed));
+    }
+
+    /// The cleanup relay carries the event's block, and the coordinator's 409
+    /// comes back as a refusal with its reason; a 503 does not.
+    #[tokio::test]
+    async fn a_cleanup_relay_is_refused_by_a_409_and_retried_after_a_503() {
+        let cleanup = |base_url: String| async move {
+            ApiClient::new(base_url, "t".to_string())
+                .unwrap()
+                .create_project_storage_cleanup_task("alice.near/app", "p0000000000000001", 123)
+                .await
+        };
+        let refused = cleanup(coordinator_answering(409, "project alice.near/app still exists")).await.unwrap_err();
+        assert!(TerminalRelay::is_terminal(&refused));
+        assert!(format!("{refused:#}").contains("still exists"), "{refused:#}");
+        let unavailable = cleanup(coordinator_answering(503, "cannot confirm")).await.unwrap_err();
+        assert!(!TerminalRelay::is_terminal(&unavailable), "{unavailable:#}");
+        let created = cleanup(coordinator_answering(200, r#"{"task_id":5,"created":true}"#)).await.unwrap();
+        assert_eq!(created, Some(5));
+    }
+
+    /// A 200 whose body is not the coordinator's — a proxy's HTML page — is
+    /// retried, never taken as the coordinator's refusal.
+    #[tokio::test]
+    async fn a_cleanup_relay_answered_by_a_page_that_does_not_parse_is_retried() {
+        let proxy_page = ApiClient::new(coordinator_answering(200, "<html>upstream warming up</html>"), "t".to_string())
+            .unwrap()
+            .create_project_storage_cleanup_task("alice.near/app", "p0000000000000001", 123)
+            .await
+            .unwrap_err();
+        assert!(!TerminalRelay::is_terminal(&proxy_page), "{proxy_page:#}");
+        assert!(format!("{proxy_page:#}").contains("does not parse"), "{proxy_page:#}");
+    }
+
+    #[tokio::test]
+    async fn a_cache_invalidation_is_refused_by_a_4xx_only() {
+        let invalidate = |base_url: String| async move {
+            ApiClient::new(base_url, "t".to_string())
+                .unwrap()
+                .invalidate_project_uuid_cache(&["alice.near/app".to_string()])
+                .await
+        };
+        assert!(TerminalRelay::is_terminal(&invalidate(coordinator_answering(400, "bad")).await.unwrap_err()));
+        assert!(!TerminalRelay::is_terminal(&invalidate(coordinator_answering(500, "boom")).await.unwrap_err()));
+        assert!(!TerminalRelay::is_terminal(&invalidate("http://127.0.0.1:1".to_string()).await.unwrap_err()));
+        invalidate(coordinator_answering(200, "{}")).await.unwrap();
+    }
+
+    /// A coordinator that accepts the connection and never answers is given
+    /// up on after the relay timeout, and that failure is retried, not final.
+    #[tokio::test]
+    async fn a_hanging_coordinator_is_abandoned_after_the_relay_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(2).collect();
+            std::thread::sleep(Duration::from_secs(10));
+            drop(held);
+        });
+        let client = ApiClient::new(base_url, "t".to_string())
+            .unwrap()
+            .with_relay_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let cleanup = client
+            .create_project_storage_cleanup_task("alice.near/app", "p0000000000000001", 123)
+            .await
+            .unwrap_err();
+        let invalidate = client.invalidate_project_uuid_cache(&["alice.near/app".to_string()]).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert!(!TerminalRelay::is_terminal(&cleanup), "{cleanup:#}");
+        assert!(!TerminalRelay::is_terminal(&invalidate), "{invalidate:#}");
+    }
+
+    /// A coordinator that refuses connections is asked for about a hundred
+    /// seconds; one that hangs every attempt holds the scan three minutes at
+    /// most.
+    #[test]
+    fn a_relay_is_retried_for_about_a_hundred_seconds() {
+        let pauses: Duration = RELAY_RETRY_DELAYS.iter().sum();
+        assert!(pauses >= Duration::from_secs(90) && pauses <= Duration::from_secs(100), "{pauses:?}");
+        let worst = RELAY_ATTEMPT_TIMEOUT * (RELAY_RETRY_DELAYS.len() as u32 + 1) + pauses;
+        assert!(worst <= Duration::from_secs(180), "{worst:?}");
     }
 }

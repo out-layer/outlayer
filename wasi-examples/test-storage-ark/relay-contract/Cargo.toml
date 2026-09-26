@@ -1,0 +1,27 @@
+[package]
+name = "outlayer-test-relay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A testnet fixture: relays request_execution to OutLayer so the run's predecessor is this contract and its signer is the caller"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Its own workspace: never a member of anything above it.
+[workspace]
+
+[dependencies]
+near-sdk = "=5.9.0"
+
+[dev-dependencies]
+near-sdk = { version = "=5.9.0", features = ["unit-testing"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true

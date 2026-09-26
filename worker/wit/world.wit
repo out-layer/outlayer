@@ -99,7 +99,8 @@ world rpc-host {
     import api;
 }
 
-// Combined world with RPC, storage, payment, VRF, wallet and signing keys
+// Combined world with RPC, storage, payment, VRF, wallet, signing keys and
+// encryption keys
 world outlayer-host {
     import api;
     import near:storage/api@0.1.0;
@@ -107,4 +108,5 @@ world outlayer-host {
     import near:vrf/api@0.1.0;
     import outlayer:wallet/api@0.1.0;
     import outlayer:signing-keys/api@0.1.0;
+    import outlayer:encryption-keys/api@0.1.0;
 }

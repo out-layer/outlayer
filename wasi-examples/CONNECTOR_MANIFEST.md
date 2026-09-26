@@ -58,9 +58,15 @@ and exactly the ones priced on chain — see the next section.
 | `operations` | no | Documentation, and a cross-check against the price list. |
 | `limits` | **yes** | Caps this connector declares about itself. Unioned with the coordinator's own rules — every applicable one must pass — so a declaration can only ever tighten. |
 | `author_secrets` | **yes** | The author's own credential, for any project: the row `owner` stored under the accessor `Project(<this project id>)` and `profile`, decrypted into the environment on every run next to the caller's. `owner` defaults to the publishing account. The row's access condition is judged against the real caller, so it is who may run the project — `AllowAll` for everyone, a whitelist or DAO role for a circle. A name on both sides, or a profile nobody stored, refuses the run; a name the caller's row carries and the author never stored is added to the environment as the caller's — store every name your code reads, so no caller can supply it. A run with no project (a `Repo` source executed directly) cannot hold one. See `WASI_TUTORIAL.md` §3c and `docs/CONNECTORS.md` §4.1. |
-| `signing_keys` | **yes** | ed25519 keys the module signs with, by `path`. The keystore derives each for the run, bound to the caller and to the project or the exact code; the module reaches them only through the `outlayer:signing-keys` host functions. Any project may declare them. See `signing_keys` below. |
+| `signing_keys` | **yes** | ed25519 or secp256k1 keys the module signs with, by `path`. The keystore derives each for the run, bound to the caller and to the project or the exact code; the module reaches them only through the `outlayer:signing-keys` host functions. Any project may declare them. See `signing_keys` below. |
+| `encryption_keys` | **yes** | Symmetric keys the module seals data with, by `path`. Derived like signing keys — the same `bind`, `caller` and `vault` rules — but a separate namespace with its own limit; the module reaches them only through the `outlayer:encryption-keys` host functions. Any project may declare them. See `encryption_keys` below. |
+| `storage_account` | **yes** | Whose cell of the project's per-account storage the run reads and writes: `signer` (default) or `predecessor`. Any project may declare it. See `storage_account` below. |
 | `display` | no | For the dashboard. |
 | `describe` | no | What each operation does and takes, for the developer page (`app.outlayer.ai/connectors/<id>`) — see the next section. |
+
+Any other top-level member — `network`, read as `capabilities.network`, aside —
+refuses the run, and the refusal names the member and the ones there are: a
+misspelled `storage_account` must not quietly mean `signer`.
 
 ### `describe`: the operations, for a reader
 
@@ -150,7 +156,7 @@ manifest at build time; `connectors/connector-probe/build.sh` shows how.
 "signing_keys": [
   {"path": "records", "type": "ed25519"},
   {"path": "votes", "type": "ed25519", "caller": "predecessor"},
-  {"path": "payouts", "type": "ed25519", "vault": "vault.alice.near"}
+  {"path": "payouts", "type": "secp256k1", "vault": "vault.alice.near"}
 ]
 ```
 
@@ -162,19 +168,41 @@ and calls the `outlayer:signing-keys` host interface
 
 | Function | Answers |
 |---|---|
-| `public-key(path: string, vault: option<string>) -> result<list<u8>, string>` | the 32-byte ed25519 public key |
-| `sign(path: string, vault: option<string>, message: list<u8>) -> result<list<u8>, string>` | a 64-byte RFC 8032 signature over the raw message bytes — no prehash, no prefix. At most 65536 bytes of message; sign a digest to cover more |
+| `public-key(path: string, vault: option<string>) -> result<list<u8>, string>` | the key's public key, by type (below) |
+| `sign(path: string, vault: option<string>, message: list<u8>) -> result<list<u8>, string>` | a signature, by type (below) |
+| `sign-nep413(path: string, vault: option<string>, message: string, recipient: string, nonce: list<u8>, callback-url: option<string>) -> result<nep413-signature, string>` | a NEP-413 (NEAR `signMessage`) signature by an ed25519 key: `nep413-signature {account-id, public-key, signature}` |
+
+| `type` | `public-key` | `sign` |
+|---|---|---|
+| `ed25519` | 32 bytes | RFC 8032 over the raw message bytes — no prehash, no prefix; at most 65536 bytes of message (sign a digest to cover more); 64 bytes out |
+| `secp256k1` | 64 bytes `x ‖ y`: the uncompressed SEC1 point without its `0x04` prefix, as NEAR's `secp256k1:` public keys carry it | `message` must be exactly 32 bytes, a prehash, signed as it is — no further hashing; any other length is an `err`. ECDSA with an RFC 6979 nonce, so one key and one prehash give one signature. 65 bytes out, `r ‖ s ‖ v`: `r` and `s` big-endian, `s` in the low half of the group order, `v` the recovery id, 0 or 1 — NEAR's secp256k1 signature and the input `ecrecover` takes. EVM wants `v + 27` |
+
+A `secp256k1` key's EVM address is the last 20 bytes of keccak256 of its 64-byte
+public key.
+
+`sign-nep413` builds the signed bytes itself: `sha256(borsh(2^31 + 413 as u32)
+‖ borsh(payload))`, the payload `{message: string, nonce: [u8; 32], recipient:
+string, callback_url: option<string>}` in that order, and signs the 32-byte hash
+with ed25519. It answers in the shape a NEAR wallet's `signMessage` does:
+`account-id` is the lowercase hex of the 32-byte public key (the key's NEAR
+implicit account, 64 characters), `public-key` is `ed25519:` and the base58 of
+those 32 bytes, `signature` is the 64-byte signature in standard base64 with
+padding. Anything that verifies a wallet's NEP-413 signature verifies this one.
+It is an `err` for a key that is not ed25519, a `nonce` that is not exactly 32
+bytes, a `message` over 65536 bytes, a `recipient` or `callback-url` over 2048
+bytes.
 
 `vault` names the key's declared vault exactly: `none` for a key declared
 without one, `some("<vault>")` for a key declared with that vault. Any other
-combination, an undeclared `path`, and a message over the limit are an `err`
-carrying the reason, never a trap. A module that imports the interface and
-declares no key gets an `err` for every path.
+combination, an undeclared `path`, a key of a type the call does not serve, and
+a message the key's type does not take are an `err` carrying the reason, never a
+trap. A module that imports the interface and declares no key gets an `err` for
+every path.
 
 | Field | Allowed | Meaning |
 |---|---|---|
 | `path` | `[a-z0-9][a-z0-9_-]{0,31}`, unique in the list | The key's name and an input of its derivation. The same path gives the same key for as long as its binding holds; another path is another key. Renaming a path loses the key, any address made from its public key, and every signature checked against it. |
-| `type` | `ed25519` | The only type. |
+| `type` | `ed25519` \| `secp256k1` | The key's algorithm, and an input of its derivation (`signing-key:v1:{type}:{project\|wasm}:…`): one secret never serves two algorithms. A path is declared once whatever its type — the same path under the other type would be another key. |
 | `bind` | `project` (default) \| `wasm` | How the code must be run to get the key, and what the key belongs to besides the caller. There is no repository binding. |
 | `caller` | `signer` (default) \| `predecessor` | Which account of the run the key belongs to: the transaction's signer (the payment key's owner over HTTPS), or the account that called the contract. A segment of the derivation, so the two never derive one key. |
 | `vault` | a NEAR account id | `project` keys only: derive from that vault's master instead of the default one. |
@@ -268,25 +296,41 @@ missing, unreadable, not the owner's, unfunded or not loadable refuses the run;
 the default master is never used in its place. A `wasm` key cannot name a
 vault: code has no owner to own one.
 
-**NEP-413 and the implicit account.** `sign` takes raw bytes, so a module can
-produce a NEP-413 (NEAR `signMessage`) signature: it signs
-`sha256(borsh(2^31 + 413 as u32 LE) ++ borsh(payload))`, 32 bytes. The key's
-public key, in lowercase hex, is a NEAR implicit account, so the signature
-verifies against that account with no registration. The copyable code and a
-Python verifier are in [`signing-key-probe`](signing-key-probe/README.md)
+**NEP-413 and the implicit account.** An ed25519 key's public key, in
+lowercase hex, is a NEAR implicit account, so a `sign-nep413` signature verifies
+against that account with no registration. A verifier that also looks the key
+up among the account's access keys over RPC finds it only once the implicit
+account has been funded; checking `account-id == hex(public key)` holds
+regardless. The same signature built in the guest from `sign`, and a Python
+verifier, are in [`signing-key-probe`](signing-key-probe/README.md)
 (`sign_nep413`).
 
-That also makes the key a wallet nobody governs: it can sign NEAR transactions
-for its implicit account, and Solana ones for the same public key. Funds sent
-there are controlled only by the code, outside every wallet policy. Do not hold
-money on a signing key. EVM is not supported: it needs secp256k1.
+That also makes every key a wallet nobody governs: an ed25519 key can sign NEAR
+transactions for its implicit account, and Solana ones for the same public key;
+a secp256k1 key's public key is an EVM address, and its signatures are what EVM
+transactions carry. Funds sent there are controlled only by the code, outside
+every wallet policy. Do not hold money on a signing key.
 
 **Never sign caller-supplied bytes or digests verbatim.** For the same reason:
 a signature over bytes the caller chose is a signature over whatever those bytes
-are — a transaction that empties the implicit account, an authorization, a
-message the account never meant. Sign only messages the module composes itself,
-from fields it has parsed and checked, under a fixed prefix or structure of its
-own; an input that asks for a signature over raw bytes is refused.
+are — a transaction that empties the account, an authorization, a message the
+account never meant. A secp256k1 key signs a 32-byte digest as it is, so a
+caller-chosen digest is the hash of any EVM transaction, EIP-712 permit or
+`personal_sign` message the caller likes. Sign only messages the module composes
+itself, from fields it has parsed and checked, under a fixed prefix or structure
+of its own, and compute the digest in the module from those bytes; an input that
+asks for a signature over raw bytes or a digest is refused. The same holds for
+`sign-nep413`: its tag keeps the bytes from being a transaction, but a
+caller-chosen `message` and `recipient` is a login, as the key's account, to
+whatever site the caller names.
+
+**Proving a key is the project's.** Every run carries a TEE attestation that
+binds its output to the build that ran, the project and the caller. A module
+that returns its `public-key` in its output — with, if the verifier wants
+freshness, a signature over a verifier-chosen nonce — lets anyone check once,
+from that run's attestation, that the key was derived in the TEE for this
+project and caller; from then on a signature by that key is the project's. The
+recipe: [app.outlayer.ai/docs/signing-keys#prove-key](https://app.outlayer.ai/docs/signing-keys#prove-key).
 
 **Where the keys live.** The keystore derives them in the same request that
 decrypts the run's secrets and hands them to the worker for that one run. They
@@ -297,8 +341,9 @@ are dropped with it. The master never leaves the keystore.
 
 * a WASI P1 module that declares keys — only a P2 component imports host
   interfaces;
-* more than 3 keys, a `path` of the wrong shape or declared twice, an unknown
-  field, a `type`, `bind` or `caller` outside the lists above;
+* more than 3 keys, a `path` of the wrong shape or declared twice (under any
+  type), an unknown field, a `type`, `bind` or `caller` outside the lists
+  above;
 * keys declared on a GitHub-sourced run, when the manifest reaches the worker;
 * a `project` key on a run with no project; a `wasm` key on a run through a
   project;
@@ -311,7 +356,160 @@ are dropped with it. The master never leaves the keystore.
   check above;
 * a run with no caller account — the worker's placeholder for a missing account
   is refused by name;
+* a `secp256k1` key whose derived secret scalar is zero or not below the group
+  order (probability about 2^-128);
 * a worker or keystore without signing-key support.
+
+### `encryption_keys`: keys the module seals data with
+
+```jsonc
+"encryption_keys": [
+  {"path": "records"},
+  {"path": "inbox", "caller": "predecessor"},
+  {"path": "vault-data", "vault": "vault.alice.near"}
+]
+```
+
+Each entry is a 256-bit symmetric key the module encrypts, decrypts and
+authenticates with, so that what it seals opens again only in a run that holds
+the same key — the same project (or the same exact build), the same caller and
+the same path. The keystore derives it inside the TEE exactly as it
+derives a signing key; the module never holds it. It names the key by `path`
+and calls the `outlayer:encryption-keys` host interface
+(`worker/wit/deps/encryption-keys.wit`):
+
+| Function | Answers |
+|---|---|
+| `encrypt(path: string, vault: option<string>, plaintext: list<u8>, aad: list<u8>) -> result<list<u8>, string>` | `plaintext` sealed under the key, bound to `aad` |
+| `decrypt(path: string, vault: option<string>, ciphertext: list<u8>, aad: list<u8>) -> result<list<u8>, string>` | the plaintext of what `encrypt` sealed under the same `path`, `vault` and `aad` |
+| `mac(path: string, vault: option<string>, data: list<u8>) -> result<list<u8>, string>` | HMAC-SHA256 of `data`, 32 bytes, under a subkey derived from the key for this purpose alone |
+
+**An encryption key has no `type`.** It is 32 bytes, and which algorithm uses
+them is the platform's choice. A declaration that names a `type` is refused as
+an unknown field.
+
+**The ciphertext format.** `encrypt` answers `0x01 ‖ nonce (24 bytes) ‖
+ciphertext ‖ tag (16 bytes)` — 41 bytes longer than the plaintext. The first
+byte is the format marker: it names the ciphertext's format, not a key version.
+Format `0x01` is XChaCha20-Poly1305 with a fresh random 24-byte nonce from the
+host's CSPRNG, so two calls on the same input never return the same bytes. A
+later format would get another marker over the same key. Symmetric 256-bit keys
+are considered adequate against quantum attacks.
+
+**`decrypt` says nothing about why.** Any failure to open — an unknown format
+marker, a truncated or tampered ciphertext, another key, another `aad` — is
+exactly `err("decryption failed")`.
+
+**`mac` is deterministic.** The same `data` under the same key is the same
+32-byte tag in every run that holds the key. Its subkey is never the key
+`encrypt` uses, so a tag reveals nothing about a ciphertext and no ciphertext
+about a tag.
+
+**Limits.** At most 262144 bytes (256 KiB) of plaintext, of `aad` and of `mac`
+data; a ciphertext may be longer by the 41 bytes of overhead, so everything
+`encrypt` returns opens again.
+
+`vault` names the key's declared vault exactly: `none` for a key declared
+without one, `some("<vault>")` for a key declared with that vault. Any other
+combination, an undeclared `path`, and an input over the limit are an `err`
+carrying the reason, never a trap. A module that imports the interface and
+declares no key gets an `err` for every path.
+
+| Field | Allowed | Meaning |
+|---|---|---|
+| `path` | `[a-z0-9][a-z0-9_-]{0,31}`, unique in the list | The key's name and an input of its derivation. The same path gives the same key for as long as its binding holds. **Renaming a path loses the key, and with it everything the key sealed.** |
+| `bind` | `project` (default) \| `wasm` | As for a signing key. |
+| `caller` | `signer` (default) \| `predecessor` | As for a signing key. |
+| `vault` | a NEAR account id | `project` keys only, as for a signing key. |
+
+At most 3 encryption keys, counted apart from the signing keys: a manifest may
+declare 3 of each. A key with an unknown field — `type` included — is refused,
+not read with the field dropped; a `bind` or `caller` value outside its list is
+refused the same way.
+
+**The rules are the signing keys', key for key.** `bind`, `caller`, `vault`,
+what is issued to which run, who checks what, and the refusal of every
+GitHub-sourced run are exactly as in `signing_keys` above; one encryption key
+that breaks a rule refuses the whole run before it starts, as a signing key
+does. The keystore derives
+
+```text
+bind "project": HMAC-SHA256(master, "encryption-key:v1:project:{project_uuid}:{caller}:{account_id}:{path}")
+bind "wasm":    HMAC-SHA256(master, "encryption-key:v1:wasm:{wasm_sha256}:{caller}:{account_id}:{path}")
+```
+
+where `{caller}` is `signer` or `predecessor` and `{account_id}` is that
+account. So a `project` key survives code upgrades — every version of the
+project opens what an earlier version sealed — and a `wasm` key does not: a new
+build cannot open what the old one sealed.
+
+**A namespace of its own.** An encryption key and a signing key declared at the
+same `path` are two unrelated secrets, derived under two roots.
+
+**Decide who may read what the module opens.** With `caller: "signer"`, any
+contract the signer transacts with can start a run under the signer's key with
+input of its own choosing — so `decrypt` must never hand a plaintext back to
+whoever asks. An on-chain answer is public besides. A module decides from what
+it has checked who may read what it opens.
+
+**Bind a ciphertext to its record.** A ciphertext opens under an `aad` only if
+it was sealed under the same `aad`. Pass the name of the record the ciphertext
+is stored under as `aad`: a ciphertext copied onto another record by whoever
+holds the storage then fails to decrypt instead of being read as that record's
+data.
+
+**Hide what the records are called.** Storage keys are visible to the
+storage's operator. Store a record under `mac(path, vault, name)` (hex or base64
+of it) instead of `name`: the same name always maps to the same key, and the
+operator cannot tell which name it is.
+
+**Sealed storage.** Together with the raw storage functions (`set-raw`,
+`get-raw`, `set-if-absent-raw`, `set-if-equals-raw` in `near:storage`, which
+store bytes as given in the run's storage cell — see `storage_account` — and
+never call the keystore), that is the whole recipe: the record's storage key is `mac(name)`,
+its value is `encrypt(value, aad = name)`, and it is written and read with the
+raw functions. A compare-and-swap (`set-if-equals-raw`) compares the stored
+ciphertext bytes. The Rust SDK provides helpers for this pattern.
+
+**Pair the key's `caller` with `storage_account`.** A module that seals records
+under a `caller: "predecessor"` key and stores them declares
+`storage_account: "predecessor"` as well, so the key and the cell belong to the
+same account. With the default `signer` cell, records sealed for a relaying
+contract land in the cell of whichever account signed each transaction, and a
+call signed by another account finds none of them. The Hyperliquid and
+Polymarket connectors declare `predecessor` for both.
+
+**Where the keys live.** Derived in the same request that decrypts the run's
+secrets and any signing keys, handed to the worker for that one run, held in
+that run's memory only — never in the environment, stdin or a log — and dropped
+with it.
+
+**Refused before the code runs:** everything listed for signing keys above
+applies to encryption keys as well, except the `type` and `secp256k1` rows —
+an encryption key has no `type`, and a `type` member is itself refused as an
+unknown field. Every path is checked for shape and uniqueness within
+`encryption_keys` only.
+
+### `storage_account`: whose storage cell the run uses
+
+```jsonc
+"storage_account": "predecessor"
+```
+
+Every `near:storage` function outside the `@worker` ones (`set`/`get`, the
+conditional writes, the `-raw` functions, `list-keys`, `clear-all`) reads and
+writes one account's cell of the project. The worker fixes that account from
+the manifest and the job before the run starts; the guest never names an
+account, and no storage function takes one.
+
+| Value | The cell belongs to |
+|---|---|
+| `signer` (default) | on chain, the transaction's signer; over HTTPS, the payment key's owner; `anonymous` on a run that carries neither |
+| `predecessor` | on chain, the account that called the contract — a relaying contract, a DAO, a wallet contract, not the user who signed; over HTTPS, the payment key's owner. A run that carries no predecessor is refused before it executes, never served from the signer's cell or `anonymous` |
+
+Any other value — a different spelling, `null`, a number — makes the manifest
+unreadable, and the run is refused. The `@worker` storage (`set-worker`,
+`get-worker`) is the project's own and is not affected by this field.
 
 ## How a request names its operation
 
@@ -360,8 +558,7 @@ before the request reaches us. It does not change what we price.
 their own price would set it to zero and burn our workers; and the chain
 enforces it — `request_execution` refuses a call that does not attach the
 operation's exact price — so a second copy baked into a published wasm could
-only ever disagree with the one that decides. A manifest may state a
-*recommended* price; the on-chain one is what is charged.
+only ever disagree with the one that decides. A manifest carries no price.
 
 **The author's share** lives there too, per operation, next to the price it
 splits, along with the account it is paid to. Same reason: it is what the
@@ -374,9 +571,15 @@ never from something the code says about itself.
 
 ## Fail-closed
 
-A connector whose manifest cannot be read — missing, not valid JSON, larger than
-64 KB, or present but declaring no `network` — gets an **empty allowlist**: no
-outbound network at all.
+A connector whose manifest is missing, or present but declaring no `network`,
+gets an **empty allowlist**: no outbound network at all.
+
+A manifest that is present and cannot be read — larger than 64 KB, not valid
+JSON, or not a manifest (an unknown top-level member, a `storage_account`
+other than `signer` or `predecessor`, a key declaration that breaks its rules) — refuses the run
+before it executes: a declaration nobody can read never becomes no
+declaration. So does `storage_account: "predecessor"` on a run that carries no
+predecessor.
 
 That is deliberate. The other choice is a connector with a broken manifest
 quietly keeping the run of the internet from inside a TEE that holds keys, and

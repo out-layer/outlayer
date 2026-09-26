@@ -76,8 +76,9 @@ impl SecretsNotFound {
     }
 }
 
-/// The keystore ANSWERED about a run's signing keys with the
-/// `signing_keys_refused` code: a declaration, a project or a vault it
+/// The keystore ANSWERED about a run's declared keys — signing keys,
+/// encryption keys, or both — with the `signing_keys_refused` code, the one
+/// code of a refused keyed request: a declaration, a project or a vault it
 /// judged and refused. A configuration the component's author or caller can
 /// act on, as opposed to a keystore that could not be reached or could not
 /// serve keys at all ([`SigningKeysUnserved`]).
@@ -86,7 +87,7 @@ pub struct SigningKeysRefused;
 
 impl std::fmt::Display for SigningKeysRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the keystore refused the declared signing keys")
+        write!(f, "the keystore refused the declared keys")
     }
 }
 
@@ -98,18 +99,18 @@ impl SigningKeysRefused {
     }
 }
 
-/// The keystore did not serve the declared signing keys, and it did not
-/// refuse them either: it predates signing keys — it could not read a request
+/// The keystore did not serve the declared keys, and it did not refuse them
+/// either: it predates the family asked for — it could not read a request
 /// naming only keys, answered a keyed request with its plain "not found", or
-/// answered without a `signing_keys` member — or the seeds it sent are not
-/// the set the manifest declares. Nothing the component's author or caller
+/// answered without the `signing_keys` or `encryption_keys` member asked for
+/// — or the keys it sent are not the set the manifest declares. Nothing the component's author or caller
 /// can fix: the run fails as it does when the keystore cannot be reached.
 #[derive(Debug)]
 pub struct SigningKeysUnserved;
 
 impl std::fmt::Display for SigningKeysUnserved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the keystore did not serve the declared signing keys")
+        write!(f, "the keystore did not serve the declared keys")
     }
 }
 
@@ -121,18 +122,33 @@ impl SigningKeysUnserved {
     }
 }
 
-/// The `code` a keystore puts on a refusal of signing keys.
+/// The `code` a keystore puts on a refusal of a keyed request, whichever
+/// family of keys it concerns.
 const SIGNING_KEYS_REFUSED: &str = "signing_keys_refused";
 
-/// The signing keys a run asks for: the manifest's declarations and the job's
-/// project, if it runs one — present for a run through a project, absent for
-/// a direct run of a wasm URL — read off the job, never from the guest. The
-/// keystore reads the kind of run off the project alone; the accounts the
-/// keys belong to travel with the request as `user_account_id` and
-/// `predecessor_id`, as does the build.
+/// The declared keys a run asks for: the manifest's signing and encryption
+/// keys and the job's project, if it runs one — present for a run through a
+/// project, absent for a direct run of a wasm URL — read off the job, never
+/// from the guest. The keystore reads the kind of run off the project alone;
+/// the accounts the keys belong to travel with the request as
+/// `user_account_id` and `predecessor_id`, as does the build.
 pub struct KeysRequest<'a> {
     pub project_id: Option<&'a str>,
+    /// The signing keys; empty when the manifest declares none.
     pub keys: &'a [crate::signing_keys::ManifestKey],
+    /// The encryption keys; empty when the manifest declares none.
+    pub encryption_keys: &'a [crate::encryption_keys::EncryptionManifestKey],
+}
+
+impl KeysRequest<'_> {
+    /// How messages name what this request asks for.
+    fn families(&self) -> &'static str {
+        match (self.keys.is_empty(), self.encryption_keys.is_empty()) {
+            (false, true) => "signing keys",
+            (true, false) => "encryption keys",
+            _ => "signing and encryption keys",
+        }
+    }
 }
 
 /// What one run's decrypt brought back.
@@ -140,12 +156,12 @@ pub struct RunSecrets {
     /// The secrets; `None` when the row does not exist — the case a run
     /// continues past without secrets.
     pub secrets: Option<std::collections::HashMap<String, String>>,
-    /// The run's signing keys, when it asked for any.
-    pub keys: Option<crate::signing_keys::SigningKeys>,
+    /// The run's declared keys, when it asked for any.
+    pub keys: Option<crate::executor::RunKeys>,
 }
 
-/// A run's secrets request, carrying its signing keys when it declares any —
-/// see [`KeystoreClient::with_signing_keys`].
+/// A run's secrets request, carrying its declared keys when it declares any —
+/// see [`KeystoreClient::with_keys`].
 pub struct RunDecrypt<'a> {
     client: &'a KeystoreClient,
     keys: Option<&'a KeysRequest<'a>>,
@@ -1133,47 +1149,49 @@ impl KeystoreClient {
         self.decrypt_secrets(accessor, profile, owner, user_account_id, task_id, executed_wasm_sha256, predecessor_id).await
     }
 
-    /// Scope the next decrypt to a run that declares signing keys.
+    /// Scope the next decrypt to a run that declares signing or encryption
+    /// keys.
     ///
     /// With `keys`, the secrets request of the run carries them too, and the
     /// one answer brings both; without, the calls are exactly the plain
     /// secrets requests.
-    pub fn with_signing_keys<'a>(&'a self, keys: Option<&'a KeysRequest<'a>>) -> RunDecrypt<'a> {
+    pub fn with_keys<'a>(&'a self, keys: Option<&'a KeysRequest<'a>>) -> RunDecrypt<'a> {
         RunDecrypt { client: self, keys }
     }
 
-    /// The signing keys of a run that names no secret row: one `/decrypt`
+    /// The declared keys of a run that names no secret row: one `/decrypt`
     /// request carrying the keys alone, with both accounts of the run —
     /// `user_account_id` (the signer) and `predecessor_id` (the calling
     /// account), exactly as a secrets request carries them.
-    pub async fn derive_signing_keys(
+    pub async fn derive_keys(
         &self,
         user_account_id: &str,
         task_id: Option<&str>,
         executed_wasm_sha256: &str,
         predecessor_id: Option<&str>,
         keys: &KeysRequest<'_>,
-    ) -> Result<crate::signing_keys::SigningKeys> {
+    ) -> Result<crate::executor::RunKeys> {
         let run = self
             .decrypt_keyed(None, user_account_id, task_id, Some(executed_wasm_sha256), predecessor_id, keys)
             .await?;
-        run.keys.ok_or_else(|| anyhow::anyhow!("the keystore's answer carries no signing keys"))
+        run.keys.ok_or_else(|| anyhow::anyhow!("the keystore's answer carries no keys"))
     }
 
-    /// One `/decrypt` request naming the run's signing keys and, when the run
-    /// has one, its secret row.
+    /// One `/decrypt` request naming the run's declared keys — signing,
+    /// encryption, or both — and, when the run has one, its secret row.
     ///
     /// The keystore judges the two independently. A refusal of the keys is
-    /// typed [`SigningKeysRefused`]; a keystore that predates signing keys, or
-    /// serves other seeds than the declared ones, is [`SigningKeysUnserved`];
+    /// typed [`SigningKeysRefused`]; a keystore that predates a family asked
+    /// for, or serves other keys than the declared ones, is
+    /// [`SigningKeysUnserved`];
     /// a refusal of the row reads exactly as it does for a secrets-only
     /// request. A row that does not exist comes back as `secrets: None` beside
     /// the keys — the case a secrets-only request answers with
     /// [`SecretsNotFound`] and the run continues past.
     ///
-    /// The response body holds the seeds in hex and the plaintext secrets; it
-    /// is wiped once read, and the seeds live on only inside the returned
-    /// [`crate::signing_keys::SigningKeys`].
+    /// The response body holds the keys in hex and the plaintext secrets; it
+    /// is wiped once read, and the keys live on only inside the returned
+    /// [`crate::executor::RunKeys`].
     async fn decrypt_keyed(
         &self,
         row: Option<(&SecretAccessor, &str, &str)>,
@@ -1199,7 +1217,10 @@ impl KeystoreClient {
             predecessor_id: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             project_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
             signing_keys: &'a [crate::signing_keys::ManifestKey],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            encryption_keys: &'a [crate::encryption_keys::EncryptionManifestKey],
         }
         #[derive(Deserialize)]
         struct KeyedResponse {
@@ -1207,6 +1228,8 @@ impl KeystoreClient {
             secrets: Option<SecretsPart>,
             #[serde(default)]
             signing_keys: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>,
+            #[serde(default)]
+            encryption_keys: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>,
         }
         #[derive(Deserialize)]
         #[serde(tag = "status", rename_all = "snake_case")]
@@ -1225,19 +1248,22 @@ impl KeystoreClient {
             predecessor_id,
             project_id: keys.project_id,
             signing_keys: keys.keys,
+            encryption_keys: keys.encryption_keys,
         };
+        let families = keys.families();
         tracing::info!(
             project_id = ?keys.project_id,
             predecessor = ?predecessor_id,
             caller = %user_account_id,
             signing_keys = ?keys.keys.iter().map(|k| k.path.as_str()).collect::<Vec<_>>(),
+            encryption_keys = ?keys.encryption_keys.iter().map(|k| k.path.as_str()).collect::<Vec<_>>(),
             secret_row = row.is_some(),
             task_id = ?task_id,
-            "🔑 Sending decrypt request with signing keys to keystore"
+            "🔑 Sending decrypt request with declared keys to keystore"
         );
 
         let mut reply = self
-            .post_json("/decrypt", || Ok(request.clone()), "Decrypt with signing keys", None)
+            .post_json("/decrypt", || Ok(request.clone()), "Decrypt with declared keys", None)
             .await?;
 
         if !reply.status.is_success() {
@@ -1254,45 +1280,62 @@ impl KeystoreClient {
                     .chars()
                     .take(500)
                     .collect();
-                tracing::error!(status = %status, error_body = %said, "🔒 Keystore refused the signing keys");
+                tracing::error!(status = %status, error_body = %said, "🔒 Keystore refused the declared keys");
                 return Err(anyhow::Error::new(SigningKeysRefused)
-                    .context(format!("The keystore refused the signing keys this component declares ({status}): {said}")));
+                    .context(format!("The keystore refused the {families} this component declares ({status}): {said}")));
             }
             let Some((accessor, _, _)) = row else {
                 let said: String = text.chars().take(500).collect();
                 if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
                     return Err(anyhow::Error::new(SigningKeysUnserved).context(format!(
-                        "The keystore could not read a request naming only signing keys ({status}): it predates \
-                         signing keys. {said}"
+                        "The keystore could not read a request naming only {families} ({status}): it predates \
+                         {families}. {said}"
                     )));
                 }
-                anyhow::bail!("The keystore could not serve the signing keys this component declares ({status}): {said}");
+                anyhow::bail!("The keystore could not serve the {families} this component declares ({status}): {said}");
             };
             let error = self.secrets_error(status, &text, accessor);
             if SecretsNotFound::is_missing(&error) {
                 // A keystore that knows signing keys reports a missing row in
                 // its answer, beside the keys; one that answers "not found" as
                 // a refusal never read them.
-                return Err(anyhow::Error::new(SigningKeysUnserved).context(
-                    "The keystore answered a request carrying signing keys with a plain \"not found\": it \
-                     predates signing keys. The run was refused rather than started without them.",
-                ));
+                return Err(anyhow::Error::new(SigningKeysUnserved).context(format!(
+                    "The keystore answered a request carrying {families} with a plain \"not found\": it \
+                     predates {families}. The run was refused rather than started without them."
+                )));
             }
             return Err(error);
         }
 
         let parsed = serde_json::from_slice::<KeyedResponse>(&reply.body);
         reply.body.zeroize();
-        let parsed = parsed.context("Failed to parse the keystore's answer with signing keys")?;
-        let seeds = parsed.signing_keys.ok_or_else(|| {
-            anyhow::Error::new(SigningKeysUnserved).context(
-                "The keystore answered without the signing keys this component declares: it predates \
-                 signing keys. The run was refused rather than started without them.",
-            )
-        })?;
+        let parsed = parsed.context("Failed to parse the keystore's answer with declared keys")?;
+        // A family asked for must be answered under its own member; a family
+        // not asked for must not be answered at all.
+        let answered = |member: &str,
+                        declared_any: bool,
+                        got: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>|
+         -> Result<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>> {
+            match (declared_any, got) {
+                (true, Some(got)) => Ok(got),
+                (true, None) => Err(anyhow::Error::new(SigningKeysUnserved).context(format!(
+                    "The keystore answered without the {member} this component declares: it predates \
+                     {member}. The run was refused rather than started without them."
+                ))),
+                (false, got) => Ok(got.unwrap_or_default()),
+            }
+        };
+        let seeds = answered("signing keys", !keys.keys.is_empty(), parsed.signing_keys)?;
+        let encryption = answered("encryption keys", !keys.encryption_keys.is_empty(), parsed.encryption_keys)?;
         let signing_keys = crate::signing_keys::SigningKeys::from_keystore(keys.keys, seeds)
             .map_err(|m| anyhow::Error::new(SigningKeysUnserved).context(m))?;
-        tracing::debug!(keys = ?signing_keys, "Signing keys received");
+        let encryption_keys = crate::encryption_keys::EncryptionKeys::from_keystore(keys.encryption_keys, encryption)
+            .map_err(|m| anyhow::Error::new(SigningKeysUnserved).context(m))?;
+        let run_keys = crate::executor::RunKeys {
+            signing: (!keys.keys.is_empty()).then_some(signing_keys),
+            encryption: (!keys.encryption_keys.is_empty()).then_some(encryption_keys),
+        };
+        tracing::debug!(keys = ?run_keys, "Declared keys received");
 
         let secrets = match (row, parsed.secrets) {
             (None, None) => None,
@@ -1303,7 +1346,7 @@ impl KeystoreClient {
                 Some(Self::parse_plaintext_secrets(&plaintext_secrets)?)
             }
         };
-        Ok(RunSecrets { secrets, keys: Some(signing_keys) })
+        Ok(RunSecrets { secrets, keys: Some(run_keys) })
     }
 
     /// Encrypt data using keystore's derived key
@@ -2141,9 +2184,9 @@ mod signing_key_requests {
         let (url, sent) = keystore_answering(code, body);
         let client = KeystoreClient::new(vec![url], "t".to_string()).unwrap();
         let declared = declared();
-        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared };
+        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared, encryption_keys: &[] };
         let result = client
-            .with_signing_keys(with_keys.then_some(&request))
+            .with_keys(with_keys.then_some(&request))
             .decrypt_secrets_by_project("alice.near/app", "default", "alice.near", "bob.near", Some("data-1"), Some(H), Some("bob.near"))
             .await;
         let sent: serde_json::Value = serde_json::from_str(&sent.join().unwrap()).unwrap();
@@ -2159,8 +2202,11 @@ mod signing_key_requests {
         let (url, sent) = keystore_answering(code, body);
         let client = KeystoreClient::new(vec![url], "t".to_string()).unwrap();
         let declared = declared();
-        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared };
-        let result = client.derive_signing_keys("bob.near", Some("data-1"), H, predecessor, &request).await;
+        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared, encryption_keys: &[] };
+        let result = client
+            .derive_keys("bob.near", Some("data-1"), H, predecessor, &request)
+            .await
+            .map(|k| k.signing.expect("the signing keys asked for"));
         let sent: serde_json::Value = serde_json::from_str(&sent.join().unwrap()).unwrap();
         (result, sent)
     }
@@ -2196,7 +2242,9 @@ mod signing_key_requests {
         let (result, sent) = run_call(200, body, true).await;
         let run = result.expect("served");
         assert_eq!(run.secrets.unwrap()["API_KEY"], "x");
-        assert_eq!(run.keys.unwrap().paths().collect::<Vec<_>>(), vec!["records"]);
+        let keys = run.keys.unwrap();
+        assert_eq!(keys.signing.unwrap().paths().collect::<Vec<_>>(), vec!["records"]);
+        assert!(keys.encryption.is_none(), "no encryption keys were asked for");
         assert_eq!(
             sent,
             serde_json::json!({
@@ -2309,8 +2357,105 @@ mod signing_key_requests {
     async fn a_keystore_that_cannot_be_reached_is_not_a_refusal() {
         let client = KeystoreClient::new(vec!["http://127.0.0.1:1".into()], "t".to_string()).unwrap();
         let declared = declared();
-        let request = KeysRequest { project_id: None, keys: &declared };
-        let e = client.derive_signing_keys("bob.near", None, H, None, &request).await.err().expect("unreachable");
+        let request = KeysRequest { project_id: None, keys: &declared, encryption_keys: &[] };
+        let e = client.derive_keys("bob.near", None, H, None, &request).await.err().expect("unreachable");
         assert!(!SigningKeysRefused::is_refusal(&e) && !SigningKeysUnserved::is_unserved(&e), "{e:#}");
+    }
+
+    // ---- Encryption keys ----------------------------------------------------
+
+    const ENC: &str = "4324b148cb409d9a56e27a37c0cfbc4787481db4dec90cfcd2219a091c4a5d0a";
+
+    fn declared_encryption() -> Vec<crate::encryption_keys::EncryptionManifestKey> {
+        vec![crate::encryption_keys::EncryptionManifestKey {
+            path: "records".into(),
+            bind: KeyBinding::Project,
+            caller: CallerKind::Signer,
+            vault: None,
+        }]
+    }
+
+    /// A keys-only call naming the signing keys when `signing`, and the
+    /// encryption keys when `encryption`.
+    async fn families_call(
+        code: u16,
+        body: String,
+        signing: bool,
+        encryption: bool,
+    ) -> (Result<crate::executor::RunKeys>, serde_json::Value) {
+        let (url, sent) = keystore_answering(code, body);
+        let client = KeystoreClient::new(vec![url], "t".to_string()).unwrap();
+        let sig = if signing { declared() } else { vec![] };
+        let enc = if encryption { declared_encryption() } else { vec![] };
+        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &sig, encryption_keys: &enc };
+        let result = client.derive_keys("bob.near", Some("data-1"), H, None, &request).await;
+        let sent: serde_json::Value = serde_json::from_str(&sent.join().unwrap()).unwrap();
+        (result, sent)
+    }
+
+    /// Encryption keys alone: the request names them and no `signing_keys`
+    /// member, and the answer is read from `encryption_keys`.
+    #[tokio::test]
+    async fn encryption_keys_alone_are_requested_and_received() {
+        let (result, sent) = families_call(200, format!(r#"{{"encryption_keys":{{"records":"{ENC}"}}}}"#), false, true).await;
+        let keys = result.expect("served");
+        assert!(keys.signing.is_none());
+        assert_eq!(keys.encryption.unwrap().paths().collect::<Vec<_>>(), vec!["records"]);
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "user_account_id": "bob.near", "task_id": "data-1", "executed_wasm_sha256": H,
+                "predecessor_id": null, "project_id": "alice.near/app",
+                "encryption_keys": [{ "path": "records", "bind": "project", "caller": "signer" }],
+            })
+        );
+    }
+
+    /// Both families in one request, one path in both; each answered under
+    /// its own member.
+    #[tokio::test]
+    async fn both_families_travel_in_one_request() {
+        let body = format!(r#"{{{},"encryption_keys":{{"records":"{ENC}"}}}}"#, keys_ok());
+        let (result, sent) = families_call(200, body, true, true).await;
+        let keys = result.expect("served");
+        assert_eq!(keys.signing.unwrap().paths().collect::<Vec<_>>(), vec!["records"]);
+        assert_eq!(keys.encryption.unwrap().paths().collect::<Vec<_>>(), vec!["records"]);
+        assert_eq!(sent["signing_keys"].as_array().unwrap().len(), 1);
+        assert_eq!(sent["encryption_keys"].as_array().unwrap().len(), 1);
+    }
+
+    /// A family asked for and not answered, answered with other paths, or
+    /// answered when not asked for: unserved — never a run short of a key.
+    #[tokio::test]
+    async fn an_encryption_answer_other_than_the_declared_set_is_unserved() {
+        let unserved = |e: &anyhow::Error| SigningKeysUnserved::is_unserved(e) && !SigningKeysRefused::is_refusal(e);
+        // An old keystore: signing keys served, the encryption member missing.
+        let e = families_call(200, format!("{{{}}}", keys_ok()), true, true).await.0.err().expect("unserved");
+        assert!(unserved(&e) && format!("{e:#}").contains("predates encryption keys"), "{e:#}");
+        // Another path, an extra path, a short key.
+        for body in [
+            format!(r#"{{"encryption_keys":{{"other":"{ENC}"}}}}"#),
+            format!(r#"{{"encryption_keys":{{"records":"{ENC}","extra":"{ENC}"}}}}"#),
+            r#"{"encryption_keys":{"records":"abcd"}}"#.to_string(),
+        ] {
+            let e = families_call(200, body.clone(), false, true).await.0.err().expect("unserved");
+            assert!(unserved(&e), "{body}: {e:#}");
+        }
+        // Encryption keys nobody asked for.
+        let body = format!(r#"{{{},"encryption_keys":{{"records":"{ENC}"}}}}"#, keys_ok());
+        let e = families_call(200, body, true, false).await.0.err().expect("unserved");
+        assert!(unserved(&e), "{e:#}");
+        // An old keystore that cannot read a keys-only request.
+        let e = families_call(422, "missing field `accessor`".into(), false, true).await.0.err().expect("unserved");
+        assert!(unserved(&e) && format!("{e:#}").contains("predates encryption keys"), "{e:#}");
+    }
+
+    /// The one refusal code covers both families.
+    #[tokio::test]
+    async fn an_encryption_key_refusal_is_the_same_typed_refusal() {
+        let refusal = r#"{"error":"Encryption keys refused: key \"records\" is bound to the project","code":"signing_keys_refused"}"#;
+        let e = families_call(400, refusal.into(), false, true).await.0.err().expect("refused");
+        assert!(SigningKeysRefused::is_refusal(&e) && !SigningKeysUnserved::is_unserved(&e), "{e:#}");
+        assert!(format!("{e:#}").contains("refused the encryption keys") && format!("{e:#}").contains("bound to the project"), "{e:#}");
     }
 }

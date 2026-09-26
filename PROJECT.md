@@ -318,7 +318,7 @@ pub struct VersionInfo {
 | `set_active_version(project_name, version_key)` | Switch active version |
 | `remove_version(project_name, version_key)` | Remove version (cannot remove active) |
 | `delete_project(project_name)` | Delete project and all versions |
-| `transfer_project(project_name, new_owner)` | Transfer ownership |
+| `transfer_project(project_name, new_owner)` | Transfer ownership; emits `system_event` `ProjectTransferred` |
 
 ### View Methods
 
@@ -595,11 +595,12 @@ cargo build --target wasm32-wasip2 --release
 | POST | `/storage/clear-all`, `clear-version`, `clear-project` | Storage cleanup |
 | POST | `/storage/get-public` | Read public storage |
 | GET | `/projects/uuid` | Resolve project UUID |
-| DELETE | `/projects/cache` | Invalidate project cache |
+| DELETE | `/projects/cache` | Invalidate one project's cached name → uuid |
+| POST | `/projects/cache/invalidate` | Invalidate cached name → uuid for `{project_ids: [..]}` (transfer relay: old and new name) |
 | POST | `/topup/create` | Create top-up task |
 | POST | `/topup/complete` | Complete top-up |
 | POST | `/payment-keys/delete-task/create` | Create delete key task |
-| POST | `/projects/cleanup-task/create` | Create storage cleanup task |
+| POST | `/projects/cleanup-task/create` | Create storage cleanup task; drops the deleted name's cached uuid |
 | GET | `/system-callbacks/poll` | Poll system callback tasks |
 | POST | `/https-calls/complete` | Complete HTTPS call |
 | POST | `/payment-keys/delete` | Delete payment key data |

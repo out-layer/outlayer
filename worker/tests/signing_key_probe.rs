@@ -1,11 +1,13 @@
 //! `wasi-examples/signing-key-probe` through the executor, with injected keys.
 //!
 //! What a guest sees of the `outlayer:signing-keys` host interface: every
-//! operation, the pinned public key and signatures (computed independently,
-//! with PyNaCl), an independent ed25519 and NEP-413 verification, every attack
-//! answered as an `err` inside a run that succeeds, every vault mismatch, no
-//! seed byte anywhere the guest can look — and a module that declares keys and
-//! is handed none refused before it runs.
+//! operation, the pinned public keys and signatures (computed independently —
+//! ed25519 with PyNaCl, secp256k1 with `coincurve`), an independent ed25519,
+//! secp256k1 and NEP-413 verification, the host's `sign-nep413` byte for byte
+//! the guest-built signature, every attack answered as an `err` inside a run
+//! that succeeds, every vault mismatch, no seed byte anywhere the guest can
+//! look — and a module that declares keys and is handed none refused before it
+//! runs.
 //!
 //! Run with: cargo test --test signing_key_probe
 //! The probe must be built first: wasi-examples/signing-key-probe/build.sh
@@ -39,6 +41,20 @@ const NEP413_SIGNATURE: &str = "BwSUP+RPUQJ6gV30nIFJsy3ywCs4VvRtd9QV6quPxK5MVrWn
 /// The same, with callback URL "https://example.com/cb".
 const NEP413_SIGNATURE_CB: &str = "pYY73u/dA6smLFR3cTEG/Bdi1JkiXVT+KK+oQvJBa4+SvYtvq/k1xHVBp0EDngBSM0/SLhM09adQ3r4HQXMCCg==";
 
+/// The keystore's pinned secp256k1 seeds (`crypto.rs`,
+/// `secp256k1_signing_key_pinned_vectors`), their public keys `x ‖ y` and EVM
+/// addresses, computed with Python (`coincurve`, `pycryptodome` keccak256).
+const SECP_SEED_A: &str = "772890cc14851d53236ca8223391e336f711aedaaca1ee1922e9ad6452661b90";
+const SECP_PUB_A: &str = "ed426f3507c4c5d16edaa292cc2a60e3bdb4a92724613c4d242c97f51ff47d677ca9bd17bd777ecddbe30fc984d124f0b189ebac9c40e322da396b5fd217c5e3";
+const SECP_EVM_A: &str = "0x20d9ed83e1e77fe943ff7627cb55b87a94675832";
+const SECP_SEED_B: &str = "eca5d0f77b791ab4165da888811f52130b61a594f1efba0015c473da48efee50";
+const SECP_PUB_B: &str = "ad0a99c4c37c0f69cce104532f8fa3b59534d5c259891c37e1e8e4180e85b458f065d5678b11500966b320b7d1f0ce607c84d6fe0962ce3bcb5dc874bea81783";
+const SECP_EVM_B: &str = "0x8914e846ae2737631d8b242daf4f2cd25929de1e";
+/// keccak256("record #1"), and SECP_SEED_A's `r ‖ s ‖ v` over it (RFC 6979,
+/// libsecp256k1 through `coincurve`).
+const KECCAK_RECORD_1: &str = "7e212fe9e9a2b5d41a353b8f7399c8d48fb7e83bee75d2233a856cefad932852";
+const SECP_SIG_A_RECORD_1: &str = "b5f5dc30365e5da9c6c2135a088d7974ac3293d9a0ea64955df0ffd117a927cb56bbf86061befe7d1e1e64342360a6ae1d401c70e4d0b0d7c384e05bdd7b8c4601";
+
 fn probe(variant: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -71,6 +87,23 @@ fn project_keys(wasm: &[u8]) -> SigningKeys {
     keys_for(wasm, &[("alpha", SEED_A), ("beta", SEED_B)])
 }
 
+/// The keys of the `project-secp` build: `evm` (secp256k1), `alpha` (ed25519).
+fn secp_keys(wasm: &[u8]) -> SigningKeys {
+    keys_for(wasm, &[("evm", SECP_SEED_A), ("alpha", SEED_A)])
+}
+
+/// The keys every build declares, by variant, as the keystore would hand them.
+fn seeds_of(variant: &str) -> Vec<(&'static str, &'static str)> {
+    match variant {
+        "project" | "project-v2" => vec![("alpha", SEED_A), ("beta", SEED_B)],
+        "project-vault" => vec![("alpha", SEED_A), ("treasury", SEED_B)],
+        "wasm" | "wasm-v2" => vec![("code", SEED_C)],
+        "project-secp" => vec![("evm", SECP_SEED_A), ("alpha", SEED_A)],
+        "wasm-secp" => vec![("code-evm", SECP_SEED_B)],
+        other => panic!("no seeds for {other}"),
+    }
+}
+
 async fn run(wasm: &[u8], keys: Option<SigningKeys>, input: Value) -> ExecutionResult {
     let executor = Executor::new(10_000_000_000, false);
     let limits = ResourceLimits { max_instructions: 10_000_000_000, max_memory_mb: 128, max_execution_seconds: 60 };
@@ -88,7 +121,7 @@ async fn run(wasm: &[u8], keys: Option<SigningKeys>, input: Value) -> ExecutionR
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
     executor
-        .with_signing_keys(keys)
+        .with_keys(offchainvm_worker::executor::RunKeys { signing: keys, encryption: None })
         .execute(
             wasm,
             Some(&sha),
@@ -281,40 +314,56 @@ async fn a_wasm_key_answers_through_the_wasm_build() {
     assert_eq!(refused["status"], "err", "{refused}");
 }
 
-/// Every attack is answered — an `err` with the host's reason, or `ok` for the
-/// two that must succeed — and the run itself succeeds.
+/// Every attack is answered — an `err` with the host's reason, `ok` for the two
+/// that must succeed, `n/a` where the build declares no key the attack needs —
+/// and the run itself succeeds.
 #[tokio::test]
 async fn every_attack_is_an_err_and_the_run_succeeds() {
-    let expected: &[(&str, &str, &str)] = &[
+    let paths: &[(&str, &str, &str)] = &[
         ("undeclared_path", "err", "no signing key at path"),
         ("empty_path", "err", "no signing key at path"),
         ("colon_path", "err", "no signing key at path"),
         ("traversal_path", "err", "no signing key at path"),
         ("huge_path", "err", "no signing key at path"),
-        ("oversized_message", "err", "at most 65536"),
-        ("message_at_cap", "ok", "signature verifies"),
         ("vault_when_none_declared", "err", "declared without a vault"),
         ("determinism", "ok", "one public key and one signature"),
     ];
-    for (variant, vault_rows) in [
-        ("project", [("vault_missing_when_declared", "n/a", "no key with a vault"), ("vault_wrong_when_declared", "n/a", "no key with a vault")]),
-        (
-            "project-vault",
-            [
-                ("vault_missing_when_declared", "err", "names none"),
-                ("vault_wrong_when_declared", "err", "names vault \"vault.attacker.near\""),
-            ],
-        ),
+    let ed: &[(&str, &str, &str)] = &[
+        ("oversized_message", "err", "at most 65536"),
+        ("message_at_cap", "ok", "signature verifies"),
+        ("nep413_bad_nonce", "err", "nonce is 31 bytes; it must be exactly 32"),
+    ];
+    let no_ed: &[(&str, &str, &str)] = &[
+        ("oversized_message", "n/a", "no ed25519 key"),
+        ("message_at_cap", "n/a", "no ed25519 key"),
+        ("nep413_bad_nonce", "n/a", "no ed25519 key"),
+    ];
+    let secp: &[(&str, &str, &str)] = &[
+        ("secp_message_not_32", "err", "32-byte prehash only, and the message is 31 bytes"),
+        ("nep413_wrong_type", "err", "sign-nep413 signs with an ed25519 key"),
+    ];
+    let no_secp: &[(&str, &str, &str)] =
+        &[("secp_message_not_32", "n/a", "no secp256k1 key"), ("nep413_wrong_type", "n/a", "no secp256k1 key")];
+    let no_vault: &[(&str, &str, &str)] = &[
+        ("vault_missing_when_declared", "n/a", "no key with a vault"),
+        ("vault_wrong_when_declared", "n/a", "no key with a vault"),
+    ];
+    let vault: &[(&str, &str, &str)] = &[
+        ("vault_missing_when_declared", "err", "names none"),
+        ("vault_wrong_when_declared", "err", "names vault \"vault.attacker.near\""),
+    ];
+    for (variant, groups) in [
+        ("project", [ed, no_secp, no_vault]),
+        ("project-vault", [ed, no_secp, vault]),
+        ("project-secp", [ed, secp, no_vault]),
+        ("wasm-secp", [no_ed, secp, no_vault]),
     ] {
         let wasm = probe(variant);
-        let keys = || match variant {
-            "project" => project_keys(&wasm),
-            _ => keys_for(&wasm, &[("alpha", SEED_A), ("treasury", SEED_B)]),
-        };
+        let keys = || keys_for(&wasm, &seeds_of(variant));
         let all = answer(&wasm, keys(), json!({ "operation": "attacks" })).await;
         assert_eq!(all["status"], "ok", "{variant}: {all}");
         let results = all["results"].as_array().expect("results");
-        let rows: Vec<(&str, &str, &str)> = expected.iter().copied().chain(vault_rows).collect();
+        let rows: Vec<(&str, &str, &str)> = paths.iter().chain(groups.into_iter().flatten()).copied().collect();
         assert_eq!(results.len(), rows.len(), "{variant}: {all}");
         for (name, status, says) in rows {
             let r = results.iter().find(|r| r["name"] == name).unwrap_or_else(|| panic!("{variant}: no {name}"));
@@ -324,9 +373,10 @@ async fn every_attack_is_an_err_and_the_run_succeeds() {
             assert!(message.len() < 400, "{variant} {name}: a reason, not an echo ({} bytes)", message.len());
         }
         // One at a time, too: each its own run, each answered.
-        for (name, status) in [("huge_path", "err"), ("oversized_message", "err"), ("message_at_cap", "ok")] {
+        for name in ["huge_path", "oversized_message", "message_at_cap", "secp_message_not_32", "nep413_wrong_type", "nep413_bad_nonce"] {
             let one = answer(&wasm, keys(), json!({ "operation": "attack", "name": name })).await;
-            assert_eq!(one["status"], status, "{variant} {name}: {one}");
+            let expected = results.iter().find(|r| r["name"] == name).unwrap();
+            assert_eq!(one["status"], expected["status"], "{variant} {name}: {one}");
         }
     }
 }
@@ -371,11 +421,8 @@ async fn every_vault_mismatch_is_an_err() {
 async fn no_seed_is_visible_to_the_guest() {
     const MASK: u8 = 0x5a;
     let masked = |bytes: &[u8]| hex::encode(bytes.iter().map(|b| b ^ MASK).collect::<Vec<u8>>());
-    for (variant, seeds) in [
-        ("project", vec![("alpha", SEED_A), ("beta", SEED_B)]),
-        ("project-vault", vec![("alpha", SEED_A), ("treasury", SEED_B)]),
-        ("wasm", vec![("code", SEED_C)]),
-    ] {
+    for variant in ["project", "project-vault", "wasm", "project-secp", "wasm-secp"] {
+        let seeds = seeds_of(variant);
         let wasm = probe(variant);
         let mut needles = Vec::new();
         for (_, seed) in &seeds {
@@ -478,4 +525,132 @@ async fn a_module_that_declares_keys_and_receives_none_is_refused_before_running
 
     // And with its keys it runs.
     assert!(run(&wasm, Some(project_keys(&wasm)), json!({ "operation": "all_public_keys" })).await.success);
+}
+
+/// A secp256k1 key through the executor: the pinned public key, EVM address
+/// and signature of an independent implementation; verified, low-s and
+/// recovered inside the guest; a message that is not 32 bytes refused; and
+/// the ed25519 key of the same build untouched.
+#[tokio::test]
+async fn a_secp256k1_key_answers_with_the_pinned_key_address_and_signature() {
+    let wasm = probe("project-secp");
+
+    let pk = answer(&wasm, secp_keys(&wasm), json!({ "operation": "public_key", "path": "evm" })).await;
+    assert_eq!(pk["status"], "ok", "{pk}");
+    assert_eq!(pk["public_key"], SECP_PUB_A, "64 bytes x ‖ y");
+
+    let address = answer(&wasm, secp_keys(&wasm), json!({ "operation": "evm_address", "path": "evm" })).await;
+    assert_eq!(address["status"], "ok", "{address}");
+    assert_eq!(address["evm_address"], SECP_EVM_A);
+    let not_evm = answer(&wasm, secp_keys(&wasm), json!({ "operation": "evm_address", "path": "alpha" })).await;
+    assert_eq!(not_evm["status"], "err", "an ed25519 key has no EVM address: {not_evm}");
+
+    let signed = answer(&wasm, secp_keys(&wasm), json!({ "operation": "sign", "path": "evm", "message_hex": KECCAK_RECORD_1 })).await;
+    assert_eq!(signed["status"], "ok", "{signed}");
+    assert_eq!(signed["signature"], SECP_SIG_A_RECORD_1, "coincurve's signature, byte for byte");
+
+    // Verified outside the guest too, with k256's verification and recovery.
+    {
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        let sig = hex::decode(SECP_SIG_A_RECORD_1).unwrap();
+        let prehash = hex::decode(KECCAK_RECORD_1).unwrap();
+        let mut sec1 = vec![0x04];
+        sec1.extend(hex::decode(SECP_PUB_A).unwrap());
+        let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).unwrap();
+        let signature = k256::ecdsa::Signature::from_slice(&sig[..64]).unwrap();
+        assert!(vk.verify_prehash(&prehash, &signature).is_ok());
+        assert!(signature.normalize_s().is_none(), "low-s");
+        assert_eq!(sig[64], 1);
+        let recovered =
+            k256::ecdsa::VerifyingKey::recover_from_prehash(&prehash, &signature, k256::ecdsa::RecoveryId::from_byte(sig[64]).unwrap())
+                .unwrap();
+        assert_eq!(recovered, vk);
+    }
+
+    for message_hex in [KECCAK_RECORD_1.to_string(), hex::encode([0x42u8; 32])] {
+        let checked =
+            answer(&wasm, secp_keys(&wasm), json!({ "operation": "sign_and_verify", "path": "evm", "message_hex": message_hex })).await;
+        assert_eq!(checked["status"], "ok", "{checked}");
+        for field in ["verified", "recovered", "low_s", "tampered_rejected"] {
+            assert_eq!(checked[field], true, "{field}: {checked}");
+        }
+        assert!(checked["v"] == 0 || checked["v"] == 1, "{checked}");
+        assert_eq!(checked["evm_address"], SECP_EVM_A);
+        assert_eq!(checked["public_key"], SECP_PUB_A);
+    }
+
+    for bad in [hex::encode(b"record #1"), hex::encode([0u8; 31]), hex::encode([0u8; 33]), String::new()] {
+        let refused = answer(&wasm, secp_keys(&wasm), json!({ "operation": "sign", "path": "evm", "message_hex": bad })).await;
+        assert_eq!(refused["status"], "err", "{refused}");
+        assert!(refused["message"].as_str().unwrap().contains("32-byte prehash only"), "{refused}");
+    }
+
+    let all = answer(&wasm, secp_keys(&wasm), json!({ "operation": "all_public_keys" })).await;
+    assert_eq!(all["status"], "ok", "{all}");
+    assert_eq!(all["keys"]["evm"]["public_key"], SECP_PUB_A);
+    assert_eq!(all["keys"]["alpha"]["public_key"], PUB_A, "the ed25519 key beside it");
+    let ed = answer(&wasm, secp_keys(&wasm), json!({ "operation": "sign", "path": "alpha", "message_hex": hex::encode(b"record #1") })).await;
+    assert_eq!(ed["signature"], SIG_A_RECORD_1);
+
+    // The wasm build's secp256k1 key.
+    let wasm = probe("wasm-secp");
+    let keys = || keys_for(&wasm, &seeds_of("wasm-secp"));
+    let address = answer(&wasm, keys(), json!({ "operation": "evm_address", "path": "code-evm" })).await;
+    assert_eq!((address["public_key"].as_str(), address["evm_address"].as_str()), (Some(SECP_PUB_B), Some(SECP_EVM_B)), "{address}");
+    let checked =
+        answer(&wasm, keys(), json!({ "operation": "sign_and_verify", "path": "code-evm", "message_hex": KECCAK_RECORD_1 })).await;
+    assert_eq!(checked["status"], "ok", "{checked}");
+}
+
+/// The host's `sign-nep413` answers the guest-built signature byte for byte —
+/// PyNaCl's — and refuses a secp256k1 key and a nonce that is not 32 bytes.
+#[tokio::test]
+async fn the_host_nep413_signature_is_the_guest_built_one() {
+    use base64::Engine;
+    let wasm = probe("project");
+    let request = |operation: &str, callback: Option<&str>| {
+        json!({
+            "operation": operation, "path": "alpha",
+            "message": "Login to example.com", "recipient": "example.com",
+            "nonce_hex": hex::encode(nonce()), "callback_url": callback,
+        })
+    };
+    for (callback, pinned) in [(None, NEP413_SIGNATURE), (Some("https://example.com/cb"), NEP413_SIGNATURE_CB)] {
+        let host = answer(&wasm, project_keys(&wasm), request("host_nep413", callback)).await;
+        let guest = answer(&wasm, project_keys(&wasm), request("sign_nep413", callback)).await;
+        assert_eq!(host["status"], "ok", "{host}");
+        for field in ["accountId", "publicKey", "signature"] {
+            assert_eq!(host[field], guest[field], "{field}: host {host} / guest {guest}");
+        }
+        assert_eq!(host["signature"], pinned, "PyNaCl's signature");
+        assert_eq!(host["publicKey"], NEP413_PUBLIC_KEY);
+        assert_eq!(host["accountId"], PUB_A);
+        let sig = base64::engine::general_purpose::STANDARD.decode(host["signature"].as_str().unwrap()).unwrap();
+        assert!(verify(PUB_A, &nep413_hash("Login to example.com", &nonce(), "example.com", callback), &sig));
+    }
+    for bad_nonce in ["", "00", &hex::encode([0u8; 31]), &hex::encode([0u8; 33])] {
+        let mut ask = request("host_nep413", None);
+        ask["nonce_hex"] = json!(bad_nonce);
+        let refused = answer(&wasm, project_keys(&wasm), ask).await;
+        assert_eq!(refused["status"], "err", "{refused}");
+        assert!(refused["message"].as_str().unwrap().contains("must be exactly 32"), "{refused}");
+    }
+    let mut long = request("host_nep413", None);
+    long["recipient"] = json!("r".repeat(2049));
+    let refused = answer(&wasm, project_keys(&wasm), long).await;
+    assert!(refused["message"].as_str().unwrap().contains("recipient is 2049 bytes; at most 2048"), "{refused}");
+
+    // A secp256k1 key: the host refuses, and so does the guest-built op.
+    let wasm = probe("project-secp");
+    let mut on_evm = request("host_nep413", None);
+    on_evm["path"] = json!("evm");
+    let refused = answer(&wasm, secp_keys(&wasm), on_evm.clone()).await;
+    assert_eq!(refused["status"], "err", "{refused}");
+    assert!(refused["message"].as_str().unwrap().contains("\"evm\" is secp256k1"), "{refused}");
+    on_evm["operation"] = json!("sign_nep413");
+    let refused = answer(&wasm, secp_keys(&wasm), on_evm).await;
+    assert_eq!(refused["status"], "err", "{refused}");
+    // Its ed25519 key signs as in the project build.
+    let host = answer(&wasm, secp_keys(&wasm), request("host_nep413", None)).await;
+    assert_eq!(host["signature"], NEP413_SIGNATURE);
 }

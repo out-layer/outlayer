@@ -12,6 +12,12 @@
 //! bind "wasm":    HMAC-SHA256(master, "signing-key:v1:{type}:wasm:{wasm_sha256}:{caller}:{account_id}:{path}")
 //! ```
 //!
+//! `type` is the key's algorithm, `ed25519` or `secp256k1` — a segment of the
+//! string, so one secret never serves two algorithms. The keystore hands back
+//! the 32-byte HMAC output for either type; the worker reads it as the key: an
+//! ed25519 seed (RFC 8032), or a secp256k1 secret scalar (big-endian), which it
+//! refuses to use when it is zero or not below the group order.
+//!
 //! `caller` is which account of the job the key belongs to, chosen per key in
 //! the manifest (`"caller": "signer" | "predecessor"`, default `signer`), and
 //! `account_id` is that account:
@@ -76,13 +82,27 @@
 //! a `:` — each is checked against a shape that cannot contain one — so after
 //! the fixed `signing-key:v1:{type}:{bind}` the segments parse back uniquely,
 //! and two different tuples never spell one string. The root `signing-key:v1:`
-//! is the start of no other seed this keystore derives (pinned in `api_tests`),
-//! so no other family's string equals a signing key's, and no signing key's
-//! equals another family's.
+//! is the start of no other seed this keystore derives: no other fixed root
+//! starts it (pinned in `api_tests`), and a seed a caller spells — raw, or a
+//! `Repo` accessor's — is refused when it starts with `signing-key:` or
+//! `encryption-key:` (`api.rs`, `DECLARED_KEY_ROOTS`). So no other family's
+//! string equals a signing key's, and no signing key's equals another
+//! family's.
 //!
 //! `v1` names the scheme. A different scheme would be added beside it under its
 //! own label; this one never changes, because changing it changes every key and
 //! every signature made with one.
+//!
+//! **Encryption keys share these rules.** Everything above — the bindings, the
+//! caller, the vault, the path, the checks — applies unchanged to the
+//! symmetric keys declared under `encryption_keys` (`crate::encryption_keys`),
+//! whose strings live under their own root `encryption-key:v1:` and carry no
+//! type segment: an encryption key has no type. Which root a string gets is
+//! decided by the key's kind ([`KeyKind::family`]) — the declaration type it
+//! was parsed as, never a caller-written field — so a signing key and an
+//! encryption key at the same path are two unrelated secrets. The validation
+//! here is written once, for any [`KeyDeclaration`], and each family names
+//! itself in its refusals.
 
 use near_primitives::types::AccountId;
 use serde::{Deserialize, Serialize};
@@ -109,6 +129,98 @@ const MAX_PROJECT_NAME_LEN: usize = 64;
 /// sender (`worker/src/main.rs`, `storage_account_id`).
 pub const PLACEHOLDER_CALLERS: &[&str] = &["anonymous"];
 
+/// The family a declared key belongs to. Each has its own root, so no string of
+/// one family is a string of the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyFamily {
+    /// `signing_keys`: asymmetric keys the guest signs with.
+    Signing,
+    /// `encryption_keys`: symmetric keys the guest seals and opens data with.
+    Encryption,
+}
+
+impl KeyFamily {
+    /// The fixed start of every derivation string of this family.
+    pub fn root(self) -> &'static str {
+        match self {
+            KeyFamily::Signing => SIGNING_KEY_LABEL,
+            KeyFamily::Encryption => crate::encryption_keys::ENCRYPTION_KEY_LABEL,
+        }
+    }
+
+    /// How a refusal names one key of this family.
+    pub fn noun(self) -> &'static str {
+        match self {
+            KeyFamily::Signing => "signing key",
+            KeyFamily::Encryption => "encryption key",
+        }
+    }
+
+    /// [`Self::noun`] with its article.
+    pub fn a_noun(self) -> &'static str {
+        match self {
+            KeyFamily::Signing => "a signing key",
+            KeyFamily::Encryption => "an encryption key",
+        }
+    }
+
+    /// How many keys of this family one request may name.
+    pub fn max_keys(self) -> usize {
+        match self {
+            KeyFamily::Signing => MAX_SIGNING_KEYS,
+            KeyFamily::Encryption => crate::encryption_keys::MAX_ENCRYPTION_KEYS,
+        }
+    }
+}
+
+/// What a declared key is: a signing key of one type, or an encryption key.
+/// The one thing that picks the derivation string's root. A signing key's
+/// type is the segment after the root; an encryption key has no type — the
+/// host that uses it picks the algorithm — so its string has no such segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyKind {
+    Signing(SigningKeyType),
+    Encryption,
+}
+
+impl KeyKind {
+    /// The family whose root the string starts with.
+    pub fn family(self) -> KeyFamily {
+        match self {
+            KeyKind::Signing(_) => KeyFamily::Signing,
+            KeyKind::Encryption => KeyFamily::Encryption,
+        }
+    }
+
+    /// The segment between the root and the binding: a signing key's type,
+    /// and nothing for an encryption key.
+    pub fn type_segment(self) -> Option<&'static str> {
+        match self {
+            KeyKind::Signing(t) => Some(t.label()),
+            KeyKind::Encryption => None,
+        }
+    }
+
+    /// How a log line names the kind: the signing key's type, or `encryption`.
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyKind::Signing(t) => t.label(),
+            KeyKind::Encryption => "encryption",
+        }
+    }
+}
+
+/// What the validation reads off one declared key, in either family.
+pub trait KeyDeclaration {
+    /// The family every key of this declaration type belongs to.
+    const FAMILY: KeyFamily;
+    fn path(&self) -> &str;
+    fn kind(&self) -> KeyKind;
+    fn bind(&self) -> KeyBinding;
+    fn caller(&self) -> CallerKind;
+    fn vault(&self) -> Option<&str>;
+}
+
 /// The algorithm a key is for. It is an input of the derivation, so one secret
 /// never serves two algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -116,13 +228,22 @@ pub const PLACEHOLDER_CALLERS: &[&str] = &["anonymous"];
 pub enum SigningKeyType {
     /// The 32-byte seed is the ed25519 signing-key seed (RFC 8032).
     Ed25519,
+    /// The 32-byte seed is the secp256k1 secret scalar, big-endian. A seed that
+    /// is zero or not below the group order (probability about 2^-128) is not
+    /// a key; the worker refuses the run rather than use it.
+    Secp256k1,
 }
 
 impl SigningKeyType {
+    /// Every type, for the tests that must cover each one.
+    #[cfg(test)]
+    pub const ALL: [SigningKeyType; 2] = [SigningKeyType::Ed25519, SigningKeyType::Secp256k1];
+
     /// The segment this type contributes to the derivation string.
     pub fn label(self) -> &'static str {
         match self {
             SigningKeyType::Ed25519 => "ed25519",
+            SigningKeyType::Secp256k1 => "secp256k1",
         }
     }
 }
@@ -193,6 +314,25 @@ pub struct SigningKeyRequest {
     pub vault: Option<String>,
 }
 
+impl KeyDeclaration for SigningKeyRequest {
+    const FAMILY: KeyFamily = KeyFamily::Signing;
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn kind(&self) -> KeyKind {
+        KeyKind::Signing(self.key_type)
+    }
+    fn bind(&self) -> KeyBinding {
+        self.bind
+    }
+    fn caller(&self) -> CallerKind {
+        self.caller
+    }
+    fn vault(&self) -> Option<&str> {
+        self.vault.as_deref()
+    }
+}
+
 /// A key path that passed [`KeyPath::parse`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyPath(String);
@@ -237,8 +377,10 @@ pub struct ProjectId {
 }
 
 impl ProjectId {
-    /// `{owner}/{name}` — `owner` a valid NEAR account id, `name` 1 to 64 of
-    /// `[A-Za-z0-9_-]`. Neither half can hold a `:` or a second `/`.
+    /// `{owner}/{name}` — `owner` a valid NEAR account id, `name` 1 to 64
+    /// bytes of letters, digits (Unicode, as `char::is_alphanumeric`), `-` and
+    /// `_`: the rule `create_project` enforces, so every project the contract
+    /// holds parses. Neither half can hold a `:` or a second `/`.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let Some((owner, name)) = raw.split_once('/') else {
             return Err(format!(
@@ -254,10 +396,10 @@ impl ProjectId {
         })?;
         let name_ok = !name.is_empty()
             && name.len() <= MAX_PROJECT_NAME_LEN
-            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_');
         if !name_ok {
             return Err(format!(
-                "project_id {:?}: the name must be 1 to {MAX_PROJECT_NAME_LEN} of [A-Za-z0-9_-]",
+                "project_id {:?}: the name must be 1 to {MAX_PROJECT_NAME_LEN} bytes of letters, digits, '-' or '_'",
                 truncate_for_message(raw)
             ));
         }
@@ -332,19 +474,27 @@ pub enum Binding<'a> {
 
 /// The derivation string of one key. Built only by [`DerivationInput::new`]
 /// from validated parts, so nothing else can hand the keystore a string to
-/// derive under this root.
+/// derive under either root. It carries its family, so a string of one family
+/// cannot be derived as a key of the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivationInput(String);
+pub struct DerivationInput {
+    family: KeyFamily,
+    text: String,
+}
 
 impl DerivationInput {
-    /// `signing-key:v1:{type}:project:{project_uuid}:{caller}:{account_id}:{path}`,
+    /// A signing key:
+    /// `signing-key:v1:{type}:project:{project_uuid}:{caller}:{account_id}:{path}`
     /// or `signing-key:v1:{type}:wasm:{wasm_sha256}:{caller}:{account_id}:{path}`.
+    /// An encryption key, which has no type:
+    /// `encryption-key:v1:project:{project_uuid}:{caller}:{account_id}:{path}`
+    /// or `encryption-key:v1:wasm:{wasm_sha256}:{caller}:{account_id}:{path}`.
     ///
     /// Every part is already a validated type that cannot hold a `:`; the check
     /// here is the invariant the whole scheme rests on, stated once more where
     /// the string is made.
     pub fn new(
-        key_type: SigningKeyType,
+        kind: KeyKind,
         binding: Binding<'_>,
         caller: CallerKind,
         account: &AccountId,
@@ -354,27 +504,38 @@ impl DerivationInput {
             Binding::Project(uuid) => (KeyBinding::Project.label(), uuid.as_str()),
             Binding::Wasm(wasm) => (KeyBinding::Wasm.label(), wasm.as_str()),
         };
-        let parts = [key_type.label(), tag, bound_to, caller.label(), account.as_str(), path.as_str()];
+        let parts: Vec<&str> = kind
+            .type_segment()
+            .into_iter()
+            .chain([tag, bound_to, caller.label(), account.as_str(), path.as_str()])
+            .collect();
+        let family = kind.family();
         if let Some(bad) = parts.iter().find(|p| p.is_empty() || p.contains(':')) {
             return Err(format!(
-                "a signing-key field is empty or holds ':' ({:?})",
+                "{} field is empty or holds ':' ({:?})",
+                family.a_noun(),
                 truncate_for_message(bad)
             ));
         }
-        Ok(Self(format!("{SIGNING_KEY_LABEL}{}", parts.join(":"))))
+        Ok(Self { family, text: format!("{}{}", family.root(), parts.join(":")) })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+        self.text.as_bytes()
+    }
+
+    /// The family whose root the string starts with.
+    pub fn family(&self) -> KeyFamily {
+        self.family
     }
 
     #[cfg(test)]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.text
     }
 }
 
-/// One requested key, validated on its fields: its path, its type, its
+/// One requested key, validated on its fields: its path, its kind, its
 /// binding, which of the job's accounts it belongs to and that account, and
 /// the vault whose master it derives from (`None` for the default master). Its
 /// derivation string is built by [`ValidatedKeys::bind`], once the project's
@@ -382,7 +543,7 @@ impl DerivationInput {
 #[derive(Debug, Clone)]
 pub struct ValidatedKey {
     pub path: KeyPath,
-    pub key_type: SigningKeyType,
+    pub kind: KeyKind,
     pub bind: KeyBinding,
     pub caller: CallerKind,
     /// The job's signer or predecessor, as `caller` says.
@@ -394,6 +555,8 @@ pub struct ValidatedKey {
 /// build — everything that can be checked before a chain read.
 #[derive(Debug, Clone)]
 pub struct ValidatedKeys {
+    /// The family every key here belongs to.
+    pub family: KeyFamily,
     /// The job's project: present exactly for a project run.
     pub project: Option<ProjectId>,
     /// The job's `user_account_id`.
@@ -444,10 +607,10 @@ impl ValidatedKeys {
                     ));
                 }
             };
-            let input = DerivationInput::new(key.key_type, binding, key.caller, &key.account, &key.path)?;
+            let input = DerivationInput::new(key.kind, binding, key.caller, &key.account, &key.path)?;
             keys.push(BoundKey {
                 path: key.path,
-                key_type: key.key_type,
+                kind: key.kind,
                 bind: key.bind,
                 caller: key.caller,
                 account: key.account,
@@ -455,7 +618,14 @@ impl ValidatedKeys {
                 input,
             });
         }
-        Ok(BoundKeys { project, signer: self.signer, predecessor: self.predecessor, wasm_sha256: self.wasm_sha256, keys })
+        Ok(BoundKeys {
+            family: self.family,
+            project,
+            signer: self.signer,
+            predecessor: self.predecessor,
+            wasm_sha256: self.wasm_sha256,
+            keys,
+        })
     }
 }
 
@@ -471,7 +641,7 @@ pub struct BoundProject {
 #[derive(Debug, Clone)]
 pub struct BoundKey {
     pub path: KeyPath,
-    pub key_type: SigningKeyType,
+    pub kind: KeyKind,
     pub bind: KeyBinding,
     pub caller: CallerKind,
     /// The account the key belongs to: the job's signer or predecessor.
@@ -480,10 +650,11 @@ pub struct BoundKey {
     pub input: DerivationInput,
 }
 
-/// A whole request's keys, each with its derivation string: what
-/// `derive_signing_key_seed` is given.
+/// A whole request's keys of one family, each with its derivation string:
+/// what `derive_signing_key_seed` or `derive_encryption_key` is given.
 #[derive(Debug, Clone)]
 pub struct BoundKeys {
+    pub family: KeyFamily,
     pub project: Option<BoundProject>,
     pub signer: AccountId,
     pub predecessor: Option<AccountId>,
@@ -491,13 +662,15 @@ pub struct BoundKeys {
     pub keys: Vec<BoundKey>,
 }
 
-/// Validate everything the request says about keys, before any chain read.
+/// Validate everything the request says about one family's keys, before any
+/// chain read. Each family is validated on its own: its paths are its own
+/// namespace, and its count its own limit.
 ///
 /// `project_id`, `account_id` (the signer), `predecessor_id` and
 /// `executed_wasm_sha256` are the job's (sent by the worker, never by the
 /// guest). A `project_id` makes the run a project run; none makes it a direct
 /// run. Refused, and the whole request with it:
-/// * no keys, or more than [`MAX_SIGNING_KEYS`];
+/// * no keys, or more than the family's limit ([`KeyFamily::max_keys`]);
 /// * a malformed project id;
 /// * a signer or predecessor that is a placeholder ([`PLACEHOLDER_CALLERS`])
 ///   or not a NEAR account id, a build hash that is missing or not 64 lowercase
@@ -507,37 +680,46 @@ pub struct BoundKeys {
 ///   a `project` key on a direct run;
 /// * a `predecessor` key on a request that names no `predecessor_id`;
 /// * a vault that is empty or not an account id, or a vault on a `wasm` key.
-pub fn validate_request(
+pub fn validate_request<D: KeyDeclaration>(
     project_id: Option<&str>,
     account_id: &str,
     predecessor_id: Option<&str>,
     executed_wasm_sha256: Option<&str>,
-    keys: &[SigningKeyRequest],
+    keys: &[D],
 ) -> Result<ValidatedKeys, String> {
+    let family = D::FAMILY;
+    let noun = family.noun();
+    let most = family.max_keys();
     if keys.is_empty() {
-        return Err("no signing keys were requested".to_string());
+        return Err(format!("no {noun}s were requested"));
     }
-    if keys.len() > MAX_SIGNING_KEYS {
-        return Err(format!(
-            "{} signing keys were requested; at most {MAX_SIGNING_KEYS} are allowed",
-            keys.len()
-        ));
+    if keys.len() > most {
+        return Err(format!("{} {noun}s were requested; at most {most} are allowed", keys.len()));
     }
     let project = project_id.map(ProjectId::parse).transpose()?;
-    let signer = real_account("caller", account_id)?;
-    let predecessor = predecessor_id.map(|p| real_account("predecessor", p)).transpose()?;
+    let signer = real_account(family, "caller", account_id)?;
+    let predecessor = predecessor_id.map(|p| real_account(family, "predecessor", p)).transpose()?;
     let Some(executed_wasm_sha256) = executed_wasm_sha256 else {
-        return Err("signing keys need the running build's executed_wasm_sha256, and the request names none".to_string());
+        return Err(format!("{noun}s need the running build's executed_wasm_sha256, and the request names none"));
     };
     let wasm_sha256 = WasmSha256::parse(executed_wasm_sha256)?;
 
     let mut out: Vec<ValidatedKey> = Vec::with_capacity(keys.len());
     for request in keys {
-        let path = KeyPath::parse(&request.path)?;
+        let path = KeyPath::parse(request.path())?;
+        let kind = request.kind();
+        if kind.family() != family {
+            return Err(format!(
+                "key {:?} is {} and cannot be requested as {}",
+                path.as_str(),
+                kind.family().a_noun(),
+                family.a_noun()
+            ));
+        }
         if out.iter().any(|k| k.path == path) {
             return Err(format!("key path {:?} is requested twice", path.as_str()));
         }
-        match (request.bind, project.as_ref()) {
+        match (request.bind(), project.as_ref()) {
             (KeyBinding::Project, Some(_)) | (KeyBinding::Wasm, None) => {}
             (KeyBinding::Project, None) => {
                 return Err(format!(
@@ -556,7 +738,7 @@ pub fn validate_request(
                 ))
             }
         }
-        let account = match request.caller {
+        let account = match request.caller() {
             CallerKind::Signer => signer.clone(),
             CallerKind::Predecessor => predecessor.clone().ok_or_else(|| {
                 format!(
@@ -566,7 +748,7 @@ pub fn validate_request(
                 )
             })?,
         };
-        let vault = match (request.vault.as_deref(), request.bind) {
+        let vault = match (request.vault(), request.bind()) {
             (None, _) => None,
             (Some(_), KeyBinding::Wasm) => {
                 return Err(format!(
@@ -583,24 +765,32 @@ pub fn validate_request(
                 )
             })?),
         };
-        out.push(ValidatedKey { path, key_type: request.key_type, bind: request.bind, caller: request.caller, account, vault });
+        out.push(ValidatedKey {
+            path,
+            kind,
+            bind: request.bind(),
+            caller: request.caller(),
+            account,
+            vault,
+        });
     }
-    Ok(ValidatedKeys { project, signer, predecessor, wasm_sha256, keys: out })
+    Ok(ValidatedKeys { family, project, signer, predecessor, wasm_sha256, keys: out })
 }
 
 /// `raw` as an account a key may belong to: not a placeholder the worker
 /// writes for a missing account, and a valid NEAR account id. `role` names the
 /// field in the refusal.
-fn real_account(role: &str, raw: &str) -> Result<AccountId, String> {
+fn real_account(family: KeyFamily, role: &str, raw: &str) -> Result<AccountId, String> {
+    let noun = family.a_noun();
     if PLACEHOLDER_CALLERS.contains(&raw) {
         return Err(format!(
-            "the {role} {raw:?} is the worker's placeholder for a run without one, not an account; a signing \
-             key needs a real caller to be bound to, so a run without one gets no key"
+            "the {role} {raw:?} is the worker's placeholder for a run without one, not an account; {noun} \
+             needs a real caller to be bound to, so a run without one gets no key"
         ));
     }
     raw.parse().map_err(|e| {
         format!(
-            "the {role} {:?} is not a valid NEAR account id ({e}); a signing key is bound to one",
+            "the {role} {:?} is not a valid NEAR account id ({e}); {noun} is bound to one",
             truncate_for_message(raw)
         )
     })
@@ -648,8 +838,9 @@ pub fn vault_belongs_to(
     Ok(())
 }
 
-/// A derived seed in hex, as the `/decrypt` response carries it to the worker.
-/// Wiped when dropped; its `Debug` prints nothing of it.
+/// A derived seed or key in hex, as the `/decrypt` response carries it to the
+/// worker — a signing key's seed, or an encryption key. Wiped when dropped; its
+/// `Debug` prints nothing of it.
 pub struct SeedHex(zeroize::Zeroizing<String>);
 
 impl SeedHex {
@@ -1068,7 +1259,7 @@ mod tests {
         // this pins, independently of how the types are built.
         let bob = acct("bob.near");
         let k = KeyPath("k".into());
-        let make = |b: Binding<'_>, p: &KeyPath| DerivationInput::new(SigningKeyType::Ed25519, b, CallerKind::Signer, &bob, p);
+        let make = |b: Binding<'_>, p: &KeyPath| DerivationInput::new(KeyKind::Signing(SigningKeyType::Ed25519), b, CallerKind::Signer, &bob, p);
         let good_uuid = ProjectUuid(P1.into());
         let colon_uuid = ProjectUuid("p00000000000000:1".into());
         let empty_uuid = ProjectUuid(String::new());
@@ -1083,13 +1274,55 @@ mod tests {
 
     #[test]
     fn an_unknown_type_is_refused() {
-        for t in ["secp256k1", "Ed25519", "ED25519", "", "x25519"] {
+        for t in ["Ed25519", "ED25519", "", "x25519", "Secp256k1", "SECP256K1", "secp256r1", "secp256k1:x", "ecdsa", "k256"] {
             let body = format!(r#"{{"path":"k","type":"{t}"}}"#);
             assert!(serde_json::from_str::<SigningKeyRequest>(&body).is_err(), "type {t:?}");
         }
         assert!(serde_json::from_str::<SigningKeyRequest>(r#"{"path":"k"}"#).is_err(), "no type");
         let ok: SigningKeyRequest = serde_json::from_str(r#"{"path":"k","type":"ed25519"}"#).unwrap();
         assert_eq!(ok.key_type, SigningKeyType::Ed25519);
+        let ok: SigningKeyRequest = serde_json::from_str(r#"{"path":"k","type":"secp256k1"}"#).unwrap();
+        assert_eq!(ok.key_type, SigningKeyType::Secp256k1);
+        assert_eq!(serde_json::to_value(SigningKeyType::Secp256k1).unwrap(), "secp256k1");
+    }
+
+    /// A secp256k1 key is declared, validated and bound exactly as an ed25519
+    /// one — every binding, caller and vault rule — and its string differs from
+    /// the ed25519 key's of the same tuple in the type segment alone.
+    #[test]
+    fn a_secp256k1_key_follows_the_same_rules_under_its_own_type_segment() {
+        let secp = |r: SigningKeyRequest| SigningKeyRequest { key_type: SigningKeyType::Secp256k1, ..r };
+        let v = bound(&[secp(req("records"))]).unwrap();
+        assert_eq!(v.keys[0].input.as_str(), "signing-key:v1:secp256k1:project:p0000000000000001:signer:bob.near:records");
+        assert_eq!(v.keys[0].kind, KeyKind::Signing(SigningKeyType::Secp256k1));
+        let w = bound_direct(&[secp(wasm_req("session"))]).unwrap();
+        assert_eq!(w.keys[0].input.as_str(), format!("signing-key:v1:secp256k1:wasm:{H1}:signer:bob.near:session"));
+        let d = validate_request(Some("alice.near/app"), "bob.near", Some("dao.near"), Some(H1), &[secp(pred_req("votes"))])
+            .unwrap()
+            .bind(Some(uuid(P1)))
+            .unwrap();
+        assert_eq!(d.keys[0].input.as_str(), "signing-key:v1:secp256k1:project:p0000000000000001:predecessor:dao.near:votes");
+        // A vault on a project key; refused on a wasm key.
+        assert!(validate(&[SigningKeyRequest { vault: Some("vault.alice.near".into()), ..secp(req("k")) }]).is_ok());
+        assert!(validate_direct(&[SigningKeyRequest { vault: Some("vault.alice.near".into()), ..secp(wasm_req("k")) }]).is_err());
+        // Bind mismatches and a missing predecessor: refused.
+        assert!(validate(&[secp(wasm_req("k"))]).is_err());
+        assert!(validate_direct(&[secp(req("k"))]).is_err());
+        assert!(validate(&[secp(pred_req("k"))]).is_err());
+        // Mixed types in one request, each path once.
+        let mixed = bound(&[req("a"), secp(req("b"))]).unwrap();
+        assert_eq!(mixed.keys[0].kind.label(), "ed25519");
+        assert_eq!(mixed.keys[1].kind.label(), "secp256k1");
+        // One path is one key whatever its type: declared twice, refused.
+        assert!(validate(&[req("k"), secp(req("k"))]).is_err());
+        // One tuple under the two types: two strings, differing only in the type.
+        let ed = bound(&[req("k")]).unwrap().keys.remove(0).input;
+        let k1 = bound(&[secp(req("k"))]).unwrap().keys.remove(0).input;
+        assert_ne!(ed, k1);
+        assert_eq!(
+            ed.as_str().strip_prefix("signing-key:v1:ed25519:").unwrap(),
+            k1.as_str().strip_prefix("signing-key:v1:secp256k1:").unwrap()
+        );
     }
 
     #[test]
@@ -1140,6 +1373,20 @@ mod tests {
         assert!(validate_request(Some("alice.near/app"), "", None, Some(H1), &[req("k")]).is_err());
     }
 
+    /// Every name `create_project` accepts parses: Unicode letters and digits,
+    /// `-`, `_`, up to 64 bytes. Anything else it refuses is refused here too.
+    #[test]
+    fn project_names_follow_the_contracts_rule() {
+        for name in ["проект", "app-ё_2", "café", "应用", &"a".repeat(64), &"я".repeat(32)] {
+            let id = format!("alice.near/{name}");
+            let parsed = ProjectId::parse(&id).unwrap_or_else(|e| panic!("{id:?}: {e}"));
+            assert_eq!(parsed.as_str(), id);
+        }
+        for name in ["", "a:b", "a b", "a.b", "a/b", "emoji🙂", &"a".repeat(65), &"я".repeat(33)] {
+            assert!(ProjectId::parse(&format!("alice.near/{name}")).is_err(), "{name:?}");
+        }
+    }
+
     #[test]
     fn the_segments_parse_back_uniquely() {
         // No field holds ':', so after `signing-key:v1:{type}:{bind}` splitting
@@ -1151,11 +1398,18 @@ mod tests {
             .bind(Some(uuid("pfedcba9876543210")))
             .unwrap();
         let direct = validate_request(None, account, None, Some(H2), &[wasm_req("pay-outs_1")]).unwrap().bind(None).unwrap();
-        for v in [&project, &direct] {
+        let secp = |r: SigningKeyRequest| SigningKeyRequest { key_type: SigningKeyType::Secp256k1, ..r };
+        let project_secp = validate_request(Some("a-b_c.near/My_App-2"), account, Some("signer.near"), Some(H2), &[secp(req("x")), secp(pred_req("y"))])
+            .unwrap()
+            .bind(Some(uuid("pfedcba9876543210")))
+            .unwrap();
+        let direct_secp = validate_request(None, account, None, Some(H2), &[secp(wasm_req("pay-outs_1"))]).unwrap().bind(None).unwrap();
+        for v in [&project, &direct, &project_secp, &direct_secp] {
             for k in &v.keys {
                 let parts: Vec<&str> = k.input.as_str().split(':').collect();
                 assert_eq!(parts.len(), 8, "{}", k.input.as_str());
-                assert_eq!(&parts[..3], &["signing-key", "v1", "ed25519"], "{}", k.input.as_str());
+                assert_eq!(&parts[..3], &["signing-key", "v1", k.kind.label()], "{}", k.input.as_str());
+                assert!(SigningKeyType::ALL.iter().any(|t| t.label() == parts[2]), "{}", k.input.as_str());
                 assert_eq!(parts[3], k.bind.label());
                 let bound_to = match k.bind {
                     KeyBinding::Project => v.project.as_ref().unwrap().uuid.as_str(),

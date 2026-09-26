@@ -2472,3 +2472,370 @@ mod store_wallet_policy_tests {
         assert!(b.contains(":1:x:"), "{b}");
     }
 }
+
+mod project_transfer_event_tests {
+    use crate::*;
+    use near_sdk::test_utils::{accounts, get_logs, VMContextBuilder};
+    use near_sdk::{testing_env, NearToken};
+
+    fn ctx(predecessor: AccountId, deposit: NearToken) -> VMContextBuilder {
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(predecessor).attached_deposit(deposit);
+        b
+    }
+
+    /// The `system_event` payloads logged by the last call, parsed.
+    fn system_events() -> Vec<serde_json::Value> {
+        get_logs()
+            .iter()
+            .filter_map(|l| l.strip_prefix("EVENT_JSON:"))
+            .map(|j| serde_json::from_str::<serde_json::Value>(j).expect("event is JSON"))
+            .filter(|e| e["event"] == "system_event")
+            .collect()
+    }
+
+    /// A transfer tells the workers both names and the uuid that moved, under
+    /// the contract's own standard and version, so the coordinator can drop
+    /// every cached name → uuid entry the move made wrong.
+    #[test]
+    fn a_transfer_emits_project_transferred_with_both_names() {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+
+        testing_env!(ctx(accounts(1), NearToken::from_near(10)).build());
+        c.create_project(
+            "app".to_string(),
+            CodeSource::WasmUrl {
+                url: "https://example.invalid/app.wasm".to_string(),
+                hash: "ab".repeat(32),
+                build_target: None,
+            },
+        );
+        let uuid = c.get_project(format!("{}/app", accounts(1))).unwrap().uuid;
+
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+
+        let events = system_events();
+        assert_eq!(events.len(), 1, "exactly one system event: {events:?}");
+        let event = &events[0];
+        assert_eq!(event["standard"], c.event_standard.as_str());
+        assert_eq!(event["version"], c.event_version.as_str());
+
+        let data = event["data"].as_array().expect("data is an array");
+        assert_eq!(data.len(), 1);
+        let t = &data[0]["ProjectTransferred"];
+        assert_eq!(t["old_project_id"], format!("{}/app", accounts(1)));
+        assert_eq!(t["new_project_id"], format!("{}/app", accounts(2)));
+        assert_eq!(t["project_uuid"], uuid.as_str());
+        assert_eq!(t["old_owner"], accounts(1).as_str());
+        assert_eq!(t["new_owner"], accounts(2).as_str());
+        assert_eq!(
+            t.as_object().unwrap().len(),
+            5,
+            "the event carries exactly the five fields: {t}"
+        );
+
+        // The uuid moved with the project; the old name is free.
+        assert_eq!(c.get_project(format!("{}/app", accounts(2))).unwrap().uuid, uuid);
+        assert!(c.get_project(format!("{}/app", accounts(1))).is_none());
+    }
+
+    /// Deleting a project still announces the cleanup under its name and uuid:
+    /// the coordinator drops the cached name → uuid entry from that event.
+    #[test]
+    fn a_delete_emits_project_storage_cleanup_with_name_and_uuid() {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+
+        testing_env!(ctx(accounts(1), NearToken::from_near(10)).build());
+        c.create_project(
+            "app".to_string(),
+            CodeSource::WasmUrl {
+                url: "https://example.invalid/app.wasm".to_string(),
+                hash: "ab".repeat(32),
+                build_target: None,
+            },
+        );
+        let uuid = c.get_project(format!("{}/app", accounts(1))).unwrap().uuid;
+
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.delete_project("app".to_string());
+
+        let events = system_events();
+        let cleanup = events
+            .iter()
+            .find_map(|e| e["data"][0].get("ProjectStorageCleanup").cloned())
+            .expect("a delete announces the cleanup");
+        assert_eq!(cleanup["project_id"], format!("{}/app", accounts(1)));
+        assert_eq!(cleanup["project_uuid"], uuid.as_str());
+    }
+}
+
+/// Every field of a code source becomes part of a version key or reaches the
+/// worker, and the contract logs version keys: none may carry an event, a line
+/// break or anything the worker could not use.
+#[cfg(test)]
+mod code_source_tests {
+    use super::*;
+    use crate::projects::code_source_error;
+    use near_sdk::test_utils::get_logs;
+
+    const HASH: &str = "cbf80ed0080dd62f2041745cdc958ec0fbd192f33aeaa756f7873d742204b2f8";
+    const FORGED: &str = r#"EVENT_JSON:{"standard":"near-outlayer","version":"1.0.0","event":"system_event","data":[{"ProjectStorageCleanup":{"project_id":"v.near/a","project_uuid":"p0000000000000001","timestamp":1}}]}"#;
+
+    fn wasm(url: &str, hash: &str) -> CodeSource {
+        CodeSource::WasmUrl { url: url.to_string(), hash: hash.to_string(), build_target: None }
+    }
+
+    fn github(repo: &str, commit: &str) -> CodeSource {
+        CodeSource::GitHub { repo: repo.to_string(), commit: commit.to_string(), build_target: None }
+    }
+
+    fn owner_context() {
+        testing_env!(get_context(accounts(2), NearToken::from_near(1)).build());
+    }
+
+    #[test]
+    fn a_wasm_url_source_needs_a_64_lowercase_hex_hash() {
+        let url = "https://wasmhub.testnet.fastfs.io/fastfs.testnet/app.wasm";
+        assert_eq!(code_source_error(&wasm(url, HASH)), None);
+        for bad in [
+            "",
+            "ab",
+            &HASH[..63],
+            &format!("{HASH}0"),
+            &HASH.to_uppercase(),
+            &format!("{}g", &HASH[..63]),
+            FORGED,
+            &format!("{}\n", &HASH[..63]),
+            &format!("{HASH}\n{FORGED}"),
+        ] {
+            assert!(code_source_error(&wasm(url, bad)).is_some(), "accepted hash {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_wasm_url_source_needs_a_clean_https_url() {
+        assert_eq!(code_source_error(&wasm("https://example.invalid/app.wasm", HASH)), None);
+        for bad in [
+            "http://example.invalid/app.wasm",
+            "ipfs://bafy",
+            "https://",
+            "https://example.invalid/a b.wasm",
+            "https://example.invalid/a.wasm\nEVENT_JSON:{}",
+            "https://example.invalid/a.wasm\t",
+            "https://example.invalid/EVENT_JSON",
+        ] {
+            assert!(code_source_error(&wasm(bad, HASH)).is_some(), "accepted url {bad:?}");
+        }
+        let long = format!("https://example.invalid/{}", "a".repeat(2048));
+        assert!(code_source_error(&wasm(&long, HASH)).is_some());
+    }
+
+    /// The forms the docs, CLI and tests use all pass.
+    #[test]
+    fn github_sources_in_use_pass() {
+        for (repo, commit) in [
+            ("https://github.com/out-layer/random-example", "main"),
+            ("https://github.com/test/repo", "abc123"),
+            ("github.com/alice/project", "stable-v1.0"),
+            ("out-layer/eas-attestor", "0"),
+            ("github.com/a/b", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"),
+            ("https://github.com/owner/repo.git", "release/2024-01"),
+            ("github.com/owner/my_repo", "v1.2.3+build"),
+        ] {
+            assert_eq!(code_source_error(&github(repo, commit)), None, "{repo}@{commit}");
+        }
+    }
+
+    #[test]
+    fn github_sources_that_could_carry_an_event_or_an_option_are_refused() {
+        for (repo, commit) in [
+            ("", "main"),
+            ("github.com/a/b", ""),
+            ("github.com/a b", "main"),
+            ("github.com/a/b\nEVENT_JSON:{}", "main"),
+            ("github.com/a/b", "main\nx"),
+            ("github.com/a/b", FORGED),
+            ("github.com/EVENT_JSON/b", "main"),
+            ("github.com/a/b", "EVENT_JSON"),
+            ("github.com/a/{b}", "main"),
+            ("github.com/a/\"b\"", "main"),
+            ("--upload-pack=x", "main"),
+            ("github.com/a/b", "--upload-pack=x"),
+            ("github.com/a/b", "-x"),
+            ("github.com/../b", "main"),
+            ("github.com/a/b", "a..b"),
+            ("git@github.com:a/b", "main"),
+        ] {
+            assert!(code_source_error(&github(repo, commit)).is_some(), "accepted {repo:?}@{commit:?}");
+        }
+        assert!(code_source_error(&github(&"a".repeat(513), "main")).is_some());
+        assert!(code_source_error(&github("a/b", &"a".repeat(257))).is_some());
+    }
+
+    #[test]
+    fn a_build_target_is_a_plain_word() {
+        let with = |t: &str| CodeSource::GitHub {
+            repo: "a/b".to_string(),
+            commit: "main".to_string(),
+            build_target: Some(t.to_string()),
+        };
+        assert_eq!(code_source_error(&with("wasm32-wasip2")), None);
+        assert_eq!(code_source_error(&with("wasm32-wasi")), None);
+        assert!(code_source_error(&with("")).is_some());
+        assert!(code_source_error(&with("wasm32 wasip2")).is_some());
+        assert!(code_source_error(&with("x\nEVENT_JSON:{}")).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "source.hash must be the SHA-256 of the WASM")]
+    fn create_project_refuses_an_event_as_its_hash() {
+        let mut c = setup_contract();
+        owner_context();
+        c.create_project("app".to_string(), wasm("https://example.invalid/a.wasm", FORGED));
+    }
+
+    #[test]
+    #[should_panic(expected = "source.commit must be a commit hash")]
+    fn add_version_refuses_a_line_break_in_the_commit() {
+        let mut c = setup_contract();
+        owner_context();
+        c.create_project("app".to_string(), github("github.com/a/b", "main"));
+        c.add_version("app".to_string(), github("github.com/a/b", &format!("x\n{FORGED}")), true);
+    }
+
+    #[test]
+    #[should_panic(expected = "source.hash must be the SHA-256 of the WASM")]
+    fn request_execution_refuses_an_inline_source_with_a_bad_hash() {
+        let mut c = setup_contract();
+        owner_context();
+        c.request_execution(
+            ExecutionSource::WasmUrl {
+                url: "https://example.invalid/a.wasm".to_string(),
+                hash: "EVENT_JSON:{}".to_string(),
+                build_target: None,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// A well-formed source is stored, and no log of the contract starts with
+    /// anything the caller wrote.
+    #[test]
+    fn a_valid_project_is_created_and_its_logs_start_with_the_contracts_words() {
+        let mut c = setup_contract();
+        owner_context();
+        c.create_project("app".to_string(), wasm("https://example.invalid/a.wasm", HASH));
+        c.add_version("app".to_string(), github("github.com/a/b", "main"), false);
+        c.set_active_version("app".to_string(), "github.com/a/b@main".to_string());
+        let project_id = format!("{}/app", accounts(2));
+        assert_eq!(c.get_project(project_id).unwrap().active_version, "github.com/a/b@main");
+        let logs = get_logs();
+        assert!(!logs.is_empty());
+        for log in logs {
+            assert!(
+                log.starts_with("Project created: ")
+                    || log.starts_with("Version added: ")
+                    || log.starts_with("Active version changed: "),
+                "{log}"
+            );
+        }
+    }
+
+    /// `has_project_uuid` follows the project, not its name: true while it
+    /// lives, false once deleted.
+    #[test]
+    fn has_project_uuid_is_true_until_the_project_is_deleted() {
+        let mut c = setup_contract();
+        owner_context();
+        c.create_project("app".to_string(), wasm("https://example.invalid/a.wasm", HASH));
+        let uuid = c.get_project(format!("{}/app", accounts(2))).unwrap().uuid;
+        assert!(c.has_project_uuid(uuid.clone()));
+        assert!(!c.has_project_uuid("p00000000000000ff".to_string()));
+        c.delete_project("app".to_string());
+        assert!(!c.has_project_uuid(uuid));
+    }
+}
+
+/// The storage namespace of a run is the contract's to name.
+#[cfg(test)]
+mod project_uuid_tests {
+    use super::*;
+    use near_sdk::test_utils::get_logs;
+
+    /// The `project_uuid` the contract announces for request 0.
+    fn announced_uuid() -> Option<String> {
+        let log = get_logs()
+            .into_iter()
+            .find(|l| l.starts_with("EVENT_JSON:") && l.contains("execution_requested"))
+            .expect("execution_requested event");
+        let event: serde_json::Value = serde_json::from_str(&log["EVENT_JSON:".len()..]).unwrap();
+        let request_data: serde_json::Value =
+            serde_json::from_str(event["data"][0]["request_data"].as_str().unwrap()).unwrap();
+        request_data["project_uuid"].as_str().map(str::to_string)
+    }
+
+    /// Code given inline runs in no project, whatever uuid the caller names:
+    /// naming another project's uuid would otherwise run the caller's code
+    /// inside that project's storage.
+    #[test]
+    fn an_inline_source_runs_in_no_project_whatever_the_caller_names() {
+        let mut c = setup_contract();
+        testing_env!(get_context(accounts(1), NearToken::from_near(1)).build());
+        c.request_execution(
+            ExecutionSource::GitHub {
+                repo: "https://github.com/eve/app".to_string(),
+                commit: "main".to_string(),
+                build_target: None,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(RequestParams {
+                project_uuid: Some("p0000000000000001".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(announced_uuid(), None);
+    }
+
+    /// A Project source runs in its own uuid, whatever the caller names.
+    #[test]
+    fn a_project_source_runs_in_its_own_uuid() {
+        let mut c = setup_contract();
+        testing_env!(get_context(accounts(2), NearToken::from_near(1)).build());
+        c.create_project(
+            "app".to_string(),
+            CodeSource::GitHub {
+                repo: "github.com/a/b".to_string(),
+                commit: "main".to_string(),
+                build_target: None,
+            },
+        );
+        let project_id = format!("{}/app", accounts(2));
+        let uuid = c.get_project(project_id.clone()).unwrap().uuid;
+        testing_env!(get_context(accounts(1), NearToken::from_near(1)).build());
+        c.request_execution(
+            ExecutionSource::Project { project_id, version_key: None },
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(RequestParams {
+                project_uuid: Some("p00000000000000ff".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(announced_uuid(), Some(uuid));
+    }
+}

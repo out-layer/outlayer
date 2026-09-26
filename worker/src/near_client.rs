@@ -3,7 +3,7 @@ use near_crypto::InMemorySigner;
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_primitives::transaction::{Action, FunctionCallAction, Transaction, TransactionV0};
 use near_primitives::types::{AccountId, Balance, BlockReference, Finality, Gas};
-use near_primitives::views::FinalExecutionOutcomeView;
+use near_primitives::views::{ExecutionStatusView, FinalExecutionOutcomeView};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -57,6 +57,10 @@ impl NearClient {
     /// Extract cost from transaction logs (parses [[yNEAR charged: "..."]] or estimated_cost)
     /// Parses the "Resolving execution" log from contract which contains estimated_cost
     /// Returns 0 if not found (will show as 0 NEAR in dashboard)
+    ///
+    /// Only logs written by the contract the transaction called are read, and
+    /// each marker must START its log: the contract's other logs carry
+    /// caller-supplied text, which may itself contain a marker.
     #[allow(dead_code)]
     pub fn extract_payment_from_logs(outcome: &FinalExecutionOutcomeView) -> u128 {
         // Collect all logs from transaction and receipt outcomes
@@ -64,13 +68,23 @@ impl NearClient {
 
         info!("📋 Extracting estimated_cost from transaction logs...");
 
-        // Logs from transaction itself
-        info!("   Transaction outcome logs: {}", outcome.transaction_outcome.outcome.logs.len());
-        all_logs.extend(outcome.transaction_outcome.outcome.logs.clone());
+        let contract_id = &outcome.transaction.receiver_id;
 
-        // Logs from all receipts
+        // Logs from the receipts the contract executed
         info!("   Receipt outcomes: {}", outcome.receipts_outcome.len());
         for (i, receipt_outcome) in outcome.receipts_outcome.iter().enumerate() {
+            if &receipt_outcome.outcome.executor_id != contract_id {
+                continue;
+            }
+            // A failed receipt keeps its logs and loses its state: nothing it
+            // says was charged.
+            if !matches!(
+                receipt_outcome.outcome.status,
+                ExecutionStatusView::SuccessValue(_) | ExecutionStatusView::SuccessReceiptId(_)
+            ) {
+                info!("   Receipt #{} did not commit; its logs are not read", i);
+                continue;
+            }
             info!("   Receipt #{} executor: {}, logs: {}",
                 i,
                 receipt_outcome.outcome.executor_id,
@@ -94,10 +108,9 @@ impl NearClient {
             info!("   Log #{}: {}", i, head(log, 200));
 
             // Parse log format: [[yNEAR charged: "123456789"]] (exact final cost after refunds)
-            if let Some(start) = log.find("[[yNEAR charged: \"") {
+            if let Some(after_prefix) = log.strip_prefix("[[yNEAR charged: \"") {
                 info!("   ✓ Found '[[yNEAR charged]]' log");
 
-                let after_prefix = &log[start + "[[yNEAR charged: \"".len()..];
                 // Find closing quote
                 if let Some(quote_end) = after_prefix.find('"') {
                     let cost_str = &after_prefix[..quote_end];
@@ -116,7 +129,7 @@ impl NearClient {
             }
 
             // Fallback: Parse "estimated_cost" from resolve_execution log (before callback)
-            if log.contains("Resolving execution") && log.contains("estimated_cost:") {
+            if log.starts_with("Resolving execution") && log.contains("estimated_cost:") {
                 info!("   ✓ Found 'Resolving execution' log with estimated_cost");
 
                 // Extract the cost value using string parsing

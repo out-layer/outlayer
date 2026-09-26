@@ -108,13 +108,17 @@ pub struct DecryptResponse {
     pub plaintext_secrets: String,
 }
 
-/// A `/decrypt` request that names signing keys: the job's secret row, if it
-/// has one, and the keys its artefact declares, answered together.
+/// A `/decrypt` request that names declared keys: the job's secret row, if it
+/// has one, and the signing and encryption keys its artefact declares,
+/// answered together.
 ///
-/// Only a request whose body carries a `signing_keys` member (other than
-/// `null` or `[]`) is read as this; every other request is a [`DecryptRequest`]
-/// and is answered exactly as it always was. `accessor` + `profile` + `owner`
-/// name one secret row, all three or none; `signing_keys` must not be empty.
+/// Only a request whose body carries a `signing_keys` or `encryption_keys`
+/// member (other than `null` or `[]`) is read as this; every other request is
+/// a [`DecryptRequest`] and is answered exactly as it always was. Here too a
+/// `null` list is an empty one, so the other family may be `null`. `accessor` +
+/// `profile` + `owner` name one secret row, all three or none; at least one of
+/// the two key lists must be non-empty. The two lists are two namespaces: the
+/// same path may appear in both, and names two unrelated keys.
 #[derive(Debug, Deserialize)]
 pub struct KeyedDecryptRequest {
     #[serde(default)]
@@ -125,7 +129,7 @@ pub struct KeyedDecryptRequest {
     pub owner: Option<String>,
 
     /// Who requested execution: the account a secret's access condition is
-    /// judged for, and the account every signing key is bound to.
+    /// judged for, and the account every `signer` key is bound to.
     pub user_account_id: String,
     pub task_id: Option<String>,
 
@@ -148,21 +152,46 @@ pub struct KeyedDecryptRequest {
     #[serde(default)]
     pub project_id: Option<String>,
 
-    /// The signing keys the running artefact's manifest declares.
+    /// The signing keys the running artefact's manifest declares. `null` is
+    /// no keys, as an absent member is.
+    #[serde(default, deserialize_with = "null_as_no_keys")]
     pub signing_keys: Vec<crate::signing_keys::SigningKeyRequest>,
+
+    /// The encryption keys the running artefact's manifest declares. `null` is
+    /// no keys, as an absent member is.
+    #[serde(default, deserialize_with = "null_as_no_keys")]
+    pub encryption_keys: Vec<crate::encryption_keys::EncryptionKeyRequest>,
 }
 
-/// The answer to a [`KeyedDecryptRequest`]: two independent parts.
+/// A key list read as the dispatch probe reads it: `null` names no keys.
+fn null_as_no_keys<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// The answer to a [`KeyedDecryptRequest`]: independent parts.
 ///
-/// `signing_keys` is always present — a request whose keys cannot be served is
-/// refused whole, with the `signing_keys_refused` code, and nothing else is
-/// returned. `secrets` is present exactly when the request named a secret row.
+/// `signing_keys` is present exactly when the request named signing keys, and
+/// `encryption_keys` exactly when it named encryption keys — so the answer to
+/// a request naming signing keys alone is the answer it always was. A request
+/// whose keys cannot be served is refused whole, with the
+/// `signing_keys_refused` code, and nothing else is returned. `secrets` is
+/// present exactly when the request named a secret row.
 #[derive(Debug, Serialize)]
 pub struct KeyedDecryptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets: Option<SecretsOutcome>,
     /// One 32-byte signing-key seed per requested key, hex, by key path.
-    pub signing_keys: std::collections::BTreeMap<String, crate::signing_keys::SeedHex>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_keys: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>,
+    /// One 32-byte encryption key per requested encryption key, hex, by key
+    /// path. The key has no type: the worker's host picks the algorithm that
+    /// uses it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption_keys: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>,
 }
 
 /// What became of the secret row a keyed request named.

@@ -397,6 +397,17 @@ pub enum SystemEvent {
         owner: AccountId,
         frozen: bool,
     },
+    /// A project moved to a new owner and so to a new name; its uuid, versions
+    /// and storage stay. Anything that maps a project name to a uuid drops both
+    /// names: the old one is free for a new project, the new one may have been
+    /// looked up while it named nothing.
+    ProjectTransferred {
+        old_project_id: String,
+        new_project_id: String,
+        project_uuid: String,
+        old_owner: AccountId,
+        new_owner: AccountId,
+    },
 }
 
 /// Which plan a payment buys, or `None` if it buys nothing.
@@ -542,7 +553,7 @@ impl Contract {
             }
             Ok(TopUpResult::Error { message }) => {
                 log!(
-                    "TopUp failed: owner={}, nonce={}, error={}",
+                    "TopUp failed: owner={}, nonce={}, error={:?}",
                     owner,
                     nonce,
                     message
@@ -713,7 +724,7 @@ impl Contract {
             }
             Ok(DeletePaymentKeyResult::Error { message }) => {
                 log!(
-                    "DeletePaymentKey failed: owner={}, nonce={}, error={}",
+                    "DeletePaymentKey failed: owner={}, nonce={}, error={:?}",
                     owner,
                     nonce,
                     message

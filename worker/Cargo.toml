@@ -73,7 +73,11 @@ hex = "0.4"
 bs58 = "0.5"
 base64 = "0.22"
 ed25519-dalek = "2.1"
-zeroize = "1.8"  # signing-key seeds are wiped when dropped
+# secp256k1 signing keys: RFC 6979 recoverable ECDSA over a 32-byte prehash; the secret wipes itself when dropped
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+zeroize = "1.8"  # signing-key seeds and encryption keys are wiped when dropped
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }  # encryption keys: XChaCha20-Poly1305
+poly1305 = { version = "0.8", features = ["zeroize"] }  # its per-message key wiped when dropped, as chacha20poly1305 leaves it off
 
 # Utils
 uuid = { version = "1.0", features = ["v4"] }
@@ -86,3 +90,6 @@ dirs = "5.0"
 dstack-sdk = "0.1"
 log = "0.4.28"
 tempfile = "3.10"  # secure temp dir for native compilation (0700 perms + random name)
+
+[dev-dependencies]
+hmac = "0.12"  # reference HMAC-SHA256 the encryption keys' own is checked against

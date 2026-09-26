@@ -937,7 +937,10 @@ sorry we are. Three questions, in order:
      hash, an access key, a nonce — is `chain_unavailable` instead. `broadcast_tx_commit`
      answering `TIMEOUT_ERROR` is the common case: it accepted the transaction
      and ran out of its own polling window, so the transaction is usually on
-     chain. Calling that 503 invites the retry that spends twice.
+     chain. Calling that 503 invites the retry that spends twice. The same holds
+     for a synchronous `/call` whose job is already queued: a database failure
+     while it waits is `internal_error`, never `upstream_unavailable`, because
+     the job may still run and be charged and `/call` takes no idempotency key.
    * It happened and it failed on chain is **422** with the tx hash, never a 5xx.
 2. **Is it the caller's to fix?** Then 4xx, naming the field or the rule. A
    refusal the caller cannot act on is worse than no explanation.

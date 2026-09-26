@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use blstrs::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar};
 use elliptic_curve::{Field as _, Group as _, group::prime::PrimeCurveAffine as _};
 use hkdf::Hkdf;
-use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_jsonrpc_client::methods;
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_primitives::transaction::{Action, FunctionCallAction, Transaction, TransactionV0};
 use near_primitives::types::{AccountId, Balance, BlockReference, Finality, FunctionArgs, Gas};
@@ -150,6 +150,38 @@ impl std::fmt::Display for InsufficientVaultBalance {
 }
 
 impl std::error::Error for InsufficientVaultBalance {}
+
+/// The chain says this keystore may not serve `vault`'s master: the DAO does
+/// not verify it (never verified, or banned — `is_vault_verified` answers
+/// `false` for both), or the vault is unlocked (recovery completed, the parent
+/// holds a FullAccess key). A standing answer about the vault, not a failure
+/// to get one: it holds until the DAO or the vault's owner changes it, so the
+/// HTTP layer can refuse the request by type instead of reporting an outage.
+#[derive(Debug)]
+pub enum VaultNotServable {
+    NotVerified(AccountId),
+    Unlocked(AccountId),
+}
+
+impl std::fmt::Display for VaultNotServable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VaultNotServable::NotVerified(vault) => write!(
+                f,
+                "vault {vault} is not verified on keystore-dao (or has been banned); \
+                 cannot serve per-vault master"
+            ),
+            VaultNotServable::Unlocked(vault) => write!(
+                f,
+                "vault {vault} is unlocked (recovery completed); per-vault master \
+                 cannot be served for unlocked vaults — the customer now \
+                 owns this vault and must derive their own keys directly via MPC"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VaultNotServable {}
 
 /// True iff a broadcast error is a NEAR `NotEnoughBalance` pre-inclusion
 /// rejection (the signer can't cover the tx gas prepayment). Deep-matches the
@@ -294,12 +326,12 @@ pub struct CkdResponse {
 /// adding a third CKD flow can't accidentally inherit the wrong one.
 pub struct MpcCkdClient {
     config: MpcCkdConfig,
-    rpc_client: JsonRpcClient,
+    rpc_client: crate::near::RpcClient,
     /// Separate, far more patient client for the CKD broadcast. The derivation result comes
     /// back as the transaction's own `SuccessValue`, so the request stays open until the MPC
     /// nodes resume the yielded receipt — cutting it short would abandon a transaction that
     /// is already on-chain. Queries keep the fast client above: they sit on the signing path.
-    rpc_client_tx: JsonRpcClient,
+    rpc_client_tx: crate::near::RpcClient,
 }
 
 impl MpcCkdClient {
@@ -1165,13 +1197,15 @@ pub async fn add_customer(
 ///   * `customer = None` ⇒ no-op (legacy default-master path).
 ///   * `customer = Some(c)`:
 ///     1. View-call `keystore-dao.is_vault_verified(c)` — `false` for
-///        unverified AND banned vaults. Evicts cache + bails.
+///        unverified AND banned vaults. Evicts cache and fails with
+///        [`VaultNotServable::NotVerified`].
 ///     2. View-call `c.get_state()` and require `unlocked == false`.
 ///        A vault that went through `finalize_recovery` is now under
 ///        parent control; the DAO's `verified_vaults` set isn't
 ///        auto-updated, so without this recheck the worker would keep
 ///        deriving for a vault whose trust model has dropped to
-///        "parent has FullAccess". Evicts cache + bails.
+///        "parent has FullAccess". Evicts cache and fails with
+///        [`VaultNotServable::Unlocked`].
 ///     3. If both checks pass, take the per-vault load lock + call
 ///        [`add_customer`] to populate the cache.
 ///
@@ -1220,6 +1254,9 @@ pub async fn ensure_customer_loaded(
 /// 2. `vault_id.get_state().unlocked == false` — vaults under parent
 ///    FullAccess (post-recovery) are no longer TEE-controlled. We must
 ///    refuse to derive new addresses or sign operations against them.
+///
+/// Either answer failing its check is a [`VaultNotServable`]; a read that
+/// could not be made, or an answer of the wrong shape, is a plain error.
 ///
 /// On unlocked detection we proactively evict the cached master so
 /// subsequent calls don't even reach the cache check; the next attempt
@@ -1281,11 +1318,7 @@ async fn assert_serving_allowed(
     if !verified {
         // Drop any cached master — vault was banned or de-verified.
         keystore.evict_customer(vault_id);
-        anyhow::bail!(
-            "vault {} is not verified on keystore-dao (or has been banned); \
-             cannot serve per-vault master",
-            vault_id
-        );
+        return Err(VaultNotServable::NotVerified(vault_id.clone()).into());
     }
 
     // get_state can fail for two distinct reasons:
@@ -1358,12 +1391,7 @@ async fn assert_serving_allowed(
         })?;
     if unlocked {
         keystore.evict_customer(vault_id);
-        anyhow::bail!(
-            "vault {} is unlocked (recovery completed); per-vault master \
-             cannot be served for unlocked vaults — the customer now \
-             owns this vault and must derive their own keys directly via MPC",
-            vault_id
-        );
+        return Err(VaultNotServable::Unlocked(vault_id.clone()).into());
     }
 
     Ok(())
@@ -1625,6 +1653,43 @@ mod tests {
             !ks.has_customer(&v),
             "a de-verified vault must have its cached master evicted"
         );
+    }
+
+    /// The gate's two refusals are typed, so the HTTP layer refuses by type and
+    /// never by reading the message; a read that could not be made is not one
+    /// of them.
+    #[tokio::test]
+    async fn the_gates_refusals_are_typed_and_its_outages_are_not() {
+        let dao = vault("dao.testnet");
+        let v = vault("vault.alice.testnet");
+
+        let (url, _s) = fake_rpc(
+            std::time::Duration::ZERO,
+            vec![("is_vault_verified", "false"), ("get_state", r#"{"unlocked":false}"#)],
+        );
+        let near_client = crate::near::NearClient::new(&url, "dao.testnet").unwrap();
+        let err = assert_serving_allowed(&near_client, &dao, &v, &Keystore::generate()).await.unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<VaultNotServable>(), Some(VaultNotServable::NotVerified(x)) if x == &v),
+            "{err:#}"
+        );
+
+        let (url, _s) = fake_rpc(
+            std::time::Duration::ZERO,
+            vec![("is_vault_verified", "true"), ("get_state", r#"{"unlocked":true}"#)],
+        );
+        let near_client = crate::near::NearClient::new(&url, "dao.testnet").unwrap();
+        let err = assert_serving_allowed(&near_client, &dao, &v, &Keystore::generate()).await.unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<VaultNotServable>(), Some(VaultNotServable::Unlocked(x)) if x == &v),
+            "{err:#}"
+        );
+
+        // A DAO that does not answer `is_vault_verified` (the fake serves a 400).
+        let (url, _s) = fake_rpc(std::time::Duration::ZERO, vec![("get_state", r#"{"unlocked":false}"#)]);
+        let near_client = crate::near::NearClient::new(&url, "dao.testnet").unwrap();
+        let err = assert_serving_allowed(&near_client, &dao, &v, &Keystore::generate()).await.unwrap_err();
+        assert!(err.downcast_ref::<VaultNotServable>().is_none(), "{err:#}");
     }
 
     /// Garbage in, refusal out — never a guess. A response that is not the exact shape the

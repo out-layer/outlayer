@@ -79,14 +79,12 @@ fn test_checksum_computation() {
 
 #[test]
 fn test_event_json_parsing() {
-    use regex::Regex;
+    use offchainvm_worker::event_monitor::event_json_payload;
     use serde_json::Value;
 
     let log = r#"EVENT_JSON:{"standard":"near-outlayer","version":"1.0.0","event":"execution_requested","data":[{"request_data":"{}","data_id":[1,2,3],"timestamp":123}]}"#;
 
-    let regex = Regex::new(r"EVENT_JSON:(.*?)$").unwrap();
-    let captures = regex.captures(log).unwrap();
-    let event_json = captures.get(1).unwrap().as_str();
+    let event_json = event_json_payload(log).unwrap();
 
     let event: Value = serde_json::from_str(event_json).unwrap();
 

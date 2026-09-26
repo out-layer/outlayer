@@ -482,6 +482,47 @@ fn seed_for_log(seed: &str) -> String {
     }
 }
 
+/// The roots of the two families derived only for the keys a job's manifest
+/// declares (`crate::signing_keys`, `crate::encryption_keys`), version
+/// included in neither so a later scheme is covered too.
+pub(crate) const DECLARED_KEY_ROOTS: [&str; 2] = ["signing-key:", "encryption-key:"];
+
+/// Refuse a seed a caller spells when it starts at a declared-key root.
+///
+/// `/pubkey`, `/encrypt` and `/add_generated_secret` derive from the seed they
+/// are sent — a secret's seed, `repo:owner[:branch]` and its siblings, none of
+/// which starts at either root. One that did would spell a declared key's
+/// derivation string.
+fn refuse_declared_key_seed(seed: &str) -> Result<(), ApiError> {
+    match DECLARED_KEY_ROOTS.iter().find(|root| seed.starts_with(**root)) {
+        Some(root) => Err(ApiError::BadRequest(format!(
+            "a seed cannot start with `{root}`: that root is reserved for the keys a job's manifest declares"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The first segment of a `Repo` accessor's seed: its normalized repo.
+///
+/// The seed is `{repo}:{owner}[:{branch}]` with the repo as the caller wrote it
+/// less its scheme and `.git`, so a repo whose `{repo}:` starts at a
+/// declared-key root (`signing-key`, or `encryption-key:v1:project`), with owner
+/// and branch to match, would spell a declared key's derivation string. A
+/// repository URL never does; such a repo is refused, every other one is
+/// returned as `normalize_repo_url` gives it.
+fn repo_seed_root(repo: &str) -> Result<String, ApiError> {
+    let normalized = crate::utils::normalize_repo_url(repo);
+    let seed_start = format!("{normalized}:");
+    match DECLARED_KEY_ROOTS.iter().find(|root| seed_start.starts_with(**root)) {
+        Some(root) => Err(ApiError::BadRequest(format!(
+            "`{}` is not a repository URL: a repo cannot start with `{root}`, a root reserved for \
+             the keys a job's manifest declares",
+            seed_for_log(&normalized)
+        ))),
+        None => Ok(normalized),
+    }
+}
+
 /// API error types
 #[derive(Debug)]
 pub enum ApiError {
@@ -512,20 +553,32 @@ pub enum ApiError {
     /// "send NEAR and it will work" would be a remedy we cannot know applies.
     ChainRefused(String),
     InternalError(String),
+    /// This instance cannot serve the request at this moment, and the same
+    /// request can succeed when made again: HTTP 503. A condition of the
+    /// keystore's own memory, never a verdict on the request — no refusal
+    /// code, nothing for the author or caller to change.
+    Unavailable(String),
     /// The secret row a `/decrypt` request names is not on the contract. On the
     /// wire it is a 400 with the message, byte for byte what `BadRequest`
     /// answers — the answer the worker has always run on without secrets. Its
     /// own variant so that a keyed request reports this outcome beside the keys
     /// by type, and no other 400 is mistaken for it.
     SecretsNotFound(String),
-    /// The signing keys a `/decrypt` request names cannot be served: a field,
-    /// the project or build, or a vault. Answered with its status and the code
-    /// `signing_keys_refused`, so the worker can tell it from a secret's
-    /// refusal and from a keystore that could not answer.
+    /// The declared keys a `/decrypt` request names — signing keys, encryption
+    /// keys, or both — cannot be served: a field, the project or build, or a
+    /// vault. Answered with its status and the code `signing_keys_refused`,
+    /// so the worker can tell it from a secret's refusal and from a keystore
+    /// that could not answer.
+    ///
+    /// One code for both families, on purpose: a keyed request is judged
+    /// whole — the project and vault checks are shared by every key it names —
+    /// so a refusal belongs to the request, not to a family, and the message
+    /// says which keys it concerns. The code is the one workers already read.
     SigningKeysRefused(StatusCode, String),
 }
 
-/// The `code` of a refused signing-key request.
+/// The `code` of a refused keyed request, whichever family the refused keys
+/// belong to.
 pub(crate) const SIGNING_KEYS_REFUSED: &str = "signing_keys_refused";
 
 impl ApiError {
@@ -538,6 +591,7 @@ impl ApiError {
             | ApiError::PaymentRequired(m)
             | ApiError::ChainRefused(m)
             | ApiError::InternalError(m)
+            | ApiError::Unavailable(m)
             | ApiError::SecretsNotFound(m)
             | ApiError::SigningKeysRefused(_, m) => m,
         }
@@ -571,6 +625,7 @@ impl IntoResponse for ApiError {
             // own remedy.
             ApiError::ChainRefused(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             ApiError::SigningKeysRefused(status, msg) => {
                 return (status, Json(serde_json::json!({"error": msg, "code": SIGNING_KEYS_REFUSED})))
                     .into_response()
@@ -832,6 +887,8 @@ async fn pubkey_handler(
         )));
     }
 
+    refuse_declared_key_seed(&req.seed)?;
+
     // 2. Generate public key for encryption
     // Route through per-vault master if vault_id is set in
     // the request body. We use body-based extraction here (not the
@@ -1007,13 +1064,14 @@ fn enforce_agent_secret(caller: &str, owner: &str, profile: &str) -> Result<(), 
 
 
 /// Decrypt secrets from contract for authorized TEE worker — and, for a request
-/// that names them, derive the job's signing keys in the same answer.
+/// that names them, derive the job's signing and encryption keys in the same
+/// answer.
 ///
 /// Which of the two a request is, is decided on its body before either shape is
-/// parsed: a body with a `signing_keys` member other than `null` or `[]` is a
-/// [`KeyedDecryptRequest`]; every other body is a [`DecryptRequest`], read by
-/// the same extractor as always, so its answer — status, body, and every
-/// rejection — is the answer it always got.
+/// parsed: a body with a `signing_keys` or `encryption_keys` member other than
+/// `null` or `[]` is a [`KeyedDecryptRequest`]; every other body is a
+/// [`DecryptRequest`], read by the same extractor as always, so its answer —
+/// status, body, and every rejection — is the answer it always got.
 async fn decrypt_handler(
     State(state): State<AppState>,
     worker: Option<axum::Extension<WorkerIdentity>>,
@@ -1035,7 +1093,7 @@ async fn decrypt_handler(
     };
     match body_shape(&bytes) {
         BodyShape::Keyed => match Json::<KeyedDecryptRequest>::from_bytes(&bytes) {
-            Ok(Json(req)) => decrypt_with_signing_keys(state, worker, req).await.into_response(),
+            Ok(Json(req)) => decrypt_with_keys(state, worker, req).await.into_response(),
             Err(rejection) => rejection.into_response(),
         },
         BodyShape::SecretsOnly => match Json::<DecryptRequest>::from_bytes(&bytes) {
@@ -1046,8 +1104,8 @@ async fn decrypt_handler(
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": format!(
-                    "the request body cannot be read as either a secrets request or a signing-key request: \
-                     {reason}. A body names `signing_keys` at most once."
+                    "the request body cannot be read as either a secrets request or a keyed request: \
+                     {reason}. A body names each of `signing_keys` and `encryption_keys` at most once."
                 )
             })),
         )
@@ -1073,13 +1131,14 @@ fn json_content_type(headers: &axum::http::HeaderMap) -> bool {
 
 /// Which request a `/decrypt` body is.
 enum BodyShape {
-    /// A `signing_keys` member other than `null` or an empty array.
+    /// A `signing_keys` or `encryption_keys` member other than `null` or an
+    /// empty array.
     Keyed,
     /// No such member — or not a JSON object at all, or not JSON: the
     /// secrets-only extractor answers it as it always has.
     SecretsOnly,
-    /// A JSON object the probe could not read as data — `signing_keys` named
-    /// twice. Neither parser is trusted with it: a duplicate member is read
+    /// A JSON object the probe could not read as data — `signing_keys` or
+    /// `encryption_keys` named twice. Neither parser is trusted with it: a duplicate member is read
     /// differently by different readers, so which shape the body "is" would
     /// depend on which reader looked. Refused with the reason.
     Ambiguous(String),
@@ -1090,16 +1149,23 @@ fn body_shape(body: &[u8]) -> BodyShape {
     struct Probe {
         #[serde(default)]
         signing_keys: Option<serde_json::Value>,
+        #[serde(default)]
+        encryption_keys: Option<serde_json::Value>,
+    }
+    /// Absent, `null` or `[]`: names no key.
+    fn names_keys(member: &Option<serde_json::Value>) -> bool {
+        match member {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Array(a)) => !a.is_empty(),
+            Some(_) => true,
+        }
     }
     match serde_json::from_slice::<Probe>(body) {
-        Ok(Probe { signing_keys: Some(serde_json::Value::Array(a)) }) if a.is_empty() => BodyShape::SecretsOnly,
-        Ok(Probe { signing_keys: Some(serde_json::Value::Null) }) | Ok(Probe { signing_keys: None }) => {
-            BodyShape::SecretsOnly
-        }
-        Ok(Probe { signing_keys: Some(_) }) => BodyShape::Keyed,
-        // A data error on a well-formed object is the probe's one field named
-        // more than once; a data error on anything else (an array, a string) is
-        // the extractor's to refuse, as it always did.
+        Ok(probe) if names_keys(&probe.signing_keys) || names_keys(&probe.encryption_keys) => BodyShape::Keyed,
+        Ok(_) => BodyShape::SecretsOnly,
+        // A data error on a well-formed object is one of the probe's fields
+        // named more than once; a data error on anything else (an array, a
+        // string) is the extractor's to refuse, as it always did.
         Err(e) if e.classify() == serde_json::error::Category::Data && is_json_object(body) => {
             BodyShape::Ambiguous(e.to_string())
         }
@@ -1154,20 +1220,21 @@ async fn decrypt_secrets_only(
     Ok(Json(DecryptResponse { plaintext_secrets }))
 }
 
-/// A request that names signing keys, and the job's secret row if it has one.
+/// A request that names declared keys — signing, encryption, or both — and
+/// the job's secret row if it has one.
 ///
 /// The two are judged independently, and neither decides for the other: the
-/// keys by [`authorize_signing_keys`] (every key's binding against how the job
-/// was started, the job's project and build on the contract, the vaults'
-/// owner), the row by its own access condition, exactly as for a secrets-only
-/// request. The keys are judged first and in full; a
-/// refusal answers the whole request with the `signing_keys_refused` code
-/// before the row is read, so no secret leaves beside a refused key. Then the
-/// row: an outcome that would let the run continue without secrets is reported
-/// in `secrets` and the keys still come back; any other failure of the row
-/// fails the request with the same status and message a secrets-only request
-/// gets. Only then are the seeds derived.
-async fn decrypt_with_signing_keys(
+/// keys by [`authorize_keys`] (every key's binding against how the job was
+/// started, the job's project and build on the contract, the vaults' owner),
+/// the row by its own access condition, exactly as for a secrets-only request.
+/// The keys are judged first and in full, both families together; a refusal
+/// answers the whole request with the `signing_keys_refused` code before the
+/// row is read, so no secret leaves beside a refused key. Then the row: an
+/// outcome that would let the run continue without secrets is reported in
+/// `secrets` and the keys still come back; any other failure of the row fails
+/// the request with the same status and message a secrets-only request gets.
+/// Only then are the keys derived.
+async fn decrypt_with_keys(
     state: AppState,
     worker: Option<axum::Extension<WorkerIdentity>>,
     req: KeyedDecryptRequest,
@@ -1192,20 +1259,20 @@ async fn decrypt_with_signing_keys(
         _ => {
             return Err(ApiError::BadRequest(
                 "accessor, profile and owner name one secret row together: send all three, or none \
-                 for a request that only derives signing keys"
+                 for a request that only derives keys"
                     .to_string(),
             ))
         }
     };
 
-    let bound = authorize_signing_keys(&state, &req).await.inspect_err(|e| {
+    let authorized = authorize_keys(&state, &req).await.inspect_err(|e| {
         tracing::warn!(
             task_id = %task_id_str,
             worker = %worker_key,
             project_id = ?req.project_id.as_deref().map(seed_for_log),
             caller = %seed_for_log(&req.user_account_id),
             predecessor = ?req.predecessor_id.as_deref().map(seed_for_log),
-            "Signing keys refused: {}",
+            "Declared keys refused: {}",
             crate::signing_keys::bounded(e.message(), crate::signing_keys::MOST_QUOTED_ERROR)
         );
     })?;
@@ -1216,38 +1283,52 @@ async fn decrypt_with_signing_keys(
             Ok(plaintext_secrets) => SecretsOutcome::Decrypted { plaintext_secrets },
             // The one refusal the worker runs on past, reported beside the keys.
             Err(ApiError::SecretsNotFound(error)) => {
-                tracing::info!(task_id = %task_id_str, "Secret row reported as not found beside the signing keys");
+                tracing::info!(task_id = %task_id_str, "Secret row reported as not found beside the declared keys");
                 SecretsOutcome::NotFound { error }
             }
             Err(e) => return Err(e),
         }),
     };
 
-    let signing_keys = derive_signing_keys(&state, &bound).await?;
+    let signing_keys = match &authorized.signing {
+        Some(bound) => Some(derive_keys(&state, bound, &authorized.what).await?),
+        None => None,
+    };
+    let encryption_keys = match &authorized.encryption {
+        Some(bound) => Some(derive_keys(&state, bound, &authorized.what).await?),
+        None => None,
+    };
+    let described = |bound: &Option<crate::signing_keys::BoundKeys>| {
+        bound
+            .iter()
+            .flat_map(|b| b.keys.iter())
+            .map(|k| {
+                format!(
+                    "{}({}, bind={}, caller={}={}, vault={})",
+                    k.path.as_str(),
+                    k.kind.label(),
+                    k.bind.label(),
+                    k.caller.label(),
+                    k.account,
+                    k.vault.as_ref().map(|v| v.as_str()).unwrap_or("default")
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let run = authorized.run();
     tracing::info!(
         task_id = %task_id_str,
         worker = %worker_key,
-        project_id = ?bound.project.as_ref().map(|p| p.id.as_str()),
-        project_uuid = ?bound.project.as_ref().map(|p| p.uuid.as_str()),
-        executed_wasm_sha256 = %bound.wasm_sha256.as_str(),
-        signer = %bound.signer,
-        predecessor = ?bound.predecessor.as_ref().map(|p| p.as_str()),
-        signing_keys = ?bound
-            .keys
-            .iter()
-            .map(|k| format!(
-                "{}({}, bind={}, caller={}={}, vault={})",
-                k.path.as_str(),
-                k.key_type.label(),
-                k.bind.label(),
-                k.caller.label(),
-                k.account,
-                k.vault.as_ref().map(|v| v.as_str()).unwrap_or("default")
-            ))
-            .collect::<Vec<_>>(),
-        "Signing keys derived"
+        project_id = ?run.project.as_ref().map(|p| p.id.as_str()),
+        project_uuid = ?run.project.as_ref().map(|p| p.uuid.as_str()),
+        executed_wasm_sha256 = %run.wasm_sha256.as_str(),
+        signer = %run.signer,
+        predecessor = ?run.predecessor.as_ref().map(|p| p.as_str()),
+        signing_keys = ?described(&authorized.signing),
+        encryption_keys = ?described(&authorized.encryption),
+        "Declared keys derived"
     );
-    Ok(Json(KeyedDecryptResponse { secrets, signing_keys }))
+    Ok(Json(KeyedDecryptResponse { secrets, signing_keys, encryption_keys }))
 }
 
 /// One secret row, as a `/decrypt` request names it, with the facts of the run
@@ -1461,7 +1542,7 @@ async fn decrypt_secret_row(
     // computed seed) without exposing any cryptographic material.
     let seed = match row.accessor {
         SecretAccessor::Repo { repo, branch: request_branch } => {
-            let normalized_repo = crate::utils::normalize_repo_url(repo);
+            let normalized_repo = repo_seed_root(repo)?;
             // The contract's `SecretProfileView`
             // does NOT have a top-level `branch` field — branch is
             // nested inside `accessor.Repo.branch`. Reading
@@ -1588,39 +1669,91 @@ async fn decrypt_secret_row(
     Ok(plaintext_b64)
 }
 
-/// The seeds of keys that passed [`authorize_signing_keys`], by path. Never
-/// cached here; the seeds leave in the response and nowhere else.
-async fn derive_signing_keys(
+/// The keys of one family that passed [`authorize_keys`], by path: seeds of
+/// signing keys, or encryption keys. Never cached here; they leave in the
+/// response and nowhere else.
+async fn derive_keys(
     state: &AppState,
     bound: &crate::signing_keys::BoundKeys,
+    what: &str,
 ) -> Result<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>, ApiError> {
+    use crate::signing_keys::KeyFamily;
     let keystore = state.keystore.read().await;
     let mut out = std::collections::BTreeMap::new();
     for key in &bound.keys {
         // A vault evicted since it was checked fails here — never the default
-        // master in its place.
-        let seed = keystore.derive_signing_key_seed(key.vault.as_ref(), &key.input).map_err(|e| {
+        // master in its place. That is a race with the eviction, not a verdict
+        // on the request: [`authorize_keys`] passed this vault moments ago, and
+        // the same request loads it again. So a 503 the run can retry, and no
+        // refusal code.
+        let derived = match bound.family {
+            KeyFamily::Signing => keystore.derive_signing_key_seed(key.vault.as_ref(), &key.input),
+            KeyFamily::Encryption => keystore.derive_encryption_key(key.vault.as_ref(), &key.input),
+        };
+        let secret = derived.map_err(|e| {
+            if let Some(crate::crypto::VaultMasterNotLoaded(vault)) = e.downcast_ref() {
+                tracing::warn!(vault = %vault, path = %key.path.as_str(), "{what}: vault master unloaded between the checks and the derivation");
+                return ApiError::Unavailable(format!(
+                    "{what}: the master of vault {vault} was unloaded while the request was served; \
+                     the same request loads it again"
+                ));
+            }
             ApiError::SigningKeysRefused(
                 StatusCode::BAD_REQUEST,
-                format!("Signing keys refused: key {:?} could not be derived: {e}", key.path.as_str()),
+                format!("{what} refused: {} {:?} could not be derived: {e}", bound.family.noun(), key.path.as_str()),
             )
         })?;
-        out.insert(key.path.as_str().to_string(), crate::signing_keys::SeedHex::from_seed(&seed));
+        out.insert(key.path.as_str().to_string(), crate::signing_keys::SeedHex::from_seed(&secret));
     }
     Ok(out)
 }
 
-/// Every check a signing-key request must pass before anything is derived.
+/// The keys of a keyed request that passed [`authorize_keys`], by family:
+/// each present exactly when the request named keys of that family.
+struct AuthorizedKeys {
+    signing: Option<crate::signing_keys::BoundKeys>,
+    encryption: Option<crate::signing_keys::BoundKeys>,
+    /// How refusals and log lines name the keys of this request: "Signing
+    /// keys", "Encryption keys", or both.
+    what: String,
+}
+
+impl AuthorizedKeys {
+    /// The run's facts, which every family's keys carry alike.
+    fn run(&self) -> &crate::signing_keys::BoundKeys {
+        self.signing
+            .as_ref()
+            .or(self.encryption.as_ref())
+            .expect("authorize_keys refuses a request that names no keys")
+    }
+}
+
+/// How a refusal names the keys a request carries.
+fn keys_named(req: &KeyedDecryptRequest) -> &'static str {
+    match (req.signing_keys.is_empty(), req.encryption_keys.is_empty()) {
+        (false, true) => "Signing keys",
+        (true, false) => "Encryption keys",
+        (false, false) => "Signing and encryption keys",
+        (true, true) => "Keys",
+    }
+}
+
+/// Every check a keyed request must pass before anything is derived — for the
+/// signing keys and the encryption keys it names, together.
 ///
-/// 1. The fields: [`crate::signing_keys::validate_request`] — every key's
-///    binding against the run (`project` keys only with a `project_id`, `wasm`
-///    keys only without one), the shapes that keep `:` out of every segment,
-///    the count, the build hash, the signer and predecessor, no vault on a
-///    `wasm` key. A direct run ends here: its `wasm` keys are bound to the
-///    hash the worker reports, the same trust a `WasmHash` access condition on
-///    a secret gives it (`types.rs`, `RunFacts::executed_wasm_sha256`).
+/// 1. The fields, each family on its own:
+///    [`crate::signing_keys::validate_request`] — every key's binding against
+///    the run (`project` keys only with a `project_id`, `wasm` keys only
+///    without one), the shapes that keep `:` out of every segment, the count
+///    (per family), the build hash, the signer and predecessor, no vault on a
+///    `wasm` key. A request naming no key of either family is refused. A
+///    direct run ends here: its `wasm` keys are bound to the hash the worker
+///    reports, the same trust a `WasmHash` access condition on a secret gives
+///    it (`types.rs`, `RunFacts::executed_wasm_sha256`).
 /// 2. The project, for a project run — two reads of the contract, made
-///    together since both are needed:
+///    together since both are needed, made once for both families, and made
+///    at ONE final block ([`project_at_one_block`]) so both describe the same
+///    project:
 ///    * `get_version(project_id, executed_wasm_sha256)`: the build the worker
 ///      measured on the bytes it is about to run must be a version of the
 ///      project whose source is a `WasmUrl` with that hash. A job cannot name
@@ -1634,66 +1767,97 @@ async fn derive_signing_keys(
 ///      again under the same name is another project with another uuid, and a
 ///      cache would hand the new project the old one's keys for as long as the
 ///      entry lived.
-/// 3. Each vault a key names: it is a direct sub-account of the project's
-///    owner ([`crate::signing_keys::vault_is_named_under`]) — decided on the
-///    names alone, BEFORE the vault is read, so a vault that is not the owner's
-///    costs no RPC — then its own `get_state` names that owner as its parent
-///    ([`crate::signing_keys::vault_belongs_to`]), checked BEFORE the vault's
-///    master is loaded — a first load is paid for by the vault — and then it is
-///    loaded through the same gate as every per-vault operation (verified on
-///    the DAO, not unlocked). What the chain or the keystore SAYS about the
-///    vault — another parent, not verified, unlocked, underfunded (402) —
-///    refuses the request; a chain that could not be asked, or a master that
-///    could not be loaded for any other reason, is `InternalError` — the
-///    keystore's own outage, as for `get_version` and `get_project` — since
-///    nothing the author or caller does clears it. Either way the default
-///    master is never used for a key that names a vault.
+/// 3. Each vault a key of either family names: it is a direct sub-account of
+///    the project's owner ([`crate::signing_keys::vault_is_named_under`]) —
+///    decided on the names alone, BEFORE the vault is read, so a vault that is
+///    not the owner's costs no RPC — then its own `get_state` names that owner
+///    as its parent ([`crate::signing_keys::vault_belongs_to`]), checked
+///    BEFORE the vault's master is loaded — a first load is paid for by the
+///    vault — and then it is loaded through the same gate as every per-vault
+///    operation (verified on the DAO, not unlocked). What the chain SAYS
+///    about the vault refuses the request with the refusal code: another
+///    parent, not verified on the DAO or banned, unlocked — 403, each a
+///    standing answer the author or the vault's owner changes, told apart by
+///    type ([`crate::mpc_ckd::VaultNotServable`]), never by message; too poor
+///    to pay for its first load — 402. A chain that could not be asked, or a
+///    master that could not be loaded for any other reason, is
+///    `InternalError` — the keystore's own outage, as for `get_version` and
+///    `get_project` — since nothing the author or caller does clears it.
+///    Either way the default master is never used for a key that names a
+///    vault; a vault whose master leaves memory after these checks fails the
+///    derivation in [`derive_keys`] with a 503, not a refusal.
 ///
 /// Text from the RPC or the contract never reaches a message or a log line
 /// whole: it is cut to [`crate::signing_keys::MOST_QUOTED_ERROR`] characters.
-async fn authorize_signing_keys(
-    state: &AppState,
-    req: &KeyedDecryptRequest,
-) -> Result<crate::signing_keys::BoundKeys, ApiError> {
+async fn authorize_keys(state: &AppState, req: &KeyedDecryptRequest) -> Result<AuthorizedKeys, ApiError> {
     use crate::signing_keys::{bounded, MOST_QUOTED_ERROR};
 
-    let validated = crate::signing_keys::validate_request(
-        req.project_id.as_deref(),
-        &req.user_account_id,
-        req.predecessor_id.as_deref(),
-        req.executed_wasm_sha256.as_deref(),
-        &req.signing_keys,
-    )
-    .map_err(|m| ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("Signing keys refused: {m}")))?;
+    let what = keys_named(req);
+    let refused = |status: StatusCode, m: String| ApiError::SigningKeysRefused(status, format!("{what} refused: {m}"));
 
-    let Some(project) = validated.project.clone() else {
-        return validated.bind(None).map_err(|m| {
-            ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("Signing keys refused: {m}"))
-        });
+    let validate = |family: &str, result: Result<crate::signing_keys::ValidatedKeys, String>| {
+        result.map_err(|m| ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("{family} refused: {m}")))
+    };
+    let signing = if req.signing_keys.is_empty() {
+        None
+    } else {
+        Some(validate(
+            "Signing keys",
+            crate::signing_keys::validate_request(
+                req.project_id.as_deref(),
+                &req.user_account_id,
+                req.predecessor_id.as_deref(),
+                req.executed_wasm_sha256.as_deref(),
+                &req.signing_keys,
+            ),
+        )?)
+    };
+    let encryption = if req.encryption_keys.is_empty() {
+        None
+    } else {
+        Some(validate(
+            "Encryption keys",
+            crate::signing_keys::validate_request(
+                req.project_id.as_deref(),
+                &req.user_account_id,
+                req.predecessor_id.as_deref(),
+                req.executed_wasm_sha256.as_deref(),
+                &req.encryption_keys,
+            ),
+        )?)
+    };
+    let Some(first) = signing.as_ref().or(encryption.as_ref()) else {
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            "the request names neither signing_keys nor encryption_keys".to_string(),
+        ));
+    };
+    let bind_all = |uuid: Option<crate::signing_keys::ProjectUuid>| -> Result<AuthorizedKeys, ApiError> {
+        let bind = |v: Option<crate::signing_keys::ValidatedKeys>| {
+            v.map(|v| v.bind(uuid.clone())).transpose().map_err(|m| refused(StatusCode::BAD_REQUEST, m))
+        };
+        Ok(AuthorizedKeys { signing: bind(signing.clone())?, encryption: bind(encryption.clone())?, what: what.to_string() })
+    };
+
+    let Some(project) = first.project.clone() else {
+        return bind_all(None);
     };
     let near_client = state
         .near_client
         .as_ref()
         .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
     let project_id = project.as_str();
-    let wasm = validated.wasm_sha256.as_str();
+    let wasm = first.wasm_sha256.as_str();
 
-    let (version, project_view) = tokio::join!(
-        near_client.view_call_json(
-            near_client.contract_id(),
-            "get_version",
-            serde_json::json!({ "project_id": project_id, "version_key": wasm }),
-        ),
-        near_client.view_call_json(near_client.contract_id(), "get_project", serde_json::json!({ "project_id": project_id })),
-    );
+    let (version, project_view) = project_at_one_block(near_client, project_id, wasm).await;
     let version = version.map_err(|e| {
         let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
-        tracing::warn!(project_id = %project_id, "Signing keys: the project version could not be read: {said}");
-        ApiError::InternalError(format!("Signing keys: the project version could not be read: {said}"))
+        tracing::warn!(project_id = %project_id, "{what}: the project version could not be read: {said}");
+        ApiError::InternalError(format!("{what}: the project version could not be read: {said}"))
     })?;
     if !project_version_matches(&version, wasm) {
-        return Err(ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!(
-            "Signing keys refused: the running build (sha256 {wasm}) is not a WasmUrl version of \
+        return Err(refused(StatusCode::FORBIDDEN, format!(
+            "the running build (sha256 {wasm}) is not a WasmUrl version of \
              project {project_id} on the contract. A project run gets keys only when its code is \
              published under the project as a WasmUrl version whose hash is this build's; a version \
              built from a GitHub repository gets none."
@@ -1701,19 +1865,22 @@ async fn authorize_signing_keys(
     }
     let project_view = project_view.map_err(|e| {
         let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
-        tracing::warn!(project_id = %project_id, "Signing keys: the project could not be read: {said}");
-        ApiError::InternalError(format!("Signing keys: the project could not be read: {said}"))
+        tracing::warn!(project_id = %project_id, "{what}: the project could not be read: {said}");
+        ApiError::InternalError(format!("{what}: the project could not be read: {said}"))
     })?;
-    let owner = project_owner(&project_view, &project)
-        .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
-    let uuid = project_uuid(&project_view, &project)
-        .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
+    let owner = project_owner(&project_view, &project).map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
+    let uuid = project_uuid(&project_view, &project).map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
 
-    let vaults = validated.vaults();
+    // The distinct vaults both families name, in first-seen order.
+    let mut vaults: Vec<near_primitives::types::AccountId> = Vec::new();
+    for vault in signing.iter().chain(encryption.iter()).flat_map(|v| v.vaults()) {
+        if !vaults.contains(&vault) {
+            vaults.push(vault);
+        }
+    }
     // Every vault's name against the owner's, before any vault is read.
     for vault in &vaults {
-        crate::signing_keys::vault_is_named_under(&owner, vault)
-            .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
+        crate::signing_keys::vault_is_named_under(&owner, vault).map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
     }
     for vault in &vaults {
         let vault_state = near_client
@@ -1721,32 +1888,83 @@ async fn authorize_signing_keys(
             .await
             .map_err(|e| {
                 let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
-                tracing::warn!(vault = %vault, "Signing keys: vault could not be read: {said}");
+                tracing::warn!(vault = %vault, "{what}: vault could not be read: {said}");
                 ApiError::InternalError(format!(
-                    "Signing keys: vault {vault} could not be read, so its owner cannot be established: {said}"
+                    "{what}: vault {vault} could not be read, so its owner cannot be established: {said}"
                 ))
             })?;
         crate::signing_keys::vault_belongs_to(&owner, vault, &vault_state)
-            .map_err(|m| ApiError::SigningKeysRefused(StatusCode::FORBIDDEN, format!("Signing keys refused: {m}")))?;
+            .map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
     }
     for vault in &vaults {
         state
             .ensure_customer_loaded(Some(vault))
             .await
-            .map_err(|e| match ApiError::from_customer_load(e) {
-                ApiError::PaymentRequired(m) => {
-                    ApiError::SigningKeysRefused(StatusCode::PAYMENT_REQUIRED, format!("Signing keys refused: {m}"))
+            .map_err(|e| {
+                if let Some(not_servable) = e.downcast_ref::<crate::mpc_ckd::VaultNotServable>() {
+                    return refused(StatusCode::FORBIDDEN, not_servable.to_string());
                 }
-                other => {
-                    let said = bounded(other.message(), MOST_QUOTED_ERROR);
-                    tracing::warn!(vault = %vault, "Signing keys: vault could not be loaded: {said}");
-                    ApiError::InternalError(format!("Signing keys: vault {vault} is not available: {said}"))
+                match ApiError::from_customer_load(e) {
+                    ApiError::PaymentRequired(m) => refused(StatusCode::PAYMENT_REQUIRED, m),
+                    other => {
+                        let said = bounded(other.message(), MOST_QUOTED_ERROR);
+                        tracing::warn!(vault = %vault, "{what}: vault could not be loaded: {said}");
+                        ApiError::InternalError(format!("{what}: vault {vault} is not available: {said}"))
+                    }
                 }
             })?;
     }
-    validated
-        .bind(Some(uuid))
-        .map_err(|m| ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("Signing keys refused: {m}")))
+    bind_all(Some(uuid))
+}
+
+/// `get_version(project_id, wasm)` and `get_project(project_id)`, both as of
+/// ONE final block, so the build check and the owner and uuid it binds keys to
+/// describe one project: never a version of a project deleted in between and
+/// the uuid of the one created again under its name.
+///
+/// Both are asked at `final` together, so the common case costs one
+/// round-trip. Two answers from different blocks — the final head moved
+/// between them, or the RPC's nodes stand at different heads — are reconciled
+/// at the OLDER of the two blocks: the answer read at the newer one is read
+/// again at the older one's hash. The older block is the one every node that
+/// answered either read already holds. Either read failing is returned as its
+/// own error, and no second read is made.
+async fn project_at_one_block(
+    near_client: &crate::near::NearClient,
+    project_id: &str,
+    wasm: &str,
+) -> (anyhow::Result<serde_json::Value>, anyhow::Result<serde_json::Value>) {
+    use near_primitives::types::{BlockId, BlockReference, Finality};
+    let contract = near_client.contract_id();
+    let version_args = serde_json::json!({ "project_id": project_id, "version_key": wasm });
+    let project_args = serde_json::json!({ "project_id": project_id });
+    let final_block = || BlockReference::Finality(Finality::Final);
+
+    let (version, project) = tokio::join!(
+        near_client.view_call_json_at(contract, "get_version", version_args.clone(), final_block()),
+        near_client.view_call_json_at(contract, "get_project", project_args.clone(), final_block()),
+    );
+    let (version, project) = match (version, project) {
+        (Ok(version), Ok(project)) => (version, project),
+        (version, project) => return (version.map(|v| v.value), project.map(|p| p.value)),
+    };
+    if version.block_hash == project.block_hash {
+        return (Ok(version.value), Ok(project.value));
+    }
+    let at = |hash| BlockReference::BlockId(BlockId::Hash(hash));
+    if version.block_height <= project.block_height {
+        let project = near_client
+            .view_call_json_at(contract, "get_project", project_args, at(version.block_hash))
+            .await
+            .map(|p| p.value);
+        (Ok(version.value), project)
+    } else {
+        let version = near_client
+            .view_call_json_at(contract, "get_version", version_args, at(project.block_hash))
+            .await
+            .map(|v| v.value);
+        (version, Ok(project.value))
+    }
 }
 
 /// Is `version` (the contract's `get_version` answer) a WasmUrl version whose
@@ -1831,6 +2049,8 @@ async fn encrypt_handler(
         seed = %seed_for_log(&req.seed),
         "Received encrypt request"
     );
+
+    refuse_declared_key_seed(&req.seed)?;
 
     // Decode plaintext from base64
     let plaintext_bytes = base64::decode(&req.plaintext_base64)
@@ -1970,6 +2190,7 @@ async fn add_generated_secret_handler(
             MAX_GENERATED_SECRETS
         )));
     }
+    refuse_declared_key_seed(&req.seed)?;
 
     // Vault scope from request body. The decrypt+re-encrypt
     // round-trip MUST use the same scope (default OR vault) as the
@@ -2352,7 +2573,7 @@ async fn update_user_secrets_handler(
         // Format: normalized_repo:owner[:branch] - same as /pubkey endpoint
         let seed = match &req.accessor {
             SecretAccessor::Repo { repo, branch } => {
-                let normalized_repo = crate::utils::normalize_repo_url(repo);
+                let normalized_repo = repo_seed_root(repo)?;
                 if let Some(b) = branch.as_deref().filter(|s| !s.is_empty()) {
                     format!("{}:{}:{}", normalized_repo, req.owner, b)
                 } else {
@@ -2508,7 +2729,7 @@ async fn update_user_secrets_handler(
     let final_accessor = req.new_accessor.as_ref().unwrap_or(&req.accessor);
     let encryption_seed = match final_accessor {
         SecretAccessor::Repo { repo, branch } => {
-            let normalized_repo = crate::utils::normalize_repo_url(repo);
+            let normalized_repo = repo_seed_root(repo)?;
             if let Some(b) = branch.as_deref().filter(|s| !s.is_empty()) {
                 format!("{}:{}:{}", normalized_repo, req.owner, b)
             } else {

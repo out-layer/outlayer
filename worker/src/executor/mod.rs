@@ -162,14 +162,23 @@ impl ExecutionContext {
     }
 }
 
-/// One execution carrying its signing keys — see [`Executor::with_signing_keys`].
+/// The declared keys of one run: its signing keys and its encryption keys,
+/// each present when the manifest declares keys of that family. Moved into the
+/// run and dropped with it; its `Debug` prints paths and public parts only.
+#[derive(Debug, Default)]
+pub struct RunKeys {
+    pub signing: Option<crate::signing_keys::SigningKeys>,
+    pub encryption: Option<crate::encryption_keys::EncryptionKeys>,
+}
+
+/// One execution carrying its declared keys — see [`Executor::with_keys`].
 pub struct RunWithKeys<'a> {
     executor: &'a Executor,
-    signing_keys: Option<crate::signing_keys::SigningKeys>,
+    keys: RunKeys,
 }
 
 impl RunWithKeys<'_> {
-    /// As [`Executor::execute`], with this run's signing keys.
+    /// As [`Executor::execute`], with this run's declared keys.
     pub async fn execute(
         self,
         wasm_bytes: &[u8],
@@ -197,7 +206,7 @@ impl RunWithKeys<'_> {
                 vrf_config,
                 wallet_config,
                 network_config,
-                self.signing_keys,
+                self.keys,
             )
             .await
     }
@@ -248,7 +257,7 @@ impl Executor {
     /// * `wallet_config` - Optional per-execution wallet config (overrides context)
     /// * `network_config` - Per-execution outbound allowlist + egress audit sink
     ///
-    /// A run with signing keys goes through [`Executor::with_signing_keys`],
+    /// A run with declared keys goes through [`Executor::with_keys`],
     /// which is how the job path calls it; this is the entry for everything
     /// else (tests, tools).
     #[allow(dead_code)]
@@ -278,16 +287,17 @@ impl Executor {
             vrf_config,
             wallet_config,
             network_config,
-            None,
+            RunKeys::default(),
         )
         .await
     }
 
-    /// One run with this run's signing keys: they are moved in, reachable only
-    /// through the `outlayer:signing-keys` host functions, and dropped with the
-    /// run — never part of the long-lived execution context.
-    pub fn with_signing_keys(&self, signing_keys: Option<crate::signing_keys::SigningKeys>) -> RunWithKeys<'_> {
-        RunWithKeys { executor: self, signing_keys }
+    /// One run with this run's declared keys: they are moved in, reachable
+    /// only through the `outlayer:signing-keys` and `outlayer:encryption-keys`
+    /// host functions, and dropped with the run — never part of the long-lived
+    /// execution context.
+    pub fn with_keys(&self, keys: RunKeys) -> RunWithKeys<'_> {
+        RunWithKeys { executor: self, keys }
     }
 
     async fn execute_run(
@@ -303,7 +313,7 @@ impl Executor {
         vrf_config: Option<VrfConfig>,
         wallet_config: Option<WalletConfig>,
         network_config: Option<NetworkConfig>,
-        signing_keys: Option<crate::signing_keys::SigningKeys>,
+        keys: RunKeys,
     ) -> Result<ExecutionResult> {
         info!(
             "Starting WASM execution: {} instructions, {} MB memory, {} seconds, target: {:?}, format: {:?}",
@@ -313,7 +323,7 @@ impl Executor {
         let start = Instant::now();
 
         // Try to execute with different WASI versions
-        let result = self.execute_async(wasm_bytes, wasm_content_sha256, input_data, limits, env_vars, build_target, storage_config, vrf_config, wallet_config, network_config, signing_keys).await;
+        let result = self.execute_async(wasm_bytes, wasm_content_sha256, input_data, limits, env_vars, build_target, storage_config, vrf_config, wallet_config, network_config, keys).await;
 
         let execution_time_ms = start.elapsed().as_millis() as u64;
 
@@ -436,11 +446,13 @@ impl Executor {
         vrf_config: Option<VrfConfig>,
         wallet_config: Option<WalletConfig>,
         network_config: Option<NetworkConfig>,
-        signing_keys: Option<crate::signing_keys::SigningKeys>,
+        keys: RunKeys,
     ) -> Result<(Vec<u8>, u64, Option<u64>)> {
-        // A module runs with exactly the signing keys it declares, or not at
-        // all — checked on these bytes before anything is instantiated.
-        crate::signing_keys::check_run_keys(wasm_bytes, signing_keys.as_ref()).map_err(anyhow::Error::msg)?;
+        // A module runs with exactly the signing and encryption keys it
+        // declares, or not at all — checked on these bytes before anything is
+        // instantiated.
+        crate::signing_keys::check_run_keys(wasm_bytes, keys.signing.as_ref()).map_err(anyhow::Error::msg)?;
+        crate::encryption_keys::check_run_keys(wasm_bytes, keys.encryption.as_ref()).map_err(anyhow::Error::msg)?;
 
         // Create effective execution context with per-execution overrides
         let has_overrides = storage_config.is_some()
@@ -495,13 +507,13 @@ impl Executor {
                         env_vars,
                         self.print_wasm_stderr,
                         effective_ctx.as_ref(),
-                        signing_keys,
+                        keys,
                     ).await;
                 }
                 "wasm32-wasip1" | "wasm32-wasi" => {
                     tracing::debug!("🔹 Trying WASI P1 executor (target: {})", target);
                     // When target is known, return error directly (don't fallback to other formats)
-                    // P1 does not support RPC proxy, storage, signing keys, or compiled cache
+                    // P1 does not support RPC proxy, storage, declared keys, or compiled cache
                     // (no component model); a P1 run that declares keys is refused before here.
                     return wasi_p1::execute(wasm_bytes, input_data, limits, env_vars, self.print_wasm_stderr).await;
                 }
@@ -525,7 +537,7 @@ impl Executor {
             env_vars.clone(),
             self.print_wasm_stderr,
             effective_ctx.as_ref(),
-            signing_keys,
+            keys,
         ).await
         {
             return Ok(result);

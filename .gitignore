@@ -69,11 +69,17 @@ tests/.hos_fixture.env
 tests/hos-status-stub/target/
 
 # A published artefact's dependency set is part of the artefact. A connector's
-# wasm hash goes on chain and is meant to be auditable, so what went into it has
-# to be readable here rather than resolved afresh at every build. These override
-# the global ignore, which is right for an application and wrong for these.
+# or a contract's wasm hash goes on chain and is meant to be auditable, so what
+# went into it has to be readable here rather than resolved afresh at every
+# build — a fresh resolution also picks crates the pinned toolchain cannot
+# build. These override the global ignore, which is right for an application
+# and wrong for these.
 !connectors/*/Cargo.lock
 !crates/*/Cargo.lock
+!contract/Cargo.lock
+!register-contract/Cargo.lock
+!keystore-dao-contract/Cargo.lock
+!vault-contract/Cargo.lock
 
 # A separate git repository checked out here; not part of this tree.
 wasi-examples/private-token-ark/
