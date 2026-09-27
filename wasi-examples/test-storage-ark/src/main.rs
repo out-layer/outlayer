@@ -188,7 +188,10 @@ fn cmd_get(key: &str) -> Output {
 }
 
 fn cmd_delete(key: &str) -> Output {
-    let deleted = storage::delete(key);
+    let deleted = match storage::delete(key) {
+        Ok(deleted) => deleted,
+        Err(e) => return error_output("delete", &e.to_string()),
+    };
     Output {
         success: true,
         command: "delete".to_string(),
@@ -206,7 +209,10 @@ fn cmd_delete(key: &str) -> Output {
 }
 
 fn cmd_has(key: &str) -> Output {
-    let exists = storage::has(key);
+    let exists = match storage::has(key) {
+        Ok(exists) => exists,
+        Err(e) => return error_output("has", &e.to_string()),
+    };
     Output {
         success: true,
         command: "has".to_string(),
@@ -793,7 +799,10 @@ fn test_get(key: &str, expected: Option<&str>) -> TestResult {
 }
 
 fn test_has(key: &str, expected: bool) -> TestResult {
-    let exists = storage::has(key);
+    let exists = match storage::has(key) {
+        Ok(exists) => exists,
+        Err(e) => return TestResult { name: format!("has({}) == {}", key, expected), success: false, error: Some(e.to_string()) },
+    };
     if exists == expected {
         TestResult { name: format!("has({}) == {}", key, expected), success: true, error: None }
     } else {
@@ -802,7 +811,10 @@ fn test_has(key: &str, expected: bool) -> TestResult {
 }
 
 fn test_delete(key: &str, expected_existed: bool) -> TestResult {
-    let deleted = storage::delete(key);
+    let deleted = match storage::delete(key) {
+        Ok(deleted) => deleted,
+        Err(e) => return TestResult { name: format!("delete({}) == {}", key, expected_existed), success: false, error: Some(e.to_string()) },
+    };
     if deleted == expected_existed {
         TestResult { name: format!("delete({}) == {}", key, expected_existed), success: true, error: None }
     } else {

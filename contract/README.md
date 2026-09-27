@@ -345,6 +345,26 @@ near view outlayer.testnet list_user_secrets '{
 
 `limit` is capped at 500. Both arguments may be omitted.
 
+#### Payment key nonces
+A payment key is a secret under the `System: PaymentKey` accessor whose profile
+is its nonce. A nonce is handed out to an owner once: `store_secrets` refuses a
+payment key at or below the owner's floor — the highest nonce the contract has
+seen them create or delete — with "has already been used". The coordinator
+keeps a deleted key's row under `(owner, nonce)`, and a new key there would
+bring it back with the old balance and grants.
+
+- `get_next_payment_key_nonce({account_id})` — the lowest nonce a new key may
+  take: one above both the live keys and the floor.
+- `get_payment_key_nonce_floor({account_id})` — the floor; 0 when none is
+  recorded.
+
+The floor is raised when a key is created and when one is deleted, so it holds
+every nonce the contract has seen come or go; a key older than the owner's
+floor entry is recorded when it is deleted. Its entry is
+paid once, by the owner's first key (included in `estimate_storage_cost`), and
+is not refunded: it outlives every key. `delete_payment_key` refunds the key's
+storage deposit; its unspent balance is forfeited.
+
 ## Events
 
 ### `execution_requested`

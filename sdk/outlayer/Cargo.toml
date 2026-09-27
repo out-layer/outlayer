@@ -1,6 +1,6 @@
 [package]
 name = "outlayer"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "SDK for OutLayer off-chain WASM execution on NEAR"
 license = "MIT OR Apache-2.0"

@@ -40,6 +40,9 @@ NETWORK="${NETWORK:-testnet}"
 # vault.fastjambo.near` and was stopped from deploying a real mainnet vault
 # only by that account holding 0.2 NEAR against the 1.1 it needed.
 export OUTLAYER_NETWORK="$NETWORK"
+# The `near` wrapper: signs with the legacy key file when the signer has one —
+# `sign-with-keychain` fails before signing for an account with many access keys.
+source "$SCRIPT_DIR/lib/rpc.sh"
 PARENT="${PARENT:-}"
 VAULT_NAME="${VAULT_NAME:-recovery-test-$(date +%s)}"
 VAULT_CONTRACT_DIR="${VAULT_CONTRACT_DIR:-$SCRIPT_DIR/../vault-contract}"

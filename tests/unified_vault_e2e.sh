@@ -267,7 +267,7 @@ if [[ -n "${MPC_PUBLIC_KEY:-}" && "$APPLY" == true ]]; then
     if [[ $INIT_RC -ne 0 ]] && echo "$INIT_OUT" | grep -q "outlayer vault resume"; then
       for _ in 1 2 3 4 5; do sleep 6; if outlayer vault resume "$VAULT_ID" >&2; then INIT_RC=0; break; fi; done
     fi
-    [[ $INIT_RC -eq 0 ]] || { echo "✗ vault init failed: $INIT_OUT" >&2; exit 1; }
+    [[ $INIT_RC -eq 0 ]] || { echo "✗ vault init failed: $(near_why "$INIT_OUT")" >&2; exit 1; }
     pass "shared vault $VAULT_ID deployed"
   fi
 elif [[ -n "${MPC_PUBLIC_KEY:-}" ]]; then
@@ -276,7 +276,7 @@ else
   log "Default-vault mode (no MPC_PUBLIC_KEY): skipping vault init; tokens omit vault-id → coordinator default vault"
 fi
 
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1" ${2:+--vault-id "$2"}; }
+mk_token() { local v=(); [[ -n "${2:-}" ]] && v=(--vault-id "$2"); CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1" ${v[@]+"${v[@]}"}; }
 AUTH() { echo "Authorization: Bearer near:$(mk_token "$1" "$VAULT_ID")"; }
 
 # new_subwallet <seed> → echoes "WALLET_ID SUB_ADDR"
@@ -695,14 +695,14 @@ deploy_throwaway_vault() {
   if [[ $rc -ne 0 ]] && echo "$out" | grep -q "outlayer vault resume"; then
     for _ in 1 2 3 4 5; do sleep 6; if outlayer vault resume "$id" >&2; then rc=0; break; fi; done
   fi
-  [[ $rc -eq 0 ]] || { echo "✗ throwaway vault init failed for $id: $out" >&2; return 1; }
+  [[ $rc -eq 0 ]] || { echo "✗ throwaway vault init failed for $id: $(near_why "$out")" >&2; return 1; }
   outlayer vault status "$id" >/dev/null 2>&1 || { echo "✗ vault.status failed for $id" >&2; return 1; }
   echo "$id"
 }
 
 # mk_token_v <seed> <vault_id|''> → Bearer-near token under an ARBITRARY vault scope (mk_token always
 # uses the shared VAULT_ID; the isolation/recovery tests need tokens under their own throwaway vaults).
-mk_token_v() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1" ${2:+--vault-id "$2"}; }
+mk_token_v() { local v=(); [[ -n "${2:-}" ]] && v=(--vault-id "$2"); CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1" ${v[@]+"${v[@]}"}; }
 
 # vault_state <vault_id> → echoes the vault's get_state JSON ("{}" on any RPC/decode error).
 vault_state() {
@@ -764,7 +764,7 @@ vault_initiate_retry() {
     rc=0; out=$(outlayer vault initiate-unilateral-recovery "$vid" 2>&1) || rc=$?
     [[ $rc -eq 0 ]] && { echo "$out" >&2; return 0; }
     if echo "$out" | grep -qiE 'invalidnonce|nonce'; then note "$label initiate: parent-key nonce race (try $i/5) — settling 5s"; sleep 5; continue; fi
-    echo "$out" >&2; fail "$label initiate-unilateral-recovery failed: $(echo "$out" | tail -3 | tr '\n' ' ' | head -c200)"; return 1
+    fail "$label initiate-unilateral-recovery failed: $(near_why "$out")"; return 1
   done
   fail "$label initiate-unilateral-recovery still InvalidNonce after 5 retries"; return 1
 }
@@ -909,7 +909,7 @@ if want V2; then
     for i in $(seq 1 "$N_WALLETS"); do
       RESP=$(curl -sS -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d "$(jq -nc --arg v "$VAULT_ID" '{vault_id:$v}')")
       WK=$(echo "$RESP" | jq -r '.api_key // empty'); WID=$(echo "$RESP" | jq -r '.wallet_id // empty'); ADDR=$(echo "$RESP" | jq -r '.near_account_id // empty')
-      if [[ -z "$WK" || "$WK" != wk_* ]]; then fail "V2 /register #$i returned no wk_ api_key: $(echo "$RESP" | head -c160)"; ok=false; break; fi
+      if [[ -z "$WK" || "$WK" != wk_* ]]; then fail "V2 /register #$i returned no wk_ api_key: $(jq -c 'del(.api_key, .handoff_url)' <<<"$RESP" 2>/dev/null | head -c160)"; ok=false; break; fi
       V2_WK+=("$WK"); V2_WID+=("$WID"); V2_ADDR+=("$ADDR")
       note "V2 wallet #$i: wallet_id=$WID addr=$ADDR"
     done
@@ -1028,16 +1028,19 @@ if want V3; then
         echo "$V3_REC_OUT" >&2
         [[ $V3_REC_RC -eq 0 ]] || fail "V3d customer-recovery exited $V3_REC_RC"
         V3_MASTER=$(echo "$V3_REC_OUT" | awk -F= '/^master_hex=/{print $2; exit}')
-        [[ -n "$V3_MASTER" && ${#V3_MASTER} -eq 64 ]] || fail "V3d no master_hex (got '${V3_MASTER:0:16}', len ${#V3_MASTER})"
-        pass "V3d per-vault master recovered locally (64 hex chars)"
-        v3derok=true
-        for i in 0 1 2; do
-          WID=$("$RECOVERY_BIN" compute-wallet-id --account-id "$PARENT" --seed "${V3_SEEDS[$i]}" --vault-id "$V3_VAULT")
-          DERA=$("$RECOVERY_BIN" derive-wallet-key --master "$V3_MASTER" --wallet-id "$WID" | jq -r '.near_address')
-          note "V3d user $((i+1)): offline=$DERA keystore=${V3_ADDRS[$i]}"
-          [[ "$DERA" == "${V3_ADDRS[$i]}" ]] || { fail "V3d user $((i+1)) DERIVATION MISMATCH: offline=$DERA vs keystore=${V3_ADDRS[$i]}"; v3derok=false; }
-        done
-        [[ "$v3derok" == true ]] && pass "V3d ALL 3 users re-derived offline; addresses match the keystore exactly — sovereign exit proven"
+        if [[ -n "$V3_MASTER" && ${#V3_MASTER} -eq 64 ]]; then
+          pass "V3d per-vault master recovered locally (64 hex chars)"
+          v3derok=true
+          for i in 0 1 2; do
+            WID=$("$RECOVERY_BIN" compute-wallet-id --account-id "$PARENT" --seed "${V3_SEEDS[$i]}" --vault-id "$V3_VAULT")
+            DERA=$("$RECOVERY_BIN" derive-wallet-key --master "$V3_MASTER" --wallet-id "$WID" | jq -r '.near_address')
+            note "V3d user $((i+1)): offline=$DERA keystore=${V3_ADDRS[$i]}"
+            [[ "$DERA" == "${V3_ADDRS[$i]}" ]] || { fail "V3d user $((i+1)) DERIVATION MISMATCH: offline=$DERA vs keystore=${V3_ADDRS[$i]}"; v3derok=false; }
+          done
+          [[ "$v3derok" == true ]] && pass "V3d ALL 3 users re-derived offline; addresses match the keystore exactly — sovereign exit proven"
+        else
+          fail "V3d no master_hex (got '${V3_MASTER:0:16}', len ${#V3_MASTER})"
+        fi
       fi
     fi
   else
@@ -1130,23 +1133,29 @@ if want V4; then
       echo "$V4_REC_OUT" >&2
       [[ $V4_REC_RC -eq 0 ]] || fail "V4d customer-recovery exited $V4_REC_RC"
       V4_MASTER=$(echo "$V4_REC_OUT" | awk -F= '/^master_hex=/{print $2; exit}')
-      [[ -n "$V4_MASTER" && ${#V4_MASTER} -eq 64 ]] || fail "V4d no master_hex (got '${V4_MASTER:0:16}', len ${#V4_MASTER})"
-      pass "V4d per-vault master recovered locally (64 hex chars)"
-      # Fetch the encrypted ciphertext from the contract via get_secrets (accessor enum: {Project:{project_id}}).
-      GET_ARGS=$(jq -nc --arg pid "$SECRET_PROJECT" --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{accessor:{Project:{project_id:$pid}}, profile:$profile, owner:$owner}')
-      GET_ARGS_B64=$(printf '%s' "$GET_ARGS" | base64 | tr -d '\n')
-      SECRETS_VIEW=$(curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
-        -d "$(jq -nc --arg a "$CONTRACT_ID" --arg ab "$GET_ARGS_B64" '{jsonrpc:"2.0",id:1,method:"query",params:{request_type:"call_function",finality:"final",account_id:$a,method_name:"get_secrets",args_base64:$ab}}')")
-      ENCRYPTED_B64=$(echo "$SECRETS_VIEW" | jq -r '.result.result | implode' 2>/dev/null | jq -r '.encrypted_secrets // empty' 2>/dev/null)
-      [[ -n "$ENCRYPTED_B64" && "$ENCRYPTED_B64" != "null" ]] || fail "V4d get_secrets returned no encrypted_secrets: $(echo "$SECRETS_VIEW" | head -c200)"
-      pass "V4d fetched on-chain ciphertext (${#ENCRYPTED_B64} chars base64)"
-      V4_DEC_RC=0
-      V4_DECRYPTED=$("$RECOVERY_BIN" decrypt-secret --master "$V4_MASTER" --seed "$SECRET_SEED" --ciphertext-base64 "$ENCRYPTED_B64" 2>&1) || V4_DEC_RC=$?
-      echo "V4d decrypt output: $V4_DECRYPTED" >&2
-      [[ $V4_DEC_RC -eq 0 ]] || fail "V4d local decrypt failed (rc=$V4_DEC_RC) — derivation chain gap. keystore_pubkey=$KEYSTORE_PUBKEY master=$V4_MASTER seed=$SECRET_SEED"
-      V4_DEC_VALUE=$(echo "$V4_DECRYPTED" | jq -r '.MY_TEST_SECRET // empty' 2>/dev/null || echo "")
-      [[ "$V4_DEC_VALUE" == "$EXPECTED_SECRET_VALUE" ]] && pass "V4d local decryption matches: MY_TEST_SECRET='$V4_DEC_VALUE' — full sovereignty over secrets confirmed" \
-        || fail "V4d decrypt mismatch: expected '$EXPECTED_SECRET_VALUE', got '$V4_DEC_VALUE'"
+      if [[ -n "$V4_MASTER" && ${#V4_MASTER} -eq 64 ]]; then
+        pass "V4d per-vault master recovered locally (64 hex chars)"
+        # Fetch the encrypted ciphertext from the contract via get_secrets (accessor enum: {Project:{project_id}}).
+        GET_ARGS=$(jq -nc --arg pid "$SECRET_PROJECT" --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{accessor:{Project:{project_id:$pid}}, profile:$profile, owner:$owner}')
+        GET_ARGS_B64=$(printf '%s' "$GET_ARGS" | base64 | tr -d '\n')
+        SECRETS_VIEW=$(curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
+          -d "$(jq -nc --arg a "$CONTRACT_ID" --arg ab "$GET_ARGS_B64" '{jsonrpc:"2.0",id:1,method:"query",params:{request_type:"call_function",finality:"final",account_id:$a,method_name:"get_secrets",args_base64:$ab}}')")
+        ENCRYPTED_B64=$(echo "$SECRETS_VIEW" | jq -r '.result.result | implode' 2>/dev/null | jq -r '.encrypted_secrets // empty' 2>/dev/null)
+        if [[ -n "$ENCRYPTED_B64" && "$ENCRYPTED_B64" != "null" ]]; then
+          pass "V4d fetched on-chain ciphertext (${#ENCRYPTED_B64} chars base64)"
+        else
+          fail "V4d get_secrets returned no encrypted_secrets: $(echo "$SECRETS_VIEW" | head -c200)"
+        fi
+        V4_DEC_RC=0
+        V4_DECRYPTED=$("$RECOVERY_BIN" decrypt-secret --master "$V4_MASTER" --seed "$SECRET_SEED" --ciphertext-base64 "$ENCRYPTED_B64" 2>&1) || V4_DEC_RC=$?
+        echo "V4d decrypt output: $V4_DECRYPTED" >&2
+        [[ $V4_DEC_RC -eq 0 ]] || fail "V4d local decrypt failed (rc=$V4_DEC_RC) — derivation chain gap. keystore_pubkey=$KEYSTORE_PUBKEY master=$V4_MASTER seed=$SECRET_SEED"
+        V4_DEC_VALUE=$(echo "$V4_DECRYPTED" | jq -r '.MY_TEST_SECRET // empty' 2>/dev/null || echo "")
+        [[ "$V4_DEC_VALUE" == "$EXPECTED_SECRET_VALUE" ]] && pass "V4d local decryption matches: MY_TEST_SECRET='$V4_DEC_VALUE' — full sovereignty over secrets confirmed" \
+          || fail "V4d decrypt mismatch: expected '$EXPECTED_SECRET_VALUE', got '$V4_DEC_VALUE'"
+      else
+        fail "V4d no master_hex (got '${V4_MASTER:0:16}', len ${#V4_MASTER})"
+      fi
     fi
   fi
 fi
@@ -1181,8 +1190,11 @@ if want V5; then
       # 5a: mint wk_ bound to the vault + pre-recovery sign (the derive-sub-wallet work).
       REG=$(curl -sS -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d "$(jq -nc --arg v "$V5_VAULT" '{vault_id:$v}')")
       V5_WK=$(echo "$REG" | jq -r '.api_key // empty'); V5_WID=$(echo "$REG" | jq -r '.wallet_id // empty'); V5_ADDR=$(echo "$REG" | jq -r '.near_account_id // empty')
-      [[ -n "$V5_WK" && "$V5_WK" != null && -n "$V5_WID" && -n "$V5_ADDR" && "$V5_ADDR" != null ]] || fail "V5a /register did not return api_key+wallet_id+near_account_id: $(echo "$REG" | head -c200)"
-      pass "V5a minted wk_=${V5_WK:0:9}… wallet_id=$V5_WID address=$V5_ADDR"
+      if [[ -n "$V5_WK" && "$V5_WK" != null && -n "$V5_WID" && -n "$V5_ADDR" && "$V5_ADDR" != null ]]; then
+        pass "V5a minted a wk_ (${#V5_WK} chars) wallet_id=$V5_WID address=$V5_ADDR"
+      else
+        fail "V5a /register did not return api_key+wallet_id+near_account_id: $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG" 2>/dev/null | head -c200)"
+      fi
       SR=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer $V5_WK" -H 'Content-Type: application/json' -d '{"message":"v5-preflight","recipient":"v5-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
       V5_PRESIG=$(echo "$SR" | jq -r '.signature // empty')
       [[ -n "$V5_PRESIG" && "$V5_PRESIG" != null ]] && pass "V5a PRE-RECOVERY keystore signed (sig len=${#V5_PRESIG})" || fail "V5a /sign-message returned no signature pre-recovery: $(echo "$SR" | head -c160)"
@@ -1220,39 +1232,42 @@ if want V5; then
       echo "$V5_REC_OUT" >&2
       [[ $V5_REC_RC -eq 0 ]] || fail "V5d customer-recovery exited $V5_REC_RC"
       V5_MASTER=$(echo "$V5_REC_OUT" | awk -F= '/^master_hex=/{print $2; exit}')
-      [[ -n "$V5_MASTER" && ${#V5_MASTER} -eq 64 ]] || fail "V5d no master_hex (got '${V5_MASTER:0:16}', len ${#V5_MASTER})"
-      pass "V5d per-vault master recovered locally (64 hex chars)"
-      V5_DERIVED=$("$RECOVERY_BIN" derive-wallet-key --master "$V5_MASTER" --wallet-id "$V5_WID")
-      V5_DER_ADDR=$(echo "$V5_DERIVED" | jq -r '.near_address'); V5_DER_PRIV=$(echo "$V5_DERIVED" | jq -r '.private_key')
-      [[ "$V5_DER_ADDR" == "$V5_ADDR" ]] && pass "V5d local derivation matches keystore: $V5_DER_ADDR" \
-        || fail "V5d DERIVATION MISMATCH: local=$V5_DER_ADDR vs keystore=$V5_ADDR"
+      if [[ -n "$V5_MASTER" && ${#V5_MASTER} -eq 64 ]]; then
+        pass "V5d per-vault master recovered locally (64 hex chars)"
+        V5_DERIVED=$("$RECOVERY_BIN" derive-wallet-key --master "$V5_MASTER" --wallet-id "$V5_WID")
+        V5_DER_ADDR=$(echo "$V5_DERIVED" | jq -r '.near_address'); V5_DER_PRIV=$(echo "$V5_DERIVED" | jq -r '.private_key')
+        [[ "$V5_DER_ADDR" == "$V5_ADDR" ]] && pass "V5d local derivation matches keystore: $V5_DER_ADDR" \
+          || fail "V5d DERIVATION MISMATCH: local=$V5_DER_ADDR vs keystore=$V5_ADDR"
 
-      # 5d-fund: NOW the derived key is in hand — fund the wallet 0.05 NEAR so the sovereign tx has gas
-      # (covers the 0.001 send + fees + the final delete-account reclaim). MONEY=true from here: a failure
-      # mid-flight halts the suite, and the wallet is recoverable via the just-derived key ($V5_DER_PRIV).
-      MONEY=true
-      log "V5d fund the wallet ($V5_ADDR) with 0.05 NEAR from $PARENT (for the sovereign tx + reclaim)"
-      fund_near "$V5_ADDR" "0.05 NEAR" || fail "V5d funding the wallet from $PARENT failed"
-      for _ in 1 2 3 4 5 6 7 8; do
-        if curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
-          -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$V5_ADDR\"}}" | jq -e '.result.amount' >/dev/null 2>&1; then break; fi
-        sleep 2
-      done
+        # 5d-fund: NOW the derived key is in hand — fund the wallet 0.05 NEAR so the sovereign tx has gas
+        # (covers the 0.001 send + fees + the final delete-account reclaim). MONEY=true from here: a failure
+        # mid-flight halts the suite, and the wallet is recoverable via the just-derived key ($V5_DER_PRIV).
+        MONEY=true
+        log "V5d fund the wallet ($V5_ADDR) with 0.05 NEAR from $PARENT (for the sovereign tx + reclaim)"
+        fund_near "$V5_ADDR" "0.05 NEAR" || fail "V5d funding the wallet from $PARENT failed"
+        for _ in 1 2 3 4 5 6 7 8; do
+          if curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$V5_ADDR\"}}" | jq -e '.result.amount' >/dev/null 2>&1; then break; fi
+          sleep 2
+        done
 
-      # The unique 'wk_ path' end-state: a REAL testnet tx, signed by the locally-derived key (no
-      # outlayer vault send-near subcommand exists — use `near tokens send-near` via near_tty, exactly
-      # like the legacy sovereignty_e2e.sh proof).
-      log "V5d SOVEREIGN TX — locally-derived key signs send-near 0.001 NEAR → $PARENT"
-      near_tty "near tokens \"$V5_ADDR\" send-near \"$PARENT\" '0.001 NEAR' network-config \"$NETWORK\" sign-with-plaintext-private-key '$V5_DER_PRIV' send" \
-        || fail "V5d sovereign send-near with the locally-derived key failed — the wallet is NOT recoverable end-to-end"
-      pass "V5d sovereign tx landed — wallet $V5_ADDR is controlled by the customer-held key, independent of OutLayer"
+        # The unique 'wk_ path' end-state: a REAL testnet tx, signed by the locally-derived key (no
+        # outlayer vault send-near subcommand exists — use `near tokens send-near` via near_tty, exactly
+        # like the legacy sovereignty_e2e.sh proof).
+        log "V5d SOVEREIGN TX — locally-derived key signs send-near 0.001 NEAR → $PARENT"
+        near_tty "near tokens \"$V5_ADDR\" send-near \"$PARENT\" '0.001 NEAR' network-config \"$NETWORK\" sign-with-plaintext-private-key '$V5_DER_PRIV' send" \
+          || fail "V5d sovereign send-near with the locally-derived key failed — the wallet is NOT recoverable end-to-end"
+        pass "V5d sovereign tx landed — wallet $V5_ADDR is controlled by the customer-held key, independent of OutLayer"
 
-      # 5d-reclaim: drain the funded wallet back to BENEFICIARY with the RECOVERED key (leak-free cleanup;
-      # also a second proof the local key has full authority). The keystore can't do this post-finalize.
-      log "V5d reclaim — delete the funded wallet to $BENEFICIARY using the recovered key (no leak)"
-      near_tty "near account delete-account \"$V5_ADDR\" beneficiary \"$BENEFICIARY\" network-config \"$NETWORK\" sign-with-plaintext-private-key '$V5_DER_PRIV' send" \
-        || warn "V5d delete-account reclaim failed — $V5_ADDR may retain residual NEAR (recover via the recovered key)"
-      MONEY=false; CUR_TEST=""
+        # 5d-reclaim: drain the funded wallet back to BENEFICIARY with the RECOVERED key (leak-free cleanup;
+        # also a second proof the local key has full authority). The keystore can't do this post-finalize.
+        log "V5d reclaim — delete the funded wallet to $BENEFICIARY using the recovered key (no leak)"
+        near_tty "near account delete-account \"$V5_ADDR\" beneficiary \"$BENEFICIARY\" network-config \"$NETWORK\" sign-with-plaintext-private-key '$V5_DER_PRIV' send" \
+          || warn "V5d delete-account reclaim failed — $V5_ADDR may retain residual NEAR (recover via the recovered key)"
+        MONEY=false; CUR_TEST=""
+      else
+        fail "V5d no master_hex (got '${V5_MASTER:0:16}', len ${#V5_MASTER})"
+      fi
     fi
   else
     note "V5 SKIPPED (vault mode off): wk_-path sovereign exit requires a DEPLOYED vault to finalize_recovery on — set MPC_PUBLIC_KEY"
@@ -1312,7 +1327,7 @@ if want V6 && agent_secret_mode V6; then
     V6_WK=$(echo "$V6_REG" | jq -r '.api_key // empty')
     V6_AGENT=$(echo "$V6_REG" | jq -r '.near_account_id // empty')
     if [[ "$V6_WK" != wk_* || -z "$V6_AGENT" ]]; then
-      fail "V6a /register under $VAULT_ID returned no wk_ + account: $(echo "$V6_REG" | head -c200)"
+      fail "V6a /register under $VAULT_ID returned no wk_ + account: $(jq -c 'del(.api_key, .handoff_url)' <<<"$V6_REG" 2>/dev/null | head -c200)"
     else
       note "V6 agent A: $V6_AGENT"
       V6_PUB=$(agent_secret_pubkey "$V6_WK" "$CONNECTOR_PROJECT_ID")
@@ -1331,7 +1346,7 @@ if want V6 && agent_secret_mode V6; then
       V6_DWK=$(echo "$V6_DREG" | jq -r '.api_key // empty')
       V6_DKEY=$(agent_secret_pubkey "$V6_DWK" "$CONNECTOR_PROJECT_ID" | jq -r '.pubkey // empty')
       if [[ -z "$V6_DKEY" ]]; then
-        fail "V6b the default-master agent returned no key: $(echo "$V6_DREG" | head -c160)"
+        fail "V6b the default-master agent returned no key: $(jq -c 'del(.api_key, .handoff_url)' <<<"$V6_DREG" 2>/dev/null | head -c160)"
       elif [[ "$V6_DKEY" != "$V6_KEY" ]]; then
         pass "V6b the vault-bound agent and the default-master agent get different keys"
       else
@@ -1385,7 +1400,7 @@ if want V6 && agent_secret_mode V6; then
       V6_WK_B=$(echo "$V6_REG_B" | jq -r '.api_key // empty')
       V6_AGENT_B=$(echo "$V6_REG_B" | jq -r '.near_account_id // empty')
       if [[ "$V6_WK_B" != wk_* || -z "$V6_AGENT_B" ]]; then
-        fail "V6d /register (agent B) returned no wk_ + account: $(echo "$V6_REG_B" | head -c200)"
+        fail "V6d /register (agent B) returned no wk_ + account: $(jq -c 'del(.api_key, .handoff_url)' <<<"$V6_REG_B" 2>/dev/null | head -c200)"
       else
         note "V6 agent B (unfunded): $V6_AGENT_B"
         V6_DENIED=$(OUTLAYER_WALLET_KEY="$V6_WK_B" "$OUTLAYER_BIN" secrets set-for-agent \
@@ -1431,7 +1446,7 @@ if want V6 && agent_secret_mode V6; then
       V6_WK_C=$(echo "$V6_REG_C" | jq -r '.api_key // empty')
       V6_AGENT_C=$(echo "$V6_REG_C" | jq -r '.near_account_id // empty')
       if [[ "$V6_WK_C" != wk_* ]]; then
-        fail "V6f /register (agent C) returned no wk_: $(echo "$V6_REG_C" | head -c200)"
+        fail "V6f /register (agent C) returned no wk_: $(jq -c 'del(.api_key, .handoff_url)' <<<"$V6_REG_C" 2>/dev/null | head -c200)"
       elif ! store_agent_secret_cli "$V6_WK_C" \
              "$(jq -nc --arg v "v6f-$RUN_TAG" '{V6_SIGNED_OVER:$v}')" \
              --vault-id "$VAULT_ID"; then

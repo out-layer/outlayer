@@ -20,12 +20,12 @@
 //! }
 //!
 //! // Check if key exists
-//! if storage::has("my-key") {
+//! if storage::has("my-key")? {
 //!     println!("Key exists!");
 //! }
 //!
 //! // Delete a key
-//! storage::delete("my-key");
+//! storage::delete("my-key")?;
 //!
 //! // List keys with prefix
 //! let keys = storage::list_keys("prefix:")?;
@@ -167,28 +167,30 @@ pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// Check if a key exists
+/// Check if a key exists, in either mode
 ///
 /// # Arguments
 /// * `key` - The key to check
 ///
 /// # Returns
-/// * `true` - Key exists
-/// * `false` - Key doesn't exist, **or the storage call failed**: the host
-///   answers both with `false`, so this is not proof of absence. Where absence
-///   decides anything, read the key with [`get`] or [`get_raw`], which return a
-///   failed call as `Err`.
+/// * `Ok(true)` - Key exists
+/// * `Ok(false)` - Key doesn't exist
+/// * `Err(StorageError)` - The storage call failed; nothing is known about the key
 ///
 /// # Example
 /// ```rust,ignore
-/// if storage::has("session:abc") {
+/// if storage::has("session:abc")? {
 ///     // Session exists, continue
 /// } else {
 ///     // Create new session
 /// }
 /// ```
-pub fn has(key: &str) -> bool {
-    raw::has(key)
+pub fn has(key: &str) -> Result<bool> {
+    let (exists, error) = raw::has_checked(key);
+    if !error.is_empty() {
+        return Err(StorageError(error));
+    }
+    Ok(exists)
 }
 
 /// Delete a key
@@ -197,20 +199,22 @@ pub fn has(key: &str) -> bool {
 /// * `key` - The key to delete
 ///
 /// # Returns
-/// * `true` - Key existed and was deleted
-/// * `false` - Nothing was deleted: the key didn't exist, **or the storage call
-///   failed** — the host answers both with `false`, so this is not proof that
-///   the key is gone. Read it back with [`get`] or [`get_raw`] where that
-///   matters.
+/// * `Ok(true)` - Key existed and was deleted
+/// * `Ok(false)` - Key didn't exist
+/// * `Err(StorageError)` - The storage call failed; the key may still be there
 ///
 /// # Example
 /// ```rust,ignore
-/// if storage::delete("session:abc") {
+/// if storage::delete("session:abc")? {
 ///     println!("Session deleted");
 /// }
 /// ```
-pub fn delete(key: &str) -> bool {
-    raw::delete(key)
+pub fn delete(key: &str) -> Result<bool> {
+    let (deleted, error) = raw::delete_checked(key);
+    if !error.is_empty() {
+        return Err(StorageError(error));
+    }
+    Ok(deleted)
 }
 
 /// List all keys with optional prefix filter

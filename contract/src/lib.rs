@@ -65,6 +65,9 @@ enum StorageKey {
     SecretVaultBindings,
     // What curated projects charge (project_id -> ProjectPricing)
     ProjectPricing,
+    // The highest payment-key nonce the contract has seen each owner create or
+    // delete (owner -> nonce)
+    PaymentKeyNonceFloor,
 }
 
 /// Execution source - GitHub repo, pre-compiled WASM URL, or project reference
@@ -547,6 +550,12 @@ pub struct Contract {
     // other project never pays to deserialise it. `UnorderedMap` keeps that
     // property and adds the key list.
     project_pricing: UnorderedMap<String, payment::ProjectPricing>,
+
+    // The highest payment-key nonce the contract has seen each owner create or
+    // delete. A new payment key must be above it: the coordinator keeps a
+    // deleted key's row under `(owner, nonce)`, and a key at that nonce would
+    // bring the row back. See `payment::Contract::payment_key_nonce_floor`.
+    payment_key_nonce_floors: LookupMap<AccountId, u32>,
 }
 
 #[near_bindgen]
@@ -597,6 +606,7 @@ impl Contract {
             // subscription away at a price nobody set.
             subscription_plans: Vec::new(),
             project_pricing: UnorderedMap::new(StorageKey::ProjectPricing),
+            payment_key_nonce_floors: LookupMap::new(StorageKey::PaymentKeyNonceFloor),
         }
     }
 

@@ -101,7 +101,7 @@ log "Building customer-recovery (sign-bearer-near)"
   || { echo "✗ customer-recovery build failed" >&2; exit 1; }
 
 SEED="binding-$(date +%s)-$$"
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$SEED"; }
+mk_token() { CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$SEED"; }
 AUTH() { echo "Authorization: Bearer near:$(mk_token)"; }
 
 account_field() {
@@ -272,7 +272,7 @@ if [[ "$KIT_OK" == true && -n "$EXECUTOR" ]]; then
     pass "L5 the account now references the global contract by hash"
   else
     fail "L5 the kit transaction did not land: global_contract_hash=$GLOBAL_NOW"
-    note "$(tail -c 400 <<<"$SEND")"
+    note "$(near_why "$SEND")"
   fi
   STATUS=""
   for _ in 1 2 3 4 5 6 7 8; do

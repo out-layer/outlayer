@@ -106,8 +106,8 @@ log "Building customer-recovery (sign-bearer-near)"
   || { echo "✗ customer-recovery build failed" >&2; exit 1; }
 
 AUTH() { # AUTH <seed>
-  echo "Authorization: Bearer near:$("$RECOVERY_BIN" sign-bearer-near \
-    --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1")"
+  echo "Authorization: Bearer near:$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near \
+ --account-id "$PARENT" --seed "$1")"
 }
 
 sql() { [[ -n "$PSQL_CMD" ]] && $PSQL_CMD "$1"; }
@@ -605,7 +605,10 @@ fi
 
 # ── B4: asked for and not available → refusal, never a silent fallback ───────
 log "B4 flag ON from a wallet with NO binding — must be REFUSED"
-STRANGER_SEED="stranger-$(date +%s)-$$"
+# One stranger per PARENT, the same every run: its wallet, policy and balance
+# are reused (topped up only below the floor), so a run adds no policy under
+# PARENT. A fresh seed would leave a funded wallet and a new policy each run.
+STRANGER_SEED="${STRANGER_SEED:-bound-identity-stranger}"
 SR=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "$(AUTH "$STRANGER_SEED")")
 SWID=$(jq -r '.wallet_id // empty' <<<"$SR")
 SADDR=$(jq -r '.address // empty' <<<"$SR")

@@ -115,7 +115,7 @@ fi
 if [[ -n "$(project_on_chain)" ]]; then
   pass "R1 $PROJECT is published"
 else
-  fail "R1 the project was not created: $(grep -iE 'panick|Error' <<<"${CREATE:-}" | head -2 | tr '\n' ' ' | head -c 240)"
+  fail "R1 the project was not created: $(near_why "${CREATE:-}")"
   verdict "fresh-project build lock"; exit $?
 fi
 
@@ -131,7 +131,7 @@ send() {
     sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1)
   tx=$(grep -oE 'Transaction ID: *[1-9A-HJ-NP-Za-km-z]{40,50}' <<<"$out" | grep -oE '[1-9A-HJ-NP-Za-km-z]{40,50}' | head -1)
   RUN_OK=absent; RUN_ERR=""; RUN_OUT=""
-  [[ -z "$tx" ]] && { note "the send never landed: $(grep -iE 'panick|Error' <<<"$out" | head -2 | tr '\n' ' ' | head -c 240)"; return 0; }
+  [[ -z "$tx" ]] && { note "the send never landed: $(near_why "$out")"; return 0; }
   note "tx=$tx"
   ev=$(grep -o 'EVENT_JSON:.*execution_completed.*' <<<"$out" | sed 's/^EVENT_JSON://' | head -1)
   # The yield resolves in a later receipt of this same transaction, and the
@@ -150,7 +150,7 @@ send() {
   [[ -z "$ev" ]] && return 0
   RUN_OK=$(jq -r '.data[0] | if has("success") then (.success|tostring) else "absent" end' <<<"$ev")
   RUN_ERR=$(jq -r '.data[0].error_message // ""' <<<"$ev")
-  RUN_OUT=$(awk '/Function execution return value/{getline; print}' <<<"$out" | jq -c 'select(.!=null) | if type=="string" then fromjson else . end' 2>/dev/null)
+  RUN_OUT=$(awk '/Function execution return value/{f=1; next} f && /^The "/{exit} f{print}' <<<"$out" | jq -c 'select(.!=null) | if type=="string" then fromjson else . end' 2>/dev/null)
 }
 
 # ── R2 the wrong build ───────────────────────────────────────────────────────
@@ -180,7 +180,7 @@ fi
 log "R3 the lock moves to the build that runs — the same call now runs"
 MOVE=$(OUTLAYER_NETWORK="$NETWORK" OUTLAYER_RPC_URL="$RPC_URL" "$OUTLAYER_BIN_PATH" \
   secrets access --project "$PROJECT" --profile "$PROFILE" --build "$RIGHT" 2>&1) \
-  || fail "R3 the CLI would not move the lock: $(tail -3 <<<"$MOVE" | tr '\n' ' ' | head -c 240)"
+  || fail "R3 the CLI would not move the lock: $(near_why "$MOVE")"
 sleep 5
 STORED=$(jq -r '[.. | objects | select(has("WasmHash")) | .WasmHash.hash] | join(",")' <<<"$(jq -c '.access // {}' <<<"$(row_of "$PROJECT" "$PROFILE")")")
 [[ "$STORED" == "$RIGHT" ]] && note "R3 the row is now locked to $STORED" || note "R3 the row holds '$STORED'"

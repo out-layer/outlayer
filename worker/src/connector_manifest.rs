@@ -864,9 +864,10 @@ mod tests {
             let bytes = std::fs::read(&file).expect("read");
             match ProjectManifest::read(&bytes) {
                 Ok(_) => {}
-                // The probe's deliberately refused variant: a `type` on an
-                // encryption key.
+                // The probe's deliberately refused variants: a `type` on an
+                // encryption key, and an unknown top-level member.
                 Err(e) if file.ends_with("encryption-typed.json") => assert!(e.contains("`type`"), "{e}"),
+                Err(e) if file.ends_with("project-misspelled.json") => assert!(e.contains("`storage_acount`"), "{e}"),
                 Err(e) => panic!("{}: {e}", file.display()),
             }
         }

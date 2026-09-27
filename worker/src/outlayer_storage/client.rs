@@ -354,8 +354,10 @@ impl StorageClient {
             .send()
             .context("Failed to send storage has request")?;
 
+        // Only an answer says whether the key exists. A failed call is an
+        // error here; the WIT `has` alone still folds it into `false`.
         if !response.status().is_success() {
-            return Ok(false);
+            anyhow::bail!("storage has failed: HTTP {}", response.status());
         }
 
         #[derive(Deserialize)]
@@ -363,7 +365,9 @@ impl StorageClient {
             exists: bool,
         }
 
-        let resp: HasResponse = response.json().unwrap_or(HasResponse { exists: false });
+        let resp: HasResponse = response
+            .json()
+            .context("storage has answered a body that does not parse")?;
         Ok(resp.exists)
     }
 
@@ -386,7 +390,13 @@ impl StorageClient {
             .send()
             .context("Failed to send storage delete request")?;
 
-        Ok(response.status().is_success())
+        // 200: the record was there and is gone; 404: there was none. Anything
+        // else is a failed call, not "was not there".
+        match response.status() {
+            s if s.is_success() => Ok(true),
+            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            s => anyhow::bail!("storage delete failed: HTTP {}", s),
+        }
     }
 
     /// List keys with optional prefix filter
@@ -1214,6 +1224,44 @@ mod tests {
         let err = client.get_by_version("k", "wasm-old").unwrap_err().to_string();
         assert!(err.contains("storage get-by-version failed: HTTP 503"), "{err}");
         assert!(keystore.seen().is_empty());
+    }
+
+    /// A coordinator that fails `has` or `delete` gives the caller an error,
+    /// never "no such key" or "was not there".
+    #[test]
+    fn a_failed_has_or_delete_is_an_error_not_an_absence() {
+        let coordinator = serve(|_, _| (503, json!({ "error": "the database is temporarily unavailable" }).to_string()));
+        let keystore = untouched_keystore();
+        let client = StorageClient::new(config(&coordinator, &keystore)).unwrap();
+
+        let err = client.has("k").unwrap_err().to_string();
+        assert!(err.contains("storage has failed: HTTP 503"), "{err}");
+        let err = client.delete("k").unwrap_err().to_string();
+        assert!(err.contains("storage delete failed: HTTP 503"), "{err}");
+
+        let garbled = serve(|_, _| (200, "not json".to_string()));
+        let client = StorageClient::new(config(&garbled, &keystore)).unwrap();
+        assert!(client.has("k").is_err(), "an answer that does not parse is not \"absent\"");
+        assert!(keystore.seen().is_empty());
+    }
+
+    /// What the coordinator does answer passes through: `exists`, and on delete
+    /// 200 (it was there) or 404 (it was not).
+    #[test]
+    fn has_and_delete_report_what_the_coordinator_answered() {
+        let coordinator = serve(|path, _| match path {
+            "/storage/has" => (200, json!({ "exists": true }).to_string()),
+            "/storage/delete" => (404, String::new()),
+            _ => (500, String::new()),
+        });
+        let keystore = untouched_keystore();
+        let client = StorageClient::new(config(&coordinator, &keystore)).unwrap();
+        assert!(client.has("k").unwrap());
+        assert!(!client.delete("k").unwrap());
+
+        let deleting = serve(|_, _| (200, String::new()));
+        let client = StorageClient::new(config(&deleting, &keystore)).unwrap();
+        assert!(client.delete("k").unwrap());
     }
 
     /// A version read whose record the keystore cannot open is an error too.

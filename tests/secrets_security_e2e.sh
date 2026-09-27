@@ -352,7 +352,7 @@ activate() { # activate <version_key> — leaves the reason in ACTIVATE_ERR when
     grep -qiE "expired|timed out|connection" <<<"$ACTIVATE_ERR" && (( attempt == 1 )) && { sleep 5; continue; }
     break
   done
-  ACTIVATE_ERR=$(grep -viE '^\s*$' <<<"$ACTIVATE_ERR" | tail -4 | tr '\n' ' ' | head -c 300)
+  ACTIVATE_ERR=$(near_why "$ACTIVATE_ERR")
   return 1
 }
 # Each restore runs in a SUBSHELL: the helpers end the shell on failure, and
@@ -395,9 +395,9 @@ else
   # other failure — gas exceeded, a deposit, a missing method — is a failed
   # send, not a verdict.
   if grep -qE '[Rr]ecursion|deserializ' <<<"$TRY_OUT"; then
-    pass "N1 the contract refused to store it: $(grep -iE 'panick|recursion|deserializ' <<<"$TRY_OUT" | head -2 | tr '\n' ' ' | head -c 200)"
+    pass "N1 the contract refused to store it: $(near_why "$TRY_OUT")"
   else
-    fail "N1 the send failed without the contract refusing it: $(grep -viE '^\s*$' <<<"$TRY_OUT" | tail -3 | head -c 200)"
+    fail "N1 the send failed without the contract refusing it: $(near_why "$TRY_OUT")"
   fi
   [[ "$(row_of "$PROJECT" "$ROW")" == "$BEFORE" ]] \
     && pass "N1 and the row is byte-identical" \
@@ -525,7 +525,7 @@ elif grep -q 'Secrets not found' <<<"$TRY_OUT"; then
 else
   # A send that never reached the contract is not a refusal by the contract.
   # Recording it as one would turn every network outage into a security pass.
-  fail "R1 the call failed without the contract refusing it: $(grep -viE '^\s*$' <<<"$TRY_OUT" | tail -3 | head -c 200)"
+  fail "R1 the call failed without the contract refusing it: $(near_why "$TRY_OUT")"
 fi
 sleep 3
 [[ "$(row_of "$PROJECT" "$ROW")" == "$BEFORE" ]] \
@@ -1135,7 +1135,7 @@ if ! try_update_access "$PARENT" "$PROJECT" "$ROW" "$(grant_until 1)"; then
     # Skipping on ANY failure blamed an undeployed contract for expired
     # transactions and short deposits alike, and the whole ValidUntil block
     # disappeared from the tally without anyone reading a reason.
-    fail "T1 the time-limited grant could not be stored, and not because the contract lacks ValidUntil: $(grep -viE '^\s*$' <<<"$TRY_OUT" | tail -3 | head -c 200)"
+    fail "T1 the time-limited grant could not be stored, and not because the contract lacks ValidUntil: $(near_why "$TRY_OUT")"
   fi
 else
   run_as "$STRANGER" "$PARENT/$ROW"
@@ -1183,7 +1183,7 @@ else
     elif grep -qE 'deserializ|invalid type|invalid digit' <<<"$TRY_OUT"; then
       pass "T3 until_ns \"abc\" is refused by the contract"
     else
-      fail "T3 the send failed without the contract refusing it: $(grep -viE '^\s*$' <<<"$TRY_OUT" | tail -3 | head -c 200)"
+      fail "T3 the send failed without the contract refusing it: $(near_why "$TRY_OUT")"
     fi
     set_access "$PROJECT" "$ROW" "$(grant_until 0)"
     run_as "$PARENT" "$PARENT/$ROW"
@@ -1510,7 +1510,7 @@ if want N3; then
   if grep -qiE 'asks the chain 6 times' <<<"$TRY_OUT"; then
     pass "N3 six chain-read leaves are refused by the contract, naming the count"
   else
-    fail "N3 the contract did not refuse six chain-read leaves: $(head -c 200 <<<"$TRY_OUT")"
+    fail "N3 the contract did not refuse six chain-read leaves: $(near_why "$TRY_OUT")"
   fi
   N3_AFTER=$(jq -Sc '.access // empty' <<<"$(row_of "$PROJECT" "$ROW")")
   if [[ -z "$N3_BEFORE" || -z "$N3_AFTER" ]]; then

@@ -9,7 +9,7 @@
 //! without a wallet id (see `wasi-examples/wallet-probe/README.md`), while a
 //! signing key needs no wallet at all.
 //!
-//! Thirteen builds, one per manifest (`manifests/`), chosen by feature:
+//! Fourteen builds, one per manifest (`manifests/`), chosen by feature:
 //!
 //! | feature | keys | runs as |
 //! |---|---|---|
@@ -26,6 +26,7 @@
 //! | `encryption-vault` | encryption `alpha`, and `treasury` with a vault | a project version whose owner has that vault |
 //! | `encryption-pred` | encryption `alpha` — `caller: "predecessor"` | a project version |
 //! | `encryption-typed` | encryption `alpha` with a `type` — refused before it runs | anything |
+//! | `project-misspelled` | the `project` keys, and an unknown top-level member `storage_acount` — refused before it runs | anything |
 //!
 //! `v2` changes one constant, so the same manifest gets a second sha256.
 //!
@@ -50,11 +51,13 @@ use serde_json::{json, Map, Value};
     feature = "encryption-wasm",
     feature = "encryption-vault",
     feature = "encryption-pred",
-    feature = "encryption-typed"
+    feature = "encryption-typed",
+    feature = "project-misspelled"
 )))]
 compile_error!(
     "choose the manifest: --features project | project-pred | wasm | project-vault | project-secp | wasm-secp | encryption | \
-     encryption-storage | encryption-storage-pred | encryption-wasm | encryption-vault | encryption-pred | encryption-typed"
+     encryption-storage | encryption-storage-pred | encryption-wasm | encryption-vault | encryption-pred | encryption-typed | \
+     project-misspelled"
 );
 
 /// How many manifest features this build names: exactly one is allowed.
@@ -70,7 +73,8 @@ const MANIFEST_FEATURES: usize = cfg!(feature = "project") as usize
     + cfg!(feature = "encryption-wasm") as usize
     + cfg!(feature = "encryption-vault") as usize
     + cfg!(feature = "encryption-pred") as usize
-    + cfg!(feature = "encryption-typed") as usize;
+    + cfg!(feature = "encryption-typed") as usize
+    + cfg!(feature = "project-misspelled") as usize;
 const _: () = assert!(MANIFEST_FEATURES == 1, "exactly one manifest feature: pass --no-default-features with one");
 
 /// Embeds `$file` as the `outlayer.manifest` custom section — covered by the
@@ -117,6 +121,8 @@ manifest!("../manifests/encryption-vault.json");
 manifest!("../manifests/encryption-pred.json");
 #[cfg(feature = "encryption-typed")]
 manifest!("../manifests/encryption-typed.json");
+#[cfg(feature = "project-misspelled")]
+manifest!("../manifests/project-misspelled.json");
 
 /// Which build this is. Part of every answer, so the constant is in the binary
 /// and `v2` really is another sha256.
@@ -242,6 +248,11 @@ struct Input {
     #[serde(default)]
     #[cfg_attr(not(feature = "storage-api"), allow(dead_code))]
     prefix: Option<String>,
+    /// `storage_get_by_version`, `storage_clear_version`: the sha256 of the
+    /// version, hex.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "storage-api"), allow(dead_code))]
+    wasm_hash: Option<String>,
 }
 
 fn main() {
@@ -274,7 +285,8 @@ fn run(input: &Input, raw: &str) -> Value {
         }
         #[cfg(feature = "storage-api")]
         "raw_set" | "raw_get" | "raw_set_if_absent" | "raw_set_if_equals" | "enc_set" | "enc_get" | "storage_has"
-        | "storage_delete" | "storage_list" | "sealed_put" | "sealed_get" | "raw_attack" | "raw_attacks" => raw_storage::run(input),
+        | "storage_delete" | "storage_list" | "sealed_put" | "sealed_get" | "raw_attack" | "raw_attacks"
+        | "storage_get_by_version" | "storage_clear_version" | "sealed_handle" | "sealed_has" | "sealed_delete" => raw_storage::run(input),
         other => err(format!(
             "unknown operation {other:?}; one of public_key, sign, sign_and_verify, sign_nep413, host_nep413, \
              evm_address, all_public_keys, what_i_can_see, attack, attacks"

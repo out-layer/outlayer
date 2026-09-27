@@ -1,12 +1,15 @@
 //! The `encryption` build's storage operations: raw records (`raw_*`), the
 //! encrypted mode for comparison (`enc_set`, `enc_get`), `storage_has` /
 //! `storage_delete` / `storage_list`, `sealed_put` / `sealed_get` — encryption
-//! with `outlayer:encryption-keys` over raw records — and the attacks on the
-//! two modes (`raw_attack`, `raw_attacks`).
+//! with `outlayer:encryption-keys` over raw records — the attacks on the
+//! two modes (`raw_attack`, `raw_attacks`), version-addressed reads and
+//! clears (`storage_get_by_version`, `storage_clear_version`), and the SDK's
+//! `storage::sealed` (`sealed_handle`, `sealed_has`, `sealed_delete`).
 //!
 //! Every answer is the probe's usual `{status, message, …}`; an error from the
 //! host is an answer, and the run itself succeeds.
 
+use outlayer::storage::sealed;
 use serde_json::{json, Value};
 
 use super::{encryption_keys, err, ok, storage, Input};
@@ -24,7 +27,7 @@ pub fn run(input: &Input) -> Value {
             (_, e) if !e.is_empty() => err(e),
             (value, _) => ok(
                 "read raw",
-                json!({ "key": key, "found": !value.is_empty() || storage::has(key), "value_hex": hex::encode(value) }),
+                json!({ "key": key, "found": !value.is_empty() || storage::has_checked(key).0, "value_hex": hex::encode(value) }),
             ),
         }),
         "raw_set_if_absent" => with_key(input, |key| match hex_of("value_hex", &input.value_hex) {
@@ -60,11 +63,20 @@ pub fn run(input: &Input) -> Value {
             (_, e) if !e.is_empty() => err(e),
             (value, _) => ok(
                 "read encrypted",
-                json!({ "key": key, "found": !value.is_empty() || storage::has(key), "value_hex": hex::encode(value) }),
+                json!({ "key": key, "found": !value.is_empty() || storage::has_checked(key).0, "value_hex": hex::encode(value) }),
             ),
         }),
-        "storage_has" => with_key(input, |key| ok("asked", json!({ "key": key, "exists": storage::has(key) }))),
-        "storage_delete" => with_key(input, |key| ok("asked", json!({ "key": key, "deleted": storage::delete(key) }))),
+        "storage_has" => with_key(input, |key| match storage::has_checked(key) {
+            (_, e) if !e.is_empty() => err(e),
+            (exists, _) => ok("asked", json!({ "key": key, "exists": exists })),
+        }),
+        "storage_delete" => with_key(input, |key| match storage::delete_checked(key) {
+            (_, e) if !e.is_empty() => err(e),
+            (deleted, _) => ok("asked", json!({ "key": key, "deleted": deleted })),
+        }),
+        // The `bool` forms a guest built before `has-checked` links against.
+        "storage_has_legacy" => with_key(input, |key| ok("asked", json!({ "key": key, "exists": storage::has(key) }))),
+        "storage_delete_legacy" => with_key(input, |key| ok("asked", json!({ "key": key, "deleted": storage::delete(key) }))),
         "storage_list" => match storage::list_keys(input.prefix.as_deref().unwrap_or_default()) {
             (_, e) if !e.is_empty() => err(e),
             (keys, _) => match serde_json::from_str::<Vec<String>>(&keys) {
@@ -111,6 +123,34 @@ pub fn run(input: &Input) -> Value {
                 },
             }
         }),
+        "storage_get_by_version" => with_key(input, |key| match input.wasm_hash.as_deref() {
+            Some(hash) => match storage::get_by_version(key, hash) {
+                (_, e) if !e.is_empty() => err(e),
+                (value, _) => ok(
+                    "read by version",
+                    json!({ "key": key, "wasm_hash": hash, "found": !value.is_empty(), "value_hex": hex::encode(value) }),
+                ),
+            },
+            None => err("this operation needs a `wasm_hash`".to_string()),
+        }),
+        "storage_clear_version" => match input.wasm_hash.as_deref() {
+            Some(hash) => match storage::clear_version(hash) {
+                e if e.is_empty() => ok("cleared", json!({ "wasm_hash": hash })),
+                e => err(e),
+            },
+            None => err("this operation needs a `wasm_hash`".to_string()),
+        },
+        "sealed_handle" => with_sealed(input, |path, vault, name| {
+            sealed_handle(path, vault, name, input.value.as_deref().unwrap_or_default())
+        }),
+        "sealed_has" => with_sealed(input, |path, vault, name| match sealed::has(path, vault, name) {
+            Ok(exists) => ok("asked the SDK", json!({ "path": path, "key": name, "exists": exists })),
+            Err(e) => err(e.0),
+        }),
+        "sealed_delete" => with_sealed(input, |path, vault, name| match sealed::delete(path, vault, name) {
+            Ok(deleted) => ok("asked the SDK", json!({ "path": path, "key": name, "deleted": deleted })),
+            Err(e) => err(e.0),
+        }),
         "raw_attack" => match input.name.as_deref() {
             Some(name) => attack(name, &prefix_of(input)),
             None => err("raw_attack needs a `name`; `raw_attacks` runs them all".to_string()),
@@ -118,6 +158,63 @@ pub fn run(input: &Input) -> Value {
         "raw_attacks" => attacks(&prefix_of(input)),
         other => err(format!("unknown storage operation {other:?}")),
     }
+}
+
+/// The SDK's `Sealed` handle rules, in one run, on record `name` (left holding
+/// `"<value> (2)"`) and a second record `<name>/other` (deleted at the end):
+/// set-if-absent on an existing record does not insert; a handle read from the
+/// other record is refused and changes nothing; the handle read from `name`
+/// wins a compare-and-swap, and the same handle, now stale, loses and hands
+/// back the winner; has / delete / has / get on the other record.
+fn sealed_handle(path: &str, vault: Option<&str>, name: &str, value: &str) -> Value {
+    let other = format!("{name}/other");
+    let winner = format!("{value} (2)");
+    let opened = |n: &str| sealed::get(path, vault, n).map(|r| r.map(|r| r.into_plaintext()));
+    if let Err(e) = sealed::set(path, vault, name, value.as_bytes()).and_then(|_| sealed::set(path, vault, &other, b"the other record")) {
+        return err(format!("setup: {}", e.0));
+    }
+    let absent = sealed::set_if_absent(path, vault, name, b"inserted over a record");
+    let (first, foreign) = match (sealed::get(path, vault, name), sealed::get(path, vault, &other)) {
+        (Ok(Some(first)), Ok(Some(foreign))) => (first, foreign),
+        (a, b) => return err(format!("setup: the two records just written read back as {:?} and {:?}", a.map(|r| r.is_some()), b.map(|r| r.is_some()))),
+    };
+    let foreign_cas = sealed::set_if_equals(path, vault, name, &foreign, b"written with another record's handle");
+    let after_foreign = opened(name);
+    let win = sealed::set_if_equals(path, vault, name, &first, winner.as_bytes());
+    let stale = sealed::set_if_equals(path, vault, name, &first, b"written with a stale handle");
+    let held = opened(name);
+    let has = sealed::has(path, vault, name);
+    let other_has = sealed::has(path, vault, &other);
+    let other_deleted = sealed::delete(path, vault, &other);
+    let other_has_after = sealed::has(path, vault, &other);
+    let other_get_after = opened(&other);
+    ok(
+        "the Sealed handle rules, through the SDK",
+        json!({
+            "path": path, "key": name, "storage_key": first.storage_key(), "value": winner,
+            "read_back": first.plaintext() == value.as_bytes(),
+            "set_if_absent_on_existing": match absent { Ok(inserted) => json!({ "inserted": inserted }), Err(e) => json!({ "error": e.0 }) },
+            "foreign_handle": match foreign_cas {
+                Err(e) => json!({ "status": "err", "message": e.0 }),
+                Ok((updated, _)) => json!({ "status": "ok", "updated": updated }),
+            },
+            "unchanged_after_foreign": matches!(after_foreign, Ok(Some(ref v)) if v == value.as_bytes()),
+            "cas_win": match win { Ok((updated, current)) => json!({ "updated": updated, "current": current.is_some() }), Err(e) => json!({ "error": e.0 }) },
+            "cas_stale": match stale {
+                Ok((updated, current)) => json!({
+                    "updated": updated,
+                    "current_is_the_winner": current.as_ref().is_some_and(|c| c.plaintext() == winner.as_bytes()),
+                }),
+                Err(e) => json!({ "error": e.0 }),
+            },
+            "holds_the_winner": matches!(held, Ok(Some(ref v)) if v == winner.as_bytes()),
+            "has": has.map_err(|e| e.0).ok(),
+            "other_has": other_has.map_err(|e| e.0).ok(),
+            "other_deleted": other_deleted.map_err(|e| e.0).ok(),
+            "other_has_after": other_has_after.map_err(|e| e.0).ok(),
+            "other_get_after": match other_get_after { Ok(None) => "none", Ok(Some(_)) => "found", Err(_) => "error" },
+        }),
+    )
 }
 
 fn with_key(input: &Input, f: impl FnOnce(&str) -> Value) -> Value {
@@ -181,7 +278,10 @@ fn attacks(prefix: &str) -> Value {
 
 /// A record in one mode at `key`, whatever was there before.
 fn put(key: &str, raw: bool, value: &[u8]) -> Result<(), String> {
-    storage::delete(key);
+    let (_, e) = storage::delete_checked(key);
+    if !e.is_empty() {
+        return Err(e);
+    }
     let e = if raw { storage::set_raw(key, value) } else { storage::set(key, value) };
     if e.is_empty() {
         Ok(())
@@ -206,7 +306,7 @@ fn holds(key: &str, raw: bool, value: &[u8]) -> bool {
 pub fn attack(name: &str, prefix: &str) -> Value {
     let key = format!("{prefix}/{name}");
     let out = run_attack(name, &key).unwrap_or_else(|e| json!({ "status": "setup_failed", "message": e }));
-    storage::delete(&key);
+    let _ = storage::delete_checked(&key);
     out
 }
 
@@ -301,7 +401,7 @@ fn run_attack(name: &str, key: &str) -> Result<Value, String> {
             out
         }
         "cas_raw_absent" => {
-            storage::delete(key);
+            let _ = storage::delete_checked(key);
             let (updated, current, e) = storage::set_if_equals_raw(key, b"", b"v");
             let mut out = match (updated, e) {
                 (_, e) if !e.is_empty() => json!({ "status": "err", "message": e }),
@@ -309,7 +409,7 @@ fn run_attack(name: &str, key: &str) -> Result<Value, String> {
                 (true, _) => json!({ "status": "ok", "message": "replaced a record that was not there" }),
             };
             out["current_empty"] = json!(current.is_empty());
-            out["unchanged"] = json!(!storage::has(key));
+            out["unchanged"] = json!(matches!(storage::has_checked(key), (false, e) if e.is_empty()));
             out
         }
         "cas_raw_win" => {
@@ -323,13 +423,13 @@ fn run_attack(name: &str, key: &str) -> Result<Value, String> {
         }
         "delete_raw" => {
             put(key, true, RAW)?;
-            match (storage::has(key), storage::delete(key), storage::has(key), storage::get_raw(key)) {
-                (true, true, false, (v, e)) if v.is_empty() && e.is_empty() => {
+            match (storage::has_checked(key), storage::delete_checked(key), storage::has_checked(key), storage::get_raw(key)) {
+                ((true, e1), (true, e2), (false, e3), (v, e)) if [&e1, &e2, &e3, &e].iter().all(|x| x.is_empty()) && v.is_empty() => {
                     json!({ "status": "ok", "message": "has, then deleted, then gone" })
                 }
-                (had, deleted, has, (v, e)) => json!({
+                ((had, e1), (deleted, e2), (has, e3), (v, e)) => json!({
                     "status": "err",
-                    "message": format!("has={had} deleted={deleted} has_after={has} get_raw_after={} bytes {e}", v.len()),
+                    "message": format!("has={had} {e1} deleted={deleted} {e2} has_after={has} {e3} get_raw_after={} bytes {e}", v.len()),
                 }),
             }
         }

@@ -7,12 +7,10 @@ Complete test suite for NEAR OutLayer platform.
 ```
 tests/
 ├── unit.sh          - Unit tests (WASM execution, cargo test)
-├── compilation.sh   - Compilation tests (GitHub → WASM via Docker)
-├── integration.sh   - Integration tests (Coordinator + Worker API)
 ├── e2e.sh          - End-to-end tests (NEAR contract flow)
 ├── transactions.sh  - Transaction tests (real testnet execution)
 ├── job_workflow.sh  - ⭐ Job-based workflow tests (NEW!)
-├── verify_jobs.sh   - ⭐ Database verification (NEW!)
+├── verify_jobs.sh   - Database verification (jobs, timings, duplicates)
 └── run_all.sh      - Run all tests in sequence
 ```
 
@@ -31,11 +29,7 @@ cd tests
 # Unit tests only
 ./unit.sh
 
-# Compilation tests (requires Docker)
-./compilation.sh
 
-# Integration tests (requires coordinator running)
-./integration.sh
 
 # End-to-end tests (requires testnet contract)
 ./e2e.sh
@@ -75,115 +69,6 @@ cd tests
 🧪 Running worker unit tests...
 
 ✅ All unit tests passed!
-```
-
-## Test 2: Compilation Tests
-
-**File**: `compilation.sh`
-
-**What it tests**:
-- ✅ Docker container creation
-- ✅ GitHub repository cloning
-- ✅ Rust toolchain installation
-- ✅ WASM compilation from source
-- ✅ WASM extraction via tar streaming
-- ✅ Magic number validation
-- ✅ Checksum verification
-
-**Prerequisites**:
-- Docker installed and running
-- Network access to GitHub
-- ~2GB free disk space for Docker images
-
-**Run**:
-```bash
-./compilation.sh
-```
-
-**Expected output**:
-```
-🧪 Compilation Test - GitHub to WASM
-=====================================
-
-🔍 Checking prerequisites...
-✓ Docker is running
-
-📦 Testing compilation:
-  Repository: https://github.com/out-layer/random-example
-  Commit: 6491b317afa33534b56cebe9957844e16ac720e8
-  Target: wasm32-wasi
-
-Compiling https://github.com/out-layer/random-example @ 6491b31...
-Compiled WASM size: 113915 bytes
-Compiled WASM checksum: ba2c7a75...
-Expected WASM checksum: ba2c7a75...
-✅ Compilation successful! Size difference: 0 bytes
-
-✅ Compilation test passed!
-```
-
-**Duration**: ~30-60 seconds (first run slower due to Docker image pull)
-
-## Test 3: Integration Tests
-
-**File**: `integration.sh`
-
-**What it tests**:
-- ✅ Coordinator health check
-- ✅ WASM upload/download
-- ✅ WASM cache verification
-- ✅ Task creation via API
-- ✅ Task polling
-- ✅ Distributed locks
-
-**Prerequisites**:
-- Coordinator running on http://localhost:8080
-- PostgreSQL and Redis (via docker-compose)
-- Test WASM modules built (run `unit.sh` first)
-
-**Setup**:
-```bash
-# Terminal 1: Start coordinator
-cd coordinator
-cargo run
-```
-
-**Run**:
-```bash
-# Terminal 2: Run tests
-cd tests
-./integration.sh
-```
-
-**Expected output**:
-```
-🧪 Integration Tests - Coordinator + Worker Flow
-=================================================
-
-📋 Test 1: Coordinator Health Check
-✓ Coordinator is healthy
-
-📋 Test 2: Upload WASM File
-✓ WASM uploaded successfully
-
-📋 Test 3: Verify WASM Exists
-✓ WASM exists in cache
-
-📋 Test 4: Download WASM
-✓ WASM downloaded successfully (111234 bytes)
-
-📋 Test 5: Create Execution Task
-✓ Task created successfully
-
-📋 Test 6: Poll for Task
-✓ Task received (request_id: 999)
-
-📋 Test 7: Distributed Lock
-✓ Lock acquired
-✓ Lock released
-
-====================================
-✅ All tests passed!
 ```
 
 ## Test 3: End-to-End Tests
@@ -300,20 +185,6 @@ cargo clean
 cargo build --release --target wasm32-wasip1
 ```
 
-### Integration Tests
-
-**"Connection refused"**
-- Start coordinator: `cd coordinator && cargo run`
-
-**"Redis connection failed"**
-- Start services: `cd coordinator && docker-compose up -d`
-
-**"Test WASM not found"**
-- Build modules: `./unit.sh`
-
-**"Task creation failed (HTTP 422)"**
-- Check JSON format (must include `input_data` field)
-
 ### End-to-End Tests
 
 **"NEAR CLI not found"**
@@ -365,14 +236,6 @@ jobs:
       - name: Run unit tests
         run: ./tests/unit.sh
 
-      - name: Start coordinator
-        run: |
-          cd coordinator
-          cargo run &
-          sleep 5
-
-      - name: Run integration tests
-        run: ./tests/integration.sh
 ```
 
 ## Additional Resources
@@ -480,7 +343,7 @@ Worker 2:
 3. No duplicate jobs in database
 4. Cache hit ratio > 1 (more executes than compiles)
 
-## Test 7: Database Verification ⭐ NEW
+## Test 7: Database Verification
 
 **File**: `verify_jobs.sh`
 
@@ -493,12 +356,13 @@ Worker 2:
 - ✅ Failed/pending job analysis
 
 **Prerequisites**:
-- PostgreSQL running (docker-compose up -d)
-- Jobs exist in database (run job_workflow.sh first)
+- `PSQL_CMD`: a command that runs one SQL statement against the coordinator
+  database (on testnet: `.idea/testnet-runners/psql_testnet.sh`)
+- Jobs exist in the database (run job_workflow.sh first)
 
 **Run**:
 ```bash
-./verify_jobs.sh
+PSQL_CMD=/path/to/psql_runner ./verify_jobs.sh
 ```
 
 **Expected output**:

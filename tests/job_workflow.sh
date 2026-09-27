@@ -120,7 +120,7 @@ if echo "$TX1_OUTPUT" | grep -q -E "(Transaction ID:|succeeded)"; then
     fi
 
     # Extract request_id from logs
-    REQUEST_ID1=$(echo "$TX1_OUTPUT" | grep -o '"request_id":[0-9]*' | head -1 | grep -o '[0-9]*')
+    REQUEST_ID1=$(echo "$TX1_OUTPUT" | grep -oE 'request_id\\?":[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
     if [ -n "$REQUEST_ID1" ]; then
         echo -e "${BLUE}Request ID:${NC} $REQUEST_ID1"
     fi
@@ -192,7 +192,7 @@ if echo "$TX2_OUTPUT" | grep -q -E "(Transaction ID:|succeeded)"; then
         echo -e "${BLUE}Explorer:${NC} https://testnet.nearblocks.io/txns/$TX2_ID"
     fi
 
-    REQUEST_ID2=$(echo "$TX2_OUTPUT" | grep -o '"request_id":[0-9]*' | head -1 | grep -o '[0-9]*')
+    REQUEST_ID2=$(echo "$TX2_OUTPUT" | grep -oE 'request_id\\?":[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
     if [ -n "$REQUEST_ID2" ]; then
         echo -e "${BLUE}Request ID:${NC} $REQUEST_ID2"
     fi
@@ -267,7 +267,7 @@ if echo "$TX3_OUTPUT" | grep -q -E "(Transaction ID:|succeeded)"; then
         echo -e "${BLUE}Explorer:${NC} https://testnet.nearblocks.io/txns/$TX3_ID"
     fi
 
-    REQUEST_ID3=$(echo "$TX3_OUTPUT" | grep -o '"request_id":[0-9]*' | head -1 | grep -o '[0-9]*')
+    REQUEST_ID3=$(echo "$TX3_OUTPUT" | grep -oE 'request_id\\?":[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
     if [ -n "$REQUEST_ID3" ]; then
         echo -e "${BLUE}Request ID:${NC} $REQUEST_ID3"
     fi

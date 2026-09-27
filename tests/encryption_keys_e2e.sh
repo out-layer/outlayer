@@ -62,6 +62,23 @@
 #       value, and never contain it; the name is never a stored key name; the
 #       ciphertext moved under another name does not open; $CALLER2 finds
 #       nothing under the name
+#   E11 the SDK's sealed records (outlayer::storage::sealed, run by the
+#       storage build): set-if-absent on an existing record → false; a Sealed
+#       handle read from another record → refused, the record unchanged; the
+#       handle get returned wins a compare-and-swap, and the same handle, now
+#       stale, loses and hands back the winner, opened; has / delete; in later
+#       runs the bytes under the SDK's storage key open (host decrypt, the
+#       name as aad) to the winner, and the SDK's has / delete / has answer
+#       true / true / false
+#   H   keys and storage over HTTPS /call, paid by HTTPS_PAYMENT_KEY (owned by
+#       $PARENT): the guest's caller is the key's owner (NEAR_PREDECESSOR_ID
+#       is a chain variable, empty over HTTPS); the
+#       project signing key and both encryption keys are $PARENT's on-chain
+#       ones; another owner's key (HTTPS_OTHER_PAYMENT_KEY) gets other keys; an
+#       encryption round trip across HTTPS calls, opened on chain too; a raw
+#       storage round trip, read on chain from the signer's cell; SC4: the
+#       predecessor build's record over HTTPS sits under the key's owner in
+#       storage_data (PSQL_CMD) and the default build over HTTPS reads it
 #   E10 an encryption key that names a `type` → the run is refused before it
 #       starts, naming the unknown field (the keystore's own refusal of a
 #       `type` in a keyed /decrypt is pinned by its unit tests; the suite has
@@ -99,8 +116,13 @@
 # $PROJECT. Not the signing suite's GITHUB_PROBE_REPO: its default build
 # declares signing keys, and its refusal names those.
 #
+# For H: HTTPS_PAYMENT_KEY, a funded payment key (owner:nonce:secret) whose
+# owner is $PARENT, in the environment only; HTTPS_OTHER_PAYMENT_KEY (another
+# owner) adds the "another owner, other keys" rows. Without HTTPS_PAYMENT_KEY, H
+# SKIPS, loudly.
+#
 # Env: PROJECT_NAME (default encryption-key-probe), DEPOSIT (default 0.1 NEAR),
-# ONLY=E1,E8,SC (a subset; fixtures a row needs are made on demand), OFFLINE=1
+# ONLY=E1,E8,SC,E11,H (a subset; fixtures a row needs are made on demand), OFFLINE=1
 # (dry run only: no chain or GitHub reads).
 #
 # Money: eight FastFS uploads (~300 KB each), a project and five versions
@@ -180,7 +202,10 @@ var_name() { printf '%s_%s' "$( [[ $1 == hash ]] && echo H || echo U )" "${2//-/
 set_for() { printf -v "$(var_name "$1" "$2")" '%s' "$3"; }
 get_for() { local n; n=$(var_name "$1" "$2"); printf '%s' "${!n:-}"; }
 
-signer_flag() { [[ "$1" == "$PARENT" ]] && echo with-keychain || echo with-legacy-keychain; }
+# The key file in the legacy keychain first (the preflight requires it for
+# both accounts): the keychain path lists every access key of the account, and
+# the RPC refuses that list for an account with many keys (TOO_MANY_ACCESS_KEYS).
+signer_flag() { [[ -f "$HOME/.near-credentials/$NETWORK/$1.json" ]] && echo with-legacy-keychain || echo with-keychain; }
 
 # One contract call, its whole transcript on stdout — the logs and the return
 # value included, which is where a run's event and answer are read from.
@@ -227,7 +252,7 @@ run_on() { # run_on <signer> <receiver> <method> <args-json>
       sleep 20
     done
   fi
-  RUN_OUT=$(awk '/Function execution return value/{getline; print}' <<<"$out" \
+  RUN_OUT=$(awk '/Function execution return value/{f=1; next} f && /^The "/{exit} f{print}' <<<"$out" \
     | jq -c 'select(. != null) | if type=="string" then fromjson else . end' 2>/dev/null)
   if [[ -z "$RUN_OUT" && -n "$logs" ]]; then
     RUN_OUT=$(jq -r '.result.status.SuccessValue // empty | @base64d' <<<"$logs" 2>/dev/null \
@@ -235,7 +260,7 @@ run_on() { # run_on <signer> <receiver> <method> <args-json>
   fi
   if [[ -z "$ev" ]]; then
     RUN_OK=absent
-    RUN_ERR=$( { grep -iE 'error|panick|failed' <<<"$out" | head -2
+    RUN_ERR=$( { near_why "$out"; echo
                  [[ -n "$logs" ]] && jq -r '.result.receipts_outcome[]?.outcome.status.Failure? // empty | tostring' <<<"$logs" 2>/dev/null | head -2
                } | tr '\n' ' ' | head -c 300)
     return 0
@@ -468,13 +493,7 @@ done
 
 log "upload to FastFS"
 for v in $BUILDS; do
-  up=$(OUTLAYER_RPC_URL="$RPC_URL" outlayer upload "$VARIANTS/signing-key-probe-$v.wasm" 2>&1)
-  url=$(grep -oE 'https://[A-Za-z0-9._-]+\.fastfs\.io/[^[:space:]"]+\.wasm' <<<"$up" | head -1)
-  if [[ -z "$url" ]]; then
-    echo "✗ upload of $v gave no FastFS URL: $(tail -3 <<<"$up" | tr '\n' ' ' | head -c 300)" >&2; exit 1
-  fi
-  got=$(curl -sL --max-time 60 "$url" | shasum -a 256 | cut -d' ' -f1)
-  [[ "$got" == "$(get_for hash "$v")" ]] || { echo "✗ $url serves $got, not $(get_for hash "$v")" >&2; exit 1; }
+  url=$(fastfs_upload "$VARIANTS/signing-key-probe-$v.wasm" "$(get_for hash "$v")") || { echo "✗ upload of $v never served its bytes" >&2; exit 1; }
   set_for url "$v" "$url"
   note "$v at $url"
 done
@@ -913,6 +932,56 @@ if want E9 && storage_gate; then
   fi
 fi
 
+# ── E11 the SDK's sealed records ────────────────────────────────────────────
+
+if want E11 && storage_gate; then
+  log "E11 the SDK's sealed records: the Sealed handle, compare-and-swap, has, delete"
+  SNAME="sdk sealed $TAG"; SVAL="sdk sealed value $TAG"; SSK=""
+  via_project "$PARENT" encryption-storage "$(jq -nc --arg n "$SNAME" --arg v "$SVAL" '{operation:"sealed_handle",path:"alpha",key:$n,value:$v}')"
+  if ran_ok "E11 sealed_handle"; then
+    SSK=$(out_field .storage_key)
+    [[ "$(out_field .read_back)" == true ]] && pass "E11 sealed::get opens what sealed::set stored" || fail "E11 sealed::get did not read back the value"
+    [[ "$(out_field .set_if_absent_on_existing.inserted)" == false ]] && pass "E11 sealed::set_if_absent on an existing record → false" \
+      || fail "E11 sealed::set_if_absent on an existing record: $(out_field .set_if_absent_on_existing)"
+    [[ "$(out_field .foreign_handle.status)" == err && "$(out_field .foreign_handle.message)" == *"read from another record"* ]] \
+      && pass "E11 a Sealed handle read from another record is refused: $(out_field .foreign_handle.message | head -c 120)" \
+      || fail "E11 a foreign handle: $(out_field .foreign_handle)"
+    [[ "$(out_field .unchanged_after_foreign)" == true ]] && pass "E11 the refused compare-and-swap left the record as it was" || fail "E11 the foreign handle changed the record"
+    [[ "$(out_field .cas_win.updated)/$(out_field .cas_win.current)" == "true/false" ]] && pass "E11 set_if_equals with the handle get returned wins" \
+      || fail "E11 CAS win: $(out_field .cas_win)"
+    [[ "$(out_field .cas_stale.updated)/$(out_field .cas_stale.current_is_the_winner)" == "false/true" ]] \
+      && pass "E11 the same handle, now stale, loses and hands back the winner, opened" || fail "E11 CAS with a stale handle: $(out_field .cas_stale)"
+    [[ "$(out_field .holds_the_winner)" == true ]] && pass "E11 the record holds the winner" || fail "E11 the record does not hold the winner"
+    [[ "$(out_field .has)/$(out_field .other_has)/$(out_field .other_deleted)/$(out_field .other_has_after)/$(out_field .other_get_after)" == "true/true/true/false/none" ]] \
+      && pass "E11 has → true; the other record: has → true, delete → true, has → false, get → None" \
+      || fail "E11 has/delete: has=$(out_field .has) other has=$(out_field .other_has) deleted=$(out_field .other_deleted) has after=$(out_field .other_has_after) get after=$(out_field .other_get_after)"
+  fi
+  # A later run reads the record without the SDK: the raw bytes under the
+  # storage key, opened by the host's decrypt with the record's NAME as aad
+  # (the SDK's format — the probe's own sealed_put binds to the storage key).
+  if [[ -n "$SSK" ]]; then
+    SSTORED=""
+    via_project "$PARENT" encryption-storage "$(jq -nc --arg k "$SSK" '{operation:"raw_get",key:$k}')"
+    ran_ok "E11 raw_get of the SDK's storage key" && SSTORED=$(out_field .value_hex)
+    if [[ -n "$SSTORED" ]]; then
+      via_project "$PARENT" encryption-storage "$(jq -nc --arg c "$SSTORED" --arg a "$(hex_of "$SNAME")" '{operation:"decrypt",path:"alpha",ciphertext_hex:$c,aad_hex:$a}')"
+      ran_ok "E11 decrypt of the stored bytes" && { [[ "$(out_field .plaintext)" == "$(hex_of "$SVAL (2)")" ]] \
+        && pass "E11 in a later run the bytes under the SDK's storage key open, with the name as aad, to the CAS winner" \
+        || fail "E11 the stored bytes opened to $(out_field .plaintext), not the winner"; }
+    fi
+  fi
+  via_project "$PARENT" encryption-storage "$(jq -nc --arg n "$SNAME" '{operation:"sealed_has",path:"alpha",key:$n}')"
+  ran_ok "E11 sealed_has" && { [[ "$(out_field .exists)" == true ]] && pass "E11 sealed::has in a later run → true" || fail "E11 sealed::has → $(out_field .exists)"; }
+  via_project "$PARENT" encryption-storage "$(jq -nc --arg n "$SNAME" '{operation:"sealed_delete",path:"alpha",key:$n}')"
+  ran_ok "E11 sealed_delete" && { [[ "$(out_field .deleted)" == true ]] && pass "E11 sealed::delete → true" || fail "E11 sealed::delete → $(out_field .deleted)"; }
+  via_project "$PARENT" encryption-storage "$(jq -nc --arg n "$SNAME" '{operation:"sealed_has",path:"alpha",key:$n}')"
+  ran_ok "E11 sealed_has after delete" && { [[ "$(out_field .exists)" == false ]] && pass "E11 sealed::has after delete → false" || fail "E11 the record survived sealed::delete"; }
+  if [[ -n "$SSK" ]]; then
+    via_project "$PARENT" encryption-storage "$(jq -nc --arg k "$SSK" '{operation:"storage_has",key:$k}')"
+    ran_ok "E11 storage_has of the storage key" && { [[ "$(out_field .exists)" == false ]] && pass "E11 and the raw record under the mac name is gone" || fail "E11 the raw record under $SSK is still there"; }
+  fi
+fi
+
 # ── SC the storage cell ─────────────────────────────────────────────────────
 
 # The account a record's row sits under in storage_data, when PSQL_CMD reads
@@ -986,6 +1055,105 @@ if want SC && storage_gate; then
       row_under "SC2" "$KS" "$PARENT"
       via_project "$PARENT" encryption-storage "$(jq -nc --arg k "$KS" '{operation:"storage_delete",key:$k}')"
       ran_ok "SC2 cleanup" >/dev/null && [[ "$(out_field .deleted)" == true ]] || warn "SC2 $KS was not deleted — left in $PARENT's storage of $PROJECT"
+    fi
+  fi
+fi
+
+# ── H keys and storage over HTTPS /call ─────────────────────────────────────
+
+# One run over HTTPS: `https_run <key-variable> <build> <input-json>` runs the
+# build as a version of $PROJECT, paid by the payment key held in the variable
+# NAMED <key-variable>; the key reaches curl as a config line on stdin, never
+# on a command line. Sets RUN_OK / RUN_ERR / RUN_OUT as an on-chain run does.
+https_run() {
+  local resp body
+  body=$(jq -nc --argjson i "$3" --arg v "$(get_for hash "$2")" \
+    '{input:$i, version_key:$v, async:false, resource_limits:{max_instructions:10000000000,max_memory_mb:128,max_execution_seconds:60}}')
+  resp=$(printf 'header = "X-Payment-Key: %s"\n' "${!1}" | command curl -sS --max-time 180 -K - -X POST \
+    -H 'Content-Type: application/json' --data-binary "$body" "$COORDINATOR_URL/call/$PARENT/$PROJECT_NAME" 2>&1)
+  printf '%s\n' "$resp" >> "$ANSWERS"
+  RUN_OUT=$(jq -c '.output // empty | if type == "string" then (fromjson? // .) else . end' <<<"$resp" 2>/dev/null)
+  case "$(jq -r '.status // empty' <<<"$resp" 2>/dev/null)" in
+    completed) RUN_OK=true; RUN_ERR="" ;;
+    failed) RUN_OK=false; RUN_ERR=$(jq -r '.error // ""' <<<"$resp" 2>/dev/null) ;;
+    *) RUN_OK=absent; RUN_ERR=$(head -c 300 <<<"$resp") ;;
+  esac
+}
+
+if want H; then
+  log "H keys and storage over HTTPS /call: the payment key's owner is the caller"
+  if [[ -z "${HTTPS_PAYMENT_KEY:-}" ]]; then
+    skip "H — HTTPS_PAYMENT_KEY is unset (a funded payment key owned by $PARENT)"
+  elif [[ "${HTTPS_PAYMENT_KEY%%:*}" != "$PARENT" ]]; then
+    fail "H — HTTPS_PAYMENT_KEY is owned by ${HTTPS_PAYMENT_KEY%%:*}, not $PARENT: its keys cannot be compared with $PARENT's on-chain ones"
+  else
+    SIG_ALPHA=""
+    via_project "$PARENT" encryption '{"operation":"all_public_keys"}'
+    ran_ok "H on-chain all_public_keys" && SIG_ALPHA=$(out_field .keys.alpha.public_key)
+    https_run HTTPS_PAYMENT_KEY encryption '{"operation":"what_i_can_see"}'
+    ran_ok "H1 what_i_can_see over HTTPS" && {
+      # NEAR_PREDECESSOR_ID is a chain variable: empty over HTTPS (worker
+      # main.rs); the predecessor's keys and cell follow the payer (SC4).
+      [[ "$(out_field .env.NEAR_USER_ACCOUNT_ID)/$(out_field .env.NEAR_PREDECESSOR_ID)" == "$PARENT/" ]] \
+        && pass "H1 over HTTPS the guest's caller is the payment key's owner, $PARENT (no chain predecessor)" \
+        || fail "H1 over HTTPS the guest sees caller '$(out_field .env.NEAR_USER_ACCOUNT_ID)', predecessor '$(out_field .env.NEAR_PREDECESSOR_ID)'"; }
+    https_run HTTPS_PAYMENT_KEY encryption '{"operation":"all_public_keys"}'
+    ran_ok "H1 all_public_keys over HTTPS" && { [[ "$SIG_ALPHA" =~ ^[0-9a-f]{64}$ && "$(out_field .keys.alpha.public_key)" == "$SIG_ALPHA" ]] \
+      && pass "H1 the project signing key over HTTPS is $PARENT's on-chain alpha" \
+      || fail "H1 over HTTPS alpha is '$(out_field .keys.alpha.public_key)', on chain '$SIG_ALPHA'"; }
+    https_run HTTPS_PAYMENT_KEY encryption '{"operation":"all_encryption_keys"}'
+    ran_ok "H1 all_encryption_keys over HTTPS" && { remember_all_macs
+      [[ -n "$MAC_ALPHA" && "$(out_field .keys.alpha.mac)/$(out_field .keys.beta.mac)" == "$MAC_ALPHA/$MAC_BETA" ]] \
+        && pass "H1 the encryption keys over HTTPS are $PARENT's on-chain alpha and beta (the macs are equal)" \
+        || fail "H1 over HTTPS the macs are $(out_field .keys.alpha.mac)/$(out_field .keys.beta.mac), on chain $MAC_ALPHA/$MAC_BETA"; }
+    if [[ -n "${HTTPS_OTHER_PAYMENT_KEY:-}" && "${HTTPS_OTHER_PAYMENT_KEY%%:*}" != "$PARENT" ]]; then
+      https_run HTTPS_OTHER_PAYMENT_KEY encryption '{"operation":"all_public_keys"}'
+      ran_ok "H1 another owner's all_public_keys" && { [[ "$(out_field .keys.alpha.public_key)" =~ ^[0-9a-f]{64}$ && "$(out_field .keys.alpha.public_key)" != "$SIG_ALPHA" ]] \
+        && pass "H1 another payment key's owner (${HTTPS_OTHER_PAYMENT_KEY%%:*}) gets another signing alpha" || fail "H1 two owners, one signing alpha"; }
+      https_run HTTPS_OTHER_PAYMENT_KEY encryption '{"operation":"all_encryption_keys"}'
+      ran_ok "H1 another owner's all_encryption_keys" && { remember_all_macs
+        [[ "$(out_field .keys.alpha.mac)" =~ ^[0-9a-f]{64}$ && "$(out_field .keys.alpha.mac)" != "$MAC_ALPHA" ]] \
+          && pass "H1 and another encryption alpha" || fail "H1 two owners, one encryption alpha"; }
+    else
+      skip "H1 another owner — HTTPS_OTHER_PAYMENT_KEY is unset or owned by $PARENT"
+    fi
+
+    CTH=""
+    https_run HTTPS_PAYMENT_KEY encryption "$(jq -nc --arg p "$PT_HEX" --arg a "$AAD_HEX" '{operation:"encrypt",path:"alpha",plaintext_hex:$p,aad_hex:$a}')"
+    ran_ok "H2 encrypt over HTTPS" && CTH=$(out_field .ciphertext)
+    if [[ -n "$CTH" ]]; then
+      https_run HTTPS_PAYMENT_KEY encryption "$(jq -nc --arg c "$CTH" --arg a "$AAD_HEX" '{operation:"decrypt",path:"alpha",ciphertext_hex:$c,aad_hex:$a}')"
+      ran_ok "H2 decrypt over HTTPS" && { [[ "$(out_field .plaintext)" == "$PT_HEX" ]] \
+        && pass "H2 sealed in one HTTPS call, opened in a later one" || fail "H2 opened to '$(out_field .plaintext)'"; }
+      via_project "$PARENT" encryption "$(jq -nc --arg c "$CTH" --arg a "$AAD_HEX" '{operation:"decrypt",path:"alpha",ciphertext_hex:$c,aad_hex:$a}')"
+      ran_ok "H2 on-chain decrypt" && { [[ "$(out_field .plaintext)" == "$PT_HEX" ]] \
+        && pass "H2 and $PARENT opens it on chain: one key behind both doors" || fail "H2 on chain it opened to '$(out_field .plaintext)'"; }
+    fi
+
+    KH="$TAG/https-raw"
+    https_run HTTPS_PAYMENT_KEY encryption-storage "$(jq -nc --arg k "$KH" '{operation:"raw_set",key:$k,value_hex:"a1b2c3"}')"
+    if ran_ok "H3 raw_set over HTTPS"; then
+      https_run HTTPS_PAYMENT_KEY encryption-storage "$(jq -nc --arg k "$KH" '{operation:"raw_get",key:$k}')"
+      ran_ok "H3 raw_get over HTTPS" && { [[ "$(out_field .found)/$(out_field .value_hex)" == "true/a1b2c3" ]] \
+        && pass "H3 raw_set / raw_get across HTTPS calls: the bytes as given" || fail "H3 raw_get over HTTPS: found=$(out_field .found) $(out_field .value_hex)"; }
+      via_project "$PARENT" encryption-storage "$(jq -nc --arg k "$KH" '{operation:"raw_get",key:$k}')"
+      ran_ok "H3 on-chain raw_get" && { [[ "$(out_field .found)/$(out_field .value_hex)" == "true/a1b2c3" ]] \
+        && pass "H3 $PARENT's on-chain run reads it: the HTTPS record is in the key owner's cell" || fail "H3 on chain: found=$(out_field .found) $(out_field .value_hex)"; }
+      row_under "H3" "$KH" "$PARENT"
+      https_run HTTPS_PAYMENT_KEY encryption-storage "$(jq -nc --arg k "$KH" '{operation:"storage_delete",key:$k}')"
+      ran_ok "H3 cleanup" >/dev/null && [[ "$(out_field .deleted)" == true ]] || warn "H3 $KH was not deleted — left in $PARENT's storage of $PROJECT"
+    fi
+
+    KH4="$TAG/https-pred"
+    https_run HTTPS_PAYMENT_KEY encryption-storage-pred "$(jq -nc --arg k "$KH4" '{operation:"raw_set",key:$k,value_hex:"c4"}')"
+    if ran_ok "SC4 raw_set over HTTPS (predecessor cell)"; then
+      if sql_alive; then row_under "SC4" "$KH4" "$PARENT"; else fail "SC4 needs PSQL_CMD: the row's account_id is the row"; fi
+      https_run HTTPS_PAYMENT_KEY encryption-storage "$(jq -nc --arg k "$KH4" '{operation:"raw_get",key:$k}')"
+      ran_ok "SC4 raw_get over HTTPS (signer cell)" && { [[ "$(out_field .found)/$(out_field .value_hex)" == "true/c4" ]] \
+        && pass "SC4 encryption-storage over HTTPS reads what encryption-storage-pred wrote: one cell, the payment key's owner's" \
+        || fail "SC4 over HTTPS the default build found=$(out_field .found) $(out_field .value_hex)"; }
+      https_run HTTPS_PAYMENT_KEY encryption-storage "$(jq -nc --arg k "$KH4" '{operation:"storage_delete",key:$k}')"
+      ran_ok "SC4 cleanup" >/dev/null && [[ "$(out_field .deleted)" == true ]] || warn "SC4 $KH4 was not deleted — left in $PARENT's storage of $PROJECT"
     fi
   fi
 fi

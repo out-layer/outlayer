@@ -84,7 +84,7 @@ near_tty() {
     script -q /dev/null bash "$tmp"; local rc=$?; rm -f "$tmp"; return $rc
   else eval "$@"; fi
 }
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1"; }
+mk_token() { CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1"; }
 AUTH()  { echo "Authorization: Bearer near:$(mk_token "$1")"; }
 nonce() { head -c 32 /dev/urandom | base64 | tr -d '\n'; }
 
@@ -195,8 +195,8 @@ fi
 REJ_SIG=""; REJ_NONCE=""
 sign_reject() { # sign_reject <approval_id> <wallet_pubkey> <request_hash>
   REJ_NONCE=$(nonce)
-  REJ_SIG=$("$RECOVERY_BIN" sign-nep413 \
-    --private-key "$PARENT_PRIVKEY" \
+  REJ_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-nep413 \
+ \
     --message "reject:$1:$2:$3" \
     --recipient "$CONTRACT_ID" \
     --nonce-base64 "$REJ_NONCE" | jq -r '.signature')

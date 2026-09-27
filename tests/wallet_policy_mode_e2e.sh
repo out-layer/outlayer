@@ -105,7 +105,7 @@ near_tty() {
   else eval "$@"; fi
 }
 
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1"; }
+mk_token() { CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1"; }
 AUTH() { echo "Authorization: Bearer near:$(mk_token "$1")"; }
 
 chain_balance() {

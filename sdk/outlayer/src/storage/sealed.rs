@@ -7,8 +7,9 @@
 //! - storage key: `hex(mac(path, vault, name))` — 64 lowercase hex characters
 //! - value: `encrypt(path, vault, value, aad = name)`
 //!
-//! That is the pattern `outlayer:encryption-keys` documents, so code without
-//! this module reads and writes the same records.
+//! That is the pattern `outlayer:encryption-keys` documents — `aad` is the
+//! plain record name, not its storage key — so code without this module that
+//! follows it reads and writes the same records.
 //!
 //! What the storage operator still sees: that a record exists, when it is
 //! touched, the same tag for the same name in every run, and the value's length
@@ -207,25 +208,20 @@ pub fn set_if_equals(
 ///
 /// # Returns
 /// * `Ok(true)` - Record existed and was deleted
-/// * `Ok(false)` - No record was deleted: none existed, **or the storage call
-///   failed** — the host answers both with `false`, so this is not proof of
-///   absence. Read the record with [`get`] to tell them apart.
-/// * `Err(StorageError)` - Encryption key operation failed
+/// * `Ok(false)` - No record existed
+/// * `Err(StorageError)` - Encryption key operation or the storage call failed
 pub fn delete(path: &str, vault: Option<&str>, name: &str) -> Result<bool> {
-    Ok(super::delete(&storage_key(path, vault, name)?))
+    super::delete(&storage_key(path, vault, name)?)
 }
 
 /// Check whether record `name` exists
 ///
 /// # Returns
 /// * `Ok(true)` - A record is stored under this name
-/// * `Ok(false)` - No record was found: none exists, **or the storage call
-///   failed** — the host answers both with `false`, so this is not proof of
-///   absence. Use [`get`], which returns a failed call as `Err`, where absence
-///   decides anything.
-/// * `Err(StorageError)` - Encryption key operation failed
+/// * `Ok(false)` - No record is stored under this name
+/// * `Err(StorageError)` - Encryption key operation or the storage call failed
 pub fn has(path: &str, vault: Option<&str>, name: &str) -> Result<bool> {
-    Ok(super::has(&storage_key(path, vault, name)?))
+    super::has(&storage_key(path, vault, name)?)
 }
 
 fn seal(path: &str, vault: Option<&str>, name: &str, value: &[u8]) -> Result<Vec<u8>> {

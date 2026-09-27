@@ -72,9 +72,6 @@ GROUPS: dict[str, list[str]] = {
     ],
     "local-infra": [
         "unit.sh",
-        "integration.sh",
-        "compilation.sh",
-        "compilation_timeout.sh",
         "transactions.sh",
         "job_workflow.sh",
         "parallel_execution.sh",

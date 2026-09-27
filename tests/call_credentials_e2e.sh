@@ -124,8 +124,8 @@ SEED="callcred-$(date +%s)-$$"
 # `timestamp_expired`, which reads like a clock problem rather than a script
 # holding a token too long.
 AUTH() {
-  echo "Authorization: Bearer near:$("$RECOVERY_BIN" sign-bearer-near \
-    --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$SEED")"
+  echo "Authorization: Bearer near:$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near \
+ --account-id "$PARENT" --seed "$SEED")"
 }
 
 # `PUT /wallet/v1/api-key` under a Bearer derives a SUB-wallet from
@@ -270,7 +270,7 @@ else
     # only evidence that the middle one landed is the balance. A suite that
     # says "sent" and then watches the key creation fail sends the reader to
     # the coordinator for a fault that is on this line.
-    warn "the stablecoin did not arrive: $ADDR holds ${LANDED:-0} of $AMT. near-cli said: $(tail -2 <<<"$FT_OUT" | head -c 200)"
+    warn "the stablecoin did not arrive: $ADDR holds ${LANDED:-0} of $AMT. near-cli said: $(near_why "$FT_OUT")"
   fi
 fi
 

@@ -45,13 +45,13 @@ log "POST /register with empty body (legacy random-wallet path)"
 REG=$(curl -sS -X POST "$COORDINATOR_URL/register" \
   -H 'Content-Type: application/json' \
   -d '{}')
-echo "$REG" | jq . >&2
+jq 'del(.api_key, .handoff_url)' <<<"$REG" >&2   # the wk_ and the handoff_url that embeds it stay out of the log
 
 API_KEY=$(echo "$REG" | jq -r '.api_key // empty')
 WALLET_ID=$(echo "$REG" | jq -r '.wallet_id // empty')
 ADDR=$(echo "$REG" | jq -r '.near_account_id // empty')
 [[ -n "$API_KEY" && "$API_KEY" != "null" ]] || \
-  fail "no api_key in legacy /register response: $REG"
+  fail "no api_key in legacy /register response: $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG" 2>/dev/null | head -c 300)"
 [[ -n "$WALLET_ID" && "$WALLET_ID" != "null" ]] || \
   fail "no wallet_id in legacy /register response"
 [[ -n "$ADDR" && "$ADDR" != "null" ]] || \
@@ -61,7 +61,7 @@ keystore default-master path may be broken"
 # Confirm the response shape doesn't carry a vault_id (this is the
 # legacy path — vault binding is explicitly absent).
 HANDOFF=$(echo "$REG" | jq -r '.handoff_url // empty')
-pass "legacy /register returned api_key=${API_KEY:0:9}… wallet_id=$WALLET_ID address=$ADDR"
+pass "legacy /register returned api_key (${#API_KEY} chars) wallet_id=$WALLET_ID address=$ADDR"
 [[ -n "$HANDOFF" ]] && pass "handoff_url returned (legacy UX flow intact)"
 
 # ─── 2. Sign a NEP-413 message via the default-master path ──────────

@@ -32,6 +32,26 @@ declare -a SKIP_NAMES=()
 declare -a FINDING_NAMES=()
 
 log()  { printf '\n\033[36m▶ %s\033[0m\n' "$*" >&2; }
+
+# An `outlayer upload` can report success while the gateway never serves the
+# file; a second upload of the same bytes then lands. Upload, wait up to ~90 s
+# for the bytes, upload again, up to three times. Prints the URL; returns 1
+# (with the last served sha256 on stderr) when the bytes never arrive.
+fastfs_upload() { # fastfs_upload <file> <sha256>
+  local up url="" got="" attempt i
+  for attempt in 1 2 3; do
+    up=$(OUTLAYER_RPC_URL="$RPC_URL" outlayer upload "$1" 2>&1)
+    url=$(grep -oE 'https://[A-Za-z0-9._-]+\.fastfs\.io/[^[:space:]"]+\.wasm' <<<"$up" | head -1)
+    [[ -n "$url" ]] || continue
+    for i in $(seq 1 18); do
+      got=$(curl -sL --max-time 60 "$url" | shasum -a 256 | cut -d' ' -f1)
+      [[ "$got" == "$2" ]] && { printf '%s' "$url"; return 0; }
+      sleep 5
+    done
+  done
+  echo "fastfs_upload: ${url:-no URL} serves ${got:-nothing}, not $2 after 3 uploads" >&2
+  return 1
+}
 note() { printf '\033[35m• %s\033[0m\n' "$*" >&2; }
 warn() { printf '\033[33m⚠ %s\033[0m\n' "$*" >&2; }
 pass() { printf '\033[32m✓ %s\033[0m\n' "$*" >&2; PASS=$((PASS+1)); }
@@ -114,7 +134,7 @@ throttle() {
   HOS_RL_COUNT=$(( HOS_RL_COUNT + 1 ))
 }
 
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1"; }
+mk_token() { CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1"; }
 AUTH_FOR() { echo "Authorization: Bearer near:$(mk_token "$1")"; }
 
 # api <seed|-> <METHOD> <path> [body-json] [extra curl args…]

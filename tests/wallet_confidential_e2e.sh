@@ -487,7 +487,7 @@ cmd_multisig() {
     echo -e "  vault: ${GREEN}$VAULT_ID${NC}"
 
     # ─── auth + policy helpers (mirror unified_op_e2e.sh) ──────────────────────
-    mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1" --vault-id "$VAULT_ID"; }
+    mk_token() { CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1" --vault-id "$VAULT_ID"; }
     AUTHH() { echo "Authorization: Bearer near:$(mk_token "$1")"; }
 
     local SEED="confms-$(date +%s)"
@@ -524,7 +524,7 @@ cmd_multisig() {
         local v=$1 aid=$2 h=$3 priv=$4 pub=$5 acct=$6 nonce sj sig wpk
         wpk=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$aid" | jq -r '.wallet_pubkey // empty')
         nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-        sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$priv" --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+        sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$priv" "$RECOVERY_BIN" sign-nep413 --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
         sig=$(echo "$sj" | jq -r '.signature')
         curl -sS -o /tmp/conf_vote.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/$v/$aid" -H 'Content-Type: application/json' \
             -d "$(jq -nc --arg s "$sig" --arg pk "$pub" --arg ac "$acct" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')"

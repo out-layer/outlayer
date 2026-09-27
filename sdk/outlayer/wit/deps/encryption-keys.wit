@@ -61,10 +61,12 @@ package outlayer:encryption-keys@0.1.0;
 /// reason, never a trap.
 ///
 /// **Binding a ciphertext to its record.** A ciphertext opens under any `aad`
-/// only if it was sealed under the same `aad`. Pass the name of the record the
-/// ciphertext is stored under (the storage key, a record id) as `aad`: a
+/// only if it was sealed under the same `aad`. Pass the record's NAME (the
+/// plain name, not the `mac` of it the record is stored under) as `aad`: a
 /// ciphertext copied onto another record by whoever holds the storage then
-/// fails to decrypt instead of being read as that record's data.
+/// fails to decrypt instead of being read as that record's data. The SDK's
+/// `storage::sealed` does exactly this, so code that follows it reads the
+/// same records.
 ///
 /// **Hiding what the records are called.** Storage keys are visible to the
 /// operator of the storage. Store records under `mac(path, vault, name)` (hex

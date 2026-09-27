@@ -204,7 +204,7 @@ run_as() { # run_as <signer> <profile>
   RUN_OK=$(jq -r '.data[0] | if has("success") then (.success|tostring) else "absent" end' <<<"$ev" 2>/dev/null)
   RUN_ERR=$(jq -r '.data[0].error_message // ""' <<<"$ev" 2>/dev/null)
   # The module's own answer, when it ran at all.
-  RUN_SECRET=$(awk '/Function execution return value/{getline; print}' <<<"$out" \
+  RUN_SECRET=$(awk '/Function execution return value/{f=1; next} f && /^The "/{exit} f{print}' <<<"$out" \
     | jq -r 'select(. != null) | fromjson | .secrets[]? | select(.key=="SECRET") | .value // ""' 2>/dev/null)
 }
 

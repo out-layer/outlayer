@@ -97,7 +97,7 @@ store() { # store <project> <profile> <secrets-json> <access>   (the CLI signs a
   local before out
   before=$(jq -r '.updated_at // 0' <<<"$(row_of "$1" "$2")")
   out=$(OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set "$3" --project "$1" --profile "$2" --access "$4" 2>&1) \
-    || { echo "✗ could not store $1/$2: $(tail -1 <<<"$out" | head -c 200)" >&2; exit 1; }
+    || { echo "✗ could not store $1/$2: $(near_why "$out")" >&2; exit 1; }
   wait_row_after "$1" "$2" "$before" || { echo "✗ $1/$2 never became final" >&2; exit 1; }
   note "stored $1/$2 ($4)"
 }
@@ -158,8 +158,7 @@ set_access() { # set_access <project> <profile> <access-json>
       continue
     fi
     echo "✗ update_access failed for $1/$2 (deposit $deposit_used):" >&2
-    grep -viE '^\s*$' <<<"$out" | tail -12 | head -c 900 >&2
-    echo >&2
+    near_why "$out" >&2
     exit 1
   done
   wait_row_after "$1" "$2" "$before" || { echo "✗ $1/$2 access change never became final" >&2; exit 1; }
@@ -195,7 +194,7 @@ delete_row() { # delete_row <project> <profile>
     [[ $i -eq 1 ]] && sleep 4
   done
   [[ $rc -eq 0 ]] || {
-    echo "✗ delete_secrets failed for $1/$2: $(grep -oE 'panic_msg: [^,}]*|[Ee]rror: .*' <<<"$out" | head -2 | tr '\n' ' ' | head -c 200)" >&2
+    echo "✗ delete_secrets failed for $1/$2: $(near_why "$out")" >&2
     exit 1; }
   for i in $(seq 1 15); do
     [[ -z "$(jq -r '.encrypted_secrets // empty' <<<"$(row_of "$1" "$2")")" ]] && { note "deleted $1/$2"; return 0; }
@@ -257,12 +256,12 @@ run_as() {
   RUN_RAW="$out"
   if [[ -z "$ev" ]]; then
     RUN_OK=absent; RUN_ERR=""; RUN_OUT=""
-    note "no completion event from $signer: $(grep -iE 'error|fail|panick|reset|limit' <<<"$out" | head -2 | head -c 300)"
+    note "no completion event from $signer: $(near_why "$out")"
     return 0
   fi
   RUN_OK=$(jq -r '.data[0] | if has("success") then (.success|tostring) else "absent" end' <<<"$ev" 2>/dev/null)
   RUN_ERR=$(jq -r '.data[0].error_message // ""' <<<"$ev" 2>/dev/null)
-  RUN_OUT=$(awk '/Function execution return value/{getline; print}' <<<"$out" \
+  RUN_OUT=$(awk '/Function execution return value/{f=1; next} f && /^The "/{exit} f{print}' <<<"$out" \
     | jq -c 'select(. != null) | if type=="string" then fromjson else . end' 2>/dev/null)
 }
 

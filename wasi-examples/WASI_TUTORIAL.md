@@ -338,7 +338,7 @@ The `outlayer` crate provides access to OutLayer-specific features for WASI P2 m
 
 ```toml
 [dependencies]
-outlayer = "0.1"
+outlayer = "0.2"
 ```
 
 ### Getting the Caller's NEAR Account
@@ -483,7 +483,7 @@ getrandom = { version = "0.2", features = ["custom"] }
 wasi-http-client = "0.2"
 
 # OutLayer SDK (persistent storage, env access) - WASI P2 only:
-outlayer = "0.1"
+outlayer = "0.2"
 
 # For WASI P1 with NEAR contracts embedded (advanced):
 borsh = { version = "1.5", features = ["derive"] }

@@ -210,13 +210,14 @@ impl Contract {
         result
     }
 
-    /// Get the next available payment key nonce for a user.
-    ///
-    /// Scans existing payment key secrets and returns max(nonce) + 1.
-    /// Returns 1 if the user has no payment keys yet.
+    /// The lowest nonce a new payment key of `account_id` may use: one above both
+    /// its live keys and its floor (`Contract::payment_key_nonce_floor`, the
+    /// highest nonce the contract has seen it create or delete). 1 for an
+    /// account with neither.
     pub fn get_next_payment_key_nonce(&self, account_id: AccountId) -> u32 {
+        let floor = self.payment_key_nonce_floor(&account_id);
         let user_secrets = self.user_secrets_index.get(&account_id);
-        match user_secrets {
+        let live = match user_secrets {
             Some(secrets_set) => {
                 let max_nonce = secrets_set
                     .iter()
@@ -229,9 +230,16 @@ impl Contract {
                     .filter_map(|key| key.profile.parse::<u32>().ok())
                     .max()
                     .unwrap_or(0);
-                max_nonce + 1
+                max_nonce
             }
-            None => 1,
-        }
+            None => 0,
+        };
+        live.max(floor).saturating_add(1)
+    }
+
+    /// The highest payment-key nonce `account_id` has held, as far as the
+    /// contract knows; 0 when nothing is recorded. A new key must be above it.
+    pub fn get_payment_key_nonce_floor(&self, account_id: AccountId) -> u32 {
+        self.payment_key_nonce_floor(&account_id)
     }
 }

@@ -185,13 +185,13 @@ if [[ -n "${MPC_PUBLIC_KEY:-}" ]]; then
   if [[ $INIT_RC -ne 0 ]] && echo "$INIT_OUT" | grep -q "outlayer vault resume"; then
     for _ in 1 2 3 4 5; do sleep 6; if outlayer vault resume "$VAULT_ID" >&2; then INIT_RC=0; break; fi; done
   fi
-  [[ $INIT_RC -eq 0 ]] || { echo "✗ vault init failed: $INIT_OUT" >&2; exit 1; }
+  [[ $INIT_RC -eq 0 ]] || { echo "✗ vault init failed: $(near_why "$INIT_OUT")" >&2; exit 1; }
   pass "vault $VAULT_ID deployed"
 else
   log "Default-vault mode (no MPC_PUBLIC_KEY): skipping vault init; tokens omit vault-id → coordinator default vault"
 fi
 
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1" ${2:+--vault-id "$2"}; }
+mk_token() { local v=(); [[ -n "${2:-}" ]] && v=(--vault-id "$2"); CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1" ${v[@]+"${v[@]}"}; }
 AUTH() { echo "Authorization: Bearer near:$(mk_token "$1" "$VAULT_ID")"; }
 
 # new_subwallet <seed> → echoes "WALLET_ID SUB_ADDR"
@@ -656,7 +656,7 @@ if want T9 && intents_mainnet T9; then
       local v=$1 aid=$2 h=$3 priv=$4 pub=$5 acct=$6 nonce sj sig wpk
       wpk=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$aid" | jq -r '.wallet_pubkey // empty')
       nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-      sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$priv" --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+      sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$priv" "$RECOVERY_BIN" sign-nep413 --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
       sig=$(echo "$sj" | jq -r '.signature')
       curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/$v/$aid" -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg s "$sig" --arg pk "$pub" --arg ac "$acct" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')"
@@ -728,7 +728,7 @@ if want T10 && intents_mainnet T10; then
       local v=$1 aid=$2 h=$3 priv=$4 pub=$5 acct=$6 nonce sj sig wpk
       wpk=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$aid" | jq -r '.wallet_pubkey // empty')
       nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-      sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$priv" --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+      sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$priv" "$RECOVERY_BIN" sign-nep413 --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
       sig=$(echo "$sj" | jq -r '.signature')
       curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/$v/$aid" -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg s "$sig" --arg pk "$pub" --arg ac "$acct" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')"
@@ -1258,7 +1258,7 @@ if want T16 && intents_mainnet T16; then
           local v=$1 aid=$2 h=$3 priv=$4 pub=$5 acct=$6 nonce sj sig wpk
           wpk=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$aid" | jq -r '.wallet_pubkey // empty')
           nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-          sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$priv" --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+          sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$priv" "$RECOVERY_BIN" sign-nep413 --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
           sig=$(echo "$sj" | jq -r '.signature')
           curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/$v/$aid" -H 'Content-Type: application/json' \
             -d "$(jq -nc --arg s "$sig" --arg pk "$pub" --arg ac "$acct" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')"
@@ -1401,8 +1401,11 @@ if want T17 && intents_mainnet T17; then
     post POST /wallet/v1/limit-orders "$SEED" "$(lo_body)"
     if [[ "$HTTP" != "200" ]]; then fail "T17d create failed ($HTTP): $BODY"; fi
     LO_ID=$(echo "$BODY" | jq -r '.order_id // empty')
-    [[ -n "$LO_ID" ]] || fail "T17d no order_id in: $(echo "$BODY"|head -c200)"
-    pass "T17d order created and funded: $LO_ID (intent=$(echo "$BODY" | jq -r '.transfer_intent_hash // "?"'))"
+    if [[ -n "$LO_ID" ]]; then
+      pass "T17d order created and funded: $LO_ID (intent=$(echo "$BODY" | jq -r '.transfer_intent_hash // "?"'))"
+    else
+      fail "T17d no order_id in: $(echo "$BODY"|head -c200)"
+    fi
     # The fee is the upstream's, never ours — but it comes out of the owner's input, so it is reported.
     if [[ "$(echo "$BODY" | jq -r '.app_fees | type')" == "array" ]]; then pass "T17d app_fees reported: $(echo "$BODY" | jq -c '.app_fees')"
     else fail "T17d app_fees missing from the answer"; fi

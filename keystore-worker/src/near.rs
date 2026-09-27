@@ -199,7 +199,8 @@ pub fn key_for_display(public_key: &str) -> String {
     })
 }
 
-/// A public key as `view_access_key_list` spells it: see `verify_access_key_owner`.
+/// A public key as the chain lists it: the key itself for ed25519 and
+/// secp256k1, the handle for ml-dsa-65.
 fn on_chain_form(public_key: &str) -> Result<String> {
     let parsed = near_crypto::PublicKey::from_str(public_key)
         .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
@@ -591,13 +592,11 @@ impl NearClient {
         let account_id_parsed = AccountId::from_str(account_id)
             .context("Invalid account ID")?;
 
-        // Optimistic finality (most-recent block), NOT Final. Final lags ~1-2 blocks
-        // behind, so a caller that broadcasts a tx with `broadcast_tx_commit` and then
-        // immediately re-signs (e.g. the coordinator's sequential create_payment_key
-        // store→storage→ft_transfer chain) would read the PRE-increment nonce under Final
-        // and collide. Optimistic reflects the just-committed nonce. This does NOT
-        // reintroduce a caller-chosen nonce — the signer still uses rpc_nonce+1, so the
-        // one-approval-one-tx property holds.
+        // The NONCE is read at optimistic finality (the most recent block): a
+        // caller that broadcasts with `broadcast_tx_commit` and at once signs
+        // again (the coordinator's store→storage→ft_transfer chain) would read
+        // the pre-increment nonce at Final and collide. The signer still uses
+        // rpc_nonce+1, so one approval is still one transaction.
         let query = methods::query::RpcQueryRequest {
             block_reference: BlockReference::Finality(Finality::None),
             request: near_primitives::views::QueryRequest::ViewAccessKey {
@@ -617,7 +616,19 @@ impl NearClient {
             _ => anyhow::bail!("Unexpected query response"),
         };
 
-        let block_hash = response.block_hash;
+        // The BLOCK HASH the transaction is signed against is a FINAL block's:
+        // behind a load-balanced RPC, the node that receives the transaction
+        // may not have seen the optimistic block yet and would answer it
+        // `Expired`. Every synced node knows a final block, and it is well
+        // inside the validity window.
+        let block = self
+            .rpc_client
+            .call(methods::block::RpcBlockRequest {
+                block_reference: BlockReference::Finality(Finality::Final),
+            })
+            .await
+            .context("Failed to query the final block")?;
+        let block_hash = block.header.hash;
 
         Ok((nonce, block_hash))
     }
@@ -962,17 +973,24 @@ impl NearClient {
         Ok(ViewAt { value, block_height: response.block_height, block_hash: response.block_hash })
     }
 
-    /// Verify that a public key belongs to an account
+    /// Verify that a public key belongs to an account.
     ///
-    /// Calls: view_access_key_list for account_id
-    /// Returns: Ok(()) if public_key is found, Err if not found or RPC error
+    /// Asks the chain for that ONE key (`view_access_key`), never for the
+    /// account's whole list: the RPC refuses the list for an account with many
+    /// keys (`TOO_MANY_ACCESS_KEYS`), and the owner of such an account could
+    /// then never approve, reject or edit a secret. An unknown key or account
+    /// is "does not belong"; any other failure is an RPC error.
     pub async fn verify_access_key_owner(
         &self,
         account_id: &str,
         public_key: &str,
     ) -> Result<()> {
+        use near_jsonrpc_primitives::types::query::RpcQueryError;
+
         let account_id_parsed = AccountId::from_str(account_id)
             .context("Invalid account ID")?;
+        let parsed = near_crypto::PublicKey::from_str(public_key)
+            .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
         let shown = key_for_display(public_key);
 
         tracing::debug!(
@@ -983,49 +1001,39 @@ impl NearClient {
 
         let query = methods::query::RpcQueryRequest {
             block_reference: BlockReference::latest(),
-            request: near_primitives::views::QueryRequest::ViewAccessKeyList {
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
                 account_id: account_id_parsed,
+                public_key: parsed,
             },
         };
 
-        let response = self
-            .rpc_client
-            .call(query)
-            .await
-            .context("Failed to query access keys")?;
-
-        let access_keys = match response.kind {
-            QueryResponseKind::AccessKeyList(list) => list.keys,
-            _ => anyhow::bail!("Unexpected query response"),
-        };
-
-        // Compared in the form the chain keeps a key in. For ed25519 and
-        // secp256k1 that is the key itself; an ml-dsa-65 key is 1952 bytes, and
-        // the trie holds only its handle — SHA3-256 over a domain tag and the
-        // key, listed as `ml-dsa-65-hash:…`. The full key the wallet signed
-        // with is turned into that handle here; comparing the strings as they
-        // arrive would never match one.
-        let wanted = on_chain_form(public_key)?;
-        let key_found = access_keys.iter().any(|key| key.public_key.to_string() == wanted);
-
-        if key_found {
-            tracing::debug!(
-                account_id = %account_id,
-                public_key = %shown,
-                "✅ Access key verified"
-            );
-            Ok(())
-        } else {
-            tracing::warn!(
-                account_id = %account_id,
-                public_key = %shown,
-                keys_count = access_keys.len(),
-                "❌ Access key not found for account"
-            );
-            anyhow::bail!(
-                "Public key {} does not belong to account {}",
-                shown, account_id
-            )
+        match self.rpc_client.call(query).await {
+            Ok(response) => match response.kind {
+                QueryResponseKind::AccessKey(_) => {
+                    tracing::debug!(
+                        account_id = %account_id,
+                        public_key = %shown,
+                        "✅ Access key verified"
+                    );
+                    Ok(())
+                }
+                _ => anyhow::bail!("Unexpected query response"),
+            },
+            Err(e) if matches!(
+                e.handler_error(),
+                Some(RpcQueryError::UnknownAccessKey { .. } | RpcQueryError::UnknownAccount { .. })
+            ) => {
+                tracing::warn!(
+                    account_id = %account_id,
+                    public_key = %shown,
+                    "❌ Access key not found for account"
+                );
+                anyhow::bail!(
+                    "Public key {} does not belong to account {}",
+                    shown, account_id
+                )
+            }
+            Err(e) => Err(anyhow::Error::new(e)).context("Failed to query access key"),
         }
     }
 }

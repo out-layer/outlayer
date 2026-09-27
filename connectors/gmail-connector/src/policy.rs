@@ -24,9 +24,9 @@ pub struct Policy {
     pub recipient_domains: Option<Vec<String>>,
     /// Addresses the agent may write to regardless of domain.
     pub recipients: Option<Vec<String>>,
-    /// Messages a day, counted in project storage in UTC days. Required: a
-    /// policy that allows sending without saying how much allows a loop to mail
-    /// a thousand strangers.
+    /// Messages a day, per calling wallet, counted in project storage in UTC
+    /// days. Optional: absent means no cap of the owner's — the manifest's
+    /// per-wallet technical ceiling on `send` still applies.
     pub max_per_day: Option<u32>,
     /// Recipients one message may carry, `to` and `cc` together.
     pub max_recipients: Option<usize>,

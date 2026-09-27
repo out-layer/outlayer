@@ -115,8 +115,8 @@ MINTED="${MINTED:-false}"
 # A function, not a value: the token carries a timestamp and the coordinator
 # refuses a stale one partway through a run that waits on chain.
 AUTH() {
-  echo "Authorization: Bearer near:$("$RECOVERY_BIN" sign-bearer-near \
-    --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$WALLET_SEED")"
+  echo "Authorization: Bearer near:$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near \
+ --account-id "$PARENT" --seed "$WALLET_SEED")"
 }
 
 # Big-integer helpers. Yocto amounts are 22+ digits: shell arithmetic truncates
@@ -179,7 +179,7 @@ store_policy() { # store_policy <policy-json>
   out=$(near --quiet contract call-function as-transaction "$CONTRACT_ID" store_wallet_policy \
     json-args "$store_args" prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \
     sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1) || rc=$?
-  (( rc == 0 )) || { warn "store_wallet_policy failed (rc=$rc): $(tail -c 400 <<<"$out")"; return 1; }
+  (( rc == 0 )) || { warn "store_wallet_policy failed (rc=$rc): $(near_why "$out")"; return 1; }
   sleep 6
 }
 

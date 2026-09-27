@@ -299,7 +299,7 @@ cli_set_build() {
   local before out
   before=$(jq -r '.updated_at // 0' <<<"$(row_of "$PROJECT" "$PROFILE")")
   out=$(OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set "$(jq -nc --arg v "$CANARY" '{USER_SECRET:$v}')" \
-        --project "$PROJECT" --profile "$PROFILE" --build "$1" 2>&1) || { echo "$out" | tail -3 >&2; return 1; }
+        --project "$PROJECT" --profile "$PROFILE" --build "$1" 2>&1) || { echo "  $(near_why "$out")" >&2; return 1; }
   wait_row_after "$PROJECT" "$PROFILE" "$before"
 }
 if ! cli_set_build "$RUNNING"; then

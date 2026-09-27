@@ -9,6 +9,51 @@ use crate::*;
 use near_sdk::serde_json::json;
 use near_sdk::{env, log, near_bindgen, AccountId, Gas, GasWeight, NearToken, Promise};
 
+/// Bytes one floor entry occupies: the record overhead, the map prefix, the
+/// borsh-encoded account id and the `u32`.
+pub(crate) fn nonce_floor_entry_bytes(owner: &AccountId) -> u64 {
+    40 + 1 + 4 + owner.as_str().len() as u64 + 4
+}
+
+impl Contract {
+    /// A payment key's nonce is not handed out twice to one owner.
+    ///
+    /// The coordinator keeps a deleted key's row under its `(owner, nonce)` —
+    /// marked deleted, holding what the key had left and what it was granted. A
+    /// new key at that nonce would land on that row: its registration would find
+    /// the row taken and do nothing, and its first top-up would bring the old row
+    /// back to life with the old balance and grants attached. So `store_secrets`
+    /// takes a payment key only above the owner's floor (`payment_key_nonce_floors`,
+    /// the highest nonce the contract has seen them create or delete), and
+    /// `get_next_payment_key_nonce` answers above it.
+    ///
+    /// The floor is raised when a key is created and again when one is deleted,
+    /// so a key older than its owner's floor entry is recorded when it goes.
+    ///
+    /// Returns the floor recorded for `owner`, 0 if none is.
+    pub(crate) fn payment_key_nonce_floor(&self, owner: &AccountId) -> u32 {
+        self.payment_key_nonce_floors.get(owner).unwrap_or(0)
+    }
+
+    /// Raise `owner`'s floor to `nonce` if it is below it; never lowers it.
+    pub(crate) fn raise_payment_key_nonce_floor(&mut self, owner: &AccountId, nonce: u32) {
+        if self.payment_key_nonce_floors.get(owner).map_or(true, |floor| floor < nonce) {
+            self.payment_key_nonce_floors.insert(owner, &nonce);
+        }
+    }
+
+    /// What a new payment key must add to its deposit for the owner's floor
+    /// entry: its bytes on the owner's first key, nothing after. Not part of
+    /// the key's refundable deposit — the entry outlives every key.
+    pub(crate) fn nonce_floor_deposit(&self, owner: &AccountId) -> u128 {
+        if self.payment_key_nonce_floors.contains_key(owner) {
+            0
+        } else {
+            nonce_floor_entry_bytes(owner) as u128 * crate::secrets::STORAGE_PRICE_PER_BYTE
+        }
+    }
+}
+
 /// Minimum top-up amount: $0.01 (10_000 for USDT with 6 decimals)
 pub const MIN_TOP_UP_AMOUNT: u128 = 10_000;
 
@@ -715,6 +760,10 @@ impl Contract {
                 // A payment key is owned by the account that created it, and the
                 // storage deposit goes back to that same account.
                 self.delete_secrets_internal(secret_key, &owner, &owner);
+
+                // Its nonce stays used. A key created before the floor existed
+                // has no entry yet; this is where it gets one.
+                self.raise_payment_key_nonce_floor(&owner, nonce);
 
                 log!(
                     "Payment key deleted: owner={}, nonce={}",

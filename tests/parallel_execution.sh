@@ -31,7 +31,7 @@ echo ""
 # Function to submit a single execution request
 submit_task() {
     local task_num=$1
-    local input_data="{\"message\":\"Task ${task_num} - $(date +%s)\"}"
+    local input_data="{\\\"message\\\":\\\"Task ${task_num} - $(date +%s)\\\"}"
 
     echo -e "${BLUE}[Task ${task_num}] Submitting execution request...${NC}"
 
@@ -55,7 +55,7 @@ submit_task() {
     echo $output
 
     # Extract transaction hash
-    local tx_hash=$(echo "$output" | grep -oE '[A-Z0-9]{40,}' | head -1)
+    local tx_hash=$(echo "$output" | grep -oE 'Transaction ID: *[1-9A-HJ-NP-Za-km-z]{43,44}' | awk '{print $NF}' | head -1)
 
     if [ -n "$tx_hash" ]; then
         echo -e "${GREEN}[Task ${task_num}] ✓ Submitted successfully${NC}"
@@ -98,7 +98,7 @@ echo ""
 sleep 5  # Give workers time to pick up tasks
 
 echo -e "${BLUE}Checking coordinator for job distribution:${NC}"
-curl -s "http://localhost:8080/public/jobs?limit=50" | python3 -c "
+curl -s "${COORDINATOR_URL:-http://localhost:8080}/public/jobs?limit=50" | python3 -c "
 import sys
 import json
 from collections import Counter

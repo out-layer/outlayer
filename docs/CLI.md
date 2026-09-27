@@ -182,7 +182,7 @@ Payment keys are required for HTTPS API calls.
 | `outlayer keys list` | List keys with balances |
 | `outlayer keys balance <nonce>` | Check key balance |
 | `outlayer keys topup <nonce> <amount>` | Top up with NEAR (mainnet, auto-swaps to USDC) |
-| `outlayer keys delete <nonce>` | Delete key (refunds storage deposit) |
+| `outlayer keys delete <nonce>` | Delete key: the storage deposit is refunded, the remaining balance is forfeited |
 
 ```bash
 outlayer keys create
@@ -195,6 +195,11 @@ outlayer keys balance 1
 outlayer keys topup 1 0.5       # top up key nonce 1 with 0.5 NEAR
 outlayer keys delete 2
 ```
+
+A deleted key's unspent balance is not refunded and does not move to another
+key. Deleting it does not free its nonce: the contract refuses a new key there,
+and `keys create` takes the next nonce from the contract
+(`get_next_payment_key_nonce`).
 
 ### Upload (FastFS)
 

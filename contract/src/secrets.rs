@@ -750,7 +750,16 @@ impl Contract {
             &access,
             vault_bound_after_call,
         );
-        U128((storage_bytes as u128) * STORAGE_PRICE_PER_BYTE)
+        // A new payment key also pays for its owner's nonce floor entry, once.
+        let floor_deposit = match &key.accessor {
+            SecretAccessor::System(SystemSecretType::PaymentKey)
+                if self.secrets_storage.get(&key).is_none() =>
+            {
+                self.nonce_floor_deposit(&key.owner)
+            }
+            _ => 0,
+        };
+        U128((storage_bytes as u128) * STORAGE_PRICE_PER_BYTE + floor_deposit)
     }
 
     /// Get secrets (for keystore worker to read)
@@ -2136,6 +2145,23 @@ impl Contract {
             }
         }
 
+        // A nonce the owner has held before is never taken again — see
+        // `Contract::payment_key_nonce_floor` for what reusing one would do.
+        // The floor entry's bytes are charged once, with the owner's first key
+        // after it exists, and kept: the entry outlives every key.
+        let mut floor_deposit = 0;
+        if let SecretAccessor::System(SystemSecretType::PaymentKey) = &accessor {
+            let nonce: u32 = profile.parse().expect("PaymentKey profile must be a valid u32 nonce");
+            let floor = self.payment_key_nonce_floor(&owner);
+            if nonce <= floor {
+                env::panic_str(&format!(
+                    "Payment key nonce {nonce} has already been used by this account: a nonce is \
+                     never handed out twice. Take the one get_next_payment_key_nonce answers."
+                ));
+            }
+            floor_deposit = self.nonce_floor_deposit(&owner);
+        }
+
         if let Some(existing) = self.secrets_storage.get(&key) {
             // Updating existing: combine attached + old deposit, require only new cost
             let total_available = attached_deposit + existing.storage_deposit;
@@ -2164,16 +2190,17 @@ impl Contract {
             }
         } else {
             // Check attached deposit
+            let charged = required_deposit + floor_deposit;
             assert!(
-                attached_deposit >= required_deposit,
+                attached_deposit >= charged,
                 "Insufficient storage deposit. Required: {} yoctoNEAR, attached: {} yoctoNEAR",
-                required_deposit,
+                charged,
                 attached_deposit
             );
 
             // Refund excess if any
-            if attached_deposit > required_deposit {
-                let refund = attached_deposit - required_deposit;
+            if attached_deposit > charged {
+                let refund = attached_deposit - charged;
                 near_sdk::Promise::new(payer.clone()).transfer(NearToken::from_yoctonear(refund));
             }
         }
@@ -2229,6 +2256,7 @@ impl Contract {
         if let SecretAccessor::System(SystemSecretType::PaymentKey) = &accessor {
             let nonce: u32 = profile.parse()
                 .expect("PaymentKey profile must be a valid u32 nonce");
+            self.raise_payment_key_nonce_floor(&owner, nonce);
             self.emit_system_event(SystemEvent::TopUpPaymentKey {
                 data_id: [0u8; 32], // No yield promise - dummy data_id
                 owner: owner.clone(),

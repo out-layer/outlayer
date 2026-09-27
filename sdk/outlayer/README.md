@@ -9,14 +9,14 @@ Rust SDK for building WASM applications on [OutLayer](https://app.outlayer.ai) -
 
 ```toml
 [dependencies]
-outlayer = "0.1"
+outlayer = "0.2"
 ```
 
 Signing keys and encryption keys (with sealed storage) are opt-in features:
 
 ```toml
 [dependencies]
-outlayer = { version = "0.1.2", features = ["signing-keys", "encryption-keys"] }
+outlayer = { version = "0.2.0", features = ["signing-keys", "encryption-keys"] }
 ```
 
 | Feature | Adds | Host interface |
@@ -97,8 +97,8 @@ use outlayer::storage;
 // Basic operations
 storage::set("key", b"value")?;
 let data = storage::get("key")?;
-let exists = storage::has("key");
-storage::delete("key");
+let exists = storage::has("key")?;
+storage::delete("key")?;
 let keys = storage::list_keys("prefix:")?;
 
 // Convenience methods
@@ -211,9 +211,8 @@ sealed::has("records", None, "init")?;
 sealed::delete("records", None, "init")?;
 ```
 
-`has` and `delete` answer `false` both for no record and for a failed storage
-call (the host returns a plain `bool`), so `false` is not proof of absence;
-`get` returns a failed call as `Err`.
+`has` and `delete` return a failed storage call as `Err`, never as `false`
+(host functions `has-checked` and `delete-checked`).
 
 Encryption is randomized, so compare-and-swap compares the stored ciphertext,
 never a plaintext: `get` returns a `Sealed` holding both, and it is the
@@ -249,7 +248,7 @@ name = "my-outlayer-app"
 path = "src/main.rs"
 
 [dependencies]
-outlayer = "0.1"
+outlayer = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

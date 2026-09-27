@@ -153,7 +153,8 @@ for tool in jq curl near; do command -v "$tool" >/dev/null || { echo "✗ missin
 
 # view <method> <json-args> → the view's JSON text ("null" on any error)
 view() {
-  curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
+  # The keyed URL reaches curl on stdin, never on its command line.
+  printf 'url = "%s"\n' "$RPC_URL" | curl -s -K - -X POST -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg c "$CONTRACT_ID" --arg m "$1" --arg a "$(printf '%s' "$2" | base64 | tr -d '\n')" \
       '{jsonrpc:"2.0",id:1,method:"query",params:{request_type:"call_function",finality:"final",account_id:$c,method_name:$m,args_base64:$a}}')" \
     | jq -r '.result.result | implode' 2>/dev/null || echo 'null'
@@ -299,6 +300,9 @@ if want C2; then
     # PRICE — not on what was sent, which would pay the author a share of the
     # caller's own change.
     log "C2 change on an over-attached call"
+    if [[ "$APPLY" != true ]]; then
+      printf '\033[90m  (dry-run) secret with 15000 attached → author +7000, owner +3000, caller out 10000\033[0m\n' >&2
+    else
     user_balance() {
       view get_user_stablecoin_balance "$(jq -nc --arg a "$CALLER" '{account_id:$a}')" | jq -r 'if . == null then 0 else fromjson end'
     }
@@ -313,7 +317,7 @@ if want C2; then
           params:{attached_usd:"15000"}}')" \
       prepaid-gas '300.0 Tgas' attached-deposit '0.1 NEAR' \
       sign-as "$CALLER" network-config "$NETWORK" sign-with-keychain send 2>&1) \
-      || fail "C2 the over-attached call did not land: $(tail -c 300 <<<"$OVER_OUT")"
+      || fail "C2 the over-attached call did not land: $(near_why "$OVER_OUT")"
     A1=$A0; O1=$O0; U1=$U0
     for _ in $(seq 1 30); do
       A1=$(earnings_of "$AUTHOR"); O1=$(earnings_of "$PROJECT_OWNER"); U1=$(user_balance)
@@ -331,6 +335,7 @@ if want C2; then
       pass "C2 the change came back — the caller paid the price, not what they attached"
     else
       fail "C2 the caller's balance fell by $(( U0 - U1 )), not 10000 — the change of 5000 did not return"
+    fi
     fi
   fi
 fi
@@ -1131,7 +1136,9 @@ if want C12 && agent_secret_mode C12; then
       "$OUTLAYER_BIN" secrets set "$(jq -nc '{PROBE_TOKEN:"planted-by-a-stranger"}')" \
         --project "$PROJECT" --profile "$AGENT_ACCOUNT" >&2 2>/dev/null || PLANT_OK=0
       sleep 5
-      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "Authorization: Bearer $AGENT_WALLET_KEY" \
+      # The agent's own payment key, as in the first check: a `wk_` buys
+      # nothing and is refused as `wk_is_not_a_payer` before the guest runs.
+      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $AGENT_PAYMENT_KEY" \
             -H 'X-Use-Owner-Secret: 1' -H 'Content-Type: application/json' \
             -d '{"input":{"operation":"secret"}}')
       STILL=$(echo "$R" | jq -r '.output.secrets[]? | select(.key=="PROBE_TOKEN") | .sha256_prefix')
@@ -1628,13 +1635,13 @@ if want C17; then
         prepaid-gas '300.0 Tgas' attached-deposit '1 yoctoNEAR' \
         sign-as "$OWNER" network-config "$NETWORK" sign-with-keychain send >"$RUN_TMP"/c17_buy 2>&1
       then
-        fail "C17 the renewal transaction did not send: $(tail -c 200 "$RUN_TMP"/c17_buy)"
+        fail "C17 the renewal transaction did not send: $(near_why < "$RUN_TMP"/c17_buy)"
       fi
       # The transfer answers with the amount USED. Zero means the contract
       # refused and handed it all back, which is a different failure from a
       # renewal that applied wrongly — and it must not be read as the latter.
       if ! grep -q "$PLAN_PRICE" "$RUN_TMP"/c17_buy; then
-        note "C17 the renewal was not accepted by the contract: $(tail -c 200 "$RUN_TMP"/c17_buy)"
+        note "C17 the renewal was not accepted by the contract: $(near_why < "$RUN_TMP"/c17_buy)"
       fi
       sleep 14
 
@@ -1826,7 +1833,7 @@ if want C18 && agent_secret_mode C18; then
       CT_BEFORE=$(ciphertext_after_write "$AGENT" "$C18_PROJECT" "")
 
       if [[ -z "$AGENT" || -z "$CT_BEFORE" ]]; then
-        note "C18 rotation INCONCLUSIVE — nothing landed for agent '''$AGENT''': $(tail -c 200 "$RUN_TMP"/c18_write)"
+        note "C18 rotation INCONCLUSIVE — nothing landed for agent '''$AGENT''': $(near_why < "$RUN_TMP"/c18_write)"
       else
         pass "C18 a secret is on chain under the fresh agent ($AGENT)"
 
@@ -1883,7 +1890,7 @@ if want C18 && agent_secret_mode C18; then
         if grep -q "MethodNotFound" "$RUN_TMP"/c18_pay; then
           note "C18 the second-payer half SKIPPED — the chain has no store_agent_secret yet; deploy the contract and re-run"
         else
-          fail "C18 a second payer holding the same wk_ could not write: $(tail -c 220 "$RUN_TMP"/c18_pay)"
+          fail "C18 a second payer holding the same wk_ could not write: $(near_why < "$RUN_TMP"/c18_pay)"
         fi
       else
         CT_END=$(ciphertext_after_write "$AGENT2" "$C18_PROJECT" "$CT_MID")
@@ -1962,7 +1969,7 @@ if want C19 && agent_secret_mode C19; then
       done
 
       if [[ -z "$C19_STORED" ]]; then
-        fail "C19 nothing landed under the wasm accessor: $(tail -c 220 "$RUN_TMP"/c19_store)"
+        fail "C19 nothing landed under the wasm accessor: $(near_why < "$RUN_TMP"/c19_store)"
       else
         pass "C19 a wasm-scoped secret is on chain under WasmHash($(printf '%.8s' "$C19_HASH")…)"
 
@@ -1983,9 +1990,9 @@ if want C19 && agent_secret_mode C19; then
         C19_RC=$?
 
         if [[ $C19_RC -ne 0 ]] && grep -qiE "unrecognized subcommand|404|not found" "$RUN_TMP"/c19_del; then
-          note "C19 the delete SKIPPED — this build has no delete route yet: $(tail -c 160 "$RUN_TMP"/c19_del)"
+          note "C19 the delete SKIPPED — this build has no delete route yet: $(near_why < "$RUN_TMP"/c19_del)"
         elif [[ $C19_RC -ne 0 ]]; then
-          fail "C19 the delete was refused: $(tail -c 220 "$RUN_TMP"/c19_del)"
+          fail "C19 the delete was refused: $(near_why < "$RUN_TMP"/c19_del)"
         else
           C19_LEFT="$C19_STORED"
           for _ in $(seq 1 12); do

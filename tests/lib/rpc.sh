@@ -36,3 +36,6 @@ fi
 # `rpc_url_public` prints the host and whether a key is on it, which is what a
 # reader of a log needs and all they may have.
 rpc_url_public() { printf '%s %s\n' "${RPC_URL%%\?*}" "$([[ "$RPC_URL" == *apiKey=* ]] && echo '(keyed)' || echo '(UNKEYED)')"; }
+
+# Signing that survives an account with many access keys (see the file).
+source "$(dirname "${BASH_SOURCE[0]}")/near_sign.sh"

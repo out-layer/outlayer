@@ -23,38 +23,6 @@ echo ""
 "$SCRIPT_DIR/unit.sh"
 echo ""
 
-# Test 2: Compilation Tests
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Test 2/4: Compilation Tests${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo ""
-
-# Check if Docker is running
-if docker info > /dev/null 2>&1; then
-    "$SCRIPT_DIR/compilation.sh"
-    echo ""
-else
-    echo "⚠️  Skipping compilation tests - Docker not running"
-    echo "   Start Docker and try again"
-    echo ""
-fi
-
-# Test 3: Integration Tests
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Test 3/4: Integration Tests${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo ""
-
-# Check if coordinator is running
-if curl -s http://localhost:8080/health > /dev/null 2>&1; then
-    "$SCRIPT_DIR/integration.sh"
-    echo ""
-else
-    echo "⚠️  Skipping integration tests - Coordinator not running"
-    echo "   Start with: cd coordinator && cargo run"
-    echo ""
-fi
-
 # Test 4: Wallet Tests (Mode 1 — Agent)
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}Test 4/6: Wallet Mode 1 — Simple Agent${NC}"

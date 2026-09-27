@@ -1155,6 +1155,71 @@ mod text_this_worker_did_not_write_is_cut_on_a_character_boundary {
 }
 
 #[cfg(test)]
+mod only_a_committed_receipt_says_what_was_charged {
+    use super::NearClient;
+    use near_primitives::views::FinalExecutionOutcomeView;
+    use serde_json::{json, Value};
+
+    const CONTRACT: &str = "outlayer.testnet";
+    /// 32 zero bytes, base58.
+    const ZERO_HASH: &str = "11111111111111111111111111111111";
+
+    fn committed() -> Value {
+        json!({ "SuccessValue": "" })
+    }
+
+    fn panicked() -> Value {
+        json!({ "Failure": { "ActionError": { "index": 0, "kind": {
+            "FunctionCallError": { "ExecutionError": "Smart contract panicked: after the log" } } } } })
+    }
+
+    fn receipt(executor: &str, status: Value, logs: &[&str]) -> Value {
+        json!({
+            "proof": [], "block_hash": ZERO_HASH, "id": ZERO_HASH,
+            "outcome": {
+                "logs": logs, "receipt_ids": [], "gas_burnt": 0, "tokens_burnt": "0",
+                "executor_id": executor, "status": status,
+                "metadata": { "version": 1, "gas_profile": null }
+            }
+        })
+    }
+
+    /// The worker's own transaction to the contract, as the RPC's `tx` answers it.
+    fn outcome(receipts: Vec<Value>) -> FinalExecutionOutcomeView {
+        serde_json::from_value(json!({
+            "status": { "SuccessValue": "" },
+            "transaction": {
+                "signer_id": "worker.testnet",
+                "public_key": format!("ed25519:{ZERO_HASH}"),
+                "nonce": 1,
+                "receiver_id": CONTRACT,
+                "actions": [],
+                "signature": format!("ed25519:{}", "1".repeat(64)),
+                "hash": ZERO_HASH
+            },
+            "transaction_outcome": receipt("worker.testnet", json!({ "SuccessReceiptId": ZERO_HASH }), &[]),
+            "receipts_outcome": receipts
+        }))
+        .expect("the outcome must parse as the RPC serves it")
+    }
+
+    #[test]
+    fn a_failed_receipts_charge_is_not_read_and_the_committed_one_is() {
+        let o = outcome(vec![
+            receipt(CONTRACT, panicked(), &["[[yNEAR charged: \"999000\"]]"]),
+            receipt(CONTRACT, committed(), &["[[yNEAR charged: \"123000\"]]"]),
+        ]);
+        assert_eq!(NearClient::extract_payment_from_logs(&o), 123_000);
+    }
+
+    #[test]
+    fn a_charge_only_in_a_failed_receipt_reads_as_nothing_charged() {
+        let o = outcome(vec![receipt(CONTRACT, panicked(), &["[[yNEAR charged: \"999000\"]]"])]);
+        assert_eq!(NearClient::extract_payment_from_logs(&o), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use near_crypto::SecretKey;

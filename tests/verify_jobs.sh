@@ -22,24 +22,15 @@ echo "🔍 Job Database Verification"
 echo "============================"
 echo ""
 
-# Configuration
-DB_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost/offchainvm}"
-
-# Check prerequisites
-if ! command -v psql &> /dev/null; then
-    echo -e "${RED}❌ psql not found${NC}"
-    echo "   Install PostgreSQL client"
-    exit 1
-fi
+# PSQL_CMD runs ONE statement against the coordinator database — the same
+# variable as tests/lib/hos_common.sh (e.g. .idea/testnet-runners/psql_testnet.sh).
+# It is the only way in: no connection string with a password lives here.
+: "${PSQL_CMD:?set PSQL_CMD to a command that runs one SQL statement against the coordinator database}"
+q() { $PSQL_CMD "$1"; }
 
 echo "📊 Connecting to database..."
-echo "  URL: $DB_URL"
-echo ""
-
-# Test database connection
-if ! psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
-    echo -e "${RED}❌ Database connection failed${NC}"
-    echo "   Make sure PostgreSQL is running: docker-compose up -d"
+if ! q "SELECT 1;" > /dev/null 2>&1; then
+    echo -e "${RED}❌ Database connection failed (PSQL_CMD)${NC}"
     exit 1
 fi
 echo -e "${GREEN}✓ Database connected${NC}"
@@ -54,7 +45,7 @@ echo ""
 echo "📊 Job Statistics:"
 echo ""
 
-psql "$DB_URL" -c "
+q "
 SELECT
     job_type,
     status,
@@ -72,7 +63,7 @@ echo -e "${CYAN}Recent Jobs (Last 10)${NC}"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
-psql "$DB_URL" -c "
+q "
 SELECT
     job_id,
     request_id,
@@ -95,15 +86,15 @@ echo -e "${CYAN}Compilation Jobs (with timing)${NC}"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
-psql "$DB_URL" -c "
+q "
 SELECT
     j.job_id,
     j.request_id,
     j.worker_id,
     j.status,
     LEFT(j.wasm_checksum, 16) as wasm_checksum,
-    eh.time_ms as compile_time_ms,
-    ROUND(eh.time_ms::numeric / 1000, 2) as compile_time_sec,
+    eh.compile_time_ms,
+    ROUND(eh.compile_time_ms::numeric / 1000, 2) as compile_time_sec,
     j.created_at
 FROM jobs j
 LEFT JOIN execution_history eh ON j.job_id = eh.job_id
@@ -119,15 +110,15 @@ echo -e "${CYAN}Execution Jobs (with metrics)${NC}"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
-psql "$DB_URL" -c "
+q "
 SELECT
     j.job_id,
     j.request_id,
     j.worker_id,
     j.status,
-    eh.time_ms as exec_time_ms,
-    eh.instructions,
-    ROUND(eh.instructions::numeric / 1000000, 2) as instructions_millions,
+    eh.execution_time_ms,
+    eh.instructions_used,
+    ROUND(eh.instructions_used::numeric / 1000000, 2) as instructions_millions,
     j.created_at
 FROM jobs j
 LEFT JOIN execution_history eh ON j.job_id = eh.job_id
@@ -146,7 +137,7 @@ echo ""
 echo "Requests that triggered both compile and execute:"
 echo ""
 
-psql "$DB_URL" -c "
+q "
 SELECT
     request_id,
     COUNT(*) as job_count,
@@ -169,7 +160,7 @@ echo ""
 echo "WASM reuse (same checksum used multiple times):"
 echo ""
 
-psql "$DB_URL" -c "
+q "
 SELECT
     wasm_checksum,
     LEFT(wasm_checksum, 16) as checksum_preview,
@@ -194,7 +185,7 @@ echo ""
 echo "Jobs completed by each worker:"
 echo ""
 
-psql "$DB_URL" -c "
+q "
 SELECT
     worker_id,
     job_type,
@@ -215,13 +206,13 @@ echo -e "${CYAN}Failed Jobs${NC}"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
-FAILED_COUNT=$(psql "$DB_URL" -t -c "SELECT COUNT(*) FROM jobs WHERE status = 'failed';" 2>/dev/null | xargs)
+FAILED_COUNT=$(q "SELECT COUNT(*) FROM jobs WHERE status = 'failed';" 2>/dev/null | xargs)
 
 if [ "$FAILED_COUNT" -gt 0 ]; then
     echo -e "${RED}⚠️  Found $FAILED_COUNT failed job(s)${NC}"
     echo ""
 
-    psql "$DB_URL" -c "
+    q "
     SELECT
         job_id,
         request_id,
@@ -245,13 +236,13 @@ echo -e "${CYAN}Pending/In-Progress Jobs${NC}"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
-PENDING_COUNT=$(psql "$DB_URL" -t -c "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'in_progress');" 2>/dev/null | xargs)
+PENDING_COUNT=$(q "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'in_progress');" 2>/dev/null | xargs)
 
 if [ "$PENDING_COUNT" -gt 0 ]; then
     echo -e "${YELLOW}⏳ Found $PENDING_COUNT pending/in-progress job(s)${NC}"
     echo ""
 
-    psql "$DB_URL" -c "
+    q "
     SELECT
         job_id,
         request_id,
@@ -278,7 +269,7 @@ echo ""
 echo "Checking for duplicate jobs (should be NONE due to UNIQUE constraint):"
 echo ""
 
-DUPLICATE_COUNT=$(psql "$DB_URL" -t -c "
+DUPLICATE_COUNT=$(q "
     SELECT COUNT(*)
     FROM (
         SELECT request_id, data_id, job_type, COUNT(*) as cnt
@@ -291,7 +282,7 @@ DUPLICATE_COUNT=$(psql "$DB_URL" -t -c "
 if [ "$DUPLICATE_COUNT" -gt 0 ]; then
     echo -e "${RED}❌ Found $DUPLICATE_COUNT duplicate job(s) - UNIQUE constraint failed!${NC}"
 
-    psql "$DB_URL" -c "
+    q "
     SELECT request_id, data_id, job_type, COUNT(*) as duplicates
     FROM jobs
     GROUP BY request_id, data_id, job_type
@@ -308,9 +299,9 @@ echo -e "${CYAN}Summary${NC}"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
-TOTAL_JOBS=$(psql "$DB_URL" -t -c "SELECT COUNT(*) FROM jobs;" 2>/dev/null | xargs)
-COMPLETED_JOBS=$(psql "$DB_URL" -t -c "SELECT COUNT(*) FROM jobs WHERE status = 'completed';" 2>/dev/null | xargs)
-TOTAL_REQUESTS=$(psql "$DB_URL" -t -c "SELECT COUNT(DISTINCT request_id) FROM jobs;" 2>/dev/null | xargs)
+TOTAL_JOBS=$(q "SELECT COUNT(*) FROM jobs;" 2>/dev/null | xargs)
+COMPLETED_JOBS=$(q "SELECT COUNT(*) FROM jobs WHERE status = 'completed';" 2>/dev/null | xargs)
+TOTAL_REQUESTS=$(q "SELECT COUNT(DISTINCT request_id) FROM jobs;" 2>/dev/null | xargs)
 
 echo "📊 Overall Statistics:"
 echo "  • Total jobs: $TOTAL_JOBS"
@@ -321,8 +312,8 @@ echo "  • Unique requests: $TOTAL_REQUESTS"
 echo ""
 
 # Calculate compile vs execute ratio
-COMPILE_JOBS=$(psql "$DB_URL" -t -c "SELECT COUNT(*) FROM jobs WHERE job_type = 'compile';" 2>/dev/null | xargs)
-EXECUTE_JOBS=$(psql "$DB_URL" -t -c "SELECT COUNT(*) FROM jobs WHERE job_type = 'execute';" 2>/dev/null | xargs)
+COMPILE_JOBS=$(q "SELECT COUNT(*) FROM jobs WHERE job_type = 'compile';" 2>/dev/null | xargs)
+EXECUTE_JOBS=$(q "SELECT COUNT(*) FROM jobs WHERE job_type = 'execute';" 2>/dev/null | xargs)
 
 echo "🔨 Job Type Distribution:"
 echo "  • Compile jobs: $COMPILE_JOBS"
@@ -350,11 +341,8 @@ echo ""
 echo "💡 Useful Queries:"
 echo ""
 echo "# View specific request:"
-echo "psql $DB_URL -c \"SELECT * FROM jobs WHERE request_id = YOUR_REQUEST_ID;\""
+echo "\$PSQL_CMD \"SELECT * FROM jobs WHERE request_id = YOUR_REQUEST_ID;\""
 echo ""
 echo "# View execution history with job details:"
-echo "psql $DB_URL -c \"SELECT j.*, eh.* FROM jobs j LEFT JOIN execution_history eh ON j.job_id = eh.job_id;\""
-echo ""
-echo "# Clear all jobs (for testing):"
-echo "psql $DB_URL -c \"TRUNCATE jobs, execution_history CASCADE;\""
+echo "\$PSQL_CMD \"SELECT j.*, eh.* FROM jobs j LEFT JOIN execution_history eh ON j.job_id = eh.job_id;\""
 echo ""

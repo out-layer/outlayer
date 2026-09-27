@@ -151,8 +151,8 @@ fi
 # refuses a stale one. Minted once at startup it expires partway through a run
 # that waits on chain, and the failure then reads like a clock problem.
 AUTH() {
-  echo "Authorization: Bearer near:$("$RECOVERY_BIN" sign-bearer-near \
-    --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$WALLET_SEED")"
+  echo "Authorization: Bearer near:$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near \
+ --account-id "$PARENT" --seed "$WALLET_SEED")"
 }
 
 # The policy this run needs, stored rather than assumed.
@@ -188,7 +188,7 @@ store_policy() { # store_policy <policy-json>
     json-args "$store_args" prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \
     sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1) || rc=$?
   if (( rc != 0 )); then
-    warn "store_wallet_policy failed (rc=$rc): $(tail -c 500 <<<"$out")"
+    warn "store_wallet_policy failed (rc=$rc): $(near_why "$out")"
     return 1
   fi
   sleep 5

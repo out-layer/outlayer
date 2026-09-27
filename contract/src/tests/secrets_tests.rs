@@ -1179,3 +1179,143 @@ fn the_build_lock_is_the_last_variant_and_every_earlier_one_keeps_its_index() {
         "WasmHash must stay LAST; anything else re-reads every stored condition"
     );
 }
+
+// ── A payment-key nonce is handed out once ─────────────────────────────────
+
+/// Store accounts(1)'s payment key at `nonce`, attaching exactly the quote.
+fn store_key(contract: &mut Contract, context: &mut VMContextBuilder, nonce: u32) {
+    testing_env!(context.attached_deposit(NearToken::from_yoctonear(0)).build());
+    let cost = contract.estimate_storage_cost(
+        SecretAccessor::System(SystemSecretType::PaymentKey),
+        nonce.to_string(),
+        accounts(1),
+        "encrypted".to_string(),
+        types::AccessCondition::AllowAll,
+        None,
+    );
+    testing_env!(context.attached_deposit(NearToken::from_yoctonear(cost.0)).build());
+    contract.store_secrets(
+        SecretAccessor::System(SystemSecretType::PaymentKey),
+        nonce.to_string(),
+        "encrypted".to_string(),
+        types::AccessCondition::AllowAll,
+        None,
+    );
+}
+
+/// The worker confirmed the coordinator deleted accounts(1)'s key at `nonce`.
+fn confirm_delete(contract: &mut Contract, nonce: u32) {
+    testing_env!(get_context(accounts(0)).build());
+    contract.on_delete_payment_key_response(
+        accounts(1),
+        nonce,
+        Ok(crate::payment::DeletePaymentKeyResult::Success),
+    );
+}
+
+fn fresh() -> (Contract, VMContextBuilder) {
+    let context = get_context(accounts(1));
+    testing_env!(context.build());
+    (Contract::new(accounts(0), Some(accounts(0)), None, None), context)
+}
+
+/// The coordinator keeps a deleted key's row under `(owner, nonce)`; a new key
+/// at that nonce would revive it with the old balance and grants. Deleting the
+/// highest key must not make `get_next_payment_key_nonce` answer its nonce.
+#[test]
+fn a_deleted_nonce_is_never_taken_again() {
+    let (mut contract, mut context) = fresh();
+    store_key(&mut contract, &mut context, 1);
+    store_key(&mut contract, &mut context, 2);
+    confirm_delete(&mut contract, 2);
+
+    assert_eq!(contract.get_next_payment_key_nonce(accounts(1)), 3);
+    let refusal = refusal_from(|| store_key(&mut contract, &mut context, 2));
+    assert!(
+        refusal.as_deref().is_some_and(|m| m.contains("has already been used")),
+        "re-creating a deleted nonce must be refused, got {refusal:?}"
+    );
+    store_key(&mut contract, &mut context, 3);
+}
+
+/// Deleting an owner's ONLY key empties their index; the floor still remembers.
+#[test]
+fn the_floor_outlives_the_last_key() {
+    let (mut contract, mut context) = fresh();
+    store_key(&mut contract, &mut context, 1);
+    confirm_delete(&mut contract, 1);
+    assert!(contract.user_secrets_index.get(&accounts(1)).is_none());
+    assert_eq!(contract.get_next_payment_key_nonce(accounts(1)), 2);
+    assert!(refusal_from(|| store_key(&mut contract, &mut context, 1)).is_some());
+}
+
+/// A key created before the floor existed has no entry; its deletion makes one.
+#[test]
+fn deleting_a_key_older_than_the_floor_records_its_nonce() {
+    let (mut contract, mut context) = fresh();
+    store_key(&mut contract, &mut context, 4);
+    contract.payment_key_nonce_floors.remove(&accounts(1));
+    assert_eq!(contract.get_payment_key_nonce_floor(accounts(1)), 0);
+
+    confirm_delete(&mut contract, 4);
+    assert_eq!(contract.get_payment_key_nonce_floor(accounts(1)), 4);
+    assert!(refusal_from(|| store_key(&mut contract, &mut context, 4)).is_some());
+}
+
+/// An owner whose keys all predate the floor: the next key is their highest
+/// live nonce + 1, and deleting the highest one does not hand its nonce out.
+#[test]
+fn keys_older_than_the_floor_continue_from_their_highest_nonce() {
+    let (mut contract, mut context) = fresh();
+    for n in 1..=5 {
+        store_key(&mut contract, &mut context, n);
+    }
+    contract.payment_key_nonce_floors.remove(&accounts(1));
+    assert_eq!(contract.get_next_payment_key_nonce(accounts(1)), 6);
+
+    confirm_delete(&mut contract, 5);
+    assert_eq!(contract.get_next_payment_key_nonce(accounts(1)), 6);
+    assert!(refusal_from(|| store_key(&mut contract, &mut context, 5)).is_some());
+    store_key(&mut contract, &mut context, 6);
+    assert_eq!(contract.get_payment_key_nonce_floor(accounts(1)), 6);
+}
+
+/// The floor entry is paid once, by the owner's first key, and is not part of
+/// that key's refundable deposit: the entry outlives it. The quote says so.
+#[test]
+fn the_first_key_pays_for_the_floor_entry_and_the_quote_includes_it() {
+    let (mut contract, mut context) = fresh();
+    let quote = |c: &Contract, nonce: u32| {
+        c.estimate_storage_cost(
+            SecretAccessor::System(SystemSecretType::PaymentKey),
+            nonce.to_string(),
+            accounts(1),
+            "encrypted".to_string(),
+            types::AccessCondition::AllowAll,
+            None,
+        )
+        .0
+    };
+    let entry = crate::payment::nonce_floor_entry_bytes(&accounts(1)) as u128 * STORAGE_PRICE_PER_BYTE;
+    let first = quote(&contract, 1);
+
+    // One yocto short of the quote is refused.
+    testing_env!(context.attached_deposit(NearToken::from_yoctonear(first - 1)).build());
+    assert!(refusal_from(|| contract.store_secrets(
+        SecretAccessor::System(SystemSecretType::PaymentKey),
+        "1".to_string(),
+        "encrypted".to_string(),
+        types::AccessCondition::AllowAll,
+        None,
+    ))
+    .is_some_and(|m| m.contains("Insufficient storage deposit")));
+
+    store_key(&mut contract, &mut context, 1);
+    let key = SecretKey {
+        accessor: SecretAccessor::System(SystemSecretType::PaymentKey),
+        profile: "1".to_string(),
+        owner: accounts(1),
+    };
+    assert_eq!(contract.secrets_storage.get(&key).unwrap().storage_deposit, first - entry);
+    assert_eq!(quote(&contract, 2), first - entry, "the second key pays only for itself");
+}

@@ -82,8 +82,11 @@ log "Building customer-recovery"
 # machine — and the check below compares against the wrong network's account.
 export OUTLAYER_NETWORK="$NETWORK"
 WHOAMI=$(outlayer whoami 2>/dev/null | awk -F': *' '/^Account:/{print $2; exit}')
-[[ "$WHOAMI" == "$PARENT" ]] || fail "outlayer logged in as '$WHOAMI', not '$PARENT'"
-pass "logged in as $PARENT on $NETWORK"
+if [[ "$WHOAMI" == "$PARENT" ]]; then
+  pass "logged in as $PARENT on $NETWORK"
+else
+  fail "outlayer logged in as '$WHOAMI', not '$PARENT'"
+fi
 
 PARENT_PRIVKEY=$(jq -r '.private_key' "$CREDS_FILE")
 APPROVER_PUBKEY=$(jq -r '.public_key' "$APPROVER_CREDS" 2>/dev/null || echo "")
@@ -105,8 +108,11 @@ fi
 # and can fail for reasons the operator can act on — a name already taken, a
 # balance too small, a network pointed elsewhere — and none of them survive an
 # exit status.
-[[ $INIT_RC -eq 0 ]] || fail "vault init failed (rc=$INIT_RC): $(tail -c 500 <<<"$INIT_OUT")"
-pass "vault $VAULT_ID deployed + verified"
+if [[ $INIT_RC -eq 0 ]]; then
+  pass "vault $VAULT_ID deployed + verified"
+else
+  fail "vault init failed (rc=$INIT_RC): $(near_why "$INIT_OUT")"
+fi
 
 # ─── Helper: end-to-end "encrypt → sign → store policy" for one wallet ────
 #
@@ -180,16 +186,19 @@ sync_call() {
 
 log "2. Scenario A: mint sub-wallet via Bearer near: + vault_id"
 SEED_A="ipsync-A-$(date +%s)-$$"
-TOKEN_A=$("$RECOVERY_BIN" sign-bearer-near \
-  --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$SEED_A" \
+TOKEN_A=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near \
+ --account-id "$PARENT" --seed "$SEED_A" \
   --vault-id "$VAULT_ID")
 ADDR_RESP_A=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" \
   -H "Authorization: Bearer near:$TOKEN_A")
 SUB_PUB_A=$(echo "$ADDR_RESP_A" | jq -r '.public_key')
 WALLET_ID_A=$(echo "$ADDR_RESP_A" | jq -r '.wallet_id')
 SUB_ADDR_A=$(echo "$ADDR_RESP_A" | jq -r '.address')
-[[ -n "$SUB_PUB_A" && "$SUB_PUB_A" != "null" ]] || fail "Scenario A /address failed: $ADDR_RESP_A"
-pass "Scenario A sub-wallet: $SUB_ADDR_A (wallet_id=$WALLET_ID_A)"
+if [[ -n "$SUB_PUB_A" && "$SUB_PUB_A" != "null" ]]; then
+  pass "Scenario A sub-wallet: $SUB_ADDR_A (wallet_id=$WALLET_ID_A)"
+else
+  fail "Scenario A /address failed: $ADDR_RESP_A"
+fi
 
 log "2.1 encrypt-policy + sign-policy + store_wallet_policy under Bearer near:"
 ENC_A=$(prepare_and_store_policy "near:$TOKEN_A" "$SUB_PUB_A" "$WALLET_ID_A") || \
@@ -219,7 +228,7 @@ REG_B=$(curl -sS -X POST "$COORDINATOR_URL/register" \
 WK_B=$(echo "$REG_B" | jq -r '.api_key')
 WALLET_ID_B=$(echo "$REG_B" | jq -r '.wallet_id')
 SUB_ADDR_B=$(echo "$REG_B" | jq -r '.near_account_id')
-[[ -n "$WK_B" && "$WK_B" != "null" ]] || fail "Scenario B /register failed: $REG_B"
+[[ -n "$WK_B" && "$WK_B" != "null" ]] || fail "Scenario B /register failed: $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG_B" 2>/dev/null | head -c 300)"
 ADDR_RESP_B=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" \
   -H "Authorization: Bearer $WK_B")
 SUB_PUB_B=$(echo "$ADDR_RESP_B" | jq -r '.public_key')

@@ -64,7 +64,7 @@ BEFORE=$(jq -r '.updated_at // 0' <<<"$(row_of "$PROJECT" "$PROFILE")")
 OUT=$(run_cli secrets set "$(jq -nc '{CLI_CANARY:"x"}')" --project "$PROJECT" --profile "$PROFILE" \
       --access "whitelist:$PARENT" --direct)
 if ! wait_row_after "$PROJECT" "$PROFILE" "$BEFORE"; then
-  fail "F1 the store never became final: $(tail -3 <<<"$OUT" | tr '\n' ' ' | head -c 240)"
+  fail "F1 the store never became final: $(near_why "$OUT")"
 else
   WANT=$(jq -nSc --arg p "$PARENT" '{Logic:{operator:"And",conditions:[{Whitelist:{accounts:[$p]}},{Predecessor:{condition:{Whitelist:{accounts:[$p]}}}}]}}')
   [[ "$(stored)" == "$WANT" ]] \
@@ -84,7 +84,7 @@ OUT=$(run_cli secrets access --project "$PROJECT" --profile "$PROFILE" --access 
 if grep -q "drop-callers" <<<"$OUT"; then
   pass "F3 refused, naming the way past it"
 else
-  fail "F3 not refused for the rule: $(tail -2 <<<"$OUT" | tr '\n' ' ' | head -c 200)"
+  fail "F3 not refused for the rule: $(near_why "$OUT")"
 fi
 
 log "F4 --access with --direct follows the new readers AND keeps the via contract"
@@ -104,7 +104,7 @@ OUT=$(run_cli secrets access --project "$PROJECT" --profile "$PROFILE" --direct)
 if grep -q "cannot rewrite" <<<"$OUT" && [[ "$(stored)" == "$BEFORE_OR" ]]; then
   pass "F5 refused, and the row on chain is untouched"
 else
-  fail "F5 got '$(tail -2 <<<"$OUT" | tr '\n' ' ' | head -c 200)'; row now $(stored)"
+  fail "F5 got '$(near_why "$OUT")'; row now $(stored)"
 fi
 
 log "F6 --drop-callers removes the rule when it owns one, and refuses when it does not"
@@ -119,7 +119,7 @@ fi
 OUT=$(run_cli secrets access --project "$PROJECT" --profile "$PROFILE" --drop-callers)
 grep -q "no calling-account rule to drop" <<<"$OUT" \
   && pass "F6 a second --drop-callers is refused rather than sending a no-op transaction" \
-  || fail "F6 the no-op was not refused: $(tail -2 <<<"$OUT" | tr '\n' ' ' | head -c 200)"
+  || fail "F6 the no-op was not refused: $(near_why "$OUT")"
 
 log "F7 the list shows the rule"
 run_cli secrets access --project "$PROJECT" --profile "$PROFILE" --direct >/dev/null

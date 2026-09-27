@@ -44,8 +44,13 @@ encryption-vault = ["enc-api"]
 encryption-pred = ["enc-api"]
 # A manifest that names a `type` on an encryption key: refused before it runs.
 encryption-typed = ["enc-api"]
+# The `project` manifest with one unknown top-level member
+# (`storage_acount`): refused before it runs, naming the member.
+project-misspelled = []
 enc-api = []
-storage-api = []
+# `near:storage`, and the SDK's `storage::sealed` over it (`sealed_handle`,
+# `sealed_has`, `sealed_delete` run the published SDK code, not a copy).
+storage-api = ["dep:outlayer"]
 # The same code and manifest with one constant changed: another sha256, for
 # "a new version" and "another build".
 v2 = []
@@ -72,6 +77,9 @@ base64 = "0.22"
 # secp256k1 in the guest (`sign_and_verify` on a secp256k1 key): verification
 # and recovery; keccak256 for the EVM address (`evm_address`).
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+# The SDK's `storage::sealed` (the `Sealed` handle, compare-and-swap, has,
+# delete), in the storage builds only.
+outlayer = { path = "../../sdk/outlayer", features = ["encryption-keys"], optional = true }
 sha3 = { version = "0.10", default-features = false }
 
 [profile.release]

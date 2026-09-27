@@ -1018,20 +1018,33 @@ impl ApiClient {
             time_ms
         );
 
-        let response = self.add_auth_headers(self.client.post(&url))
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send complete job request")?;
-
-        if !response.status().is_success() {
+        // A connection that failed or a 5xx is repeated with the event relays'
+        // pauses. A repeat is safe: the coordinator ignores the completion of
+        // a job it already completed, and reopens one whose follow-up task it
+        // could not queue. A 4xx is its answer and is not repeated.
+        let body = serde_json::to_value(&request).context("Failed to serialize complete job request")?;
+        retry_relay("complete job", &RELAY_RETRY_DELAYS, || async {
+            let response = self.add_auth_headers(self.client.post(&url))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to send complete job request")?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
+            }
             let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!("❌ Complete job failed: {}", error_text);
-            anyhow::bail!("Complete job failed: {}", error_text)
-        }
+            tracing::error!("❌ Complete job failed: HTTP {} {}", status, error_text);
+            let message = format!("Complete job failed: {}", error_text);
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(TerminalRelay).context(message));
+            }
+            Err(anyhow::anyhow!(message))
+        })
+        .await?;
 
         tracing::info!("✅ Job {} completed successfully", job_id);
         Ok(())
@@ -2652,6 +2665,48 @@ pub struct StoreAttestationRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coordinator answering `/jobs/complete` with each status of `codes` in
+    /// turn; returns its URL and the number of requests it served.
+    fn completing_coordinator(codes: Vec<u16>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = served.clone();
+        std::thread::spawn(move || {
+            for (stream, code) in listener.incoming().zip(codes) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 16384];
+                let _ = stream.read(&mut buf);
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if code == 200 { "" } else { "no" };
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {code} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                        .as_bytes(),
+                );
+            }
+        });
+        (url, served)
+    }
+
+    /// A 503 from `/jobs/complete` is repeated until the coordinator takes the
+    /// completion; a 4xx is its answer and is not repeated.
+    #[tokio::test]
+    async fn a_completion_the_coordinator_could_not_take_is_repeated_and_a_refusal_is_not() {
+        let (url, served) = completing_coordinator(vec![503, 200]);
+        let client = ApiClient::new(url, "token".into()).unwrap();
+        client
+            .complete_job(7, true, None, None, 1, 1, None, None, None, None, None)
+            .await
+            .expect("the second attempt completes the job");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let (url, served) = completing_coordinator(vec![400, 200]);
+        let client = ApiClient::new(url, "token".into()).unwrap();
+        assert!(client.complete_job(7, true, None, None, 1, 1, None, None, None, None, None).await.is_err());
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1, "a 400 is not repeated");
+    }
 
     /// Every field the caller hands to `create_task` must survive into the JSON
     /// body, and this reads the source to prove it.

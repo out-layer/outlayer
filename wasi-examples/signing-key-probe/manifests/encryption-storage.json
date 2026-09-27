@@ -32,7 +32,12 @@
     "sealed_put",
     "sealed_get",
     "raw_attack",
-    "raw_attacks"
+    "raw_attacks",
+    "storage_get_by_version",
+    "storage_clear_version",
+    "sealed_handle",
+    "sealed_has",
+    "sealed_delete"
   ],
   "capabilities": {
     "network": []

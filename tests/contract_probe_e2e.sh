@@ -115,9 +115,9 @@ if call "$CALLER" store_secrets \
   call "$CALLER" delete_secrets \
     "$(jq -nc --argjson a "$acc_upper" '{accessor:$a, profile:"probe"}')" '0 NEAR' \
     && note "P1 cleaned up (deposit refunded)" \
-    || note "P1 cleanup FAILED, 0.1 NEAR left staked: $(tail -c 200 <<<"$OUT")"
+    || note "P1 cleanup FAILED, 0.1 NEAR left staked: $(near_why "$OUT")"
 else
-  note "P1 SKIPPED — the store was refused: $(tail -c 200 <<<"$OUT")"
+  note "P1 SKIPPED — the store was refused: $(near_why "$OUT")"
 fi
 
 # ── P2: a payment key's profile IS its nonce, in one spelling ────────────────
@@ -130,46 +130,50 @@ fi
 # exactly that — and because the store now lands ON the canonical slot, it must
 # know what sits there BEFORE it writes: the first guard here read the slot
 # after the write and could only ever see its own bytes.
-log "P2 a payment key at profile \"01\""
+# A nonce is handed out once, so the probe takes the owner's NEXT nonce N and
+# stores it as "0N"; a fixed "01" would meet the floor from the second run on.
+log "P2 a payment key at a zero-padded profile"
 
 acc_pk='{"System":"PaymentKey"}'
 
-PRE_ONE=$(view get_secrets "$(jq -nc --argjson a "$acc_pk" --arg o "$OTHER" '{accessor:$a, profile:"1", owner:$o}')")
-if [[ "$PRE_ONE" != "null" && -n "$PRE_ONE" ]]; then
-  note "P2 SKIPPED — $OTHER holds a real key at nonce 1, and a canonicalised store would overwrite it"
+N=$(view get_next_payment_key_nonce "$(jq -nc --arg a "$OTHER" '{account_id:$a}')")
+PRE=$(view get_secrets "$(jq -nc --argjson a "$acc_pk" --arg o "$OTHER" --arg p "$N" '{accessor:$a, profile:$p, owner:$o}')")
+if [[ ! "$N" =~ ^[0-9]+$ ]]; then
+  note "P2 SKIPPED — get_next_payment_key_nonce answered '$N'"
+elif [[ "$PRE" != "null" && -n "$PRE" ]]; then
+  note "P2 SKIPPED — $OTHER already holds a key at nonce $N, the nonce the contract calls next"
 else
-  NEXT_BEFORE=$(view get_next_payment_key_nonce "$(jq -nc --arg a "$OTHER" '{account_id:$a}')")
-
   if call "$OTHER" store_secrets \
-        "$(jq -nc --argjson a "$acc_pk" '{accessor:$a, profile:"01", encrypted_secrets_base64:"cHJvYmU=", access:"AllowAll", vault_id:null}')" \
+        "$(jq -nc --argjson a "$acc_pk" --arg p "0$N" '{accessor:$a, profile:$p, encrypted_secrets_base64:"cHJvYmU=", access:"AllowAll", vault_id:null}')" \
         '0.1 NEAR'; then
-    GOT_ONE=$(view get_secrets "$(jq -nc --argjson a "$acc_pk" --arg o "$OTHER" '{accessor:$a, profile:"1", owner:$o}')")
-    GOT_PAD=$(view get_secrets "$(jq -nc --argjson a "$acc_pk" --arg o "$OTHER" '{accessor:$a, profile:"01", owner:$o}')")
+    GOT_ONE=$(view get_secrets "$(jq -nc --argjson a "$acc_pk" --arg o "$OTHER" --arg p "$N" '{accessor:$a, profile:$p, owner:$o}')")
+    GOT_PAD=$(view get_secrets "$(jq -nc --argjson a "$acc_pk" --arg o "$OTHER" --arg p "0$N" '{accessor:$a, profile:$p, owner:$o}')")
     NEXT_AFTER=$(view get_next_payment_key_nonce "$(jq -nc --arg a "$OTHER" '{account_id:$a}')")
 
     if [[ "$GOT_ONE" != "null" && -n "$GOT_ONE" && "$GOT_ONE" == "$GOT_PAD" ]]; then
-      pass "P2 the padded spelling lands in the canonical slot — one nonce, one slot, both spellings read it"
+      pass "P2 the padded spelling \"0$N\" lands in the canonical slot — one nonce, one slot, both spellings read it"
     else
-      fail "P2 two slots for one nonce: \"1\" → $(head -c 24 <<<"$GOT_ONE") vs \"01\" → $(head -c 24 <<<"$GOT_PAD")"
+      fail "P2 two slots for one nonce: \"$N\" → $(head -c 24 <<<"$GOT_ONE") vs \"0$N\" → $(head -c 24 <<<"$GOT_PAD")"
     fi
-    note "P2 get_next_payment_key_nonce: $NEXT_BEFORE → $NEXT_AFTER"
+    note "P2 get_next_payment_key_nonce: $N → $NEXT_AFTER"
 
-    # The canonical door must be able to remove what a padded store created —
-    # this is the half that failed live before `canonical_profile` existed.
-    if call "$OTHER" delete_payment_key "$(jq -nc '{nonce:1}')" '1 yoctoNEAR'; then
-      pass "P2 delete_payment_key(1) reaches what the padded store created (deposit refunded)"
+    # The canonical door must be able to remove what a padded store created.
+    if call "$OTHER" delete_payment_key "$(jq -nc --argjson n "$N" '{nonce:$n}')" '1 yoctoNEAR'; then
+      pass "P2 delete_payment_key($N) reaches what the padded store created (deposit refunded)"
     else
-      fail "P2 delete_payment_key(1) cannot see the padded key: $(tail -c 160 <<<"$OUT")"
+      fail "P2 delete_payment_key($N) cannot see the padded key: $(near_why "$OUT")"
       call "$OTHER" delete_secrets \
-        "$(jq -nc --argjson a "$acc_pk" '{accessor:$a, profile:"01"}')" '0 NEAR' \
+        "$(jq -nc --argjson a "$acc_pk" --arg p "0$N" '{accessor:$a, profile:$p}')" '0 NEAR' \
         && note "P2 cleaned up through delete_secrets (deposit refunded)" \
-        || note "P2 cleanup FAILED, 0.1 NEAR left staked: $(tail -c 200 <<<"$OUT")"
+        || note "P2 cleanup FAILED, 0.1 NEAR left staked: $(near_why "$OUT")"
     fi
   else
-    if refused_with "nonce"; then
-      pass "P2 a zero-padded nonce is refused outright: $(grep -o 'Payment key[^"]*' <<<"$OUT" | head -1)"
+    if refused_with "has already been used"; then
+      fail "P2 the contract refused nonce $N, the one its own get_next_payment_key_nonce named: $(near_why "$OUT")"
+    elif refused_with "nonce"; then
+      pass "P2 a zero-padded nonce is refused outright: $(near_why "$OUT")"
     else
-      note "P2 INCONCLUSIVE — refused for another reason: $(tail -c 200 <<<"$OUT")"
+      note "P2 INCONCLUSIVE — refused for another reason: $(near_why "$OUT")"
     fi
   fi
 fi
@@ -194,11 +198,11 @@ else
       pass "P3 the shouted key froze the same wallet — freeze follows the KEY"
       call "$CALLER" unfreeze_wallet "$(jq -nc --arg k "$SHOUTED" '{wallet_pubkey:$k}')" '0 NEAR' \
         && pass "P3 …and thawed it again" \
-        || fail "P3 froze but could NOT thaw with the same spelling: $(tail -c 200 <<<"$OUT")"
+        || fail "P3 froze but could NOT thaw with the same spelling: $(near_why "$OUT")"
     elif refused_with "Wallet policy not found"; then
       fail "P3 the same key in UPPER case answers 'Wallet policy not found' — an emergency freeze, and the way out of one, lost to capitalisation"
     else
-      note "P3 INCONCLUSIVE — refused for another reason: $(tail -c 200 <<<"$OUT")"
+      note "P3 INCONCLUSIVE — refused for another reason: $(near_why "$OUT")"
     fi
   fi
 fi
@@ -211,7 +215,7 @@ if call "$OTHER" set_paused "$(jq -nc '{paused:true}')" '0 NEAR'; then
 else
   refused_with "owner" \
     && pass "P4 refused, and the message names the owner" \
-    || note "P4 refused for another reason: $(tail -c 160 <<<"$OUT")"
+    || note "P4 refused for another reason: $(near_why "$OUT")"
 fi
 
 log "P5 a stranger cannot delete somebody else's secret"
@@ -223,7 +227,7 @@ if call "$OTHER" delete_secrets \
 else
   refused_with "not found" \
     && pass "P5 refused — a delete addresses the caller's own secrets and nobody else's" \
-    || note "P5 refused for another reason: $(tail -c 160 <<<"$OUT")"
+    || note "P5 refused for another reason: $(near_why "$OUT")"
 fi
 
 log "P6 a secret cannot be stored against a project that does not exist"
@@ -236,7 +240,7 @@ if call "$OTHER" store_secrets \
 else
   refused_with "does not exist" \
     && pass "P6 refused, naming the project" \
-    || note "P6 refused for another reason: $(tail -c 160 <<<"$OUT")"
+    || note "P6 refused for another reason: $(near_why "$OUT")"
 fi
 
 echo

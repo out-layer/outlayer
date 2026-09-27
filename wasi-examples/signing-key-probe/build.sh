@@ -18,6 +18,7 @@
 #   signing-key-probe-encryption-vault.wasm  encryption alpha, and treasury with a vault
 #   signing-key-probe-encryption-pred.wasm   encryption alpha — caller "predecessor"
 #   signing-key-probe-encryption-typed.wasm  encryption alpha with a `type` (refused)
+#   signing-key-probe-project-misspelled.wasm  the project keys and an unknown top-level member (refused)
 #
 # and checks each: the manifest section is in the artefact and is the right
 # one, the module imports outlayer:signing-keys — and, for the encryption
@@ -131,16 +132,18 @@ build() {
             echo "Imports: WASI + outlayer:signing-keys/api only"
         fi
 
-        # The platform strips a GitHub build with `wasm-tools strip`. Whether
-        # the manifest survives that step decides what a GitHub run of this
-        # code declares — reported, since tests/signing_keys_e2e.sh relies on it.
+        # The platform strips a GitHub build with this delete list
+        # (worker/src/compiler/wasm32_wasip2.rs), which leaves
+        # `outlayer.manifest` in place — so a GitHub run of this code declares
+        # what the manifest says. Checked here with the same list.
         local stripped
         stripped=$(mktemp)
-        wasm-tools strip "$wasm" -o "$stripped"
+        wasm-tools strip --delete '^(\.debug_.*|producers|target_features|linking|reloc\..*|sourceMappingURL|external_debug_info|component-name)$' "$wasm" -o "$stripped"
         if grep -qa 'outlayer.manifest' "$stripped"; then
-            echo "After wasm-tools strip: the manifest survives"
+            echo "After the platform's strip: the manifest survives"
         else
-            echo "After wasm-tools strip: the manifest is GONE — a GitHub build of this code declares no keys"
+            echo "ERROR: the platform's strip removed the manifest" >&2
+            exit 1
         fi
         rm -f "$stripped"
     else
@@ -173,6 +176,7 @@ build encryption-wasm-v2 encryption-wasm,v2  manifests/encryption-wasm.json  cod
 build encryption-vault   encryption-vault    manifests/encryption-vault.json alpha treasury
 build encryption-pred    encryption-pred     manifests/encryption-pred.json  alpha
 build encryption-typed   encryption-typed    manifests/encryption-typed.json alpha
+build project-misspelled project-misspelled  manifests/project-misspelled.json alpha beta
 
 # Two builds of one manifest must be two hashes, or "a new version" and
 # "another build" test nothing.
@@ -223,8 +227,18 @@ for variant in encryption encryption-v2 encryption-storage encryption-storage-pr
     fi
 done
 
+# Exactly one build carries the misspelled top-level member.
+for variant in project project-misspelled encryption-storage encryption-storage-pred; do
+    typo=no; grep -qa '"storage_acount"' "$OUT/signing-key-probe-$variant.wasm" && typo=yes
+    want_typo=no; [ "$variant" = project-misspelled ] && want_typo=yes
+    if [ "$typo" != "$want_typo" ]; then
+        echo "ERROR: $OUT/signing-key-probe-$variant.wasm: the member storage_acount $typo (want $want_typo)"
+        exit 1
+    fi
+done
+
 # Exactly one of the signing-only builds declares a predecessor key.
-for variant in project project-v2 project-pred wasm wasm-v2 project-vault project-secp wasm-secp; do
+for variant in project project-v2 project-pred wasm wasm-v2 project-vault project-secp wasm-secp project-misspelled; do
     wasm="$OUT/signing-key-probe-$variant.wasm"
     pred=no; grep -qa '"caller": "predecessor"' "$wasm" && pred=yes
     want_pred=no; [ "$variant" = project-pred ] && want_pred=yes
@@ -235,4 +249,4 @@ for variant in project project-v2 project-pred wasm wasm-v2 project-vault projec
 done
 
 echo ""
-echo "OK: seventeen variants in $OUT/"
+echo "OK: eighteen variants in $OUT/"

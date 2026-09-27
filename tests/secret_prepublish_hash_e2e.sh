@@ -96,8 +96,8 @@ gate() {
 }
 gate
 
-command -v docker >/dev/null 2>&1 || {
-  skip "docker is not available, and the whole point of this suite is computing the hash in the platform's compiler image"
+docker info >/dev/null 2>&1 || {
+  skip "docker is not available (no CLI or no reachable daemon), and the whole point of this suite is computing the hash in the platform's compiler image"
   verdict "pre-published build hash"; exit $?
 }
 
@@ -126,7 +126,7 @@ if ! git clone -q "$SRC_REPO" "$CLONE" 2>/dev/null || ! git -C "$CLONE" checkout
 fi
 DEPLOY_OUT=$(cd "$CLONE" && OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" deploy "$PROJECT_NAME" --github --target "$SRC_TARGET" 2>&1)
 if grep -qiE "error|failed" <<<"$DEPLOY_OUT" && ! grep -qiE "deployed|activated|version" <<<"$DEPLOY_OUT"; then
-  fail "P1 deploy failed: $(tail -3 <<<"$DEPLOY_OUT" | head -c 400)"
+  fail "P1 deploy failed: $(near_why "$DEPLOY_OUT")"
   verdict "pre-published build hash"; exit $?
 fi
 pass "P1 published $PROJECT at $SRC_COMMIT"

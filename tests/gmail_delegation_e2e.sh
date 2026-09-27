@@ -24,11 +24,22 @@
 #
 # Needs: PARENT (the owner; the CLI logged in as it), AGENT_PAYMENT_KEY and
 # AGENT_ACCOUNT (a custody wallet the owner grants), GMAIL_TEST_TO (an address
-# the policy allows), and the credential in GMAIL_ENV (default
-# connectors/gmail-connector/.env.gmail: CLIENT_ID, SECRET, REFRESH_TOKEN) —
-# read into this shell, never exported, never printed. It reaches jq through
-# the environment of that one process; it reaches `outlayer secrets set` as an
-# argument, which is visible to `ps` on this machine for the length of the call.
+# the policy allows), and one of two owner rows:
+#   token      GMAIL_ENV (default connectors/gmail-connector/.env.gmail:
+#              CLIENT_ID, SECRET, REFRESH_TOKEN) — the suite writes the row
+#              itself, whitelist PARENT + AGENT_ACCOUNT, under its own capped
+#              policy. The credential is read into this shell, never exported,
+#              never printed; it reaches jq through the environment of that one
+#              process and `outlayer secrets set` as an argument, visible to `ps`
+#              on this machine for the length of the call.
+#   connected  no GMAIL_ENV, or one without REFRESH_TOKEN: the row the owner
+#              connected through the dashboard, used as it is. The credential is
+#              never written. The owner's policy, read through `status`, is the
+#              one every row expects and the one put back; G1/G4 change only
+#              GMAIL_POLICY (`outlayer secrets update`, merged by the keystore)
+#              and G4 only the whitelist (`update_access`), both restored.
+#              AGENT_ACCOUNT must already be on the row's whitelist. Without
+#              GMAIL_TEST_TO the sends SKIP.
 #
 # Run:
 #   PARENT=you.testnet AGENT_PAYMENT_KEY=… AGENT_ACCOUNT=… GMAIL_TEST_TO=… \
@@ -51,29 +62,57 @@ want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 APPLY=false; [[ "${1:-}" == "--apply" ]] && APPLY=true
 
 if [[ "$APPLY" != true ]]; then
-  sed -n '3,34p' "$0" >&2; echo "  Pass --apply to run." >&2; exit 0
+  sed -n '3,46p' "$0" >&2; echo "  Pass --apply to run." >&2; exit 0
 fi
 [[ -n "$PARENT" ]] || { echo "✗ PARENT is required" >&2; exit 1; }
-for v in AGENT_PAYMENT_KEY AGENT_ACCOUNT GMAIL_TEST_TO; do
+# Which owner row: a file with a REFRESH_TOKEN line is the token path; anything
+# else is the row the owner connected. Only the line's presence is read here.
+CONNECTED=true
+[[ -r "$GMAIL_ENV" ]] && grep -q '^REFRESH_TOKEN=.' "$GMAIL_ENV" && CONNECTED=false
+REQUIRED="AGENT_PAYMENT_KEY AGENT_ACCOUNT"; [[ "$CONNECTED" == true ]] || REQUIRED="$REQUIRED GMAIL_TEST_TO"
+for v in $REQUIRED; do
   [[ -n "${!v}" ]] || { echo "✗ $v is required" >&2; exit 1; }
 done
-[[ -r "$GMAIL_ENV" ]] || { echo "✗ no credential file at $GMAIL_ENV" >&2; exit 1; }
 hos_require
 PROJECT="$GMAIL"
 source "$SCRIPT_DIR/lib/secrets_common.sh"
 
-# The credential: read into this shell (not exported — a child process must
-# not inherit it, and a variable the caller's shell had already exported is
-# un-exported here) and never echoed. `store` reports project/profile/access.
-source "$GMAIL_ENV"
-export -n CLIENT_ID SECRET REFRESH_TOKEN 2>/dev/null || true
-for v in CLIENT_ID SECRET REFRESH_TOKEN; do
-  [[ -n "${!v:-}" ]] || { echo "✗ $GMAIL_ENV lacks $v" >&2; exit 1; }
-done
+# gmail <input-json> [payment-key] — an AGENT calls, naming the OWNER's row.
+gmail() {
+  https_post "${2:-$AGENT_PAYMENT_KEY}" "$GMAIL" \
+    "$(jq -nc --argjson i "$1" --arg o "$PARENT" '{input:$i, secrets_ref:{account_id:$o, profile:"gmail"}}')"
+}
 
-CAPPED=$(jq -nc --arg to "$GMAIL_TEST_TO" \
-  '{recipients:[$to], max_recipients:1, subject_prefix:"[agent]", max_per_day:50}')
-CAPLESS=$(jq -c 'del(.max_per_day)' <<<"$CAPPED")
+ACCESS_CHANGED=false
+if [[ "$CONNECTED" == false ]]; then
+  # The credential: read into this shell (not exported — a child process must
+  # not inherit it, and a variable the caller's shell had already exported is
+  # un-exported here) and never echoed. `store` reports project/profile/access.
+  source "$GMAIL_ENV"
+  export -n CLIENT_ID SECRET REFRESH_TOKEN 2>/dev/null || true
+  for v in CLIENT_ID SECRET REFRESH_TOKEN; do
+    [[ -n "${!v:-}" ]] || { echo "✗ $GMAIL_ENV lacks $v" >&2; exit 1; }
+  done
+  CAPPED=$(jq -nc --arg to "$GMAIL_TEST_TO" \
+    '{recipients:[$to], max_recipients:1, subject_prefix:"[agent]", max_per_day:50}')
+else
+  # The connected row, as the chain holds it, and the owner's policy, as the
+  # connector reads it over HTTPS (every field of it, in the clear).
+  ORIG_ACCESS=$(jq -c '.access // empty' <<<"$(row_of "$GMAIL" gmail)" 2>/dev/null)
+  [[ -n "$ORIG_ACCESS" ]] || { echo "✗ $PARENT has no gmail row for $GMAIL — connect one in the dashboard, or give GMAIL_ENV" >&2; exit 1; }
+  jq -e --arg a "$AGENT_ACCOUNT" '.Whitelist.accounts // [] | index($a) != null' <<<"$ORIG_ACCESS" >/dev/null \
+    || { echo "✗ $AGENT_ACCOUNT is not on the connected row's whitelist ($(jq -c . <<<"$ORIG_ACCESS"))" >&2; exit 1; }
+  gmail '{"operation":"status"}'
+  CAPPED=""
+  if [[ "$RUN_OK" == "true" && "$(field .output.policy.present)" == "true" && "$(field .output.policy.readable)" != "false" ]]; then
+    CAPPED=$(jq -c '.output.policy | del(.present) | with_entries(select(.value != null))' <<<"$RUN_OUT")
+  fi
+  note "connected row: access $(jq -c . <<<"$ORIG_ACCESS"), the owner's policy ${CAPPED:-UNREADABLE (success=$RUN_OK err='$(head -c 120 <<<"$RUN_ERR")')}"
+fi
+NO_POLICY='{}'
+CAPLESS=$(jq -c 'del(.max_per_day)' <<<"${CAPPED:-$NO_POLICY}")
+EXPECT_PREFIX=$(jq -r '.subject_prefix // ""' <<<"${CAPPED:-$NO_POLICY}")
+EXPECT_CAP=$(jq -r '.max_per_day // ""' <<<"${CAPPED:-$NO_POLICY}")
 credential_with() { # credential_with <policy-json> → the secrets JSON
   # The credential reaches jq through the environment of this one process,
   # never through its arguments.
@@ -89,25 +128,56 @@ credential_with() { # credential_with <policy-json> → the secrets JSON
 # (set after it returned). The cap is known to be there only when both agree.
 POLICY_ASKED=""
 POLICY_CONFIRMED=""
+# The connected row's policy, merged in by the keystore (`secrets update`): the
+# credential is neither read nor sent, and the row keeps its condition.
+update_policy() { # update_policy <policy-json>
+  local before out
+  before=$(jq -r '.updated_at // 0' <<<"$(row_of "$GMAIL" gmail)")
+  out=$(OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets update "$(jq -nc --arg p "$1" '{GMAIL_POLICY:$p}')" \
+        --project "$GMAIL" --profile gmail 2>&1) \
+    || { echo "✗ could not update the policy of $GMAIL/gmail: $(tail -1 <<<"$out" | head -c 200)" >&2; exit 1; }
+  wait_row_after "$GMAIL" gmail "$before" || { echo "✗ $GMAIL/gmail policy update never became final" >&2; exit 1; }
+  note "updated the policy of $GMAIL/gmail to $1"
+}
+# The connected row's whitelist, widened by `update_access` (the ciphertext
+# stays) and put back to what the chain held at the start.
+grant_access() { # grant_access <account…>
+  local want
+  want=$(jq -c 'reduce $ARGS.positional[] as $a (.; if (.Whitelist.accounts | index($a)) then . else .Whitelist.accounts += [$a] end)' \
+    --args "$@" <<<"$ORIG_ACCESS")
+  [[ "$want" == "$ORIG_ACCESS" ]] && return 0
+  ACCESS_CHANGED=true
+  set_access "$GMAIL" gmail "$want"
+}
+restore_access() {
+  [[ "$ACCESS_CHANGED" == true ]] || return 0
+  set_access "$GMAIL" gmail "$ORIG_ACCESS"
+  ACCESS_CHANGED=false
+}
 store_policy() { # store_policy <policy-json> [more grantees…] — the owner's row, granted to the agent(s)
   local pol=$1; shift
-  local grant="whitelist:$PARENT,$AGENT_ACCOUNT"; for a in "$@"; do grant="$grant,$a"; done
   POLICY_ASKED="$pol"
-  store "$GMAIL" gmail "$(credential_with "$pol")" "$grant"
+  if [[ "$CONNECTED" == true ]]; then
+    update_policy "$pol"
+    if (( $# )); then grant_access "$@"; else restore_access; fi
+  else
+    local grant="whitelist:$PARENT,$AGENT_ACCOUNT"; for a in "$@"; do grant="$grant,$a"; done
+    store "$GMAIL" gmail "$(credential_with "$pol")" "$grant"
+  fi
   POLICY_CONFIRMED="$pol"
 }
 restore_cap() {
+  if [[ "$ACCESS_CHANGED" == true ]]; then
+    note "putting the connected row's access back before exit"
+    ( restore_access ) || echo "✗ THE ACCESS WAS NOT RESTORED — set $GMAIL/gmail back to $ORIG_ACCESS by hand" >&2
+    ACCESS_CHANGED=false
+  fi
   if [[ -n "$POLICY_ASKED" && ( "$POLICY_ASKED" != "$CAPPED" || "$POLICY_CONFIRMED" != "$CAPPED" ) ]]; then
-    note "putting the capped policy back before exit"
-    ( store_policy "$CAPPED" ) || echo "✗ THE CAP WAS NOT RESTORED — store the capped policy for $GMAIL by hand" >&2
+    note "putting the owner's policy back before exit"
+    ( store_policy "$CAPPED" ) || echo "✗ THE POLICY WAS NOT RESTORED — store $CAPPED for $GMAIL by hand" >&2
   fi
 }
 trap restore_cap EXIT
-# gmail <input-json> [payment-key] — an AGENT calls, naming the OWNER's row.
-gmail() {
-  https_post "${2:-$AGENT_PAYMENT_KEY}" "$GMAIL" \
-    "$(jq -nc --argjson i "$1" --arg o "$PARENT" '{input:$i, secrets_ref:{account_id:$o, profile:"gmail"}}')"
-}
 # A connector call on a TRIAL key that has made its calls is refused for that —
 # an answer that says nothing about the policy under test. `gmail_ready` makes
 # the status call a row needs anyway and steps the row aside when a spent trial
@@ -122,8 +192,14 @@ gmail_ready() { # gmail_ready <row> [key] — leaves the status answer in RUN_*
 
 RUN="$(date -u +%Y%m%dT%H%M%SZ)"
 
-log "Fixture: the owner's row, capped, granted to $AGENT_ACCOUNT"
-store_policy "$CAPPED"
+if [[ "$CONNECTED" == true ]]; then
+  log "Fixture: the owner's connected row, as it is"
+else
+  log "Fixture: the owner's row, capped, granted to $AGENT_ACCOUNT"
+  store_policy "$CAPPED"
+fi
+# A send is a real message: none without an address the owner's policy allows.
+no_send() { [[ -z "$GMAIL_TEST_TO" ]] && skip "$1 — GMAIL_TEST_TO is not given, so no real message is sent"; }
 
 # ── G2 the delegated send ────────────────────────────────────────────────────
 if ! want G2; then
@@ -136,10 +212,11 @@ else
   [[ "$RUN_OK" == "true" && "$(field .output.credential)" == "ok" ]] \
     && pass "G2 control: the agent reads the owner's row through the grant (credential=$(field .output.credential), sent_today=$G2_BEFORE)" \
     || fail "G2 control failed — the agent cannot read the owner's row: success=$RUN_OK err='$(head -c 160 <<<"$RUN_ERR")'"
-  [[ "$G2_PREFIX" == "[agent]" ]] \
-    && pass "G2 the OWNER's policy is the one in force (subject_prefix=$G2_PREFIX)" \
-    || fail "G2 subject_prefix is '$G2_PREFIX', expected the owner's [agent]"
+  [[ "$G2_PREFIX" == "$EXPECT_PREFIX" ]] \
+    && pass "G2 the OWNER's policy is the one in force (subject_prefix='$G2_PREFIX')" \
+    || fail "G2 subject_prefix is '$G2_PREFIX', expected the owner's '$EXPECT_PREFIX'"
 
+  if no_send "G2 the delegated send"; then :; else
   gmail "$(jq -nc --arg to "$GMAIL_TEST_TO" --arg s "delegated send $RUN" \
     --arg b "sent by an agent holding a grant on the owner row, named through secrets_ref" \
     '{operation:"send", to:$to, subject:$s, body:$b}')"
@@ -149,30 +226,42 @@ else
     [[ -n "$(field .output.message_id)" ]] \
       && pass "G2 a real message left the owner's mailbox: message_id=$(field .output.message_id)" \
       || fail "G2 the send answered without a message_id: $(head -c 200 <<<"$RUN_OUT")"
-    [[ "$(field .output.sent_today)" == "$((G2_BEFORE + 1))" ]] \
-      && pass "G2 and the owner's counter moved ($G2_BEFORE → $(field .output.sent_today))" \
-      || fail "G2 sent_today is '$(field .output.sent_today)', expected $((G2_BEFORE + 1))"
-    [[ "$(field .output.remaining_today)" == "$((50 - G2_BEFORE - 1))" ]] \
-      && pass "G2 and the remaining allowance is the owner's cap minus the sends" \
-      || fail "G2 remaining_today is '$(field .output.remaining_today)', expected $((50 - G2_BEFORE - 1))"
+    if [[ -z "$EXPECT_CAP" ]]; then
+      skip "G2 the owner's counter — the owner's policy has no max_per_day, so no counter moves"
+    else
+      [[ "$(field .output.sent_today)" == "$((G2_BEFORE + 1))" ]] \
+        && pass "G2 and the owner's counter moved ($G2_BEFORE → $(field .output.sent_today))" \
+        || fail "G2 sent_today is '$(field .output.sent_today)', expected $((G2_BEFORE + 1))"
+      [[ "$(field .output.remaining_today)" == "$((EXPECT_CAP - G2_BEFORE - 1))" ]] \
+        && pass "G2 and the remaining allowance is the owner's cap minus the sends" \
+        || fail "G2 remaining_today is '$(field .output.remaining_today)', expected $((EXPECT_CAP - G2_BEFORE - 1))"
+    fi
     skip "G2 the message's From is the owner's address — the send's answer carries no From header; read it in $GMAIL_TEST_TO's mailbox"
+  fi
   fi
 fi
 
 # ── G1 a policy with no daily cap ────────────────────────────────────────────
-if want G1; then
+if ! want G1; then
+  :
+elif [[ -z "$CAPPED" ]]; then
+  skip "G1 the owner's policy could not be read, so it could not be put back — the row is left alone"
+else
   log "G1 the owner stores the same credential with NO max_per_day"
+  [[ "$CAPLESS" == "$CAPPED" ]] && note "G1 the owner's policy has no cap already: the capless store rewrites the same policy"
   store_policy "$CAPLESS"
   gmail '{"operation":"status"}'
-  # A policy that is PRESENT (its recipients read back) and has no cap — an
-  # absent or unreadable policy has no max_per_day either.
-  if [[ "$RUN_OK" == "true" && -n "$(field .output.policy.recipients)" && "$(field .output.policy.max_per_day)" == "" ]]; then
+  # A policy that is PRESENT and readable and has no cap — an absent or
+  # unreadable policy has no max_per_day either.
+  if [[ "$RUN_OK" == "true" && "$(field .output.policy.present)" == "true" && "$(field .output.policy.readable)" != "false" \
+        && "$(field .output.policy.max_per_day)" == "" ]]; then
     pass "G1 status reads the policy back with no cap"
   elif trial_spent "$RUN_ERR"; then
     skip "G1 the key is a spent TRIAL ($(head -c 80 <<<"$RUN_ERR")) — the capless policy is stored and unread"
   else
     fail "G1 status: success=$RUN_OK recipients='$(field .output.policy.recipients)' max_per_day='$(field .output.policy.max_per_day)' (expected a policy with no cap)"
   fi
+  if no_send "G1 the capless send"; then :; else
   gmail "$(jq -nc --arg to "$GMAIL_TEST_TO" --arg s "capless send $RUN" \
     --arg b "sent under a policy with no daily cap" \
     '{operation:"send", to:$to, subject:$s, body:$b}')"
@@ -188,16 +277,17 @@ if want G1; then
       && pass "G1 and the answer carries no remaining_today — there is no cap to count down" \
       || fail "G1 remaining_today='$(field .output.remaining_today)' under a policy with no cap"
   fi
+  fi
 
-  log "G1 the cap goes back — a live mailbox does not stay uncapped"
+  log "G1 the owner's policy goes back — a live mailbox does not stay uncapped"
   store_policy "$CAPPED"
   gmail '{"operation":"status"}'
-  if [[ "$RUN_OK" == "true" && "$(field .output.policy.max_per_day)" == "50" ]]; then
-    pass "G1 the capped policy is back (max_per_day=$(field .output.policy.max_per_day))"
+  if [[ "$RUN_OK" == "true" && "$(field .output.credential)" == "ok" && "$(field .output.policy.max_per_day)" == "$EXPECT_CAP" ]]; then
+    pass "G1 the owner's policy is back (max_per_day='$(field .output.policy.max_per_day)', credential=$(field .output.credential))"
   elif trial_spent "$RUN_ERR"; then
     skip "G1 the restore was STORED but could not be read back — the key is a spent TRIAL; check max_per_day by hand"
   else
-    fail "G1 THE CAP WAS NOT RESTORED: success=$RUN_OK max_per_day='$(field .output.policy.max_per_day)' — put it back by hand"
+    fail "G1 THE POLICY WAS NOT RESTORED: success=$RUN_OK credential='$(field .output.credential)' max_per_day='$(field .output.policy.max_per_day)', expected '$EXPECT_CAP' — put it back by hand"
   fi
 fi
 
@@ -206,6 +296,12 @@ if ! want G4; then
   :
 elif [[ -z "$AGENT2_PAYMENT_KEY" || -z "$AGENT2_ACCOUNT" ]]; then
   skip "G4 needs AGENT2_PAYMENT_KEY and AGENT2_ACCOUNT (a second granted agent)"
+elif no_send "G4 the per-agent cap (up to six real messages)"; then
+  :
+elif [[ -z "$CAPPED" ]]; then
+  skip "G4 the owner's policy could not be read, so it could not be put back — the row is left alone"
+elif [[ "$CONNECTED" == true ]] && ! jq -e '(keys == ["Whitelist"]) and (.Whitelist | keys == ["accounts"])' <<<"$ORIG_ACCESS" >/dev/null; then
+  skip "G4 the connected row's access is not a plain whitelist ($(jq -c . <<<"$ORIG_ACCESS")) — the second agent is not added to it"
 else
   log "G4 two agents under max_per_day=2: each gets its own allowance"
   # Each agent's counter is its own, so a cap of 2 means 2 for each — less

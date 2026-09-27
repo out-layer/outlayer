@@ -140,7 +140,7 @@ sql() { $PSQL_CMD "$1"; }
 # "0" — so a wrapper that does not work makes half this suite pass on silence.
 sql "SELECT 1" >/dev/null 2>&1 \
   || { echo "✗ PSQL_CMD does not work — every counter would read 0 and most probes would pass blind" >&2; exit 1; }
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1"; }
+mk_token() { CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1"; }
 AUTH() { echo "Authorization: Bearer near:$(mk_token "$1")"; }
 
 chain_balance() {

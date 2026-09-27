@@ -453,10 +453,10 @@ whoever asks. An on-chain answer is public besides. A module decides from what
 it has checked who may read what it opens.
 
 **Bind a ciphertext to its record.** A ciphertext opens under an `aad` only if
-it was sealed under the same `aad`. Pass the name of the record the ciphertext
-is stored under as `aad`: a ciphertext copied onto another record by whoever
-holds the storage then fails to decrypt instead of being read as that record's
-data.
+it was sealed under the same `aad`. Pass the record's plain name — not the
+`mac` of it the record is stored under — as `aad`: a ciphertext copied onto
+another record by whoever holds the storage then fails to decrypt instead of
+being read as that record's data.
 
 **Hide what the records are called.** Storage keys are visible to the
 storage's operator. Store a record under `mac(path, vault, name)` (hex or base64

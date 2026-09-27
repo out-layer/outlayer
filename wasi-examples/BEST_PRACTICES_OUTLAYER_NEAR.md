@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-outlayer = "0.1"  # OutLayer SDK for WASI P2
+outlayer = "0.2"  # OutLayer SDK for WASI P2
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ```

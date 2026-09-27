@@ -14,6 +14,9 @@ echo ""
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 CALLER_ACCOUNT="${CALLER_ACCOUNT:-outlayer.testnet}"
 PAYMENT="${PAYMENT:-0.1}"
+# sign-with-legacy-keychain for an account with many access keys (the RPC refuses
+# their list, which sign-with-keychain reads first).
+SIGN_METHOD="${SIGN_METHOD:-sign-with-keychain}"
 
 echo "📝 Configuration:"
 echo "  Contract: $CONTRACT_ID"
@@ -69,7 +72,7 @@ prepaid-gas '300.0 Tgas' \
 attached-deposit "$PAYMENT NEAR" \
 sign-as "$CALLER_ACCOUNT" \
 network-config testnet \
-sign-with-keychain \
+"$SIGN_METHOD" \
 send
 
 echo ""

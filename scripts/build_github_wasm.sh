@@ -92,6 +92,7 @@ else
 fi
 
 command -v docker >/dev/null || { echo "docker is required: the build runs in the platform's compiler image" >&2; exit 2; }
+docker info >/dev/null 2>&1 || { echo "the docker daemon is not reachable: start it, the build runs in the platform's compiler image" >&2; exit 2; }
 
 # Fix the architecture by naming an amd64 image, then check it. `--platform`
 # cannot rescue a multi-arch reference here: docker stores one image per

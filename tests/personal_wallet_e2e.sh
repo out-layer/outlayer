@@ -159,7 +159,7 @@ if grep -q "succeeded" <<<"$OUT"; then
   pass "P1 the three-action install transaction succeeded"
 else
   fail "P1 the kit-shape transaction failed"
-  printf '%s\n' "$OUT" | tail -12 >&2
+  echo "  $(near_why "$OUT")" >&2
 fi
 
 # ── P2: the chain reports the hash our allowlist pins ────────────────────────
@@ -208,7 +208,7 @@ if call_on "$ACC_A" "$EXECUTOR" w_execute_extension "$TRANSFER_ARGS" '1 yoctoNEA
     || fail "P4 the wallet account's balance did not drop (delta $A_DELTA)"
 else
   fail "P4 the lane transfer failed"
-  printf '%s\n' "$OUT" | tail -8 >&2
+  echo "  $(near_why "$OUT")" >&2
 fi
 
 # ── P5: w_init with 0 yocto rolls the whole batch back ───────────────────────
@@ -249,7 +249,7 @@ elif refused_with "private"; then
   pass "P6 w_init by another account was refused (#[private])"
 else
   fail "P6 w_init failed, but NOT for the #[private] reason — see output"
-  printf '%s\n' "$OUT" | tail -6 >&2
+  echo "  $(near_why "$OUT")" >&2
 fi
 
 log "P7 self w_init once — and only once"
@@ -261,11 +261,11 @@ if call_on "$ACC_B" "$ACC_B" w_init '{}' '1 yoctoNEAR'; then
     pass "P7 a second w_init was refused (already initialized)"
   else
     fail "P7 the second w_init failed for an unexpected reason — see output"
-    printf '%s\n' "$OUT" | tail -6 >&2
+    echo "  $(near_why "$OUT")" >&2
   fi
 else
   fail "P7 self w_init failed"
-  printf '%s\n' "$OUT" | tail -6 >&2
+  echo "  $(near_why "$OUT")" >&2
 fi
 
 # ── P8: the mode's one revocation event ──────────────────────────────────────
@@ -281,7 +281,7 @@ if call_on "$ACC_A" "$ACC_A" w_execute_extension "$RM_EXT_ARGS" '1 yoctoNEAR'; t
     || fail "P8 membership still answers '$EXEC_ON' after RemoveExtension"
 else
   fail "P8 the owner's RemoveExtension failed"
-  printf '%s\n' "$OUT" | tail -6 >&2
+  echo "  $(near_why "$OUT")" >&2
 fi
 
 # ── P9: the owner's keys outrank the construction ────────────────────────────
@@ -295,7 +295,7 @@ for ACC in "$ACC_A" "$ACC_B"; do
   if grep -q "succeeded\|deleted" <<<"$OUT"; then
     forget_created "$ACC"
   else
-    DEL_OK=false; fail "P9 could not delete $ACC"; printf '%s\n' "$OUT" | tail -4 >&2
+    DEL_OK=false; fail "P9 could not delete $ACC"; echo "  $(near_why "$OUT")" >&2
   fi
 done
 if $DEL_OK; then

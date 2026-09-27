@@ -105,7 +105,7 @@ if [[ "$INLINE_HASH" == "11111111111111111111111111111111" && "$GLOBAL_HASH" == 
   pass "G1 the published global resolved by hash; global_contract_hash reports the pin (code_hash stays the zero sentinel)"
 else
   fail "G1 code_hash='$INLINE_HASH' global_contract_hash='$GLOBAL_HASH' — expected sentinel + pin"
-  printf '%s\n' "$OUT" | tail -10 >&2
+  echo "  $(near_why "$OUT")" >&2
 fi
 
 EXEC_ON=$(view_on "$ACC" w_is_extension_enabled "$(jq -nc --arg a "$EXECUTOR" '{account_id:$a}')")
@@ -125,7 +125,7 @@ OUT=$(near contract call-function as-transaction "$ACC" w_execute_extension \
   json-args "$TRANSFER_ARGS" prepaid-gas '100.0 Tgas' attached-deposit '1 yoctoNEAR' \
   sign-as "$EXECUTOR" network-config "$NETWORK" sign-with-keychain send 2>&1)
 if ! grep -q "succeeded" <<<"$OUT"; then
-  fail "G2 the lane transfer was never accepted — this is the SEND failing, not the wallet: $(tail -c 300 <<<"$OUT")"
+  fail "G2 the lane transfer was never accepted — this is the SEND failing, not the wallet: $(near_why "$OUT")"
 else
   RCPT_AFTER=$(account_field "$RECIPIENT" amount)
   RCPT_DELTA=$(python3 -c "print(int('$RCPT_AFTER')-int('$RCPT_BEFORE'))" 2>/dev/null || echo unreadable)
@@ -141,7 +141,7 @@ if [[ "$(account_field "$ACC" amount)" == "null" ]]; then
   CREATED=""
   pass "G3 account deleted, funds returned to $FUNDER"
 else
-  fail "G3 the account still exists — the delete did not land: $(tail -c 300 <<<"$OUT")"
+  fail "G3 the account still exists — the delete did not land: $(near_why "$OUT")"
 fi
 
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAILED" >&2

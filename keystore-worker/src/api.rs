@@ -2635,7 +2635,18 @@ async fn update_user_secrets_handler(
 
         secrets
     } else {
-        // No existing secrets
+        // `Append` merges into a row every caller has just seen exists (the
+        // CLI reads it first; the dashboard edits one). Not finding it here is
+        // a read that cannot see it yet — and starting from nothing would store
+        // a row holding ONLY the new keys, dropping every other one (a
+        // connector's refresh token among them). Nothing is changed.
+        if matches!(req.mode, UpdateMode::Append) {
+            return Err(ApiError::Unavailable(
+                "the contract shows no row to merge this update into — if it was just \
+                 created, it is not visible yet; nothing was changed, try again in a moment"
+                    .to_string(),
+            ));
+        }
         tracing::info!("No existing secrets found in contract, starting fresh");
         serde_json::Map::new()
     };

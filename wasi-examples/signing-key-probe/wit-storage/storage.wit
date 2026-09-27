@@ -27,12 +27,25 @@ interface api {
     /// error if the key holds a raw record (read it with get-raw)
     get: func(key: string) -> tuple<list<u8>, string>;
 
-    /// Check if a key exists
+    /// Check if a key exists, in either mode.
+    /// Answers false also when the storage call fails, so false is not proof of
+    /// absence: use `has-checked`.
     has: func(key: string) -> bool;
 
-    /// Delete a key
-    /// Returns true if key existed and was deleted
+    /// Check if a key exists, in either mode.
+    /// Returns (exists, error): a failed storage call is an error, never "does
+    /// not exist".
+    has-checked: func(key: string) -> tuple<bool, string>;
+
+    /// Delete a key.
+    /// Returns true if the key existed and was deleted; false also when the
+    /// storage call fails: use `delete-checked`.
     delete: func(key: string) -> bool;
+
+    /// Delete a key.
+    /// Returns (deleted, error): deleted=true if the key held a record and it
+    /// is gone; a failed storage call is an error, never "was not there".
+    delete-checked: func(key: string) -> tuple<bool, string>;
 
     /// List all keys with optional prefix filter
     /// Returns JSON array of key strings
@@ -118,7 +131,8 @@ interface api {
 
     // ==================== Version Migration ====================
 
-    /// Get data from a specific WASM version (for migration)
+    /// Get data from a specific WASM version (for migration): the caller's
+    /// record in this project, when that version wrote it last
     /// wasm-hash: SHA256 hash of the specific version's WASM
     get-by-version: func(key: string, wasm-hash: string) -> tuple<list<u8>, string>;
 
@@ -128,7 +142,8 @@ interface api {
     /// This is called by __outlayer_clear_all_storage export
     clear-all: func() -> string;
 
-    /// Clear storage written by a specific WASM version
+    /// Clear the caller's records in this project written last by a specific
+    /// WASM version
     /// This is called by __outlayer_clear_storage_for_version export
     clear-version: func(wasm-hash: string) -> string;
 }

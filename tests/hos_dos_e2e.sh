@@ -130,10 +130,14 @@ while IFS="|" read -r name blob; do
   call_ext_raw "$SEED" "$ASSET" "$blob" >/dev/null
   if [[ "$HTTP" =~ ^5 ]]; then
     fail "S5 [$name] answered $HTTP — a crafted envelope reached a server error: $(msg_of | head -c 140)"
-  elif [[ "$HTTP" == "200" && "$name" == request-is-* || "$HTTP" == "200" && "$name" == external-empty ]]; then
-    # Nothing moves, so no rule was bypassed — but the door signed and BROADCAST
-    # a transaction that does nothing, and the executor paid for it.
-    finding "an EMPTY envelope ($name) is admitted, signed and sent: HTTP 200, $(jq -r '.status // "?"' <<<"$BODY"), tx $(jq -r '.tx_hash // "-"' <<<"$BODY" | head -c 12). Nothing moves and no rule is bypassed, but the executor's gas is spent on a no-op the door could have refused for free. Note also that '{\"request\":[]}' decodes at all: both wire fields carry serde defaults, so the POSITIONAL array spelling deserialises to an empty request as well as the map spelling."
+  elif [[ "$name" == request-is-list || "$name" == request-is-empty-map || "$name" == external-empty ]]; then
+    # A request that asks for nothing decodes, and every rule permits it; the
+    # door refuses it before signing, so the executor never pays for a no-op.
+    if [[ "$HTTP" == "403" && "$(err_of)" == "policy_denied" ]] && grep -qi "no operation" <<<"$(msg_of)"; then
+      pass "S5 [$name] empty request refused -> $HTTP $(err_of)"
+    else
+      fail "S5 [$name] an EMPTY envelope must be refused 403 policy_denied (no operation), got HTTP $HTTP $(err_of) tx $(jq -r '.tx_hash // "-"' <<<"$BODY" | head -c 12): $(msg_of | head -c 140)"
+    fi
   else
     pass "S5 [$name] -> $HTTP $(err_of)"
   fi

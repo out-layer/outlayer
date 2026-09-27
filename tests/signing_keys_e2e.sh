@@ -30,6 +30,19 @@
 #   S12 sign_nep413 → the wallet-style answer, verified HERE against a NEP-413
 #       hash rebuilt independently (struct + hashlib); a tampered message,
 #       recipient or nonce does not verify
+#   S13 secp256k1 (`project-secp`: evm secp256k1 + alpha ed25519): the key is 64
+#       bytes, `evm_address` = keccak256(pk)[12:] computed HERE; a signature over
+#       a 32-byte prehash recovers HERE (coincurve) to that key, low s, v ∈ {0,1}
+#   S14 sign_and_verify evm: verified, recovered, low_s, tampered_rejected
+#   S15 one prehash signs the same twice; $CALLER2 gets another evm key
+#   S16 alpha in project-secp is alpha in project
+#   S17 `wasm-secp` run from its URL gets code-evm; as a project version: refused
+#   S18 host_nep413 answers exactly what sign_nep413 does (with and without a
+#       callback_url) and verifies HERE
+#   S19 secp and NEP-413 attacks: wrong prehash length, wrong key type, bad
+#       nonce, a 2049-byte recipient — each an err
+#   S20 no answer holds a scalar of any secp256k1 key seen (S11 for secp256k1)
+#   S21 a keystore without secp256k1: SKIP, none reachable
 #   S22 caller predecessor (the `project-pred` build, a version of the project):
 #       on a direct call the predecessor key at alpha is NOT the signer key at
 #       alpha, though the account is one (the caller kind is a derivation
@@ -45,7 +58,7 @@
 # Needs: PARENT (owns the project, first caller; key in the keychain), CALLER2
 # (a second account with its key in the legacy keychain), the `outlayer` CLI
 # logged in on testnet (any account: it pays for the FastFS uploads), python3
-# with PyNaCl or `cryptography`,
+# with PyNaCl or `cryptography`, coincurve + pycryptodome (S13–S20),
 # near, outlayer, jq, curl, cargo + wasm-tools (the build). The RPC is keyed
 # through tests/lib/rpc.sh.
 # For S22's relayed half: RELAY_CONTRACT, the testnet account of the deployed
@@ -54,7 +67,7 @@
 #
 # Env: OFFLINE=1 (dry run only: no chain or GitHub reads; ignored with --apply).
 #
-# Money: five FastFS uploads (~230 KB each), project storage, and one on-chain
+# Money: seven FastFS uploads (~230 KB each), project storage, and one on-chain
 # run per probe at $DEPOSIT (~27 runs; a relayed run's unused deposit comes
 # back to its signer, as a direct run's does).
 #
@@ -121,7 +134,10 @@ var_name() { printf '%s_%s' "$( [[ $1 == hash ]] && echo H || echo U )" "${2//-/
 set_for() { printf -v "$(var_name "$1" "$2")" '%s' "$3"; }
 get_for() { local n; n=$(var_name "$1" "$2"); printf '%s' "${!n:-}"; }
 
-signer_flag() { [[ "$1" == "$PARENT" ]] && echo with-keychain || echo with-legacy-keychain; }
+# The key file in the legacy keychain first (the preflight requires it for
+# both accounts): the keychain path lists every access key of the account, and
+# the RPC refuses that list for an account with many keys (TOO_MANY_ACCESS_KEYS).
+signer_flag() { [[ -f "$HOME/.near-credentials/$NETWORK/$1.json" ]] && echo with-legacy-keychain || echo with-keychain; }
 
 # One contract call, its whole transcript on stdout — the logs and the return
 # value included, which is where a run's event and answer are read from.
@@ -168,7 +184,7 @@ run_on() { # run_on <signer> <receiver> <method> <args-json>
       sleep 20
     done
   fi
-  RUN_OUT=$(awk '/Function execution return value/{getline; print}' <<<"$out" \
+  RUN_OUT=$(awk '/Function execution return value/{f=1; next} f && /^The "/{exit} f{print}' <<<"$out" \
     | jq -c 'select(. != null) | if type=="string" then fromjson else . end' 2>/dev/null)
   if [[ -z "$RUN_OUT" && -n "$logs" ]]; then
     RUN_OUT=$(jq -r '.result.status.SuccessValue // empty | @base64d' <<<"$logs" 2>/dev/null \
@@ -176,7 +192,7 @@ run_on() { # run_on <signer> <receiver> <method> <args-json>
   fi
   if [[ -z "$ev" ]]; then
     RUN_OK=absent
-    RUN_ERR=$( { grep -iE 'error|panick|failed' <<<"$out" | head -2
+    RUN_ERR=$( { near_why "$out"; echo
                  [[ -n "$logs" ]] && jq -r '.result.receipts_outcome[]?.outcome.status.Failure? // empty | tostring' <<<"$logs" 2>/dev/null | head -2
                } | tr '\n' ' ' | head -c 300)
     return 0
@@ -351,13 +367,7 @@ done
 
 log "upload to FastFS"
 for v in project project-v2 project-pred wasm wasm-v2; do
-  up=$(OUTLAYER_RPC_URL="$RPC_URL" outlayer upload "$VARIANTS/signing-key-probe-$v.wasm" 2>&1)
-  url=$(grep -oE 'https://[A-Za-z0-9._-]+\.fastfs\.io/[^[:space:]"]+\.wasm' <<<"$up" | head -1)
-  if [[ -z "$url" ]]; then
-    echo "✗ upload of $v gave no FastFS URL: $(tail -3 <<<"$up" | tr '\n' ' ' | head -c 300)" >&2; exit 1
-  fi
-  got=$(curl -sL --max-time 60 "$url" | shasum -a 256 | cut -d' ' -f1)
-  [[ "$got" == "$(get_for hash "$v")" ]] || { echo "✗ $url serves $got, not $(get_for hash "$v")" >&2; exit 1; }
+  url=$(fastfs_upload "$VARIANTS/signing-key-probe-$v.wasm" "$(get_for hash "$v")") || { echo "✗ upload of $v never served its bytes" >&2; exit 1; }
   set_for url "$v" "$url"
   note "$v at $url"
 done
@@ -367,6 +377,7 @@ U_P=$(get_for url project); U_W=$(get_for url wasm); U_W2=$(get_for url wasm-v2)
 log "publish $PROJECT"
 if [[ -z "$(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{project_id:$p}')" | jq -r '.project_id // empty' 2>/dev/null)" ]]; then
   out=$(call "$PARENT" create_project "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$U_P" "$H_P")" '{name:$n, source:$s}')" '0.3 NEAR')
+  grep -q 'succeeded' <<<"$out" || { echo "✗ create_project failed: $(near_why "$out")" >&2; exit 1; }
   sleep 4
 fi
 # project v1 active; v2, the predecessor build and the wasm build as inactive
@@ -376,6 +387,7 @@ for v in project project-v2 project-pred wasm; do
   active=false; [[ "$v" == project ]] && active=true
   out=$(call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$(get_for url "$v")" "$(get_for hash "$v")")" --argjson a "$active" \
     '{project_name:$n, source:$s, set_active:$a}')" '0.1 NEAR')
+  grep -q 'succeeded' <<<"$out" || { echo "✗ add_version $v failed: $(near_why "$out")" >&2; exit 1; }
   sleep 4
 done
 for v in project project-v2 project-pred wasm; do
@@ -655,6 +667,176 @@ else
     || fail "S22 the project build relayed holds $(out_field .keys.alpha.public_key), not $PARENT's alpha $ALPHA"; }
 fi
 
+# ── S13–S19 secp256k1 keys and the host's sign-nep413 ────────────────────────
+#
+# Builds `project-secp` (evm secp256k1 + alpha ed25519, bind project; a version
+# of the project) and `wasm-secp` (code-evm secp256k1, bind wasm; run from its
+# URL). Every signature is checked here with coincurve and pycryptodome — not
+# the worker's library, not the guest's.
+
+secp_check() { # secp_check <pk_hex_64_bytes> <prehash_hex> <sig_hex_65_bytes> — "ok|<why>"
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+from coincurve import PublicKey
+from Crypto.Hash import keccak
+pk, h, sig = (bytes.fromhex(a) for a in sys.argv[1:4])
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+if len(pk) != 64 or len(sig) != 65:
+    print(f"shape pk={len(pk)} sig={len(sig)}"); sys.exit()
+r, s, v = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:64], "big"), sig[64]
+if v not in (0, 1): print(f"v={v}"); sys.exit()
+if s > N // 2: print("high s"); sys.exit()
+rec = PublicKey.from_signature_and_message(sig, h, hasher=None).format(compressed=False)[1:]
+if rec != pk: print("recovers to another key"); sys.exit()
+print("ok")
+PY
+}
+evm_address_local() { # evm_address_local <pk_hex_64_bytes>
+  python3 -c "
+import sys
+from Crypto.Hash import keccak
+k = keccak.new(digest_bits=256); k.update(bytes.fromhex(sys.argv[1]))
+print('0x' + k.hexdigest()[24:])" "$1"
+}
+keccak_local() { # keccak_local <text>
+  python3 -c "
+import sys
+from Crypto.Hash import keccak
+k = keccak.new(digest_bits=256); k.update(sys.argv[1].encode()); print(k.hexdigest())" "$1"
+}
+
+SECP_READY=true
+if ! python3 -c 'import coincurve; from Crypto.Hash import keccak' 2>/dev/null; then
+  SECP_READY=false
+  skip "S13–S20: python3 needs coincurve and pycryptodome (pip install coincurve pycryptodome)"
+fi
+
+if [[ "$SECP_READY" == true ]]; then
+  log "S13–S19 upload and publish the secp256k1 builds"
+  for v in project-secp wasm-secp; do
+    set_for hash "$v" "$(sha_of "$VARIANTS/signing-key-probe-$v.wasm")"
+    url=$(fastfs_upload "$VARIANTS/signing-key-probe-$v.wasm" "$(get_for hash "$v")") || { fail "S13 upload of $v never served its bytes"; SECP_READY=false; break; }
+    set_for url "$v" "$url"
+    note "$v sha256 $(get_for hash "$v") at $url"
+  done
+fi
+
+if [[ "$SECP_READY" == true ]]; then
+  H_PS=$(get_for hash project-secp); U_PS=$(get_for url project-secp)
+  H_WS=$(get_for hash wasm-secp); U_WS=$(get_for url wasm-secp)
+  for v in project-secp wasm-secp; do
+    [[ -n "$(version_on_chain "$(get_for hash "$v")")" ]] && continue
+    call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$(get_for url "$v")" "$(get_for hash "$v")")" \
+      '{project_name:$n, source:$s, set_active:false}')" '0.1 NEAR' >/dev/null
+    sleep 4
+  done
+
+  # ── S13 the secp256k1 key, checked here ──
+  log "S13 project-secp: a 64-byte key, its EVM address, a recoverable low-s signature"
+  run_src "$PARENT" "$(project_src "$H_PS")" '{"operation":"evm_address","path":"evm"}'
+  EVM_PK=""
+  if ran_ok "S13 evm_address"; then
+    remember_keys
+    EVM_PK=$(out_field .public_key)
+    [[ ${#EVM_PK} == 128 ]] && pass "S13 the evm public key is 64 bytes" || fail "S13 the evm public key is ${#EVM_PK} hex chars, not 128"
+    want=$(evm_address_local "$EVM_PK")
+    [[ "$(out_field .evm_address | tr 'A-F' 'a-f')" == "$want" ]] && pass "S13 evm_address is keccak256(pk)[12:] computed here ($want)" \
+      || fail "S13 evm_address $(out_field .evm_address) is not $want"
+  fi
+  PREHASH=$(keccak_local "outlayer signing-keys e2e secp256k1")
+  run_src "$PARENT" "$(project_src "$H_PS")" "$(jq -nc --arg m "$PREHASH" '{operation:"sign",path:"evm",message_hex:$m}')"
+  SECP_SIG=""
+  if ran_ok "S13 sign evm" && [[ -n "$EVM_PK" ]]; then
+    SECP_SIG=$(out_field .signature)
+    r=$(secp_check "$EVM_PK" "$PREHASH" "$SECP_SIG")
+    [[ "$r" == ok ]] && pass "S13 the signature recovers here to the evm key; s ≤ n/2; v ∈ {0,1}" || fail "S13 the signature: $r"
+  fi
+
+  # ── S14 in-guest verification ──
+  log "S14 sign_and_verify evm"
+  run_src "$PARENT" "$(project_src "$H_PS")" "$(jq -nc --arg m "$PREHASH" '{operation:"sign_and_verify",path:"evm",message_hex:$m}')"
+  if ran_ok "S14 sign_and_verify evm"; then
+    flags=$(jq -r '[.verified, .recovered, .low_s, .tampered_rejected] | map(tostring) | join(",")' <<<"$RUN_OUT")
+    [[ "$flags" == "true,true,true,true" ]] && pass "S14 verified, recovered, low_s, tampered_rejected all true" || fail "S14 verified,recovered,low_s,tampered_rejected = $flags"
+  fi
+
+  # ── S15 determinism, another caller ──
+  log "S15 secp256k1: one prehash, one signature; another caller, another key"
+  run_src "$PARENT" "$(project_src "$H_PS")" "$(jq -nc --arg m "$PREHASH" '{operation:"sign",path:"evm",message_hex:$m}')"
+  if ran_ok "S15 sign evm again" && [[ -n "$SECP_SIG" ]]; then
+    [[ "$(out_field .signature)" == "$SECP_SIG" ]] && pass "S15 the second run signs the same prehash byte for byte (RFC 6979)" || fail "S15 the second signature differs"
+  fi
+  run_src "$CALLER2" "$(project_src "$H_PS")" '{"operation":"public_key","path":"evm"}'
+  if ran_ok "S15 public_key evm as CALLER2"; then
+    remember_keys
+    [[ -n "$EVM_PK" && "$(out_field .public_key)" != "$EVM_PK" ]] && pass "S15 $CALLER2 gets another evm key" || fail "S15 $CALLER2's evm key is $PARENT's"
+  fi
+  skip "S15 a second project version keeping evm: needs a second secp256k1 project build (not built); S5 covers the rule for ed25519"
+
+  # ── S16 adding a secp256k1 key disturbs no ed25519 key ──
+  log "S16 alpha in project-secp is alpha in project"
+  run_src "$PARENT" "$(project_src "$H_PS")" '{"operation":"public_key","path":"alpha"}'
+  if ran_ok "S16 public_key alpha"; then
+    [[ "$(out_field .public_key)" == "$ALPHA" ]] && pass "S16 alpha is the same key in both builds" || fail "S16 alpha in project-secp is $(out_field .public_key), not $ALPHA"
+  fi
+
+  # ── S17 a wasm-bound secp256k1 key ──
+  log "S17 wasm-secp: run from its URL gets code-evm; through the project it is refused"
+  run_src "$PARENT" "$(wasm_src "$U_WS" "$H_WS")" '{"operation":"public_key","path":"code-evm"}'
+  if ran_ok "S17 direct public_key code-evm"; then
+    remember_keys
+    CODE_EVM=$(out_field .public_key)
+    [[ ${#CODE_EVM} == 128 && "$CODE_EVM" != "$EVM_PK" ]] && pass "S17 code-evm is a 64-byte key of its own" || fail "S17 code-evm is ${#CODE_EVM} hex chars or equals evm"
+  fi
+  run_src "$PARENT" "$(project_src "$H_WS")" '{"operation":"public_key","path":"code-evm"}'
+  refused_without_keys "S17 wasm-secp run as a project version" 'bind|wasm|project|signing key'
+  skip "S17 a new hash → a new code-evm key: needs a second wasm-secp build (not built); S6 covers the rule for ed25519"
+
+  # ── S18 the host's sign-nep413 is the guest's NEP-413 ──
+  log "S18 host_nep413 equals sign_nep413, verified here"
+  N413=$(openssl rand -hex 32)
+  for cb in "" "https://e2e.outlayer.testnet/cb"; do
+    args=$(jq -nc --arg n "$N413" --arg c "$cb" '{path:"alpha",message:"Login to signing-keys e2e",recipient:"e2e.outlayer.testnet",nonce_hex:$n} + (if $c == "" then {} else {callback_url:$c} end)')
+    label=$([[ -z "$cb" ]] && echo "without callback_url" || echo "with callback_url")
+    run_src "$PARENT" "$(project_src "$H_PS")" "$(jq -c '. + {operation:"sign_nep413"}' <<<"$args")"
+    ran_ok "S18 sign_nep413 $label" || continue
+    guest=$(jq -c '{accountId, publicKey, signature}' <<<"$RUN_OUT")
+    run_src "$PARENT" "$(project_src "$H_PS")" "$(jq -c '. + {operation:"host_nep413"}' <<<"$args")"
+    ran_ok "S18 host_nep413 $label" || continue
+    host=$(jq -c '{accountId, publicKey, signature}' <<<"$RUN_OUT")
+    [[ "$host" == "$guest" ]] && pass "S18 $label: the host's answer is the guest's byte for byte" || fail "S18 $label: host $host ≠ guest $guest"
+    sig_hex=$(jq -r .signature <<<"$host" | base64 -d 2>/dev/null | xxd -p | tr -d '\n')
+    if [[ -z "$cb" ]]; then h=$(nep413_hash_local "Login to signing-keys e2e" "$N413" "e2e.outlayer.testnet")
+    else h=$(nep413_hash_local "Login to signing-keys e2e" "$N413" "e2e.outlayer.testnet" "$cb"); fi
+    [[ "$(verify_local "$ALPHA" "$h" "$sig_hex")" == ok ]] && pass "S18 $label: verifies here against a hash rebuilt independently" || fail "S18 $label: does not verify here"
+    [[ "$(jq -r .accountId <<<"$host")" == "$ALPHA" ]] && pass "S18 $label: accountId is hex(public key)" || fail "S18 $label: accountId is not alpha"
+  done
+
+  # ── S19 attacks on the secp256k1 build ──
+  log "S19 project-secp attacks"
+  run_src "$PARENT" "$(project_src "$H_PS")" '{"operation":"attacks"}'
+  if ran_ok "S19 attacks"; then
+    bad=$(jq -r '.results[] | select((.name | test("^(secp_message_not_32|nep413_wrong_type|nep413_bad_nonce)$")) and .status != "err") | "\(.name)=\(.status)"' <<<"$RUN_OUT" 2>/dev/null | tr '\n' ' ')
+    [[ -z "$bad" ]] && pass "S19 secp_message_not_32, nep413_wrong_type, nep413_bad_nonce are err" || fail "S19 unexpected: $bad"
+  fi
+  for len in 31 33; do
+    run_src "$PARENT" "$(project_src "$H_PS")" "$(jq -nc --arg m "$(openssl rand -hex $len)" '{operation:"sign",path:"evm",message_hex:$m}')"
+    if [[ "$RUN_OK" == "true" && "$(out_field .status)" == "err" ]] && grep -q "32" <<<"$(out_field .message)"; then
+      pass "S19 sign evm with $len bytes → err naming the 32-byte rule"
+    else
+      fail "S19 sign evm with $len bytes: run=$RUN_OK status=$(out_field .status) $(out_field .message | head -c 150)"
+    fi
+  done
+  run_src "$PARENT" "$(project_src "$H_PS")" "$(jq -nc --arg r "$(printf 'r%.0s' $(seq 1 2049))" --arg n "$N413" \
+    '{operation:"host_nep413",path:"alpha",message:"x",recipient:$r,nonce_hex:$n}')"
+  if [[ "$RUN_OK" == "true" && "$(out_field .status)" == "err" ]]; then
+    pass "S19 host_nep413 with a 2049-byte recipient → err: $(out_field .message | head -c 120)"
+  else
+    fail "S19 host_nep413 with a 2049-byte recipient: run=$RUN_OK status=$(out_field .status)"
+  fi
+fi
+skip "S21 a keystore without secp256k1 refusing the declaration: no such keystore is reachable"
+
 # ── S11 no seed anywhere ─────────────────────────────────────────────────────
 
 log "S11 no seed in any answer of the run"
@@ -686,6 +868,40 @@ PY
   tried=${leak%% *}; hits=${leak##* }
   [[ "$hits" == 0 ]] && pass "S11 $tried 32-byte values in the answers tried as seeds; none derives any of the $(wc -l < "$SEEN_KEYS" | tr -d ' ') keys seen" \
     || fail "S11 $hits value(s) in the answers derive a public key the run saw — a seed left the enclave"
+fi
+
+# ── S20 no secp256k1 scalar anywhere ─────────────────────────────────────────
+
+log "S20 no secp256k1 scalar in any answer of the run"
+if [[ "${SECP_READY:-false}" != true ]]; then
+  skip "S20: the secp256k1 builds did not run"
+elif ! grep -qE '^[0-9a-f]{128}$' "$SEEN_KEYS"; then
+  fail "S20 the run saw no 64-byte public key to test candidates against"
+else
+  leak=$(python3 - "$ANSWERS" "$SEEN_KEYS" <<'PY'
+import base64, re, sys
+from coincurve import PrivateKey
+answers = open(sys.argv[1], errors="replace").read()
+seen = {l.strip() for l in open(sys.argv[2]) if len(l.strip()) == 128}
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+candidates = {bytes.fromhex(h) for h in re.findall(r'(?i)(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])', answers)}
+for b64 in re.findall(r'[A-Za-z0-9+/]{43}=', answers):
+    try:
+        candidates.add(base64.b64decode(b64))
+    except Exception:
+        pass
+hits = 0
+for c in candidates:
+    if len(c) != 32 or not (0 < int.from_bytes(c, "big") < N):
+        continue
+    if PrivateKey(c).public_key.format(compressed=False)[1:].hex() in seen:
+        hits += 1
+print(f"{len(candidates)} {hits}")
+PY
+)
+  tried=${leak%% *}; hits=${leak##* }
+  [[ "$hits" == 0 ]] && pass "S20 $tried 32-byte values tried as secp256k1 scalars; none derives any of the $(grep -cE '^[0-9a-f]{128}$' "$SEEN_KEYS") secp256k1 keys seen" \
+    || fail "S20 $hits value(s) in the answers derive a secp256k1 key the run saw — a scalar left the enclave"
 fi
 
 verdict "signing keys"

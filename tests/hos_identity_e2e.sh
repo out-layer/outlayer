@@ -89,7 +89,7 @@ if [[ -z "$PK" ]]; then
   # the runner's table as a suite that passed.
   verdict "§5 identity"; exit 3
 fi
-note "paying with ${PK:0:8}… ($(jq -r 'if .calls then "a trial of \(.calls) calls" else "bought with stablecoin" end' <<<"$CLAIM" 2>/dev/null || echo "bought with stablecoin"))"
+note "paying with a key of ${#PK} chars ($(jq -r 'if .calls then "a trial of \(.calls) calls" else "bought with stablecoin" end' <<<"$CLAIM" 2>/dev/null || echo "bought with stablecoin"))"
 
 ACC="hos-ident-$(openssl rand -hex 3).$PARENT"
 cleanup() {

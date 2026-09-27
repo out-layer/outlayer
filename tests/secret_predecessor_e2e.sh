@@ -173,7 +173,7 @@ ensure_deputy() {
     out=$(near --quiet contract deploy "$acc" use-file "$DEPUTY_WASM" \
       with-init-call new json-args "$(jq -nc --arg o "$PARENT" '{owner:$o}')" prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
       network-config "$NETWORK" sign-with-keychain send 2>&1) \
-      || { echo "✗ the deputy did not deploy to $acc: $(grep -viE '^\s*$' <<<"$out" | tail -3 | tr '\n' ' ' | head -c 240)" >&2; exit 1; }
+      || { echo "✗ the deputy did not deploy to $acc: $(near_why "$out")" >&2; exit 1; }
     sleep 3
   fi
   note "$acc holds code $(account_field "$acc" code_hash | head -c 12)… owned by $PARENT"
@@ -208,7 +208,7 @@ relay_via() { # relay_via <deputy>
   tx=$(grep -oE 'Transaction ID: *[1-9A-HJ-NP-Za-km-z]{40,50}' <<<"$out" | grep -oE '[1-9A-HJ-NP-Za-km-z]{40,50}' | head -1)
   logs="$out"
   if [[ -z "$tx" ]]; then
-    note "the relay through $deputy never landed: $(grep -A3 -iE 'error|panick|fail' <<<"$out" | grep -viE '^\s*$' | head -3 | tr '\n' ' ' | head -c 300)"
+    note "the relay through $deputy never landed: $(near_why "$out")"
     return 0
   fi
   local raw=""

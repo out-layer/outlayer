@@ -83,8 +83,11 @@ log "Building customer-recovery (need sign-nep413)"
 # machine — and the check below compares against the wrong network's account.
 export OUTLAYER_NETWORK="$NETWORK"
 WHOAMI=$(outlayer whoami 2>/dev/null | awk -F': *' '/^Account:/{print $2; exit}')
-[[ "$WHOAMI" == "$PARENT" ]] || fail "outlayer is logged in as '$WHOAMI', not '$PARENT'"
-pass "logged in as $PARENT on $NETWORK; approver=$APPROVER"
+if [[ "$WHOAMI" == "$PARENT" ]]; then
+  pass "logged in as $PARENT on $NETWORK; approver=$APPROVER"
+else
+  fail "outlayer is logged in as '$WHOAMI', not '$PARENT'"
+fi
 
 APPROVER_PRIVKEY=$(jq -r '.private_key' "$APPROVER_CREDS")
 APPROVER_PUBKEY=$(jq -r '.public_key' "$APPROVER_CREDS")
@@ -102,8 +105,11 @@ if [[ $INIT_RC -ne 0 ]] && echo "$INIT_OUT" | grep -q "outlayer vault resume"; t
     if outlayer vault resume "$VAULT_ID" >&2; then INIT_RC=0; break; fi
   done
 fi
-[[ $INIT_RC -eq 0 ]] || fail "vault init failed"
-pass "vault $VAULT_ID deployed + verified"
+if [[ $INIT_RC -eq 0 ]]; then
+  pass "vault $VAULT_ID deployed + verified"
+else
+  fail "vault init failed"
+fi
 
 # ─── 2. Mint wallet via POST /register {vault_id} (wk_ Bearer) ────
 
@@ -114,8 +120,11 @@ REG_RESP=$(curl -sS -X POST "$COORDINATOR_URL/register" \
 WK_API_KEY=$(echo "$REG_RESP" | jq -r '.api_key')
 WALLET_ID=$(echo "$REG_RESP"  | jq -r '.wallet_id')
 SUB_ADDR=$(echo "$REG_RESP"   | jq -r '.near_account_id')
-[[ -n "$WK_API_KEY" && "$WK_API_KEY" != "null" ]] || fail "/register failed: $REG_RESP"
-pass "wallet $WALLET_ID  addr=$SUB_ADDR  api_key=${WK_API_KEY:0:12}…"
+if [[ -n "$WK_API_KEY" && "$WK_API_KEY" != "null" ]]; then
+  pass "wallet $WALLET_ID  addr=$SUB_ADDR  api_key: ${#WK_API_KEY} chars"
+else
+  fail "/register failed: $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG_RESP" 2>/dev/null | head -c 300)"
+fi
 
 # /register doesn't echo vault_id in the response by current API shape —
 # verify the binding via the /address endpoint (which DOES expose vault_id).
@@ -123,7 +132,7 @@ ADDR_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "c
   -H "Authorization: Bearer $WK_API_KEY")
 GOT_VAULT=$(echo "$ADDR_RESP" | jq -r '.vault_id // empty')
 [[ "$GOT_VAULT" == "$VAULT_ID" ]] || \
-  fail "/address vault_id mismatch: got '$GOT_VAULT', expected '$VAULT_ID'. /register response: $REG_RESP"
+  fail "/address vault_id mismatch: got '$GOT_VAULT', expected '$VAULT_ID'. /register response (key removed): $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG_RESP" 2>/dev/null | head -c 300)"
 PUB_HEX_SHORT=$(echo "$ADDR_RESP" | jq -r '.public_key' | sed 's/^ed25519://')
 WALLET_PUBKEY_HEX="ed25519:$PUB_HEX_SHORT"
 
@@ -165,8 +174,11 @@ SIGN_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg ed "$ENCRYPTED_B64" --arg c "$PARENT" '{encrypted_data: $ed, caller: $c}')")
 SIG_HEX=$(echo "$SIGN_RESP" | jq -r '.signature_hex // empty')
-[[ -n "$SIG_HEX" && "$SIG_HEX" != "null" ]] || fail "/sign-policy: $SIGN_RESP"
-pass "policy encrypted+signed under wk_ wallet"
+if [[ -n "$SIG_HEX" && "$SIG_HEX" != "null" ]]; then
+  pass "policy encrypted+signed under wk_ wallet"
+else
+  fail "/sign-policy: $SIGN_RESP"
+fi
 
 log "3.1 store_wallet_policy on $CONTRACT_ID"
 STORE_ARGS=$(jq -nc --arg pk "$WALLET_PUBKEY_HEX" --arg ed "$ENCRYPTED_B64" --arg sg "$SIG_HEX" \
@@ -188,8 +200,11 @@ T_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/transfer" \
 echo "$T_RESP" | jq . >&2
 APPROVAL_ID=$(echo "$T_RESP" | jq -r '.approval_id // .approval.id // empty')
 REQUEST_ID=$(echo "$T_RESP"  | jq -r '.request_id  // .request.id  // empty')
-[[ -n "$APPROVAL_ID" && "$APPROVAL_ID" != "null" ]] || fail "no approval_id: $T_RESP"
-pass "approval_id=$APPROVAL_ID  request_id=$REQUEST_ID"
+if [[ -n "$APPROVAL_ID" && "$APPROVAL_ID" != "null" ]]; then
+  pass "approval_id=$APPROVAL_ID  request_id=$REQUEST_ID"
+else
+  fail "no approval_id: $T_RESP"
+fi
 
 # ─── 5. Approver signs NEP-413 → /approve ────────────────────────
 
@@ -202,8 +217,8 @@ WALLET_PUBKEY=$(echo "$DETAILS" | jq -r '.wallet_pubkey // empty')
 # Wallet-bound approval message (audit fix 2): approve:{id}:{wallet_pubkey}:{request_hash}.
 APPROVE_MSG="approve:$APPROVAL_ID:$WALLET_PUBKEY:$REQUEST_HASH"
 NONCE_B64=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-APP_SIG_JSON=$("$RECOVERY_BIN" sign-nep413 \
-  --private-key "$APPROVER_PRIVKEY" --message "$APPROVE_MSG" \
+APP_SIG_JSON=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$APPROVER_PRIVKEY" "$RECOVERY_BIN" sign-nep413 \
+ --message "$APPROVE_MSG" \
   --recipient "$CONTRACT_ID" --nonce-base64 "$NONCE_B64")
 APP_SIG=$(echo "$APP_SIG_JSON" | jq -r '.signature')
 
@@ -236,8 +251,11 @@ for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
     failed)    fail "worker failed: $(echo "$S" | jq -r '.result')";;
   esac
 done
-[[ -n "$TX_HASH" && "$TX_HASH" != "null" ]] || fail "worker did not complete within ~36s"
-pass "background worker completed: tx_hash=$TX_HASH"
+if [[ -n "$TX_HASH" && "$TX_HASH" != "null" ]]; then
+  pass "background worker completed: tx_hash=$TX_HASH"
+else
+  fail "worker did not complete within ~36s"
+fi
 
 log "6.1 Verify on chain: tx signer_id == $SUB_ADDR"
 TX_VIEW=$(curl -sS "$RPC_URL" -X POST -H 'Content-Type: application/json' \

@@ -197,13 +197,13 @@ if [[ -n "${MPC_PUBLIC_KEY:-}" ]]; then
   if [[ $INIT_RC -ne 0 ]] && echo "$INIT_OUT" | grep -q "outlayer vault resume"; then
     for _ in 1 2 3 4 5; do sleep 6; if outlayer vault resume "$VAULT_ID" >&2; then INIT_RC=0; break; fi; done
   fi
-  [[ $INIT_RC -eq 0 ]] || { echo "✗ vault init failed: $INIT_OUT" >&2; exit 1; }
+  [[ $INIT_RC -eq 0 ]] || { echo "✗ vault init failed: $(near_why "$INIT_OUT")" >&2; exit 1; }
   pass "vault $VAULT_ID deployed"
 else
   log "Default-vault mode (no MPC_PUBLIC_KEY): skipping vault init; tokens omit vault-id → coordinator default vault"
 fi
 
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1" ${2:+--vault-id "$2"}; }
+mk_token() { local v=(); [[ -n "${2:-}" ]] && v=(--vault-id "$2"); CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1" ${v[@]+"${v[@]}"}; }
 AUTH() { echo "Authorization: Bearer near:$(mk_token "$1" "$VAULT_ID")"; }
 
 # new_subwallet <seed> → echoes "WALLET_ID SUB_ADDR"
@@ -508,7 +508,7 @@ if want T4; then
       local v=$1 aid=$2 h=$3 priv=$4 pub=$5 acct=$6 nonce sj sig wpk
       wpk=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$aid" | jq -r '.wallet_pubkey // empty')
       nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-      sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$priv" --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+      sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$priv" "$RECOVERY_BIN" sign-nep413 --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
       sig=$(echo "$sj" | jq -r '.signature')
       curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/$v/$aid" -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg s "$sig" --arg pk "$pub" --arg ac "$acct" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')"
@@ -618,7 +618,7 @@ if want T7; then
     #     coordinator + keystore both re-derive the real message → invalid → no execution.
     WRONG_H=$(printf '%064d' 0)
     nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-    sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$A1_PRIV" --message "approve:$AID:$WPK:$WRONG_H" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+    sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$A1_PRIV" "$RECOVERY_BIN" sign-nep413 --message "approve:$AID:$WPK:$WRONG_H" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
     sig=$(echo "$sj" | jq -r '.signature')
     C=$(curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/approve/$AID" -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg s "$sig" --arg pk "$A1_PUB" --arg ac "$APPROVER1" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')")
@@ -638,7 +638,7 @@ if want T7; then
     H_B=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$AID_B" | jq -r '.request_hash')
     # Sign with wallet A's pubkey binding (WPK from T7's wallet) but submit to B's approval.
     nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-    sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$A1_PRIV" --message "approve:$AID_B:$WPK:$H_B" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+    sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$A1_PRIV" "$RECOVERY_BIN" sign-nep413 --message "approve:$AID_B:$WPK:$H_B" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
     sig=$(echo "$sj" | jq -r '.signature')
     C=$(curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/approve/$AID_B" -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg s "$sig" --arg pk "$A1_PUB" --arg ac "$APPROVER1" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')")
@@ -832,7 +832,7 @@ if want T14; then
 
   # ── 14a: happy path — sign-api-key-claim → PUT /api-key → 200, binds wallet_id (+ vault echo) ──
   SEED="t14-$(date +%s)-$$"; SUB_KEY=$(new_sub_key)
-  BODY14=$("$RECOVERY_BIN" sign-api-key-claim --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$SEED" --sub-key "$SUB_KEY" ${VAULT_ID:+--vault-id "$VAULT_ID"})
+  BODY14=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-api-key-claim --account-id "$PARENT" --seed "$SEED" --sub-key "$SUB_KEY" ${VAULT_ID:+--vault-id "$VAULT_ID"})
   H14=$(curl -sS -o /tmp/uop.body -w '%{http_code}' -X PUT "$COORDINATOR_URL/wallet/v1/api-key" -H 'Content-Type: application/json' -d "$BODY14"); R14=$(cat /tmp/uop.body)
   WALLET_ID_14=$(echo "$R14" | jq -r '.wallet_id // empty'); GOT_VAULT_14=$(echo "$R14" | jq -r '.vault_id // empty')
   if [[ "$H14" == "200" && -n "$WALLET_ID_14" ]]; then
@@ -872,7 +872,7 @@ if want T14; then
   # ── (vault-only) cross-vault mint → DISTINCT wallet_id (v2: not a refusal, a distinct wallet) ──
   if [[ -n "$VAULT_ID" ]]; then
     SUB_KEY2=$(new_sub_key)
-    BODY14B=$("$RECOVERY_BIN" sign-api-key-claim --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$SEED" --sub-key "$SUB_KEY2")
+    BODY14B=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-api-key-claim --account-id "$PARENT" --seed "$SEED" --sub-key "$SUB_KEY2")
     H14B=$(curl -sS -o /tmp/uop.body -w '%{http_code}' -X PUT "$COORDINATOR_URL/wallet/v1/api-key" -H 'Content-Type: application/json' -d "$BODY14B"); R14B=$(cat /tmp/uop.body)
     WID14B=$(echo "$R14B" | jq -r '.wallet_id // empty')
     if [[ "$H14B" == "200" && -n "$WID14B" && "$WID14B" != "$WALLET_ID_14" ]]; then
@@ -966,7 +966,7 @@ if want T16; then
   # 256 → must clear the length gate. Sign a REAL parent-keyed claim (correct api-key:<seed>:<ts> +
   # valid sig) so the request reaches binding; HTTP 200 proves a 256-char seed is within bound.
   SK_256=$(printf 'wk_%s' "$(head -c 32 /dev/urandom | xxd -p -c 64)")
-  BODY_256=$("$RECOVERY_BIN" sign-api-key-claim --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$SEED_256" --sub-key "$SK_256" ${VAULT_ID:+--vault-id "$VAULT_ID"})
+  BODY_256=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-api-key-claim --account-id "$PARENT" --seed "$SEED_256" --sub-key "$SK_256" ${VAULT_ID:+--vault-id "$VAULT_ID"})
   H_256=$(curl -sS -o /tmp/uop.body -w '%{http_code}' -X PUT "$COORDINATOR_URL/wallet/v1/api-key" -H 'Content-Type: application/json' -d "$BODY_256")
   [[ "$H_256" == "200" ]] && pass "T16a 256-char seed accepted (HTTP 200 — within max-length bound)" || fail "T16a 256-char seed should be accepted (200), got $H_256: $(cat /tmp/uop.body | head -c160)"
 
@@ -1031,7 +1031,7 @@ if want T17; then
     if [[ -n "$AID" ]]; then
       # Real approver YES (wallet-bound NEP-413 message approve:{id}:{wallet_pubkey}:{hash}).
       nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-      sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$A1_PRIV" --message "approve:$AID:$WPK:$H" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+      sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$A1_PRIV" "$RECOVERY_BIN" sign-nep413 --message "approve:$AID:$WPK:$H" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
       sig=$(echo "$sj" | jq -r '.signature')
       C=$(curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/approve/$AID" -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg s "$sig" --arg pk "$A1_PUB" --arg ac "$APPROVER1" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')")
