@@ -2444,7 +2444,9 @@ async fn update_user_secrets_handler(
                 recipient = %req.recipient,
                 "❌ NEP-413 signature verification failed"
             );
-            return Err(ApiError::Unauthorized(format!("Invalid signature: {}", e)));
+            // A signature that does not verify is a refusal, not a keystore
+            // that is not ready: 403, which the coordinator passes through.
+            return Err(ApiError::Forbidden(format!("Invalid signature: {}", e)));
         }
     }
 
@@ -2466,7 +2468,15 @@ async fn update_user_secrets_handler(
                     error = %e,
                     "❌ Access key ownership verification failed"
                 );
-                return Err(ApiError::Unauthorized(e.to_string()));
+                // The chain said the key is not the owner's: 403, final. An
+                // RPC that did not answer: 503, the same request works later.
+                return Err(match e.downcast_ref::<crate::near::KeyOwnerRefusal>() {
+                    Some(crate::near::KeyOwnerRefusal::NotOwned(m)) => ApiError::Forbidden(m.clone()),
+                    Some(crate::near::KeyOwnerRefusal::Malformed(m)) => ApiError::BadRequest(m.clone()),
+                    None => ApiError::Unavailable(
+                        "could not check the key's owner on chain right now; try again shortly".to_string(),
+                    ),
+                });
             }
         }
     } else {

@@ -89,7 +89,7 @@ judge "S4 [20 000-address policy]"
 # Not a fuzzer — one already runs against the decoder in the crate. This is the
 # E2E half of the same claim: whatever the crate refuses, the ENCLAVE refuses
 # without falling over, over the real wire.
-log "S5 mutating a valid envelope 24 ways"
+log "S5 mutating a valid envelope 27 ways"
 MUTANTS=$(python3 - "$WL" <<'PY'
 import sys, base64
 wl = sys.argv[1]
@@ -102,6 +102,9 @@ cases = [
  ("request-is-list", '{"request":[]}'),
  ("request-is-empty-map", '{"request":{}}'),
  ("external-empty", '{"request":{"external":[]}}'),
+ ("internal-empty", '{"request":{"internal":[]}}'),
+ ("both-empty", '{"request":{"internal":[],"external":[]}}'),
+ ("positional-both-empty", '{"request":[[],[]]}'),
  ("request-is-string", '{"request":"hello"}'),
  ("receiver-missing", '{"request":{"external":[{"actions":[]}]}}'),
  ("receiver-null", '{"request":{"external":[{"receiver_id":null,"actions":[]}]}}'),
@@ -125,15 +128,18 @@ for name, payload in cases:
 print("raw-bytes|" + base64.b64encode(bytes([0xff, 0xfe, 0x00, 0x01, 0x02])).decode())
 PY
 )
+# The envelopes that ask for nothing: every one must be refused before signing.
+EMPTY_MUTANTS="request-is-list request-is-empty-map external-empty internal-empty both-empty positional-both-empty"
 while IFS="|" read -r name blob; do
   [[ -n "$name" ]] || continue
   call_ext_raw "$SEED" "$ASSET" "$blob" >/dev/null
   if [[ "$HTTP" =~ ^5 ]]; then
     fail "S5 [$name] answered $HTTP — a crafted envelope reached a server error: $(msg_of | head -c 140)"
-  elif [[ "$name" == request-is-list || "$name" == request-is-empty-map || "$name" == external-empty ]]; then
+  elif [[ " $EMPTY_MUTANTS " == *" $name "* ]]; then
     # A request that asks for nothing decodes, and every rule permits it; the
     # door refuses it before signing, so the executor never pays for a no-op.
-    if [[ "$HTTP" == "403" && "$(err_of)" == "policy_denied" ]] && grep -qi "no operation" <<<"$(msg_of)"; then
+    if [[ "$HTTP" == "403" && "$(err_of)" == "policy_denied" ]] && grep -qi "no operation" <<<"$(msg_of)" \
+       && [[ "$(jq -r '.tx_hash // ""' <<<"$BODY" 2>/dev/null)" == "" ]]; then
       pass "S5 [$name] empty request refused -> $HTTP $(err_of)"
     else
       fail "S5 [$name] an EMPTY envelope must be refused 403 policy_denied (no operation), got HTTP $HTTP $(err_of) tx $(jq -r '.tx_hash // "-"' <<<"$BODY" | head -c 12): $(msg_of | head -c 140)"
@@ -142,6 +148,23 @@ while IFS="|" read -r name blob; do
     pass "S5 [$name] -> $HTTP $(err_of)"
   fi
 done <<<"$MUTANTS"
+
+# The control for the empty refusals: ONE operation a policy permits (1 yocto
+# to PARENT; the whitelist also names the bound account, the call's receiver) is
+# admitted, signed and lands — so the refusals above are about the
+# empty request, not a door that refuses everything. The wallet contract refuses
+# a self-call, so the receiver is not the bound account itself.
+log "S5 control: a one-operation envelope within the policy"
+store_policy "$SEED" "$WALLET_ID" \
+  "$(jq -nc --arg p "$PARENT" --arg s "$ASSET" '{rules:{addresses:{mode:"whitelist",list:[$s,$p]},limits:{per_transaction:{native:"1"}}}}')" \
+  || warn "the control policy could not be stored"
+call_ext "$SEED" "$ASSET" "$(ext_transfer "$PARENT" 1)" >/dev/null
+TX1=$(jq -r '.tx_hash // ""' <<<"$BODY" 2>/dev/null)
+if [[ "$HTTP" == "200" && -n "$TX1" ]]; then
+  pass "S5 [one-op] admitted and signed -> $HTTP tx ${TX1:0:12}"
+else
+  fail "S5 [one-op] a one-operation envelope within the policy must be signed, got HTTP $HTTP $(err_of): $(msg_of | head -c 160)"
+fi
 
 # ── S6 firing faster than the wallet can serve ────────────────────────────
 log "S6 eight concurrent calls on one wallet"

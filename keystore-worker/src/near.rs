@@ -987,10 +987,12 @@ impl NearClient {
     ) -> Result<()> {
         use near_jsonrpc_primitives::types::query::RpcQueryError;
 
-        let account_id_parsed = AccountId::from_str(account_id)
-            .context("Invalid account ID")?;
-        let parsed = near_crypto::PublicKey::from_str(public_key)
-            .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
+        let account_id_parsed = AccountId::from_str(account_id).map_err(|e| {
+            anyhow::Error::new(KeyOwnerRefusal::Malformed(format!("Invalid account ID: {e}")))
+        })?;
+        let parsed = near_crypto::PublicKey::from_str(public_key).map_err(|e| {
+            anyhow::Error::new(KeyOwnerRefusal::Malformed(format!("Invalid public key: {e}")))
+        })?;
         let shown = key_for_display(public_key);
 
         tracing::debug!(
@@ -1028,15 +1030,35 @@ impl NearClient {
                     public_key = %shown,
                     "❌ Access key not found for account"
                 );
-                anyhow::bail!(
+                Err(anyhow::Error::new(KeyOwnerRefusal::NotOwned(format!(
                     "Public key {} does not belong to account {}",
                     shown, account_id
-                )
+                ))))
             }
             Err(e) => Err(anyhow::Error::new(e)).context("Failed to query access key"),
         }
     }
 }
+
+/// Why [`NearClient::verify_access_key_owner`] refused, when asking again will
+/// not change the answer. Any other failure is the RPC not answering.
+#[derive(Debug)]
+pub enum KeyOwnerRefusal {
+    /// The account id or the public key does not parse.
+    Malformed(String),
+    /// The chain answered that the key is not one of the account's.
+    NotOwned(String),
+}
+
+impl std::fmt::Display for KeyOwnerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(m) | Self::NotOwned(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for KeyOwnerRefusal {}
 
 #[cfg(test)]
 mod tests {
@@ -1112,6 +1134,61 @@ mod tests {
             "RPC request is missing Content-Type: application/json — NEAR answers 415:\n{request}"
         );
     }
+    /// A raw JSON-RPC body served once, for the owner check below.
+    fn serving_rpc(body: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)
+                    .as_bytes(),
+            );
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    const A_KEY: &str = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
+
+    /// The owner check says WHICH refusal it is, so the handler can answer a
+    /// key that is not the account's with a final 403, a malformed input with
+    /// 400, and an RPC that did not answer with a retryable 503.
+    #[tokio::test]
+    async fn the_owner_check_tells_a_foreign_key_from_a_silent_rpc() {
+        // The chain answers: no such key on this account.
+        let unknown = serde_json::json!({
+            "jsonrpc": "2.0", "id": "dontcare",
+            "error": {
+                "name": "HANDLER_ERROR", "code": -32000, "message": "Server error",
+                "data": "access key does not exist while viewing",
+                "cause": { "name": "UNKNOWN_ACCESS_KEY", "info": {
+                    "public_key": A_KEY, "block_height": 1,
+                    "block_hash": "11111111111111111111111111111111" } }
+            }
+        })
+        .to_string();
+        let (url, server) = serving_rpc(unknown);
+        let client = NearClient::new(&url, "outlayer.testnet").expect("client");
+        let err = client.verify_access_key_owner("bob.testnet", A_KEY).await.expect_err("not the owner's");
+        server.join().ok();
+        assert!(
+            matches!(err.downcast_ref::<KeyOwnerRefusal>(), Some(KeyOwnerRefusal::NotOwned(m)) if m.contains("does not belong to account bob.testnet")),
+            "a key the chain does not know on the account is a final refusal: {err:#}"
+        );
+
+        // Malformed input.
+        let err = client.verify_access_key_owner("Not An Account", A_KEY).await.expect_err("malformed");
+        assert!(matches!(err.downcast_ref::<KeyOwnerRefusal>(), Some(KeyOwnerRefusal::Malformed(_))), "{err:#}");
+
+        // Nothing answers: not a refusal at all.
+        let dead = NearClient::new(KEYED_DEAD_URL, "outlayer.testnet").expect("client");
+        let err = dead.verify_access_key_owner("bob.testnet", A_KEY).await.expect_err("nothing listens");
+        assert!(err.downcast_ref::<KeyOwnerRefusal>().is_none(), "an RPC that did not answer is not a refusal: {err:#}");
+    }
+
     /// One JSON-RPC answer, served once from a throwaway socket.
     ///
     /// A chain read is judged on what the CONTRACT answered, and the answers
