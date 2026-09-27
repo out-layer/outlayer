@@ -354,8 +354,7 @@ impl StorageClient {
             .send()
             .context("Failed to send storage has request")?;
 
-        // Only an answer says whether the key exists. A failed call is an
-        // error here; the WIT `has` alone still folds it into `false`.
+        // Only an answer says whether the key exists; a failed call is an error.
         if !response.status().is_success() {
             anyhow::bail!("storage has failed: HTTP {}", response.status());
         }

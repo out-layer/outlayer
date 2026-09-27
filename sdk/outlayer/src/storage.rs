@@ -186,7 +186,7 @@ pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
 /// }
 /// ```
 pub fn has(key: &str) -> Result<bool> {
-    let (exists, error) = raw::has_checked(key);
+    let (exists, error) = raw::has(key);
     if !error.is_empty() {
         return Err(StorageError(error));
     }
@@ -210,7 +210,7 @@ pub fn has(key: &str) -> Result<bool> {
 /// }
 /// ```
 pub fn delete(key: &str) -> Result<bool> {
-    let (deleted, error) = raw::delete_checked(key);
+    let (deleted, error) = raw::delete(key);
     if !error.is_empty() {
         return Err(StorageError(error));
     }

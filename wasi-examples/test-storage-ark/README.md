@@ -211,8 +211,8 @@ interface api {
     // Basic operations
     set: func(key: string, value: list<u8>) -> string;
     get: func(key: string) -> tuple<list<u8>, string>;
-    has: func(key: string) -> bool;
-    delete: func(key: string) -> bool;
+    has: func(key: string) -> tuple<bool, string>;
+    delete: func(key: string) -> tuple<bool, string>;
     list-keys: func(prefix: string) -> tuple<string, string>;
 
     // Conditional writes

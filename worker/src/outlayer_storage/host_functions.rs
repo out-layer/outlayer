@@ -51,26 +51,16 @@ impl near::storage::api::Host for StorageHostState {
         }
     }
 
-    fn has(&mut self, key: String) -> bool {
+    fn has(&mut self, key: String) -> (bool, String) {
         debug!("storage::has key={}", key);
-        self.client.has(&key).unwrap_or(false)
-    }
-
-    fn has_checked(&mut self, key: String) -> (bool, String) {
-        debug!("storage::has_checked key={}", key);
         match self.client.has(&key) {
             Ok(exists) => (exists, String::new()),
             Err(e) => (false, e.to_string()),
         }
     }
 
-    fn delete(&mut self, key: String) -> bool {
+    fn delete(&mut self, key: String) -> (bool, String) {
         debug!("storage::delete key={}", key);
-        self.client.delete(&key).unwrap_or(false)
-    }
-
-    fn delete_checked(&mut self, key: String) -> (bool, String) {
-        debug!("storage::delete_checked key={}", key);
         match self.client.delete(&key) {
             Ok(deleted) => (deleted, String::new()),
             Err(e) => (false, e.to_string()),

@@ -211,8 +211,7 @@ sealed::has("records", None, "init")?;
 sealed::delete("records", None, "init")?;
 ```
 
-`has` and `delete` return a failed storage call as `Err`, never as `false`
-(host functions `has-checked` and `delete-checked`).
+`has` and `delete` return a failed storage call as `Err`, never as `false`.
 
 Encryption is randomized, so compare-and-swap compares the stored ciphertext,
 never a plaintext: `get` returns a `Sealed` holding both, and it is the

@@ -27,7 +27,7 @@ pub fn run(input: &Input) -> Value {
             (_, e) if !e.is_empty() => err(e),
             (value, _) => ok(
                 "read raw",
-                json!({ "key": key, "found": !value.is_empty() || storage::has_checked(key).0, "value_hex": hex::encode(value) }),
+                json!({ "key": key, "found": !value.is_empty() || storage::has(key).0, "value_hex": hex::encode(value) }),
             ),
         }),
         "raw_set_if_absent" => with_key(input, |key| match hex_of("value_hex", &input.value_hex) {
@@ -63,20 +63,17 @@ pub fn run(input: &Input) -> Value {
             (_, e) if !e.is_empty() => err(e),
             (value, _) => ok(
                 "read encrypted",
-                json!({ "key": key, "found": !value.is_empty() || storage::has_checked(key).0, "value_hex": hex::encode(value) }),
+                json!({ "key": key, "found": !value.is_empty() || storage::has(key).0, "value_hex": hex::encode(value) }),
             ),
         }),
-        "storage_has" => with_key(input, |key| match storage::has_checked(key) {
+        "storage_has" => with_key(input, |key| match storage::has(key) {
             (_, e) if !e.is_empty() => err(e),
             (exists, _) => ok("asked", json!({ "key": key, "exists": exists })),
         }),
-        "storage_delete" => with_key(input, |key| match storage::delete_checked(key) {
+        "storage_delete" => with_key(input, |key| match storage::delete(key) {
             (_, e) if !e.is_empty() => err(e),
             (deleted, _) => ok("asked", json!({ "key": key, "deleted": deleted })),
         }),
-        // The `bool` forms a guest built before `has-checked` links against.
-        "storage_has_legacy" => with_key(input, |key| ok("asked", json!({ "key": key, "exists": storage::has(key) }))),
-        "storage_delete_legacy" => with_key(input, |key| ok("asked", json!({ "key": key, "deleted": storage::delete(key) }))),
         "storage_list" => match storage::list_keys(input.prefix.as_deref().unwrap_or_default()) {
             (_, e) if !e.is_empty() => err(e),
             (keys, _) => match serde_json::from_str::<Vec<String>>(&keys) {
@@ -278,7 +275,7 @@ fn attacks(prefix: &str) -> Value {
 
 /// A record in one mode at `key`, whatever was there before.
 fn put(key: &str, raw: bool, value: &[u8]) -> Result<(), String> {
-    let (_, e) = storage::delete_checked(key);
+    let (_, e) = storage::delete(key);
     if !e.is_empty() {
         return Err(e);
     }
@@ -306,7 +303,7 @@ fn holds(key: &str, raw: bool, value: &[u8]) -> bool {
 pub fn attack(name: &str, prefix: &str) -> Value {
     let key = format!("{prefix}/{name}");
     let out = run_attack(name, &key).unwrap_or_else(|e| json!({ "status": "setup_failed", "message": e }));
-    let _ = storage::delete_checked(&key);
+    let _ = storage::delete(&key);
     out
 }
 
@@ -401,7 +398,7 @@ fn run_attack(name: &str, key: &str) -> Result<Value, String> {
             out
         }
         "cas_raw_absent" => {
-            let _ = storage::delete_checked(key);
+            let _ = storage::delete(key);
             let (updated, current, e) = storage::set_if_equals_raw(key, b"", b"v");
             let mut out = match (updated, e) {
                 (_, e) if !e.is_empty() => json!({ "status": "err", "message": e }),
@@ -409,7 +406,7 @@ fn run_attack(name: &str, key: &str) -> Result<Value, String> {
                 (true, _) => json!({ "status": "ok", "message": "replaced a record that was not there" }),
             };
             out["current_empty"] = json!(current.is_empty());
-            out["unchanged"] = json!(matches!(storage::has_checked(key), (false, e) if e.is_empty()));
+            out["unchanged"] = json!(matches!(storage::has(key), (false, e) if e.is_empty()));
             out
         }
         "cas_raw_win" => {
@@ -423,7 +420,7 @@ fn run_attack(name: &str, key: &str) -> Result<Value, String> {
         }
         "delete_raw" => {
             put(key, true, RAW)?;
-            match (storage::has_checked(key), storage::delete_checked(key), storage::has_checked(key), storage::get_raw(key)) {
+            match (storage::has(key), storage::delete(key), storage::has(key), storage::get_raw(key)) {
                 ((true, e1), (true, e2), (false, e3), (v, e)) if [&e1, &e2, &e3, &e].iter().all(|x| x.is_empty()) && v.is_empty() => {
                     json!({ "status": "ok", "message": "has, then deleted, then gone" })
                 }
