@@ -484,7 +484,7 @@ async fn main() -> Result<()> {
     let heartbeat_worker_name = config.worker_id.clone();
     let heartbeat_block_height = shared_block_height.clone();
     let heartbeat_last_poll_at = shared_last_poll_at.clone();
-    let stale_threshold_secs = config.poll_timeout_seconds + config.max_execution_seconds_cap + config.iteration_overhead_seconds;
+    let stale_threshold_secs = iteration_timeout_seconds(&config);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         loop {
@@ -587,12 +587,10 @@ async fn main() -> Result<()> {
 
     // Main worker loop
     info!("Starting worker loop...");
-    // Hard timeout: poll_timeout + max_execution_cap + overhead for RPC/download/upload
-    let iteration_timeout = tokio::time::Duration::from_secs(
-        config.poll_timeout_seconds + config.max_execution_seconds_cap + config.iteration_overhead_seconds,
-    );
-    info!("⏱️ Iteration timeout: {}s (poll={}s + cap={}s + overhead={}s)",
-        iteration_timeout.as_secs(), config.poll_timeout_seconds, config.max_execution_seconds_cap, config.iteration_overhead_seconds);
+    let iteration_timeout = tokio::time::Duration::from_secs(iteration_timeout_seconds(&config));
+    info!("⏱️ Iteration timeout: {}s (poll={}s + cap={}s + contract call={}s + overhead={}s)",
+        iteration_timeout.as_secs(), config.poll_timeout_seconds, config.max_execution_seconds_cap,
+        NearClient::CALL_BUDGET.as_secs(), config.iteration_overhead_seconds);
     loop {
         match tokio::time::timeout(
             iteration_timeout,
@@ -635,6 +633,18 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// The hard timeout of one worker iteration: the long poll, the execution
+/// cap, one contract call followed to its execution, and the overhead for the
+/// other RPC, download and upload work. The contract call is counted in full,
+/// so a send that is still being followed is never cut off with its job left
+/// in progress.
+fn iteration_timeout_seconds(config: &Config) -> u64 {
+    config.poll_timeout_seconds
+        + config.max_execution_seconds_cap
+        + NearClient::CALL_BUDGET.as_secs()
+        + config.iteration_overhead_seconds
 }
 
 /// Single iteration of the worker loop

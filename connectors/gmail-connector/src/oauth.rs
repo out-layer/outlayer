@@ -120,13 +120,13 @@ pub fn access_token(credential: &Credential, now_secs: u64) -> Result<String, St
         good_until: now_secs + expires_in.saturating_sub(SAFETY_MARGIN_SECS),
     };
     if let Ok(bytes) = serde_json::to_vec(&record) {
-        let _ = ::outlayer::storage::set(&key, &bytes);
+        let _ = crate::store::set(&key, &bytes);
     }
     Ok(token)
 }
 
 fn cached(key: &str, now_secs: u64) -> Option<String> {
-    let bytes = ::outlayer::storage::get(key).ok()??;
+    let bytes = crate::store::get(key).ok()??;
     let record: Cached = serde_json::from_slice(&bytes).ok()?;
     (record.good_until > now_secs).then_some(record.access_token)
 }

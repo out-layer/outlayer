@@ -31,6 +31,7 @@ mod mime;
 mod oauth;
 mod policy;
 mod seal;
+mod store;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -77,10 +78,6 @@ struct Input {
 const OPERATIONS: &[&str] = &["status", "send"];
 
 fn main() {
-    // Storage is imported by being called: the token cache and the day's count
-    // need a project context.
-    let _ = ::outlayer::storage::has("_init");
-
     let raw = env::input();
     let envelope = match serde_json::from_slice::<Input>(&raw) {
         Err(e) => Envelope {

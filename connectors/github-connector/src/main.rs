@@ -25,6 +25,7 @@ mod github;
 mod ops;
 mod policy;
 mod seal;
+mod store;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -132,9 +133,6 @@ const OPERATIONS: &[&str] = &[
 ];
 
 fn main() {
-    // Storage is imported by being called: the day's count needs a project context.
-    let _ = ::outlayer::storage::has("_init");
-
     let raw = env::input();
     let envelope = match serde_json::from_slice::<Input>(&raw) {
         Err(e) => Envelope {

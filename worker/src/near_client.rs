@@ -51,8 +51,148 @@ impl NearClient {
     /// RPC call timeout to prevent hanging on unresponsive RPC nodes
     const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// Broadcast tx with timeout (longer timeout since tx confirmation can take time)
-    const TX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    /// How long a sent transaction is followed before the send is called
+    /// failed: past the contract's yield window of 200 blocks with room to
+    /// spare, so a result the contract can still take is delivered.
+    const TX_FOLLOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// The pause between two looks at a sent transaction: a few blocks. With
+    /// one send and one look per round, it bounds one send to about two
+    /// hundred RPC requests at worst.
+    const TX_POLL_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// How many rounds a nonce refusal is looked at again before it fails the
+    /// send. A resend of a transaction that is already in a block is refused
+    /// for its nonce, and the node asked for its status may not have that
+    /// block yet.
+    const NONCE_REFUSAL_ROUNDS: u32 = 3;
+
+    /// The longest one contract call can take: the access-key and block
+    /// queries, then the send followed to its execution. The worker's
+    /// iteration timeout includes it, so a send is never cut off mid-follow.
+    pub const CALL_BUDGET: std::time::Duration =
+        std::time::Duration::from_secs(2 * Self::RPC_TIMEOUT.as_secs() + Self::TX_FOLLOW.as_secs());
+
+    /// Send a signed transaction and follow it by hash until it executes.
+    ///
+    /// A slow or silent RPC must not fail a send the chain will still execute
+    /// while the contract holds a yield open for it. The transaction is looked
+    /// up by hash until it has executed or [`Self::TX_FOLLOW`] has passed, and
+    /// the SAME signed transaction is sent again on every round: one hash, one
+    /// nonce, so it executes at most once, and a copy the chain already has is
+    /// dropped. No RPC request outlives the window.
+    ///
+    /// A transaction the chain refused and does not know fails at once — a
+    /// nonce refusal after [`Self::NONCE_REFUSAL_ROUNDS`] rounds, since a
+    /// resend of a transaction already in a block is refused the same way.
+    ///
+    /// Errors name what happened, never the RPC's own text: a transport error
+    /// quotes the endpoint URL, and this text reaches the job's error details.
+    async fn send_and_follow(
+        &self,
+        signed_transaction: near_primitives::transaction::SignedTransaction,
+    ) -> Result<FinalExecutionOutcomeView> {
+        self.send_and_follow_within(signed_transaction, Self::TX_FOLLOW, Self::TX_POLL_PAUSE).await
+    }
+
+    async fn send_and_follow_within(
+        &self,
+        signed_transaction: near_primitives::transaction::SignedTransaction,
+        follow: std::time::Duration,
+        pause: std::time::Duration,
+    ) -> Result<FinalExecutionOutcomeView> {
+        use near_jsonrpc_primitives::types::transactions::{RpcTransactionError, TransactionInfo};
+        use near_primitives::errors::InvalidTxError;
+        use near_primitives::views::TxExecutionStatus;
+
+        let hash = signed_transaction.get_hash();
+        let sender = signed_transaction.transaction.signer_id().clone();
+        let deadline = tokio::time::Instant::now() + follow;
+        // One RPC request's wait: its own timeout, or what is left of the window.
+        let wait = || Self::RPC_TIMEOUT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let mut sends = 0u32;
+        let mut nonce_refusals = 0u32;
+        let mut last: String;
+        loop {
+            // (Re)send without waiting. Only a refusal by the chain decides
+            // anything; a node that does not answer, or answers late, does not,
+            // and the look that follows says where the transaction is.
+            sends += 1;
+            // The chain's refusal of this round's send, and whether it was
+            // for the nonce.
+            let mut refused: Option<(String, bool)> = None;
+            let send = methods::send_tx::RpcSendTransactionRequest {
+                signed_transaction: signed_transaction.clone(),
+                wait_until: TxExecutionStatus::None,
+            };
+            if let Ok(Err(e)) = tokio::time::timeout(wait(), self.client.call(send)).await {
+                if let Some(RpcTransactionError::InvalidTransaction { context }) = e.handler_error() {
+                    let nonce = matches!(context, InvalidTxError::InvalidNonce { .. });
+                    refused = Some((format!("{context:?}"), nonce));
+                }
+            }
+
+            // Look it up by hash, waiting for execution.
+            let status = methods::tx::RpcTransactionStatusRequest {
+                transaction_info: TransactionInfo::TransactionId {
+                    tx_hash: hash,
+                    sender_account_id: sender.clone(),
+                },
+                wait_until: TxExecutionStatus::ExecutedOptimistic,
+            };
+            let unknown = match tokio::time::timeout(wait(), self.client.call(status)).await {
+                Ok(Ok(response)) => match response.final_execution_outcome {
+                    Some(outcome) => {
+                        if sends > 1 {
+                            info!("Transaction {} executed after {} sends", hash, sends);
+                        }
+                        return Ok(outcome.into_outcome());
+                    }
+                    None => {
+                        last = "sent, not executed yet".to_string();
+                        false
+                    }
+                },
+                Ok(Err(e)) => match e.handler_error() {
+                    Some(RpcTransactionError::UnknownTransaction { .. }) => {
+                        last = "the chain has not seen it".to_string();
+                        true
+                    }
+                    Some(other) => {
+                        last = format!("status answered {}", tx_error_name(other));
+                        false
+                    }
+                    None => {
+                        last = "status: the RPC did not answer".to_string();
+                        false
+                    }
+                },
+                Err(_) => {
+                    last = "status: the RPC did not answer in time".to_string();
+                    false
+                }
+            };
+
+            match refused {
+                Some((reason, nonce)) if unknown => {
+                    nonce_refusals = if nonce { nonce_refusals + 1 } else { 0 };
+                    if !nonce || nonce_refusals >= Self::NONCE_REFUSAL_ROUNDS {
+                        anyhow::bail!("the chain refused transaction {hash}: {reason}");
+                    }
+                    last = format!("send refused: {reason}");
+                }
+                _ => nonce_refusals = 0,
+            }
+            if deadline.saturating_duration_since(tokio::time::Instant::now()) < pause {
+                anyhow::bail!(
+                    "transaction {hash} was not seen executed within {}s after {sends} sends ({last})",
+                    follow.as_secs()
+                );
+            }
+            warn!("Transaction {} not executed yet ({}); looking again", hash, last);
+            tokio::time::sleep(pause).await;
+        }
+    }
 
     /// Extract cost from transaction logs (parses [[yNEAR charged: "..."]] or estimated_cost)
     /// Parses the "Resolving execution" log from contract which contains estimated_cost
@@ -497,19 +637,9 @@ impl NearClient {
         );
         let hash = signed_transaction.get_hash();
 
-        // Broadcast transaction with commit (wait for finality)
-        let tx_request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
-            signed_transaction,
-        };
-
-        debug!("Broadcasting transaction with commit: {:?}", hash);
-
-        let outcome = tokio::time::timeout(Self::TX_TIMEOUT, self.client.call(tx_request))
-            .await
-            .context("NEAR RPC broadcast timed out")?
-            .context("Failed to broadcast transaction and wait for commit")?;
-
-        debug!("Transaction committed: {:?}", hash);
+        debug!("Sending transaction {:?}", hash);
+        let outcome = self.send_and_follow(signed_transaction).await?;
+        debug!("Transaction executed: {:?}", hash);
 
         Ok(outcome)
     }
@@ -614,19 +744,9 @@ impl NearClient {
         );
         let hash = signed_transaction.get_hash();
 
-        // Broadcast transaction with commit (wait for finality)
-        let tx_request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
-            signed_transaction,
-        };
-
-        debug!("Broadcasting transaction with commit: {:?}", hash);
-
-        let outcome = tokio::time::timeout(Self::TX_TIMEOUT, self.client.call(tx_request))
-            .await
-            .context("NEAR RPC broadcast timed out")?
-            .context("Failed to broadcast transaction and wait for commit")?;
-
-        debug!("Transaction committed: {:?}", hash);
+        debug!("Sending transaction {:?}", hash);
+        let outcome = self.send_and_follow(signed_transaction).await?;
+        debug!("Transaction executed: {:?}", hash);
 
         Ok(outcome)
     }
@@ -1128,6 +1248,20 @@ pub(crate) fn head(s: &str, max: usize) -> &str {
     &s[..s.floor_char_boundary(max)]
 }
 
+
+/// The name of a transaction RPC error, without its text.
+fn tx_error_name(e: &near_jsonrpc_primitives::types::transactions::RpcTransactionError) -> &'static str {
+    use near_jsonrpc_primitives::types::transactions::RpcTransactionError as E;
+    match e {
+        E::InvalidTransaction { .. } => "INVALID_TRANSACTION",
+        E::DoesNotTrackShard => "DOES_NOT_TRACK_SHARD",
+        E::RequestRouted { .. } => "REQUEST_ROUTED",
+        E::UnknownTransaction { .. } => "UNKNOWN_TRANSACTION",
+        E::InternalError { .. } => "INTERNAL_ERROR",
+        E::TimeoutError => "TIMEOUT_ERROR",
+    }
+}
+
 #[cfg(test)]
 mod text_this_worker_did_not_write_is_cut_on_a_character_boundary {
     use super::{head, truncate_error_for_chain, MAX_ERROR_SIZE};
@@ -1223,6 +1357,213 @@ mod only_a_committed_receipt_says_what_was_charged {
 mod tests {
     use super::*;
     use near_crypto::SecretKey;
+
+    /// A JSON-RPC node that answers each method from its own script, one entry
+    /// per request (the last entry repeats), and counts the requests.
+    fn scripted_rpc(
+        send_tx: Vec<String>,
+        tx: Vec<String>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<(u32, u32)>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let counts = std::sync::Arc::new(std::sync::Mutex::new((0u32, 0u32)));
+        let seen = counts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = vec![0u8; 65536];
+                let mut got = 0;
+                // Read until the JSON body is complete (headers + Content-Length).
+                loop {
+                    let n = stream.read(&mut buf[got..]).unwrap_or(0);
+                    if n == 0 { break; }
+                    got += n;
+                    let text = String::from_utf8_lossy(&buf[..got]);
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h].lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if got >= h + 4 + len { break; }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf[..got]).into_owned();
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+                let method = serde_json::from_str::<serde_json::Value>(body).ok()
+                    .and_then(|v| v["method"].as_str().map(str::to_string)).unwrap_or_default();
+                let answer = {
+                    let mut c = seen.lock().unwrap();
+                    match method.as_str() {
+                        "send_tx" => { c.0 += 1; send_tx[(c.0 as usize - 1).min(send_tx.len() - 1)].clone() }
+                        "tx" => { c.1 += 1; tx[(c.1 as usize - 1).min(tx.len() - 1)].clone() }
+                        _ => r#"{"jsonrpc":"2.0","id":"dontcare","error":{"name":"REQUEST_VALIDATION_ERROR","cause":{"name":"METHOD_NOT_FOUND","info":{"method_name":"?"}},"code":-32601,"message":"Method not found","data":"?"}}"#.to_string(),
+                    }
+                };
+                let _ = stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(), answer).as_bytes());
+            }
+        });
+        (url, counts)
+    }
+
+    fn handler_error(cause: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":"dontcare","error":{{"name":"HANDLER_ERROR","cause":{},"code":-32000,"message":"Server error","data":"x"}}}}"#, cause)
+    }
+
+    const EXECUTED: &str = include_str!("testdata/tx_executed.json");
+
+    fn client_at(url: &str) -> NearClient {
+        let secret_key = SecretKey::from_random(near_crypto::KeyType::ED25519);
+        let signer = InMemorySigner {
+            account_id: "worker.testnet".parse().unwrap(),
+            public_key: secret_key.public_key(),
+            secret_key,
+        };
+        NearClient::new(url.to_string(), signer, "outlayer.testnet".parse().unwrap()).unwrap()
+    }
+
+    fn a_signed_transaction(client: &NearClient) -> near_primitives::transaction::SignedTransaction {
+        let transaction = Transaction::V0(TransactionV0 {
+            signer_id: client.signer.account_id.clone(),
+            public_key: client.signer.public_key(),
+            nonce: 7,
+            receiver_id: client.contract_id.clone(),
+            block_hash: near_primitives::hash::CryptoHash::default(),
+            actions: vec![],
+        });
+        let signature = client.signer.sign(transaction.get_hash_and_size().0.as_ref());
+        near_primitives::transaction::SignedTransaction::new(signature, transaction)
+    }
+
+    /// W1: the RPC loses the send and the chain has not seen the transaction
+    /// yet. The same signed transaction is sent again and followed to its
+    /// execution, instead of the send being called failed while the contract
+    /// still waits for it.
+    #[tokio::test]
+    async fn a_send_the_rpc_lost_is_sent_again_and_followed_to_its_execution() {
+        let (url, counts) = scripted_rpc(
+            vec![handler_error(r#"{"name":"TIMEOUT_ERROR"}"#), r#"{"jsonrpc":"2.0","id":"dontcare","result":{"final_execution_status":"NONE"}}"#.to_string()],
+            vec![
+                handler_error(r#"{"name":"UNKNOWN_TRANSACTION","info":{"requested_transaction_hash":"11111111111111111111111111111111"}}"#),
+                EXECUTED.to_string(),
+            ],
+        );
+        let client = client_at(&url);
+        let outcome = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect("followed to its execution");
+        assert_eq!(outcome.transaction_outcome.id.to_string(), "BsishL8AARtgjDigfrGCXbnaJ5h98vvuTHJodBrv6fUv");
+        let (sends, looks) = *counts.lock().unwrap();
+        assert_eq!((sends, looks), (2, 2), "sent again after the chain did not know it");
+    }
+
+    /// A transaction the chain never sees fails once the window has passed, and
+    /// the error names what happened — never the RPC URL.
+    #[tokio::test]
+    async fn a_transaction_the_chain_never_sees_fails_after_the_window() {
+        let unknown = handler_error(r#"{"name":"UNKNOWN_TRANSACTION","info":{"requested_transaction_hash":"11111111111111111111111111111111"}}"#);
+        let (url, counts) = scripted_rpc(
+            vec![r#"{"jsonrpc":"2.0","id":"dontcare","result":{"final_execution_status":"NONE"}}"#.to_string()],
+            vec![unknown],
+        );
+        let client = client_at(&url);
+        let err = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_millis(300), std::time::Duration::from_millis(50))
+            .await
+            .expect_err("never executed");
+        let text = format!("{err:#}");
+        assert!(text.contains("was not seen executed") && text.contains("the chain has not seen it"), "{text}");
+        assert!(!text.contains("127.0.0.1") && !text.contains("http"), "the error must not carry the RPC URL: {text}");
+        assert!(counts.lock().unwrap().0 >= 2, "sent again while the chain did not know it");
+    }
+
+    fn invalid_tx(info: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"dontcare","error":{{"name":"HANDLER_ERROR","cause":{{"name":"INVALID_TRANSACTION","info":{info}}},"code":-32000,"message":"Server error","data":{{"TxExecutionError":{{"InvalidTxError":{info}}}}}}}}}"#
+        )
+    }
+
+    const NONCE_USED: &str = r#"{"InvalidNonce":{"tx_nonce":7,"ak_nonce":7}}"#;
+
+    fn unknown_tx() -> String {
+        handler_error(r#"{"name":"UNKNOWN_TRANSACTION","info":{"requested_transaction_hash":"11111111111111111111111111111111"}}"#)
+    }
+
+    /// An RPC that takes every request and never answers: no request may
+    /// outlive the window, so the send fails when the window ends — not a
+    /// full RPC timeout per request later, past the worker's iteration budget.
+    #[tokio::test]
+    async fn a_silent_rpc_fails_the_send_when_the_window_ends() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                held.push(stream);
+            }
+        });
+        let client = client_at(&url);
+        let started = std::time::Instant::now();
+        let err = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(2), std::time::Duration::from_millis(100))
+            .await
+            .expect_err("nothing answered");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(4), "the send outlived its window: {took:?}");
+        assert!(format!("{err:#}").contains("did not answer in time"), "{err:#}");
+    }
+
+    /// A refusal that is not about the nonce, for a transaction the chain does
+    /// not know, fails the send at once.
+    #[tokio::test]
+    async fn a_refused_transaction_the_chain_does_not_know_fails_at_once() {
+        let (url, counts) = scripted_rpc(
+            vec![invalid_tx(r#"{"NotEnoughBalance":{"signer_id":"worker.testnet","balance":"1","cost":"2"}}"#)],
+            vec![unknown_tx()],
+        );
+        let client = client_at(&url);
+        let err = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect_err("refused");
+        assert!(format!("{err:#}").contains("refused") && format!("{err:#}").contains("NotEnoughBalance"), "{err:#}");
+        assert_eq!(*counts.lock().unwrap(), (1, 1), "one send, one look");
+    }
+
+    /// A resend of a transaction already in a block is refused for its nonce,
+    /// and the node asked for its status may not have that block yet. The
+    /// refusal is looked at again, and the executed transaction is returned.
+    #[tokio::test]
+    async fn a_nonce_refusal_is_looked_at_again_before_it_fails_the_send() {
+        let (url, counts) = scripted_rpc(
+            vec![invalid_tx(NONCE_USED)],
+            vec![unknown_tx(), EXECUTED.to_string()],
+        );
+        let client = client_at(&url);
+        let outcome = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect("the transaction was the one in the block");
+        assert_eq!(outcome.transaction_outcome.id.to_string(), "BsishL8AARtgjDigfrGCXbnaJ5h98vvuTHJodBrv6fUv");
+        assert_eq!(*counts.lock().unwrap(), (2, 2));
+    }
+
+    /// A nonce taken by another transaction: the refusal holds round after
+    /// round, and the send fails after the set number of rounds.
+    #[tokio::test]
+    async fn a_nonce_taken_by_another_transaction_fails_the_send() {
+        let (url, counts) = scripted_rpc(vec![invalid_tx(NONCE_USED)], vec![unknown_tx()]);
+        let client = client_at(&url);
+        let err = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect_err("the nonce is not ours");
+        assert!(format!("{err:#}").contains("InvalidNonce"), "{err:#}");
+        let rounds = NearClient::NONCE_REFUSAL_ROUNDS;
+        assert_eq!(*counts.lock().unwrap(), (rounds, rounds));
+    }
 
     #[test]
     fn test_near_client_creation() {

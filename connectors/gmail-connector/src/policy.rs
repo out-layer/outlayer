@@ -221,8 +221,8 @@ pub fn day_key(ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The day's count, touched only through `storage::increment` — which the SDK
-/// documents as atomic (compare-and-swap with retries). Never read and then
+/// The day's count, touched only through `store::increment` — atomic
+/// (compare-and-set on the sealed record, with retries). Never read and then
 /// written back: two calls of one agent can run at once, and a read-then-write
 /// lets both see room for one more message.
 fn key(day: &str) -> String {
@@ -234,7 +234,7 @@ fn key(day: &str) -> String {
 type Bump = fn(&str, i64) -> Result<i64, String>;
 
 fn storage_bump(key: &str, delta: i64) -> Result<i64, String> {
-    ::outlayer::storage::increment(key, delta).map_err(|e| e.to_string())
+    crate::store::increment(key, delta).map_err(|e| e.to_string())
 }
 
 /// Messages counted today, including any a call in flight has reserved.
