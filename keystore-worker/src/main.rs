@@ -35,6 +35,7 @@ mod tdx_attestation;
 mod vault_verifier;
 mod signing_keys;
 mod encryption_keys;
+mod task_keys;
 
 use anyhow::{Context, Result};
 use config::{Config, TeeMode};

@@ -163,12 +163,14 @@ impl ExecutionContext {
 }
 
 /// The declared keys of one run: its signing keys and its encryption keys,
-/// each present when the manifest declares keys of that family. Moved into the
-/// run and dropped with it; its `Debug` prints paths and public parts only.
+/// each present when the manifest declares keys of that family, and what the
+/// run holds for tasks when the manifest declares them. Moved into the run
+/// and dropped with it; its `Debug` prints paths and public parts only.
 #[derive(Debug, Default)]
 pub struct RunKeys {
     pub signing: Option<crate::signing_keys::SigningKeys>,
     pub encryption: Option<crate::encryption_keys::EncryptionKeys>,
+    pub tasks: Option<crate::tasks::TasksRun>,
 }
 
 /// One execution carrying its declared keys — see [`Executor::with_keys`].

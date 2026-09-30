@@ -149,7 +149,7 @@ enum BuildRefusal<'a> {
 /// which refuses at every combinator. A verdict either way would admit
 /// somebody: "lapsed" admits everyone under `Not`, "live" admits every
 /// dated grant.
-fn now_ns() -> anyhow::Result<u64> {
+pub(crate) fn now_ns() -> anyhow::Result<u64> {
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("the host clock reads before the epoch; no time limit can be judged"))?;
@@ -710,6 +710,94 @@ impl AccessCondition {
             // "Everyone but bob" names alice.
             AccessCondition::Not { condition } if condition.is_naming_leaf() => !condition.names(caller, patterns),
             _ => false,
+        }
+    }
+
+    /// Whether a condition that ADMITTED `caller` admitted them by name: a
+    /// `Whitelist` that lists the account is on the path that let them in.
+    /// A row open to everyone, to a pattern, or to whoever holds a balance, a
+    /// token or a role admits without naming anybody, and answers `false`.
+    ///
+    /// Called only after [`Self::evaluate`] answered `Ok(true)` for the same
+    /// caller and facts, and it reads no chain. Under an `And` that is known
+    /// to hold, one branch that names the caller is enough — the others are
+    /// restrictions that passed. Under an `Or` nothing is known of a single
+    /// branch, so a branch counts only when it names the caller AND every
+    /// restriction beside the name holds on what can be read without the
+    /// chain (a time limit, a build, a name). A branch that cannot be judged
+    /// so does not count: the answer errs towards `false`, never towards a
+    /// name that did not admit.
+    ///
+    /// Never under `Not`, which names whom it keeps out, and never under
+    /// `Predecessor`, whose subject is the calling contract and not the caller.
+    pub fn admits_by_name(&self, caller: &str, now: u64, patterns: &CompiledPatterns, facts: RunFacts<'_>) -> bool {
+        self.names_on_an_admitting_path(caller, now, patterns, facts, true)
+    }
+
+    fn names_on_an_admitting_path(
+        &self,
+        caller: &str,
+        now: u64,
+        patterns: &CompiledPatterns,
+        facts: RunFacts<'_>,
+        known_to_hold: bool,
+    ) -> bool {
+        match self {
+            AccessCondition::Whitelist { accounts } => accounts.iter().any(|a| a == caller),
+            AccessCondition::Logic { operator: LogicOperator::And, conditions } => {
+                conditions.iter().enumerate().any(|(at, named)| {
+                    named.names_on_an_admitting_path(caller, now, patterns, facts, known_to_hold)
+                        && (known_to_hold
+                            || conditions
+                                .iter()
+                                .enumerate()
+                                .filter(|(other, _)| *other != at)
+                                .all(|(_, c)| c.holds_without_the_chain(caller, now, patterns, facts) == Some(true)))
+                })
+            }
+            AccessCondition::Logic { operator: LogicOperator::Or, conditions } => conditions
+                .iter()
+                .any(|c| c.names_on_an_admitting_path(caller, now, patterns, facts, false)),
+            _ => false,
+        }
+    }
+
+    /// The verdict of this condition where it can be read without the chain;
+    /// `None` where it cannot — a balance, a token, a role, the calling
+    /// contract — or where the condition itself cannot be read.
+    fn holds_without_the_chain(&self, caller: &str, now: u64, patterns: &CompiledPatterns, facts: RunFacts<'_>) -> Option<bool> {
+        match self {
+            AccessCondition::AllowAll => Some(true),
+            AccessCondition::Whitelist { accounts } => Some(accounts.iter().any(|a| a == caller)),
+            AccessCondition::AccountPattern { pattern } => patterns.get(pattern).map(|re| re.is_match(caller)),
+            AccessCondition::ValidUntil { until_ns } => until_ns.parse::<u64>().ok().map(|until| now < until),
+            AccessCondition::WasmHash { hash } => facts.executed_wasm_sha256.map(|executed| executed.eq_ignore_ascii_case(hash)),
+            AccessCondition::Not { condition } => condition.holds_without_the_chain(caller, now, patterns, facts).map(|held| !held),
+            AccessCondition::Logic { operator: LogicOperator::And, conditions } => {
+                let verdicts: Vec<_> = conditions.iter().map(|c| c.holds_without_the_chain(caller, now, patterns, facts)).collect();
+                if verdicts.contains(&Some(false)) {
+                    Some(false)
+                } else if verdicts.contains(&None) {
+                    None
+                } else {
+                    Some(true)
+                }
+            }
+            AccessCondition::Logic { operator: LogicOperator::Or, conditions } => {
+                let verdicts: Vec<_> = conditions.iter().map(|c| c.holds_without_the_chain(caller, now, patterns, facts)).collect();
+                if verdicts.contains(&Some(true)) {
+                    Some(true)
+                } else if verdicts.contains(&None) {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            AccessCondition::NearBalance { .. }
+            | AccessCondition::FtBalance { .. }
+            | AccessCondition::NftOwned { .. }
+            | AccessCondition::DaoMember { .. }
+            | AccessCondition::Predecessor { .. } => None,
         }
     }
 
@@ -1737,5 +1825,105 @@ mod a_predecessor_leaf_is_judged_on_the_calling_account {
         let parsed: AccessCondition = serde_json::from_str(json).expect("the contract's shape");
         assert_eq!(parsed, via(wl("dao.near")));
         assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+}
+
+#[cfg(test)]
+mod a_condition_admits_by_name_only_through_a_whitelist_that_lists_the_caller {
+    //! `admits_by_name` is asked only of a condition that admitted the caller;
+    //! every tree here is one that does, for `agent.near` at `T`.
+    use super::*;
+
+    const T: u64 = 1_760_000_000_000_000_000;
+    const BUILD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn by_name(condition: serde_json::Value) -> bool {
+        let condition: AccessCondition = serde_json::from_value(condition).expect("a condition as the chain spells it");
+        let patterns = condition.compile_patterns().expect("patterns compile");
+        let facts = RunFacts { executed_wasm_sha256: Some(BUILD), predecessor_id: Some("contract.near") };
+        condition.admits_by_name("agent.near", T, &patterns, facts)
+    }
+
+    fn whitelist(accounts: &[&str]) -> serde_json::Value {
+        serde_json::json!({"Whitelist": {"accounts": accounts}})
+    }
+    fn until(ns: u64) -> serde_json::Value {
+        serde_json::json!({"ValidUntil": {"until_ns": ns.to_string()}})
+    }
+    fn all(conditions: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"Logic": {"operator": "And", "conditions": conditions}})
+    }
+    fn any(conditions: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"Logic": {"operator": "Or", "conditions": conditions}})
+    }
+    fn balance() -> serde_json::Value {
+        serde_json::json!({"NearBalance": {"operator": "Gte", "value": "1"}})
+    }
+
+    #[test]
+    fn a_whitelist_that_lists_the_caller_names_them() {
+        assert!(by_name(whitelist(&["agent.near"])));
+        assert!(by_name(whitelist(&["other.near", "agent.near"])));
+    }
+
+    #[test]
+    fn a_row_open_to_everyone_to_a_pattern_or_to_a_holder_names_nobody() {
+        assert!(!by_name(serde_json::json!("AllowAll")));
+        assert!(!by_name(serde_json::json!({"AccountPattern": {"pattern": ".*\\.near"}})));
+        assert!(!by_name(balance()));
+        assert!(!by_name(serde_json::json!({"FtBalance": {"contract": "ft.near", "operator": "Gte", "value": "1"}})));
+        assert!(!by_name(serde_json::json!({"NftOwned": {"contract": "nft.near", "token_id": null}})));
+        assert!(!by_name(serde_json::json!({"DaoMember": {"dao_contract": "dao.near", "role": "council"}})));
+    }
+
+    #[test]
+    fn a_dated_grant_names_the_caller() {
+        assert!(by_name(all(vec![whitelist(&["agent.near"]), until(T + 1)])));
+        assert!(by_name(all(vec![until(T + 1), whitelist(&["agent.near"])])), "the order of the branches is nothing");
+    }
+
+    #[test]
+    fn a_restriction_read_on_chain_beside_the_name_does_not_unname_a_condition_known_to_hold() {
+        assert!(by_name(all(vec![whitelist(&["agent.near"]), balance()])));
+    }
+
+    #[test]
+    fn a_lapsed_grant_beside_an_open_door_did_not_admit_by_name() {
+        let lapsed = all(vec![whitelist(&["agent.near"]), until(T)]);
+        assert!(!by_name(any(vec![lapsed.clone(), serde_json::json!("AllowAll")])));
+        assert!(!by_name(any(vec![serde_json::json!("AllowAll"), lapsed])));
+    }
+
+    #[test]
+    fn a_live_grant_beside_an_open_door_admits_by_name() {
+        let live = all(vec![whitelist(&["agent.near"]), until(T + 1)]);
+        assert!(by_name(any(vec![serde_json::json!("AllowAll"), live])));
+        assert!(by_name(any(vec![serde_json::json!("AllowAll"), whitelist(&["agent.near"])])));
+    }
+
+    #[test]
+    fn a_branch_of_an_or_that_cannot_be_judged_without_the_chain_does_not_count() {
+        let unjudged = all(vec![whitelist(&["agent.near"]), balance()]);
+        assert!(!by_name(any(vec![unjudged, serde_json::json!("AllowAll")])));
+    }
+
+    #[test]
+    fn a_build_lock_beside_the_name_is_judged_on_the_running_build() {
+        let this_build = serde_json::json!({"WasmHash": {"hash": BUILD}});
+        let another = serde_json::json!({"WasmHash": {"hash": "b".repeat(64)}});
+        assert!(by_name(any(vec![all(vec![whitelist(&["agent.near"]), this_build])])));
+        assert!(!by_name(any(vec![all(vec![whitelist(&["agent.near"]), another]), serde_json::json!("AllowAll")])));
+    }
+
+    #[test]
+    fn a_whitelist_of_others_names_nobody_here() {
+        assert!(!by_name(any(vec![whitelist(&["other.near"]), serde_json::json!("AllowAll")])));
+    }
+
+    #[test]
+    fn a_negation_and_the_calling_contract_name_nobody() {
+        assert!(!by_name(serde_json::json!({"Not": {"condition": whitelist(&["other.near"])}})));
+        assert!(!by_name(serde_json::json!({"Predecessor": {"condition": whitelist(&["contract.near"])}})));
+        assert!(!by_name(serde_json::json!({"Predecessor": {"condition": whitelist(&["agent.near"])}})));
     }
 }

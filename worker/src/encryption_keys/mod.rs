@@ -54,7 +54,7 @@ pub use host_functions::{add_encryption_keys_to_linker, EncryptionKeysHostState}
 
 /// How many encryption keys one manifest may declare. The keystore's own
 /// limit, counted apart from the signing keys.
-pub const MAX_ENCRYPTION_KEYS: usize = 3;
+pub const MAX_ENCRYPTION_KEYS: usize = 5;
 
 /// The encryption keys' family, as refusals name it.
 pub const ENCRYPTION: Family = Family { noun: "encryption key", field: "encryption_keys", most: MAX_ENCRYPTION_KEYS };
@@ -167,7 +167,7 @@ pub struct EncryptionKeys {
 /// the padded key blocks live in wiped buffers, the hasher's state after
 /// absorbing a padded key is reset in place by each `finalize_into_reset` and
 /// the hasher is overwritten with zeros before it goes out of scope.
-fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> Zeroizing<[u8; 32]> {
     const BLOCK: usize = 64;
     const IPAD: u8 = 0x36;
     const OPAD: u8 = 0x5c;
@@ -458,11 +458,11 @@ mod tests {
         ] {
             assert!(manifest(keys.clone()).is_err(), "{keys}");
         }
-        let four: Vec<_> = (0..4).map(|i| serde_json::json!({ "path": format!("k{i}") })).collect();
-        let e = manifest(serde_json::Value::Array(four)).unwrap_err();
-        assert!(e.contains("declares 4 encryption keys; at most 3"), "{e}");
-        let three: Vec<_> = (0..3).map(|i| serde_json::json!({ "path": format!("k{i}") })).collect();
-        assert_eq!(declared(serde_json::Value::Array(three), project_run()).unwrap().len(), 3);
+        let six: Vec<_> = (0..6).map(|i| serde_json::json!({ "path": format!("k{i}") })).collect();
+        let e = manifest(serde_json::Value::Array(six)).unwrap_err();
+        assert!(e.contains("declares 6 encryption keys; at most 5"), "{e}");
+        let five: Vec<_> = (0..5).map(|i| serde_json::json!({ "path": format!("k{i}") })).collect();
+        assert_eq!(declared(serde_json::Value::Array(five), project_run()).unwrap().len(), 5);
     }
 
     /// An encryption key has no type: a `type` member — whatever its value, a

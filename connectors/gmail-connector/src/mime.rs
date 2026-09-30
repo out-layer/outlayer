@@ -20,7 +20,7 @@ pub struct Outgoing<'a> {
     pub attachments: &'a [Attachment],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Attachment {
     pub filename: String,
     pub content_type: String,

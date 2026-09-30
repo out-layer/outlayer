@@ -17,6 +17,7 @@ mod outlayer_vrf;
 mod outlayer_wallet;
 mod signing_keys;
 mod encryption_keys;
+mod tasks;
 mod tdx_attestation;
 mod wasm_cache;
 
@@ -2470,14 +2471,26 @@ async fn handle_execute_job(
     // The run's secrets request carries its declared keys, both families: one
     // keystore call for all of it, judged independently by the keystore. A run
     // with keys and no secrets request makes a keys-only call below instead.
-    let keys_request = (!declared_keys.is_empty() || !declared_encryption_keys.is_empty()).then(|| {
-        keystore_client::KeysRequest {
-            project_id: run_source.project_id,
-            keys: &declared_keys,
-            encryption_keys: &declared_encryption_keys,
-        }
+    //
+    // A component that declares tasks asks for its task key in the same
+    // request, when the run can hold one: it goes through a project whose
+    // code is a published wasm, names a secret row, and is a component — the
+    // only kind that can import `outlayer:tasks`. Any other run of it starts
+    // without, and the host interface says why.
+    let asks_task_key = tasks::declared_in(declared_manifest.as_ref())
+        && secrets_ref.is_some()
+        && run_source.project_id.is_some()
+        && !run_source.built_from_github
+        && declared_keys_reachable(code_source, &wasm_bytes);
+    let declares_keys = !declared_keys.is_empty() || !declared_encryption_keys.is_empty();
+    let keys_request = (declares_keys || asks_task_key).then(|| keystore_client::KeysRequest {
+        project_id: run_source.project_id,
+        keys: &declared_keys,
+        encryption_keys: &declared_encryption_keys,
+        task_key: asks_task_key,
     });
     let mut run_keys: Option<executor::RunKeys> = None;
+    let mut task_grant: Option<tasks::TaskGrant> = None;
 
     let user_secrets = if let (Some(secrets_ref), Some(keystore)) = (secrets_ref, keystore_client) {
         // A reference the contract could never hold is refused here, naming
@@ -2575,6 +2588,7 @@ async fn handle_execute_job(
         match secrets_result {
             Ok(run) => {
                 run_keys = run.keys;
+                task_grant = run.task_grant;
                 match run.secrets {
                     Some(secrets) => {
                         info!("✅ Secrets decrypted successfully: {} environment variables", secrets.len());
@@ -2632,14 +2646,20 @@ async fn handle_execute_job(
     // and settled before the author's secrets are read. They go into the
     // execution by value and are dropped with it — never into the environment,
     // stdin or a log.
-    let declared_run_keys = if keys_request.is_none() {
+    let mut declared_run_keys = if keys_request.is_none() {
         executor::RunKeys::default()
     } else if let Some(keys) = run_keys {
         keys
+    } else if !declares_keys {
+        // The request was made for the task key alone, and no row was opened
+        // to hold one beside.
+        executor::RunKeys::default()
     } else {
+        // Keys alone: the task key comes only beside a row.
+        let keys_alone = keys_request.as_ref().map(|asked| keystore_client::KeysRequest { task_key: false, ..*asked });
         match keys_for_run(
             keystore_client,
-            keys_request.as_ref(),
+            keys_alone.as_ref(),
             user_account_id.map(|s| s.as_str()),
             predecessor_id,
             data_id,
@@ -2655,6 +2675,36 @@ async fn handle_execute_job(
             }
         }
     };
+
+    // What the run holds for tasks, when its component declares them: the
+    // task key if the row opened, and the run's own facts — this call, its
+    // project, the row's owner, the account that made the run. The guest
+    // supplies none of them.
+    let task_report = tasks::RunReport::default();
+    let task_store = tasks::StoreConfig {
+        coordinator_url: config.api_base_url.clone(),
+        coordinator_token: config.api_auth_token.clone(),
+    };
+    let task_run_id = tasks::run_id(call_id.map(|s| s.as_str()), request_id);
+    declared_run_keys.tasks = tasks::declared_in(declared_manifest.as_ref()).then(|| tasks::TasksRun {
+        declared: true,
+        grant: task_grant.take(),
+        run: task_run_id.clone(),
+        project_id: job.project_id.clone(),
+        project_uuid: project_uuid.clone(),
+        build: Some(executed_wasm_sha256.clone()),
+        operation: connector_manifest::operation_from_input(&input_data).ok(),
+        owner: secrets_ref.map(|r| r.account_id.clone()),
+        profile: secrets_ref.map(|r| r.profile.clone()),
+        caller: user_account_id.cloned(),
+        predecessor: predecessor_id.map(str::to_string),
+        store: Some(task_store.clone()),
+        chain: Some(tasks::ChainConfig {
+            rpc_url: config.near_rpc_url.clone(),
+            recipient: config.offchainvm_contract_id.to_string(),
+        }),
+        report: task_report.clone(),
+    });
 
     // The author's credential, named by the artefact rather than by the call
     // (`author_secrets` in the manifest), decrypted into the same environment
@@ -2871,6 +2921,22 @@ async fn handle_execute_job(
             Some(network_config),
         )
         .await;
+
+    // The tasks this run answered, told to the store now that the guest has
+    // exited — however it exited: a task it reported on, in a run that
+    // succeeded, is `done`; every other is `failed`. A store that cannot be
+    // told leaves them `answering`, and closes them `failed` by itself.
+    {
+        let answered = task_report.tasks();
+        if let (false, Some(uuid), Some(row)) = (answered.is_empty(), project_uuid.as_ref(), secrets_ref) {
+            let scope = tasks::client::Scope { project_uuid: uuid.clone(), owner: row.account_id.clone() };
+            let success = exec_result.as_ref().is_ok_and(|r| r.success);
+            match tasks::client::finish(&task_store, &scope, &task_run_id, success, &answered).await {
+                Ok(finished) => info!("📬 Tasks finished: {} done, {} failed", finished.done, finished.failed),
+                Err(e) => warn!("Tasks answered by this run could not be finished in the store: {:?}", e),
+            }
+        }
+    }
 
     // Submit the egress audit (§C3). Read AFTER execution and unconditionally,
     // including for a run that trapped or timed out — a connector that was
@@ -5142,10 +5208,19 @@ mod signing_keys_in_the_job_path {
         // The request is the manifest's keys, how the job was started and its
         // own project.
         let built = src
-            .find("let keys_request = (!declared_keys.is_empty() || !declared_encryption_keys.is_empty()).then(|| {")
+            .find("let keys_request = (declares_keys || asks_task_key).then(|| keystore_client::KeysRequest {")
             .expect("the request");
+        let declares = src
+            .find("let declares_keys = !declared_keys.is_empty() || !declared_encryption_keys.is_empty();")
+            .expect("what makes a run one that declares keys");
+        assert!(declares < built);
         let request = &src[built..built + 350];
-        for field in ["project_id: run_source.project_id", "keys: &declared_keys", "encryption_keys: &declared_encryption_keys"] {
+        for field in [
+            "project_id: run_source.project_id",
+            "keys: &declared_keys",
+            "encryption_keys: &declared_encryption_keys",
+            "task_key: asks_task_key",
+        ] {
             assert!(request.contains(field), "the key request must carry {field}: {request}");
         }
         assert!(!request.contains("source_kind"), "the request says nothing about how the run was started: {request}");
@@ -5161,9 +5236,17 @@ mod signing_keys_in_the_job_path {
         // Only a run that made no secrets request asks for the keys alone,
         // with the caller and the measured build.
         let at = src.find("match keys_for_run(").expect("the keys-only request");
-        assert!(src[at - 200..at].contains("} else if let Some(keys) = run_keys {"), "the keys-only call is the fallback");
+        let fallback = &src[at - 700..at];
+        assert!(fallback.contains("} else if let Some(keys) = run_keys {"), "the keys-only call is the fallback");
+        // It asks for the declared keys and never for the task key, which
+        // comes only beside a row; a run that declares none makes no call.
+        assert!(fallback.contains("} else if !declares_keys {"), "{fallback}");
+        assert!(
+            fallback.contains("keystore_client::KeysRequest { task_key: false, ..*asked }"),
+            "the keys-only request asks for no task key: {fallback}"
+        );
         let call = &src[at..at + 300];
-        for arg in ["keys_request.as_ref()", "user_account_id.map(|s| s.as_str())", "predecessor_id,", "&executed_wasm_sha256"] {
+        for arg in ["keys_alone.as_ref()", "user_account_id.map(|s| s.as_str())", "predecessor_id,", "&executed_wasm_sha256"] {
             assert!(call.contains(arg), "the key request must carry {arg}: {call}");
         }
         // Both accounts, and the calling account is the door's answer — the
@@ -5189,6 +5272,81 @@ mod signing_keys_in_the_job_path {
         let exec = src.find(".execute(\n").expect("the executor call");
         assert!(src[exec - 60..exec].contains(".with_keys(declared_run_keys)"), "the keys go into the run by value");
         assert_eq!(src.matches("(declared_run_keys)").count(), 1, "one hand-over, to the executor");
+    }
+}
+
+/// What a run holds for tasks comes from the job and the keystore, and what it
+/// answered is told to the store after the guest exits, however it exited.
+/// Source-shape tests, as for the keys.
+#[cfg(test)]
+mod tasks_in_the_job_path {
+    fn src() -> &'static str {
+        let all = include_str!("main.rs");
+        &all[..all.find("#[cfg(test)]").expect("tests follow the code")]
+    }
+
+    #[test]
+    fn the_task_key_is_asked_for_only_by_a_run_that_can_hold_one() {
+        let src = src();
+        let at = src.find("let asks_task_key = tasks::declared_in(declared_manifest.as_ref())").expect("the decision");
+        let decision = &src[at..at + 300];
+        for condition in [
+            "&& secrets_ref.is_some()",
+            "&& run_source.project_id.is_some()",
+            "&& !run_source.built_from_github",
+            "&& declared_keys_reachable(code_source, &wasm_bytes);",
+        ] {
+            assert!(decision.contains(condition), "{condition}: {decision}");
+        }
+    }
+
+    #[test]
+    fn the_runs_facts_are_the_jobs() {
+        let src = src();
+        let at = src.find("declared_run_keys.tasks = tasks::declared_in(declared_manifest.as_ref()).then(|| tasks::TasksRun {").expect("the context");
+        let context = &src[at..at + 1000];
+        for fact in [
+            "grant: task_grant.take(),",
+            "run: task_run_id.clone(),",
+            "project_id: job.project_id.clone(),",
+            "project_uuid: project_uuid.clone(),",
+            "build: Some(executed_wasm_sha256.clone()),",
+            "operation: connector_manifest::operation_from_input(&input_data).ok(),",
+            "owner: secrets_ref.map(|r| r.account_id.clone()),",
+            "profile: secrets_ref.map(|r| r.profile.clone()),",
+            "caller: user_account_id.cloned(),",
+            "predecessor: predecessor_id.map(str::to_string),",
+            "recipient: config.offchainvm_contract_id.to_string(),",
+        ] {
+            assert!(context.contains(fact), "{fact}: {context}");
+        }
+        // The operation is read off the call's input by the host, as the
+        // contract priced it; nothing else of the input, and nothing of the
+        // environment, is a fact of the run.
+        let without_the_operation = context.replace("operation: connector_manifest::operation_from_input(&input_data).ok(),", "");
+        assert!(
+            !without_the_operation.contains("input_data") && !without_the_operation.contains("env_vars"),
+            "nothing of the guest's: {context}"
+        );
+        let exec = src.find(".execute(\n").expect("the executor call");
+        assert!(at < exec);
+        let env = src.find("let mut env_vars = merge_env_vars(").expect("the environment");
+        let env_end = env + src[env..].find(");").expect("its end");
+        assert!(!src[env..env_end].contains("task"), "nothing of tasks reaches the guest's environment");
+    }
+
+    #[test]
+    fn what_a_run_answered_is_finished_after_it_whatever_way_it_ended() {
+        let src = src();
+        let exec = src.find(".execute(\n").expect("the executor call");
+        let finish = src.find("tasks::client::finish(&task_store, &scope, &task_run_id, success, &answered)").expect("the report");
+        let outcome = src.find("match exec_result {").expect("where the run's outcome is branched on");
+        assert!(exec < finish && finish < outcome, "told before any branch on the outcome can return");
+        assert!(
+            src[exec..finish].contains("let success = exec_result.as_ref().is_ok_and(|r| r.success);"),
+            "a run that trapped, timed out or failed reports no task as done"
+        );
+        assert!(!src[exec..finish].contains("return"), "nothing returns between the run and its report");
     }
 }
 

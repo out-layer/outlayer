@@ -67,7 +67,7 @@ pub const ENCRYPTION_KEY_LABEL: &str = "encryption-key:v1:";
 
 /// How many encryption keys one request may name — the manifest's own limit,
 /// counted apart from the signing keys.
-pub const MAX_ENCRYPTION_KEYS: usize = 3;
+pub const MAX_ENCRYPTION_KEYS: usize = 5;
 
 /// One encryption key as the worker asks for it, copied from the running
 /// artefact's manifest. Unknown fields are refused, as for a signing key: a
@@ -258,13 +258,13 @@ mod tests {
     }
 
     #[test]
-    fn three_keys_are_accepted_and_four_refused() {
-        assert_eq!(MAX_ENCRYPTION_KEYS, 3);
-        let three: Vec<_> = (0..3).map(|i| req(&format!("k{i}"))).collect();
-        assert_eq!(bound(&three).unwrap().keys.len(), 3);
-        let four: Vec<_> = (0..4).map(|i| req(&format!("k{i}"))).collect();
-        let e = validate(&four).unwrap_err();
-        assert!(e.contains("4 encryption keys") && e.contains("at most 3"), "{e}");
+    fn five_keys_are_accepted_and_six_refused() {
+        assert_eq!(MAX_ENCRYPTION_KEYS, 5);
+        let five: Vec<_> = (0..5).map(|i| req(&format!("k{i}"))).collect();
+        assert_eq!(bound(&five).unwrap().keys.len(), 5);
+        let six: Vec<_> = (0..6).map(|i| req(&format!("k{i}"))).collect();
+        let e = validate(&six).unwrap_err();
+        assert!(e.contains("6 encryption keys") && e.contains("at most 5"), "{e}");
         assert!(validate(&[]).unwrap_err().contains("no encryption keys"));
         assert!(validate(&[req("k"), req("k")]).is_err());
     }

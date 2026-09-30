@@ -4,7 +4,7 @@ package outlayer:encryption-keys@0.1.0;
 /// only the component itself can open again.
 ///
 /// A component declares the keys it encrypts with in its `outlayer.manifest`
-/// custom section, at most three:
+/// custom section, at most five:
 ///
 ///     "encryption_keys": [
 ///       {"path": "records"},

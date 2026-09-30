@@ -495,6 +495,26 @@ impl Keystore {
         self.derive_declared_key(vault, input)
     }
 
+    /// The 32 bytes of one task key: `HMAC-SHA256(master, input)`, with
+    /// `input` `task-key:v1:{project_uuid}:{owner}` — a string only
+    /// [`crate::task_keys::TaskKeyInput`] builds — and `master` the master of
+    /// the vault the row is bound to, the default master for a row bound to
+    /// none: what a vault seals, it seals with its own key, tasks included.
+    /// Never cached; wiped when dropped.
+    pub fn derive_task_key(
+        &self,
+        input: &crate::task_keys::TaskKeyInput,
+        vault: Option<&AccountId>,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        let master = zeroize::Zeroizing::new(self.master_for(vault)?);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(master.as_ref())
+            .expect("HMAC can take key of any size");
+        mac.update(input.as_bytes());
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(&mac.finalize().into_bytes());
+        Ok(key)
+    }
+
     /// `HMAC-SHA256(master, input)` for a declared key of either family.
     fn derive_declared_key(
         &self,

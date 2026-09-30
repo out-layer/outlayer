@@ -113,12 +113,13 @@ pub struct DecryptResponse {
 /// answered together.
 ///
 /// Only a request whose body carries a `signing_keys` or `encryption_keys`
-/// member (other than `null` or `[]`) is read as this; every other request is
+/// member (other than `null` or `[]`), or a `task_key` member (other than
+/// `null` or `false`), is read as this; every other request is
 /// a [`DecryptRequest`] and is answered exactly as it always was. Here too a
 /// `null` list is an empty one, so the other family may be `null`. `accessor` +
-/// `profile` + `owner` name one secret row, all three or none; at least one of
-/// the two key lists must be non-empty. The two lists are two namespaces: the
-/// same path may appear in both, and names two unrelated keys.
+/// `profile` + `owner` name one secret row, all three or none; the request
+/// names a key of either list or asks for its task key. The two lists are two
+/// namespaces: the same path may appear in both, and names two unrelated keys.
 #[derive(Debug, Deserialize)]
 pub struct KeyedDecryptRequest {
     #[serde(default)]
@@ -161,6 +162,17 @@ pub struct KeyedDecryptRequest {
     /// no keys, as an absent member is.
     #[serde(default, deserialize_with = "null_as_no_keys")]
     pub encryption_keys: Vec<crate::encryption_keys::EncryptionKeyRequest>,
+
+    /// Whether the run asks for its task key (`crate::task_keys`): the
+    /// running artefact's manifest declares tasks and the run names a secret
+    /// row. `null` is no, as an absent member is.
+    #[serde(default, deserialize_with = "null_as_false")]
+    pub task_key: bool,
+}
+
+/// A flag read as the dispatch probe reads it: `null` is `false`.
+fn null_as_false<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// A key list read as the dispatch probe reads it: `null` names no keys.
@@ -174,8 +186,9 @@ where
 
 /// The answer to a [`KeyedDecryptRequest`]: independent parts.
 ///
-/// `signing_keys` is present exactly when the request named signing keys, and
-/// `encryption_keys` exactly when it named encryption keys — so the answer to
+/// `signing_keys` is present exactly when the request named signing keys,
+/// `encryption_keys` exactly when it named encryption keys, and `task_key`
+/// when the request asked for it and its row opened — so the answer to
 /// a request naming signing keys alone is the answer it always was. A request
 /// whose keys cannot be served is refused whole, with the
 /// `signing_keys_refused` code, and nothing else is returned. `secrets` is
@@ -192,6 +205,11 @@ pub struct KeyedDecryptResponse {
     /// uses it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_keys: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>,
+    /// The run's task key, and whether the row admitted the caller by name.
+    /// Present exactly when the request asked for it and the row it named
+    /// opened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_key: Option<crate::task_keys::TaskKeyGrant>,
 }
 
 /// What became of the secret row a keyed request named.

@@ -25,8 +25,61 @@ and an app password is of no use here. The manifest allows exactly two hosts:
 
 | `operation` | class | what it does |
 |---|---|---|
-| `status` | read | whether the credential works (it fetches an access token), the policy's caps, today's send count |
-| `send` | write | `to`, `cc`, `subject`, `body`, `attachments` — policy-checked, then sent |
+| `status` | read | whether the credential works (it fetches an access token), the policy — every member it holds, `confirm` among them — and the caller's own sends today |
+| `send` | write | `to`, `cc`, `subject`, `body`, `attachments` — policy-checked, then sent; or, when the policy lists `send` under `confirm`, left as a task for the owner and answered `awaiting_owner` |
+| `confirm` | write | the owner's own call, with `task_id` and `task_hash`: sends the message the task holds, under the policy the task was made under |
+| `task_status`, `task_cancel`, `task_delete` | | a task this caller made, by `task_id`: where it stands, withdraw it, delete it |
+| `tasks` | read | the tasks this caller made for this owner |
+| `tasks_unlock` | write | the owner's own call: opens the waiting tasks for a device that was not signed in when they were made |
+
+### A send the owner confirms
+
+With `"confirm": ["send"]` in the policy, `send` checks the message against the
+policy and sends nothing: it leaves a task for the owner of the row and answers
+
+```json
+{"status": "awaiting_owner", "task_id": "…", "task_hash": "…", "expires_at": 1790000000, "link": "https://app.outlayer.ai/inbox/…"}
+```
+
+which is a success — the agent did its part. The owner reads the message in
+their inbox (who it goes to, the subject, the body, the attachments by name and
+size) and sends it with their own call of `confirm`; the agent learns the
+outcome from `task_status`. The message waits sealed, and `confirm` sends
+exactly it: nothing in the task says what to do on a yes.
+
+What the owner is shown is what is sent, so a message to be confirmed is one
+that can be shown whole: a body of at most 50000 characters, attachments of at
+most 6 MiB together and ten in number. The attachments wait as the task's
+files: the owner's page lists each by name, type and size and gives it to the
+owner to open. A message over these is refused `display_invalid` or
+`task_too_large` and never shown in part.
+
+**The rules at `confirm` are the rules the message was prepared under.** The
+policy's bytes are part of the task, and a task made under another policy is
+refused `task_void`. What can differ between preparing and confirming is the
+day's count and Google's answer.
+
+**What a refusal does to the task.** The message is inside the task and is
+handed over only with the owner's answer, so the answer is taken first and the
+message is sent after; a task whose answer was taken never returns to `open`.
+
+| refused | the task | the refusal |
+|---|---|---|
+| before the answer is taken: no `task_id` or `task_hash`, a policy absent or unreadable, anything the host refuses the answer for (`task_not_found`, `not_the_owner`, `task_hash_mismatch`, `task_answer_invalid`, `task_store_unavailable`, `task_closed`, `task_expired`, `task_void`) | stays as it was; an open one can be confirmed again | as it is |
+| after: a state that is not a message, the day's count, the credential, building the message, Google's refusal of the send | ends `failed` | its own code, and a sentence ending "The task is closed: to send this message, prepare it again" |
+| after the message left: the result could not be left for the agent | ends `failed` | its own code, and "The message WAS sent (Gmail message …) and the task is closed without its result: do not prepare it again" |
+
+**What `confirm` answers.** Over HTTPS, what a send answers, with `status` and
+`task_id`. On chain (`OUTLAYER_EXECUTION_TYPE` is anything but `HTTPS`) the
+answer is the output of a transaction the owner signed and stays public, so it
+carries `status`, `task_id`, `message_id`, `thread_id`, `attachments` (a
+count), `sent_today` and `remaining_today`, and nothing that names a person or
+a subject. What is reported to the task is whole either way: the host seals it
+for the agent, which reads the recipients and the subject from `task_status`.
+
+A direct `send` answers the same way: whole over HTTPS, and on chain the
+same five members. A refusal, which is an answer too, names a recipient by its
+place in the list (`recipient 2 of 3`) and never by its address.
 
 ### `status` on chain: the policy leaves only sealed
 
@@ -122,8 +175,8 @@ outlayer secrets access --project connectors.outlayer.testnet/gmail --profile gm
 A date after an account makes that grant lapse on its own; dropping the account
 from the whitelist takes it back. The ciphertext never moves.
 
-`X-Use-Owner-Secret: 1` with the row under the agent's own wallet
-(`outlayer secrets set-for-agent`) is the older arrangement and still works.
+One row holds the credential and the policy, and it is the owner's: an agent
+is admitted by name in its access condition and stores nothing of its own.
 
 When Google later refuses a refresh, the answer says `credential_expired` and
 that retrying will not help, because it will not: connect the account again.
@@ -157,7 +210,8 @@ not help — distinct from the throttle that arrives with the same status.
   "max_per_day": 20,
   "max_recipients": 5,
   "max_attachment_kb": 2048,
-  "subject_prefix": "[agent]"
+  "subject_prefix": "[agent]",
+  "confirm": ["send"]
 }
 ```
 
@@ -174,15 +228,37 @@ of messages, any number of addresses per message. The exception is
 `max_attachment_kb`: without it the agent may not send files at all, because
 silence about attachments is not permission. `recipient_domains: ["any"]`, or
 naming neither list, means anywhere. `subject_prefix` is added once when it is
-missing, so a recipient can tell agent mail from its owner's.
+missing, so a recipient can tell agent mail from its owner's. `confirm` lists
+the operations that need the owner — `send` is the one there is; a name that is
+not an operation to confirm makes the policy unreadable.
 
-`max_per_day` is the owner's own cap on a runaway agent, counted per calling
-wallet in UTC days, and it is optional. The mailbox is the owner's and how much it
-sends is theirs to decide; the manifest's `send` limit of 500 a day per calling
-wallet is a technical ceiling against a loop, set below what Google itself allows
-an account, not a quota. An attempt that ceiling refuses still counts toward it.
+`max_per_day` is the owner's own cap on a runaway agent, counted per agent in
+UTC days, and it is optional. The mailbox is the owner's and how much it
+sends is theirs to decide; the manifest's `send` and `confirm` limits of 500 a
+day per calling wallet are a technical ceiling against a loop, set below what
+Google itself allows an account, not a quota. An attempt that ceiling refuses
+still counts toward it.
 
-The day's count lives in project storage, per agent, in UTC days. A message's
+**The cap counts direct sends and confirmed sends separately.** A run reads
+and writes the storage cell of the account that made it and no other — no
+storage function takes an account — and every record is sealed under a key
+derived for that account. So there are two counts, each where the run that
+sends can write it:
+
+| count | record | whose cell | written by |
+|---|---|---|---|
+| the sends an agent makes itself | `gm:sends:<day>` | the agent's | the agent's `send` |
+| the sends the owner confirmed for an agent | `gm:sends:<day>:confirmed:<preparer>` | the owner's | the owner's `confirm` |
+
+`<preparer>` is the account whose run made the task, as the host names it.
+`max_per_day` bounds each count for each agent. Under one policy an agent's
+sends are all of one kind — `confirm` lists `send` or it does not — so the cap
+is exact; on a day the owner switches `confirm` on or off, an agent can send up
+to the cap directly and up to the cap confirmed. The agent's count is one for
+every owner it sends for; the confirmed count is this owner's alone. `status`
+reports the caller's own sends as `sent_today`.
+
+Each count lives in project storage, in UTC days. A message's
 place is **reserved atomically before it is sent** and given back if the send
 does not happen — the way the platform reserves money before a call runs — so two
 calls at once cannot both take the last place, and a message Google refused costs
@@ -222,15 +298,19 @@ checked; rollback is one more `set_active_version`.
 CONTRACT=outlayer.testnet OWNER=owner.outlayer.testnet ./set-prices.sh testnet
 ```
 
-Sets the on-chain price row — `status` free, `send` $0.01, no author share, since
-the connector is ours — then tells the coordinator to re-read it. The admin token
+Sets the on-chain price row — `send` $0.01, everything else free, no author
+share, since the connector is ours — then tells the coordinator to re-read it. A
+message the owner confirms is paid for once, by the agent that asked for it. The admin token
 and the coordinator URL come from the main repo's `scripts/.env`. The coordinator
 charges from its cached copy, so a row nobody refreshed is a price nobody charges.
 
 ## Tests
 
 `cargo test` covers the address parser, the policy, the day's counter, the
-translation of Google's refusals, and the seal — including the golden vector the
+translation of Google's refusals, what a message to be confirmed keeps and
+shows, what refuses before and after the owner's answer is taken, what
+`confirm` answers on chain and off it, that `status` reports every member of
+the policy, and the seal — including the golden vector the
 dashboard's test opens. The live suite is
 `tests/gmail_delegation_e2e.sh` in the main repo: it sends real mail through the
 whitelist route and needs the owner's keychain, an agent's payment key and a
@@ -240,9 +320,11 @@ recipient.
 
 | file | what it is |
 |---|---|
-| `src/main.rs` | the two operations and the input shape |
+| `src/main.rs` | the operations, the input shape, `status` and `send` |
+| `src/confirm.rs` | a send the owner confirms: the task, the owner's `confirm`, what it answers on chain |
 | `src/oauth.rs` | refresh token to access token, cached; Google's refusals translated |
 | `src/gmail.rs` | the send call, with Google's errors turned into what to do about them |
 | `src/mime.rs` | building an RFC 2822 message |
 | `src/policy.rs` | the owner's rules, address parsing, the day's count |
 | `src/seal.rs` | sealing the policy to a caller's `reply_pubkey`, for answers that land on chain |
+| `src/store.rs` | sealed records in the caller's storage cell, and the atomic counter |

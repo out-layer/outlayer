@@ -1,0 +1,10 @@
+{
+  "content": "01864d6812f9ada37fe5560153664de2a0b7b7d9b2c41c8176457015c903414a6348009f6251304c2b29fe4c4d8b612fb88328a36963c98cffdbd050eb4f43507e4cbcccfa2d357e6b0f717edc68df77cec01880db8b5ed9282e80",
+  "content_key": "0909090909090909090909090909090909090909090909090909090909090909",
+  "device_copy": "01040b71c0c7db2d808643c9428af1c55330c9db15faaf8bcf6f086c07d56444c25b96a618bd105eead40b149f3cc4a78f16d8d99ef9c8f67c0c9258298e1dab5189d432ecaa59c4c64f604ff49516af17d81c5ad7d2e94110eeb3dd6ca0271bcf9e4b4bedbfd09c64b191ca63c876c470ad89623fac4c9401ed55bb7cd6",
+  "device_pubkey": "p256:BFFcPW6545a5BNP-yn9U_c0MwemXvzddylFa0KbDtANfRTa-OlDzGPv5pUdZAqIhUCvvDVfgjFOyzApW8X2fk1Q",
+  "document": "{\"display\":{\"fields\":[],\"title\":\"Send an email\"},\"id\":\"run-0\"}",
+  "hash": "92067502a74314ee1db26da1eb2bc195c3e4ef0d135dd5c0a9e4a988d38875ce",
+  "reply_pubkey": "p256:BNuauRGLIM1_y5TyuGFWUuc1DchdnxTyepLoto5HgpAfSTZvN20m27RBD-OekVO1ERM9WATr--6-ko7G9MDcbaI",
+  "task": "run-0"
+}

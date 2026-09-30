@@ -89,6 +89,7 @@ fn keys_for(wasm: &[u8], encryption: &[(&str, &str)], signing: &[(&str, &str)]) 
             .then(|| EncryptionKeys::from_keystore(&enc, hexes(encryption)).expect("the encryption keys the manifest declares")),
         signing: (!sig.is_empty())
             .then(|| SigningKeys::from_keystore(&sig, hexes(signing)).expect("the signing keys the manifest declares")),
+        tasks: None,
     }
 }
 

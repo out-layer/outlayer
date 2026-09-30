@@ -489,7 +489,7 @@ operator can read a raw record's key name and bytes, so a raw record is sealed
 by your code first.
 
 That is what `encryption_keys` are for. Declare one in the manifest
-(`{"path": "records"}` — no `type`; at most 3, counted apart from signing keys;
+(`{"path": "records"}` — no `type`; at most 5, counted apart from signing keys;
 a namespace of its own, so an encryption key and a signing key at one path are
 two secrets) and seal through the `outlayer:encryption-keys` host functions:
 `encrypt(path, vault, plaintext, aad)`, `decrypt(path, vault, ciphertext, aad)`
@@ -537,6 +537,33 @@ Format, limits and every refusal:
 [`CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md), `encryption_keys`.
 
 ---
+
+### 4.8 Asking the owner: tasks
+
+A connector can ask the owner before it acts. With `"tasks": true` in the
+manifest, an operation prepares its action, leaves it as a task for the owner
+of the row the call named, and answers the agent `awaiting_owner`; the owner
+reads the task in their inbox and carries it out with their own call of the
+operation the task names. The model, the host interface and the SDK are in
+[TASKS.md](TASKS.md).
+
+The convention for a connector's policy is one field, `confirm`: the list of
+operations that need the owner. A connector may ask on grounds of its own as
+well — an amount over a threshold — by opening a task from any operation.
+
+Four rules a connector keeps:
+
+* **A task is paid for when it is prepared.** The operation that opens a task
+  keeps its price, and nothing comes back if the owner says no. The operation
+  that answers a task is priced at zero, and so are `task_status`,
+  `task_cancel`, `task_delete`, `tasks` and `tasks_unlock`.
+
+* **Check before you ask.** The request is judged against the policy before
+  the task is made, so the owner is never shown what the policy forbids.
+* **Check again before you act.** The operation that answers a task judges the
+  action against the policy and the limits as they are at that moment.
+* **Show what you will do, whole.** What cannot be shown whole is refused, not
+  shown in part.
 
 ## 5. Limits
 
@@ -702,6 +729,7 @@ access; one that echoed secrets would make every test run a leak.
 
 ## See also
 
+* [`TASKS.md`](TASKS.md) — tasks between an agent and its owner: the model, the inbox, the host interface
 * [`CONNECTOR_DOCS.md`](CONNECTOR_DOCS.md) — writing a connector's documentation: which claim is read from which source, and what a diff forces you to re-check. Hand it to whoever (or whatever) writes the skill and the spec entry
 * [`wasi-examples/CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md) — manifest reference
 * [`wasi-examples/WASI_TUTORIAL.md`](../wasi-examples/WASI_TUTORIAL.md) — writing and building a WASI guest

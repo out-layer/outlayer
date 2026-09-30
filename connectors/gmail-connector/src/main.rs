@@ -14,7 +14,9 @@
 //! | `operation` | class | what it does |
 //! |---|---|---|
 //! | `status` | read | whether the credential works, the policy's caps, today's send count. On chain the policy comes back only sealed to the caller's `reply_pubkey` |
-//! | `send` | write | a message, policy-checked first |
+//! | `send` | write | a message, policy-checked first; left as a task for the owner when their policy lists `send` under `confirm` |
+//! | `confirm` | write | the owner's own call: sends the message a task holds. On chain the answer names no recipient and no subject |
+//! | `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | | the tasks this caller made, and the owner's devices |
 //!
 //! It only sends. `gmail.send` authorises sending and nothing else — not reading
 //! the mailbox, not even reading back which address the credential belongs to —
@@ -26,6 +28,7 @@
 //! API rather than SMTP. Two hosts, both in the manifest:
 //! `oauth2.googleapis.com` for the token and `gmail.googleapis.com` for mail.
 
+mod confirm;
 mod gmail;
 mod mime;
 mod oauth;
@@ -72,10 +75,15 @@ struct Input {
     /// `eciesjs` gives it) to seal the policy to. Required for the policy to be
     /// shown at all when the run's output lands on chain.
     reply_pubkey: Option<String>,
+    /// `confirm` and the `task_*` operations: the task's id.
+    task_id: Option<String>,
+    /// `confirm`: SHA-256 of the task as the owner's page showed it.
+    task_hash: Option<String>,
 }
 
 /// Everything this connector sells. A name not here is refused with the list.
-const OPERATIONS: &[&str] = &["status", "send"];
+const OPERATIONS: &[&str] =
+    &["status", "send", "confirm", "task_status", "task_cancel", "task_delete", "tasks", "tasks_unlock"];
 
 fn main() {
     let raw = env::input();
@@ -102,6 +110,12 @@ fn run(op: &str, input: &Input) -> Result<Value, String> {
     match op {
         "status" => status(input),
         "send" => send(input),
+        "confirm" => confirm::confirm(input),
+        "task_status" => confirm::task(op, input),
+        "task_cancel" => confirm::task(op, input),
+        "task_delete" => confirm::task(op, input),
+        "tasks" => confirm::task(op, input),
+        "tasks_unlock" => confirm::task(op, input),
         "" => Err(format!("no `operation` in the input. This connector sells: {}", OPERATIONS.join(", "))),
         other => Err(format!("unknown operation `{other}`. This connector sells: {}", OPERATIONS.join(", "))),
     }
@@ -163,7 +177,7 @@ fn status(input: &Input) -> Result<Value, String> {
 /// Where this run's output goes. The worker names an HTTPS run in so many
 /// words; anything else is treated as public — the direction that leaks nothing
 /// when the variable is missing.
-fn on_chain() -> bool {
+pub(crate) fn on_chain() -> bool {
     std::env::var("OUTLAYER_EXECUTION_TYPE").map(|v| v != "HTTPS").unwrap_or(true)
 }
 
@@ -176,17 +190,17 @@ fn on_chain() -> bool {
 /// one on chain the fields are withheld: the output of an on-chain run sits in
 /// the transaction for ever, and the policy names the people the owner's agent
 /// may write to.
+///
+/// The full policy is the policy serialised, so every member it has is
+/// reported, under its own name and as the policy holds it: `confirm` with
+/// the rest, sealed or clear as they are.
 fn policy_view(loaded: policy::Loaded, reply_pubkey: Option<&str>, on_chain: bool) -> Result<(Value, Option<String>), String> {
     let full = match loaded {
-        policy::Loaded::Some(p) => json!({
-            "present": true,
-            "recipient_domains": p.recipient_domains,
-            "recipients": p.recipients,
-            "max_per_day": p.max_per_day,
-            "max_recipients": p.max_recipients,
-            "max_attachment_kb": p.max_attachment_kb,
-            "subject_prefix": p.subject_prefix,
-        }),
+        policy::Loaded::Some(p) => {
+            let mut full = serde_json::to_value(&p).map_err(|e| format!("the policy could not be reported: {e}"))?;
+            full["present"] = json!(true);
+            full
+        }
         policy::Loaded::None => json!({
             "present": false,
             "effect": "nothing can be sent until the owner stores a policy",
@@ -213,47 +227,97 @@ fn policy_view(loaded: policy::Loaded, reply_pubkey: Option<&str>, on_chain: boo
     }
 }
 
+/// A message as it will be sent: what `send` builds from the call, and what
+/// a task holds sealed until the owner confirms it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Prepared {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub attachments: Vec<mime::Attachment>,
+}
+
+impl Prepared {
+    fn from_call(input: &Input, rules: &policy::Policy) -> Result<Self, String> {
+        Ok(Self {
+            to: address_list(input.to.as_ref(), "to")?,
+            cc: address_list(input.cc.as_ref(), "cc")?,
+            subject: rules.apply_prefix(input.subject.as_deref().unwrap_or_default()),
+            body: input.body.clone().unwrap_or_default(),
+            attachments: input.attachments.clone(),
+        })
+    }
+
+    /// The size of each attachment, in bytes.
+    pub(crate) fn attachment_sizes(&self) -> Result<Vec<usize>, String> {
+        self.attachments
+            .iter()
+            .map(|a| mime::decode_base64(&a.data).map(|b| b.len()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("an attachment is {e}"))
+    }
+
+    /// Every recipient, and the attachments, against the owner's rules.
+    pub(crate) fn check(&self, rules: &policy::Policy) -> Result<(), String> {
+        let mut recipients = self.to.clone();
+        recipients.extend(self.cc.iter().cloned());
+        rules.check_recipients(&recipients)?;
+        rules.check_attachments(&self.attachment_sizes()?)
+    }
+}
+
 fn send(input: &Input) -> Result<Value, String> {
     let rules = policy::require()?;
-    let to = address_list(input.to.as_ref(), "to")?;
-    let cc = address_list(input.cc.as_ref(), "cc")?;
-    let subject = rules.apply_prefix(input.subject.as_deref().unwrap_or_default());
-    let body = input.body.clone().unwrap_or_default();
+    let message = Prepared::from_call(input, &rules)?;
+    // Before anything is built, sent, or shown to the owner.
+    message.check(&rules)?;
+    if rules.confirms(policy::Confirmable::Send) {
+        return confirm::ask(&message);
+    }
+    let sent = deliver(&rules, &message, policy::Counted::Own)?;
+    Ok(sent_as_answered(&sent, on_chain()))
+}
 
-    // Every recipient, and the attachments, before anything is built or sent.
-    let mut recipients = to.clone();
-    recipients.extend(cc.iter().cloned());
-    rules.check_recipients(&recipients)?;
-    let sizes: Vec<usize> = input
-        .attachments
-        .iter()
-        .map(|a| mime::decode_base64(&a.data).map(|b| b.len()))
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("an attachment is {e}"))?;
-    rules.check_attachments(&sizes)?;
+/// The members of a send's answer that may stand in a transaction.
+const ON_CHAIN: [&str; 5] = ["message_id", "thread_id", "attachments", "sent_today", "remaining_today"];
+
+/// What a send answers where it runs. On chain the answer is the output of a
+/// transaction and stays in it for ever: it carries the members of
+/// [`ON_CHAIN`] and nothing that names a person or a subject. Members are
+/// picked by name, so one added to what a send answers stays off the chain
+/// until it is listed here. Over HTTPS the answer is whole.
+pub(crate) fn sent_as_answered(sent: &Value, on_chain: bool) -> Value {
+    match on_chain {
+        true => Value::Object(
+            ON_CHAIN.iter().map(|name| (name.to_string(), sent.get(*name).cloned().unwrap_or(Value::Null))).collect(),
+        ),
+        false => sent.clone(),
+    }
+}
+
+/// Send a message that passed the owner's rules, counted as `counted` says.
+pub(crate) fn deliver(rules: &policy::Policy, message: &Prepared, counted: policy::Counted) -> Result<Value, String> {
+    let Prepared { to, cc, subject, body, attachments } = message;
 
     // The owner's own cap, if they set one — their guard against a runaway
-    // agent on their mailbox, counted per calling wallet. It is not the
-    // platform's: the manifest's `send` limit is enforced by the coordinator for
-    // every wallet, and Google caps the account itself. The place in today's
-    // budget is taken before anything leaves, atomically, so two calls at once
-    // cannot both see room for the last message. Any return from here without
-    // `keep` gives it back.
+    // agent on their mailbox. A message the caller sends itself is counted
+    // for the caller; one the owner confirms, for the agent that prepared it.
+    // The two counts are separate records in separate cells, and the cap
+    // bounds each. It is not the platform's: the manifest's limits are
+    // enforced by the coordinator for every wallet, and Google caps the
+    // account itself. The place in today's budget is taken before anything
+    // leaves, atomically, so two calls at once cannot both see room for the
+    // last message. Any return from here without `keep` gives it back.
     let day = policy::day_key(policy::now_ms());
     let reservation = match rules.max_per_day {
-        Some(cap) => Some(policy::reserve(&day, cap)?),
+        Some(cap) => Some(policy::reserve(&day, counted, cap)?),
         None => None,
     };
 
     let token = token()?;
-    let raw = mime::build(&mime::Outgoing {
-        from: None,
-        to: &to,
-        cc: &cc,
-        subject: &subject,
-        body: &body,
-        attachments: &input.attachments,
-    })?;
+    let raw = mime::build(&mime::Outgoing { from: None, to, cc, subject, body, attachments })?;
     let result = gmail::send(&token, &raw)?;
     let sent_today = reservation.map(|(reservation, used)| {
         reservation.keep();
@@ -266,7 +330,7 @@ fn send(input: &Input) -> Result<Value, String> {
         "to": to,
         "cc": cc,
         "subject": subject,
-        "attachments": input.attachments.len(),
+        "attachments": attachments.len(),
         "sent_today": sent_today,
         "remaining_today": rules.max_per_day.zip(sent_today).map(|(cap, used)| cap.saturating_sub(used)),
     }))
@@ -280,7 +344,7 @@ mod tests {
     fn the_operations_this_code_runs_are_the_ones_it_advertises() {
         for bad in ["", "list", "read", "read_attachment", "delete"] {
             let err = run(bad, &Input::default()).unwrap_err();
-            assert!(err.contains("This connector sells: status, send"), "{bad} → {err}");
+            assert!(err.contains("This connector sells: status, send, confirm, task_status"), "{bad} → {err}");
         }
     }
 
@@ -336,14 +400,132 @@ mod tests {
         assert!(open.get("sealed").is_none());
     }
 
+    /// A policy with every member set. Written member by member, so a member
+    /// added to the policy does not compile here until it is given a value.
+    fn every_member() -> policy::Policy {
+        policy::Policy {
+            recipient_domains: Some(vec!["example.com".into()]),
+            recipients: Some(vec!["boss@other.org".into()]),
+            max_per_day: Some(20),
+            max_recipients: Some(5),
+            max_attachment_kb: Some(2048),
+            subject_prefix: Some("[agent]".into()),
+            confirm: Some(vec![policy::Confirmable::Send]),
+        }
+    }
+
+    fn names(value: &Value) -> Vec<String> {
+        let mut names: Vec<String> = value.as_object().expect("an object").keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// What rewrites a policy from what `status` answered keeps every member
+    /// only if every member is answered.
+    #[test]
+    fn status_reports_every_member_of_the_policy() {
+        // The members, taken apart with no `..`: one more in the policy does
+        // not compile here until it is named and compared below.
+        let policy::Policy {
+            recipient_domains,
+            recipients,
+            max_per_day,
+            max_recipients,
+            max_attachment_kb,
+            subject_prefix,
+            confirm,
+        } = every_member();
+        let expected = json!({
+            "present": true,
+            "recipient_domains": recipient_domains,
+            "recipients": recipients,
+            "max_per_day": max_per_day,
+            "max_recipients": max_recipients,
+            "max_attachment_kb": max_attachment_kb,
+            "subject_prefix": subject_prefix,
+            "confirm": ["send"],
+        });
+        assert_eq!(confirm, Some(vec![policy::Confirmable::Send]));
+
+        // The names the policy is spelled with are the names it reads back by.
+        let spelled = serde_json::to_value(every_member()).unwrap();
+        assert!(serde_json::from_value::<policy::Policy>(spelled.clone()).is_ok());
+        let mut with_present = names(&spelled);
+        with_present.push("present".into());
+        with_present.sort();
+        assert_eq!(with_present, names(&expected), "a member of the policy is missing from this test");
+
+        // In the clear.
+        let (open, sealed) = policy_view(policy::Loaded::Some(every_member()), None, false).unwrap();
+        assert_eq!(open, expected);
+        assert_eq!(names(&open), names(&expected));
+        assert!(sealed.is_none());
+
+        // Sealed, on chain and off it: the same members inside.
+        let (sk, pk) = ecies::utils::generate_keypair();
+        let hex: String = pk.serialize_compressed().iter().map(|b| format!("{b:02x}")).collect();
+        for on_chain in [true, false] {
+            let (open, sealed) = policy_view(policy::Loaded::Some(every_member()), Some(&hex), on_chain).unwrap();
+            assert_eq!(open, json!({"present": true, "sealed": true}));
+            let blob = BASE64.decode(sealed.expect("a sealed policy")).unwrap();
+            let inside: Value = serde_json::from_slice(&seal::open(&sk.serialize(), &blob).unwrap()).unwrap();
+            assert_eq!(inside, expected);
+        }
+
+        // On chain with no key nothing of the policy leaves, `confirm` included.
+        let (open, _) = policy_view(policy::Loaded::Some(every_member()), None, true).unwrap();
+        assert_eq!(names(&open), ["note", "present", "sealed"]);
+    }
+
+    #[test]
+    fn status_reports_confirm_as_the_policy_holds_it() {
+        let reported = |json: &str| policy_view(loaded(json), None, false).unwrap().0;
+        assert_eq!(reported(r#"{"confirm":["send"]}"#)["confirm"], json!(["send"]));
+        assert_eq!(reported(r#"{"confirm":[]}"#)["confirm"], json!([]));
+        // A policy with none reports none, and the members beside it as null.
+        for none in [r#"{}"#, r#"{"confirm":null}"#] {
+            let open = reported(none);
+            assert!(open.get("confirm").is_none(), "{open}");
+            assert_eq!(open["max_per_day"], Value::Null);
+            assert_eq!(names(&open).len(), 7, "{open}");
+        }
+        // What is reported, less the word about the row, is a policy again.
+        let mut back = reported(r#"{"confirm":["send"],"max_per_day":3}"#);
+        back.as_object_mut().unwrap().remove("present");
+        let again: policy::Policy = serde_json::from_value(back).unwrap();
+        assert!(again.confirms(policy::Confirmable::Send) && again.max_per_day == Some(3));
+    }
+
     #[test]
     fn an_address_field_takes_one_address_or_an_array_of_them() {
         assert_eq!(address_list(Some(&json!("A@b.co")), "to").unwrap(), vec!["a@b.co"]);
         assert_eq!(address_list(Some(&json!(["a@b.co", " d@e.co "])), "to").unwrap(), vec!["a@b.co", "d@e.co"]);
         assert!(address_list(None, "cc").unwrap().is_empty());
         // A string is one address. A comma makes it a malformed one, never a list.
-        assert!(address_list(Some(&json!("a@b.co, d@e.co")), "to").unwrap_err().contains("not a bare email address"));
+        let said = address_list(Some(&json!("a@b.co, d@e.co")), "to").unwrap_err();
+        assert!(said.contains("not a bare email address") && !said.contains("a@b.co"), "{said}");
         assert!(address_list(Some(&json!([1])), "to").unwrap_err().contains("as strings"));
         assert!(address_list(Some(&json!(7)), "to").unwrap_err().contains("array of addresses"));
+    }
+}
+
+#[cfg(test)]
+mod a_send_on_chain_names_nobody {
+    use super::*;
+
+    #[test]
+    fn on_chain_a_direct_send_answers_as_confirm_does_and_over_https_it_answers_whole() {
+        let sent = json!({
+            "message_id": "m1", "thread_id": "t1", "to": ["a@b.co"], "cc": [], "subject": "Hello",
+            "attachments": 1, "sent_today": 2, "remaining_today": 8
+        });
+        let on_chain = sent_as_answered(&sent, true);
+        let members: Vec<&str> = on_chain.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(members, ["attachments", "message_id", "remaining_today", "sent_today", "thread_id"]);
+        assert_eq!(sent_as_answered(&sent, false), sent);
+        // A member added to what a send answers stays off the chain.
+        let mut more = sent.clone();
+        more["reply_to"] = json!("x@y.co");
+        assert_eq!(sent_as_answered(&more, true), on_chain);
     }
 }

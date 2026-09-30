@@ -2905,6 +2905,8 @@ mod a_caller_seed_cannot_start_at_a_declared_key_root {
     const REFUSED_REPOS: &[&str] = &[
         "signing-key",
         "encryption-key",
+        "task-key",
+        "task-key:v1:p0000000000000001",
         "signing-key:v1:ed25519:project:p0000000000000001",
         "https://encryption-key:v1:project:p0000000000000001",
         "  encryption-key:v1:wasm.git",
@@ -2914,6 +2916,7 @@ mod a_caller_seed_cannot_start_at_a_declared_key_root {
     fn the_roots_are_the_declared_families_roots() {
         assert!(SIGNING_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[0]));
         assert!(ENCRYPTION_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[1]));
+        assert!(crate::task_keys::TASK_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[2]));
     }
 
     #[test]
@@ -3370,6 +3373,7 @@ mod signing_key_seed_audit {
         "ecies:",
         "secret-path:",
         "vault-master:",
+        crate::task_keys::TASK_KEY_LABEL,
     ];
 
     #[test]
@@ -3655,6 +3659,7 @@ mod encryption_key_seed_audit {
         "secret-path:",
         "vault-master:",
         SIGNING_KEY_LABEL,
+        crate::task_keys::TASK_KEY_LABEL,
     ];
 
     #[test]
@@ -3920,6 +3925,8 @@ mod signing_keys_at_the_door {
     /// in `refs`, as `(method, "final" | "hash:{hash}")`.
     struct World {
         sealed: std::sync::Mutex<String>,
+        /// The blob of `dave.near`'s row, which names `agent.near`.
+        sealed_named: std::sync::Mutex<String>,
         uuid: std::sync::Mutex<String>,
         project_hidden: std::sync::atomic::AtomicBool,
         vault_unverified: std::sync::atomic::AtomicBool,
@@ -4018,6 +4025,16 @@ mod signing_keys_at_the_door {
                         "profile": { "encrypted_secrets": sealed, "access": { "Whitelist": { "accounts": ["carol.near"] } } },
                         "vault_id": null
                     }),
+                    Some("dave.near") => json!({
+                        "profile": {
+                            "encrypted_secrets": world.sealed_named.lock().unwrap().clone(),
+                            "access": { "Logic": { "operator": "And", "conditions": [
+                                { "Whitelist": { "accounts": ["agent.near"] } },
+                                { "ValidUntil": { "until_ns": "4102444800000000000" } }
+                            ] } }
+                        },
+                        "vault_id": null
+                    }),
                     _ => json!({ "profile": null, "vault_id": null }),
                 })
             }
@@ -4049,6 +4066,7 @@ mod signing_keys_at_the_door {
     async fn world_with(keystore: crate::crypto::Keystore) -> (AppState, Arc<World>) {
         let world = Arc::new(World {
             sealed: Default::default(),
+            sealed_named: Default::default(),
             uuid: std::sync::Mutex::new(P1.to_string()),
             project_hidden: Default::default(),
             vault_unverified: Default::default(),
@@ -4066,6 +4084,8 @@ mod signing_keys_at_the_door {
             // before any decryption, so it never needs a blob of its own.
             let ct = ks.encrypt(None, "project:alice.near/app:alice.near", SECRET_JSON).unwrap();
             *world.sealed.lock().unwrap() = base64::encode(&ct);
+            let ct = ks.encrypt(None, "project:alice.near/app:dave.near", SECRET_JSON).unwrap();
+            *world.sealed_named.lock().unwrap() = base64::encode(&ct);
         }
         (state, world)
     }
@@ -5142,10 +5162,10 @@ mod signing_keys_at_the_door {
                 "carries no predecessor_id",
             ),
             (
-                "four encryption keys",
-                both(Some("alice.near/app"), Some("alice.near"), "bob.near", None, H1, vec![], (0..4).map(|i| pekey(&format!("k{i}"))).collect()),
+                "six encryption keys",
+                both(Some("alice.near/app"), Some("alice.near"), "bob.near", None, H1, vec![], (0..6).map(|i| pekey(&format!("k{i}"))).collect()),
                 StatusCode::BAD_REQUEST,
-                "4 encryption keys were requested; at most 3",
+                "6 encryption keys were requested; at most 5",
             ),
             (
                 "a placeholder caller",
@@ -5364,5 +5384,290 @@ mod signing_keys_at_the_door {
             "encryption_keys": [{ "path": "k", "bind": "wasm", "seed": "wallet:abc:near" }],
         }));
         assert!(parsed.is_err(), "an encryption key cannot carry its own derivation string");
+    }
+
+    /// The task key: asked for beside a row of the run's own project, served
+    /// when that row opens, bound to the project's uuid and the row's owner.
+    mod the_task_key {
+        use super::*;
+
+        /// A run through `project` that names the row of `owner` under
+        /// `row_project`, asks for its task key, and names `keys`.
+        fn task_run(
+            project: Option<&str>,
+            row_project: &str,
+            owner: &str,
+            caller: &str,
+            wasm: &str,
+            keys: Vec<SigningKeyRequest>,
+        ) -> KeyedDecryptRequest {
+            serde_json::from_value(json!({
+                "accessor": { "type": "Project", "project_id": row_project },
+                "profile": "default",
+                "owner": owner,
+                "user_account_id": caller,
+                "task_id": "t1",
+                "executed_wasm_sha256": wasm,
+                "project_id": project,
+                "signing_keys": keys,
+                "task_key": true,
+            }))
+            .unwrap()
+        }
+
+        fn own_row(owner: &str, caller: &str) -> KeyedDecryptRequest {
+            task_run(Some("alice.near/app"), "alice.near/app", owner, caller, H1, vec![])
+        }
+
+        fn task_key_of(response: &KeyedDecryptResponse) -> (String, bool) {
+            let wire = serde_json::to_value(response).unwrap();
+            (
+                wire["task_key"]["key"].as_str().expect("a task key").to_string(),
+                wire["task_key"]["admitted_by_name"].as_bool().expect("how the row admitted"),
+            )
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn it_comes_beside_the_row_with_no_declared_key_named() {
+            let (state, world) = world().await;
+            let response = ask(&state, own_row("dave.near", "agent.near")).await.expect("served");
+            let (key, by_name) = task_key_of(&response);
+            assert_eq!(key.len(), 64);
+            assert!(by_name, "dave's row lists agent.near");
+            let wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(wire.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["secrets", "task_key"]);
+            assert_eq!(world.project_reads.load(Ordering::SeqCst), 1, "the project is read once");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn it_is_the_pinned_string_under_the_default_master() {
+            let keystore = crate::crypto::Keystore::from_master_secret(&pinned_master()).unwrap();
+            let expected = {
+                use hmac::Mac;
+                let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(&pinned_master()).unwrap();
+                mac.update(b"task-key:v1:p0000000000000001:dave.near");
+                hex::encode(mac.finalize().into_bytes())
+            };
+            let (state, _) = world_with(keystore).await;
+            let response = ask(&state, own_row("dave.near", "agent.near")).await.expect("served");
+            assert_eq!(task_key_of(&response).0, expected);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_row_open_to_everyone_gives_the_key_and_says_nobody_was_named() {
+            let (state, _) = world().await;
+            let response = ask(&state, own_row("alice.near", "bob.near")).await.expect("served");
+            assert!(!task_key_of(&response).1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn one_owner_is_one_key_whoever_runs_and_another_owner_is_another() {
+            let (state, _) = world().await;
+            let by_bob = task_key_of(&ask(&state, own_row("alice.near", "bob.near")).await.unwrap()).0;
+            let by_eve = task_key_of(&ask(&state, own_row("alice.near", "eve.near")).await.unwrap()).0;
+            let of_dave = task_key_of(&ask(&state, own_row("dave.near", "agent.near")).await.unwrap()).0;
+            assert_eq!(by_bob, by_eve);
+            assert_ne!(by_bob, of_dave);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_project_created_again_under_the_name_has_another_key() {
+            let (state, world) = world().await;
+            let before = task_key_of(&ask(&state, own_row("alice.near", "bob.near")).await.unwrap()).0;
+            *world.uuid.lock().unwrap() = P2.to_string();
+            let after = task_key_of(&ask(&state, own_row("alice.near", "bob.near")).await.unwrap()).0;
+            assert_ne!(before, after);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn it_comes_beside_declared_keys_and_the_project_is_read_once() {
+            let (state, world) = world().await;
+            let request =
+                task_run(Some("alice.near/app"), "alice.near/app", "dave.near", "agent.near", H1, vec![pkey("records")]);
+            let response = ask(&state, request).await.expect("served");
+            assert_eq!(seed_of(&response, "records").len(), 64);
+            assert_ne!(seed_of(&response, "records"), task_key_of(&response).0);
+            assert_eq!(world.project_reads.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_row_that_does_not_exist_gives_none_and_the_run_goes_on() {
+            let (state, _) = world().await;
+            let response = ask(&state, own_row("nobody.near", "bob.near")).await.expect("answered");
+            let wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(wire["secrets"]["status"], "not_found");
+            assert!(wire.get("task_key").is_none(), "{wire}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_row_that_refuses_the_caller_refuses_the_request() {
+            let (state, _) = world().await;
+            let (status, body) = refused(ask(&state, own_row("dave.near", "bob.near")).await).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert!(body.get("task_key").is_none(), "{body}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_build_that_is_no_version_of_the_project_gets_none_and_the_row_is_not_read() {
+            let (state, world) = world().await;
+            for wasm in [H3, H4] {
+                let request = task_run(Some("alice.near/app"), "alice.near/app", "alice.near", "bob.near", wasm, vec![]);
+                let (status, body) = refused(ask(&state, request).await).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert!(is_key_refusal(&body), "{body}");
+                assert!(body.to_string().contains("Task key refused"), "{body}");
+            }
+            assert_eq!(world.secret_reads.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_direct_run_a_row_of_another_project_and_no_row_are_refused_before_the_chain() {
+            let (state, world) = world().await;
+            let direct = task_run(None, "alice.near/app", "alice.near", "bob.near", H1, vec![]);
+            let another = task_run(Some("alice.near/app"), "mallory.near/app", "alice.near", "bob.near", H1, vec![]);
+            let no_row: KeyedDecryptRequest = serde_json::from_value(json!({
+                "user_account_id": "bob.near",
+                "executed_wasm_sha256": H1,
+                "project_id": "alice.near/app",
+                "task_key": true,
+            }))
+            .unwrap();
+            for request in [direct, another, no_row] {
+                let (status, body) = refused(ask(&state, request).await).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert!(is_key_refusal(&body), "{body}");
+            }
+            assert_eq!(world.project_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(world.secret_reads.load(Ordering::SeqCst), 0);
+        }
+
+        /// `own_row`, called by `predecessor`.
+        fn own_row_called_by(owner: &str, caller: &str, predecessor: &str) -> KeyedDecryptRequest {
+            let mut request = serde_json::to_value(json!({
+                "accessor": { "type": "Project", "project_id": "alice.near/app" },
+                "profile": "default",
+                "owner": owner,
+                "user_account_id": caller,
+                "predecessor_id": predecessor,
+                "task_id": "t1",
+                "executed_wasm_sha256": H1,
+                "project_id": "alice.near/app",
+                "task_key": true,
+            }))
+            .unwrap();
+            request["signing_keys"] = json!([]);
+            serde_json::from_value(request).unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_caller_that_is_no_account_gets_the_row_and_no_task_key() {
+            let (state, world) = world().await;
+            let with_an_account = serde_json::to_value(ask(&state, own_row("alice.near", "bob.near")).await.unwrap()).unwrap();
+            assert!(with_an_account.get("task_key").is_some(), "{with_an_account}");
+            let reads = world.project_reads.load(Ordering::SeqCst);
+
+            for caller in ["anonymous", "Not An Account", "a"] {
+                let response = ask(&state, own_row("alice.near", caller)).await.expect("served");
+                let wire = serde_json::to_value(&response).unwrap();
+                assert!(wire.get("task_key").is_none(), "{caller}: a task key was issued");
+                assert_eq!(wire["secrets"], with_an_account["secrets"], "{caller}: the row is served as it was");
+                assert_eq!(wire.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["secrets"]);
+            }
+            assert_eq!(world.project_reads.load(Ordering::SeqCst), reads, "no chain read for a key that is not issued");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_predecessor_that_is_no_account_gets_the_row_and_no_task_key() {
+            let (state, _) = world().await;
+            let called = ask(&state, own_row_called_by("alice.near", "bob.near", "bob.near")).await.expect("served");
+            assert_eq!(task_key_of(&called).0.len(), 64, "a predecessor that is an account changes nothing");
+            for predecessor in ["anonymous", "Not An Account"] {
+                let response = ask(&state, own_row_called_by("alice.near", "bob.near", predecessor)).await.expect("served");
+                let wire = serde_json::to_value(&response).unwrap();
+                assert!(wire.get("task_key").is_none(), "{predecessor}: a task key was issued");
+                assert_eq!(wire["secrets"]["status"], serde_json::to_value(&called).unwrap()["secrets"]["status"]);
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_caller_that_is_no_account_is_refused_beside_declared_keys_as_without_a_task_key() {
+            let (state, world) = world().await;
+            let keys = || vec![pkey("records")];
+            let without = keyed_with_row("alice.near", "anonymous", H1, keys());
+            let with = task_run(Some("alice.near/app"), "alice.near/app", "alice.near", "anonymous", H1, keys());
+            let (status, without) = refused(ask(&state, without).await).await;
+            let (status_with, with) = refused(ask(&state, with).await).await;
+            assert_eq!((status_with, &with), (status, &without), "asking for the task key changes nothing of the refusal");
+            assert!(is_key_refusal(&with), "{with}");
+            assert_eq!(world.secret_reads.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_request_without_a_task_key_gets_what_it_got_whoever_calls() {
+            let (state, _) = world().await;
+            let read = |bytes: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&bytes).expect("a JSON answer");
+            let body = |caller: &str, task_key: serde_json::Value| {
+                json!({
+                    "accessor": { "type": "Project", "project_id": "alice.near/app" },
+                    "profile": "default",
+                    "owner": "alice.near",
+                    "user_account_id": caller,
+                    "executed_wasm_sha256": H1,
+                    "project_id": "alice.near/app",
+                    "task_key": task_key,
+                })
+                .to_string()
+            };
+            let (status, by_an_account) = post(&state, Some("application/json"), body("bob.near", json!(false))).await;
+            assert_eq!(status, StatusCode::OK);
+            let by_an_account = read(by_an_account);
+            assert!(by_an_account.get("plaintext_secrets").is_some(), "{by_an_account}");
+            for caller in ["anonymous", "Not An Account"] {
+                for quiet in [json!(false), json!(null)] {
+                    let (status, answer) = post(&state, Some("application/json"), body(caller, quiet)).await;
+                    assert_eq!((status, read(answer)), (StatusCode::OK, by_an_account.clone()), "{caller}");
+                }
+                // Asked through the door, the row is the same row and the key is absent.
+                let (status, answer) = post(&state, Some("application/json"), body(caller, json!(true))).await;
+                let answer = read(answer);
+                assert_eq!(status, StatusCode::OK, "{answer}");
+                assert!(answer.get("task_key").is_none(), "{answer}");
+                assert_eq!(answer["secrets"]["plaintext_secrets"], by_an_account["plaintext_secrets"], "{answer}");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_request_that_does_not_ask_gets_none() {
+            let (state, _) = world().await;
+            let response = ask(&state, keyed_with_row("alice.near", "bob.near", H1, vec![pkey("records")])).await.unwrap();
+            assert!(serde_json::to_value(&response).unwrap().get("task_key").is_none());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_door_reads_a_body_that_only_asks_for_the_task_key_as_keyed() {
+            let (state, _) = world().await;
+            let body = json!({
+                "accessor": { "type": "Project", "project_id": "alice.near/app" },
+                "profile": "default",
+                "owner": "dave.near",
+                "user_account_id": "agent.near",
+                "executed_wasm_sha256": H1,
+                "project_id": "alice.near/app",
+                "task_key": true,
+            });
+            let read = |bytes: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&bytes).expect("a JSON answer");
+            let (status, answer) = post(&state, Some("application/json"), body.to_string()).await;
+            let answer = read(answer);
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["task_key"]["admitted_by_name"], true);
+            for quiet in [json!(null), json!(false)] {
+                let mut body = body.clone();
+                body["task_key"] = quiet;
+                let (status, answer) = post(&state, Some("application/json"), body.to_string()).await;
+                let answer = read(answer);
+                assert_eq!(status, StatusCode::OK, "{answer}");
+                assert!(answer.get("plaintext_secrets").is_some(), "a secrets-only answer: {answer}");
+            }
+        }
     }
 }

@@ -132,12 +132,16 @@ const SIGNING_KEYS_REFUSED: &str = "signing_keys_refused";
 /// from the guest. The keystore reads the kind of run off the project alone;
 /// the accounts the keys belong to travel with the request as
 /// `user_account_id` and `predecessor_id`, as does the build.
+#[derive(Clone, Copy)]
 pub struct KeysRequest<'a> {
     pub project_id: Option<&'a str>,
     /// The signing keys; empty when the manifest declares none.
     pub keys: &'a [crate::signing_keys::ManifestKey],
     /// The encryption keys; empty when the manifest declares none.
     pub encryption_keys: &'a [crate::encryption_keys::EncryptionManifestKey],
+    /// Whether the run asks for its task key: the manifest declares tasks and
+    /// the run, through a project, names a secret row.
+    pub task_key: bool,
 }
 
 impl KeysRequest<'_> {
@@ -146,6 +150,7 @@ impl KeysRequest<'_> {
         match (self.keys.is_empty(), self.encryption_keys.is_empty()) {
             (false, true) => "signing keys",
             (true, false) => "encryption keys",
+            (true, true) if self.task_key => "task key",
             _ => "signing and encryption keys",
         }
     }
@@ -158,6 +163,8 @@ pub struct RunSecrets {
     pub secrets: Option<std::collections::HashMap<String, String>>,
     /// The run's declared keys, when it asked for any.
     pub keys: Option<crate::executor::RunKeys>,
+    /// The run's task key, when it asked for it and its row opened.
+    pub task_grant: Option<crate::tasks::TaskGrant>,
 }
 
 /// A run's secrets request, carrying its declared keys when it declares any —
@@ -169,7 +176,7 @@ pub struct RunDecrypt<'a> {
 
 impl RunSecrets {
     fn plain(secrets: std::collections::HashMap<String, String>) -> Self {
-        Self { secrets: Some(secrets), keys: None }
+        Self { secrets: Some(secrets), keys: None, task_grant: None }
     }
 }
 
@@ -1221,6 +1228,8 @@ impl KeystoreClient {
             signing_keys: &'a [crate::signing_keys::ManifestKey],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             encryption_keys: &'a [crate::encryption_keys::EncryptionManifestKey],
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            task_key: bool,
         }
         #[derive(Deserialize)]
         struct KeyedResponse {
@@ -1230,6 +1239,15 @@ impl KeystoreClient {
             signing_keys: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>,
             #[serde(default)]
             encryption_keys: Option<std::collections::BTreeMap<String, crate::signing_keys::SeedHex>>,
+            #[serde(default)]
+            task_key: Option<TaskKeyPart>,
+        }
+        #[derive(Deserialize)]
+        struct TaskKeyPart {
+            key: crate::signing_keys::SeedHex,
+            admitted_by_name: bool,
+            #[serde(default)]
+            vault: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(tag = "status", rename_all = "snake_case")]
@@ -1249,6 +1267,7 @@ impl KeystoreClient {
             project_id: keys.project_id,
             signing_keys: keys.keys,
             encryption_keys: keys.encryption_keys,
+            task_key: keys.task_key,
         };
         let families = keys.families();
         tracing::info!(
@@ -1258,6 +1277,7 @@ impl KeystoreClient {
             signing_keys = ?keys.keys.iter().map(|k| k.path.as_str()).collect::<Vec<_>>(),
             encryption_keys = ?keys.encryption_keys.iter().map(|k| k.path.as_str()).collect::<Vec<_>>(),
             secret_row = row.is_some(),
+            task_key = keys.task_key,
             task_id = ?task_id,
             "🔑 Sending decrypt request with declared keys to keystore"
         );
@@ -1309,7 +1329,8 @@ impl KeystoreClient {
 
         let parsed = serde_json::from_slice::<KeyedResponse>(&reply.body);
         reply.body.zeroize();
-        let parsed = parsed.context("Failed to parse the keystore's answer with declared keys")?;
+        let mut parsed = parsed.context("Failed to parse the keystore's answer with declared keys")?;
+        let parsed_task_key = parsed.task_key.take();
         // A family asked for must be answered under its own member; a family
         // not asked for must not be answered at all.
         let answered = |member: &str,
@@ -1334,6 +1355,7 @@ impl KeystoreClient {
         let run_keys = crate::executor::RunKeys {
             signing: (!keys.keys.is_empty()).then_some(signing_keys),
             encryption: (!keys.encryption_keys.is_empty()).then_some(encryption_keys),
+            tasks: None,
         };
         tracing::debug!(keys = ?run_keys, "Declared keys received");
 
@@ -1346,7 +1368,26 @@ impl KeystoreClient {
                 Some(Self::parse_plaintext_secrets(&plaintext_secrets)?)
             }
         };
-        Ok(RunSecrets { secrets, keys: Some(run_keys) })
+        // The task key comes beside a row that opened, and only there. Asked
+        // for and not answered beside such a row, the keystore predates it.
+        let task_grant = match (keys.task_key, secrets.is_some(), parsed_task_key) {
+            (false, _, None) => None,
+            (false, _, Some(_)) => anyhow::bail!("The keystore answered with a task key to a request that asked for none"),
+            (true, false, _) => None,
+            (true, true, None) => {
+                return Err(anyhow::Error::new(SigningKeysUnserved).context(
+                    "The keystore answered without the task key this component's tasks need: it predates tasks. \
+                     The run was refused rather than started without them.",
+                ))
+            }
+            (true, true, Some(part)) => {
+                let key = part.key.decode32().ok_or_else(|| {
+                    anyhow::Error::new(SigningKeysUnserved).context("The keystore's task key is not 32 bytes of hex")
+                })?;
+                Some(crate::tasks::TaskGrant::new(key, part.admitted_by_name).under(part.vault))
+            }
+        };
+        Ok(RunSecrets { secrets, keys: Some(run_keys), task_grant })
     }
 
     /// Encrypt data using keystore's derived key
@@ -2184,13 +2225,77 @@ mod signing_key_requests {
         let (url, sent) = keystore_answering(code, body);
         let client = KeystoreClient::new(vec![url], "t".to_string()).unwrap();
         let declared = declared();
-        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared, encryption_keys: &[] };
+        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared, encryption_keys: &[], task_key: false };
         let result = client
             .with_keys(with_keys.then_some(&request))
             .decrypt_secrets_by_project("alice.near/app", "default", "alice.near", "bob.near", Some("data-1"), Some(H), Some("bob.near"))
             .await;
         let sent: serde_json::Value = serde_json::from_str(&sent.join().unwrap()).unwrap();
         (result, sent)
+    }
+
+    /// The run's one call asking for its task key and naming no declared key.
+    async fn task_call(code: u16, body: String) -> (Result<RunSecrets>, serde_json::Value) {
+        let (url, sent) = keystore_answering(code, body);
+        let client = KeystoreClient::new(vec![url], "t".to_string()).unwrap();
+        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &[], encryption_keys: &[], task_key: true };
+        let result = client
+            .with_keys(Some(&request))
+            .decrypt_secrets_by_project("alice.near/app", "default", "alice.near", "bob.near", Some("data-1"), Some(H), Some("bob.near"))
+            .await;
+        let sent: serde_json::Value = serde_json::from_str(&sent.join().unwrap()).unwrap();
+        (result, sent)
+    }
+
+    #[tokio::test]
+    async fn the_task_key_is_asked_for_in_the_runs_one_call_and_comes_beside_the_row() {
+        let body = format!(
+            r#"{{"secrets":{{"status":"decrypted","plaintext_secrets":"{PLAIN}"}},"task_key":{{"key":"{SEED}","admitted_by_name":true}}}}"#
+        );
+        let (run, sent) = task_call(200, body).await;
+        let run = run.expect("served");
+        assert_eq!(sent["task_key"], true);
+        assert_eq!(sent["project_id"], "alice.near/app");
+        assert!(sent.get("signing_keys").is_none() && sent.get("encryption_keys").is_none(), "{sent}");
+        assert_eq!(run.secrets.unwrap()["API_KEY"], "x");
+        let grant = run.task_grant.expect("the grant");
+        assert!(grant.admitted_by_name);
+        assert_eq!(hex::encode(grant.key()), SEED);
+        let keys = run.keys.expect("the run's keys, none of them declared");
+        assert!(keys.signing.is_none() && keys.encryption.is_none() && keys.tasks.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_does_not_ask_sends_no_task_key_member() {
+        let body = format!(r#"{{"secrets":{{"status":"decrypted","plaintext_secrets":"{PLAIN}"}},{}}}"#, keys_ok());
+        let (run, sent) = run_call(200, body, true).await;
+        assert!(sent.get("task_key").is_none(), "{sent}");
+        assert!(run.expect("served").task_grant.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_row_gives_no_task_key_and_the_run_goes_on() {
+        let body = r#"{"secrets":{"status":"not_found","error":"Secrets not found in contract"}}"#;
+        let run = task_call(200, body.into()).await.0.expect("served");
+        assert!(run.secrets.is_none() && run.task_grant.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_task_key_that_is_missing_malformed_or_unasked_fails_the_run() {
+        let opened = format!(r#""secrets":{{"status":"decrypted","plaintext_secrets":"{PLAIN}"}}"#);
+        // A keystore that predates tasks answers the row and nothing else.
+        let e = task_call(200, format!("{{{opened}}}")).await.0.err().expect("unserved");
+        assert!(SigningKeysUnserved::is_unserved(&e) && format!("{e:#}").contains("predates tasks"), "{e:#}");
+        let short = format!(r#"{{{opened},"task_key":{{"key":"abcd","admitted_by_name":true}}}}"#);
+        let e = task_call(200, short).await.0.err().expect("unserved");
+        assert!(SigningKeysUnserved::is_unserved(&e), "{e:#}");
+        let unasked = format!(r#"{{{opened},{},"task_key":{{"key":"{SEED}","admitted_by_name":true}}}}"#, keys_ok());
+        let e = run_call(200, unasked, true).await.0.err().expect("refused");
+        assert!(format!("{e:#}").contains("asked for none"), "{e:#}");
+        // A refusal of the task key is the keys' refusal.
+        let refusal = r#"{"error":"Task key refused: the running build is not a version","code":"signing_keys_refused"}"#;
+        let e = task_call(403, refusal.into()).await.0.err().expect("refused");
+        assert!(SigningKeysRefused::is_refusal(&e) && format!("{e:#}").contains("task key"), "{e:#}");
     }
 
     /// A keys-only call, with the calling account when the run has one.
@@ -2202,7 +2307,7 @@ mod signing_key_requests {
         let (url, sent) = keystore_answering(code, body);
         let client = KeystoreClient::new(vec![url], "t".to_string()).unwrap();
         let declared = declared();
-        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared, encryption_keys: &[] };
+        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &declared, encryption_keys: &[], task_key: false };
         let result = client
             .derive_keys("bob.near", Some("data-1"), H, predecessor, &request)
             .await
@@ -2357,7 +2462,7 @@ mod signing_key_requests {
     async fn a_keystore_that_cannot_be_reached_is_not_a_refusal() {
         let client = KeystoreClient::new(vec!["http://127.0.0.1:1".into()], "t".to_string()).unwrap();
         let declared = declared();
-        let request = KeysRequest { project_id: None, keys: &declared, encryption_keys: &[] };
+        let request = KeysRequest { project_id: None, keys: &declared, encryption_keys: &[], task_key: false };
         let e = client.derive_keys("bob.near", None, H, None, &request).await.err().expect("unreachable");
         assert!(!SigningKeysRefused::is_refusal(&e) && !SigningKeysUnserved::is_unserved(&e), "{e:#}");
     }
@@ -2387,7 +2492,7 @@ mod signing_key_requests {
         let client = KeystoreClient::new(vec![url], "t".to_string()).unwrap();
         let sig = if signing { declared() } else { vec![] };
         let enc = if encryption { declared_encryption() } else { vec![] };
-        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &sig, encryption_keys: &enc };
+        let request = KeysRequest { project_id: Some("alice.near/app"), keys: &sig, encryption_keys: &enc, task_key: false };
         let result = client.derive_keys("bob.near", Some("data-1"), H, None, &request).await;
         let sent: serde_json::Value = serde_json::from_str(&sent.join().unwrap()).unwrap();
         (result, sent)

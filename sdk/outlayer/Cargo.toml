@@ -19,6 +19,8 @@ default = []
 signing-keys = []
 # `outlayer:encryption-keys`: the `encryption_keys` module and `storage::sealed`.
 encryption-keys = []
+# `outlayer:tasks`: the `tasks` module.
+tasks = []
 
 [package.metadata.docs.rs]
 all-features = true

@@ -3,10 +3,10 @@
 //! Every request carries the access token as a bearer header and goes to
 //! `gmail.googleapis.com`, the only mail host in the manifest. Google's own
 //! error text is passed through to the caller, because when Google refuses
-//! something — a scope that was not granted, a quota, a message that no longer
-//! exists — its words are what tell an agent whether to change the request or
-//! stop.
+//! a send — a scope that was not granted, a quota, an API switched off — its
+//! words are what tell an agent whether to change the request or stop.
 
+use crate::policy::CONNECT_PAGE;
 use serde_json::{json, Value};
 use std::time::Duration;
 use wasi_http_client::Client as HttpClient;
@@ -48,11 +48,15 @@ fn describe(status: u16, bytes: &[u8], path: &str) -> String {
     match status {
         401 => format!(
             "credential_rejected: Gmail refused the access token for {path} ({message}). The \
-             refresh token may have been revoked; store a new one."
+             refresh token may have been revoked: the owner connects the account again at \
+             {CONNECT_PAGE}, or, with an OAuth app of their own, stores a new refresh token \
+             in the same secrets row"
         ),
         403 if message.to_ascii_lowercase().contains("insufficient") || message.contains("scope") => format!(
-            "scope_missing: the Gmail token was not granted what {path} needs ({message}). Consent \
-             again with the gmail.send scope, then store the new refresh token."
+            "scope_missing: the Gmail token was not granted what {path} needs ({message}). The \
+             owner connects the account again at {CONNECT_PAGE}, which asks for the gmail.send \
+             scope, or, with an OAuth app of their own, consents again with that scope and \
+             stores the new refresh token in the same secrets row"
         ),
         // Before the rate-limit arm, because Google answers this with 403 too
         // and the advice is the opposite: waiting never clears it, and an agent
@@ -78,9 +82,8 @@ pub fn send(token: &str, raw: &str) -> Result<Value, String> {
     post(token, "/messages/send", &json!({"raw": raw}))
 }
 
-/// Percent-encode a query or path segment. Gmail search strings are full of
-/// spaces, colons and quotes, and an unescaped one would change which mail the
-/// agent is shown.
+/// Percent-encode a query or path segment: everything outside the unreserved
+/// characters, byte by byte.
 pub fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -97,7 +100,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_search_string_survives_the_query_intact() {
+    fn a_segment_is_encoded_byte_by_byte() {
         assert_eq!(urlencode("is:unread from:a@b.c"), "is%3Aunread%20from%3Aa%40b.c");
         assert_eq!(urlencode(r#"subject:"quarterly report""#), "subject%3A%22quarterly%20report%22");
         assert_eq!(urlencode("plain-text_1.0~"), "plain-text_1.0~");
@@ -117,7 +120,10 @@ mod tests {
         let said = describe(403, off, "/messages");
         assert!(said.starts_with("api_disabled:"), "{said}");
         assert!(said.contains("console.cloud.google.com"), "{said}");
-        assert!(describe(401, b"{}", "/profile").starts_with("credential_rejected:"));
+        let rejected = describe(401, b"{}", "/messages/send");
+        assert!(rejected.starts_with("credential_rejected:") && rejected.contains(CONNECT_PAGE), "{rejected}");
+        let said = describe(403, scope, "/messages/send");
+        assert!(said.contains(CONNECT_PAGE) && said.contains("gmail.send"), "{said}");
         assert!(describe(500, b"oops", "/messages").contains("HTTP 500"));
     }
 }

@@ -98,6 +98,14 @@ mod encryption_keys_bindings {
     });
 }
 
+#[cfg(feature = "tasks")]
+mod tasks_bindings {
+    wit_bindgen::generate!({
+        world: "outlayer:tasks/tasks-host",
+        path: "wit",
+    });
+}
+
 pub mod storage;
 pub mod env;
 pub mod vrf;
@@ -105,11 +113,13 @@ pub mod vrf;
 pub mod signing_keys;
 #[cfg(feature = "encryption-keys")]
 pub mod encryption_keys;
+#[cfg(feature = "tasks")]
+pub mod tasks;
 
 /// Low-level access to generated WIT bindings
 ///
-/// Most users should use the high-level `storage`, `env`, `vrf`, `signing_keys`
-/// and `encryption_keys` modules instead.
+/// Most users should use the high-level `storage`, `env`, `vrf`, `signing_keys`,
+/// `encryption_keys` and `tasks` modules instead.
 pub mod raw {
     pub use super::near::rpc::api as rpc;
     pub use super::near::storage::api as storage;
@@ -118,4 +128,6 @@ pub mod raw {
     pub use super::signing_keys_bindings::outlayer::signing_keys::api as signing_keys;
     #[cfg(feature = "encryption-keys")]
     pub use super::encryption_keys_bindings::outlayer::encryption_keys::api as encryption_keys;
+    #[cfg(feature = "tasks")]
+    pub use super::tasks_bindings::outlayer::tasks::api as tasks;
 }

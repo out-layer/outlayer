@@ -77,6 +77,11 @@ ed25519-dalek = "2.1"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 zeroize = "1.8"  # signing-key seeds and encryption keys are wiped when dropped
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }  # encryption keys: XChaCha20-Poly1305
+# tasks: what a task shows is encrypted to the owner's devices with what a
+# browser's WebCrypto has — ECDH on P-256, HKDF-SHA256, AES-256-GCM
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.12"
 poly1305 = { version = "0.8", features = ["zeroize"] }  # its per-message key wiped when dropped, as chacha20poly1305 leaves it off
 
 # Utils

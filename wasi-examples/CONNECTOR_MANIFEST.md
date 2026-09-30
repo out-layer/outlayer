@@ -61,6 +61,7 @@ and exactly the ones priced on chain — see the next section.
 | `signing_keys` | **yes** | ed25519 or secp256k1 keys the module signs with, by `path`. The keystore derives each for the run, bound to the caller and to the project or the exact code; the module reaches them only through the `outlayer:signing-keys` host functions. Any project may declare them. See `signing_keys` below. |
 | `encryption_keys` | **yes** | Symmetric keys the module seals data with, by `path`. Derived like signing keys — the same `bind`, `caller` and `vault` rules — but a separate namespace with its own limit; the module reaches them only through the `outlayer:encryption-keys` host functions. Any project may declare them. See `encryption_keys` below. |
 | `storage_account` | **yes** | Whose cell of the project's per-account storage the run reads and writes: `signer` (default) or `predecessor`. Any project may declare it. See `storage_account` below. |
+| `tasks` | **yes** | `true` when the module leaves tasks for the owner of the secret row a run names, through the `outlayer:tasks` host functions. Any project may declare it. See `tasks` below. |
 | `display` | no | For the dashboard. |
 | `describe` | no | What each operation does and takes, for the developer page (`app.outlayer.ai/connectors/<id>`) — see the next section. |
 
@@ -341,8 +342,8 @@ are dropped with it. The master never leaves the keystore.
 
 * a WASI P1 module that declares keys — only a P2 component imports host
   interfaces;
-* more than 3 keys, a `path` of the wrong shape or declared twice (under any
-  type), an unknown field, a `type`, `bind` or `caller` outside the lists
+* more than 3 signing keys or 5 encryption keys, a `path` of the wrong shape
+  or declared twice (under any type), an unknown field, a `type`, `bind` or `caller` outside the lists
   above;
 * keys declared on a GitHub-sourced run, when the manifest reaches the worker;
 * a `project` key on a run with no project; a `wasm` key on a run through a
@@ -422,8 +423,8 @@ declares no key gets an `err` for every path.
 | `caller` | `signer` (default) \| `predecessor` | As for a signing key. |
 | `vault` | a NEAR account id | `project` keys only, as for a signing key. |
 
-At most 3 encryption keys, counted apart from the signing keys: a manifest may
-declare 3 of each. A key with an unknown field — `type` included — is refused,
+At most 5 encryption keys, counted apart from the signing keys: a manifest may
+declare 3 signing keys and 5 encryption keys. A key with an unknown field — `type` included — is refused,
 not read with the field dropped; a `bind` or `caller` value outside its list is
 refused the same way.
 
@@ -510,6 +511,34 @@ account, and no storage function takes one.
 Any other value — a different spelling, `null`, a number — makes the manifest
 unreadable, and the run is refused. The `@worker` storage (`set-worker`,
 `get-worker`) is the project's own and is not affected by this field.
+
+### `tasks`: asking the owner
+
+```json
+"tasks": true
+```
+
+A module that declares it may leave the owner of the secret row a run names a
+**task** — an action prepared and waiting for the owner's own call — and take
+the owner's answer, through the `outlayer:tasks` host functions
+(`docs/TASKS.md`). Absent means `false`; any other value than the two does not
+parse.
+
+What the declaration does: a run of the module through its project, as a
+WASI P2 component published as a wasm, that names a secret row of that project,
+is given the key its tasks for that row's owner are sealed under — in the same
+request to the keystore that opens the row. The key is held by the host and
+never given to the module.
+
+A run that cannot hold one still runs, and every call of the interface says
+why: `no-owner` for a run that names no row, whose row did not open, or that
+goes through no project. A module that imports the interface without declaring
+`tasks` is answered `not-declared`.
+
+Every operation the module serves for tasks — the ones a task names to answer
+it, and `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` —
+is an operation like any other: listed in `operations`, and priced when the
+module is a connector.
 
 ## How a request names its operation
 

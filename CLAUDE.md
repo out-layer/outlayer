@@ -150,6 +150,7 @@ cd keystore-worker && cargo run          # Run keystore
 - [DOCS_INDEX.md](https://github.com/out-layer/dashboard/blob/main/DOCS_INDEX.md) - Integration guides, API reference (dashboard repo)
 - [wasi-examples/WASI_TUTORIAL.md](wasi-examples/WASI_TUTORIAL.md) - WASI guide
 - [docs/CONNECTORS.md](docs/CONNECTORS.md) - Building a connector: model, secrets, limits
+- [docs/TASKS.md](docs/TASKS.md) - Tasks between an agent and its owner: the model, the inbox, the host interface
 - [docs/ADMIN.md](docs/ADMIN.md) - Coordinator `/admin/*` endpoints, auth model, what a leaked token reaches
 - [contract/README.md](contract/README.md) - Contract API
 - [worker/README.md](worker/README.md) - Worker config

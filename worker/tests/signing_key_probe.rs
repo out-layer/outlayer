@@ -121,7 +121,7 @@ async fn run(wasm: &[u8], keys: Option<SigningKeys>, input: Value) -> ExecutionR
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
     executor
-        .with_keys(offchainvm_worker::executor::RunKeys { signing: keys, encryption: None })
+        .with_keys(offchainvm_worker::executor::RunKeys { signing: keys, encryption: None, tasks: None })
         .execute(
             wasm,
             Some(&sha),

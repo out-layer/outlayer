@@ -69,6 +69,7 @@ use crate::outlayer_vrf::{VrfHostState, add_vrf_to_linker};
 use crate::outlayer_wallet::{WalletHostState, add_wallet_to_linker};
 use crate::signing_keys::{SigningKeys, SigningKeysHostState, add_signing_keys_to_linker};
 use crate::encryption_keys::{EncryptionKeys, EncryptionKeysHostState, add_encryption_keys_to_linker};
+use crate::tasks::{add_tasks_to_linker, TasksHostState};
 
 use super::ExecutionContext;
 
@@ -100,6 +101,9 @@ struct HostState {
     /// This run's encryption keys (only present if the component imports
     /// `outlayer:encryption-keys/api`). Dropped with the store, at the end of the run.
     encryption_keys_state: Option<EncryptionKeysHostState>,
+    /// This run's tasks (only present if the component imports
+    /// `outlayer:tasks/api`). Dropped with the store, at the end of the run.
+    tasks_state: Option<TasksHostState>,
     /// Counter for timed-out HTTP requests (shared with spawned tasks)
     http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
     /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
@@ -342,6 +346,11 @@ impl HostState {
         self.signing_keys_state.as_mut().expect("Signing keys state not initialized")
     }
 
+    /// Get tasks host state (for host function callbacks)
+    fn tasks_state_mut(&mut self) -> &mut TasksHostState {
+        self.tasks_state.as_mut().expect("Tasks state not initialized")
+    }
+
     /// Get encryption-keys host state (for host function callbacks)
     fn encryption_keys_state_mut(&mut self) -> &mut EncryptionKeysHostState {
         self.encryption_keys_state.as_mut().expect("Encryption keys state not initialized")
@@ -381,7 +390,7 @@ pub async fn execute(
     exec_ctx: Option<&ExecutionContext>,
     keys: super::RunKeys,
 ) -> Result<(Vec<u8>, u64, Option<u64>)> {
-    let super::RunKeys { signing: signing_keys, encryption: encryption_keys } = keys;
+    let super::RunKeys { signing: signing_keys, encryption: encryption_keys, tasks: tasks_run } = keys;
     // Use global P2 engine (avoids ~50-100ms overhead per execution)
     let engine = get_p2_engine();
 
@@ -624,6 +633,21 @@ pub async fn execute(
         None
     };
 
+    // Tasks: linked only when the component imports the interface. A
+    // component that imports it without declaring tasks, or on a run that
+    // holds nothing for them, is told why by every call.
+    let has_tasks_import = component.component_type().imports(&engine)
+        .any(|(name, _)| name.contains("outlayer:tasks/api"));
+
+    let tasks_state = if has_tasks_import {
+        debug!("Adding task host functions to linker");
+        add_tasks_to_linker(&mut linker, |state: &mut HostState| state.tasks_state_mut())?;
+        Some(TasksHostState::new(tasks_run))
+    } else {
+        drop(tasks_run);
+        None
+    };
+
     // Prepare stdin/stdout/stderr pipes
     let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
     let stdout_pipe =
@@ -692,6 +716,7 @@ pub async fn execute(
         wallet_state,
         signing_keys_state,
         encryption_keys_state,
+        tasks_state,
         http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         engine_handle: engine,
         network_policy,

@@ -1,0 +1,289 @@
+{
+  "operations": [
+    "prepare",
+    "prepare_many",
+    "prepare_raw",
+    "confirm",
+    "confirm_slow",
+    "supply",
+    "confirm_silent",
+    "confirm_trap",
+    "task_status",
+    "task_cancel",
+    "task_delete",
+    "tasks",
+    "tasks_unlock"
+  ],
+  "capabilities": {
+    "network": []
+  },
+  "tasks": true,
+  "describe": {
+    "summary": "Leaves the owner tasks that act on nothing, so that everything around a task can be tested.",
+    "operations": {
+      "prepare": {
+        "class": "write",
+        "doc": "Opens one task for the owner of the row the run names, and answers `awaiting_owner` with its id and hash.",
+        "params": [
+          {
+            "name": "title",
+            "type": "string",
+            "doc": "The task's title, 80 characters at most. `Tasks probe` when it is not named."
+          },
+          {
+            "name": "body",
+            "type": "string",
+            "doc": "Shown as the field `Body`, sealed in the task's state, and handed back in the result."
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "doc": "`confirm` (when it is not named), `text` or `file`: what the owner answers with."
+          },
+          {
+            "name": "answer_by",
+            "type": "string",
+            "doc": "The operation that answers a `confirm` task, and the only one that may: `confirm` (when it is not named), `confirm_slow`, `confirm_silent` or `confirm_trap`. A `text` or `file` task is answered by `supply`."
+          },
+          {
+            "name": "life_seconds",
+            "type": "number",
+            "doc": "How long the task waits; 86400 at most, and that long when it is not named."
+          },
+          {
+            "name": "files",
+            "type": "object[]",
+            "doc": "`{name, content_type, text, repeat}`: a file of `text` written `repeat` times."
+          },
+          {
+            "name": "again",
+            "type": "boolean",
+            "doc": "`supply` opens the next task of the conversation when it answers this one."
+          }
+        ]
+      },
+      "prepare_many": {
+        "class": "write",
+        "doc": "Opens `count` tasks in one run, each as `prepare` makes it, and stops at the first refusal: answers the tasks opened, and the refusal's code and the number of the task refused.",
+        "params": [
+          {
+            "name": "count",
+            "type": "number",
+            "required": true,
+            "doc": "How many tasks to open, 1 to 10."
+          },
+          {
+            "name": "title",
+            "type": "string",
+            "doc": "The task's title, 80 characters at most. `Tasks probe` when it is not named."
+          },
+          {
+            "name": "body",
+            "type": "string",
+            "doc": "Shown as the field `Body`, sealed in the task's state, and handed back in the result."
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "doc": "`confirm` (when it is not named), `text` or `file`: what the owner answers with."
+          },
+          {
+            "name": "answer_by",
+            "type": "string",
+            "doc": "The operation that answers a `confirm` task, and the only one that may: `confirm` (when it is not named), `confirm_slow`, `confirm_silent` or `confirm_trap`. A `text` or `file` task is answered by `supply`."
+          },
+          {
+            "name": "life_seconds",
+            "type": "number",
+            "doc": "How long the task waits; 86400 at most, and that long when it is not named."
+          },
+          {
+            "name": "files",
+            "type": "object[]",
+            "doc": "`{name, content_type, text, repeat}`: a file of `text` written `repeat` times."
+          },
+          {
+            "name": "again",
+            "type": "boolean",
+            "doc": "`supply` opens the next task of the conversation when it answers this one."
+          }
+        ]
+      },
+      "prepare_raw": {
+        "class": "write",
+        "doc": "Opens a `confirm` task whose display is handed to the host as the call spells it.",
+        "params": [
+          {
+            "name": "display",
+            "type": "object",
+            "required": true,
+            "doc": "`{title, fields: [{label, kind, value | values}]}`."
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "doc": "Sealed beside the task and handed back when it is answered."
+          },
+          {
+            "name": "answer_by",
+            "type": "string",
+            "doc": "The operation the task names, as given; `confirm` when it is not named."
+          },
+          {
+            "name": "life_seconds",
+            "type": "number",
+            "doc": "How long the task waits; 86400 at most."
+          }
+        ]
+      },
+      "confirm": {
+        "class": "write",
+        "doc": "The owner answers a task that names `confirm`, and reports what was prepared: the task ends `done`.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "The task answered."
+          },
+          {
+            "name": "task_hash",
+            "type": "string",
+            "required": true,
+            "doc": "The hash of what the owner's page opened."
+          }
+        ]
+      },
+      "confirm_slow": {
+        "class": "write",
+        "doc": "The owner answers a task that names `confirm_slow`, the run waits `seconds`, then reports what was prepared: the task is `answering` for that long and ends `done`.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "The task answered."
+          },
+          {
+            "name": "task_hash",
+            "type": "string",
+            "required": true,
+            "doc": "The hash of what the owner's page opened."
+          },
+          {
+            "name": "seconds",
+            "type": "number",
+            "required": true,
+            "doc": "How long the run waits before it reports, 1 to 170."
+          }
+        ]
+      },
+      "supply": {
+        "class": "write",
+        "doc": "The owner answers a `text` or `file` task and reports what was supplied; a task prepared with `again` opens the next one.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "The task answered."
+          },
+          {
+            "name": "task_hash",
+            "type": "string",
+            "required": true,
+            "doc": "The hash of what the owner's page opened."
+          },
+          {
+            "name": "supplied",
+            "type": "string",
+            "required": true,
+            "doc": "What the owner supplies, sealed to the task's reply key, in base64."
+          }
+        ]
+      },
+      "confirm_silent": {
+        "class": "write",
+        "doc": "The owner answers a task that names `confirm_silent` or `confirm`, and reports nothing: the task ends `failed`.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "The task answered."
+          },
+          {
+            "name": "task_hash",
+            "type": "string",
+            "required": true,
+            "doc": "The hash of what the owner's page opened."
+          }
+        ]
+      },
+      "confirm_trap": {
+        "class": "write",
+        "doc": "The owner answers a task that names `confirm_trap` or `confirm`, reports, and traps: the task ends `failed`.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "The task answered."
+          },
+          {
+            "name": "task_hash",
+            "type": "string",
+            "required": true,
+            "doc": "The hash of what the owner's page opened."
+          }
+        ]
+      },
+      "task_status": {
+        "class": "read",
+        "doc": "One task this caller made: its state, and the result, the reason and the run when it has them.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "A task this caller made."
+          }
+        ]
+      },
+      "task_cancel": {
+        "class": "write",
+        "doc": "Withdraws an open task this caller made.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "A task this caller made."
+          }
+        ]
+      },
+      "task_delete": {
+        "class": "write",
+        "doc": "Deletes a task this caller made, in any state.",
+        "params": [
+          {
+            "name": "task_id",
+            "type": "string",
+            "required": true,
+            "doc": "A task this caller made."
+          }
+        ]
+      },
+      "tasks": {
+        "class": "read",
+        "doc": "The tasks this caller made in this project for this owner; an empty list when there are none.",
+        "params": []
+      },
+      "tasks_unlock": {
+        "class": "write",
+        "doc": "The owner's run writes the copies of the open tasks for the device now in force, and answers how many wait.",
+        "params": []
+      }
+    }
+  }
+}

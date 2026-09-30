@@ -12,17 +12,18 @@ Rust SDK for building WASM applications on [OutLayer](https://app.outlayer.ai) -
 outlayer = "0.2"
 ```
 
-Signing keys and encryption keys (with sealed storage) are opt-in features:
+Signing keys, encryption keys (with sealed storage) and tasks are opt-in features:
 
 ```toml
 [dependencies]
-outlayer = { version = "0.2.0", features = ["signing-keys", "encryption-keys"] }
+outlayer = { version = "0.2.0", features = ["signing-keys", "encryption-keys", "tasks"] }
 ```
 
 | Feature | Adds | Host interface |
 |---------|------|----------------|
 | `signing-keys` | `outlayer::signing_keys` | `outlayer:signing-keys` |
 | `encryption-keys` | `outlayer::encryption_keys`, `outlayer::storage::sealed` | `outlayer:encryption-keys` |
+| `tasks` | `outlayer::tasks` | `outlayer:tasks` |
 
 A component imports only the host interfaces whose functions it calls, so
 enabling a feature changes nothing for a component that does not call it.
@@ -212,6 +213,45 @@ sealed::delete("records", None, "init")?;
 ```
 
 `has` and `delete` return a failed storage call as `Err`, never as `false`.
+
+### Tasks (`outlayer::tasks`, feature `tasks`)
+
+An agent prepares; the owner reads and acts with a call of their own. A run
+admitted to an owner's secret row leaves that owner a task, and the owner
+answers it by calling an operation of the same project. Declare `"tasks": true`
+in the manifest. The model is in `docs/TASKS.md`.
+
+```rust
+use outlayer::tasks::{self, Display, FieldKind, WrittenBy};
+
+// Preparing: instead of acting, ask — and answer the agent `awaiting_owner`.
+let opened = tasks::confirm(
+    Display::new("Send an email")
+        .list("To", &to, WrittenBy::Agent)
+        .field("Body", FieldKind::LongText, &body, WrittenBy::Agent),
+    "confirm",          // the operation the owner calls
+    &state,             // handed back to it; never shown
+    policy.as_bytes(),  // the policy the task is made under
+)
+.file("report.pdf", "application/pdf", &pdf)
+.open()?;
+let answer = tasks::awaiting_owner(&opened);
+
+// Acting: the operation the task names, called by the owner.
+let answer = tasks::answered_for("confirm", &input, policy.as_bytes())?;
+// … act on `answer.state` and `answer.files`, under the policy as it is now …
+tasks::report(&answer.id, result.as_bytes())?;
+
+// task_status, task_cancel, task_delete, tasks, tasks_unlock
+if let Some(answer) = tasks::dispatch(operation, &input) {
+    return answer;
+}
+```
+
+A refusal is a `TaskError`: a `reason` to branch on and a sentence.
+`TaskError::refusal()` is it as a project answers it, `code: sentence`. Nothing
+is never an error — `mine()` with no tasks is an empty list — and a store that
+did not answer is never an empty list.
 
 Encryption is randomized, so compare-and-swap compares the stored ciphertext,
 never a plaintext: `get` returns a `Sealed` holding both, and it is the

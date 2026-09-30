@@ -160,8 +160,9 @@ fn refresh(credential: &Credential) -> Result<(String, u64), String> {
             return Err(format!(
                 "credential_expired: Google refused the refresh token ({described}). It is gone for \
                  good — revoked, unused for six months, or issued by an OAuth client still in \
-                 testing mode, which expires tokens in days. Mint a new refresh token and store it \
-                 again; retrying will not help."
+                 testing mode, which expires tokens in days. The owner connects the account again \
+                 at https://app.outlayer.ai/connect/gmail, or, with an OAuth app of their own, \
+                 stores a new refresh token in the same secrets row; retrying will not help."
             ));
         }
         return Err(format!(

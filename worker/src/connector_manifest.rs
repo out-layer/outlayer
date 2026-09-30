@@ -88,7 +88,7 @@ pub struct ProjectManifest {
     /// one the run cannot be served refuses the run.
     #[serde(default, deserialize_with = "crate::signing_keys::deserialize_declared")]
     pub signing_keys: Option<Vec<crate::signing_keys::ManifestKey>>,
-    /// Encryption keys the artefact seals data with, by path, at most three —
+    /// Encryption keys the artefact seals data with, by path, at most five —
     /// see [`crate::encryption_keys`] and `wit/deps/encryption-keys.wit`.
     /// Issued under the signing keys' rules, in a namespace of their own: a
     /// path may name a signing key and an encryption key at once, and they
@@ -104,6 +104,12 @@ pub struct ProjectManifest {
     /// the run.
     #[serde(default)]
     pub storage_account: StorageAccount,
+    /// Whether the artefact uses tasks (`outlayer:tasks`): a run of it that
+    /// names a secret row of its own project is given the key its tasks for
+    /// that row's owner are sealed under. A value other than `true` or
+    /// `false` does not parse.
+    #[serde(default)]
+    pub tasks: bool,
     /// The operation names, for the dashboard and the price-list check.
     #[serde(default, rename = "operations")]
     _operations: Option<serde::de::IgnoredAny>,

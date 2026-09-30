@@ -71,16 +71,23 @@ print(f"Manifest: {len(declared)} operations agree with the price list")
 PYCHECK
 
 # `status` is free, so an agent can see its own limits before spending anything.
-# Sending is a cent: it is the only operation, and the only one that leaves a
-# trace outside the enclave.
+# Sending is a cent, paid by whoever asks for the message: the agent. The
+# owner's `confirm` of a message already paid for is free, and so is asking
+# where a task stands.
 near call "$CONTRACT" set_project_pricing "$(cat <<JSON
 {
   "project_id": "$PROJECT",
   "pricing": {
     "author_account_id": "$AUTHOR",
     "operations": [
-      {"operation": "status", "price_usd": "0",       "developer_share_bp": 0},
-      {"operation": "send",   "price_usd": "10000",   "developer_share_bp": 0}
+      {"operation": "status",       "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "send",         "price_usd": "10000", "developer_share_bp": 0},
+      {"operation": "confirm",      "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "task_status",  "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "task_cancel",  "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "task_delete",  "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "tasks",        "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "tasks_unlock", "price_usd": "0",     "developer_share_bp": 0}
     ]
   }
 }

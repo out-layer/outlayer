@@ -482,17 +482,17 @@ fn seed_for_log(seed: &str) -> String {
     }
 }
 
-/// The roots of the two families derived only for the keys a job's manifest
-/// declares (`crate::signing_keys`, `crate::encryption_keys`), version
-/// included in neither so a later scheme is covered too.
-pub(crate) const DECLARED_KEY_ROOTS: [&str; 2] = ["signing-key:", "encryption-key:"];
+/// The roots of the families derived only for what a job's manifest declares
+/// (`crate::signing_keys`, `crate::encryption_keys`, `crate::task_keys`),
+/// version included in none so a later scheme is covered too.
+pub(crate) const DECLARED_KEY_ROOTS: [&str; 3] = ["signing-key:", "encryption-key:", "task-key:"];
 
 /// Refuse a seed a caller spells when it starts at a declared-key root.
 ///
 /// `/pubkey`, `/encrypt` and `/add_generated_secret` derive from the seed they
 /// are sent — a secret's seed, `repo:owner[:branch]` and its siblings, none of
-/// which starts at either root. One that did would spell a declared key's
-/// derivation string.
+/// which starts at any of these roots. One that did would spell a declared
+/// key's derivation string.
 fn refuse_declared_key_seed(seed: &str) -> Result<(), ApiError> {
     match DECLARED_KEY_ROOTS.iter().find(|root| seed.starts_with(**root)) {
         Some(root) => Err(ApiError::BadRequest(format!(
@@ -1105,7 +1105,8 @@ async fn decrypt_handler(
             Json(serde_json::json!({
                 "error": format!(
                     "the request body cannot be read as either a secrets request or a keyed request: \
-                     {reason}. A body names each of `signing_keys` and `encryption_keys` at most once."
+                     {reason}. A body names each of `signing_keys`, `encryption_keys` and `task_key` at \
+                     most once."
                 )
             })),
         )
@@ -1132,13 +1133,13 @@ fn json_content_type(headers: &axum::http::HeaderMap) -> bool {
 /// Which request a `/decrypt` body is.
 enum BodyShape {
     /// A `signing_keys` or `encryption_keys` member other than `null` or an
-    /// empty array.
+    /// empty array, or a `task_key` member other than `null` or `false`.
     Keyed,
     /// No such member — or not a JSON object at all, or not JSON: the
     /// secrets-only extractor answers it as it always has.
     SecretsOnly,
-    /// A JSON object the probe could not read as data — `signing_keys` or
-    /// `encryption_keys` named twice. Neither parser is trusted with it: a duplicate member is read
+    /// A JSON object the probe could not read as data — `signing_keys`,
+    /// `encryption_keys` or `task_key` named twice. Neither parser is trusted with it: a duplicate member is read
     /// differently by different readers, so which shape the body "is" would
     /// depend on which reader looked. Refused with the reason.
     Ambiguous(String),
@@ -1151,6 +1152,13 @@ fn body_shape(body: &[u8]) -> BodyShape {
         signing_keys: Option<serde_json::Value>,
         #[serde(default)]
         encryption_keys: Option<serde_json::Value>,
+        #[serde(default)]
+        task_key: Option<serde_json::Value>,
+    }
+    /// Absent, `null` or `false`: asks for no task key. Anything else is the
+    /// keyed parser's to read, or to refuse.
+    fn asks_task_key(member: &Option<serde_json::Value>) -> bool {
+        !matches!(member, None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)))
     }
     /// Absent, `null` or `[]`: names no key.
     fn names_keys(member: &Option<serde_json::Value>) -> bool {
@@ -1161,7 +1169,11 @@ fn body_shape(body: &[u8]) -> BodyShape {
         }
     }
     match serde_json::from_slice::<Probe>(body) {
-        Ok(probe) if names_keys(&probe.signing_keys) || names_keys(&probe.encryption_keys) => BodyShape::Keyed,
+        Ok(probe)
+            if names_keys(&probe.signing_keys) || names_keys(&probe.encryption_keys) || asks_task_key(&probe.task_key) =>
+        {
+            BodyShape::Keyed
+        }
         Ok(_) => BodyShape::SecretsOnly,
         // A data error on a well-formed object is one of the probe's fields
         // named more than once; a data error on anything else (an array, a
@@ -1203,7 +1215,7 @@ async fn decrypt_secrets_only(
         return Err(not_ready());
     }
     let worker_key = worker_key(&worker);
-    let plaintext_secrets = decrypt_secret_row(
+    let OpenedRow { plaintext_secrets, .. } = decrypt_secret_row(
         &state,
         &worker_key,
         SecretRow {
@@ -1234,6 +1246,14 @@ async fn decrypt_secrets_only(
 /// `secrets` and the keys still come back; any other failure of the row fails
 /// the request with the same status and message a secrets-only request gets.
 /// Only then are the keys derived.
+///
+/// A request may also ask for the run's task key (`crate::task_keys`), with
+/// declared keys or without. What it says of the run is validated first; the
+/// project is established on the contract by the reads the declared keys
+/// need, made once; and the key is derived only beside a row that opened,
+/// with how the row admitted the caller. A row that does not exist yields no
+/// task key and the answer says so by leaving it out; so does a caller or a
+/// predecessor that is no account, on a request that names no declared key.
 async fn decrypt_with_keys(
     state: AppState,
     worker: Option<axum::Extension<WorkerIdentity>>,
@@ -1265,7 +1285,7 @@ async fn decrypt_with_keys(
         }
     };
 
-    let authorized = authorize_keys(&state, &req).await.inspect_err(|e| {
+    let refused_log = |e: &ApiError| {
         tracing::warn!(
             task_id = %task_id_str,
             worker = %worker_key,
@@ -1275,12 +1295,91 @@ async fn decrypt_with_keys(
             "Declared keys refused: {}",
             crate::signing_keys::bounded(e.message(), crate::signing_keys::MOST_QUOTED_ERROR)
         );
-    })?;
+    };
 
+    // What the request says of its task key, before any chain read.
+    let task_run = match req.task_key {
+        false => None,
+        true => Some(
+            crate::task_keys::validate_request(
+                req.project_id.as_deref(),
+                req.executed_wasm_sha256.as_deref(),
+                match &req.accessor {
+                    Some(SecretAccessor::Project { project_id }) => Some(project_id.as_str()),
+                    _ => None,
+                },
+                req.owner.as_deref(),
+            )
+            .map_err(|m| ApiError::SigningKeysRefused(StatusCode::BAD_REQUEST, format!("Task key refused: {m}")))
+            .inspect_err(refused_log)?,
+        ),
+    };
+    let names_keys = !req.signing_keys.is_empty() || !req.encryption_keys.is_empty();
+    // A request that names declared keys is judged on them; one that names
+    // none and asks for no task key is refused there, for naming nothing.
+    let authorized = match names_keys || task_run.is_none() {
+        true => Some(authorize_keys(&state, &req).await.inspect_err(refused_log)?),
+        false => None,
+    };
+    // A request for the task key alone passes no judgement of declared keys,
+    // which is where the caller and the predecessor are held to be accounts.
+    // They are held to it here: a run of no account gets no task key, and
+    // its row is served as it is to a request that asks for none.
+    let task_run = match (task_run, &authorized) {
+        (Some(task), None) => {
+            match crate::task_keys::real_callers(&req.user_account_id, req.predecessor_id.as_deref()) {
+                Ok(()) => Some(task),
+                Err(why) => {
+                    tracing::warn!(
+                        task_id = %task_id_str,
+                        worker = %worker_key,
+                        project_id = %task.project.as_str(),
+                        caller = %seed_for_log(&req.user_account_id),
+                        predecessor = ?req.predecessor_id.as_deref().map(seed_for_log),
+                        "Task key withheld: {}",
+                        crate::signing_keys::bounded(&why, crate::signing_keys::MOST_QUOTED_ERROR)
+                    );
+                    None
+                }
+            }
+        }
+        (task, Some(_)) | (task @ None, None) => task,
+    };
+    // The uuid the task key is bound to: the one the declared keys were bound
+    // to, read once for both, or read here for a request that names no key.
+    let task_project = match (&task_run, &authorized) {
+        (None, _) => None,
+        (Some(task), Some(authorized)) => Some(
+            authorized
+                .run()
+                .project
+                .as_ref()
+                .map(|p| p.uuid.clone())
+                .ok_or_else(|| {
+                    ApiError::InternalError(format!(
+                        "Task key: project {} was judged without its uuid",
+                        task.project.as_str()
+                    ))
+                })?,
+        ),
+        (Some(task), None) => Some(
+            published_project(&state, "Task key", &task.project, &task.wasm_sha256)
+                .await
+                .inspect_err(refused_log)?
+                .1,
+        ),
+    };
+
+    let mut admitted_by_name = false;
+    let mut row_vault: Option<near_primitives::types::AccountId> = None;
     let secrets = match row {
         None => None,
         Some(row) => Some(match decrypt_secret_row(&state, &worker_key, row).await {
-            Ok(plaintext_secrets) => SecretsOutcome::Decrypted { plaintext_secrets },
+            Ok(opened) => {
+                admitted_by_name = opened.admitted_by_name;
+                row_vault = opened.vault;
+                SecretsOutcome::Decrypted { plaintext_secrets: opened.plaintext_secrets }
+            }
             // The one refusal the worker runs on past, reported beside the keys.
             Err(ApiError::SecretsNotFound(error)) => {
                 tracing::info!(task_id = %task_id_str, "Secret row reported as not found beside the declared keys");
@@ -1290,13 +1389,50 @@ async fn decrypt_with_keys(
         }),
     };
 
-    let signing_keys = match &authorized.signing {
-        Some(bound) => Some(derive_keys(&state, bound, &authorized.what).await?),
-        None => None,
+    let (signing_keys, encryption_keys) = match &authorized {
+        None => (None, None),
+        Some(authorized) => (
+            match &authorized.signing {
+                Some(bound) => Some(derive_keys(&state, bound, &authorized.what).await?),
+                None => None,
+            },
+            match &authorized.encryption {
+                Some(bound) => Some(derive_keys(&state, bound, &authorized.what).await?),
+                None => None,
+            },
+        ),
     };
-    let encryption_keys = match &authorized.encryption {
-        Some(bound) => Some(derive_keys(&state, bound, &authorized.what).await?),
-        None => None,
+    // Only beside a row that opened: the key belongs to the owner whose row
+    // admitted this run.
+    let task_key = match (&task_run, &task_project, &secrets) {
+        (Some(task), Some(uuid), Some(SecretsOutcome::Decrypted { .. })) => {
+            let input = crate::task_keys::TaskKeyInput::new(uuid, &task.owner);
+            let key = state
+                .keystore
+                .read()
+                .await
+                .derive_task_key(&input, row_vault.as_ref())
+                .map_err(|e| ApiError::InternalError(format!("Task key could not be derived: {e}")))?;
+            tracing::info!(
+                task_id = %task_id_str,
+                worker = %worker_key,
+                project_id = %task.project.as_str(),
+                project_uuid = %uuid.as_str(),
+                owner = %task.owner,
+                caller = %seed_for_log(&req.user_account_id),
+                admitted_by_name = %admitted_by_name,
+                "Task key derived"
+            );
+            Some(crate::task_keys::TaskKeyGrant {
+                key: crate::signing_keys::SeedHex::from_seed(&key),
+                admitted_by_name,
+                vault: row_vault.as_ref().map(|v| v.to_string()),
+            })
+        }
+        _ => None,
+    };
+    let Some(authorized) = authorized else {
+        return Ok(Json(KeyedDecryptResponse { secrets, signing_keys, encryption_keys, task_key }));
     };
     let described = |bound: &Option<crate::signing_keys::BoundKeys>| {
         bound
@@ -1328,7 +1464,7 @@ async fn decrypt_with_keys(
         encryption_keys = ?described(&authorized.encryption),
         "Declared keys derived"
     );
-    Ok(Json(KeyedDecryptResponse { secrets, signing_keys, encryption_keys }))
+    Ok(Json(KeyedDecryptResponse { secrets, signing_keys, encryption_keys, task_key }))
 }
 
 /// One secret row, as a `/decrypt` request names it, with the facts of the run
@@ -1343,13 +1479,24 @@ struct SecretRow<'a> {
     predecessor_id: Option<&'a str>,
 }
 
+/// A secret row that admitted the caller and decrypted.
+struct OpenedRow {
+    /// The plaintext, base64.
+    plaintext_secrets: String,
+    /// Whether the condition admitted the caller by a whitelist that lists
+    /// them ([`crate::types::AccessCondition::admits_by_name`]).
+    admitted_by_name: bool,
+    /// The vault the row is bound to on chain, none for the default master.
+    vault: Option<near_primitives::types::AccountId>,
+}
+
 /// Read one secret row from the contract, judge its access condition against
-/// the job's caller, and decrypt it. Returns the plaintext, base64.
+/// the job's caller, and decrypt it.
 async fn decrypt_secret_row(
     state: &AppState,
     worker_key: &str,
     row: SecretRow<'_>,
-) -> Result<String, ApiError> {
+) -> Result<OpenedRow, ApiError> {
     let task_id_str = row.task_id.unwrap_or("unknown");
 
     // Log request based on accessor type
@@ -1524,7 +1671,15 @@ async fn decrypt_secret_row(
         // with the full chain. (Was InternalError/500, which hid the cause.)
         .map_err(ApiError::from_customer_load)?;
 
-    tracing::info!(task_id = %task_id_str, caller = %caller, "Access granted");
+    let admitted_by_name = admitted_by_name(
+        &access_condition,
+        caller,
+        crate::types::RunFacts {
+            executed_wasm_sha256: row.executed_wasm_sha256,
+            predecessor_id: row.predecessor_id,
+        },
+    );
+    tracing::info!(task_id = %task_id_str, caller = %caller, by_name = %admitted_by_name, "Access granted");
 
     // 4. Build seed based on accessor type
     // SECURITY NOTE:
@@ -1666,7 +1821,17 @@ async fn decrypt_secret_row(
         "Successfully decrypted secrets"
     );
 
-    Ok(plaintext_b64)
+    Ok(OpenedRow { plaintext_secrets: plaintext_b64, admitted_by_name, vault: customer })
+}
+
+/// Whether `condition`, which admitted `caller`, admitted them by name. A
+/// clock or a pattern that cannot be read answers `false`: the verdict was
+/// [`judge_access`]'s, and this only says how it came about.
+fn admitted_by_name(condition: &crate::types::AccessCondition, caller: &str, facts: crate::types::RunFacts<'_>) -> bool {
+    match (crate::types::now_ns(), condition.compile_patterns()) {
+        (Ok(now), Ok(patterns)) => condition.admits_by_name(caller, now, &patterns, facts),
+        _ => false,
+    }
 }
 
 /// The keys of one family that passed [`authorize_keys`], by path: seeds of
@@ -1734,6 +1899,7 @@ fn keys_named(req: &KeyedDecryptRequest) -> &'static str {
         (false, true) => "Signing keys",
         (true, false) => "Encryption keys",
         (false, false) => "Signing and encryption keys",
+        (true, true) if req.task_key => "Task key",
         (true, true) => "Keys",
     }
 }
@@ -1846,30 +2012,7 @@ async fn authorize_keys(state: &AppState, req: &KeyedDecryptRequest) -> Result<A
         .near_client
         .as_ref()
         .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
-    let project_id = project.as_str();
-    let wasm = first.wasm_sha256.as_str();
-
-    let (version, project_view) = project_at_one_block(near_client, project_id, wasm).await;
-    let version = version.map_err(|e| {
-        let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
-        tracing::warn!(project_id = %project_id, "{what}: the project version could not be read: {said}");
-        ApiError::InternalError(format!("{what}: the project version could not be read: {said}"))
-    })?;
-    if !project_version_matches(&version, wasm) {
-        return Err(refused(StatusCode::FORBIDDEN, format!(
-            "the running build (sha256 {wasm}) is not a WasmUrl version of \
-             project {project_id} on the contract. A project run gets keys only when its code is \
-             published under the project as a WasmUrl version whose hash is this build's; a version \
-             built from a GitHub repository gets none."
-        )));
-    }
-    let project_view = project_view.map_err(|e| {
-        let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
-        tracing::warn!(project_id = %project_id, "{what}: the project could not be read: {said}");
-        ApiError::InternalError(format!("{what}: the project could not be read: {said}"))
-    })?;
-    let owner = project_owner(&project_view, &project).map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
-    let uuid = project_uuid(&project_view, &project).map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
+    let (owner, uuid) = published_project(state, what, &project, &first.wasm_sha256).await?;
 
     // The distinct vaults both families name, in first-seen order.
     let mut vaults: Vec<near_primitives::types::AccountId> = Vec::new();
@@ -1915,6 +2058,51 @@ async fn authorize_keys(state: &AppState, req: &KeyedDecryptRequest) -> Result<A
             })?;
     }
     bind_all(Some(uuid))
+}
+
+/// The project a run goes through, as the contract knows it: its owner and
+/// its uuid, once the running build is established as a WasmUrl version of it
+/// — step 2 of [`authorize_keys`], and the whole of the chain's part for a
+/// request that asks for a task key and names no declared key. `what` names
+/// the keys of the request in refusals and log lines.
+async fn published_project(
+    state: &AppState,
+    what: &str,
+    project: &crate::signing_keys::ProjectId,
+    wasm: &crate::signing_keys::WasmSha256,
+) -> Result<(near_primitives::types::AccountId, crate::signing_keys::ProjectUuid), ApiError> {
+    use crate::signing_keys::{bounded, MOST_QUOTED_ERROR};
+
+    let refused = |status: StatusCode, m: String| ApiError::SigningKeysRefused(status, format!("{what} refused: {m}"));
+    let near_client = state
+        .near_client
+        .as_ref()
+        .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
+    let project_id = project.as_str();
+    let wasm = wasm.as_str();
+
+    let (version, project_view) = project_at_one_block(near_client, project_id, wasm).await;
+    let version = version.map_err(|e| {
+        let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
+        tracing::warn!(project_id = %project_id, "{what}: the project version could not be read: {said}");
+        ApiError::InternalError(format!("{what}: the project version could not be read: {said}"))
+    })?;
+    if !project_version_matches(&version, wasm) {
+        return Err(refused(StatusCode::FORBIDDEN, format!(
+            "the running build (sha256 {wasm}) is not a WasmUrl version of \
+             project {project_id} on the contract. A project run gets keys only when its code is \
+             published under the project as a WasmUrl version whose hash is this build's; a version \
+             built from a GitHub repository gets none."
+        )));
+    }
+    let project_view = project_view.map_err(|e| {
+        let said = bounded(&format!("{e:#}"), MOST_QUOTED_ERROR);
+        tracing::warn!(project_id = %project_id, "{what}: the project could not be read: {said}");
+        ApiError::InternalError(format!("{what}: the project could not be read: {said}"))
+    })?;
+    let owner = project_owner(&project_view, project).map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
+    let uuid = project_uuid(&project_view, project).map_err(|m| refused(StatusCode::FORBIDDEN, m))?;
+    Ok((owner, uuid))
 }
 
 /// `get_version(project_id, wasm)` and `get_project(project_id)`, both as of

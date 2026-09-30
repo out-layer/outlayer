@@ -949,9 +949,10 @@ fi
 #         16b  wallet_id idempotency / offline==online — `customer-recovery compute-wallet-id`
 #              reproduces the SAME wallet_id the coordinator returns from /address for the same
 #              (parent, seed [, vault]) — proving the v2 formula and the offline recovery path agree;
-#         16c  reverse-lookup — GET /wallet/v1/pending_approvals_by_pubkey for a vault-scoped pubkey
-#              resolves the wallet (empty approvals array = found, not 404), and a random pubkey is
-#              handled gracefully (no false hit).
+#         16c  what waits on a wallet — GET /wallet/v1/pending_approvals_by_pubkey is told to the
+#              wallet's owner inside a session: without one 401 session_required; in the owner's
+#              session the wallet is found (200, an empty list); a pubkey with no policy, and
+#              another account's session (OTHER_OWNER), 403 not_wallet_owner.
 # ════════════════════════════════════════════════════════════════════════════════
 if want T16; then
   log "T16 [POLICY] wallet_id v2 invariants — seed-length, idempotency, reverse-lookup"
@@ -979,24 +980,77 @@ if want T16; then
   WID_ONLINE2=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "$(AUTH "$SEED_ID")" | jq -r '.wallet_id // empty')
   [[ "$WID_ONLINE2" == "$WID_ONLINE" ]] && pass "T16b wallet_id idempotent across repeated /address calls" || fail "T16b wallet_id varies across calls: $WID_ONLINE2 != $WID_ONLINE"
 
-  # ── 16c: reverse-lookup /pending_approvals_by_pubkey resolves a (vault-)scoped pubkey ──
-  SEED_REV="t16-rev-$(date +%s)-$$"
-  REV_PK=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "$(AUTH "$SEED_REV")" | jq -r '.public_key // empty')
-  [[ -n "$REV_PK" ]] || fail "T16c no public_key from /address for reverse-lookup"
-  REV_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/pending_approvals_by_pubkey" --data-urlencode "near_pubkey=$REV_PK")
-  REV_COUNT=$(echo "$REV_RESP" | jq -r '.approvals | length' 2>/dev/null || echo "-1")
-  if [[ "$REV_COUNT" == "0" ]]; then
-    pass "T16c reverse-lookup resolved the scoped pubkey (empty approvals array = wallet found)"
-  elif echo "$REV_RESP" | grep -qiE "wallet not found|not_found|404"; then
-    fail "T16c reverse-lookup FAILED to find the scoped wallet by pubkey: $REV_RESP"
+  # ── 16c: what waits on a wallet is listed to the wallet's owner, signed in ──
+  # The owner's page is played by lib/tasks_owner.mjs: it signs in with the owner's wallet key and
+  # sends the session's token, which is printed nowhere. The wallet is given a policy first: the
+  # owner of a wallet is the owner of its policy on the contract, and a wallet with none has no owner.
+  if ! command -v node >/dev/null; then
+    warn "T16c SKIPPED: node is required, it plays the owner's page"
   else
-    pass "T16c reverse-lookup returned a non-error response (scoped pubkey resolved): $(echo "$REV_RESP" | head -c120)"
+    SEED_REV="t16-rev-$(date +%s)-$$"
+    read -r WID_REV _ < <(new_subwallet "$SEED_REV")
+    # The bearer reaches curl as a line of its configuration on stdin, not on its command line.
+    REV_PK=$(printf 'header = "%s"\n' "$(AUTH "$SEED_REV")" \
+      | curl -sS -G -K - "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" | jq -r '.public_key // empty')
+    [[ -n "$REV_PK" ]] || fail "T16c no public_key from /address for the list"
+    store_policy "$SEED_REV" "$WID_REV" '{"rules":{"transaction_types":["transfer"]}}' || fail "T16c store_policy"
+    INBOX_DIR=$(mktemp -d "${TMPDIR:-/tmp}/uop-inbox.XXXXXX"); chmod 700 "$INBOX_DIR"
+    # inbox <account> <command> [args…] — that account's page; leaves its one JSON document in REV.
+    REV=""
+    inbox() {
+      local account=$1; shift
+      REV=$(INBOX_URL="$COORDINATOR_URL" OWNER="$account" OWNER_KEY_FILE="$CREDS_DIR/$account.json" RECIPIENT="$CONTRACT_ID" \
+            STATE_DIR="$INBOX_DIR" node "$SCRIPT_DIR/lib/tasks_owner.mjs" "$@" 2>/dev/null || true)
+      [[ -n "$REV" ]] || REV='{"failed":"the page gave no answer"}'
+    }
+    rev() { jq -r "$1 | if . == null then \"\" else tostring end" <<<"$REV" 2>/dev/null || true; }
+    list_of() { printf '/wallet/v1/pending_approvals_by_pubkey?near_pubkey=%s' "$(jq -rn --arg k "$1" '$k | @uri')"; }
+
+    for who in none garbage; do
+      inbox "$PARENT" raw GET "$(list_of "$REV_PK")" "" "$who"
+      [[ "$(rev .status)" == "401" && "$(rev .body.error)" == "session_required" && "$(rev '.body | has("pending_approvals")')" == "false" ]] \
+        && pass "T16c ($who) without a session the list is 401 session_required" \
+        || fail "T16c ($who) without a session the list answered $(rev .status) $(rev .body.error)"
+    done
+
+    inbox "$PARENT" sign-in uop
+    if [[ "$(rev .status)" == "200" && "$(rev .token_returned)" == "true" && "$(rev .account_id)" == "$PARENT" ]]; then
+      inbox "$PARENT" raw GET "$(list_of "$REV_PK")" "" uop
+      [[ "$(rev .status)" == "200" && "$(rev .body.near_pubkey)" == "$REV_PK" && "$(rev '.body.pending_approvals | type')" == "array" \
+         && "$(rev '.body.pending_approvals | length')" == "0" ]] \
+        && pass "T16c in the owner's session the wallet is found by its pubkey: 200 and an empty list" \
+        || fail "T16c in the owner's session the list answered $(rev .status) $(rev .body.error), pending_approvals a $(rev '.body.pending_approvals | type')"
+      # A wallet nobody stored a policy for is nobody's: no list, and no false hit.
+      inbox "$PARENT" raw GET "$(list_of "ed25519:$(openssl rand -hex 32)")" "" uop
+      [[ "$(rev .status)" == "403" && "$(rev .body.error)" == "not_wallet_owner" ]] \
+        && pass "T16c a pubkey with no policy: 403 not_wallet_owner" \
+        || fail "T16c a pubkey with no policy answered $(rev .status) $(rev .body.error)"
+      # Another account's session: OTHER_OWNER, e.g. outlayer-bob.testnet, with its key in ~/.near-credentials.
+      OTHER_OWNER="${OTHER_OWNER:-}"
+      if [[ -z "$OTHER_OWNER" || "$OTHER_OWNER" == "$PARENT" || ! -r "$CREDS_DIR/$OTHER_OWNER.json" ]]; then
+        warn "T16c SKIPPED for another account's session: needs OTHER_OWNER, an account that is not $PARENT, with its key file in $CREDS_DIR"
+      else
+        inbox "$OTHER_OWNER" sign-in other
+        if [[ "$(rev .status)" == "200" ]]; then
+          inbox "$OTHER_OWNER" raw GET "$(list_of "$REV_PK")" "" other
+          [[ "$(rev .status)" == "403" && "$(rev .body.error)" == "not_wallet_owner" ]] \
+            && pass "T16c in another account's session: 403 not_wallet_owner" \
+            || fail "T16c in another account's session the list answered $(rev .status) $(rev .body.error)"
+          inbox "$OTHER_OWNER" sign-out other
+        else
+          fail "T16c the sign-in of $OTHER_OWNER answered $(rev .status) $(rev .reason)"
+        fi
+      fi
+      inbox "$PARENT" sign-out uop
+      inbox "$PARENT" raw GET "$(list_of "$REV_PK")" "" uop
+      [[ "$(rev .status)" == "401" && "$(rev .body.error)" == "session_required" ]] \
+        && pass "T16c signed out, the list is 401 session_required" \
+        || fail "T16c after the sign-out the list answered $(rev .status) $(rev .body.error)"
+    else
+      fail "T16c the owner's sign-in answered $(rev .status) $(rev .reason)"
+    fi
+    rm -rf "$INBOX_DIR"
   fi
-  # Negative: a random/non-existent pubkey must be handled gracefully (no false hit / no 5xx).
-  FAKE_PK="ed25519:11111111111111111111111111111111111111111"
-  FAKE_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/pending_approvals_by_pubkey" --data-urlencode "near_pubkey=$FAKE_PK")
-  FAKE_COUNT=$(echo "$FAKE_RESP" | jq -r '.approvals | length' 2>/dev/null || echo "-1")
-  [[ "$FAKE_COUNT" == "0" || "$FAKE_COUNT" == "-1" ]] && pass "T16c reverse-lookup of a non-existent pubkey handled gracefully (no false hit)" || fail "T16c random pubkey produced $FAKE_COUNT approvals — false hit: $FAKE_RESP"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════════

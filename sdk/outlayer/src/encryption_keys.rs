@@ -8,7 +8,7 @@
 //!
 //! ## Declaring Keys
 //!
-//! A component declares its keys, at most three, in its `outlayer.manifest`
+//! A component declares its keys, at most five, in its `outlayer.manifest`
 //! custom section:
 //!
 //! ```json
