@@ -135,8 +135,8 @@ impl TasksHostState {
                     wit::Reason::Relayed,
                     format!(
                         "this run was signed by {caller} and called by {called}: tasks are used by the account \
-                         that signs the transaction and calls OutLayer itself, not through a contract and not \
-                         through a relayer that signs for it"
+                         that calls OutLayer itself — directly or through a meta-transaction it signed — not \
+                         through a contract"
                     ),
                 )
             }

@@ -46,8 +46,8 @@ pub struct Policy {
     /// The operations that need the owner: one listed here prepares its
     /// action and leaves it as a task, and the owner's own call carries it
     /// out. Absent or empty: none. Reported by `status` as the policy holds
-    /// it, and not at all when the policy has none.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// it, `null` when the policy has none, so that a reader can tell a
+    /// policy without it from a report that does not know the member.
     pub confirm: Option<Vec<Confirmable>>,
 }
 

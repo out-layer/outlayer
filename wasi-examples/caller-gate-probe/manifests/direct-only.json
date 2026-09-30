@@ -1,0 +1,6 @@
+{
+  "display": { "name": "Caller-gate probe (direct only)" },
+  "operations": ["whoami"],
+  "capabilities": { "network": [] },
+  "callers": { "contract": "deny", "https": "deny" }
+}

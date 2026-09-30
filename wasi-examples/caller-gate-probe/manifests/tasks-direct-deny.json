@@ -1,0 +1,7 @@
+{
+  "display": { "name": "Caller-gate probe (tasks with the direct door shut: refused)" },
+  "operations": ["whoami"],
+  "capabilities": { "network": [] },
+  "tasks": true,
+  "callers": { "direct": "deny" }
+}

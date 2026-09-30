@@ -1,0 +1,6 @@
+{
+  "display": { "name": "Caller-gate probe (meta-transactions admitted, no contract)" },
+  "operations": ["whoami"],
+  "capabilities": { "network": [] },
+  "callers": { "contract": "deny", "meta_tx": "allow" }
+}

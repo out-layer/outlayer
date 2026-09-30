@@ -9,6 +9,7 @@ mod fastfs;
 mod keystore_client;
 mod near_client;
 mod registration;
+mod callers;
 mod connector_manifest;
 mod outlayer_rpc;
 mod outlayer_storage;
@@ -1175,7 +1176,8 @@ come from the coordinator's own flow. contract={:?} task={:?}",
 /// on chain the alpha would follow the bound name, over HTTPS the payment key's
 /// owner, for one flag and one request.
 ///
-/// `user_account_id` is the transaction's own sender and is never rewritten,
+/// `user_account_id` is the transaction's own sender (for a meta-transaction
+/// the account that signed the delegate action) and is never rewritten,
 /// so it slots in ahead of the fallback. For every request that carries no
 /// binding the three are the same account and nothing changes at all — which
 /// is also why this cannot be observed as a regression by anything running
@@ -1226,6 +1228,7 @@ pub const SYSTEM_ENV_VARS: &[&str] = &[
     "NEAR_USER_ACCOUNT_ID",
     "NEAR_PREDECESSOR_ID",
     "NEAR_SIGNER_PUBLIC_KEY",
+    "NEAR_RELAYER_ID",
     // Where and what kind of run.
     "NEAR_NETWORK_ID",
     "OUTLAYER_EXECUTION_TYPE",
@@ -1345,6 +1348,7 @@ fn merge_env_vars(
         env_vars.insert("NEAR_RECEIPT_ID".to_string(), "".to_string());
         env_vars.insert("NEAR_PREDECESSOR_ID".to_string(), "".to_string());
         env_vars.insert("NEAR_SIGNER_PUBLIC_KEY".to_string(), "".to_string());
+        env_vars.insert("NEAR_RELAYER_ID".to_string(), "".to_string());
         env_vars.insert("NEAR_GAS_BURNT".to_string(), "".to_string());
         env_vars.insert("NEAR_TRANSACTION_HASH".to_string(), "".to_string());
         env_vars.insert("NEAR_REQUEST_ID".to_string(), "".to_string());
@@ -1393,6 +1397,13 @@ fn merge_env_vars(
         if let Some(gas_burnt) = context.gas_burnt {
             env_vars.insert("NEAR_GAS_BURNT".to_string(), gas_burnt.to_string());
         }
+        // The account that relayed a meta-transaction and paid its gas; empty
+        // for every other call. The sender and the signer's key are then the
+        // account that signed the delegate action and its key.
+        env_vars.insert(
+            "NEAR_RELAYER_ID".to_string(),
+            context.relayer_id.clone().unwrap_or_default(),
+        );
 
         // Add user account and payment info
         if let Some(user_id) = user_account_id {
@@ -2313,6 +2324,37 @@ async fn handle_execute_job(
     };
     if declared_manifest.is_some() {
         debug!("📄 Manifest read from the wasm's own custom section");
+    }
+
+    // Who may run it: the manifest's `callers` block, judged on the doors the
+    // job came through — HTTPS or on chain, who signed, who called OutLayer,
+    // whether a relayer carried a meta-transaction — and never on anything
+    // the guest or the input says. First of the checks on the run, before
+    // the operation, the keys and the secrets: a caller the author did not
+    // admit gets no keystore round trip and no key derived for them.
+    let caller_rule = declared_manifest.as_ref().and_then(|m| m.callers.as_ref());
+    if let Err(msg) = callers::admit(
+        caller_rule,
+        &callers::RunCaller {
+            is_https_call,
+            user_account_id: user_account_id.map(|s| s.as_str()),
+            predecessor_id,
+            relayer_id: if is_https_call { None } else { context.relayer_id.as_deref() },
+        },
+    ) {
+        error!("❌ {}", msg);
+        report_refusal(
+            api_client,
+            near_client,
+            job,
+            request_id,
+            is_https_call,
+            call_id.map(|s| s.as_str()),
+            msg,
+            Some(api_client::JobStatus::AccessDenied),
+        )
+        .await?;
+        return Ok(());
     }
 
     debug!(
@@ -5427,6 +5469,59 @@ mod the_storage_cell_comes_from_the_manifest_and_the_job {
                 v.starts_with("account_id") || v.starts_with("self.config.account_id") || v.starts_with("\"@worker\""),
                 "a storage request names an account other than the config's or @worker: {line}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod the_caller_gate_in_the_job_path {
+    fn src() -> &'static str {
+        let all = include_str!("main.rs");
+        &all[..all.find("#[cfg(test)]").expect("tests follow the code")]
+    }
+
+    fn gate() -> (usize, &'static str) {
+        let src = src();
+        let at = src
+            .find("let caller_rule = declared_manifest.as_ref().and_then(|m| m.callers.as_ref());")
+            .expect("the gate");
+        let end = at + src[at..].find("return Ok(());").expect("its refusal returns");
+        (at, &src[at..end])
+    }
+
+    #[test]
+    fn the_gate_runs_on_the_manifest_that_runs_and_before_anything_is_derived() {
+        let src = src();
+        let (at, _) = gate();
+        let manifest = src.find("let declared_manifest = match connector_manifest::manifest_from_wasm(").expect("the manifest");
+        assert!(manifest < at, "judged on the manifest read from the bytes that run");
+        for later in [
+            "connector_manifest::may_run(",
+            "signing_keys::declared_signing_keys(",
+            "outlayer_storage::cell_account(",
+            "let user_secrets = if let",
+            ".execute(\n",
+        ] {
+            let there = src.find(later).unwrap_or_else(|| panic!("{later} exists"));
+            assert!(at < there, "the gate comes before {later}");
+        }
+    }
+
+    #[test]
+    fn the_gate_reads_the_jobs_facts_and_settles_its_refusal() {
+        let (_, gate) = gate();
+        for fact in [
+            "is_https_call,",
+            "user_account_id: user_account_id.map(|s| s.as_str()),",
+            "predecessor_id,",
+            "relayer_id: if is_https_call { None } else { context.relayer_id.as_deref() },",
+            "report_refusal(",
+            "Some(api_client::JobStatus::AccessDenied),",
+        ] {
+            assert!(gate.contains(fact), "{fact}: {gate}");
+        }
+        for foreign in ["input_data", "env_vars", "context.sender_id"] {
+            assert!(!gate.contains(foreign), "{foreign} is not a fact of who called: {gate}");
         }
     }
 }

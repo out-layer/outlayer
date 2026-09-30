@@ -110,6 +110,12 @@ pub struct ProjectManifest {
     /// `false` does not parse.
     #[serde(default)]
     pub tasks: bool,
+    /// Which doors a run may come through — see [`crate::callers`]. Absent
+    /// admits every door. A block that breaks a rule does not parse, and
+    /// neither does one that shuts the direct door of an artefact that
+    /// declares `tasks`.
+    #[serde(default, deserialize_with = "crate::callers::deserialize_declared")]
+    pub callers: Option<crate::callers::Callers>,
     /// The operation names, for the dashboard and the price-list check.
     #[serde(default, rename = "operations")]
     _operations: Option<serde::de::IgnoredAny>,
@@ -130,9 +136,10 @@ pub struct ProjectManifest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageAccount {
-    /// The job's `user_account_id`: the transaction signer on chain, the
-    /// payment-key owner over HTTPS; `anonymous` on a run that carries
-    /// neither.
+    /// The job's `user_account_id`: the transaction signer on chain (for a
+    /// meta-transaction the account that signed the delegate action, not its
+    /// relayer), the payment-key owner over HTTPS; `anonymous` on a run that
+    /// carries neither.
     #[default]
     Signer,
     /// The job's `predecessor_id`, the account the secrets and the
@@ -307,7 +314,13 @@ impl ProjectManifest {
     /// manifest is public, author-written text, and "unknown variant
     /// `secp256k1`" is what its author needs.
     pub fn read(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice::<Self>(bytes).map_err(|e| e.to_string())
+        let manifest = serde_json::from_slice::<Self>(bytes).map_err(|e| e.to_string())?;
+        if manifest.tasks && manifest.callers.as_ref().is_some_and(|c| !c.admits_direct()) {
+            return Err("the manifest declares tasks, which the owner answers with a direct call of their own, \
+                        and its callers block does not admit direct calls"
+                .to_string());
+        }
+        Ok(manifest)
     }
 
     #[cfg(test)]
@@ -874,6 +887,7 @@ mod tests {
                 // encryption key, and an unknown top-level member.
                 Err(e) if file.ends_with("encryption-typed.json") => assert!(e.contains("`type`"), "{e}"),
                 Err(e) if file.ends_with("project-misspelled.json") => assert!(e.contains("`storage_acount`"), "{e}"),
+                Err(e) if file.ends_with("tasks-direct-deny.json") => assert!(e.contains("declares tasks"), "{e}"),
                 Err(e) => panic!("{}: {e}", file.display()),
             }
         }
@@ -896,6 +910,26 @@ mod tests {
             resolve_network_policy(false, Some(&silent)),
             NetworkPolicy::Unrestricted
         );
+    }
+
+    #[test]
+    fn tasks_need_the_direct_door() {
+        for callers in [r#"{"direct":"deny"}"#, r#"{"contract":{"only":["game.testnet"]}}"#] {
+            let json = format!(r#"{{"tasks":true,"callers":{callers}}}"#);
+            let err = ProjectManifest::read(json.as_bytes()).unwrap_err();
+            assert!(err.contains("declares tasks") && err.contains("does not admit direct calls"), "{err}");
+            // Without tasks the same block is a rule like any other.
+            ProjectManifest::read(format!(r#"{{"callers":{callers}}}"#).as_bytes()).unwrap();
+        }
+        let open = ProjectManifest::read(br#"{"tasks":true,"callers":{"contract":"deny","https":"deny"}}"#).unwrap();
+        assert!(open.callers.is_some());
+    }
+
+    #[test]
+    fn a_broken_callers_block_refuses_the_manifest() {
+        let err = ProjectManifest::read(br#"{"callers":{"direct":"alow"}}"#).unwrap_err();
+        assert!(err.contains("unknown variant `alow`"), "{err}");
+        assert!(ProjectManifest::read(br#"{}"#).unwrap().callers.is_none());
     }
 
     #[test]

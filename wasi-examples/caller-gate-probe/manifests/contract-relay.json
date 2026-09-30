@@ -1,0 +1,6 @@
+{
+  "display": { "name": "Caller-gate probe (relay.outlayer-alice.testnet only)" },
+  "operations": ["whoami"],
+  "capabilities": { "network": [] },
+  "callers": { "contract": { "only": ["relay.outlayer-alice.testnet"] } }
+}

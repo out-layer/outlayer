@@ -29,6 +29,9 @@ What it is not:
    "tasks": true
    ```
 
+   The owner answers with a direct call of their own: a `callers` block that
+   shuts the direct door beside `tasks` does not parse.
+
 2. Build on the SDK with the `tasks` feature:
 
    ```toml
@@ -104,7 +107,7 @@ interface takes an account.
 | the project's, made by another agent of the same owner | nothing of the first agent's tasks |
 | another project's | nothing of this project's tasks |
 | any run that names no row, or whose row did not open | nothing: `no-owner` |
-| any run a contract relayed — the account that called OutLayer is not the account that signed | nothing: `relayed` |
+| any run a contract relayed — the account that called OutLayer is not the account that signed; a meta-transaction is not one, it is the call of the account that signed the delegate action | nothing: `relayed` |
 
 A run uses tasks only when the account that called OutLayer is the account
 that signed: the owner's wallet calling the contract itself, or a call over
@@ -250,8 +253,10 @@ So a project's answer has to name the task it opened: `tasks::awaiting_owner`
 is that, put wherever the answer has room for it. A turn puts it beside its
 result, for the next task.
 
-The run's answer is served to the owner by `GET /inbox/tasks/{id}/origin` for a
-call over HTTPS; a request on chain answered in its transaction. The
+The run's input and its answer are served to the owner by
+`GET /inbox/tasks/{id}/origin` for a call over HTTPS, each as the bytes its
+attestation's `input_hash` and `output_hash` are the SHA-256 of; a request on
+chain carries both in its transaction. The
 attestation is public (`GET /attestations/by-call/{call_id}`,
 `/by-request/{request_id}`).
 
@@ -319,7 +324,7 @@ every refusal are in the API spec under **Inbox**.
 | sign in, sign out | `POST`, `DELETE /inbox/session` | a signed statement; the session |
 | know what waits, read it | `GET /inbox/tasks` | the session, and this device's key |
 | open a file of a task | `GET /inbox/tasks/{id}/files/{n}` | the session, and this device's key |
-| check the proof | `GET /inbox/tasks/{id}/origin`, and the run's attestation | the session |
+| check the proof: the run, what it was asked, what it answered | `GET /inbox/tasks/{id}/origin`, and the run's attestation | the session |
 | reject, with a reason | `POST /inbox/tasks/{id}/reject` | the session |
 | delete one, or all | `DELETE /inbox/tasks/{id}`, `DELETE /inbox/tasks` | the session |
 | mute an agent or a project, see who is muted, unmute | `POST`, `GET`, `DELETE /inbox/mutes` | the session |

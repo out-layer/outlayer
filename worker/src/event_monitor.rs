@@ -122,6 +122,11 @@ pub struct ExecutionRequestedEvent {
     pub signer_public_key: Option<String>,  // Signer public key from neardata
     #[serde(skip)]
     pub gas_burnt: Option<u64>,  // Gas burnt from neardata
+    /// The account that relayed this call as a NEP-366 meta-transaction —
+    /// signed the outer transaction and paid its gas — read off the block
+    /// that carried the `Delegate` action; `None` when the call was not one.
+    #[serde(skip)]
+    pub relayer_id: Option<String>,
 }
 
 /// ProjectStorageCleanup event data from contract (emitted when project is deleted)
@@ -326,6 +331,9 @@ struct ReceiptAction {
 struct ActionDetails {
     signer_id: Option<String>,
     signer_public_key: Option<String>,
+    /// nearcore's `ActionView`s, kept as JSON: only a `Delegate` is read.
+    #[serde(default)]
+    actions: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,6 +412,107 @@ fn receipt_committed(outcome: &ReceiptExecutionOutcome) -> Result<(), String> {
         .committed()
 }
 
+/// Blocks a delegated receipt is remembered for after the `Delegate` that
+/// created it. The receipt normally executes one block later; the rest is
+/// room for congestion.
+const DELEGATED_TTL_BLOCKS: u64 = 3_000;
+
+/// Blocks before its first block the monitor reads for `Delegate` actions
+/// alone, so a meta-transaction whose delegate ran just before a restart is
+/// still told from a contract call.
+const DELEGATED_BACKFILL_BLOCKS: u64 = 100;
+
+/// A receipt a NEP-366 `Delegate` action created for this contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Delegated {
+    /// The account that signed the delegate action: the inner receipt's
+    /// predecessor.
+    sender_id: String,
+    /// The account that signed the transaction carrying it: the inner
+    /// receipt's signer.
+    relayer_id: String,
+    /// The key the sender signed the delegate action with.
+    public_key: Option<String>,
+    block: u64,
+}
+
+/// What the block that carried a meta-transaction says about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetaTransaction {
+    relayer_id: String,
+    /// The sender's key, which stands for the signer's key of the call: the
+    /// receipt's own `signer_public_key` is the relayer's.
+    sender_public_key: Option<String>,
+}
+
+/// Which receipts that reach this contract were made by a `Delegate` action.
+///
+/// The receipt that calls the contract carries no trace of the delegate: its
+/// predecessor is the user, its signer the relayer, its actions the inner
+/// function call — the same shape as a call a contract makes on a user's
+/// behalf. The `Delegate` action is on its parent, executed on the user's
+/// account at least one block earlier, and the parent's outcome lists the
+/// child's id. The monitor reads every block, so it remembers the children of
+/// every committed `Delegate` whose `receiver_id` is this contract and
+/// recognises the child when it arrives. No RPC is made.
+#[derive(Debug, Default)]
+struct DelegatedCalls {
+    by_receipt: std::collections::HashMap<String, Delegated>,
+}
+
+impl DelegatedCalls {
+    /// Remember the receipts the `Delegate` actions in `outcome` created for
+    /// `contract_id`.
+    fn record(&mut self, outcome: &ReceiptExecutionOutcome, contract_id: &str, block: u64) {
+        let Some(receipt) = outcome.receipt.as_ref() else { return };
+        let Some(action) = receipt.receipt.as_ref().and_then(|r| r.action.as_ref()) else { return };
+        let Some(relayer_id) = action.signer_id.as_deref() else { return };
+        if receipt_committed(outcome).is_err() {
+            return;
+        }
+        let children = outcome
+            .execution_outcome
+            .as_ref()
+            .and_then(|e| e.outcome.as_ref())
+            .and_then(|o| o.receipt_ids.as_ref());
+        let Some(children) = children else { return };
+        for delegate in action.actions.iter().filter_map(|a| a.get("Delegate")?.get("delegate_action")) {
+            if delegate.get("receiver_id").and_then(Value::as_str) != Some(contract_id) {
+                continue;
+            }
+            let Some(sender_id) = delegate.get("sender_id").and_then(Value::as_str) else { continue };
+            let public_key = delegate.get("public_key").and_then(Value::as_str).map(str::to_string);
+            for child in children {
+                self.by_receipt.insert(
+                    child.clone(),
+                    Delegated {
+                        sender_id: sender_id.to_string(),
+                        relayer_id: relayer_id.to_string(),
+                        public_key: public_key.clone(),
+                        block,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The meta-transaction behind the receipt `receipt_id`, when a
+    /// `Delegate` signed by `predecessor` and relayed by `signer` created it.
+    /// A delegate its own sender relayed is a direct call. The entry stays
+    /// until it expires: a block the monitor scans again must read the same.
+    fn meta_transaction(&self, receipt_id: &str, predecessor: Option<&str>, signer: Option<&str>) -> Option<MetaTransaction> {
+        let d = self.by_receipt.get(receipt_id)?;
+        (Some(d.sender_id.as_str()) == predecessor
+            && Some(d.relayer_id.as_str()) == signer
+            && d.sender_id != d.relayer_id)
+            .then(|| MetaTransaction { relayer_id: d.relayer_id.clone(), sender_public_key: d.public_key.clone() })
+    }
+
+    fn prune(&mut self, block: u64) {
+        self.by_receipt.retain(|_, d| d.block + DELEGATED_TTL_BLOCKS >= block);
+    }
+}
+
 /// NEAR RPC block response (simplified, only what we need)
 #[derive(Debug, Deserialize)]
 struct NearRpcBlockResponse {
@@ -460,6 +569,8 @@ pub struct EventMonitor {
     event_filter_min_version: Option<(u64, u64, u64)>, // Parsed semver (major, minor, patch)
     /// Shared block height for heartbeat reporting to coordinator
     shared_block_height: Arc<AtomicU64>,
+    /// Receipts to this contract made by a `Delegate` action.
+    delegated: std::sync::Mutex<DelegatedCalls>,
 }
 
 impl EventMonitor {
@@ -581,6 +692,7 @@ impl EventMonitor {
             event_filter_function_name,
             event_filter_min_version: parsed_min_version,
             shared_block_height,
+            delegated: std::sync::Mutex::new(DelegatedCalls::default()),
         })
     }
 
@@ -631,6 +743,7 @@ impl EventMonitor {
         );
 
         let start_block = self.current_block;
+        self.backfill_delegated(start_block).await;
         let mut retry_count = 0;
         let mut wait_for_block_count = 0u32; // Counter for "waiting for block" logging
         const MAX_RETRIES: u32 = 3;
@@ -835,6 +948,25 @@ impl EventMonitor {
         }
     }
 
+    /// Read the blocks just before `start_block` for `Delegate` actions only.
+    /// A block that cannot be read is skipped: at worst a meta-transaction
+    /// whose delegate ran in it is read as a contract call.
+    async fn backfill_delegated(&self, start_block: u64) {
+        for block_id in start_block.saturating_sub(DELEGATED_BACKFILL_BLOCKS)..start_block {
+            match self.load_block(block_id).await {
+                Ok(block) => {
+                    let mut delegated = self.delegated.lock().unwrap_or_else(|e| e.into_inner());
+                    for shard in block.shards.iter().flatten() {
+                        for outcome in shard.receipt_execution_outcomes.iter().flatten() {
+                            delegated.record(outcome, self.contract_id.as_str(), block_id);
+                        }
+                    }
+                }
+                Err(e) => warn!("Delegate backfill: block {} not read: {}", block_id, e),
+            }
+        }
+    }
+
     /// Scan a single block for contract events
     async fn scan_single_block(&self, block_id: u64) -> Result<Vec<ContractEvent>> {
         let block_data = self.load_block(block_id).await?;
@@ -919,6 +1051,13 @@ impl EventMonitor {
         let mut events = Vec::new();
         let mut receipts_checked = 0;
         let mut contract_receipts = 0;
+        let mut delegated = self.delegated.lock().unwrap_or_else(|e| e.into_inner());
+        delegated.prune(block_height);
+        for shard in shards {
+            for outcome in shard.receipt_execution_outcomes.iter().flatten() {
+                delegated.record(outcome, self.contract_id.as_str(), block_height);
+            }
+        }
 
         // Process receipt execution outcomes
         for shard in shards {
@@ -1008,6 +1147,13 @@ impl EventMonitor {
                                             exec_event.signer_id = signer_id.clone();
                                             exec_event.signer_public_key = signer_public_key.clone();
                                             exec_event.gas_burnt = gas_burnt;
+                                            let meta = receipt_id.as_deref().and_then(|id| {
+                                                delegated.meta_transaction(id, predecessor_id.as_deref(), signer_id.as_deref())
+                                            });
+                                            if let Some(meta) = meta {
+                                                exec_event.relayer_id = Some(meta.relayer_id);
+                                                exec_event.signer_public_key = meta.sender_public_key;
+                                            }
                                         }
                                         // A purchase is granted at most once, and the receipt is
                                         // what decides. It is not in the log — it belongs to the
@@ -1311,9 +1457,26 @@ impl EventMonitor {
         // Convert data_id Vec<u8> to hex string
         let data_id_hex = hex::encode(&event.data_id);
 
+        // Who the run is for. A meta-transaction's signer is its relayer, who
+        // only paid the gas; the call is the account that signed the delegate
+        // action, which is the receipt's predecessor.
+        let user_account_id = match event.relayer_id.as_deref() {
+            Some(relayer) => {
+                let user = request_data.predecessor_id.clone().or_else(|| event.predecessor_id.clone()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Refusing execution_requested for request_id={}: a meta-transaction relayed by {} names no predecessor",
+                        request_data.request_id, relayer
+                    )
+                })?;
+                info!("🔁 request_id={}: meta-transaction signed by {} and relayed by {}", request_data.request_id, user, relayer);
+                user
+            }
+            None => request_data.sender_id.clone(),
+        };
+
         // Build execution context
         let context = crate::api_client::ExecutionContext {
-            sender_id: Some(request_data.sender_id.clone()),
+            sender_id: Some(user_account_id.clone()),
             block_height: Some(event.block_height),
             block_timestamp: Some(event.timestamp),
             contract_id: Some(self.contract_id.to_string()),
@@ -1325,6 +1488,7 @@ impl EventMonitor {
             predecessor_id: request_data.predecessor_id.clone().or_else(|| event.predecessor_id.clone()),
             signer_public_key: event.signer_public_key.clone(),
             gas_burnt: event.gas_burnt,
+            relayer_id: event.relayer_id.clone(),
         };
 
         // Convert code_source to api_client format
@@ -1360,7 +1524,7 @@ impl EventMonitor {
             secrets_ref: request_data.secrets_ref.clone(),
             response_format: request_data.response_format.clone(),
             context,
-            user_account_id: Some(request_data.sender_id.clone()),
+            user_account_id: Some(user_account_id),
             near_payment_yocto: Some(request_data.payment.clone()),
             attached_usd: request_data.attached_usd.clone(),
             compile_only: request_data.compile_only,
@@ -2224,6 +2388,145 @@ mod tests {
         (raw, pending)
     }
 
+    // ============ meta-transactions ============
+    //
+    // Fixtures: mainnet blocks 217910341 (the `Delegate` receipt on
+    // jars-oracle.sweat, relayed by sweat-relayer.near) and 217910342 (the
+    // receipt it made, reaching v2.jars.sweat), trimmed.
+
+    const DELEGATE_TARGET: &str = "v2.jars.sweat";
+    const DELEGATE_SENDER: &str = "jars-oracle.sweat";
+    const DELEGATE_RELAYER: &str = "sweat-relayer.near";
+    const DELEGATED_CHILD: &str = "EXwNf6hCfyqvN3YwwK1v4fcVJayNafT8YoxY6883FtYo";
+
+    fn delegate_parent() -> Value {
+        serde_json::from_str(include_str!("testdata/neardata_delegate_parent.json")).unwrap()
+    }
+
+    fn outcome(v: Value) -> ReceiptExecutionOutcome {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn recorded(parent: Value, contract: &str) -> DelegatedCalls {
+        let mut calls = DelegatedCalls::default();
+        calls.record(&outcome(parent), contract, 217910341);
+        calls
+    }
+
+    #[test]
+    fn a_delegated_receipt_is_known_by_its_parent() {
+        let calls = recorded(delegate_parent(), DELEGATE_TARGET);
+        let meta = MetaTransaction {
+            relayer_id: DELEGATE_RELAYER.to_string(),
+            sender_public_key: Some("ed25519:j1ahz6PGEhwSR8Prscow95PnykimghhdLsfjgCP4ktr".to_string()),
+        };
+        assert_eq!(calls.meta_transaction(DELEGATED_CHILD, Some(DELEGATE_SENDER), Some(DELEGATE_RELAYER)), Some(meta.clone()));
+        // Asked again, as a block scanned twice asks: the same answer.
+        assert_eq!(calls.meta_transaction(DELEGATED_CHILD, Some(DELEGATE_SENDER), Some(DELEGATE_RELAYER)), Some(meta));
+    }
+
+    #[test]
+    fn the_delegated_receipt_itself_carries_no_trace_of_the_delegate() {
+        let child: Value = serde_json::from_str(include_str!("testdata/neardata_delegate_child.json")).unwrap();
+        assert_eq!(child["receipt"]["predecessor_id"], DELEGATE_SENDER);
+        assert_eq!(child["receipt"]["receipt"]["Action"]["signer_id"], DELEGATE_RELAYER);
+        let mut calls = DelegatedCalls::default();
+        calls.record(&outcome(child), DELEGATE_TARGET, 217910342);
+        assert!(calls.by_receipt.is_empty(), "only the parent names the delegate");
+    }
+
+    #[test]
+    fn only_delegates_to_this_contract_are_remembered() {
+        assert!(recorded(delegate_parent(), "outlayer.near").by_receipt.is_empty());
+    }
+
+    #[test]
+    fn a_delegated_receipt_must_match_its_delegate() {
+        let calls = recorded(delegate_parent(), DELEGATE_TARGET);
+        assert!(calls.meta_transaction(DELEGATED_CHILD, Some("someone.near"), Some(DELEGATE_RELAYER)).is_none());
+        assert!(calls.meta_transaction(DELEGATED_CHILD, Some(DELEGATE_SENDER), Some("someone.near")).is_none());
+        assert!(calls.meta_transaction(DELEGATED_CHILD, None, Some(DELEGATE_RELAYER)).is_none());
+        assert!(calls.meta_transaction("other", Some(DELEGATE_SENDER), Some(DELEGATE_RELAYER)).is_none());
+    }
+
+    #[test]
+    fn a_delegate_its_sender_relayed_is_a_direct_call() {
+        let mut parent = delegate_parent();
+        parent["receipt"]["receipt"]["Action"]["signer_id"] = DELEGATE_SENDER.into();
+        let calls = recorded(parent, DELEGATE_TARGET);
+        assert!(calls.meta_transaction(DELEGATED_CHILD, Some(DELEGATE_SENDER), Some(DELEGATE_SENDER)).is_none());
+    }
+
+    #[test]
+    fn a_failed_delegate_made_nothing() {
+        let mut parent = delegate_parent();
+        parent["execution_outcome"]["outcome"]["status"] = serde_json::json!({"Failure": {"ActionError": {}}});
+        assert!(recorded(parent, DELEGATE_TARGET).by_receipt.is_empty());
+    }
+
+    /// The whole path on a monitor: the block with the `Delegate`, then the
+    /// block where the delegated `request_execution` writes its event.
+    #[test]
+    fn a_meta_transaction_event_names_its_relayer() {
+        let monitor = parsing_monitor();
+        let contract = "outlayer.testnet";
+        let (sender, relayer) = ("alice.near", "relay.near");
+
+        let mut parent = delegate_parent();
+        let delegate = &mut parent["receipt"]["receipt"]["Action"]["actions"][0]["Delegate"]["delegate_action"];
+        delegate["receiver_id"] = contract.into();
+        delegate["sender_id"] = sender.into();
+        parent["receipt"]["receiver_id"] = sender.into();
+        parent["receipt"]["receipt"]["Action"]["signer_id"] = relayer.into();
+
+        let (raw, _) = genuine();
+        let log = format!(
+            "EVENT_JSON:{}",
+            serde_json::json!({"standard": "near-outlayer", "version": "1.0.0", "event": "execution_requested",
+                "data": [{"request_data": raw.to_string(), "data_id": DATA_ID.to_vec(), "timestamp": 1}]})
+        );
+        let child_for = |receipt_id: &str| {
+            let mut child: Value = serde_json::from_str(include_str!("testdata/neardata_delegate_child.json")).unwrap();
+            child["receipt"]["receipt_id"] = receipt_id.into();
+            child["receipt"]["receiver_id"] = contract.into();
+            child["receipt"]["predecessor_id"] = sender.into();
+            child["receipt"]["receipt"]["Action"]["signer_id"] = relayer.into();
+            child["execution_outcome"]["outcome"]["logs"] = serde_json::json!([log]);
+            child
+        };
+        let shards = |outcomes: Vec<Value>| -> Vec<ShardData> {
+            serde_json::from_value(serde_json::json!([{"receipt_execution_outcomes": outcomes}])).unwrap()
+        };
+
+        assert!(monitor.process_shards(&shards(vec![parent]), 100).unwrap().is_empty());
+        let events = monitor
+            .process_shards(&shards(vec![child_for(DELEGATED_CHILD), child_for("NotDelegated")]), 101)
+            .unwrap();
+        let seen: Vec<(Option<String>, Option<String>)> = events
+            .iter()
+            .map(|e| match e {
+                ContractEvent::ExecutionRequested(e) => (e.relayer_id.clone(), e.signer_public_key.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let relayer_key = "ed25519:AddAbvFQifGdE5yDjR3HKGN2BUDDWKA5HxNLp4E5fiYZ".to_string();
+        let sender_key = "ed25519:j1ahz6PGEhwSR8Prscow95PnykimghhdLsfjgCP4ktr".to_string();
+        assert_eq!(
+            seen,
+            vec![(Some(relayer.to_string()), Some(sender_key)), (None, Some(relayer_key))],
+            "a meta-transaction carries the sender's key, anything else the receipt's"
+        );
+    }
+
+    #[test]
+    fn a_remembered_delegate_expires() {
+        let mut calls = recorded(delegate_parent(), DELEGATE_TARGET);
+        calls.prune(217910341 + DELEGATED_TTL_BLOCKS);
+        assert_eq!(calls.by_receipt.len(), 2);
+        calls.prune(217910341 + DELEGATED_TTL_BLOCKS + 1);
+        assert!(calls.by_receipt.is_empty());
+    }
+
     fn event_for(raw: &Value, signer: Option<&str>, predecessor: Option<&str>) -> ExecutionRequestedEvent {
         ExecutionRequestedEvent {
             request_data: raw.to_string(),
@@ -2236,6 +2539,7 @@ mod tests {
             signer_id: signer.map(str::to_string),
             signer_public_key: None,
             gas_burnt: None,
+            relayer_id: None,
         }
     }
 
@@ -2327,6 +2631,7 @@ mod tests {
             event_filter_function_name: "execution_requested".to_string(),
             event_filter_min_version: EventMonitor::parse_semver("1.0.0"),
             shared_block_height: Arc::new(AtomicU64::new(0)),
+            delegated: std::sync::Mutex::new(DelegatedCalls::default()),
         }
     }
 

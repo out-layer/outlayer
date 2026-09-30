@@ -48,6 +48,11 @@ pub struct ExecutionContext {
     pub signer_public_key: Option<String>,
     #[serde(default)]
     pub gas_burnt: Option<u64>,
+    /// The account that relayed the call as a NEP-366 meta-transaction; the
+    /// run is then for the account that signed the delegate action, the
+    /// predecessor. `None` for every other call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayer_id: Option<String>,
 }
 
 /// Request from user to execute WASM code off-chain

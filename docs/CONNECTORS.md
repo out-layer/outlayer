@@ -368,6 +368,11 @@ are acting for.
 is an Agent Connect wallet running under a bound account's name, which is opt-in
 per call. Bill and attribute against the payer; act as the sender.
 
+A NEP-366 meta-transaction runs as the account that signed the delegate action:
+it is `NEAR_SENDER_ID`, `NEAR_USER_ACCOUNT_ID` and `NEAR_PREDECESSOR_ID`, its
+key is `NEAR_SIGNER_PUBLIC_KEY`, and `NEAR_RELAYER_ID` names the account that
+relayed it and paid its gas (empty on every other call).
+
 ### 4.5 Keys of your own: EVM sub-keys
 
 A connector that holds funds on an EVM chain — a venue deposit, a bridge leg —
@@ -564,6 +569,35 @@ Four rules a connector keeps:
   action against the policy and the limits as they are at that moment.
 * **Show what you will do, whole.** What cannot be shown whole is refused, not
   shown in part.
+
+The owner answers with a direct call of their own, so a connector that declares
+`tasks` cannot shut the direct door (§4.9).
+
+### 4.9 Who may call you
+
+The manifest's `callers` block says which doors a run may come through: a
+direct call, a call through a contract (any, or only the ones it names), a
+NEP-366 meta-transaction, an HTTPS call. The worker judges the door from the
+job before it decrypts, derives or runs anything, and refuses the rest with a
+sentence that names the door and the caller.
+
+```jsonc
+"callers": { "contract": { "only": ["game.near"] } }   // game.near, and nothing else
+"callers": { "https": "deny" }                          // on chain only, no meta-transactions
+```
+
+Absent, every door is open. Present, a door it does not name is open, except
+meta-transactions, which need `"meta_tx": "allow"`. `only` admits exactly the
+accounts it lists as the caller of OutLayer, so it shuts HTTPS, direct calls
+and meta-transactions by itself. The full rules and every refusal sentence are
+in [CONNECTOR_MANIFEST.md](../wasi-examples/CONNECTOR_MANIFEST.md#callers-who-may-run-it).
+
+The rule is the version's: a version published without it stays callable by
+anyone who names it with `version_key`, so remove those versions.
+
+This is about how a run arrives, not who is behind it: to admit particular
+people, put the condition on the secret row (§4.1, §4.2). The two are judged
+separately and neither widens the other.
 
 ## 5. Limits
 

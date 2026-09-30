@@ -1,0 +1,44 @@
+{
+  "execution_outcome": {
+    "id": "EXwNf6hCfyqvN3YwwK1v4fcVJayNafT8YoxY6883FtYo",
+    "outcome": {
+      "executor_id": "v2.jars.sweat",
+      "gas_burnt": 2677311773012,
+      "logs": [],
+      "receipt_ids": [
+        "9zm9rCWjjMqxoJ329zN9nqjW7M8hzSK5Kw1vYtUyYtkS"
+      ],
+      "status": {
+        "SuccessValue": ""
+      },
+      "tokens_burnt": "267731177301200000000"
+    }
+  },
+  "receipt": {
+    "predecessor_id": "jars-oracle.sweat",
+    "priority": 0,
+    "receipt": {
+      "Action": {
+        "actions": [
+          {
+            "FunctionCall": {
+              "args": "…",
+              "deposit": "0",
+              "gas": 300000000000000,
+              "method_name": "apply_booster"
+            }
+          }
+        ],
+        "gas_price": "1000000000",
+        "input_data_ids": [],
+        "is_promise_yield": false,
+        "output_data_receivers": [],
+        "signer_id": "sweat-relayer.near",
+        "signer_public_key": "ed25519:AddAbvFQifGdE5yDjR3HKGN2BUDDWKA5HxNLp4E5fiYZ"
+      }
+    },
+    "receipt_id": "EXwNf6hCfyqvN3YwwK1v4fcVJayNafT8YoxY6883FtYo",
+    "receiver_id": "v2.jars.sweat"
+  },
+  "tx_hash": "CpLaeGSh1XM17QNch4nYiuEQNve9752PPqNQuZPFEisn"
+}

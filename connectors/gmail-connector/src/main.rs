@@ -482,12 +482,13 @@ mod tests {
         let reported = |json: &str| policy_view(loaded(json), None, false).unwrap().0;
         assert_eq!(reported(r#"{"confirm":["send"]}"#)["confirm"], json!(["send"]));
         assert_eq!(reported(r#"{"confirm":[]}"#)["confirm"], json!([]));
-        // A policy with none reports none, and the members beside it as null.
+        // A policy with none reports the member as null, like the members
+        // beside it: its absence would read as a report that does not know it.
         for none in [r#"{}"#, r#"{"confirm":null}"#] {
             let open = reported(none);
-            assert!(open.get("confirm").is_none(), "{open}");
+            assert_eq!(open.get("confirm"), Some(&Value::Null), "{open}");
             assert_eq!(open["max_per_day"], Value::Null);
-            assert_eq!(names(&open).len(), 7, "{open}");
+            assert_eq!(names(&open).len(), 8, "{open}");
         }
         // What is reported, less the word about the row, is a policy again.
         let mut back = reported(r#"{"confirm":["send"],"max_per_day":3}"#);

@@ -301,6 +301,15 @@ waiting_ids() {
   jq -r '[.tasks[]?.id] | sort | join(" ")' <<<"$OWN" 2>/dev/null
 }
 
+# clear_tasks — every task of the owner deleted, so that a row starts with
+# the agent's share empty. Through the device signed in last, or a new one when
+# that session is over.
+clear_tasks() {
+  owner raw DELETE /inbox/tasks "" "$NOW_ON"
+  [[ "$(own .status)" == "200" ]] && return 0
+  sign_in_on cleared && owner raw DELETE /inbox/tasks "" cleared
+}
+
 # ── the chain ────────────────────────────────────────────────────────────────
 
 # The keyed RPC URL reaches curl on stdin, never on a command line.
@@ -455,8 +464,14 @@ HOOK_NAMED=false
 PROJECT_UUID=""
 
 POLICY_V1='{"v":1}'
-store_row() { # store_row <policy-json> <access>
-  store "$TASKS_PROBE" "$PROFILE" "$(jq -nc --arg p "$1" '{TASKS_PROBE_POLICY:$p}')" "$2"
+# The access is written as the contract holds it (`whitelist` above, or
+# `"AllowAll"`) and handed to the CLI in the CLI's spelling.
+store_row() { # store_row <policy-json> <access-json>
+  local access
+  access=$(jq -r 'if . == "AllowAll" then "allow-all"
+                  elif has("Whitelist") then "whitelist:" + (.Whitelist.accounts | join(","))
+                  else error("an access the suite does not spell: \(.)") end' <<<"$2") || exit 1
+  store "$TASKS_PROBE" "$PROFILE" "$(jq -nc --arg p "$1" '{TASKS_PROBE_POLICY:$p}')" "$access"
 }
 # Every agent the environment supplies is granted by name.
 GRANTED=$(whitelist "$PARENT" "$AGENT_ACCOUNT" ${AGENT2_ACCOUNT:+"$AGENT2_ACCOUNT"} \
@@ -720,7 +735,7 @@ fi
 
 if want C7; then
   log "C7 the run that acts traps"
-  if prepare '{"title":"A run that traps"}'; then
+  if prepare '{"title":"A run that traps","answer_by":"confirm_trap"}'; then
     in_inbox "$TASK"
     acts "$(jq -nc --arg t "$TASK" --arg h "$(row .read.hash)" '{operation:"confirm_trap", task_id:$t, task_hash:$h}')"
     [[ "$RUN_OK" != "true" ]] && pass "C7 the run failed" || fail "C7 the run that traps reported success"
@@ -1370,6 +1385,7 @@ fi
 
 if want A15; then
   log "A15 a function-call key, and a key removed after sign-in"
+  clear_tasks
   owner keygen calls
   CALLS_KEY=$(own .public_key); CALLS_FILE=$(own .file)
   if [[ -z "$CALLS_KEY" ]]; then
@@ -1394,13 +1410,24 @@ if want A15; then
     fail "A15 a second full-access key's statement answered $(own .status) $(own .reason)"
     remove_key "$SECOND_KEY" || warn "A15 the second key is still on $PARENT: $WHY"
   else
-    prepare '{"title":"Made while the key is on the account"}' && [[ "$(said .output.devices)" == "1" ]] \
-      && pass "A15 while its key is on the account the device is given a copy" \
-      || fail "A15 before the key was removed: devices '$(said .output.devices)' error='$(said .error | head -c 160)'"
+    # The account holds several devices; what is judged is this device's copy
+    # and the count of devices dropping by one when its key leaves.
+    DEVICES_BEFORE=""
+    if prepare '{"title":"Made while the key is on the account"}'; then
+      DEVICES_BEFORE=$(said .output.devices)
+      owner list second waiting
+      GIVEN=$(jq -c --arg t "$TASK" '.tasks[]? | select(.id == $t)' <<<"$OWN" 2>/dev/null)
+      [[ "$(jq -r '.has_copy' <<<"$GIVEN")" == "true" ]] \
+        && pass "A15 while its key is on the account the device is given a copy ($DEVICES_BEFORE devices)" \
+        || fail "A15 before the key was removed, the device's row: ${GIVEN:-not listed} $(own .failed | head -c 120)"
+    else
+      fail "A15 before the key was removed: error='$(said .error | head -c 160)'"
+    fi
     if remove_key "$SECOND_KEY"; then
       if prepare '{"title":"Made after the key was removed"}'; then
-        [[ "$(said .output.devices)" == "0" ]] && pass "A15 the key removed, the next task is encrypted to no device" \
-          || fail "A15 after the key was removed: devices '$(said .output.devices)'"
+        [[ -n "$DEVICES_BEFORE" && "$(said .output.devices)" == "$((DEVICES_BEFORE - 1))" ]] \
+          && pass "A15 the key removed, the next task is encrypted to one device fewer" \
+          || fail "A15 after the key was removed: devices '$(said .output.devices)', before '$DEVICES_BEFORE'"
         owner list second waiting
         GIVEN=$(jq -c --arg t "$TASK" '.tasks[]? | select(.id == $t)' <<<"$OWN" 2>/dev/null)
         if [[ "$(own .failed)" == *" 401"* ]]; then
@@ -1434,7 +1461,11 @@ fi
 
 if want A17; then
   log "A17 a device that signed out"
+  clear_tasks
   if sign_in_on left; then
+    # How many devices a task is encrypted to while this one is in force.
+    WITH_LEFT=""
+    prepare '{"title":"Made before the sign-out"}' && WITH_LEFT=$(said .output.devices)
     owner sign-out left
     [[ "$(own .status)" == "200" && "$(own .body.revoked)" == "true" ]] && pass "A17 signed out" \
       || fail "A17 sign-out answered $(own .status) $(own .body.reason)"
@@ -1443,15 +1474,12 @@ if want A17; then
       && pass "A17 its token: 401 session_required, and no list" \
       || fail "A17 its token answered $(own .status) $(own .body.reason)"
     if prepare '{"title":"Made after the sign-out"}'; then
-      [[ "$(said .output.devices)" == "0" ]] && pass "A17 the next task is encrypted to no device" \
-        || fail "A17 after the sign-out: devices '$(said .output.devices)'"
-      if sign_in_on back; then
-        in_inbox "$TASK" back && [[ "$(row .locked)" == "true" && "$(row .has_copy)" == "false" ]] \
-          && pass "A17 a copy was written for nobody: the task is locked on the device signed in since" \
-          || fail "A17 on the device signed in since: ${ROW:-not listed}"
-      else
-        fail "A17 signing in again answered $(own .status) $(own .reason)"
-      fi
+      # The account holds other devices; the one signed out is not among
+      # those the task is encrypted to.
+      [[ -n "$WITH_LEFT" && "$(said .output.devices)" == "$((WITH_LEFT - 1))" ]] \
+        && pass "A17 the next task is encrypted to the devices in force, the signed-out one not among them" \
+        || fail "A17 after the sign-out: devices '$(said .output.devices)', with it '$WITH_LEFT'"
+      sign_in_on back || fail "A17 signing in again answered $(own .status) $(own .reason)"
     else
       fail "A17 prepare: error='$(said .error | head -c 200)'"
     fi

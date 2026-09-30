@@ -1,0 +1,59 @@
+{
+  "execution_outcome": {
+    "id": "BEXBDSc1UH1w8F7zQk9oM1pBDDiHNzXmdzd7xCugKEzA",
+    "outcome": {
+      "executor_id": "jars-oracle.sweat",
+      "gas_burnt": 514544485240,
+      "logs": [],
+      "receipt_ids": [
+        "EXwNf6hCfyqvN3YwwK1v4fcVJayNafT8YoxY6883FtYo",
+        "3Y5wAmsEjKjAM6ZBsXv7njMgcnhiWMUKhooZdYyt25jp"
+      ],
+      "status": {
+        "SuccessValue": ""
+      },
+      "tokens_burnt": "51454448524000000000"
+    }
+  },
+  "receipt": {
+    "predecessor_id": "sweat-relayer.near",
+    "priority": 0,
+    "receipt": {
+      "Action": {
+        "actions": [
+          {
+            "Delegate": {
+              "delegate_action": {
+                "actions": [
+                  {
+                    "FunctionCall": {
+                      "args": "…",
+                      "deposit": "0",
+                      "gas": 300000000000000,
+                      "method_name": "apply_booster"
+                    }
+                  }
+                ],
+                "max_block_height": 999999999,
+                "nonce": 195456660232594,
+                "public_key": "ed25519:j1ahz6PGEhwSR8Prscow95PnykimghhdLsfjgCP4ktr",
+                "receiver_id": "v2.jars.sweat",
+                "sender_id": "jars-oracle.sweat"
+              },
+              "signature": "ed25519:3ym6KJZpG1JUHAZZuWct4Q8LJzBGEwkYP1t2UaFfoao7f8ZgPknfHVu15FDQnj6UCkFW3Za7sNNguLK6pTf1xT5T"
+            }
+          }
+        ],
+        "gas_price": "1000000000",
+        "input_data_ids": [],
+        "is_promise_yield": false,
+        "output_data_receivers": [],
+        "signer_id": "sweat-relayer.near",
+        "signer_public_key": "ed25519:AddAbvFQifGdE5yDjR3HKGN2BUDDWKA5HxNLp4E5fiYZ"
+      }
+    },
+    "receipt_id": "BEXBDSc1UH1w8F7zQk9oM1pBDDiHNzXmdzd7xCugKEzA",
+    "receiver_id": "jars-oracle.sweat"
+  },
+  "tx_hash": "CpLaeGSh1XM17QNch4nYiuEQNve9752PPqNQuZPFEisn"
+}

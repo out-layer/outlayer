@@ -22,7 +22,8 @@
 //! the manifest (`"caller": "signer" | "predecessor"`, default `signer`), and
 //! `account_id` is that account:
 //!
-//! * `signer` — the job's `user_account_id`: the transaction signer on chain,
+//! * `signer` — the job's `user_account_id`: the transaction signer on chain
+//!   (for a meta-transaction the account that signed the delegate action),
 //!   the payment-key owner over HTTPS.
 //! * `predecessor` — the job's `predecessor_id`: the receipt predecessor on
 //!   chain (a DAO, a wallet contract), equal to the signer over HTTPS. A
@@ -274,7 +275,8 @@ impl KeyBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CallerKind {
-    /// The job's `user_account_id`: the transaction signer on chain, the
+    /// The job's `user_account_id`: the transaction signer on chain (for a
+    /// meta-transaction the account that signed the delegate action), the
     /// payment-key owner over HTTPS.
     #[default]
     Signer,

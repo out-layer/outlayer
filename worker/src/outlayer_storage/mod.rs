@@ -39,7 +39,8 @@
 //! Every function outside the `@worker` ones reads and writes ONE account's
 //! cell of the project, fixed for the run before it executes by
 //! [`cell_account`]: the manifest's `storage_account` picks which account of
-//! the job it is — `signer` (the default: the transaction signer on chain,
+//! the job it is — `signer` (the default: the transaction signer on chain —
+//! for a meta-transaction the account that signed the delegate action —
 //! the payment-key owner over HTTPS, `anonymous` when there is neither) or
 //! `predecessor` (the account that called the contract on chain, the
 //! payment-key owner over HTTPS; a run with none is refused). No host

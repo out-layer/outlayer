@@ -62,6 +62,7 @@ and exactly the ones priced on chain — see the next section.
 | `encryption_keys` | **yes** | Symmetric keys the module seals data with, by `path`. Derived like signing keys — the same `bind`, `caller` and `vault` rules — but a separate namespace with its own limit; the module reaches them only through the `outlayer:encryption-keys` host functions. Any project may declare them. See `encryption_keys` below. |
 | `storage_account` | **yes** | Whose cell of the project's per-account storage the run reads and writes: `signer` (default) or `predecessor`. Any project may declare it. See `storage_account` below. |
 | `tasks` | **yes** | `true` when the module leaves tasks for the owner of the secret row a run names, through the `outlayer:tasks` host functions. Any project may declare it. See `tasks` below. |
+| `callers` | **yes** | Which doors a run may come through: a direct call, a call through a contract (any, or only the named ones), a meta-transaction, an HTTPS call. A run through a door the block does not admit is refused before anything is decrypted or run. Any project may declare it. See `callers` below. |
 | `display` | no | For the dashboard. |
 | `describe` | no | What each operation does and takes, for the developer page (`app.outlayer.ai/connectors/<id>`) — see the next section. |
 
@@ -505,7 +506,7 @@ account, and no storage function takes one.
 
 | Value | The cell belongs to |
 |---|---|
-| `signer` (default) | on chain, the transaction's signer; over HTTPS, the payment key's owner; `anonymous` on a run that carries neither |
+| `signer` (default) | on chain, the transaction's signer — for a meta-transaction, the account that signed the delegate action, not its relayer; over HTTPS, the payment key's owner; `anonymous` on a run that carries neither |
 | `predecessor` | on chain, the account that called the contract — a relaying contract, a DAO, a wallet contract, not the user who signed; over HTTPS, the payment key's owner. A run that carries no predecessor is refused before it executes, never served from the signer's cell or `anonymous` |
 
 Any other value — a different spelling, `null`, a number — makes the manifest
@@ -539,6 +540,86 @@ Every operation the module serves for tasks — the ones a task names to answer
 it, and `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` —
 is an operation like any other: listed in `operations`, and priced when the
 module is a connector.
+
+The owner answers a task with a direct call of their own, so a manifest that
+declares `tasks` with a `callers` block that shuts the direct door does not
+parse.
+
+### `callers`: who may run it
+
+```jsonc
+"callers": {
+  "direct":   "allow" | "deny",                    // absent: allow
+  "contract": "allow" | "deny" | {"only": [...]}, // absent: allow
+  "https":    "allow" | "deny",                    // absent: allow
+  "meta_tx":  "allow" | "deny"                     // absent: deny
+}
+```
+
+A run reaches OutLayer through one of four doors. The worker tells them apart
+from facts it was handed with the job — never from the input, the guest, or
+anything the caller says about itself — and judges the door before any secret
+is decrypted, any key derived or any code run.
+
+| Door | The run | The caller named in a refusal |
+|---|---|---|
+| `direct` | on chain; the account that called OutLayer's contract signed the transaction | that account |
+| `contract` | on chain; a contract called OutLayer on the signer's behalf — a dapp, a DAO, a wallet contract, a relaying contract | the contract, and the signer |
+| `meta_tx` | on chain; a NEP-366 meta-transaction to OutLayer's contract: the user signed a delegate action and another account (the relayer) signed the transaction and paid its gas | the user, and the relayer |
+| `https` | an HTTPS call with a payment key | — |
+
+**No block, no rule.** A manifest without `callers` admits every door,
+meta-transactions included — as a wasm with no manifest does. A block admits
+meta-transactions only with `"meta_tx": "allow"`; every other door it names
+nothing about stays open.
+
+**`only` names every account that may call OutLayer for this project.** A
+run is admitted exactly when it came on chain and the account that called
+OutLayer's contract is on the list, whatever the door: an HTTPS call comes
+through no contract, and a direct call or a meta-transaction is called by the
+user, not by a contract you listed. A block that pairs `only` with an explicit
+`"allow"` on another door does not parse, because that `"allow"` could never
+apply. The list holds 1 to 32 NEAR account ids, each once, matched exactly:
+`game.near` does not admit `x.game.near`.
+
+A meta-transaction is told from a contract call by the block that carried it:
+the `Delegate` action sits on the receipt before the one that reaches the
+contract, and the worker reads every block. A meta-transaction runs as the
+account that signed the delegate action — its secrets, its storage cell, its
+keys, `NEAR_SENDER_ID` — and `NEAR_RELAYER_ID` names the relayer. A delegate
+action that calls some other contract, which then calls OutLayer, is a
+`contract` call from that contract.
+
+| Manifest | Admits |
+|---|---|
+| `"callers": {"contract": {"only": ["game.near"]}}` | `game.near` calling OutLayer, and nothing else |
+| `"callers": {"contract": "deny", "https": "deny"}` | direct calls only |
+| `"callers": {"direct": "deny", "contract": "deny"}` | HTTPS calls only |
+| `"callers": {"https": "deny"}` | direct calls and calls through any contract |
+| `"callers": {"contract": "deny", "meta_tx": "allow"}` | direct calls, meta-transactions and HTTPS calls |
+
+A refused run executes nothing and says why, ending "Nothing was executed.":
+
+- `This project's manifest does not admit direct calls: OutLayer was called by alice.near, the account that signed the transaction, and callers.direct is "deny". Nothing was executed.`
+- `This project's manifest does not admit calls made through a contract: this run was signed by alice.near and OutLayer was called by dapp.near, and callers.contract is "deny". Nothing was executed.`
+- `This project's manifest does not admit meta-transactions: alice.near signed the call and relayer.near relayed it, and a callers block admits meta-transactions only with callers.meta_tx: "allow". Nothing was executed.`
+- `This project's manifest does not admit HTTPS calls (callers.https is "deny"): call it on chain. Nothing was executed.`
+- `This project's manifest admits calls only from the contracts it names: OutLayer was called by other.near on behalf of alice.near, which is not one of them. Nothing was executed.`
+
+A refusal never lists the accounts on `only`. On chain it is settled as any
+refusal is: the contract keeps its base fee and returns the rest of the
+deposit. Over HTTPS the call is `failed` with the sentence as its `error`. The
+job's status is `access_denied`.
+
+The rule is the version's: it is in the wasm, covered by its hash, and applies
+to the owner as to anyone — to let a door through, publish a version that
+admits it. **Every published version stays callable**: a caller names any of
+them with `version_key`, and a version without the block admits every door.
+Gating a project means removing (`remove_version`) each version that does not
+carry the rule you want. The same bytes run outside the project — directly
+from their wasm URL — keep the rule, since it travels in the wasm. A run built
+from a GitHub repository is judged after its build, so a refused first run
+still costs one compilation.
 
 ## How a request names its operation
 
@@ -605,7 +686,8 @@ gets an **empty allowlist**: no outbound network at all.
 
 A manifest that is present and cannot be read — larger than 64 KB, not valid
 JSON, or not a manifest (an unknown top-level member, a `storage_account`
-other than `signer` or `predecessor`, a key declaration that breaks its rules) — refuses the run
+other than `signer` or `predecessor`, a key declaration that breaks its rules,
+a `callers` block that breaks its rules) — refuses the run
 before it executes: a declaration nobody can read never becomes no
 declaration. So does `storage_account: "predecessor"` on a run that carries no
 predecessor.

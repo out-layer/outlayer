@@ -126,19 +126,29 @@ is_uuid() { [[ "$1" =~ ^p[0-9a-f]{16}$ ]]; }
 
 signer_flag() { [[ -f "$HOME/.near-credentials/$NETWORK/$1.json" ]] && echo with-legacy-keychain || echo with-keychain; }
 
-# One contract call, its whole transcript on stdout.
+# One contract call, its whole transcript on stdout. near-cli takes the key's
+# nonce from the RPC, which can answer with the state of a block before the
+# signer's previous transaction; that call is sent once more, after a pause.
 call() { # call <signer> <method> <args-json> <deposit>
-  near contract call-function as-transaction "$CONTRACT_ID" "$2" json-args "$3" \
-    prepaid-gas '300.0 Tgas' attached-deposit "$4" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1
+  local out i
+  for i in 1 2 3; do
+    out=$(near contract call-function as-transaction "$CONTRACT_ID" "$2" json-args "$3" \
+      prepaid-gas '300.0 Tgas' attached-deposit "$4" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1)
+    grep -qE 'Transaction nonce .* must be|InvalidNonce|Transaction has expired' <<<"$out" || break
+    sleep $((i * 3))
+  done
+  printf '%s\n' "$out"
 }
 succeeded() { grep -q 'succeeded' <<<"$1"; }
 tx_of() { grep -oE 'Transaction ID: *[1-9A-HJ-NP-Za-km-z]{40,50}' <<<"$1" | grep -oE '[1-9A-HJ-NP-Za-km-z]{40,50}' | head -1; }
-# The contract's panic only: near-cli's transport errors quote the request URL
-# (the keyed RPC), so no other line of its output is printed.
+# The contract's panic, or near-cli's own reason line through `near_why`
+# (lib/near_sign.sh): near-cli's transport errors quote the request URL (the
+# keyed RPC), so no other line of its output is printed.
+source "$SCRIPT_DIR/lib/near_sign.sh"
 why_of() {
   local m
   m=$(grep -oE 'Smart contract panicked: [^"\\]*|panicked at [^"\\]*' <<<"$1" | grep -viE 'https?:|apikey' | head -2 | tr '\n' ' ' | head -c 400)
-  [[ -n "$m" ]] && printf '%s' "$m" || printf 'near-cli failed without a contract panic (output withheld: it may quote the RPC URL)'
+  [[ -n "$m" ]] && printf '%s' "$m" || near_why "$1"
 }
 
 # Every log of a transaction, as a JSON array, once it is final.

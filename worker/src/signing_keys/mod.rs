@@ -122,7 +122,8 @@ pub enum KeyBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CallerKind {
-    /// The job's `user_account_id`: the transaction signer on chain, the
+    /// The job's `user_account_id`: the transaction signer on chain (for a
+    /// meta-transaction the account that signed the delegate action), the
     /// payment-key owner over HTTPS.
     #[default]
     Signer,

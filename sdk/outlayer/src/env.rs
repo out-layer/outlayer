@@ -29,13 +29,27 @@
 //!
 //! OutLayer automatically injects several environment variables:
 //!
-//! - `NEAR_SENDER_ID` - Account that signed the transaction (original user, e.g. alice.near)
-//! - `NEAR_PREDECESSOR_ID` - Contract that called OutLayer directly (e.g. token.near)
+//! - `NEAR_SENDER_ID` - Account that signed the transaction (original user, e.g. alice.near);
+//!   for a NEP-366 meta-transaction, the account that signed the delegate action
+//! - `NEAR_PREDECESSOR_ID` - Account that called OutLayer directly (e.g. token.near)
+//! - `NEAR_RELAYER_ID` - Account that relayed a meta-transaction and paid its gas;
+//!   empty for every other call
 //! - `NEAR_TRANSACTION_HASH` - Transaction hash (if applicable)
 //!
 //! Example call chain: User (alice.near) → Token (token.near) → OutLayer → Worker → WASM
 //! - NEAR_SENDER_ID = alice.near (user who signed)
 //! - NEAR_PREDECESSOR_ID = token.near (contract that called OutLayer)
+//!
+//! Example meta-transaction: alice.near signs a delegate action calling OutLayer,
+//! relayer.near sends it and pays the gas
+//! - NEAR_SENDER_ID = NEAR_PREDECESSOR_ID = alice.near
+//! - NEAR_RELAYER_ID = relayer.near
+//!
+//! To admit only some ways of calling the project — only through named
+//! contracts, no HTTPS, no meta-transactions — declare `callers` in the
+//! manifest rather than checking these values in code: the worker refuses a
+//! run the manifest does not admit before any secret is decrypted or any code
+//! runs (`wasi-examples/CONNECTOR_MANIFEST.md`, `callers`).
 //!
 //! You can also access secrets stored via the contract as environment variables:
 //!
@@ -48,7 +62,10 @@ use std::io::{self, Read, Write};
 
 /// Get the NEAR account ID that requested this execution
 ///
-/// This is the account that called `request_execution` on the OutLayer contract.
+/// This is the account that signed the transaction calling `request_execution`
+/// on the OutLayer contract — for a NEP-366 meta-transaction, the account that
+/// signed the delegate action, not the relayer that sent it (see
+/// [`relayer_account_id`]).
 ///
 /// # Returns
 /// * `Some(account_id)` - The signer's account ID
@@ -284,10 +301,16 @@ pub fn has_var(key: &str) -> bool {
     std::env::var(key).is_ok()
 }
 
-/// Get the predecessor account ID (contract that called OutLayer)
+/// Get the predecessor account ID (the account that called OutLayer)
 ///
-/// This is the contract that called `request_execution` on OutLayer.
-/// Use this to verify that execution was triggered by your authorized contract.
+/// The account that called `request_execution` on OutLayer: a contract
+/// relaying the call, or the signer itself on a direct call or a
+/// meta-transaction.
+///
+/// To admit only calls from your contract, declare
+/// `"callers": {"contract": {"only": ["token.near"]}}` in the manifest: the
+/// worker then refuses any other caller before the secrets are decrypted and
+/// before this code runs. A check in code, as below, runs after both.
 ///
 /// # Returns
 /// * `Some(account_id)` - The predecessor contract's account ID
@@ -309,4 +332,24 @@ pub fn has_var(key: &str) -> bool {
 /// ```
 pub fn predecessor_account_id() -> Option<String> {
     std::env::var("NEAR_PREDECESSOR_ID").ok()
+}
+
+/// Get the account that relayed this call as a NEP-366 meta-transaction
+///
+/// A meta-transaction is signed by the user as a delegate action and sent by a
+/// relayer, which pays the gas. The run belongs to the user
+/// ([`signer_account_id`]); this names the relayer.
+///
+/// # Returns
+/// * `Some(account_id)` - The relayer's account ID
+/// * `None` - The call was not a meta-transaction, or not on chain
+///
+/// # Example
+/// ```rust,ignore
+/// if let Some(relayer) = env::relayer_account_id() {
+///     println!("Gas paid by {}", relayer);
+/// }
+/// ```
+pub fn relayer_account_id() -> Option<String> {
+    std::env::var("NEAR_RELAYER_ID").ok().filter(|id| !id.is_empty())
 }

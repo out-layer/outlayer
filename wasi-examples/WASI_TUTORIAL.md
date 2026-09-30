@@ -886,6 +886,26 @@ than picking a winner. Reserved names (`NEAR_SENDER_ID`, `PROTECTED_*`, …) are
 refused at storage time and stripped at run time, so whatever your module reads
 under a system name came from the worker.
 
+### 3d. Who may call your project
+
+A manifest's `callers` block decides which doors a run may come through —
+a direct call, a call through a contract, a NEP-366 meta-transaction, an HTTPS
+call — and the worker refuses any other before it decrypts or runs anything:
+
+```jsonc
+{ "callers": { "contract": { "only": ["game.near"] } } }   // only game.near may call it
+{ "callers": { "contract": "deny", "https": "deny" } }      // direct calls only
+{ "callers": { "direct": "deny", "contract": "deny" } }     // HTTPS only
+```
+
+No block admits every door. A block leaves open every door it does not name,
+except meta-transactions, which need `"meta_tx": "allow"`. `only` lists every
+account that may call OutLayer for the project, so it shuts HTTPS, direct
+calls and meta-transactions by itself. The rule is in the wasm, so it binds the
+version and its owner alike — and only that version: remove the versions
+published without it, or a caller pins one of them with `version_key`. The table of doors, the refusal sentences and
+the limits on `only` are in `CONNECTOR_MANIFEST.md` (`callers`).
+
 ### 4. Output Size
 
 ```rust

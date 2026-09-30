@@ -1,0 +1,5 @@
+{
+  "display": { "name": "Caller-gate probe (no callers block)" },
+  "operations": ["whoami"],
+  "capabilities": { "network": [] }
+}

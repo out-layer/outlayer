@@ -48,7 +48,7 @@ let display_name = sender_id.strip_suffix(account_suffix).unwrap_or(&sender_id);
 
 | Variable | NEAR Mode | HTTPS Mode |
 |----------|-----------|------------|
-| `NEAR_SENDER_ID` | Transaction signer account | Payment Key owner |
+| `NEAR_SENDER_ID` | Transaction signer account; for a meta-transaction, the account that signed the delegate action | Payment Key owner |
 | `NEAR_USER_ACCOUNT_ID` | Same as sender | Same as sender |
 
 Always set in both modes.
@@ -118,7 +118,8 @@ let usd_amount = usd_payment as f64 / 1_000_000.0;
 | `NEAR_BLOCK_TIMESTAMP` | Block timestamp (nanoseconds) | `""` |
 | `NEAR_RECEIPT_ID` | Receipt ID | `""` |
 | `NEAR_PREDECESSOR_ID` | Predecessor account | `""` |
-| `NEAR_SIGNER_PUBLIC_KEY` | Signer's public key | `""` |
+| `NEAR_SIGNER_PUBLIC_KEY` | Signer's public key; for a meta-transaction, the key that signed the delegate action | `""` |
+| `NEAR_RELAYER_ID` | The account that relayed a meta-transaction and paid its gas; `""` for every other call | `""` |
 | `NEAR_GAS_BURNT` | Gas used | `""` |
 | `NEAR_TRANSACTION_HASH` | Transaction hash | `""` |
 | `NEAR_REQUEST_ID` | Internal request ID | `""` |
@@ -223,6 +224,7 @@ fn main() {
 | `OUTLAYER_CALL_ID` | `""` | UUID | No |
 | `NEAR_BLOCK_HEIGHT` | Value | `""` | No |
 | `NEAR_TRANSACTION_HASH` | Value | `""` | No |
+| `NEAR_RELAYER_ID` | Relayer or `""` | `""` | No |
 | `NEAR_MAX_INSTRUCTIONS` | Yes | Yes | No |
 | `NEAR_MAX_MEMORY_MB` | Yes | Yes | No |
 | `NEAR_MAX_EXECUTION_SECONDS` | Yes | Yes | No |
