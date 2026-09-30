@@ -40,8 +40,10 @@
 #       the relay calls OutLayer) against meta-tx (`contract: deny`,
 #       `meta_tx: allow`) → refused as a contract call, not admitted as a
 #       meta-transaction
-#   A5  a delegate its own sender relays, against direct-only → runs as a
-#       direct call, NEAR_RELAYER_ID empty
+#   A5  a delegate its own sender relays: SKIP — near-cli-rs signs that
+#       delegate with the nonce its own outer transaction takes, and the
+#       runtime refuses it; the worker's side is the unit test
+#       `a_delegate_its_sender_relayed_is_a_direct_call`
 #   A6  a listed account as the relayer (contract-deputy, `only: [$DEPUTY]`):
 #       $DEPUTY relays $PARENT's delegate → refused (the caller is $PARENT);
 #       control: $DEPUTY calling OutLayer itself → runs
@@ -283,6 +285,14 @@ if [[ -n "$DEPUTY" ]]; then
   if [[ "$owner" != "$PARENT" ]]; then
     warn "$DEPUTY is not a deputy owned by $PARENT (its owner(): '${owner:-unreadable}') — its rows SKIP"
     DEPUTY=""
+  else
+    # The deputy pays four deposits and one call of its own.
+    bal=$(view "$DEPUTY" balance '{}' | tr -d '"')
+    if [[ "$bal" =~ ^[0-9]+$ ]] && python3 -c "import sys; sys.exit(0 if int(sys.argv[1]) >= 10**24 else 1)" "$bal"; then
+      note "$DEPUTY balance: $(python3 -c "import sys; print(int(sys.argv[1])/10**24)" "$bal") NEAR"
+    else
+      warn "$DEPUTY holds under 1 NEAR ('${bal:-unreadable}' yocto) — its runs may fail on balance; fund it from $PARENT"
+    fi
   fi
 fi
 [[ -n "$PAYMENT_KEY" ]] && note "PAYMENT_KEY: present (${#PAYMENT_KEY} chars)" || warn "PAYMENT_KEY unset — the HTTPS rows SKIP"
@@ -458,11 +468,7 @@ if have "A4" RELAY_CONTRACT; then
 fi
 
 log "A5 a delegate its own sender relays"
-delegated "$PARENT" "$PARENT" "$CONTRACT_ID" request_execution "$(exec_args "$(get_for hash direct-only)")"
-if expect_ran "A5 self-relayed delegate against direct-only"; then
-  [[ -z "$(out_field .relayer_id)" ]] && pass "A5 — NEAR_RELAYER_ID is empty: a direct call" \
-    || fail "A5 — NEAR_RELAYER_ID is '$(out_field .relayer_id)'"
-fi
+skip "A5 near-cli-rs cannot send a delegate its own sender relays (one key, one nonce for both); covered by the worker unit test"
 
 log "A6 a listed account as the relayer"
 if have "A6" DEPUTY; then
