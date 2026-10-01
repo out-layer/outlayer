@@ -129,6 +129,11 @@ pub struct ExecutionRequest {
     /// USD payment amount for HTTPS calls (X-Attached-Deposit, in minimal token units)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd_payment: Option<String>,
+    /// What the call authorised for compute (X-Compute-Limit, in minimal
+    /// token units): the ceiling of a task's consent to the run that carries
+    /// it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_limit_usd: Option<String>,
     /// Wallet ID for wallet-enabled executions (e.g. "ed25519:abc..." from X-Wallet-Id header)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallet_id: Option<String>,

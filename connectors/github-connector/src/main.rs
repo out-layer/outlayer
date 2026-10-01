@@ -21,7 +21,8 @@
 //!
 //! Every write can be put behind the owner's confirmation: an operation the
 //! policy lists under `confirm` is checked, prepared and left as a task for the
-//! owner, and the owner's own call of `confirm` carries it out (`confirm.rs`).
+//! owner, and the run of `confirm` the platform starts on the owner's approval
+//! carries it out (`confirm.rs`).
 //!
 //! One host in the manifest: `api.github.com`.
 
@@ -132,6 +133,12 @@ pub struct Input {
     pub task_id: Option<String>,
     /// `confirm`: SHA-256 of the task as the owner's page showed it.
     pub task_hash: Option<String>,
+    /// `confirm`: the owner's approval — `at`, `public_key`, `signature`,
+    /// `nonce` — as the platform puts it in the run's input.
+    pub approval: Option<Value>,
+    /// `confirm`: what the owner wrote beside the approval, sealed to the
+    /// task's reply key, in base64. Handed to the agent with the result.
+    pub note: Option<String>,
 }
 
 /// Everything this connector sells. A name not here is refused with the list.
@@ -338,7 +345,12 @@ mod tests {
             let err = run(op, &Input { repo: Some("a/b".into()), ..Input::default() }).unwrap_err();
             assert!(err.starts_with("policy_missing:"), "{op} → {err}");
         }
-        let named = Input { task_id: Some("run-0".into()), task_hash: Some("ab".repeat(32)), ..Input::default() };
+        let named = Input {
+            task_id: Some("run-0".into()),
+            task_hash: Some("ab".repeat(32)),
+            approval: Some(serde_json::json!({ "at": 1, "public_key": "ed25519:k", "signature": "s", "nonce": "n" })),
+            ..Input::default()
+        };
         assert!(run("confirm", &named).unwrap_err().starts_with("policy_missing:"));
     }
 

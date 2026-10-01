@@ -11,16 +11,11 @@
 //! ## Why this is a separate project and not an operation in `connector-probe`
 //!
 //! The worker gives a component the wallet host functions only if the component
-//! IMPORTS them (`has_wallet_import` in `worker/src/executor/wasi_p2.rs`), and
-//! it refuses to instantiate such a component when the request carries no
-//! wallet id. Most calls to `connector-probe` carry none — every payment-key
-//! call, every trial-key call, every on-chain `request_execution` — so adding
-//! the import there would have failed all of them before `main` ran, `ping`
-//! included. One import would have taken the whole probe down.
-//!
-//! So the split is forced rather than chosen: a module that imports the wallet
-//! can only ever be called WITH a wallet, and that is the whole contract of
-//! this one.
+//! IMPORTS them (`has_wallet_import` in `worker/src/executor/wasi_p2.rs`). On a
+//! run that names no wallet every one of them answers `no_wallet`, so the
+//! import is harmless to a module that never calls them; here every operation
+//! does, and `connector-probe` keeps the wallet out so that its own answers
+//! stay about the connector path and nothing else.
 //!
 //! ## What each operation is for
 //!
@@ -307,11 +302,11 @@ fn run(input: &Input) -> Output {
 ///
 /// **Absent is a failure here, not a neutral result.** `WALLET_ID` is injected
 /// for every run that has a wallet (`worker/src/main.rs`, beside
-/// `wallet_config`), and this module cannot run without one — the worker
-/// refuses to instantiate a component importing `outlayer:wallet/api` when the
-/// request carries no wallet. So a missing variable is a system value that did
-/// not arrive on a run that must have it: exactly the silent class this probe
-/// exists to surface, and reporting it as success would bury it.
+/// `wallet_config`), and this function is reached only once `get_id` answered
+/// — on a run with no wallet it answers `no_wallet` instead. So a missing
+/// variable is a system value that did not arrive on a run that must have it:
+/// exactly the silent class this probe exists to surface, and reporting it as
+/// success would bury it.
 fn identity_verdict(id: &str, env_id: Option<&str>) -> (bool, String) {
     match env_id {
         Some(e) if e == id => (true, format!("wallet {id}; the environment agrees")),

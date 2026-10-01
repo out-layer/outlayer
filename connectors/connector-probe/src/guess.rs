@@ -1,15 +1,17 @@
 //! A guessing game played through tasks: a conversation of several turns
-//! between an agent's run and its owner's, with a secret neither of them reads.
+//! between an agent and its owner, played by the agent's runs, with a secret
+//! neither of them reads.
 //!
 //! `guess_start` (the agent) picks a number from 1 to `max` and opens an
-//! `input` task for the owner of the row the run names. The owner answers it in
-//! the inbox; their own call runs `guess`, which judges the guess, reports the
-//! turn, and — unless the guess was right — opens the next task of the same
-//! thread, which says `higher` or `lower` and counts the attempts.
+//! `input` task for the owner of the row the run names. The owner answers it
+//! in the inbox with one signature; the platform starts `guess` as a run of
+//! the agent, which judges the guess, reports the turn, and — unless the
+//! guess was right — opens the next task of the same thread, which says
+//! `higher` or `lower` and counts the attempts. Every turn is the agent's.
 //!
-//! The secret lives in the task's sealed `state`, handed from turn to turn.
-//! Not in storage: a storage cell is per account, and the agent's run and the
-//! owner's run write different cells. The envelope the owner reads carries
+//! The secret lives in the task's sealed `state`, handed from turn to turn,
+//! and nowhere else: nothing but the sealed task is kept between runs, so a
+//! game leaves no record behind it. The envelope the owner reads carries
 //! `state_hash`, the SHA-256 of the state bytes, so the state carries a random
 //! salt beside the secret: without it, hashing every state for 1 to `max` would
 //! name the secret.
@@ -180,7 +182,7 @@ impl Turn {
         }
     }
 
-    /// The turn in a sentence, for the preparer and for the owner's call.
+    /// The turn in a sentence, for the preparer's report and the run's answer.
     pub fn sentence(&self) -> String {
         let n = self.game.attempts;
         match (self.verdict, self.guess) {
@@ -240,8 +242,8 @@ pub struct Answered {
     pub next: Option<Result<Value, String>>,
 }
 
-/// `guess`: the owner's answer to a turn. Judges it, opens the next turn when
-/// the game goes on, and reports.
+/// `guess`: the agent's run on the owner's answer to a turn. Judges it, opens
+/// the next turn when the game goes on, and reports.
 pub fn answer(input: &Value) -> Result<Answered, String> {
     let answer = tasks::answered_for(ANSWER_BY, input, POLICY).map_err(|e| e.refusal())?;
     // A state that does not read is not reported on: the task ends `failed`.

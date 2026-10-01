@@ -74,6 +74,8 @@ pub enum Purpose {
     Answer,
     /// The reason of a rejection, to the task's reply key.
     Rejection,
+    /// The note the owner writes beside an approval, to the task's reply key.
+    Note,
 }
 
 impl Purpose {
@@ -82,6 +84,7 @@ impl Purpose {
             Self::DeviceCopy => "outlayer-task:v1:device-copy:",
             Self::Answer => "outlayer-task:v1:answer:",
             Self::Rejection => "outlayer-task:v1:rejection:",
+            Self::Note => "outlayer-task:v1:note:",
         };
         [label.as_bytes(), task.as_bytes()].concat()
     }

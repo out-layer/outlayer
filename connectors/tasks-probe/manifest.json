@@ -23,7 +23,7 @@
     "operations": {
       "prepare": {
         "class": "write",
-        "doc": "Opens one task for the owner of the row the run names, and answers `awaiting_owner` with its id and hash.",
+        "doc": "Opens one task for the owner of the row the run names, and answers `awaiting_owner` with its id and hash. `seconds` is sealed with a `confirm_slow` task as the time its run takes.",
         "params": [
           {
             "name": "title",
@@ -59,6 +59,11 @@
             "name": "again",
             "type": "boolean",
             "doc": "`supply` opens the next task of the conversation when it answers this one."
+          },
+          {
+            "name": "seconds",
+            "type": "integer",
+            "doc": "For a `confirm_slow` task: how long its run waits, 1 to 170 seconds, sealed with the task."
           }
         ]
       },
@@ -138,7 +143,7 @@
       },
       "confirm": {
         "class": "write",
-        "doc": "The owner answers a task that names `confirm`, and reports what was prepared: the task ends `done`.",
+        "doc": "Started by the platform as a run of the agent that prepared the task, on the owner's signed approval. Takes a task that names `confirm`, and reports what was prepared and the owner's note: the task ends `done`.",
         "params": [
           {
             "name": "task_id",
@@ -150,13 +155,25 @@
             "name": "task_hash",
             "type": "string",
             "required": true,
-            "doc": "The hash of what the owner's page opened."
+            "doc": "SHA-256 of the task as the owner's page showed it."
+          },
+          {
+            "name": "approval",
+            "type": "object",
+            "required": true,
+            "doc": "The owner's approval as the platform puts it in the run's input: `at`, `public_key`, `signature`, `nonce`."
+          },
+          {
+            "name": "note",
+            "type": "base64 string",
+            "required": false,
+            "doc": "What the owner wrote beside the approval, sealed to the task's reply key."
           }
         ]
       },
       "confirm_slow": {
         "class": "write",
-        "doc": "The owner answers a task that names `confirm_slow`, the run waits `seconds`, then reports what was prepared: the task is `answering` for that long and ends `done`.",
+        "doc": "Started by the platform as a run of the agent that prepared the task, on the owner's signed approval. Takes a task that names `confirm_slow`, waits the task's `seconds`, then reports what was prepared: the task is `answering` for that long and ends `done`.",
         "params": [
           {
             "name": "task_id",
@@ -168,19 +185,31 @@
             "name": "task_hash",
             "type": "string",
             "required": true,
-            "doc": "The hash of what the owner's page opened."
+            "doc": "SHA-256 of the task as the owner's page showed it."
           },
           {
             "name": "seconds",
             "type": "number",
+            "required": false,
+            "doc": "How long the run waits, 1 to 170. Read off the call when it names one; otherwise the value `prepare` sealed with the task."
+          },
+          {
+            "name": "approval",
+            "type": "object",
             "required": true,
-            "doc": "How long the run waits before it reports, 1 to 170."
+            "doc": "The owner's approval as the platform puts it in the run's input: `at`, `public_key`, `signature`, `nonce`."
+          },
+          {
+            "name": "note",
+            "type": "base64 string",
+            "required": false,
+            "doc": "What the owner wrote beside the approval, sealed to the task's reply key."
           }
         ]
       },
       "supply": {
         "class": "write",
-        "doc": "The owner answers a `text` or `file` task and reports what was supplied; a task prepared with `again` opens the next one.",
+        "doc": "Started by the platform as a run of the agent that prepared the task, on the owner's signed approval. Takes a `text` or `file` task and reports what the owner supplied; a task prepared with `again` opens the next one, as the agent's.",
         "params": [
           {
             "name": "task_id",
@@ -192,19 +221,31 @@
             "name": "task_hash",
             "type": "string",
             "required": true,
-            "doc": "The hash of what the owner's page opened."
+            "doc": "SHA-256 of the task as the owner's page showed it."
           },
           {
             "name": "supplied",
             "type": "string",
             "required": true,
             "doc": "What the owner supplies, sealed to the task's reply key, in base64."
+          },
+          {
+            "name": "approval",
+            "type": "object",
+            "required": true,
+            "doc": "The owner's approval as the platform puts it in the run's input: `at`, `public_key`, `signature`, `nonce`."
+          },
+          {
+            "name": "note",
+            "type": "base64 string",
+            "required": false,
+            "doc": "What the owner wrote beside the approval, sealed to the task's reply key."
           }
         ]
       },
       "confirm_silent": {
         "class": "write",
-        "doc": "The owner answers a task that names `confirm_silent` or `confirm`, and reports nothing: the task ends `failed`.",
+        "doc": "Started by the platform as a run of the agent that prepared the task, on the owner's signed approval. Takes a task that names `confirm_silent`, and reports nothing: the task ends `failed`.",
         "params": [
           {
             "name": "task_id",
@@ -216,13 +257,25 @@
             "name": "task_hash",
             "type": "string",
             "required": true,
-            "doc": "The hash of what the owner's page opened."
+            "doc": "SHA-256 of the task as the owner's page showed it."
+          },
+          {
+            "name": "approval",
+            "type": "object",
+            "required": true,
+            "doc": "The owner's approval as the platform puts it in the run's input: `at`, `public_key`, `signature`, `nonce`."
+          },
+          {
+            "name": "note",
+            "type": "base64 string",
+            "required": false,
+            "doc": "What the owner wrote beside the approval, sealed to the task's reply key."
           }
         ]
       },
       "confirm_trap": {
         "class": "write",
-        "doc": "The owner answers a task that names `confirm_trap` or `confirm`, reports, and traps: the task ends `failed`.",
+        "doc": "Started by the platform as a run of the agent that prepared the task, on the owner's signed approval. Takes a task that names `confirm_trap`, reports, and traps: the task ends `failed`.",
         "params": [
           {
             "name": "task_id",
@@ -234,13 +287,25 @@
             "name": "task_hash",
             "type": "string",
             "required": true,
-            "doc": "The hash of what the owner's page opened."
+            "doc": "SHA-256 of the task as the owner's page showed it."
+          },
+          {
+            "name": "approval",
+            "type": "object",
+            "required": true,
+            "doc": "The owner's approval as the platform puts it in the run's input: `at`, `public_key`, `signature`, `nonce`."
+          },
+          {
+            "name": "note",
+            "type": "base64 string",
+            "required": false,
+            "doc": "What the owner wrote beside the approval, sealed to the task's reply key."
           }
         ]
       },
       "task_status": {
         "class": "read",
-        "doc": "One task this caller made: its state, and the result, the reason and the run when it has them.",
+        "doc": "One task this caller made: its state, and the result, the reason, the run and `failure_reason` when it has them.",
         "params": [
           {
             "name": "task_id",
@@ -281,7 +346,7 @@
       },
       "tasks_unlock": {
         "class": "write",
-        "doc": "The owner's run writes the copies of the open tasks for the device now in force, and answers how many wait.",
+        "doc": "The owner's run writes the copies of the waiting tasks for the device now in force, and answers how many wait.",
         "params": []
       }
     }

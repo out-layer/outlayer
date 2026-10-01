@@ -15,7 +15,7 @@
 //! |---|---|---|
 //! | `status` | read | whether the credential works, the policy's caps, today's send count. On chain the policy comes back only sealed to the caller's `reply_pubkey` |
 //! | `send` | write | a message, policy-checked first; left as a task for the owner when their policy lists `send` under `confirm` |
-//! | `confirm` | write | the owner's own call: sends the message a task holds. On chain the answer names no recipient and no subject |
+//! | `confirm` | write | run by the platform as the agent on the owner's approval: sends the message a task holds. On chain the answer names no recipient and no subject |
 //! | `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | | the tasks this caller made, and the owner's devices |
 //!
 //! It only sends. `gmail.send` authorises sending and nothing else — not reading
@@ -79,6 +79,12 @@ struct Input {
     task_id: Option<String>,
     /// `confirm`: SHA-256 of the task as the owner's page showed it.
     task_hash: Option<String>,
+    /// `confirm`: the owner's approval — `at`, `public_key`, `signature`,
+    /// `nonce` — as the platform puts it in the run's input.
+    approval: Option<Value>,
+    /// `confirm`: what the owner wrote beside the approval, sealed to the
+    /// task's reply key, in base64. Handed to the agent with the result.
+    note: Option<String>,
 }
 
 /// Everything this connector sells. A name not here is refused with the list.
@@ -302,10 +308,10 @@ pub(crate) fn deliver(rules: &policy::Policy, message: &Prepared, counted: polic
     let Prepared { to, cc, subject, body, attachments } = message;
 
     // The owner's own cap, if they set one — their guard against a runaway
-    // agent on their mailbox. A message the caller sends itself is counted
-    // for the caller; one the owner confirms, for the agent that prepared it.
-    // The two counts are separate records in separate cells, and the cap
-    // bounds each. It is not the platform's: the manifest's limits are
+    // agent on their mailbox. A message the caller sends itself and one the
+    // owner confirmed are two counts in the caller's own cell — the run that
+    // confirms is the agent's own — and the cap bounds each. It is not the
+    // platform's: the manifest's limits are
     // enforced by the coordinator for every wallet, and Google caps the
     // account itself. The place in today's budget is taken before anything
     // leaves, atomically, so two calls at once cannot both see room for the

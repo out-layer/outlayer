@@ -92,7 +92,7 @@ Every write answers `awaiting_owner` instead when the policy lists it under
 
 | owner confirmation | |
 |---|---|
-| `confirm` | the owner's own call, with `task_id` and `task_hash`: makes the write the task holds |
+| `confirm` | run by the platform on the owner's approval, as the agent's own call, with `task_id`, `task_hash`, the owner's `approval` and their sealed `note`: makes the write the task holds |
 | `task_status`, `task_cancel`, `task_delete` | a task this caller made, by `task_id`: where it stands, withdraw it, delete it |
 | `tasks` | the tasks this caller made for this owner |
 | `tasks_unlock` | the owner's own call: opens the waiting tasks for a device that was not signed in when they were made |
@@ -124,8 +124,11 @@ owner and answers
 ```
 
 which is a success: the agent did its part, and paid the write's price. It
-learns the outcome from `task_status`. The write waits sealed, and the owner's
-`confirm` makes exactly it: nothing in the task says what to do on a yes.
+learns the outcome from `task_status`. The write waits sealed; the owner
+approves it with one message their wallet signs, the platform runs `confirm`
+as the agent — on the agent's own payment key, within the compute limit of
+the call that prepared the write — and that run makes exactly the write:
+nothing in the task says what to do on a yes.
 
 ### What the owner is shown
 
@@ -168,23 +171,28 @@ confirmation, and moves the branch without force.
 
 ### `confirm`
 
-The owner's page calls `confirm` with `task_id` and `task_hash`. The policy the
-write is judged by is the one the task was made under — a task made under
-another is refused `task_void` — and it is judged again in full, with the
-default-branch rule asked of GitHub again. The write is counted for the agent
-that prepared it, then made, and its whole result is left for that agent,
-sealed, in `task_status`.
+The platform calls `confirm` in a run of the agent that prepared the task,
+with `task_id`, `task_hash`, the owner's `approval` and their sealed `note`.
+The host admits it in that run only, and only with the owner's signature over
+the task's id, its hash and what they wrote: any other call is refused
+`not_the_preparer` or `task_approval_invalid`. The policy the write is judged
+by is the one the task was made under — a task made under another is refused
+`task_void` — and it is judged again in full, with the default-branch rule
+asked of GitHub again. The write is counted as confirmed in the agent's own
+cell, then made, and its whole result is left for the agent, sealed, in
+`task_status`, the owner's note with it.
 
 | refused | the task | the refusal |
 |---|---|---|
-| before the answer is taken: no `task_id` or `task_hash`, no policy or an unreadable one, anything the host refuses the answer for (`task_not_found`, `not_the_owner`, `task_hash_mismatch`, `task_answer_invalid`, `task_store_unavailable`, `task_closed`, `task_expired`, `task_void`) | stays as it was; an open one can be confirmed again | as it is |
+| before the answer is taken: no `task_id` or `task_hash`, no policy or an unreadable one, anything the host refuses the answer for (`task_not_found`, `not_the_preparer`, `task_approval_invalid`, `task_hash_mismatch`, `task_answer_invalid`, `task_store_unavailable`, `task_closed`, `task_expired`, `task_void`) | stays as it was in the run; the platform ends it `failed` with `run_refused:unreported` (a refusal of the connector's own, which the host never saw) or `run_refused:<reason>` (one of the host's) | as it is |
 | after: a state that is not a write, the policy, the day's count, the token, GitHub's refusal of the write | ends `failed` | its own code, and a sentence ending "The task is closed: to make this write, prepare it again" |
 | after the write was made: its result could not be left for the agent | ends `failed` | its own code, and "The write WAS made on GitHub (…) and the task is closed without its result: do not prepare it again" |
 
-**What `confirm` answers.** Over HTTPS, what the write answers, with `status`,
-`task_id` and `action`. On chain (`OUTLAYER_EXECUTION_TYPE` is anything but
-`HTTPS`) the answer is the output of a transaction the owner signed and stays
-public, so it carries `status`, `task_id`, `action`, and of the write's answer
+**What `confirm` answers.** The run the platform starts is an HTTPS call, so
+it answers what the write answers, with `status`, `task_id` and `action`. On
+chain (`OUTLAYER_EXECUTION_TYPE` is anything but `HTTPS`) an answer is the
+output of a transaction and stays public, so there it carries `status`,
+`task_id`, `action`, and of the write's answer
 only `number`, `comment_id`, `review_id`, `commit`, `sha`, `created`, `merged`,
 `starred`, `state` and `writes_today`: no repository, branch, path, URL or text,
 and no gist id — a secret gist's id is its address. A refusal on chain keeps its
@@ -192,12 +200,14 @@ code and says what happened in words that name nothing.
 
 **The daily cap counts confirmed writes for the agent that prepared them.** A
 run reads and writes the storage cell of the account that made it and no other,
-so there are two counts, and `max_writes_per_day` bounds each:
+and both runs that write are the agent's — its direct write, and the
+`confirm` the platform starts on the owner's approval — so there are two
+counts in the agent's cell, and `max_writes_per_day` bounds each:
 
 | count | record | whose cell | written by |
 |---|---|---|---|
 | the writes an agent makes itself | `gh:writes:<day>` | the agent's | the agent's write |
-| the writes the owner confirmed for an agent | `gh:writes:<day>:confirmed:<preparer>` | the owner's | the owner's `confirm` |
+| the writes the owner confirmed for an agent | `gh:writes:<day>:confirmed` | the agent's | the agent's `confirm`, run on the owner's approval |
 
 The manifest's per-wallet ceiling on `confirm`, 200 a day, stands beside the
 ceilings of the writes.
@@ -277,7 +287,7 @@ no outbound allowlist.
 | `src/main.rs` | the input shape, the dispatch, `status`, and the sealed policy readback |
 | `src/ops.rs` | every operation: the policy checks, the call, and what comes back |
 | `src/action.rs` | a write as one value: read from the call, checked, resolved, made — what a task holds sealed |
-| `src/confirm.rs` | a write the owner confirms: what they are shown, the task, the owner's `confirm`, what it answers on chain |
+| `src/confirm.rs` | a write the owner confirms: what they are shown, the task, the `confirm` the platform runs on their approval, what it answers on chain |
 | `src/policy.rs` | the owner's rules, the globs, and the day's counter |
 | `src/github.rs` | the REST client and GitHub's refusals turned into what to do |
 | `src/seal.rs` | sealing the policy to a caller's `reply_pubkey`, for answers that land on chain |

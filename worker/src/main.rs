@@ -703,6 +703,7 @@ async fn worker_iteration(
     let binding_kind = execution_request.binding_kind.clone();
     let payment_key_nonce = execution_request.payment_key_nonce;
     let usd_payment = execution_request.usd_payment.clone();
+    let compute_limit_usd = execution_request.compute_limit_usd.clone();
     let wallet_id = execution_request.wallet_id.clone();
 
     // Invariant: HTTPS calls must have call_id to route responses back to the user.
@@ -744,8 +745,18 @@ async fn worker_iteration(
             if using_explicit_version { "explicit" } else { "active" }
         );
 
-        // Fetch version info
-        let version_view = near_client.fetch_project_version(project_id, version_to_fetch).await?
+        // Fetch version info. A version pinned by its build hash is the hash
+        // as the platform spells it, lowercase; an author who declared the
+        // version in upper case is found under that spelling.
+        let mut version_view = near_client.fetch_project_version(project_id, version_to_fetch).await?;
+        if version_view.is_none() && version_to_fetch.len() == 64 && version_to_fetch.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let other_case = match version_to_fetch.bytes().any(|b| b.is_ascii_uppercase()) {
+                true => version_to_fetch.to_ascii_lowercase(),
+                false => version_to_fetch.to_ascii_uppercase(),
+            };
+            version_view = near_client.fetch_project_version(project_id, &other_case).await?;
+        }
+        let version_view = version_view
             .ok_or_else(|| anyhow::anyhow!("Project version not found: {} @ {}", project_id, version_to_fetch))?;
 
         // Convert contract's CodeSource to worker's api_client::CodeSource
@@ -1118,6 +1129,7 @@ come from the coordinator's own flow. contract={:?} task={:?}",
                     bound_sender.as_ref(),
                     payment_key_nonce,
                     usd_payment.as_ref(),
+                    compute_limit_usd.as_ref(),
                     wallet_id.as_ref(),
                     wasm_cache,
                 )
@@ -1924,6 +1936,7 @@ async fn handle_execute_job(
     bound_sender: Option<&String>, // Agent Connect: chain-verified bound asset account (verified in worker_iteration)
     payment_key_nonce: Option<i32>, // Payment Key nonce for HTTPS calls
     usd_payment: Option<&String>, // USD payment amount for HTTPS calls
+    compute_limit_usd: Option<&String>, // What the call authorised for compute: a task's consent carries it
     wallet_id: Option<&String>, // Wallet ID for wallet-enabled WASM executions
     wasm_cache: Option<&Arc<Mutex<WasmCache>>>, // Local raw-bytes LRU cache (both targets)
 ) -> Result<()> {
@@ -2720,7 +2733,8 @@ async fn handle_execute_job(
 
     // What the run holds for tasks, when its component declares them: the
     // task key if the row opened, and the run's own facts — this call, its
-    // project, the row's owner, the account that made the run. The guest
+    // project, the row's owner, the account that made the run, the payment
+    // key, wallet, identity and compute limit it runs with. The guest
     // supplies none of them.
     let task_report = tasks::RunReport::default();
     let task_store = tasks::StoreConfig {
@@ -2740,6 +2754,10 @@ async fn handle_execute_job(
         profile: secrets_ref.map(|r| r.profile.clone()),
         caller: user_account_id.cloned(),
         predecessor: predecessor_id.map(str::to_string),
+        payment_key_nonce: payment_key_nonce.and_then(|nonce| u32::try_from(nonce).ok()),
+        wallet_id: wallet_id.cloned(),
+        bound_identity: bound_sender.is_some(),
+        compute_limit_usd: compute_limit_usd.cloned(),
         store: Some(task_store.clone()),
         chain: Some(tasks::ChainConfig {
             rpc_url: config.near_rpc_url.clone(),
@@ -2964,16 +2982,18 @@ async fn handle_execute_job(
         )
         .await;
 
-    // The tasks this run answered, told to the store now that the guest has
-    // exited — however it exited: a task it reported on, in a run that
-    // succeeded, is `done`; every other is `failed`. A store that cannot be
-    // told leaves them `answering`, and closes them `failed` by itself.
+    // The tasks this run answered, and the approved tasks it was refused,
+    // told to the store now that the guest has exited — however it exited: a
+    // task it reported on, in a run that succeeded, is `done`; every other it
+    // answered is `failed`; one it was refused is `failed` with the reason. A
+    // store that cannot be told leaves them where they stand, and closes
+    // them `failed` by itself.
     {
-        let answered = task_report.tasks();
-        if let (false, Some(uuid), Some(row)) = (answered.is_empty(), project_uuid.as_ref(), secrets_ref) {
+        let (answered, refused) = (task_report.tasks(), task_report.refusals());
+        if let (false, Some(uuid), Some(row)) = (answered.is_empty() && refused.is_empty(), project_uuid.as_ref(), secrets_ref) {
             let scope = tasks::client::Scope { project_uuid: uuid.clone(), owner: row.account_id.clone() };
             let success = exec_result.as_ref().is_ok_and(|r| r.success);
-            match tasks::client::finish(&task_store, &scope, &task_run_id, success, &answered).await {
+            match tasks::client::finish(&task_store, &scope, &task_run_id, success, &answered, &refused).await {
                 Ok(finished) => info!("📬 Tasks finished: {} done, {} failed", finished.done, finished.failed),
                 Err(e) => warn!("Tasks answered by this run could not be finished in the store: {:?}", e),
             }
@@ -5358,6 +5378,10 @@ mod tasks_in_the_job_path {
             "profile: secrets_ref.map(|r| r.profile.clone()),",
             "caller: user_account_id.cloned(),",
             "predecessor: predecessor_id.map(str::to_string),",
+            "payment_key_nonce: payment_key_nonce.and_then(|nonce| u32::try_from(nonce).ok()),",
+            "wallet_id: wallet_id.cloned(),",
+            "bound_identity: bound_sender.is_some(),",
+            "compute_limit_usd: compute_limit_usd.cloned(),",
             "recipient: config.offchainvm_contract_id.to_string(),",
         ] {
             assert!(context.contains(fact), "{fact}: {context}");
@@ -5381,7 +5405,7 @@ mod tasks_in_the_job_path {
     fn what_a_run_answered_is_finished_after_it_whatever_way_it_ended() {
         let src = src();
         let exec = src.find(".execute(\n").expect("the executor call");
-        let finish = src.find("tasks::client::finish(&task_store, &scope, &task_run_id, success, &answered)").expect("the report");
+        let finish = src.find("tasks::client::finish(&task_store, &scope, &task_run_id, success, &answered, &refused)").expect("the report");
         let outcome = src.find("match exec_result {").expect("where the run's outcome is branched on");
         assert!(exec < finish && finish < outcome, "told before any branch on the outcome can return");
         assert!(

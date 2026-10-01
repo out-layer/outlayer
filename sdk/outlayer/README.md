@@ -216,10 +216,11 @@ sealed::delete("records", None, "init")?;
 
 ### Tasks (`outlayer::tasks`, feature `tasks`)
 
-An agent prepares; the owner reads and acts with a call of their own. A run
-admitted to an owner's secret row leaves that owner a task, and the owner
-answers it by calling an operation of the same project. Declare `"tasks": true`
-in the manifest. The model is in `docs/TASKS.md`.
+An agent prepares; the owner reads and approves with one signature; the
+agent's run carries it out. A run admitted to an owner's secret row leaves that
+owner a task; the owner approves it in their inbox, and the platform starts a
+run of the agent — on the agent's own payment key — in the operation the task
+names. Declare `"tasks": true` in the manifest. The model is in `docs/TASKS.md`.
 
 ```rust
 use outlayer::tasks::{self, Display, FieldKind, WrittenBy};
@@ -229,7 +230,7 @@ let opened = tasks::confirm(
     Display::new("Send an email")
         .list("To", &to, WrittenBy::Agent)
         .field("Body", FieldKind::LongText, &body, WrittenBy::Agent),
-    "confirm",          // the operation the owner calls
+    "confirm",          // the operation the owner's approval runs
     &state,             // handed back to it; never shown
     policy.as_bytes(),  // the policy the task is made under
 )
@@ -237,7 +238,9 @@ let opened = tasks::confirm(
 .open()?;
 let answer = tasks::awaiting_owner(&opened);
 
-// Acting: the operation the task names, called by the owner.
+// Acting: the operation the task names, run by the platform as the agent on
+// the owner's approval; the input carries the approval, and what the owner
+// supplied or noted, sealed.
 let answer = tasks::answered_for("confirm", &input, policy.as_bytes())?;
 // … act on `answer.state` and `answer.files`, under the policy as it is now …
 tasks::report(&answer.id, result.as_bytes())?;

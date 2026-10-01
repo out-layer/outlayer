@@ -572,25 +572,30 @@ pub async fn execute(
     let has_wallet_import = component.component_type().imports(&engine)
         .any(|(name, _)| name.contains("outlayer:wallet/api"));
 
+    // A component that imports the wallet interface on a run that named no
+    // wallet is linked to a state that holds none: every wallet function
+    // answers `no_wallet` and reaches nothing. The run starts all the same —
+    // a wallet connector's build serves the owner's `tasks_unlock`, which
+    // needs no wallet — and nothing is reachable that a refusal before `main`
+    // kept out, since the state holds no wallet id and no token.
     let wallet_state = if has_wallet_import {
-        if let Some(ref wallet_cfg) = exec_ctx.and_then(|ctx| ctx.wallet_config.as_ref()) {
-            debug!("Adding wallet host functions to linker, wallet_id={}", wallet_cfg.wallet_id);
-
-            add_wallet_to_linker(&mut linker, |state: &mut HostState| {
-                state.wallet_state_mut()
-            })?;
-
-            Some(WalletHostState::new(
-                &wallet_cfg.wallet_id,
-                &wallet_cfg.coordinator_url,
-                &wallet_cfg.wallet_auth_token,
-                wallet_cfg.connector_id.as_deref(),
-            ))
-        } else {
-            anyhow::bail!(
-                "WASM imports outlayer:wallet/api but wallet is not available.\n\
-                Wallet requires: X-Wallet-Id header in the execution request."
-            );
+        add_wallet_to_linker(&mut linker, |state: &mut HostState| {
+            state.wallet_state_mut()
+        })?;
+        match exec_ctx.and_then(|ctx| ctx.wallet_config.as_ref()) {
+            Some(wallet_cfg) => {
+                debug!("Adding wallet host functions to linker, wallet_id={}", wallet_cfg.wallet_id);
+                Some(WalletHostState::new(
+                    &wallet_cfg.wallet_id,
+                    &wallet_cfg.coordinator_url,
+                    &wallet_cfg.wallet_auth_token,
+                    wallet_cfg.connector_id.as_deref(),
+                ))
+            }
+            None => {
+                debug!("Adding wallet host functions to linker for a run with no wallet: every call answers no_wallet");
+                Some(WalletHostState::absent())
+            }
         }
     } else {
         None

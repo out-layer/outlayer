@@ -4,9 +4,11 @@ package outlayer:tasks@0.1.0;
 ///
 /// A run of a project, admitted to an owner's secret row, leaves a task for
 /// that owner: "confirm this email", "give me your photo". The owner reads it
-/// in their inbox, with no run, and acts on it with a call of their own to an
-/// operation of the same project. Nothing waits inside a run: a task is a
-/// record.
+/// in their inbox, with no run, and approves it with one signature of their
+/// wallet; the platform then starts a run of the AGENT that prepared the
+/// task, on the agent's own payment key and wallet, in the operation the
+/// task names, and that run carries the task out. Nothing waits inside a
+/// run: a task is a record.
 ///
 /// A project that uses tasks says so in its `outlayer.manifest`:
 ///
@@ -14,9 +16,18 @@ package outlayer:tasks@0.1.0;
 ///
 /// **Whose task.** The owner of a task is the owner of the secret row the run
 /// named and the keystore opened — never an account the component names. The
-/// preparer is the account that made the run; a task opened by a run that
-/// answered one continues that task's conversation and keeps its preparer.
-/// The host decides both from the job; no function here takes an account.
+/// preparer is the account that made the run. A task opened by a run that
+/// answered one continues that task's conversation (`thread`); its preparer
+/// is the run's caller, which for the run that carries a task out is the
+/// preparer again. The host decides both from the job; no function here
+/// takes an account.
+///
+/// **The consent.** A task is carried out by a run of its preparer that the
+/// platform starts on the owner's approval, paid by the payment key that
+/// made the preparing run, with its wallet, its identity and within its
+/// compute limit. Those facts are sealed with the task in `open` as the
+/// preparer's consent to that run, so `open` is refused `no-payment-key` in
+/// a run that has none: a task is opened over HTTPS with a payment key.
 ///
 /// **Who may do what.**
 ///
@@ -24,10 +35,12 @@ package outlayer:tasks@0.1.0;
 ///   lists the caller — or the owner's own run. A row open to everyone, to a
 ///   pattern or to holders of a token admits the run and refuses the task.
 /// - `mine`, `status`, `cancel`, `delete`: the tasks whose preparer is this
-///   caller (a turn is the preparer's of its conversation) in this project
-///   for this owner, and no others; `status`, `cancel` and `delete` also
-///   reach a task this run opened.
-/// - `answered`, `report`, `unlock`: the owner's own run.
+///   caller in this project for this owner, and no others.
+/// - `answered`, `report`: the run of the preparer the platform started on
+///   the owner's approval — the same account, payment key, wallet and
+///   identity as the preparing run, within its compute limit — and no other
+///   run, the owner's own included.
+/// - `unlock`: the owner's own run.
 ///
 /// A run of another project reaches nothing of this project's tasks: they are
 /// sealed under a key bound to the project and the owner, which the host
@@ -39,15 +52,19 @@ package outlayer:tasks@0.1.0;
 /// host checks the structure in `open`; one outside the bounds refuses the
 /// task.
 ///
-/// **What follows an answer is code.** A task names the operation the owner
-/// calls (`answer-by`) and carries no arguments for it. That operation calls
-/// `answered` with the id and the hash the owner's page showed, takes back
+/// **What follows an approval is code.** A task names the operation that
+/// carries it out (`answer-by`) and carries no arguments for it. The
+/// platform starts the preparer's run in that operation with an input of
+/// `task_id`, `task_hash`, `approval`, and `supplied` and `note` when the
+/// owner wrote them; the operation calls `answered` with them, takes back
 /// the `state` it sealed when it made the task, acts, and calls `report`.
 ///
-/// **States.** `open` → `answering` (the owner answered; the run named acts)
-/// → `done` (that run ended well and reported) or `failed` (it ended any
-/// other way). Or `open` → `rejected`, `cancelled`, `expired`, `void`. Each
-/// move is made once. A task never returns to `open`.
+/// **States.** `open` → `approved` (the owner signed; the platform started
+/// the preparer's run) → `answering` (that run took the task) → `done` (it
+/// ended well and reported) or `failed` (it ended any other way, or was
+/// refused the task before it took it, or could not be started). Or `open`
+/// → `rejected`, `cancelled`, `expired`, `void`. Each move is made once. A
+/// task never returns to `open`.
 ///
 /// **Absence is a value, failure an error.** `mine` with nothing answers
 /// `ok([])`. A store or a chain that did not answer is `err` with
@@ -167,6 +184,9 @@ interface api {
 
     enum task-state {
         open,
+        /// The owner approved; the preparer's run is started and has not yet
+        /// taken the task.
+        approved,
         answering,
         done,
         failed,
@@ -184,15 +204,42 @@ interface api {
         /// Unix seconds.
         created-at: u64,
         expires-at: u64,
-        /// The run that acts, or acted, on the owner's answer: present on
-        /// `answering`, `done` and `failed`. Its status is the platform's
-        /// ordinary status of a call.
+        /// The run that acts, or acted, on the owner's approval: present on
+        /// `approved`, `answering`, `done` and `failed`. Its status is the
+        /// platform's ordinary status of a call.
         run: option<string>,
         /// What the project reported: present on `done`.
         %result: option<list<u8>>,
         /// The owner's reason, as they wrote it: on `rejected`, when they
         /// gave one.
         rejection: option<string>,
+        /// Why a task is `failed` before its run acted: `preparer_key_unavailable`
+        /// (the payment key that prepared could not pay for the run),
+        /// `operation_priced`, `operation_unknown`, `operation_limit_reached`,
+        /// `wallet_unresolved`, `queue_unavailable`, `run_not_started`, or
+        /// `run_refused:<reason>` with the reason the host refused the run
+        /// `answered` with — `run_refused:unreported` when the run ended
+        /// without ever asking for the task. Absent when the run acted and
+        /// ended any way, or in every other state.
+        failure-reason: option<string>,
+    }
+
+    /// The owner's approval of a task: one NEP-413 signature their wallet
+    /// made over a sentence naming the task's id, the hash of what they were
+    /// shown and the digest of what they supplied and wrote, at a minute.
+    /// Handed to the run in its input by the platform and passed to
+    /// `answered` as it is; the host rebuilds the sentence from what is
+    /// sealed and verifies the signature under a full-access key of the
+    /// owner's account on chain.
+    record approval {
+        /// Unix seconds: the minute the sentence names.
+        at: u64,
+        /// The key that signed, `ed25519:<base58>`.
+        public-key: string,
+        /// Base64, 64 bytes.
+        signature: string,
+        /// Base64, 32 bytes.
+        nonce: string,
     }
 
     /// What `answered` hands the operation that acts.
@@ -211,6 +258,9 @@ interface api {
         /// What the owner supplied, opened: text, or a file's reference.
         /// Absent for a task that asked for nothing.
         supplied: option<list<u8>>,
+        /// What the owner wrote beside their approval, opened: text of at
+        /// most 50000 characters. Absent when they wrote nothing.
+        note: option<list<u8>>,
     }
 
     enum reason {
@@ -243,8 +293,22 @@ interface api {
         life-too-long,
         /// No such task of this project for this owner, or for this preparer.
         not-found,
-        /// `answered`, `report` or `unlock` in a run that is not the owner's.
+        /// `unlock` in a run that is not the owner's.
         not-the-owner,
+        /// `answered` in a run that is not the preparer's run the consent
+        /// names: another account, another payment key, another wallet,
+        /// another identity, or more compute than the preparing run allowed.
+        /// The message names which.
+        not-the-preparer,
+        /// The approval does not hold: its time is outside ten minutes of
+        /// now or past the task's life, its sentence is not this task's, its
+        /// signature does not verify, or the key that signed is not a
+        /// full-access key of the owner's account. The message names which.
+        approval-invalid,
+        /// `open` in a run that has no payment key: the consent to carry out
+        /// the owner's answer is a payment key — the run that carries it out
+        /// is paid by that key — so a task is opened over HTTPS with one.
+        no-payment-key,
         /// The hash named is not the task's.
         hash-mismatch,
         /// What the owner supplied is not what the task asked for, or does
@@ -277,36 +341,40 @@ interface api {
         message: string,
     }
 
-    /// Open a task for the owner of the secret row this run was admitted to.
+    /// Open a task for the owner of the secret row this run was admitted to,
+    /// with this run's consent to the run that will carry it out.
     open: func(request: request) -> result<opened, task-error>;
 
     /// The tasks whose preparer is this caller in this project for this
     /// owner: the open ones, and the outcomes kept.
     mine: func() -> result<list<outcome>, task-error>;
 
-    /// One of them, or a task this run opened.
+    /// One of them.
     status: func(id: string) -> result<outcome, task-error>;
 
-    /// Take the owner's answer to the task `id`, whose envelope hashes to
+    /// Take the task `id`, approved by its owner, whose envelope hashes to
     /// `hash`, in the operation `operation` — the one now running; a task
     /// that names another to answer by is refused `answer-invalid` and stays
-    /// open. `policy` is the policy as the component reads it now; `supplied`
-    /// what the owner's page sent, sealed to the task's reply key. On `ok`
-    /// the task is `answering` under this run, and what it showed is deleted
-    /// from the store.
-    answered: func(id: string, hash: string, operation: string, policy: list<u8>, supplied: option<list<u8>>) -> result<answer, task-error>;
+    /// as it is. `policy` is the policy as the component reads it now;
+    /// `approval` the owner's approval as the run's input carries it;
+    /// `supplied` and `note` what the owner's page sent, each sealed to the
+    /// task's reply key, as the input carries them. The run must be the one
+    /// the task's consent names (`not-the-preparer`), the approval must hold
+    /// (`approval-invalid`), and the task must be `approved`. On `ok` the
+    /// task is `answering` under this run, and what it showed is deleted from
+    /// the store. A refusal of a task that is `approved` is recorded and,
+    /// when the run ends, fails the task with `run_refused:<reason>`.
+    answered: func(id: string, hash: string, operation: string, policy: list<u8>, approval: approval, supplied: option<list<u8>>, note: option<list<u8>>) -> result<answer, task-error>;
 
     /// Leave `result` (at most 16384 bytes) for the preparer of a task this
     /// run answered. A task reported on is `done` when the run ends as a
     /// success; a task this run answered and did not report on is `failed`.
     report: func(id: string, %result: list<u8>) -> result<_, task-error>;
 
-    /// Withdraw an open task whose preparer is this caller, or one this run
-    /// opened.
+    /// Withdraw an open task whose preparer is this caller.
     cancel: func(id: string) -> result<_, task-error>;
 
-    /// Delete a task whose preparer is this caller, or one this run opened,
-    /// in any state.
+    /// Delete a task whose preparer is this caller, in any state.
     delete: func(id: string) -> result<_, task-error>;
 
     /// Write the copies of this project's open tasks for every device the

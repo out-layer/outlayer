@@ -1,10 +1,15 @@
 //! Tasks between an agent and its owner
 //!
-//! An agent's run prepares; the owner reads and acts with a call of their
-//! own. A run admitted to an owner's secret row leaves that owner a task —
-//! "confirm this email", "give me your photo" — and the owner answers it by
-//! calling an operation of the same project. Nothing waits inside a run: a
-//! task is a record the platform keeps sealed.
+//! An agent's run prepares; the owner reads the task in their inbox and
+//! approves it with one signature of their wallet; the platform then starts
+//! a run of the same agent — on the agent's own payment key, wallet and
+//! identity, within the compute limit of the preparing run — in the
+//! operation the task names, and that run carries the task out. A run
+//! admitted to an owner's secret row leaves that owner a task — "confirm
+//! this email", "give me your photo" — and nothing waits inside a run: a
+//! task is a record the platform keeps sealed. The owner makes no call and
+//! pays nothing; a task is opened over HTTPS with a payment key, which is
+//! the consent to the run that carries it out.
 //!
 //! Requires the `tasks` feature, and `"tasks": true` in the component's
 //! `outlayer.manifest`.
@@ -18,7 +23,7 @@
 //!     Display::new("Send an email")
 //!         .field("To", FieldKind::Address, &to, WrittenBy::Agent)
 //!         .field("Body", FieldKind::LongText, &body, WrittenBy::Agent),
-//!     "confirm",          // the operation the owner calls
+//!     "confirm",          // the operation the owner's approval runs
 //!     &message_bytes,     // handed back to that operation, never shown
 //!     policy_json.as_bytes(),
 //! )
@@ -29,15 +34,22 @@
 //!
 //! # Acting
 //!
-//! The operation named in the task is called by the owner's page with the
-//! task's `task_id` and `task_hash`, and `supplied` when the task asked for
-//! something:
+//! The operation named in the task is started by the platform, as a run of
+//! the agent that prepared it, with `task_id`, `task_hash`, `approval` (the
+//! owner's signature), and `supplied` and `note` when the owner wrote them:
 //!
 //! ```rust,ignore
 //! let answer = tasks::answered_for("confirm", &input, policy_json.as_bytes())?;
-//! let sent = send(&answer.state)?;          // today's limits; the policy is the one the task was made under
+//! let sent = send(&answer.state)?;          // today's limits, in this run's own cell; the policy is the one the task was made under
 //! tasks::report(&answer.id, sent.to_string().as_bytes())?;
 //! ```
+//!
+//! The host hands `state` over only once the run is the preparer's on the
+//! same payment key, wallet and identity ([`Reason::NotThePreparer`]) and the
+//! owner's approval holds for this task, its hash and what the owner wrote
+//! ([`Reason::ApprovalInvalid`]). A refusal there fails the task with
+//! `run_refused:<reason>`, which the agent reads in `task_status`, and the
+//! agent prepares again.
 //!
 //! # The operations every project gets
 //!
@@ -54,7 +66,7 @@
 use crate::raw::tasks as raw;
 
 pub use raw::{
-    Answer, FieldKind, File, Opened, Outcome, Reason, Supplies, TaskKind, TaskState, WrittenBy,
+    Answer, Approval, FieldKind, File, Opened, Outcome, Reason, Supplies, TaskKind, TaskState, WrittenBy,
 };
 
 /// The longest a task waits, in seconds.
@@ -83,6 +95,9 @@ impl TaskError {
             Reason::LifeTooLong => "task_life_too_long",
             Reason::NotFound => "task_not_found",
             Reason::NotTheOwner => "not_the_owner",
+            Reason::NotThePreparer => "not_the_preparer",
+            Reason::ApprovalInvalid => "task_approval_invalid",
+            Reason::NoPaymentKey => "task_no_payment_key",
             Reason::HashMismatch => "task_hash_mismatch",
             Reason::AnswerInvalid => "task_answer_invalid",
             Reason::Closed => "task_closed",
@@ -200,16 +215,19 @@ impl Task {
         self
     }
 
-    /// Open it for the owner of the secret row this run was admitted to.
+    /// Open it for the owner of the secret row this run was admitted to, with
+    /// this run's consent to the run that will carry it out: the same
+    /// payment key, wallet and identity, within this run's compute limit. A
+    /// run with no payment key is refused [`Reason::NoPaymentKey`].
     pub fn open(self) -> Result<Opened> {
         raw::open(&self.request).map_err(TaskError::from)
     }
 }
 
 /// A task the owner answers yes or no. `operation` is the operation of this
-/// project the owner calls to say yes; `state` is handed back to it and never
-/// shown; `policy` is the policy the task is made under, as the project reads
-/// it.
+/// project the platform runs, as the agent, on the owner's approval; `state`
+/// is handed back to it and never shown; `policy` is the policy the task is
+/// made under, as the project reads it.
 pub fn confirm(display: Display, operation: &str, state: &[u8], policy: &[u8]) -> Task {
     Task::new(TaskKind::Confirm, display, operation, Supplies::Nothing, state, policy)
 }
@@ -220,25 +238,33 @@ pub fn input(display: Display, operation: &str, supplies: Supplies, state: &[u8]
     Task::new(TaskKind::Input, display, operation, supplies, state, policy)
 }
 
-/// The tasks whose preparer is this caller in this project for this owner;
-/// a turn is the preparer's of its conversation.
+/// The tasks whose preparer is this caller in this project for this owner.
 pub fn mine() -> Result<Vec<Outcome>> {
     raw::mine().map_err(TaskError::from)
 }
 
-/// One of them, or a task this run opened.
+/// One of them.
 pub fn status(id: &str) -> Result<Outcome> {
     raw::status(id).map_err(TaskError::from)
 }
 
-/// Take the owner's answer to a task, in `operation` — the operation now
-/// running; a task that names another to answer by is refused and stays
-/// open. `policy` is the policy as the project reads it now; `supplied` what
-/// the owner's page sent.
+/// Take the task the owner approved, in `operation` — the operation now
+/// running; a task that names another to answer by is refused and stays as
+/// it is. `policy` is the policy as the project reads it now; `approval` the
+/// owner's signature as the run's input carries it; `supplied` and `note`
+/// what the owner's page sent, sealed, as the input carries them.
 ///
 /// On `Ok` the task is `answering` under this run. Act, then [`report`].
-pub fn answered(id: &str, hash: &str, operation: &str, policy: &[u8], supplied: Option<&[u8]>) -> Result<Answer> {
-    raw::answered(id, hash, operation, policy, supplied).map_err(TaskError::from)
+pub fn answered(
+    id: &str,
+    hash: &str,
+    operation: &str,
+    policy: &[u8],
+    approval: &Approval,
+    supplied: Option<&[u8]>,
+    note: Option<&[u8]>,
+) -> Result<Answer> {
+    raw::answered(id, hash, operation, policy, approval, supplied, note).map_err(TaskError::from)
 }
 
 /// Leave `result` for the preparer of a task this run answered. The task is
@@ -248,14 +274,13 @@ pub fn report(id: &str, result: &[u8]) -> Result<()> {
     raw::report(id, result).map_err(TaskError::from)
 }
 
-/// Withdraw an open task whose preparer is this caller, or one this run
-/// opened.
+/// Withdraw an open task whose preparer is this caller. An approved task is
+/// the owner's yes, and is not withdrawn.
 pub fn cancel(id: &str) -> Result<()> {
     raw::cancel(id).map_err(TaskError::from)
 }
 
-/// Delete a task whose preparer is this caller, or one this run opened, in
-/// any state.
+/// Delete a task whose preparer is this caller, in any state.
 pub fn delete(id: &str) -> Result<()> {
     raw::delete(id).map_err(TaskError::from)
 }
@@ -315,20 +340,47 @@ fn text_of<'a>(input: &'a serde_json::Value, member: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid(&format!("the call names no `{member}`")))
 }
 
-/// Take the owner's answer as the owner's page sends it: `task_id` and
-/// `task_hash`, and `supplied` (base64) when the task asked for something.
-/// `operation` is the operation now running.
+/// Sealed bytes as the input carries them: base64, or absent.
+fn sealed_of(input: &serde_json::Value, member: &str) -> Result<Option<Vec<u8>>> {
+    match input.get(member) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => {
+            Ok(Some(from_base64(text).ok_or_else(|| invalid(&format!("`{member}` is not base64")))?))
+        }
+        Some(_) => Err(invalid(&format!("`{member}` is not a string"))),
+    }
+}
+
+/// The owner's approval as the run's input carries it: `approval` with `at`,
+/// `public_key`, `signature` and `nonce`.
+pub fn approval_of(input: &serde_json::Value) -> Result<Approval> {
+    let approval = input.get("approval").ok_or_else(|| invalid("the call carries no `approval`"))?;
+    let at = approval
+        .get("at")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| invalid("`approval.at` is not a time"))?;
+    let member = |name: &str| {
+        approval
+            .get(name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| invalid(&format!("`approval.{name}` is missing")))
+    };
+    Ok(Approval { at, public_key: member("public_key")?, signature: member("signature")?, nonce: member("nonce")? })
+}
+
+/// Take the approved task as the platform starts this run for it: `task_id`
+/// and `task_hash`, the owner's `approval`, and `supplied` and `note`
+/// (base64) when the owner wrote them. `operation` is the operation now
+/// running.
 pub fn answered_for(operation: &str, input: &serde_json::Value, policy: &[u8]) -> Result<Answer> {
     let id = text_of(input, "task_id")?;
     let hash = text_of(input, "task_hash")?;
-    let supplied = match input.get("supplied") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(text)) => {
-            Some(from_base64(text).ok_or_else(|| invalid("`supplied` is not base64"))?)
-        }
-        Some(_) => return Err(invalid("`supplied` is not a string")),
-    };
-    answered(id, hash, operation, policy, supplied.as_deref())
+    let approval = approval_of(input)?;
+    let supplied = sealed_of(input, "supplied")?;
+    let note = sealed_of(input, "note")?;
+    answered(id, hash, operation, policy, &approval, supplied.as_deref(), note.as_deref())
 }
 
 fn kind_name(kind: TaskKind) -> &'static str {
@@ -342,6 +394,7 @@ fn kind_name(kind: TaskKind) -> &'static str {
 pub fn state_name(state: TaskState) -> &'static str {
     match state {
         TaskState::Open => "open",
+        TaskState::Approved => "approved",
         TaskState::Answering => "answering",
         TaskState::Done => "done",
         TaskState::Failed => "failed",
@@ -354,7 +407,9 @@ pub fn state_name(state: TaskState) -> &'static str {
 
 /// What a project answers when it opened a task instead of acting. It is a
 /// success: the agent did its part, hands the owner the link and asks for the
-/// outcome later with `task_status`.
+/// outcome later with `task_status`. The owner's approval starts a run of
+/// this agent, paid by this run's payment key, which must still be able to
+/// pay then.
 pub fn awaiting_owner(opened: &Opened) -> serde_json::Value {
     serde_json::json!({
         "status": "awaiting_owner",
@@ -389,6 +444,9 @@ pub fn outcome_json(outcome: &Outcome) -> serde_json::Value {
     if let Some(reason) = &outcome.rejection {
         out["reason"] = serde_json::json!(reason);
     }
+    if let Some(why) = &outcome.failure_reason {
+        out["failure_reason"] = serde_json::json!(why);
+    }
     out
 }
 
@@ -401,7 +459,7 @@ pub const OPERATIONS: &[&str] = &["task_status", "task_cancel", "task_delete", "
 ///
 /// | Operation | Input | Output |
 /// |---|---|---|
-/// | `task_status` | `task_id` | the task: `state`, and `result`, `reason`, `run` when it has them |
+/// | `task_status` | `task_id` | the task: `state`, and `result`, `reason`, `run`, `failure_reason` when it has them |
 /// | `task_cancel` | `task_id` | `{"task_id", "state": "cancelled"}` |
 /// | `task_delete` | `task_id` | `{"task_id", "deleted": true}` |
 /// | `tasks` | — | `{"tasks": [ … ]}`, empty when there are none |
@@ -455,6 +513,7 @@ mod tests {
             run: None,
             result: None,
             rejection: None,
+            failure_reason: None,
         }
     }
 
@@ -480,6 +539,44 @@ mod tests {
 
         let rejected = Outcome { rejection: Some("wrong recipient".into()), ..outcome(TaskState::Rejected) };
         assert_eq!(outcome_json(&rejected)["reason"], "wrong recipient");
+
+        let failed = Outcome { run: Some("run-9".into()), failure_reason: Some("run_refused:hash-mismatch".into()), ..outcome(TaskState::Failed) };
+        let failed = outcome_json(&failed);
+        assert_eq!((failed["state"].as_str(), failed["failure_reason"].as_str()), (Some("failed"), Some("run_refused:hash-mismatch")));
+        assert_eq!(state_name(TaskState::Approved), "approved");
+    }
+
+    #[test]
+    fn the_approval_is_read_off_the_input_as_the_platform_writes_it() {
+        let input = serde_json::json!({
+            "operation": "confirm", "task_id": "run-a-0", "task_hash": "ab",
+            "approval": { "at": 1_790_000_000u64, "public_key": "ed25519:k", "signature": "s", "nonce": "n" },
+            "supplied": "YWJj", "note": null,
+        });
+        let approval = approval_of(&input).unwrap();
+        assert_eq!((approval.at, approval.public_key.as_str(), approval.signature.as_str(), approval.nonce.as_str()), (1_790_000_000, "ed25519:k", "s", "n"));
+        assert_eq!(sealed_of(&input, "supplied").unwrap().as_deref(), Some(&b"abc"[..]));
+        assert_eq!(sealed_of(&input, "note").unwrap(), None);
+        for broken in [
+            serde_json::json!({}),
+            serde_json::json!({ "approval": { "at": "soon", "public_key": "k", "signature": "s", "nonce": "n" } }),
+            serde_json::json!({ "approval": { "at": 1, "public_key": "", "signature": "s", "nonce": "n" } }),
+            serde_json::json!({ "approval": { "at": 1, "public_key": "k", "signature": "s" } }),
+        ] {
+            let e = approval_of(&broken).unwrap_err();
+            assert_eq!(e.code(), "task_answer_invalid", "{broken}");
+        }
+        assert_eq!(sealed_of(&serde_json::json!({ "supplied": 5 }), "supplied").unwrap_err().code(), "task_answer_invalid");
+        assert_eq!(sealed_of(&serde_json::json!({ "supplied": "***" }), "supplied").unwrap_err().code(), "task_answer_invalid");
+    }
+
+    #[test]
+    fn every_reason_has_a_code_and_the_new_ones_are_named() {
+        let e = |reason: Reason| TaskError { reason, message: String::new() }.code().to_string();
+        assert_eq!(e(Reason::NotThePreparer), "not_the_preparer");
+        assert_eq!(e(Reason::ApprovalInvalid), "task_approval_invalid");
+        assert_eq!(e(Reason::NoPaymentKey), "task_no_payment_key");
+        assert_eq!(e(Reason::NotTheOwner), "not_the_owner");
     }
 
     #[test]

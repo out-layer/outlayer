@@ -3,21 +3,21 @@
 //! When the owner's policy lists `send` under `confirm`, the agent's `send`
 //! checks the message against the policy, and instead of sending it leaves
 //! it as a task: the owner is shown who it goes to, the subject and the body,
-//! and is given every attachment to open. The owner's own call of `confirm`
-//! takes the message and its attachments back, checks them against the
-//! policy — the one the task was made under: a task made under another is
-//! void — and sends them. Nothing in the task says what to do on a yes: this
-//! code does.
+//! and is given every attachment to open. The owner approves with one
+//! signature of their wallet, and the platform starts `confirm` as a run of
+//! the agent that prepared the task — on the agent's own payment key — with
+//! the approval in its input. That run takes the message and its attachments
+//! back, checks them against the policy — the one the task was made under: a
+//! task made under another is void — and sends them. Nothing in the task
+//! says what to do on a yes: this code does.
 //!
 //! What the owner is shown is what is sent. So a message to be confirmed has
 //! to fit what a task shows whole — a body of 50000 characters, attachments
 //! of 6 MiB together — and one that does not is refused, never shown in part.
 //!
-//! The owner's daily cap counts a confirmed message for the agent that
-//! prepared it: one count a day for each preparer, kept in the owner's
-//! storage cell, because the run that sends is the owner's and a run writes
-//! its own cell and no other. The sends an agent makes itself are counted in
-//! the agent's cell. The cap bounds each count; neither run reads the other's.
+//! The owner's daily cap counts a confirmed message in the agent's own
+//! cell, beside the sends the agent makes itself: both runs are the agent's.
+//! The cap bounds each count.
 
 use outlayer::tasks::{self, Display, FieldKind, WrittenBy};
 use serde_json::Value;
@@ -25,7 +25,7 @@ use serde_json::Value;
 use crate::{mime, policy};
 use crate::{Input, Prepared};
 
-/// The operation the owner calls to say yes.
+/// The operation the platform starts, as the agent, on the owner's approval.
 const ANSWERED_BY: &str = "confirm";
 
 /// Most characters of a body the owner is shown whole.
@@ -132,11 +132,14 @@ fn sent_unreported(refusal: String, sent: &Value) -> String {
 }
 
 /// What is checked before the owner's answer is taken: that the call names
-/// the task and its hash, and that the owner's policy is there and readable.
-fn before_answer(input: &Input, loaded: policy::Loaded) -> Result<(&str, &str, policy::Policy), String> {
+/// the task, its hash and the owner's approval, and that the owner's policy
+/// is there and readable. Answers the call as `tasks::answered_for` reads it.
+fn before_answer(input: &Input, loaded: policy::Loaded) -> Result<(Value, policy::Policy), String> {
     let id = named(&input.task_id, "task_id")?;
     let hash = named(&input.task_hash, "task_hash")?;
-    Ok((id, hash, policy::required(loaded)?))
+    let approval = input.approval.clone().ok_or("task_answer_invalid: the call carries no `approval`")?;
+    let call = serde_json::json!({ "task_id": id, "task_hash": hash, "approval": approval, "note": input.note });
+    Ok((call, policy::required(loaded)?))
 }
 
 /// The message a task held: its state, and its files as the attachments
@@ -147,22 +150,27 @@ fn held(state: &[u8], files: &[tasks::File]) -> Result<Prepared, String> {
     Ok(Prepared { attachments: files.iter().map(as_attachment).collect(), ..kept })
 }
 
-/// The owner's own call: send the message the task holds.
+/// The run the platform starts on the owner's approval: send the message the
+/// task holds.
 ///
 /// The message is inside the task and the host hands it over only with the
 /// answer, so the answer is taken first and the message is judged and sent
 /// after. Taking the answer moves the task to `answering`, and a task never
 /// returns to `open`.
 ///
-/// **Refused before the answer is taken — the task stays as it was, and an
-/// open one can be confirmed again:** a call that names no `task_id` or no
-/// `task_hash`; a policy that is absent or cannot be read; and everything
-/// the host refuses the answer for — a task that is not this owner's or does
-/// not exist, a hash that is not the task's, a task that names another
-/// operation, a store that did not answer, a task already closed or past its
-/// life. A task made under another policy is refused `task_void`: the
-/// policy's bytes are part of the task, so the rules a message is judged by
-/// here are the rules it was prepared under.
+/// **Refused before the answer is taken — the task fails when the run ends,
+/// `run_refused:unreported` for a refusal of this connector's own (the host
+/// never saw the task) and `run_refused:<reason>` for one of the host's, and
+/// the agent prepares again:**
+/// a call that names no `task_id`, `task_hash` or `approval`; a policy that
+/// is absent or cannot be read; and everything the host refuses the answer
+/// for — a run that is not the preparer's on the key, wallet and identity
+/// the task was prepared with, an approval that does not hold, a hash that
+/// is not the task's, a task that names another operation, a store that did
+/// not answer, a task already closed or past its life. A task made under
+/// another policy is refused `task_void`: the policy's bytes are part of the
+/// task, so the rules a message is judged by here are the rules it was
+/// prepared under.
 ///
 /// **Refused after the answer is taken — the task ends as failed, and the
 /// refusal's sentence says so:** a state that is not a message; a message
@@ -173,8 +181,8 @@ fn held(state: &[u8], files: &[tasks::File]) -> Result<Prepared, String> {
 /// count and Google's answer. Last, a result the host would not keep: the
 /// message left, and the refusal says that instead.
 pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
-    let (id, hash, rules) = before_answer(input, policy::load())?;
-    let answer = tasks::answered(id, hash, ANSWERED_BY, &policy::stored(), None).map_err(|e| e.refusal())?;
+    let (call, rules) = before_answer(input, policy::load())?;
+    let answer = tasks::answered_for(ANSWERED_BY, &call, &policy::stored()).map_err(|e| e.refusal())?;
     after_answer(&rules, &answer, crate::on_chain(), crate::deliver, |id, result| {
         tasks::report(id, result).map_err(|e| e.refusal())
     })
@@ -192,19 +200,49 @@ fn after_answer(
 ) -> Result<Value, String> {
     let message = held(&answer.state, &answer.files).map_err(closed)?;
     message.check(rules).map_err(closed)?;
-    // Counted for the agent whose run made the task, not for the owner who
-    // confirms it: the cap is the owner's bound on that agent.
-    let sent = send(rules, &message, policy::Counted::ConfirmedFor(&answer.preparer)).map_err(closed)?;
+    // Counted in this run's own cell, beside the agent's direct sends: the
+    // cap is the owner's bound on this agent, confirmed or not.
+    let mut sent = send(rules, &message, policy::Counted::Confirmed).map_err(closed)?;
+    // What the owner wrote beside their yes goes to the agent with the result,
+    // cut to what the report holds: a message that left is reported whole
+    // before a note is.
+    if let Some(note) = answer.note.as_deref().and_then(|n| std::str::from_utf8(n).ok()) {
+        with_note(&mut sent, note);
+    }
     // The agent reads the whole of it, recipients and subject with the rest:
     // the host seals a report for the preparer.
     report(&answer.id, sent.to_string().as_bytes()).map_err(|e| sent_unreported(e, &sent))?;
     Ok(answered_with(&sent, &answer.id, on_chain))
 }
 
-/// What of a sent message `confirm` answers on chain: counts and Gmail's ids.
-/// What `confirm` answers the owner, given what was sent: what a send
-/// answers where it runs ([`crate::sent_as_answered`]), with `status` and
-/// `task_id`.
+/// What `confirm` answers, given what was sent: what a send answers where it
+/// runs ([`crate::sent_as_answered`]), with `status` and `task_id`.
+/// The most a report holds, as the host bounds it (`MAX_RESULT_BYTES`).
+const MAX_REPORT_BYTES: usize = 16 * 1024;
+
+/// Put the owner's note on the result, whole when the report stays within
+/// its bound and cut at a character otherwise, said so by `note_truncated`.
+/// The recipients and the subject are the message's and are never cut.
+fn with_note(result: &mut Value, note: &str) {
+    result["note"] = serde_json::json!(note);
+    if result.to_string().len() <= MAX_REPORT_BYTES {
+        return;
+    }
+    result["note_truncated"] = serde_json::json!(true);
+    let mut keep = note.len();
+    while keep > 0 {
+        while keep > 0 && !note.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        result["note"] = serde_json::json!(&note[..keep]);
+        if result.to_string().len() <= MAX_REPORT_BYTES {
+            return;
+        }
+        keep = keep.saturating_sub(256);
+    }
+    result["note"] = serde_json::json!("");
+}
+
 fn answered_with(sent: &Value, task_id: &str, on_chain: bool) -> Value {
     let mut out = crate::sent_as_answered(sent, on_chain);
     out["status"] = serde_json::json!("done");
@@ -364,7 +402,13 @@ mod tests {
     use std::cell::RefCell;
 
     fn call() -> Input {
-        Input { task_id: Some(" run-0 ".into()), task_hash: Some("ab".repeat(32)), ..Input::default() }
+        Input {
+            task_id: Some(" run-0 ".into()),
+            task_hash: Some("ab".repeat(32)),
+            approval: Some(serde_json::json!({ "at": 1_790_000_000u64, "public_key": "ed25519:k", "signature": "s", "nonce": "n" })),
+            note: Some("bm90ZQ==".into()),
+            ..Input::default()
+        }
     }
 
     fn rules(json: &str) -> policy::Policy {
@@ -388,6 +432,7 @@ mod tests {
                 })
                 .collect(),
             supplied: None,
+            note: None,
         }
     }
 
@@ -409,15 +454,19 @@ mod tests {
         assert_eq!(unread, "policy_denied: not JSON");
         let unnamed = before_answer(&Input::default(), policy::Loaded::Some(rules("{}"))).unwrap_err();
         assert!(unnamed.starts_with("task_answer_invalid: "), "{unnamed}");
-        for said in [no_policy, unread, unnamed] {
+        let unsigned = before_answer(&Input { approval: None, ..call() }, policy::Loaded::Some(rules("{}"))).unwrap_err();
+        assert!(unsigned.starts_with("task_answer_invalid: ") && unsigned.contains("approval"), "{unsigned}");
+        for said in [no_policy, unread, unnamed, unsigned] {
             assert!(!said.contains("closed") && !said.contains("prepare"), "{said}");
         }
         // The call is judged before the policy is: one that names no task is
         // refused for that, whatever the policy.
         assert!(before_answer(&Input::default(), policy::Loaded::None).unwrap_err().starts_with("task_answer_invalid: "));
         let call = call();
-        let (id, hash, _) = before_answer(&call, policy::Loaded::Some(rules("{}"))).unwrap();
-        assert_eq!((id, hash.len()), ("run-0", 64));
+        let (read, _) = before_answer(&call, policy::Loaded::Some(rules("{}"))).unwrap();
+        assert_eq!((read["task_id"].as_str(), read["task_hash"].as_str().map(str::len)), (Some("run-0"), Some(64)));
+        assert_eq!(read["approval"]["public_key"], "ed25519:k");
+        assert_eq!(read["note"], "bm90ZQ==");
     }
 
     #[test]
@@ -459,8 +508,8 @@ mod tests {
         let allows = rules(r#"{"max_attachment_kb":10}"#);
         let (seen, reported) = (RefCell::new(None), RefCell::new(None));
         let send = |_: &policy::Policy, message: &Prepared, counted: policy::Counted| {
-            // Counted for the agent that prepared it, whoever confirms.
-            assert_eq!(counted, policy::Counted::ConfirmedFor("agent.testnet"));
+            // Counted beside the agent's own sends, in this run's cell.
+            assert_eq!(counted, policy::Counted::Confirmed);
             *seen.borrow_mut() = Some(message.clone());
             Ok(sent())
         };
@@ -483,6 +532,43 @@ mod tests {
         assert_eq!((id.as_str(), &result), ("run-0", &sent()));
         assert_eq!(out, answered_with(&sent(), "run-0", true));
         assert!(out.get("to").is_none() && out.get("subject").is_none());
+    }
+
+    /// The owner's note reaches the agent with the result, changes nothing of
+    /// what is sent, stays off a chain answer, and is cut before the message's
+    /// own members are when the report would not hold it.
+    #[test]
+    fn the_note_reaches_the_connector_and_changes_nothing_of_the_action() {
+        let allows = rules(r#"{"max_attachment_kb":10}"#);
+        let (seen, reported) = (RefCell::new(None), RefCell::new(None));
+        let send = |_: &policy::Policy, message: &Prepared, _: policy::Counted| {
+            *seen.borrow_mut() = Some(message.clone());
+            Ok(sent())
+        };
+        let report = |_: &str, result: &[u8]| {
+            *reported.borrow_mut() = Some(serde_json::from_slice::<Value>(result).unwrap());
+            Ok(())
+        };
+        let mut answer = answer_holding(&shown(&message("Hello,\r\nBob")));
+        answer.note = Some("go ahead, but today only".as_bytes().to_vec());
+        let out = after_answer(&allows, &answer, true, send, report).unwrap();
+        assert_eq!(seen.into_inner().unwrap().body, "Hello,\nBob", "the note changes nothing of the message");
+        let result = reported.into_inner().unwrap();
+        assert_eq!(result["note"], "go ahead, but today only");
+        assert!(result.get("note_truncated").is_none());
+        assert!(out.get("note").is_none(), "a chain answer carries no note");
+        let mut whole = sent();
+        whole["note"] = serde_json::json!("go ahead, but today only");
+        assert_eq!(result, whole, "the rest of the result is the send's");
+
+        // A note the report cannot hold is cut, and says so; the message's members stay.
+        let mut big = sent();
+        let note = "ж".repeat(9000);
+        with_note(&mut big, &note);
+        assert!(big.to_string().len() <= MAX_REPORT_BYTES);
+        assert_eq!(big["note_truncated"], true);
+        assert!(big["note"].as_str().unwrap().chars().count() > 1000 && note.starts_with(big["note"].as_str().unwrap()));
+        assert_eq!(big["to"], sent()["to"]);
     }
 
     #[test]

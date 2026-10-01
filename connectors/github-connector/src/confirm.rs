@@ -5,10 +5,13 @@
 //! writing it leaves it as a task: the owner is shown every value the write
 //! will use — the repository, the branch, the path, the commit message, the
 //! title, the body with its marker, each file's content — and the write
-//! waits sealed. The owner's own call of `confirm` takes it back, checks it
-//! against the policy — the one the task was made under: a task made under
-//! another is void — and makes exactly that write. Nothing in the task says
-//! what to do on a yes: this code does.
+//! waits sealed. The owner approves with one signature of their wallet, and
+//! the platform starts `confirm` as a run of the agent that prepared the
+//! task — on the agent's own payment key — with the approval in its input.
+//! That run takes the write back, checks it against the policy — the one the
+//! task was made under: a task made under another is void — and makes
+//! exactly that write. Nothing in the task says what to do on a yes: this
+//! code does.
 //!
 //! What the owner is shown is what is written, so a write to be confirmed has
 //! to fit what a task shows whole. A text is shown in a field; a file's
@@ -21,11 +24,9 @@
 //! is made, and the owner's yes is bound to the head they were shown: a merge
 //! must match it, and an approval of any other head is refused.
 //!
-//! The owner's daily cap counts a confirmed write for the agent that prepared
-//! it: one count a day for each preparer, kept in the owner's storage cell,
-//! because the run that writes is the owner's and a run writes its own cell
-//! and no other. The writes an agent makes itself are counted in the agent's
-//! cell. The cap bounds each count; neither run reads the other's.
+//! The owner's daily cap counts a confirmed write in the agent's own cell,
+//! beside the writes the agent makes itself: both runs are the agent's. The
+//! cap bounds each count.
 
 use crate::action::{Action, Change, Content, GistFile, LineComment};
 use crate::policy::{self, Counted};
@@ -34,7 +35,7 @@ use outlayer::tasks::{self, Display, FieldKind, WrittenBy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// The operation the owner calls to say yes.
+/// The operation the platform starts, as the agent, on the owner's approval.
 const ANSWERED_BY: &str = "confirm";
 
 // What a task shows, as the host bounds it (`outlayer:tasks`, `display`).
@@ -594,11 +595,11 @@ fn made_unreported(refusal: String, done: &Value, on_chain: bool) -> String {
 
 /// The codes the host's task interface answers with. Their sentences are the
 /// host's and name no repository, path or person.
-const HOST_CODES: [&str; 20] = [
+const HOST_CODES: [&str; 23] = [
     "tasks_not_declared", "no_owner", "relayed", "not_granted_by_name", "muted", "inbox_full", "task_run_limit",
-    "display_invalid", "task_too_large", "task_life_too_long", "task_not_found", "not_the_owner",
-    "task_hash_mismatch", "task_answer_invalid", "task_closed", "task_expired", "task_void", "task_unreadable",
-    "task_store_unavailable", "task_internal_error",
+    "display_invalid", "task_too_large", "task_life_too_long", "task_not_found", "not_the_owner", "not_the_preparer",
+    "task_approval_invalid", "task_no_payment_key", "task_hash_mismatch", "task_answer_invalid", "task_closed",
+    "task_expired", "task_void", "task_unreadable", "task_store_unavailable", "task_internal_error",
 ];
 
 fn code_of(refusal: &str) -> &str {
@@ -608,7 +609,7 @@ fn code_of(refusal: &str) -> &str {
     }
 }
 
-/// A refusal as the owner's `confirm` answers it where it runs. On chain the
+/// A refusal as `confirm` answers it where it runs. On chain the
 /// answer stays in the owner's transaction for ever, and this connector's
 /// sentences name repositories, branches and paths: the code is kept and the
 /// sentence is one that names nothing. The host's own refusals are as they
@@ -639,11 +640,14 @@ fn as_answered(refusal: String, on_chain: bool) -> String {
 }
 
 /// What is checked before the owner's answer is taken: that the call names
-/// the task and its hash, and that the owner's policy is there and readable.
-fn before_answer(input: &Input, loaded: policy::Loaded) -> Result<(&str, &str, policy::Policy), String> {
+/// the task, its hash and the owner's approval, and that the owner's policy
+/// is there and readable. Answers the call as `tasks::answered_for` reads it.
+fn before_answer(input: &Input, loaded: policy::Loaded) -> Result<(Value, policy::Policy), String> {
     let id = named(&input.task_id, "task_id")?;
     let hash = named(&input.task_hash, "task_hash")?;
-    Ok((id, hash, policy::required(loaded)?))
+    let approval = input.approval.clone().ok_or("task_answer_invalid: the call carries no `approval`")?;
+    let call = json!({ "task_id": id, "task_hash": hash, "approval": approval, "note": input.note });
+    Ok((call, policy::required(loaded)?))
 }
 
 /// The write a task held: its state, with each content that waited as a file
@@ -667,22 +671,27 @@ fn held(state: &[u8], files: &[tasks::File]) -> Result<Action, String> {
     Ok(action)
 }
 
-/// The owner's own call: make the write the task holds.
+/// The run the platform starts on the owner's approval: make the write the
+/// task holds.
 ///
 /// The write is inside the task and the host hands it over only with the
 /// answer, so the answer is taken first and the write is judged and made
 /// after. Taking the answer moves the task to `answering`, and a task never
 /// returns to `open`.
 ///
-/// **Refused before the answer is taken — the task stays as it was, and an
-/// open one can be confirmed again:** a call that names no `task_id` or no
-/// `task_hash`; a policy that is absent or cannot be read; and everything the
-/// host refuses the answer for — a task that is not this owner's or does not
-/// exist, a hash that is not the task's, a task that names another operation,
-/// a store that did not answer, a task already closed or past its life. A
-/// task made under another policy is refused `task_void`: the policy's bytes
-/// are part of the task, so the rules a write is judged by here are the rules
-/// it was prepared under.
+/// **Refused before the answer is taken — the task fails when the run ends,
+/// `run_refused:unreported` for a refusal of this connector's own (the host
+/// never saw the task) and `run_refused:<reason>` for one of the host's, and
+/// the agent prepares again:**
+/// a call that names no `task_id`, `task_hash` or `approval`; a policy that
+/// is absent or cannot be read; and everything the host refuses the answer
+/// for — a run that is not the preparer's on the key, wallet and identity
+/// the task was prepared with, an approval that does not hold, a hash that
+/// is not the task's, a task that names another operation, a store that did
+/// not answer, a task already closed or past its life. A task made under
+/// another policy is refused `task_void`: the policy's bytes are part of the
+/// task, so the rules a write is judged by here are the rules it was
+/// prepared under.
 ///
 /// **Refused after the answer is taken — the task ends as failed, and the
 /// refusal's sentence says so:** a state that is not a write; a write its own
@@ -693,8 +702,8 @@ fn held(state: &[u8], files: &[tasks::File]) -> Result<Action, String> {
 /// write was made, and the refusal says that instead.
 pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
     let on_chain = crate::on_chain();
-    let (id, hash, rules) = before_answer(input, policy::load()).map_err(|e| as_answered(e, on_chain))?;
-    let answer = tasks::answered(id, hash, ANSWERED_BY, &policy::stored(), None).map_err(|e| e.refusal())?;
+    let (call, rules) = before_answer(input, policy::load()).map_err(|e| as_answered(e, on_chain))?;
+    let answer = tasks::answered_for(ANSWERED_BY, &call, &policy::stored()).map_err(|e| e.refusal())?;
     after_answer(
         &rules,
         &answer,
@@ -720,9 +729,13 @@ fn after_answer(
     let refused = |e: String| closed(as_answered(e, on_chain));
     let action = held(&answer.state, &answer.files).map_err(refused)?;
     action.check(rules).map_err(refused)?;
-    // Counted for the agent whose run made the task, not for the owner who
-    // confirms it: the cap is the owner's bound on that agent.
-    let done = act(rules, &action, Counted::ConfirmedFor(&answer.preparer)).map_err(refused)?;
+    // Counted in this run's own cell, beside the agent's direct writes: the
+    // cap is the owner's bound on this agent, confirmed or not.
+    let mut done = act(rules, &action, Counted::Confirmed).map_err(refused)?;
+    // What the owner wrote beside their yes goes to the agent with the result.
+    if let Some(note) = answer.note.as_deref().and_then(|n| std::str::from_utf8(n).ok()) {
+        done["note"] = json!(note);
+    }
     // The agent reads the whole of it, repository and URL with the rest: the
     // host seals a report for the preparer.
     report(&answer.id, done.to_string().as_bytes())
@@ -1078,7 +1091,12 @@ mod tests {
     // ===== the owner's answer: before it is taken, and after =====
 
     fn call() -> Input {
-        Input { task_id: Some(" run-0 ".into()), task_hash: Some("ab".repeat(32)), ..Input::default() }
+        Input {
+            task_id: Some(" run-0 ".into()),
+            task_hash: Some("ab".repeat(32)),
+            approval: Some(json!({ "at": 1_790_000_000u64, "public_key": "ed25519:k", "signature": "s", "nonce": "n" })),
+            ..Input::default()
+        }
     }
 
     fn answer_holding(action: &Action) -> tasks::Answer {
@@ -1092,6 +1110,7 @@ mod tests {
             state: serde_json::to_vec(&shown.sealed).unwrap(),
             files: shown.files,
             supplied: None,
+            note: None,
         }
     }
 
@@ -1132,25 +1151,28 @@ mod tests {
         assert!(unread.starts_with("policy_unreadable: "), "{unread}");
         let unnamed = before_answer(&Input::default(), policy::Loaded::Some(rules("{}"))).unwrap_err();
         assert!(unnamed.starts_with("task_answer_invalid: "), "{unnamed}");
-        for said in [&no_policy, &unread, &unnamed] {
+        let unsigned = before_answer(&Input { approval: None, ..call() }, policy::Loaded::Some(rules("{}"))).unwrap_err();
+        assert!(unsigned.starts_with("task_answer_invalid: ") && unsigned.contains("approval"), "{unsigned}");
+        for said in [&no_policy, &unread, &unnamed, &unsigned] {
             assert!(!said.contains("closed") && !said.contains("prepare"), "{said}");
         }
         // On chain the policy's own words stay off: a parse error quotes what it choked on.
         let public = as_answered(unread, true);
         assert_eq!(public, "policy_unreadable: the stored policy is not one this connector understands");
         let call = call();
-        let (id, hash, _) = before_answer(&call, policy::Loaded::Some(rules("{}"))).unwrap();
-        assert_eq!((id, hash.len()), ("run-0", 64));
+        let (read, _) = before_answer(&call, policy::Loaded::Some(rules("{}"))).unwrap();
+        assert_eq!((read["task_id"].as_str(), read["task_hash"].as_str().map(str::len)), (Some("run-0"), Some(64)));
+        assert_eq!(read["approval"]["nonce"], "n");
     }
 
     #[test]
-    fn what_is_written_is_what_the_task_held_counted_for_the_agent_that_prepared_it() {
+    fn what_is_written_is_what_the_task_held_counted_in_the_agents_own_cell() {
         let (commit, _) = every_write().remove(2);
         let Action::Commit(c) = &commit else { panic!() };
         let commit = Action::Commit(Commit { repo: "alice/site".into(), branch: "agent/many".into(), ..c.clone() });
         let (seen, reported) = (RefCell::new(None), RefCell::new(None));
         let act = |_: &policy::Policy, action: &Action, counted: Counted| {
-            assert_eq!(counted, Counted::ConfirmedFor("agent.testnet"));
+            assert_eq!(counted, Counted::Confirmed);
             *seen.borrow_mut() = Some(action.clone());
             Ok(json!({"repo": "alice/site", "branch": "agent/many", "commit": "d00d", "parent": "beef", "files": 3, "url": "https://github.com/alice/site/commit/d00d", "writes_today": 1}))
         };
@@ -1166,6 +1188,30 @@ mod tests {
         assert_eq!(id, "run-0");
         assert_eq!(result["url"], "https://github.com/alice/site/commit/d00d", "the agent's sealed result is whole");
         assert_eq!(out, json!({"commit": "d00d", "writes_today": 1, "status": "done", "task_id": "run-0", "action": "commit"}));
+    }
+
+    /// The owner's note reaches the agent with the result, changes nothing of
+    /// the write, and stays off a chain answer.
+    #[test]
+    fn the_note_reaches_the_connector_and_changes_nothing_of_the_action() {
+        let (commit, _) = every_write().remove(2);
+        let (seen, reported) = (RefCell::new(None), RefCell::new(None));
+        let act = |_: &policy::Policy, action: &Action, _: Counted| {
+            *seen.borrow_mut() = Some(action.clone());
+            Ok(json!({"repo": "alice/site", "branch": "agent/many", "commit": "d00d", "files": 3, "url": "https://github.com/alice/site/commit/d00d", "writes_today": 1}))
+        };
+        let report = |_: &str, result: &[u8]| {
+            *reported.borrow_mut() = Some(serde_json::from_slice::<Value>(result).unwrap());
+            Ok(())
+        };
+        let mut answer = answer_holding(&commit);
+        answer.note = Some("squash it later".as_bytes().to_vec());
+        let out = after_answer(&rules(ALLOWS), &answer, true, act, report).unwrap();
+        assert_eq!(seen.into_inner().unwrap(), commit, "the note changes nothing of the write");
+        let result = reported.into_inner().unwrap();
+        assert_eq!(result["note"], "squash it later");
+        assert_eq!(result["url"], "https://github.com/alice/site/commit/d00d");
+        assert!(out.get("note").is_none(), "a chain answer carries no note");
     }
 
     #[test]

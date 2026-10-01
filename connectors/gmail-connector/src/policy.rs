@@ -44,8 +44,8 @@ pub struct Policy {
     /// can tell agent mail from its owner's.
     pub subject_prefix: Option<String>,
     /// The operations that need the owner: one listed here prepares its
-    /// action and leaves it as a task, and the owner's own call carries it
-    /// out. Absent or empty: none. Reported by `status` as the policy holds
+    /// action and leaves it as a task, and the run the platform starts on the
+    /// owner's approval carries it out. Absent or empty: none. Reported by `status` as the policy holds
     /// it, `null` when the policy has none, so that a reader can tell a
     /// policy without it from a report that does not know the member.
     pub confirm: Option<Vec<Confirmable>>,
@@ -270,20 +270,20 @@ pub fn day_key(ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Whose count a message is taken from.
+/// Which count a message is taken from.
 ///
 /// Every count is a record in the storage cell of the account that makes the
-/// run, sealed under that account's key: a run reads and writes its own cell
-/// and no other, so a count is kept where the run that sends can write it.
+/// run, sealed under that account's key. Both runs that send are the agent's
+/// own — a direct `send`, and the `confirm` the platform starts on the
+/// owner's approval — so both counts are in the agent's cell, and the cap
+/// bounds each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Counted<'a> {
-    /// A message the caller sends itself: one count a day, in the caller's
-    /// cell.
+pub enum Counted {
+    /// A message the caller sends itself: one count a day.
     Own,
-    /// A message the owner confirmed, prepared by this account: one count a
-    /// day for each preparer, in the OWNER's cell. It is not the count of
-    /// the preparer's own sends, which lives in the preparer's cell.
-    ConfirmedFor(&'a str),
+    /// A message the owner confirmed, sent by the run started for it: one
+    /// count a day, beside the caller's own.
+    Confirmed,
 }
 
 /// The day's count, touched only through `store::increment` — atomic
@@ -293,7 +293,7 @@ pub enum Counted<'a> {
 fn key(day: &str, counted: Counted) -> String {
     match counted {
         Counted::Own => format!("gm:sends:{day}"),
-        Counted::ConfirmedFor(preparer) => format!("gm:sends:{day}:confirmed:{preparer}"),
+        Counted::Confirmed => format!("gm:sends:{day}:confirmed"),
     }
 }
 
@@ -510,38 +510,28 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_send_is_counted_for_the_agent_that_prepared_it() {
+    fn a_confirmed_send_is_counted_beside_the_agents_own_and_each_count_is_bounded() {
         let day = "test-confirmed";
-        let (alice, bob) = (Counted::ConfirmedFor("alice.testnet"), Counted::ConfirmedFor("bob.testnet"));
         for n in 1..=2 {
-            let (reservation, after) = reserve_with(test_bump, day, alice, 2).unwrap();
+            let (reservation, after) = reserve_with(test_bump, day, Counted::Confirmed, 2).unwrap();
             assert_eq!(after, n);
             reservation.keep();
         }
-        // The cap is each agent's: one that used its own up takes nothing
-        // from another, nor from what the owner sends themselves.
-        let err = reserve_with(test_bump, day, alice, 2).err().expect("the third of one agent is refused");
+        // The cap bounds each count: the confirmed sends used up take nothing
+        // from the sends the agent makes itself.
+        let err = reserve_with(test_bump, day, Counted::Confirmed, 2).err().expect("the third confirmed is refused");
         assert!(err.starts_with("policy_denied: 2 of the owner's 2"), "{err}");
-        let (reservation, after) = reserve_with(test_bump, day, bob, 2).unwrap();
-        assert_eq!(after, 1);
-        reservation.keep();
         let (reservation, after) = reserve_with(test_bump, day, Counted::Own, 2).unwrap();
         assert_eq!(after, 1);
         drop(reservation);
-        assert_eq!((count_of(day, alice), count_of(day, bob), count(day)), (2, 1, 0));
+        assert_eq!((count_of(day, Counted::Confirmed), count(day)), (2, 0));
     }
 
     #[test]
     fn each_count_has_a_record_of_its_own() {
         assert_eq!(key("2026-09-30", Counted::Own), "gm:sends:2026-09-30");
-        assert_eq!(
-            key("2026-09-30", Counted::ConfirmedFor("agent.testnet")),
-            "gm:sends:2026-09-30:confirmed:agent.testnet"
-        );
-        // An account id holds no `:`, so no preparer's record is another's,
-        // and none is the caller's own.
-        assert_ne!(key("d", Counted::ConfirmedFor("a")), key("d", Counted::ConfirmedFor("b")));
-        assert_ne!(key("d", Counted::ConfirmedFor("")), key("d", Counted::Own));
+        assert_eq!(key("2026-09-30", Counted::Confirmed), "gm:sends:2026-09-30:confirmed");
+        assert_ne!(key("d", Counted::Confirmed), key("d", Counted::Own));
     }
 
     #[test]

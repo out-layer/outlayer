@@ -20,6 +20,7 @@ use super::StoreConfig;
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Open,
+    Approved,
     Answering,
     Done,
     Failed,
@@ -42,7 +43,10 @@ pub enum Kind {
 pub enum Refusal {
     NotFound,
     Muted,
+    /// The owner's limit of open tasks.
     InboxFull,
+    /// This preparer's share of it.
+    PreparerFull,
     /// The owner's waiting tasks hold as much as they may together.
     StorageFull,
     Exists,
@@ -75,12 +79,29 @@ pub struct Copy {
     pub wrapped_key: Vec<u8>,
 }
 
+/// The preparer's consent as the store keeps it in the clear: which payment
+/// key to charge for the run that carries the task out, and how to start it.
+/// Nothing in it is a secret; the enclave holds the same facts sealed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Voucher {
+    pub payment_key_nonce: u32,
+    pub wallet_id: Option<String>,
+    pub bound_identity: bool,
+    pub compute_limit_usd: String,
+    /// `answer_by.operation`: the operation the run is started in.
+    pub operation: String,
+    /// The build that made the task: the version pinned where the platform
+    /// pins one.
+    pub build: String,
+}
+
 /// A task to store.
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub id: String,
     pub project_id: String,
     pub preparer: String,
+    pub voucher: Voucher,
     /// The profile of the owner's secret row the run named.
     pub profile: String,
     /// The vault that row is bound to, whose master seals the task.
@@ -110,9 +131,11 @@ pub struct Prepared {
     pub outcome: Option<Vec<u8>>,
     #[serde(default, deserialize_with = "b64_opt")]
     pub rejection: Option<Vec<u8>>,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
-/// A task as the owner's run reads it.
+/// A task as the run that carries it out reads it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Stored {
     pub id: String,
@@ -344,6 +367,7 @@ impl Store for HttpStore {
                 "id": task.id,
                 "project_id": task.project_id,
                 "preparer": task.preparer,
+                "voucher": task.voucher,
                 "profile": task.profile,
                 "vault": task.vault,
                 "kind": task.kind,
@@ -440,25 +464,30 @@ pub struct Finished {
 }
 
 /// Tell the store the run that acted has ended: a task it reported on, in a
-/// run that succeeded, is `done`; every other task it answered is `failed`.
-/// Called by the job path after the guest exits, however it exited.
+/// run that succeeded, is `done`; every other task it answered is `failed`;
+/// an approved task it was refused is `failed` with the reason. Called by
+/// the job path after the guest exits, however it exited.
 pub async fn finish(
     config: &StoreConfig,
     scope: &Scope,
     run: &str,
     success: bool,
     answered: &[super::Answered],
+    refused: &[super::Refused],
 ) -> Result<Finished, StoreError> {
     let reported: Vec<_> = answered
         .iter()
         .filter_map(|task| task.outcome.as_ref().map(|outcome| serde_json::json!({ "id": task.id, "outcome": b64(outcome) })))
         .collect();
+    let refused: Vec<_> =
+        refused.iter().map(|task| serde_json::json!({ "id": task.id, "reason": task.reason })).collect();
     let body = serde_json::json!({
         "project_uuid": scope.project_uuid,
         "owner": scope.owner,
         "run": run,
         "success": success,
         "reported": reported,
+        "refused": refused,
     });
     finish_within(config, body, run, MAX_ANSWER_BYTES).await
 }
@@ -644,12 +673,16 @@ mod tests {
         ]
     }
 
+    fn refused() -> Vec<crate::tasks::Refused> {
+        vec![crate::tasks::Refused { id: "run-c-0".to_string(), reason: "hash-mismatch".to_string() }]
+    }
+
     const DOWN: (u16, &str) = (503, "the database is temporarily unavailable; try again shortly");
 
     #[tokio::test]
     async fn a_report_the_store_took_at_the_third_asking_is_a_report_made() {
         let (config, seen) = store_answering(vec![DOWN, DOWN, (200, r#"{"done":1,"failed":1}"#)]);
-        let finished = finish(&config, &scope(), "run-o", true, &answered()).await;
+        let finished = finish(&config, &scope(), "run-o", true, &answered(), &refused()).await;
         assert_eq!(finished, Ok(Finished { done: 1, failed: 1 }));
 
         let seen = seen.lock().unwrap();
@@ -667,6 +700,7 @@ mod tests {
                     "run": "run-o",
                     "success": true,
                     "reported": [{ "id": "run-a-0", "outcome": "c2VhbGVk" }],
+                    "refused": [{ "id": "run-c-0", "reason": "hash-mismatch" }],
                 })
             );
         }
@@ -675,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn a_report_the_store_did_not_take_in_three_askings_is_given_up() {
         let (config, seen) = store_answering(vec![DOWN, DOWN, DOWN, (200, r#"{"done":1,"failed":0}"#)]);
-        let finished = finish(&config, &scope(), "run-o", true, &answered()).await;
+        let finished = finish(&config, &scope(), "run-o", true, &answered(), &refused()).await;
         assert_eq!(finished, Err(StoreError::Unavailable("the task store answered 503".to_string())));
         assert_eq!(seen.lock().unwrap().len(), FINISH_ATTEMPTS as usize);
         assert_eq!(FINISH_ATTEMPTS, 3);
@@ -685,14 +719,14 @@ mod tests {
     async fn a_report_the_store_refused_by_name_is_not_sent_again() {
         let (config, seen) =
             store_answering(vec![(400, r#"{"reason":"invalid_request","message":"reported holds a task twice"}"#)]);
-        let finished = finish(&config, &scope(), "run-o", false, &answered()).await;
+        let finished = finish(&config, &scope(), "run-o", false, &answered(), &refused()).await;
         assert_eq!(finished, Err(StoreError::Refused(Refusal::InvalidRequest, None)));
         assert_eq!(seen.lock().unwrap().len(), 1);
 
         // A request the store could not read at all will not read better
         // the next time either.
         let (config, seen) = store_answering(vec![(413, "Payload Too Large")]);
-        let finished = finish(&config, &scope(), "run-o", true, &answered()).await;
+        let finished = finish(&config, &scope(), "run-o", true, &answered(), &refused()).await;
         assert_eq!(finished, Err(StoreError::Refused(Refusal::InvalidRequest, None)));
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
@@ -703,7 +737,7 @@ mod tests {
         let gone = std::net::TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
         let config =
             StoreConfig { coordinator_url: format!("http://{gone}"), coordinator_token: "the-workers-token".to_string() };
-        let Err(StoreError::Unavailable(why)) = finish(&config, &scope(), "run-o", true, &answered()).await else {
+        let Err(StoreError::Unavailable(why)) = finish(&config, &scope(), "run-o", true, &answered(), &refused()).await else {
             panic!("a store that is not there took a report");
         };
         assert_eq!(why, "the task store did not answer");

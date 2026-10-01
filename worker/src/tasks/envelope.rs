@@ -421,6 +421,49 @@ pub struct SealedTask {
     pub envelope: String,
     /// The component's `state`, base64.
     pub state: String,
+    /// The preparer's consent to the run that carries the task out.
+    pub consent: Consent,
+}
+
+/// What the preparing run was, as the run that carries the task out must be
+/// again. The account is `Envelope::preparer`; nothing here names one. Under
+/// the task's seal with the envelope and the state, so the store cannot
+/// change it, move it to another task or add one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Consent {
+    /// The nonce of the payment key that made the preparing run.
+    pub payment_key_nonce: u32,
+    /// The custody wallet bound to the preparing run; none when the call
+    /// named none.
+    pub wallet: Option<String>,
+    /// `use_bound_identity` of the preparing run.
+    pub bound_identity: bool,
+    /// What the preparing run authorised for compute, in minimal USD units
+    /// as the job spells it. The run that acts may not carry more.
+    pub compute_limit_usd: String,
+}
+
+impl Consent {
+    /// Which fact of `run` differs from this consent, in words; none when the
+    /// run is the one consented to. Compute is compared as numbers: a run
+    /// may carry less than the preparing run allowed, never more.
+    pub fn refuses(&self, run: &Consent) -> Option<&'static str> {
+        if run.payment_key_nonce != self.payment_key_nonce {
+            return Some("another payment key");
+        }
+        if run.wallet != self.wallet {
+            return Some("another wallet");
+        }
+        if run.bound_identity != self.bound_identity {
+            return Some("another identity");
+        }
+        let (allowed, carried) = (self.compute_limit_usd.parse::<u128>(), run.compute_limit_usd.parse::<u128>());
+        match (allowed, carried) {
+            (Ok(allowed), Ok(carried)) if carried <= allowed => None,
+            _ => Some("more compute than the preparing run allowed"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -767,6 +810,39 @@ mod tests {
         // Each file is checked as one file is.
         assert!(check_files([("a.pdf", pdf), ("b.pdf.", pdf)]).unwrap_err().contains("the name of file 2 ends in"));
         assert!(check_files([("a.pdf", "pdf")]).unwrap_err().contains("the type of file 1"));
+    }
+
+    fn consent() -> Consent {
+        Consent { payment_key_nonce: 3, wallet: Some("w-1".into()), bound_identity: false, compute_limit_usd: "10000".into() }
+    }
+
+    #[test]
+    fn a_consent_admits_the_same_run_with_no_more_compute_and_names_what_differs() {
+        assert_eq!(consent().refuses(&consent()), None);
+        assert_eq!(consent().refuses(&Consent { compute_limit_usd: "9999".into(), ..consent() }), None);
+        assert_eq!(
+            consent().refuses(&Consent { compute_limit_usd: "10001".into(), ..consent() }),
+            Some("more compute than the preparing run allowed")
+        );
+        assert_eq!(consent().refuses(&Consent { compute_limit_usd: "ten".into(), ..consent() }).is_some(), true);
+        assert_eq!(consent().refuses(&Consent { payment_key_nonce: 4, ..consent() }), Some("another payment key"));
+        assert_eq!(consent().refuses(&Consent { wallet: None, ..consent() }), Some("another wallet"));
+        assert_eq!(consent().refuses(&Consent { wallet: Some("w-2".into()), ..consent() }), Some("another wallet"));
+        assert_eq!(consent().refuses(&Consent { bound_identity: true, ..consent() }), Some("another identity"));
+    }
+
+    #[test]
+    fn a_sealed_task_with_a_member_missing_or_unknown_does_not_read() {
+        let sealed = serde_json::json!({
+            "content_key": "00", "envelope": "{}", "state": "", "consent": serde_json::to_value(consent()).unwrap()
+        });
+        assert!(serde_json::from_value::<SealedTask>(sealed.clone()).is_ok());
+        let mut without = sealed.clone();
+        without.as_object_mut().unwrap().remove("consent");
+        assert!(serde_json::from_value::<SealedTask>(without).is_err(), "a task sealed with no consent is not one");
+        let mut more = sealed;
+        more["consent"]["valid_from"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<SealedTask>(more).is_err());
     }
 
     #[test]

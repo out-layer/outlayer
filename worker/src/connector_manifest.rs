@@ -112,8 +112,10 @@ pub struct ProjectManifest {
     pub tasks: bool,
     /// Which doors a run may come through — see [`crate::callers`]. Absent
     /// admits every door. A block that breaks a rule does not parse, and
-    /// neither does one that shuts the direct door of an artefact that
-    /// declares `tasks`.
+    /// neither does one that shuts the HTTPS door or the direct door of an
+    /// artefact that declares `tasks`: the run that answers a task is an
+    /// HTTPS call of the agent's, and the owner opens tasks for a new device
+    /// with a direct call.
     #[serde(default, deserialize_with = "crate::callers::deserialize_declared")]
     pub callers: Option<crate::callers::Callers>,
     /// The operation names, for the dashboard and the price-list check.
@@ -315,10 +317,17 @@ impl ProjectManifest {
     /// `secp256k1`" is what its author needs.
     pub fn read(bytes: &[u8]) -> Result<Self, String> {
         let manifest = serde_json::from_slice::<Self>(bytes).map_err(|e| e.to_string())?;
-        if manifest.tasks && manifest.callers.as_ref().is_some_and(|c| !c.admits_direct()) {
-            return Err("the manifest declares tasks, which the owner answers with a direct call of their own, \
-                        and its callers block does not admit direct calls"
-                .to_string());
+        if let Some(callers) = manifest.callers.as_ref().filter(|_| manifest.tasks) {
+            if !callers.admits_https() {
+                return Err("the manifest declares tasks, which the platform carries out in a call of the agent's over HTTPS, \
+                            and its callers block does not admit calls over HTTPS"
+                    .to_string());
+            }
+            if !callers.admits_direct() {
+                return Err("the manifest declares tasks, whose owner opens them for a new device with a direct call of their own, \
+                            and its callers block does not admit direct calls"
+                    .to_string());
+            }
         }
         Ok(manifest)
     }
@@ -913,15 +922,20 @@ mod tests {
     }
 
     #[test]
-    fn tasks_need_the_direct_door() {
-        for callers in [r#"{"direct":"deny"}"#, r#"{"contract":{"only":["game.testnet"]}}"#] {
+    fn tasks_need_the_https_door_and_the_direct_door() {
+        // The run that answers comes over HTTPS; `only` shuts every door but the contracts it names.
+        for callers in [r#"{"https":"deny"}"#, r#"{"contract":{"only":["game.testnet"]}}"#, r#"{"direct":"deny","https":"deny"}"#] {
             let json = format!(r#"{{"tasks":true,"callers":{callers}}}"#);
             let err = ProjectManifest::read(json.as_bytes()).unwrap_err();
-            assert!(err.contains("declares tasks") && err.contains("does not admit direct calls"), "{err}");
-            // Without tasks the same block is a rule like any other.
+            assert!(err.contains("declares tasks") && err.contains("does not admit calls over HTTPS"), "{err}");
             ProjectManifest::read(format!(r#"{{"callers":{callers}}}"#).as_bytes()).unwrap();
         }
-        let open = ProjectManifest::read(br#"{"tasks":true,"callers":{"contract":"deny","https":"deny"}}"#).unwrap();
+        // The owner opens tasks for a new device with a direct call.
+        let err = ProjectManifest::read(br#"{"tasks":true,"callers":{"direct":"deny"}}"#).unwrap_err();
+        assert!(err.contains("declares tasks") && err.contains("does not admit direct calls"), "{err}");
+        ProjectManifest::read(br#"{"callers":{"direct":"deny"}}"#).unwrap();
+        // Without tasks the same blocks are rules like any other; with tasks, the other doors are the author's.
+        let open = ProjectManifest::read(br#"{"tasks":true,"callers":{"contract":"deny","meta_tx":"deny"}}"#).unwrap();
         assert!(open.callers.is_some());
     }
 

@@ -548,9 +548,11 @@ Format, limits and every refusal:
 A connector can ask the owner before it acts. With `"tasks": true` in the
 manifest, an operation prepares its action, leaves it as a task for the owner
 of the row the call named, and answers the agent `awaiting_owner`; the owner
-reads the task in their inbox and carries it out with their own call of the
-operation the task names. The model, the host interface and the SDK are in
-[TASKS.md](TASKS.md).
+reads the task in their inbox and approves it with one message their wallet
+signs, and the platform starts a run of the agent that prepared it — on the
+agent's own payment key, within the preparing run's compute limit — which
+carries out the operation the task names. The model, the host interface and
+the SDK are in [TASKS.md](TASKS.md).
 
 The convention for a connector's policy is one field, `confirm`: the list of
 operations that need the owner. A connector may ask on grounds of its own as
@@ -560,8 +562,10 @@ Four rules a connector keeps:
 
 * **A task is paid for when it is prepared.** The operation that opens a task
   keeps its price, and nothing comes back if the owner says no. The operation
-  that answers a task is priced at zero, and so are `task_status`,
-  `task_cancel`, `task_delete`, `tasks` and `tasks_unlock`.
+  that answers a task is priced at zero — the run the platform starts for an
+  approval is admitted only then — and so are `task_status`, `task_cancel`,
+  `task_delete`, `tasks` and `tasks_unlock`. The compute of the run that
+  answers is the agent's to pay, as its own call's would be.
 
 * **Check before you ask.** The request is judged against the policy before
   the task is made, so the owner is never shown what the policy forbids.
@@ -570,8 +574,9 @@ Four rules a connector keeps:
 * **Show what you will do, whole.** What cannot be shown whole is refused, not
   shown in part.
 
-The owner answers with a direct call of their own, so a connector that declares
-`tasks` cannot shut the direct door (§4.9).
+The run that answers is an HTTPS call of the agent's, and the owner opens
+tasks for a new device with a direct call of their own, so a connector that
+declares `tasks` can shut neither door (§4.9).
 
 The pattern in code — the policy's `confirm`, the operation `confirm`, what it
 answers on chain, prices, manifest, tests — is [CONNECTOR_TASKS.md](CONNECTOR_TASKS.md).

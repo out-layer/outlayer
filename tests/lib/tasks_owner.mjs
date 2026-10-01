@@ -30,7 +30,32 @@
 //   file <task> <n> [device]         open one file: its size and hash
 //   proof <task> [device]            the run that made the task, its attestation,
 //                                    and whether its answer names the task
-//   seal <task> answer|rejection <text> [device]   what the owner writes, sealed
+//   seal <task> answer|rejection|note <text> [device]   what the owner writes, sealed
+//   approve <task> [supplied|-] [note|-] [device] [--flag value…]
+//                                    approve: seal what the owner wrote, sign the
+//                                    sentence with the owner's key, POST it; prints
+//                                    {"status", "state", "run", "failure_reason",
+//                                    "reason"} and keeps the body under STATE_DIR
+//                                    as `approval-<task>.json` for a replay.
+//                                    The flags make the negative rows:
+//                                      --hash <hex>       sign and send this hash, not the one read
+//                                      --key <file>       sign with this key file, not OWNER_KEY_FILE
+//                                      --at <unix>        this time in the sentence
+//                                      --nonce <base64>   this nonce (32 bytes)
+//                                      --recipient <id>   sign for this contract id
+//                                      --for <task>       sign the sentence for that task, send on this one
+//                                      --swap-supplied    sign for the supply, send another sealing of it
+//                                      --swap-note        the same for the note
+//                                      --unsigned         send no approval member at all
+//                                      --blind            do not read the task first (it is not
+//                                                         listed any more): needs --hash, no words
+//   replay-approval <task> [device] [against <task>]   the kept body again, on
+//                                    the task it was made for or on another
+//   origin <task> [device] [words]   the run that made the task, its door, and of
+//                                    its input: whether it names a task, carries an
+//                                    approval and a supply that is sealed bytes (format
+//                                    byte and length, never plaintext), and whether
+//                                    `words` occur in it (never the input itself)
 //   reject <task> [text] [device]    say no, with a reason
 //   delete <task> [device]           delete one
 //   mute <agent|project> <subject> [device]
@@ -58,8 +83,8 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  Purpose, fromBase64Url, fromHex, openFile, readPubkey, readTask, signConfirmation, signStatement, toBase58, toHex, writePubkey,
-  writeReply,
+  Purpose, fromBase64Url, fromHex, openFile, readPubkey, readTask, signApproval, signConfirmation, signStatement, toBase58, toHex,
+  writePubkey, writeReply,
 } from './tasks_page.mjs';
 
 const subtle = globalThis.crypto.subtle;
@@ -274,6 +299,19 @@ async function listed(state, show) {
   return out;
 }
 
+/** What an approve answered, as a row reads it: the status and the task's move or the refusal. */
+function approved(answer) {
+  const body = typeof answer.body === 'object' && answer.body !== null ? answer.body : {};
+  return {
+    status: answer.status,
+    state: body.state ?? null,
+    run: body.run ?? null,
+    failure_reason: body.failure_reason ?? null,
+    reason: body.reason ?? null,
+    said: typeof body.error === 'string' ? body.error.slice(0, 200) : null,
+  };
+}
+
 async function readOne(state, id) {
   const { tasks } = await ask('GET', '/inbox/tasks?show=waiting', { token: state.token });
   const task = tasks.find((t) => t.id === id);
@@ -355,9 +393,103 @@ const commands = {
   },
 
   async seal([id, purpose, text, device = 'a']) {
-    if (purpose !== Purpose.Answer && purpose !== Purpose.Rejection) throw new Error('the purpose is `answer` or `rejection`');
+    if (purpose !== Purpose.Answer && purpose !== Purpose.Rejection && purpose !== Purpose.Note) {
+      throw new Error('the purpose is `answer`, `rejection` or `note`');
+    }
     const { read } = await readOne(loadState(device), id);
     return { sealed: Buffer.from(await writeReply(read.envelope, purpose, text)).toString('base64') };
+  },
+
+  /**
+   * The owner approves: what they wrote is sealed to the task's reply key,
+   * the sentence over the task, the hash read and the digest of the sealed
+   * words is signed with the owner's wallet key, and the approval is posted.
+   * `-` for a supply or a note is none. The flags are the negative rows'.
+   */
+  async approve(args) {
+    const positional = [];
+    const flags = {};
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i].startsWith('--')) {
+        const name = args[i].slice(2);
+        if (name === 'swap-supplied' || name === 'swap-note' || name === 'unsigned' || name === 'blind') flags[name] = true;
+        else flags[name] = args[++i];
+      } else positional.push(args[i]);
+    }
+    const [id, suppliedText = '-', noteText = '-', device = 'a'] = positional;
+    if (!id) throw new Error('approve takes the task id');
+    const state = loadState(device);
+    let read = null;
+    if (flags.blind) {
+      if (!flags.hash) throw new Error('--blind needs --hash: the task is not read');
+      if (suppliedText !== '-' || noteText !== '-') throw new Error('--blind seals nothing: the reply key is not read');
+    } else {
+      ({ read } = await readOne(state, id));
+    }
+    const sealOf = async (purpose, text) => (text === '-' || text === undefined ? null : Buffer.from(await writeReply(read.envelope, purpose, text)).toString('base64'));
+    const supplied = await sealOf(Purpose.Answer, suppliedText);
+    const note = await sealOf(Purpose.Note, noteText);
+    const hash = flags.hash ?? read.hash;
+    const secretKey = JSON.parse(readFileSync(flags.key || need('OWNER_KEY_FILE'), 'utf8')).private_key;
+    const at = flags.at !== undefined ? Number(flags.at) : Math.floor(Date.now() / 1000) + Number(process.env.CONFIRM_AT_OFFSET ?? 0);
+    const nonce = flags.nonce !== undefined ? new Uint8Array(Buffer.from(flags.nonce, 'base64')) : globalThis.crypto.getRandomValues(new Uint8Array(32));
+    const signedFor = flags.for ?? id;
+    const approval = await signApproval({ account: need('OWNER'), secretKey, id: signedFor, hash, supplied, note, at, nonce, recipient: flags.recipient ?? need('RECIPIENT') });
+    const body = { task_hash: hash };
+    if (!flags.unsigned) body.approval = approval;
+    // A swap: the same words sealed again, which the signature does not cover.
+    const sent = {
+      supplied: flags['swap-supplied'] ? await sealOf(Purpose.Answer, suppliedText) : supplied,
+      note: flags['swap-note'] ? await sealOf(Purpose.Note, noteText) : note,
+    };
+    if (sent.supplied !== null) body.supplied = sent.supplied;
+    if (sent.note !== null) body.note = sent.note;
+    const kept = join(stateDir(), `approval-${id}.json`);
+    writeFileSync(kept, JSON.stringify(body), { mode: 0o600 });
+    const answer = await request('POST', `/inbox/tasks/${id}/approve`, { token: state.token, body });
+    return approved(answer);
+  },
+
+  /** The kept approval body of `id` sent again: on `id`, or on another task (`against <task>`). */
+  async 'replay-approval'([id, device = 'a', against = '', other = '']) {
+    const body = JSON.parse(readFileSync(join(stateDir(), `approval-${id}.json`), 'utf8'));
+    const target = against === 'against' && other ? other : id;
+    return approved(await request('POST', `/inbox/tasks/${target}/approve`, { token: loadState(device).token, body }));
+  },
+
+  /**
+   * The run that made `id` and its input, as `GET /inbox/tasks/{id}/origin`
+   * serves them: facts about the input, never the input. For a turn, the run
+   * that made it is the run the platform started on the owner's approval of
+   * the previous task, so its input carries that approval and the sealed
+   * supply — and none of the owner's words.
+   */
+  async origin([id, device = 'a', words = '']) {
+    const state = loadState(device);
+    const found = await request('GET', `/inbox/tasks/${id}/origin`, { token: state.token });
+    if (found.status !== 200) return { status: found.status, reason: found.body?.reason ?? null };
+    const origin = found.body;
+    const out = { status: 200, run: origin.run, door: origin.door, input_kept: typeof origin.input === 'string' };
+    if (typeof origin.input === 'string') {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(origin.input);
+      } catch {
+        parsed = null;
+      }
+      out.input_is_json = parsed !== null;
+      out.input_operation = parsed?.operation ?? null;
+      out.input_task_id = parsed?.task_id ?? null;
+      out.input_has_hash = typeof parsed?.task_hash === 'string' && parsed.task_hash.length === 64;
+      out.input_has_approval = typeof parsed?.approval?.signature === 'string' && typeof parsed?.approval?.public_key === 'string';
+      // Sealed bytes: the format byte 0x01, a 65-byte point, a 12-byte nonce and a
+      // 16-byte tag at least — 94 bytes, 126 characters of base64 — never plaintext.
+      const sealed = typeof parsed?.supplied === 'string' && /^[A-Za-z0-9+/]+=*$/.test(parsed.supplied) ? Buffer.from(parsed.supplied, 'base64') : null;
+      out.input_supplied_is_sealed = sealed !== null && sealed.length >= 94 && sealed[0] === 0x01;
+      out.input_has_note = typeof parsed?.note === 'string';
+      out.words_in_input = words !== '' && (origin.input.includes(words) || (typeof parsed?.supplied === 'string' && Buffer.from(parsed.supplied, 'base64').toString('utf8').includes(words)));
+    }
+    return out;
   },
 
   async reject([id, text = '', device = 'a']) {

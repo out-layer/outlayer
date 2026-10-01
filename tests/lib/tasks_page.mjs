@@ -21,6 +21,7 @@ export const Purpose = Object.freeze({
   DeviceCopy: 'device-copy',
   Answer: 'answer',
   Rejection: 'rejection',
+  Note: 'note',
 });
 
 const utf8 = (text) => new TextEncoder().encode(text);
@@ -93,6 +94,27 @@ export async function confirmation(account, action, at) {
     named = `name the webhook ${toHex(new Uint8Array(digest))}`;
   } else named = 'remove the webhook';
   return `Confirm in OutLayer as ${account}: ${named}. At ${moment(at)}.`;
+}
+
+/**
+ * The sentence the owner's wallet signs to approve one task: the task, the
+ * hash of the envelope the page opened, and the digest of what the owner
+ * wrote, sealed. The coordinator and the enclave each rebuild it and compare
+ * bytes. Good for ten minutes at the door, once.
+ */
+export function approval(account, id, hash, digest, at) {
+  return `Approve in OutLayer as ${account}: task ${id} with hash ${hash} and supply ${digest}. At ${moment(at)}.`;
+}
+
+/**
+ * The digest the approval names of what the owner said: SHA-256, hex, of
+ * `{"note":<base64|null>,"supplied":<base64|null>}` over the sealed bytes as
+ * base64, members in that order, no whitespace. Nothing said is still a
+ * digest.
+ */
+export async function supplyDigest(sealedSupplied, sealedNote) {
+  const canonical = JSON.stringify({ note: sealedNote ?? null, supplied: sealedSupplied ?? null });
+  return toHex(new Uint8Array(await subtle.digest('SHA-256', utf8(canonical))));
 }
 
 async function eciesKey(privateKey, theirPoint, ephemeralPoint, recipientPoint, purpose, task, usage) {
@@ -259,6 +281,19 @@ export async function signStatement({ account, secretKey, devicePubkey, validUnt
 /** The owner's confirmation of `action`, signed by the wallet key, as a request carries it. */
 export async function signConfirmation({ account, secretKey, action, at, nonce, recipient }) {
   const signed = await signSentence({ secretKey, message: await confirmation(account, action, at), nonce, recipient });
+  return { at, ...signed };
+}
+
+/**
+ * The owner's approval of one task, signed by the wallet key, as
+ * `POST /inbox/tasks/{id}/approve` carries it: `{at, public_key, signature,
+ * nonce}`. `supplied` and `note` are the sealed bytes as base64, or null. The
+ * sentence names `id` and `hash` as given — a row that signs for the wrong
+ * task or hash passes them so.
+ */
+export async function signApproval({ account, secretKey, id, hash, supplied, note, at, nonce, recipient }) {
+  const digest = await supplyDigest(supplied ?? null, note ?? null);
+  const signed = await signSentence({ secretKey, message: approval(account, id, hash, digest, at), nonce, recipient });
   return { at, ...signed };
 }
 

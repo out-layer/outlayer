@@ -7,8 +7,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  Purpose, fromBase58, fromHex, newDevice, openContent, openFrom, readPubkey, readTask, sealTo, signStatement, statement,
-  toBase58, toHex, writePubkey,
+  Purpose, approval, fromBase58, fromHex, newDevice, openContent, openFrom, readPubkey, readTask, sealTo, signApproval,
+  signStatement, statement, supplyDigest, toBase58, toHex, writePubkey,
 } from './tasks_page.mjs';
 
 const subtle = globalThis.crypto.subtle;
@@ -42,6 +42,43 @@ test('the sentence is the one the host and the coordinator rebuild', () => {
     statement('alice.near', 'p256:abc', 1793275200),
     'Sign in to OutLayer as alice.near. Device key: p256:abc. Valid until 2026-10-29T12:00:00Z.',
   );
+});
+
+// Pinned in the coordinator's `confirmation.rs` and the worker's `statement.rs`:
+// the same sentence, the same digest vectors.
+test('the approval is one sentence, and its digest is of one canonical document', async () => {
+  const ID = '0b9c1a52-7c1e-4a53-9c58-2f0c8f6f3b11-0';
+  const nothing = await supplyDigest(null, null);
+  assert.equal(nothing, '93121736c33115cb57757d3d5c09b430c4a03d2c3fa06dbbda48a466620b5799');
+  assert.equal(
+    approval('alice.near', ID, 'ab'.repeat(32), nothing, 1793275200),
+    `Approve in OutLayer as alice.near: task ${ID} with hash ${'ab'.repeat(32)} and supply ${nothing}. At 2026-10-29T12:00:00Z.`,
+  );
+  const of = async (text) => toHex(new Uint8Array(await subtle.digest('SHA-256', new TextEncoder().encode(text))));
+  assert.equal(await supplyDigest('YWJj', null), await of('{"note":null,"supplied":"YWJj"}'));
+  assert.equal(await supplyDigest('YWJj', 'aGk='), await of('{"note":"aGk=","supplied":"YWJj"}'));
+  assert.equal(await supplyDigest(null, 'aGk='), await of('{"note":"aGk=","supplied":null}'));
+  assert.notEqual(await supplyDigest('YWJj', null), await supplyDigest(null, 'YWJj'), 'a note is not a supply');
+  const signed = await signApproval({
+    account: 'owner.testnet',
+    secretKey: `ed25519:${toBase58(new Uint8Array(32).fill(1))}`,
+    id: ID,
+    hash: 'ab'.repeat(32),
+    supplied: null,
+    note: null,
+    at: 1793275200,
+    nonce: new Uint8Array(32).fill(3),
+    recipient: 'outlayer.testnet',
+  });
+  if (process.env.TASKS_PRINT) console.log(`APPROVAL_FROM_THE_PAGE = ${JSON.stringify(signed)}`);
+  assert.deepEqual(Object.keys(signed).sort(), ['at', 'nonce', 'public_key', 'signature']);
+  assert.equal(signed.public_key, 'ed25519:AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9');
+  assert.equal(Buffer.from(signed.signature, 'base64').length, 64);
+  // A note is sealed under its own purpose, and opens under no other.
+  const reader = await newDevice();
+  const sealed = await sealTo(reader.point, Purpose.Note, 'run-7', new TextEncoder().encode('go ahead'));
+  assert.equal(new TextDecoder().decode(await openFrom(reader.privateKey, reader.point, Purpose.Note, 'run-7', sealed)), 'go ahead');
+  await assert.rejects(openFrom(reader.privateKey, reader.point, Purpose.Answer, 'run-7', sealed));
 });
 
 test('what the host made for the device, the page opens', async () => {

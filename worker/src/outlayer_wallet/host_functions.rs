@@ -127,12 +127,23 @@ fn coordinator_failure(status: u16, body: &str) -> String {
     }
 }
 
+/// What every function of a run with no wallet answers: a code a guest can
+/// branch on, and the remedy.
+pub const NO_WALLET: &str = "no_wallet: this run has no wallet; the operation needs a call made with the wallet's own \
+                             payment key and X-Wallet-Id";
+
 /// Host state for wallet functions
 pub struct WalletHostState {
     /// Wallet ID from execution context (e.g. "ed25519:abc...")
     wallet_id: String,
-    /// Blocking HTTP client for coordinator wallet API calls
-    http_client: reqwest::blocking::Client,
+    /// The run has no wallet: every function answers [`NO_WALLET`] and
+    /// reaches nothing. A component that imports the wallet interface still
+    /// starts on a call that named no wallet — the owner's `tasks_unlock` on
+    /// a wallet connector's build — and its wallet operations refuse by name.
+    absent: bool,
+    /// Blocking HTTP client for coordinator wallet API calls; none on a run
+    /// with no wallet, which makes no request.
+    http_client: Option<reqwest::blocking::Client>,
     /// Coordinator base URL (e.g. "http://localhost:8080")
     coordinator_url: String,
     /// Wallet signature for authenticating requests
@@ -169,12 +180,29 @@ impl WalletHostState {
 
         Self {
             wallet_id: wallet_id.to_string(),
-            http_client,
+            absent: false,
+            http_client: Some(http_client),
             coordinator_url: coordinator_url.to_string(),
             wallet_auth_token: wallet_auth_token.to_string(),
             call_count: 0,
             max_calls: MAX_CALLS,
             connector_id: connector_id.map(str::to_string),
+        }
+    }
+
+    /// The state of a run that has no wallet. It holds no wallet id and no
+    /// token, so there is nothing it could reach: every function answers
+    /// [`NO_WALLET`] without a request.
+    pub fn absent() -> Self {
+        Self {
+            wallet_id: String::new(),
+            absent: true,
+            http_client: None,
+            coordinator_url: String::new(),
+            wallet_auth_token: String::new(),
+            call_count: 0,
+            max_calls: MAX_CALLS,
+            connector_id: None,
         }
     }
 
@@ -258,8 +286,12 @@ impl WalletHostState {
         body
     }
 
-    /// Check rate limit, returns error string if exceeded
+    /// Check rate limit, returns error string if exceeded; a run with no
+    /// wallet is refused here, before any request is formed.
     fn check_rate_limit(&mut self) -> Option<String> {
+        if self.absent {
+            return Some(NO_WALLET.to_string());
+        }
         if self.call_count >= self.max_calls {
             Some(format!(
                 "Wallet rate limit exceeded: {} calls (max: {})",
@@ -279,11 +311,14 @@ impl WalletHostState {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> WalletResult {
+        let Some(http_client) = self.http_client.as_ref().filter(|_| !self.absent) else {
+            return (String::new(), NO_WALLET.to_string());
+        };
         let url = format!("{}{}", self.coordinator_url, path);
 
         let mut request_builder = match method {
-            "GET" => self.http_client.get(&url),
-            "POST" => self.http_client.post(&url),
+            "GET" => http_client.get(&url),
+            "POST" => http_client.post(&url),
             _ => return (String::new(), format!("Unsupported HTTP method: {}", method)),
         };
 
@@ -317,6 +352,9 @@ impl WalletHostState {
 
 impl outlayer::wallet::api::Host for WalletHostState {
     fn get_id(&mut self) -> WalletResult {
+        if self.absent {
+            return (String::new(), NO_WALLET.to_string());
+        }
         debug!("wallet::get_id wallet_id={}", self.wallet_id);
         (self.wallet_id.clone(), String::new())
     }
@@ -690,7 +728,8 @@ mod tests {
     fn state_for(connector_id: Option<&str>) -> WalletHostState {
         WalletHostState {
             wallet_id: "ed25519:abc123".to_string(),
-            http_client: reqwest::blocking::Client::new(),
+            absent: false,
+            http_client: Some(reqwest::blocking::Client::new()),
             coordinator_url: "http://localhost:9999".to_string(),
             wallet_auth_token: "test-token".to_string(),
             call_count: 0,
@@ -862,6 +901,31 @@ mod tests {
         assert!(err.starts_with("chain parameter is required"), "{err}");
         let (_, err) = s.confidential_deposit_intent("base".into(), String::new(), String::new());
         assert!(err.starts_with("amount parameter is required"), "{err}");
+    }
+
+    /// A run with no wallet: every function answers the one code and makes
+    /// no request — the coordinator URL is empty and would fail loudly if one
+    /// were made.
+    #[test]
+    fn a_run_with_no_wallet_is_refused_by_name_by_every_function() {
+        use outlayer::wallet::api::Host;
+        let mut none = WalletHostState::absent();
+        let answers = [
+            none.get_id(),
+            none.get_address("near".into()),
+            none.get_sub_key_address("ethereum".into(), String::new()),
+            none.evm_sign_message("ethereum".into(), "hi".into(), "utf8".into(), String::new()),
+            none.withdraw("near".into(), "a.near".into(), "1".into(), String::new()),
+            none.get_balance("near".into(), String::new()),
+            none.transfer("near".into(), "a.near".into(), "1".into()),
+            none.swap("a".into(), "b".into(), "1".into(), String::new()),
+            none.list_tokens(),
+        ];
+        for (result, error) in answers {
+            assert_eq!((result.as_str(), error.as_str()), ("", NO_WALLET));
+        }
+        assert!(NO_WALLET.starts_with("no_wallet: "), "a code a guest branches on");
+        assert_eq!(none.call_count, 0, "no call was counted, and none was made");
     }
 
     #[test]

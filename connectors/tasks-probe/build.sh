@@ -66,6 +66,7 @@ read = set()
 for text in (src, open(sys.argv[3]).read()):
     read |= set(re.findall(r'\binput\s*\.get\("([a-z_]+)"\)', text))
     read |= set(re.findall(r'\btext(?:_of)?\(input, "([a-z_]+)"', text))
+    read |= set(re.findall(r'\bsealed_of\(input, "([a-z_]+)"', text))
 for name, o in described.items():
     if o.get("class") not in {"read", "write"}:
         bad.append(f"describe.{name}.class {o.get('class')!r}")

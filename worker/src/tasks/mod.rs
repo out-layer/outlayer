@@ -1,11 +1,13 @@
 //! Tasks between an agent and its owner: the host's side.
 //!
 //! A run of a project that declares tasks (`"tasks": true` in its manifest)
-//! and was admitted to an owner's secret row may leave that owner a task, and
-//! the owner's own run may answer it — through the `outlayer:tasks` host
-//! interface ([`host_functions`], `wit/deps/tasks.wit`) and through nothing
-//! else. The component never sees a key and never names an account: whose
-//! task it is, who made it and which project it belongs to are this worker's
+//! and was admitted to an owner's secret row may leave that owner a task; on
+//! the owner's signed approval the platform starts a run of the same
+//! preparer, on the same payment key, and that run carries the task out —
+//! through the `outlayer:tasks` host interface ([`host_functions`],
+//! `wit/deps/tasks.wit`) and through nothing else. The component never sees
+//! a key and never names an account: whose task it is, who made it, whose
+//! consent it carries and which project it belongs to are this worker's
 //! facts, from the job and the keystore.
 //!
 //! **Keys.** The keystore derives one key per project and owner
@@ -23,9 +25,11 @@
 //! signed is an access key of the owner's account.
 //!
 //! **What the run leaves.** The tasks a run answered and what it reported on
-//! them are read back by the job path after the guest exits ([`RunReport`]),
-//! whatever way it exited, and sent to the store: a task reported on by a run
-//! that succeeded is `done`, any other is `failed`.
+//! them, and the approved tasks it was refused before it took them, are read
+//! back by the job path after the guest exits ([`RunReport`]), whatever way
+//! it exited, and sent to the store: a task reported on by a run that
+//! succeeded is `done`, any other it answered is `failed`, and one it was
+//! refused is `failed` with the reason.
 
 pub mod client;
 pub mod crypto;
@@ -54,6 +58,10 @@ pub const MAX_POLICY_BYTES: usize = 64 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
 /// Most bytes of what the owner supplies, sealed.
 pub const MAX_SUPPLIED_BYTES: usize = 8 * 1024;
+/// Most bytes of the note the owner writes beside an approval, sealed; the
+/// note opened is held to the same number and to the characters of a long
+/// text.
+pub const MAX_NOTE_BYTES: usize = 8 * 1024;
 /// Most bytes of the reason of a rejection, sealed; the reason opened is
 /// held to the same number.
 pub const MAX_REJECTION_BYTES: usize = 8 * 1024;
@@ -132,31 +140,58 @@ pub struct Answered {
     pub outcome: Option<Vec<u8>>,
 }
 
+/// An approved task this run was refused before it took it: the host's
+/// reason, as the store names it in `run_refused:<reason>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+struct Report {
+    answered: Vec<Answered>,
+    refused: Vec<Refused>,
+}
+
 /// What a run did that the store must hear of once the guest has exited.
 /// Shared between the host state, which writes it, and the job path, which
 /// reads it after the run — so it survives a guest that trapped.
 #[derive(Debug, Clone, Default)]
-pub struct RunReport(Arc<Mutex<Vec<Answered>>>);
+pub struct RunReport(Arc<Mutex<Report>>);
 
 impl RunReport {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Report> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn answered(&self, id: &str) {
-        let mut tasks = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !tasks.iter().any(|t| t.id == id) {
-            tasks.push(Answered { id: id.to_string(), outcome: None });
+        let mut report = self.lock();
+        if !report.answered.iter().any(|t| t.id == id) {
+            report.answered.push(Answered { id: id.to_string(), outcome: None });
         }
     }
 
     /// The store refused the answer after it was recorded: it is not one.
     pub(crate) fn forget(&self, id: &str) {
-        let mut tasks = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        tasks.retain(|t| t.id != id);
+        self.lock().answered.retain(|t| t.id != id);
+    }
+
+    /// The host refused this run an approved task before anything moved: the
+    /// task is failed with the reason when the run ends. Recorded once per
+    /// task, by the first reason.
+    pub(crate) fn refused(&self, id: &str, reason: &str) {
+        let mut report = self.lock();
+        if !report.refused.iter().any(|t| t.id == id) {
+            report.refused.push(Refused { id: id.to_string(), reason: reason.to_string() });
+        }
     }
 
     /// Record the outcome of a task this run answered; `false` when it
     /// answered no such task.
     pub(crate) fn reported(&self, id: &str, outcome: Vec<u8>) -> bool {
-        let mut tasks = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        match tasks.iter_mut().find(|t| t.id == id) {
+        let mut report = self.lock();
+        match report.answered.iter_mut().find(|t| t.id == id) {
             Some(task) => {
                 task.outcome = Some(outcome);
                 true
@@ -167,7 +202,12 @@ impl RunReport {
 
     /// Everything the run answered, in order.
     pub fn tasks(&self) -> Vec<Answered> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+        self.lock().answered.clone()
+    }
+
+    /// Every approved task the run was refused, in order.
+    pub fn refusals(&self) -> Vec<Refused> {
+        self.lock().refused.clone()
     }
 }
 
@@ -205,6 +245,19 @@ pub struct TasksRun {
     /// a contract the caller signed a transaction to can relay a request in
     /// the caller's name, and such a run is nobody's own act.
     pub predecessor: Option<String>,
+    /// The nonce of the payment key that pays for this run; none on chain.
+    /// With the caller, the wallet, the identity and the compute limit below
+    /// it is the consent a task this run opens carries, and what a run that
+    /// carries a task out is held to.
+    pub payment_key_nonce: Option<u32>,
+    /// The custody wallet the run's host functions act on, when the call
+    /// named one.
+    pub wallet_id: Option<String>,
+    /// Whether the run goes under the name of the wallet's bound account.
+    pub bound_identity: bool,
+    /// What the call authorised for compute, in minimal USD units as the job
+    /// spells it; none on chain.
+    pub compute_limit_usd: Option<String>,
     pub store: Option<StoreConfig>,
     pub chain: Option<ChainConfig>,
     pub report: RunReport,
@@ -285,6 +338,10 @@ mod tests {
             profile: Some("probe".to_string()),
             caller: Some("agent.testnet".to_string()),
             predecessor: Some("agent.testnet".to_string()),
+            payment_key_nonce: Some(1),
+            wallet_id: None,
+            bound_identity: false,
+            compute_limit_usd: Some("10000".to_string()),
             store: Some(store),
             chain: Some(chain),
             report: RunReport::default(),
@@ -312,5 +369,22 @@ mod tests {
                 Answered { id: "t-1".into(), outcome: Some(b"sealed".to_vec()) }
             ]
         );
+        assert!(report.refusals().is_empty());
+    }
+
+    #[test]
+    fn a_report_holds_the_approved_tasks_the_run_was_refused_by_their_first_reason() {
+        let report = RunReport::default();
+        report.refused("t-0", "hash-mismatch");
+        report.refused("t-0", "closed");
+        report.refused("t-1", "approval-invalid");
+        assert_eq!(
+            report.refusals(),
+            vec![
+                Refused { id: "t-0".into(), reason: "hash-mismatch".into() },
+                Refused { id: "t-1".into(), reason: "approval-invalid".into() }
+            ]
+        );
+        assert!(report.tasks().is_empty(), "a refusal is not an answer");
     }
 }

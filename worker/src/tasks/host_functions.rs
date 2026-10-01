@@ -7,32 +7,37 @@
 //!
 //! What a task IS is not taken on the store's word. A task is read from its
 //! sealed copy, which opens only under the key of that task of this project
-//! and owner; the owner, the project, the preparer, the expiry, the operation
-//! and the hashes are the ones sealed inside it. A row that was moved,
-//! swapped or extended opens as nothing, or disagrees with what is sealed,
-//! and is `unreadable`.
+//! and owner; the owner, the project, the preparer, the preparer's consent,
+//! the expiry, the operation and the hashes are the ones sealed inside it. A
+//! row that was moved, swapped or extended opens as nothing, or disagrees
+//! with what is sealed, and is `unreadable`.
+//!
+//! Whether the OWNER said yes is the owner's word: their wallet's signature
+//! over a sentence naming the task, the hash of what they saw and the digest
+//! of what they wrote, verified here under a full-access key of their account
+//! on chain. Whose run carries the task out is the consent's word: the run
+//! must be the preparer's, on the payment key, wallet and identity of the
+//! preparing run, within its compute limit.
 //!
 //! Where a task STANDS is the store's word: its state, the run that acted,
 //! and whose tasks a preparer is listed. The enclave keeps nothing between
 //! runs, so it cannot know by itself that a task was answered; the store is
 //! the coordinator's, which the platform trusts to keep its own records. A
-//! row put back to `open` with its sealed copy is a task that takes an
-//! answer again, and a reason for a rejection is whatever was sealed to the
-//! task's reply key: it is handed over only within the bound and the
-//! characters of what an owner writes.
+//! row put back to `approved` with its sealed copy is a task that takes the
+//! same approval again within its ten minutes, and a reason for a rejection
+//! is whatever was sealed to the task's reply key: it is handed over only
+//! within the bound and the characters of what an owner writes.
 //!
 //! Nothing of what a task shows, no key and no statement is logged: ids,
 //! kinds, counts and reasons only.
 
-use std::collections::BTreeMap;
-
 use base64::Engine;
 use wasmtime::component::Linker;
 
-use super::client::{self, HttpStore, NewTask, Refusal, Scope, Store, StoreError};
+use super::client::{self, HttpStore, NewTask, Refusal, Scope, Store, StoreError, Voucher};
 use super::crypto::{self, Purpose, Sealed, TaskKeys, DECRYPTION_FAILED};
-use super::envelope::{self, Envelope, SealedTask};
-use super::statement::{self, Chain, Device, RpcChain};
+use super::envelope::{self, Consent, Envelope, SealedTask};
+use super::statement::{self, Approval, ApprovalRefused, Chain, Device, RpcChain};
 use super::{RunReport, TaskGrant, TasksRun};
 
 wasmtime::component::bindgen!({
@@ -62,6 +67,10 @@ struct Ready {
     scope: Scope,
     profile: String,
     caller: String,
+    /// The run's consent to the run that carries a task it opens out: its
+    /// payment key, wallet, identity and compute limit. None in a run with no
+    /// payment key, which opens no task and carries none out.
+    consent: Option<Consent>,
     recipient: String,
     store: Box<dyn Store + Send>,
     chain: Box<dyn Chain + Send>,
@@ -92,37 +101,26 @@ pub struct TasksHostState {
     /// The conversation a task opened in this run continues, as the tasks
     /// this run answered say.
     conversation: Conversation,
-    /// The preparer of each task this run opened, by its id: `status`,
-    /// `cancel` and `delete` of such a task ask for it as that preparer's.
-    opened_as: BTreeMap<String, String>,
-}
-
-/// A conversation a run continues, as the task it answered sealed it: its
-/// id and the account it is with.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Thread {
-    id: String,
-    preparer: String,
 }
 
 /// What the tasks a run answered make of a task it opens.
 #[derive(Debug, Clone, Default)]
 enum Conversation {
-    /// The run answered no task: a task it opens is its caller's, in a
-    /// conversation of its own.
+    /// The run answered no task: a task it opens starts a conversation of
+    /// its own.
     #[default]
     Unanswered,
-    /// Every task the run answered is of this conversation: a task it opens
-    /// is the next turn of it.
-    One(Thread),
+    /// Every task the run answered is of this conversation, by the id of its
+    /// first task: a task the run opens is the next turn of it.
+    One(String),
     /// The run answered tasks of more than one conversation: a task it opens
     /// belongs to none, and is refused.
     Several,
 }
 
 impl Conversation {
-    /// The run answered a task of `thread`.
-    fn answered(&mut self, thread: Thread) {
+    /// The run answered a task of the conversation `thread`.
+    fn answered(&mut self, thread: String) {
         *self = match std::mem::take(self) {
             Conversation::Unanswered => Conversation::One(thread),
             Conversation::One(held) if held == thread => Conversation::One(held),
@@ -148,7 +146,6 @@ impl TasksHostState {
             opened: 0,
             devices: None,
             conversation: Conversation::Unanswered,
-            opened_as: BTreeMap::new(),
         }
     }
 
@@ -171,6 +168,19 @@ impl TasksHostState {
         };
         let Some(caller) = run.caller else {
             return no_owner("this run has no caller, and a task is made and answered by an account");
+        };
+        // The consent a task this run opens carries, and what this run is
+        // held to when it carries one out: the payment key that pays for it,
+        // and the wallet, the identity and the compute limit it runs with. A
+        // run on chain has no payment key and so no consent.
+        let consent = match (run.payment_key_nonce, run.compute_limit_usd) {
+            (Some(payment_key_nonce), Some(compute_limit_usd)) => Some(Consent {
+                payment_key_nonce,
+                wallet: run.wallet_id,
+                bound_identity: run.bound_identity,
+                compute_limit_usd,
+            }),
+            _ => None,
         };
         // Judged before anything is read: a relayed run opens, reads and
         // answers nothing, whoever signed it.
@@ -214,6 +224,7 @@ impl TasksHostState {
             scope: Scope { project_uuid, owner },
             profile,
             caller,
+            consent,
             recipient: chain.recipient,
             store: Box::new(store),
             chain: Box::new(rpc),
@@ -239,11 +250,6 @@ impl TasksHostState {
     fn enter(&mut self) -> Result<&Ready, wit::TaskError> {
         self.count()?;
         self.access.ready()
-    }
-
-    /// The preparer this run opened the task `id` as, when it opened it.
-    fn opened_as(&self, id: &str) -> Option<String> {
-        self.opened_as.get(id).cloned()
     }
 }
 
@@ -317,6 +323,7 @@ impl Ready {
             envelope,
             state,
             content_key: zeroize::Zeroizing::new(content_key),
+            consent: task.consent,
         })
     }
 
@@ -391,6 +398,214 @@ impl Ready {
             run: task.run,
             result,
             rejection,
+            failure_reason: task.failure_reason,
+        })
+    }
+}
+
+/// Why an approved task was not taken by this run.
+enum Untaken {
+    /// The host refused the run before anything moved: recorded, and the
+    /// task fails when the run ends.
+    Refused(wit::TaskError),
+    /// The store did not move the task to this run — another run took it,
+    /// or the store gave no answer — which the store's own record settles.
+    NotMoved(wit::TaskError),
+}
+
+impl Ready {
+    /// Take the approved task `id` for this run: E4 to E11 of the flow, in
+    /// order, each refusing before anything moves.
+    #[allow(clippy::too_many_arguments)]
+    fn take_approved(
+        &self,
+        id: &str,
+        hash: &str,
+        operation: &str,
+        policy: &[u8],
+        approval: &Approval,
+        supplied: Option<Vec<u8>>,
+        note: Option<Vec<u8>>,
+        stored: &client::Stored,
+    ) -> Result<wit::Answer, Untaken> {
+        let before = Untaken::Refused;
+        let task = self.unseal(id, stored.sealed.as_deref().ok_or_else(unreadable).map_err(before)?).map_err(before)?;
+        // The life that was sealed, whatever the row says.
+        let now = (self.now)();
+        if task.envelope.expires_at <= u64::try_from(now).unwrap_or(u64::MAX) {
+            return Err(before(not_open(client::State::Expired)));
+        }
+        if !hash.eq_ignore_ascii_case(&task.hash) {
+            return Err(before(refused(
+                wit::Reason::HashMismatch,
+                "the hash named is not this task's: what was shown is not what is stored",
+            )));
+        }
+        // The operation running is the host's word where the call names one;
+        // the component's word must agree with it, and the task's with both.
+        if self.operation.as_deref().is_some_and(|running| running != operation) {
+            return Err(before(refused(wit::Reason::AnswerInvalid, "the operation named is not the one this call runs")));
+        }
+        if operation != task.envelope.answer_by.operation {
+            return Err(before(refused(
+                wit::Reason::AnswerInvalid,
+                "the task is answered by another operation of this project than the one running",
+            )));
+        }
+        // The task is acted on with the row it was made for: another row of
+        // the same owner and project is not the task's, whatever it holds.
+        if task.envelope.profile != self.profile {
+            return Err(before(refused(
+                wit::Reason::NotFound,
+                "the task was made for another secret row of this owner than the one this call names",
+            )));
+        }
+        // The run that carries the task out is the preparer's run the consent
+        // names: the same account, on the same payment key, wallet and
+        // identity, within the compute the preparing run allowed. Nobody
+        // else's run — the owner's included — acts on it.
+        let not_the_preparer = |which: &str| {
+            before(refused(
+                wit::Reason::NotThePreparer,
+                format!("the task is carried out by the run of the agent that prepared it, and this run is {which}"),
+            ))
+        };
+        if self.caller != task.envelope.preparer {
+            return Err(not_the_preparer("another account's"));
+        }
+        let Some(consent) = self.consent.as_ref() else {
+            return Err(not_the_preparer("made with no payment key"));
+        };
+        if let Some(differs) = task.consent.refuses(consent) {
+            return Err(not_the_preparer(&format!("on {differs}")));
+        }
+        // The task is answered under the policy and by the build it was made
+        // with, or by nothing: what the owner was shown and proved is what
+        // acts. Either changed closes the task for every reader. A store
+        // that cannot be told now is told by the run's end, which fails the
+        // task with this reason.
+        let unchanged = envelope::hash(policy) == task.envelope.policy_hash;
+        let same_build = task.envelope.build == self.build;
+        if !unchanged || !same_build {
+            if let Err(e) = self.store.void(&self.scope, id) {
+                tracing::warn!(task = %id, "a void task could not be closed in the store: {e:?}");
+            }
+            let why = match (unchanged, same_build) {
+                (false, _) => "the policy changed since the task was made",
+                (true, false) => "the task was made by another build of this project than the one running",
+                (true, true) => unreachable!("a task unchanged in both is not void"),
+            };
+            tracing::info!(task = %id, "a task is void: {why}");
+            return Err(before(refused(wit::Reason::Void, format!("the task takes no answer: {why}"))));
+        }
+        // The owner's approval: over the sealed bytes as the page sent them,
+        // verified before they are opened. A chain that gives no answer is a
+        // refusal like any other here: the run did not act, the task fails,
+        // the agent prepares again.
+        if let Err(why) = statement::approval_holds(
+            approval,
+            &task.envelope.owner,
+            id,
+            &task.hash,
+            supplied.as_deref(),
+            note.as_deref(),
+            now,
+            task.envelope.expires_at,
+            &self.recipient,
+            self.chain.as_ref(),
+        ) {
+            return Err(before(match why {
+                ApprovalRefused::Invalid(why) => refused(wit::Reason::ApprovalInvalid, why),
+                ApprovalRefused::Unavailable(why) => refused(wit::Reason::Unavailable, why),
+            }));
+        }
+        let supplied = match (task.envelope.answer_by.supplies, supplied) {
+            (envelope::Supplies::Nothing, None) => None,
+            (envelope::Supplies::Nothing, Some(_)) => {
+                return Err(before(refused(wit::Reason::AnswerInvalid, "the task asks for nothing, and the answer supplies something")));
+            }
+            (envelope::Supplies::Text | envelope::Supplies::File, None) => {
+                return Err(before(refused(wit::Reason::AnswerInvalid, "the task asks for something, and the answer supplies nothing")));
+            }
+            (envelope::Supplies::Text | envelope::Supplies::File, Some(sealed)) => {
+                if sealed.len() > super::MAX_SUPPLIED_BYTES {
+                    return Err(before(refused(wit::Reason::AnswerInvalid, "what the answer supplies is over its bound")));
+                }
+                let opened = self.keys(id).open_reply(Purpose::Answer, id, &sealed).map_err(|_| {
+                    before(refused(wit::Reason::AnswerInvalid, "what the answer supplies does not open for this task"))
+                })?;
+                Some(opened.to_vec())
+            }
+        };
+        // The note the owner wrote beside their approval: text, within the
+        // bound and the characters of a long text, or the answer is refused.
+        let note = match note {
+            None => None,
+            Some(sealed) => {
+                if sealed.len() > super::MAX_NOTE_BYTES {
+                    return Err(before(refused(wit::Reason::AnswerInvalid, "the note is over its bound")));
+                }
+                let opened = self.keys(id).open_reply(Purpose::Note, id, &sealed).map_err(|_| {
+                    before(refused(wit::Reason::AnswerInvalid, "the note does not open for this task"))
+                })?;
+                let text = String::from_utf8(opened.to_vec())
+                    .map_err(|_| before(refused(wit::Reason::AnswerInvalid, "the note is not text")))?;
+                envelope::check_long_text("the note", &text)
+                    .map_err(|why| before(refused(wit::Reason::AnswerInvalid, why)))?;
+                Some(text.into_bytes())
+            }
+        };
+        // The files the task was made with, opened before anything moves: a
+        // file that is missing, changed or another task's hands nothing over.
+        if stored.files.len() != task.envelope.files.len() {
+            return Err(before(unreadable()));
+        }
+        let files = task
+            .envelope
+            .files
+            .iter()
+            .zip(&stored.files)
+            .enumerate()
+            .map(|(at, (note, blob))| {
+                let data = crypto::decrypt_file(&task.content_key, id, at, blob).map_err(|_| unreadable())?;
+                match envelope::hash(&data) == note.sha256 && data.len() as u64 == note.size {
+                    true => Ok(wit::File { name: note.name.clone(), content_type: note.content_type.clone(), data }),
+                    false => Err(unreadable()),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(before)?;
+        // Recorded before the store is asked, and forgotten only when the
+        // store refuses by name, which moves nothing. An answer whose reply
+        // did not come may have been taken, and is reported on when the run
+        // ends; the store's report of a task it did not move to this run
+        // changes nothing. Neither is a refusal of this run's: the store's
+        // record settles what became of the task.
+        self.report.answered(id);
+        if let Err(e) = self.store.answer(&self.scope, id, &self.run) {
+            match &e {
+                StoreError::Refused(..) => self.report.forget(id),
+                StoreError::Unavailable(_) => {
+                    tracing::warn!(task = %id, run = %self.run, "the store did not reply to an answer; the run reports on the task in case it was taken")
+                }
+            }
+            return Err(Untaken::NotMoved(store_failed(&e)));
+        }
+        tracing::info!(task = %id, run = %self.run, "task answered");
+
+        Ok(wit::Answer {
+            id: id.to_string(),
+            thread: task.envelope.thread,
+            preparer: task.envelope.preparer,
+            kind: match task.envelope.kind {
+                envelope::Kind::Confirm => wit::TaskKind::Confirm,
+                envelope::Kind::Input => wit::TaskKind::Input,
+            },
+            operation: task.envelope.answer_by.operation,
+            state: task.state,
+            files,
+            supplied,
+            note,
         })
     }
 }
@@ -410,6 +625,8 @@ struct Unsealed {
     hash: String,
     state: Vec<u8>,
     content_key: zeroize::Zeroizing<[u8; 32]>,
+    /// The preparer's consent, as sealed with the task.
+    consent: Consent,
 }
 
 fn kind_out(kind: client::Kind) -> wit::TaskKind {
@@ -422,6 +639,7 @@ fn kind_out(kind: client::Kind) -> wit::TaskKind {
 fn state_out(state: client::State) -> wit::TaskState {
     match state {
         client::State::Open => wit::TaskState::Open,
+        client::State::Approved => wit::TaskState::Approved,
         client::State::Answering => wit::TaskState::Answering,
         client::State::Done => wit::TaskState::Done,
         client::State::Failed => wit::TaskState::Failed,
@@ -432,9 +650,17 @@ fn state_out(state: client::State) -> wit::TaskState {
     }
 }
 
-/// Why a task that is not `open` takes no answer.
+/// Why a task that is not `approved` for this run takes no answer.
 fn not_open(state: client::State) -> wit::TaskError {
     match state {
+        client::State::Open => refused(
+            wit::Reason::ApprovalInvalid,
+            "the task is open and the owner has not approved it; a run carries a task out on the owner's approval only",
+        ),
+        client::State::Approved => refused(
+            wit::Reason::Closed,
+            "the task is approved: the owner said yes, and the run the platform started for it is the one that acts",
+        ),
         client::State::Expired => refused(wit::Reason::Expired, "the task is past its life"),
         client::State::Void => refused(wit::Reason::Void, "the policy changed since the task was made"),
         other => refused(wit::Reason::Closed, format!("the task is {} and takes no answer", state_name(other))),
@@ -444,6 +670,7 @@ fn not_open(state: client::State) -> wit::TaskError {
 fn state_name(state: client::State) -> &'static str {
     match state {
         client::State::Open => "open",
+        client::State::Approved => "approved",
         client::State::Answering => "answering",
         client::State::Done => "done",
         client::State::Failed => "failed",
@@ -451,6 +678,36 @@ fn state_name(state: client::State) -> &'static str {
         client::State::Cancelled => "cancelled",
         client::State::Expired => "expired",
         client::State::Void => "void",
+    }
+}
+
+/// A reason as the store names it in `run_refused:<reason>`: the WIT's own
+/// spelling.
+fn reason_name(reason: wit::Reason) -> &'static str {
+    match reason {
+        wit::Reason::NotDeclared => "not-declared",
+        wit::Reason::NoOwner => "no-owner",
+        wit::Reason::Relayed => "relayed",
+        wit::Reason::NotGrantedByName => "not-granted-by-name",
+        wit::Reason::Muted => "muted",
+        wit::Reason::InboxFull => "inbox-full",
+        wit::Reason::RunLimit => "run-limit",
+        wit::Reason::DisplayInvalid => "display-invalid",
+        wit::Reason::TooLarge => "too-large",
+        wit::Reason::LifeTooLong => "life-too-long",
+        wit::Reason::NotFound => "not-found",
+        wit::Reason::NotTheOwner => "not-the-owner",
+        wit::Reason::NotThePreparer => "not-the-preparer",
+        wit::Reason::ApprovalInvalid => "approval-invalid",
+        wit::Reason::NoPaymentKey => "no-payment-key",
+        wit::Reason::HashMismatch => "hash-mismatch",
+        wit::Reason::AnswerInvalid => "answer-invalid",
+        wit::Reason::Closed => "closed",
+        wit::Reason::Expired => "expired",
+        wit::Reason::Void => "void",
+        wit::Reason::Unreadable => "unreadable",
+        wit::Reason::Unavailable => "unavailable",
+        wit::Reason::Internal => "internal",
     }
 }
 
@@ -462,9 +719,12 @@ fn store_failed(error: &StoreError) -> wit::TaskError {
         StoreError::Refused(Refusal::Muted, _) => {
             refused(wit::Reason::Muted, "the owner muted this agent or this project")
         }
-        StoreError::Refused(Refusal::InboxFull, _) => refused(
+        StoreError::Refused(Refusal::InboxFull, _) => {
+            refused(wit::Reason::InboxFull, "the owner has as many open tasks as an inbox holds")
+        }
+        StoreError::Refused(Refusal::PreparerFull, _) => refused(
             wit::Reason::InboxFull,
-            "the owner has as many open tasks as an inbox holds, or as many of this agent's as one agent may leave",
+            "this agent holds as many tasks waiting on this owner as one agent may; one must close before another opens",
         ),
         StoreError::Refused(Refusal::StorageFull, _) => refused(
             wit::Reason::InboxFull,
@@ -537,14 +797,26 @@ impl wit::Host for TasksHostState {
                 format!("this run opened {opened} tasks, as many as one run may"),
             ));
         }
+        // The consent the task carries: the run that carries it out is paid
+        // by this run's payment key, with this run's wallet, identity and
+        // compute limit. A run with no payment key has nothing to consent
+        // with, and opens no task.
+        let Some(consent) = ready.consent.clone() else {
+            return Err(refused(
+                wit::Reason::NoPaymentKey,
+                "the consent to carry out the owner's answer is a payment key — the run that carries it out is paid \
+                 by that key — so a task is opened over HTTPS with one",
+            ));
+        };
         let id = format!("{}-{opened}", ready.run);
         // A task opened in a run that answered one is the next turn of that
-        // task's conversation, with that task's preparer: what makes this
-        // sound, and what it means in the owner's inbox, is in
+        // task's conversation; its preparer is this run's caller, as every
+        // task's is. What that means in the owner's inbox is in
         // `docs/TASKS.md`, "Whose task, and who may do what".
-        let (preparer, thread) = match conversation {
-            Conversation::Unanswered => (ready.caller.clone(), id.clone()),
-            Conversation::One(Thread { id: thread, preparer }) => (preparer, thread),
+        let preparer = ready.caller.clone();
+        let thread = match conversation {
+            Conversation::Unanswered => id.clone(),
+            Conversation::One(thread) => thread,
             Conversation::Several => {
                 return Err(refused(
                     wit::Reason::Internal,
@@ -657,10 +929,19 @@ impl wit::Host for TasksHostState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(unavailable)?;
         let copies = ready.copies_for(&id, &content_key, &devices)?;
+        let voucher = Voucher {
+            payment_key_nonce: consent.payment_key_nonce,
+            wallet_id: consent.wallet.clone(),
+            bound_identity: consent.bound_identity,
+            compute_limit_usd: consent.compute_limit_usd.clone(),
+            operation: task.answer_by.operation.clone(),
+            build: task.build.clone(),
+        };
         let sealed_task = SealedTask {
             content_key: hex::encode(content_key.as_ref()),
             envelope: String::from_utf8(document).map_err(|_| unavailable("the task is not text".to_string()))?,
             state: base64::engine::general_purpose::STANDARD.encode(&request.state),
+            consent,
         };
         let plain = zeroize::Zeroizing::new(
             serde_json::to_vec(&sealed_task).map_err(|_| unavailable("the task could not be written".to_string()))?,
@@ -671,6 +952,7 @@ impl wit::Host for TasksHostState {
             id: id.clone(),
             project_id: ready.project_id.clone(),
             preparer,
+            voucher,
             profile: ready.profile.clone(),
             vault: ready.grant.vault.clone(),
             kind: kind.1,
@@ -685,10 +967,8 @@ impl wit::Host for TasksHostState {
         let files = new.files.len();
         // The number is taken whether the store answered or not: a task whose
         // making was not heard of may have been made, and the next task of
-        // this run is another task under another id. Its preparer is held
-        // with it for the same reason.
+        // this run is another task under another id.
         self.opened = self.opened.saturating_add(1);
-        self.opened_as.insert(id.clone(), new.preparer.clone());
         // The devices that read the task with no run are those whose copy the
         // store wrote, which is not more than were in force when it was asked.
         let written = stored?;
@@ -711,11 +991,9 @@ impl wit::Host for TasksHostState {
     }
 
     fn status(&mut self, id: String) -> Result<wit::Outcome, wit::TaskError> {
-        let opened_as = self.opened_as(&id);
         let ready = self.enter()?;
         an_id(&id)?;
-        let preparer = opened_as.as_deref().unwrap_or(&ready.caller);
-        let mut tasks = ready.store.mine(&ready.scope, preparer, Some(&id)).map_err(|e| store_failed(&e))?;
+        let mut tasks = ready.store.mine(&ready.scope, &ready.caller, Some(&id)).map_err(|e| store_failed(&e))?;
         match (tasks.pop(), tasks.is_empty()) {
             (Some(task), true) if task.id == id => ready.outcome(task, Asked::ThisTask),
             (None, _) => Err(refused(wit::Reason::NotFound, "no such task")),
@@ -729,10 +1007,11 @@ impl wit::Host for TasksHostState {
         hash: String,
         operation: String,
         policy: Vec<u8>,
+        approval: wit::Approval,
         supplied: Option<Vec<u8>>,
+        note: Option<Vec<u8>>,
     ) -> Result<wit::Answer, wit::TaskError> {
         let ready = self.enter()?;
-        ready.the_owners("an answer")?;
         an_id(&id)?;
         if policy.len() > super::MAX_POLICY_BYTES {
             return Err(refused(wit::Reason::TooLarge, "policy is over its bound"));
@@ -741,136 +1020,35 @@ impl wit::Host for TasksHostState {
         if stored.id != id {
             return Err(unreadable());
         }
-        if stored.state != client::State::Open {
+        if stored.state != client::State::Approved {
             return Err(not_open(stored.state));
         }
-        let task = ready.unseal(&id, stored.sealed.as_deref().ok_or_else(unreadable)?)?;
-        // The life that was sealed, whatever the row says.
-        if task.envelope.expires_at <= u64::try_from((ready.now)()).unwrap_or(u64::MAX) {
-            return Err(not_open(client::State::Expired));
-        }
-        if !hash.eq_ignore_ascii_case(&task.hash) {
-            return Err(refused(
-                wit::Reason::HashMismatch,
-                "the hash named is not this task's: what was shown is not what is stored",
-            ));
-        }
-        // The operation running is the host's word where the call names one;
-        // the component's word must agree with it, and the task's with both.
-        if ready.operation.as_deref().is_some_and(|running| running != operation) {
-            return Err(refused(
-                wit::Reason::AnswerInvalid,
-                "the operation named is not the one this call runs",
-            ));
-        }
-        if operation != task.envelope.answer_by.operation {
-            return Err(refused(
-                wit::Reason::AnswerInvalid,
-                "the task is answered by another operation of this project than the one running",
-            ));
-        }
-        // The task is acted on with the row it was made for: another row of
-        // the same owner and project is not the task's, whatever it holds.
-        if task.envelope.profile != ready.profile {
-            return Err(refused(
-                wit::Reason::NotFound,
-                "the task was made for another secret row of this owner than the one this call names",
-            ));
-        }
-        // The task is answered under the policy and by the build it was made
-        // with, or by nothing: what the owner was shown and proved is what
-        // acts. Either changed closes the task for every reader. A store
-        // that cannot be told now is told by the next answer, which meets
-        // the same policy and the same build.
-        let unchanged = envelope::hash(&policy) == task.envelope.policy_hash;
-        let same_build = task.envelope.build == ready.build;
-        if !unchanged || !same_build {
-            if let Err(e) = ready.store.void(&ready.scope, &id) {
-                tracing::warn!(task = %id, "a void task could not be closed in the store: {e:?}");
-            }
-            let why = match (unchanged, same_build) {
-                (false, _) => "the policy changed since the task was made",
-                (true, false) => "the task was made by another build of this project than the one running",
-                (true, true) => unreachable!("a task unchanged in both is not void"),
-            };
-            tracing::info!(task = %id, "a task is void: {why}");
-            return Err(refused(wit::Reason::Void, format!("the task takes no answer: {why}")));
-        }
-        let supplied = match (task.envelope.answer_by.supplies, supplied) {
-            (envelope::Supplies::Nothing, None) => None,
-            (envelope::Supplies::Nothing, Some(_)) => {
-                return Err(refused(wit::Reason::AnswerInvalid, "the task asks for nothing, and the answer supplies something"));
-            }
-            (envelope::Supplies::Text | envelope::Supplies::File, None) => {
-                return Err(refused(wit::Reason::AnswerInvalid, "the task asks for something, and the answer supplies nothing"));
-            }
-            (envelope::Supplies::Text | envelope::Supplies::File, Some(sealed)) => {
-                if sealed.len() > super::MAX_SUPPLIED_BYTES {
-                    return Err(refused(wit::Reason::AnswerInvalid, "what the answer supplies is over its bound"));
-                }
-                let opened = ready.keys(&id).open_reply(Purpose::Answer, &id, &sealed).map_err(|_| {
-                    refused(wit::Reason::AnswerInvalid, "what the answer supplies does not open for this task")
-                })?;
-                Some(opened.to_vec())
-            }
+        // The task is approved and this run was started for it. A refusal
+        // from here to the store's move is this run's, and fails the task
+        // when the run ends: the owner said yes to a run that did not act,
+        // and the agent prepares again.
+        let approval = Approval {
+            at: approval.at,
+            public_key: approval.public_key,
+            signature: approval.signature,
+            nonce: approval.nonce,
         };
-        // The files the task was made with, opened before anything moves: a
-        // file that is missing, changed or another task's hands nothing over.
-        if stored.files.len() != task.envelope.files.len() {
-            return Err(unreadable());
-        }
-        let files = task
-            .envelope
-            .files
-            .iter()
-            .zip(&stored.files)
-            .enumerate()
-            .map(|(at, (note, blob))| {
-                let data = crypto::decrypt_file(&task.content_key, &id, at, blob).map_err(|_| unreadable())?;
-                match envelope::hash(&data) == note.sha256 && data.len() as u64 == note.size {
-                    true => Ok(wit::File { name: note.name.clone(), content_type: note.content_type.clone(), data }),
-                    false => Err(unreadable()),
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        // Recorded before the store is asked, and forgotten only when the
-        // store refuses by name, which moves nothing. An answer whose reply
-        // did not come may have been taken, and is reported on when the run
-        // ends; the store's report of a task it did not move to this run
-        // changes nothing.
-        ready.report.answered(&id);
-        if let Err(e) = ready.store.answer(&ready.scope, &id, &ready.run) {
-            match &e {
-                StoreError::Refused(..) => ready.report.forget(&id),
-                StoreError::Unavailable(_) => {
-                    tracing::warn!(task = %id, run = %ready.run, "the store did not reply to an answer; the run reports on the task in case it was taken")
-                }
+        match ready.take_approved(&id, &hash, &operation, &policy, &approval, supplied, note, &stored) {
+            Ok(answer) => {
+                self.conversation.answered(answer.thread.clone());
+                Ok(answer)
             }
-            return Err(store_failed(&e));
+            Err(Untaken::Refused(refusal)) => {
+                tracing::info!(task = %id, run = %ready.run, reason = reason_name(refusal.reason), "an approved task was refused this run");
+                ready.report.refused(&id, reason_name(refusal.reason));
+                Err(refusal)
+            }
+            Err(Untaken::NotMoved(refusal)) => Err(refusal),
         }
-        tracing::info!(task = %id, run = %ready.run, "task answered");
-
-        self.conversation
-            .answered(Thread { id: task.envelope.thread.clone(), preparer: task.envelope.preparer.clone() });
-        let answer = wit::Answer {
-            id,
-            thread: task.envelope.thread,
-            preparer: task.envelope.preparer,
-            kind: match task.envelope.kind {
-                envelope::Kind::Confirm => wit::TaskKind::Confirm,
-                envelope::Kind::Input => wit::TaskKind::Input,
-            },
-            operation: task.envelope.answer_by.operation,
-            state: task.state,
-            files,
-            supplied,
-        };
-        Ok(answer)
     }
 
     fn report(&mut self, id: String, result: Vec<u8>) -> Result<(), wit::TaskError> {
         let ready = self.enter()?;
-        ready.the_owners("a report")?;
         an_id(&id)?;
         if result.len() > super::MAX_RESULT_BYTES {
             return Err(refused(
@@ -889,19 +1067,15 @@ impl wit::Host for TasksHostState {
     }
 
     fn cancel(&mut self, id: String) -> Result<(), wit::TaskError> {
-        let opened_as = self.opened_as(&id);
         let ready = self.enter()?;
         an_id(&id)?;
-        let preparer = opened_as.as_deref().unwrap_or(&ready.caller);
-        ready.store.cancel(&ready.scope, preparer, &id).map_err(|e| store_failed(&e))
+        ready.store.cancel(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
     }
 
     fn delete(&mut self, id: String) -> Result<(), wit::TaskError> {
-        let opened_as = self.opened_as(&id);
         let ready = self.enter()?;
         an_id(&id)?;
-        let preparer = opened_as.as_deref().unwrap_or(&ready.caller);
-        ready.store.delete(&ready.scope, preparer, &id).map_err(|e| store_failed(&e))
+        ready.store.delete(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
     }
 
     fn unlock(&mut self) -> Result<u32, wit::TaskError> {

@@ -27,7 +27,7 @@
 //! | `vrf` | $0.01 | the ALPHA the randomness is bound to — the same seed through both doors must name the same account, differing only in the request id |
 //! | `refund` | $0.01 | money handed back reaches `earnings_history`: a non-zero `refund_usd` and an `amount` reduced by it. The worker computed this for a while and never sent it |
 //! | `guess_start` | $0.01 | a game of several turns through tasks: picks a number from 1 to `max` and opens an `input` task for the owner (`guess.rs`) |
-//! | `guess` | free | the owner's answer to a turn: judges it, reports, and opens the next turn in the same thread until the guess is right |
+//! | `guess` | free | the agent's run on the owner's answer to a turn, started by the platform on the owner's approval: judges it, reports, and opens the next turn in the same thread until the guess is right |
 //! | `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | free | the SDK's own, served by `tasks::dispatch` |
 //!
 //! And one operation that is deliberately absent from the price list —

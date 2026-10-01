@@ -19,32 +19,37 @@
 #       admission carries its own allowance. Up to six real messages; needs
 #       AGENT2_PAYMENT_KEY and AGENT2_ACCOUNT, both funded keys
 #
-# A send the owner confirms. The owner's page is played by
-# `lib/tasks_owner.mjs`: it signs in with the owner's wallet key and reads the
-# inbox on a device of its own. The owner's `confirm` is a transaction signed
-# by PARENT. The rows are named GT, so that ONLY tells them from the rows above.
+# A send the owner approves. The owner's page is played by
+# `lib/tasks_owner.mjs`: it signs in with the owner's wallet key, reads the
+# inbox on a device of its own, and approves with one signature of that key —
+# no transaction. The platform then runs the connector's `confirm` as the
+# agent, on the agent's payment key, and that run sends. The rows are named
+# GT, so that ONLY tells them from the rows above.
 #
 #   GT1  with `confirm: ["send"]` in the owner's policy the agent's `send`
 #        answers awaiting_owner with the task's id, hash and link, and no
 #        message id; the task waits in the owner's inbox under that hash; the
 #        agent's `task_status` says open, and its counter did not move
-#   GT2  the owner's `confirm` with the task's id and hash sends that message
-#        once: the answer carries the message id; the agent's `task_status`
-#        says done with the result; the same `confirm` again is refused
-#        task_closed and the result stays the one message
+#   GT2  the owner's approval, signed, moves the task to approved with the run
+#        the platform started; that run — the agent's, by the attestation's
+#        payment_key_owner — sends the message once: the agent's `task_status`
+#        says done with the message id and the run, and its confirmed count
+#        moved; approving again is refused 409 task_closed and the result
+#        stays the one message
 #   GT3  with no `confirm` in the policy `send` acts at once: the answer has
 #        the members of a sent message and none of a task, and neither the
 #        owner's inbox nor the agent's `tasks` gains one
 #   GT4  a message with an attachment under `confirm`: the task lists the file
 #        by name and size, the owner's page opens it to the same bytes
-#        (sha256), and the owner's `confirm` answers with the message sent and
+#        (sha256), and the agent's run on the owner's approval sends it with
 #        one attachment. The file is made here: 512 bytes, the same every run
 #   GT5  the prices on chain: `confirm`, `task_status`, `task_cancel`,
 #        `task_delete`, `tasks` and `tasks_unlock` cost 0 and `send` costs
 #        GMAIL_SEND_PRICE. SKIPs when the project has no price rows
 #
 # Every send is a REAL email to GMAIL_TEST_TO and to no other address: one for
-# G2, one for G1, up to six for G4, one each for GT2, GT3 and GT4. Whatever
+# G2, one for G1, up to six for G4, one each for GT2, GT3 and GT4 — the GT2 and
+# GT4 sends by the run the platform starts on the owner's approval. Whatever
 # happens, the capped policy is put back on exit, and the tasks the GT rows
 # made are deleted.
 #
@@ -70,7 +75,7 @@
 # GT1–GT4 need, besides: `node`; the owner's key file (OWNER_KEY_FILE, default
 # ~/.near-credentials/<network>/<PARENT>.json), which signs the owner's
 # statement; NEAR on PARENT for DEPOSIT (default `0.1 NEAR`), attached to each
-# `confirm`. Signing in here is one device more of the owner's, signed out when
+# approve. Signing in here is one device more of the owner's, signed out when
 # the suite ends; the owner's own devices stay signed in. On a connected row they run only when
 # `status` tells whether the owner's policy lists `confirm`; a policy whose
 # `confirm` cannot be read could not be put back as it was, and the rows SKIP.
@@ -227,30 +232,15 @@ restore_cap() {
 OWNER_KEY_FILE="${OWNER_KEY_FILE:-$HOME/.near-credentials/$NETWORK/$PARENT.json}"
 STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gmail-tasks-e2e.XXXXXX")"
 chmod 700 "$STATE_DIR"
-# owner <command> [args…] — the owner's page. Leaves its one JSON document in
-# OWN. The page prints no key and no token, and what it reads of a task stays
-# in OWN: a row prints a fact about it.
-OWN=""
-owner() {
-  throttle
-  OWN=$(INBOX_URL="$COORDINATOR_URL" OWNER="$PARENT" OWNER_KEY_FILE="$OWNER_KEY_FILE" RECIPIENT="$CONTRACT_ID" \
-        STATE_DIR="$STATE_DIR" node "$SCRIPT_DIR/lib/tasks_owner.mjs" "$@" 2>/dev/null)
-  [[ -n "$OWN" ]] || OWN='{"failed":"the page gave no answer"}'
-}
-own() { jq -r "$1 | if . == null then \"\" else tostring end" <<<"$OWN" 2>/dev/null; }
-# acts <input-json> — the owner's own call: a transaction, naming their row.
-acts() { run_as "$PARENT" "$PARENT/gmail" "$1"; }
+# The owner's page, the approval and the run it starts: lib/tasks_common.sh.
+# The page prints no key and no token, and what it reads of a task stays in
+# OWN: a row prints a fact about it.
+source "$SCRIPT_DIR/lib/tasks_common.sh"
+# The connector's task_status answer, for the library.
+task_field() { field ".output$1"; }
 # The code a refusal of the connector opens with.
 code() { local e; e=$(field .error); printf '%s' "${e%%:*}"; }
 status_of() { gmail "$(jq -nc --arg t "$1" '{operation:"task_status", task_id:$t}')"; }
-# in_inbox <task> — the task as the owner's page lists it; leaves ROW.
-ROW=""
-in_inbox() {
-  owner list a waiting
-  ROW=$(jq -c --arg t "$1" '.tasks[]? | select(.id == $t)' <<<"$OWN" 2>/dev/null)
-  [[ -n "$ROW" ]]
-}
-row() { jq -r "$1 | if . == null then \"\" else tostring end" <<<"$ROW" 2>/dev/null; }
 # How many tasks wait in the owner's inbox, or nothing when it was not read.
 inbox_count() {
   owner list a waiting
@@ -580,9 +570,6 @@ gt_refused() {
     fail "$1 expected the refusal $2, got success='$(field .success)' code='$(code | head -c 60)' message_id='$(field .output.message_id)' run=$RUN_OK"
   fi
 }
-# gt_confirm <task> <hash> — the owner's `confirm`.
-gt_confirm() { acts "$(jq -nc --arg t "$1" --arg h "$2" '{operation:"confirm", task_id:$t, task_hash:$h}')"; }
-
 if ! want GT1 && ! want GT2; then
   :
 elif ! gt_ready "GT1/GT2"; then
@@ -592,7 +579,7 @@ else
   GT1_BEFORE=$(field .output.sent_today)
   ensure_policy "$ASKS"
   GT1_SUBJECT="confirmed send $RUN"
-  gt_send "$GT1_SUBJECT" "left for the owner to confirm, and sent by the owner's own call"
+  gt_send "$GT1_SUBJECT" "left for the owner to confirm, and sent by the agent's run on their approval"
   if gt_awaits GT1; then
     [[ "$HASH" =~ ^[0-9a-f]{64}$ ]] \
       && pass "GT1 the answer names the task's hash" \
@@ -630,29 +617,25 @@ else
       || fail "GT1 sent_today is '$(field .output.sent_today)', it was '$GT1_BEFORE' before the send"
 
     if want GT2; then
-      log "GT2 the owner confirms"
-      gt_confirm "$TASK" "$HASH"
-      GT2_MESSAGE=$(field .output.message_id)
-      if [[ "$(field .success)" == "true" && "$(field .output.status)" == "done" && -n "$GT2_MESSAGE" && "$(field .output.task_id)" == "$TASK" ]]; then
-        pass "GT2 the owner's confirm sent the message: message_id=$GT2_MESSAGE"
-        status_of "$TASK"
-        [[ "$(field .output.state)" == "done" && "$(field .output.result.message_id)" == "$GT2_MESSAGE" && -n "$(field .output.run)" ]] \
-          && pass "GT2 the agent reads done, with the message sent and the run $(field .output.run)" \
-          || fail "GT2 task_status: state '$(field .output.state)' result.message_id '$(field .output.result.message_id)' run '$(field .output.run)' code='$(code | head -c 60)'"
-        if in_inbox "$TASK"; then fail "GT2 the task still waits in the inbox (state '$(row .state)')"; else
-          [[ -z "$(own .failed)" ]] && pass "GT2 the task left what waits" \
-            || fail "GT2 the inbox was not read: $(own .failed | head -c 120)"
-        fi
+      log "GT2 the owner approves, and the agent's run sends"
+      if approved_and_done GT2 "$TASK"; then
+        pass "GT2 approved with one signature: the platform started the run $RUN_OF, and the task ended done"
+        GT2_MESSAGE=$(field .output.result.message_id)
+        [[ -n "$GT2_MESSAGE" && "$(field .output.result.sent_today)" -ge 1 ]] \
+          && pass "GT2 the agent reads done, with the message sent (message_id=$GT2_MESSAGE) and its confirmed count at $(field .output.result.sent_today)" \
+          || fail "GT2 task_status: result.message_id '$GT2_MESSAGE' sent_today '$(field .output.result.sent_today)' code='$(code | head -c 60)'"
+        run_is_the_agents GT2 "$RUN_OF"
+        gone_from_inbox GT2 "$TASK"
 
-        log "GT2 the same confirm again"
-        gt_confirm "$TASK" "$HASH"
-        gt_refused GT2 task_closed
+        log "GT2 the same approval again"
+        owner replay-approval "$TASK" a
+        [[ "$(own .status)" == "409" && "$(own .reason)" == "task_closed" ]] \
+          && pass "GT2 the same approval again: 409 task_closed" \
+          || fail "GT2 approving again answered $(own .status) reason='$(own .reason)' state='$(own .state)'"
         status_of "$TASK"
         [[ "$(field .output.state)" == "done" && "$(field .output.result.message_id)" == "$GT2_MESSAGE" ]] \
           && pass "GT2 the result is still the one message" \
-          || fail "GT2 after the second confirm: state '$(field .output.state)' result.message_id '$(field .output.result.message_id)', expected done with $GT2_MESSAGE"
-      else
-        fail "GT2 confirm answered run=$RUN_OK success='$(field .success)' status='$(field .output.status)' message_id='$GT2_MESSAGE' code='$(code | head -c 60)' err='$(head -c 160 <<<"$RUN_ERR")'"
+          || fail "GT2 after the second approval: state '$(field .output.state)' result.message_id '$(field .output.result.message_id)', expected done with $GT2_MESSAGE"
       fi
     fi
   fi
@@ -693,11 +676,11 @@ else
           && pass "GT4 the owner's page opened it to the same bytes (sha256 ${GT4_SHA:0:12}…)" \
           || fail "GT4 opening the file: size '$(own .size)' sha256 '$(own .sha256 | head -c 64)' (expected $GT4_SIZE, $GT4_SHA) $(own .failed | head -c 120)"
 
-        gt_confirm "$TASK" "$HASH"
-        [[ "$(field .success)" == "true" && "$(field .output.status)" == "done" && -n "$(field .output.message_id)" \
-           && "$(field .output.task_id)" == "$TASK" && "$(field .output.attachments)" == "1" ]] \
-          && pass "GT4 the owner's confirm sent it with one attachment: message_id=$(field .output.message_id)" \
-          || fail "GT4 confirm answered run=$RUN_OK success='$(field .success)' status='$(field .output.status)' message_id='$(field .output.message_id)' attachments='$(field .output.attachments)' code='$(code | head -c 60)' err='$(head -c 160 <<<"$RUN_ERR")'"
+        if approved_and_done GT4 "$TASK"; then
+          [[ -n "$(field .output.result.message_id)" && "$(field .output.result.attachments)" == "1" ]] \
+            && pass "GT4 the agent's run sent it with one attachment: message_id=$(field .output.result.message_id)" \
+            || fail "GT4 the result: message_id='$(field .output.result.message_id)' attachments='$(field .output.result.attachments)' code='$(code | head -c 60)'"
+        fi
         skip "GT4 the message received carries the file — the answer counts attachments and cannot show the message; read it in $GMAIL_TEST_TO's mailbox"
       else
         fail "GT4 the task is not read in the inbox: '$(row '.unread // "not listed"' | head -c 120)' $(own .failed | head -c 120)"

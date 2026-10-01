@@ -82,7 +82,7 @@ with no price and no fee.
 | `sleep` | $0.01 | sleeps `seconds` (≤ 600) so the execution limit, not the module, ends the run |
 | `budget` | free | a daily budget kept the way the connectors keep theirs: `mode` reserve / release / read against `cap` on counter `run`, through the atomic `storage::increment`; `tests/connector_budget_parallel_e2e.sh` fires it in parallel to show the cap holds |
 | `guess_start` | $0.01, share 0 | tasks between an agent and its owner, over several turns: picks a number and leaves the owner the first task of a game (below) |
-| `guess` | free | the owner's answer to a turn of the game: judges the guess, reports it, and opens the next turn in the same thread |
+| `guess` | free | the agent's run on the owner's answer to a turn, started by the platform on the owner's approval: judges the guess, reports it, and opens the next turn in the same thread |
 | `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | free | the SDK's own task operations (`outlayer::tasks::dispatch`) |
 | `unpriced` | — | absent from the price table AND unimplemented here: must be refused before anything runs |
 
@@ -112,8 +112,9 @@ picks a number from 1 to `max` and opens an `input` task, `Guess my number`,
 asking `I picked a number from 1 to {max}. Your guess?`; the answer carries
 `status: "awaiting_owner"`, `task_id`, `task_hash` and the inbox `link`.
 
-**The owner plays it in the inbox.** The page seals the text they type, and
-their own call runs `guess`, which judges it:
+**The owner plays it in the inbox.** The page seals the text they type and
+asks their wallet for one signature; the platform starts `guess` as a run of
+the agent — on the agent's own payment key — which judges it:
 
 - wrong — reports `higher` or `lower` with the attempt count, and opens the
   next task of the same thread, which shows the guess, the answer and the
@@ -126,13 +127,14 @@ their own call runs `guess`, which judges it:
 **The agent reads the outcome** with `task_status` (`{"operation":
 "task_status", "task_id": "…"}`) or `tasks`. The result of a turn is
 `{attempt, guess, verdict, max, detail}`, with `next_task_id` when the game goes
-on. Every turn is the agent's: a task opened by the owner's answering run keeps
-the conversation's preparer, so the agent follows the whole game with
-`task_status` on each `next_task_id`, or with `tasks`.
+on. Every turn is the agent's: the run that judges a guess is the agent's, so
+the task it opens is the agent's too, and the agent follows the whole game
+with `task_status` on each `next_task_id`, or with `tasks`. Each turn costs
+the agent one run; the owner pays nothing and sends no transaction.
 
 **Where the number is.** In the task's sealed `state`, handed from turn to
-turn — not in storage, which is per account, so the agent's run and the
-owner's would read different cells. The envelope the owner reads carries
+turn — not in storage, so that nothing of the game is kept between runs but
+the sealed task itself. The envelope the owner reads carries
 `state_hash`, the SHA-256 of the state, so the state carries 32 random bytes
 beside `{secret, max, attempts}`: without them, hashing the state of every
 number from 1 to `max` would name the secret.

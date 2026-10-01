@@ -9,24 +9,30 @@
 //!
 //! | `operation` | Who | What it does |
 //! |---|---|---|
-//! | `prepare` | agent | opens a task from `title`, `body`, `kind` (`confirm`, `text`, `file`), `life_seconds`, and `files` (`[{name, content_type, text}]`); answers `awaiting_owner`. `answer_by` names the operation that answers a `confirm` task: `confirm` when it is not named, `confirm_slow`, `confirm_silent` or `confirm_trap` |
+//! | `prepare` | agent | opens a task from `title`, `body`, `kind` (`confirm`, `text`, `file`), `life_seconds`, and `files` (`[{name, content_type, text}]`); answers `awaiting_owner`. `answer_by` names the operation that answers a `confirm` task: `confirm` when it is not named, `confirm_slow`, `confirm_silent` or `confirm_trap`; `seconds` is sealed with a `confirm_slow` task as the time its run takes |
 //! | `prepare_many` | agent | opens `count` tasks (1 to 10) in one run, each as `prepare` makes it, and stops at the first that is refused; answers the tasks opened and the refusal |
 //! | `prepare_raw` | agent | opens a task whose display is `display` as given — for a display outside the bounds |
-//! | `confirm` | owner | answers a `confirm` task and reports what was prepared |
-//! | `supply` | owner | answers a `text` or `file` task and reports what was supplied; with `"again": true` in the prepared body, opens the next task of the conversation |
-//! | `confirm_slow` | owner | answers a task that names it, waits `seconds` (1 to 170), then reports what was prepared |
-//! | `confirm_silent` | owner | answers a task that names it, and reports nothing: the task ends `failed` |
-//! | `confirm_trap` | owner | answers a task that names it, reports, and traps: the task ends `failed` |
+//! | `confirm` | the agent's run, started by the platform on the owner's approval | takes a `confirm` task and reports what was prepared, and the owner's note when they wrote one |
+//! | `supply` | the same | takes a `text` or `file` task and reports what was supplied; with `"again": true` in the prepared body, opens the next task of the conversation |
+//! | `confirm_slow` | the same | takes a task that names it, waits `seconds` (1 to 170) — the call's, or the task's sealed one — then reports what was prepared |
+//! | `confirm_silent` | the same | takes a task that names it, and reports nothing: the task ends `failed` |
+//! | `confirm_trap` | the same | takes a task that names it, reports, and traps: the task ends `failed` |
 //! | `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | | the SDK's own |
+//!
+//! The operations that take a task read `task_id`, `task_hash`, `approval`
+//! and `supplied`/`note` off the input the platform starts the run with; a
+//! call of them with no approval, or by any run but the preparer's, is
+//! refused by the host.
 //!
 //! The policy is the `TASKS_PROBE_POLICY` secret of the owner's row, as it is
 //! at the moment of the run: a test changes it between a task and its answer
 //! to see the task void.
 
-use outlayer::tasks::{self, Display, FieldKind, Reason, Supplies, WrittenBy};
+use outlayer::tasks::{self, Display, FieldKind, Supplies, WrittenBy};
 use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
+#[cfg(target_family = "wasm")]
 #[used]
 #[link_section = "outlayer.manifest"]
 static OUTLAYER_MANIFEST: [u8; include_bytes!("../manifest.json").len()] = *include_bytes!("../manifest.json");
@@ -86,6 +92,16 @@ fn task_of(input: &Value, number: Option<(u64, u64)>) -> Result<tasks::Task, Str
         .field("Body", FieldKind::LongText, body, WrittenBy::Agent)
         .field("Prepared by", FieldKind::Text, "tasks-probe", WrittenBy::Project);
     let mut state = json!({ "body": body, "again": input.get("again").and_then(|v| v.as_bool()).unwrap_or(false) });
+    // The time a `confirm_slow` task takes, sealed with it: the run that
+    // answers is started by the platform and names none, so a task that
+    // names `confirm_slow` is refused here, before it is made, without one.
+    match input.get("seconds") {
+        Some(value) => state["seconds"] = json!(slow_seconds(Some(value))?),
+        None if input.get("answer_by").and_then(|v| v.as_str()) == Some("confirm_slow") => {
+            return Err(format!("invalid_request: a `confirm_slow` task names `seconds`, a whole number from 1 to {MAX_SLOW_SECONDS}"))
+        }
+        None => {}
+    }
     if let Some((number, of)) = number {
         display = display.field("Number", FieldKind::Text, &format!("{number} of {of}"), WrittenBy::Project);
         state["number"] = json!(number);
@@ -185,6 +201,11 @@ fn prepared(answer: &tasks::Answer) -> Value {
     serde_json::from_slice(&answer.state).unwrap_or_else(|_| json!(String::from_utf8_lossy(&answer.state)))
 }
 
+/// The owner's note, as text, when they wrote one.
+fn note(answer: &tasks::Answer) -> Value {
+    answer.note.as_deref().map(|n| json!(String::from_utf8_lossy(n))).unwrap_or(Value::Null)
+}
+
 fn confirm(input: &Value) -> Result<Value, String> {
     let answer = tasks::answered_for("confirm", input, &policy()).map_err(|e| e.refusal())?;
     let files: Vec<Value> = answer
@@ -192,7 +213,7 @@ fn confirm(input: &Value) -> Result<Value, String> {
         .iter()
         .map(|f| json!({ "name": f.name, "content_type": f.content_type, "bytes": f.data.len(), "starts": String::from_utf8_lossy(&f.data[..f.data.len().min(16)]) }))
         .collect();
-    let result = json!({ "acted_on": prepared(&answer), "prepared_by": answer.preparer, "files": files });
+    let result = json!({ "acted_on": prepared(&answer), "prepared_by": answer.preparer, "files": files, "note": note(&answer) });
     tasks::report(&answer.id, result.to_string().as_bytes()).map_err(|e| e.refusal())?;
     Ok(json!({ "status": "done", "task_id": answer.id, "thread": answer.thread, "result": result }))
 }
@@ -201,7 +222,7 @@ fn supply(input: &Value) -> Result<Value, String> {
     let answer = tasks::answered_for("supply", input, &policy()).map_err(|e| e.refusal())?;
     let supplied = answer.supplied.as_deref().map(|s| String::from_utf8_lossy(s).into_owned());
     let prepared = prepared(&answer);
-    let result = json!({ "acted_on": prepared, "supplied": supplied, "prepared_by": answer.preparer });
+    let result = json!({ "acted_on": prepared, "supplied": supplied, "prepared_by": answer.preparer, "note": note(&answer) });
     tasks::report(&answer.id, result.to_string().as_bytes()).map_err(|e| e.refusal())?;
     let mut out = json!({ "status": "done", "task_id": answer.id, "thread": answer.thread, "result": result });
     if prepared.get("again").and_then(|v| v.as_bool()) == Some(true) {
@@ -226,24 +247,38 @@ fn wait(seconds: u64) -> Duration {
     }
 }
 
-fn confirm_slow(input: &Value) -> Result<Value, String> {
-    // Read before the answer is taken: a call that names no time leaves the
-    // task open.
-    let seconds = input
-        .get("seconds")
+/// `seconds` as a call or a sealed task names it: a whole number from 1 to
+/// [`MAX_SLOW_SECONDS`].
+fn slow_seconds(value: Option<&Value>) -> Result<u64, String> {
+    value
         .and_then(|v| v.as_u64())
         .filter(|seconds| (1..=MAX_SLOW_SECONDS).contains(seconds))
-        .ok_or_else(|| format!("invalid_request: `seconds` is a whole number from 1 to {MAX_SLOW_SECONDS}"))?;
+        .ok_or_else(|| format!("invalid_request: `seconds` is a whole number from 1 to {MAX_SLOW_SECONDS}"))
+}
+
+fn confirm_slow(input: &Value) -> Result<Value, String> {
+    // The time is the task's: `prepare` sealed `seconds` in the state, and the
+    // run the platform starts carries nothing but the approval. A call that
+    // names one is judged before the answer is taken, so a bad call leaves
+    // the task as it was; the sealed value was judged when the task was made.
+    let from_call = match input.get("seconds") {
+        Some(value) => Some(slow_seconds(Some(value))?),
+        None => None,
+    };
     let answer = tasks::answered_for("confirm_slow", input, &policy()).map_err(|e| e.refusal())?;
+    let seconds = match from_call {
+        Some(seconds) => seconds,
+        None => slow_seconds(prepared(&answer).get("seconds"))?,
+    };
     let worked = wait(seconds);
     let result = json!({ "acted_on": prepared(&answer), "prepared_by": answer.preparer, "worked_ms": worked.as_millis() as u64 });
     tasks::report(&answer.id, result.to_string().as_bytes()).map_err(|e| e.refusal())?;
     Ok(json!({ "status": "done", "task_id": answer.id, "thread": answer.thread, "result": result }))
 }
 
-/// The owner's answer to a task that names `own`: the host holds the answer
-/// to the operation the call runs, so a task made for `confirm` is answered
-/// by `confirm` and by no other.
+/// The task taken by the run of `own`: the host holds the answer to the
+/// operation the call runs, so a task made for `confirm` is answered by
+/// `confirm` and by no other.
 fn answered_as(own: &str, input: &Value) -> Result<tasks::Answer, String> {
     tasks::answered_for(own, input, &policy()).map_err(|e| e.refusal())
 }

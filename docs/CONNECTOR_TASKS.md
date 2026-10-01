@@ -15,9 +15,11 @@ The agent calls an operation that would act — send a message, place an order,
 pay. When the owner's policy asks for it, the connector checks the call as it
 would before acting, and instead of acting it seals the exact action inside a
 task for the owner of the row and answers the agent `awaiting_owner`. The
-owner reads the task in their inbox and says yes with their own call of the
-connector's `confirm`, which carries out the sealed action and nothing else.
-The agent learns the outcome from `task_status`.
+owner reads the task in their inbox and says yes with one message their
+wallet signs; the platform then starts a run of the agent that prepared the
+task — the connector's `confirm`, on the agent's own payment key, within the
+preparing run's compute limit — which carries out the sealed action and
+nothing else. The agent learns the outcome from `task_status`.
 
 Every `write` operation of a connector's own is confirmable: the operations
 its `describe` block classes `write`, except `confirm` itself and the SDK's
@@ -147,30 +149,39 @@ into the answer unchanged.
 
 ### Answering: `confirm`
 
-The owner's page calls `confirm` with `task_id` and `task_hash`. The operation:
+The platform calls `confirm` in a run of the agent that prepared the task, on
+the owner's approval, with `task_id`, `task_hash`, the owner's `approval`
+(`{at, public_key, signature, nonce}`), and what the owner wrote sealed to
+the task's reply key: `supplied` for an `input` task, `note` beside any
+approval. The operation:
 
 1. Checks what it can without the task: the call names a task and a hash, the
-   policy is there and readable. A refusal here leaves the task as it was, and
-   an open task can be confirmed again.
+   policy is there and readable. A refusal here leaves the task as it was —
+   the platform records it, and the task ends `failed` with
+   `run_refused:unreported` (a refusal of the connector's own, which the host never saw) or `run_refused:<reason>` (one of the host's) when the run ends without taking the answer.
 2. Takes the answer — `tasks::answered_for("confirm", &input, &policy)` for a
-   connector that reads its input as JSON, or `tasks::answered(id, hash,
-   "confirm", &policy, None)` for one with an input struct, as Gmail. On `Ok`
-   the task is `answering` and never returns to `open`; the state and the
-   files come back in the `Answer`, with `preparer`, the account whose run
-   made the task.
+   connector that reads its input as JSON, which reads the id, the hash, the
+   approval, `supplied` and `note` off the input; or `tasks::answered(id,
+   hash, "confirm", &policy, &approval, None, note)` for one with an input
+   struct. The host holds the run to the consent sealed in the task — the
+   preparer's key, wallet, identity and compute limit — then verifies the
+   owner's signature over the task, the hash and the sealed words, and only
+   then moves the task. On `Ok` the task is `answering` and never returns to
+   `open`; the state, the files, `supplied` and `note` come back in the
+   `Answer`, opened.
 3. Reads the action from `answer.state` into the same type it was sealed from
    (`deny_unknown_fields`: a state with a member this build does not know is
    not an action).
 4. Checks it again against the policy and the limits as they are now, and
-   counts it for `answer.preparer` (§4c).
+   counts it in this run's own cell, beside the agent's direct actions (§4c).
 5. Carries out exactly that action.
-6. Reports the result to the preparer with `tasks::report`, and answers the
-   owner.
+6. Reports the result to the preparer with `tasks::report` — the owner's
+   note goes into it — and answers the run.
 
 ```rust
 pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
-    let (id, hash, rules) = before_answer(input, policy::load())?;
-    let answer = tasks::answered(id, hash, "confirm", &policy::stored(), None).map_err(|e| e.refusal())?;
+    let (call, rules) = before_answer(input, policy::load())?;
+    let answer = tasks::answered_for(ANSWERED_BY, &call, &policy::stored()).map_err(|e| e.refusal())?;
     after_answer(&rules, &answer, crate::on_chain(), crate::deliver, |id, result| {
         tasks::report(id, result).map_err(|e| e.refusal())
     })
@@ -185,7 +196,10 @@ fn after_answer(
 ) -> Result<Value, String> {
     let message = held(&answer.state, &answer.files).map_err(closed)?;
     message.check(rules).map_err(closed)?;
-    let sent = send(rules, &message, policy::Counted::ConfirmedFor(&answer.preparer)).map_err(closed)?;
+    let mut sent = send(rules, &message, policy::Counted::Confirmed).map_err(closed)?;
+    if let Some(note) = answer.note.as_deref().and_then(|n| std::str::from_utf8(n).ok()) {
+        sent["note"] = serde_json::json!(note);
+    }
     report(&answer.id, sent.to_string().as_bytes()).map_err(|e| sent_unreported(e, &sent))?;
     Ok(answered_with(&sent, &answer.id, on_chain))
 }
@@ -230,7 +244,8 @@ A task may ask the owner for text or a file instead of a yes:
 opened by the run that answered another continues that task's `thread`: the
 answering operation of `connectors/tasks-probe` opens the next task of the
 conversation from inside `supply`, and a game over several turns is one
-thread in the owner's inbox.
+thread in the owner's inbox. The run that answers is the agent's, so a turn
+is the agent's too, opened over HTTPS with the agent's key.
 
 ## 4. Rules
 
@@ -255,7 +270,7 @@ a short `life_seconds`.
 | When | Checked | Counted |
 |---|---|---|
 | prepare | every limit the preparing run can read — the policy's rules, per-action caps, what the call asks for | nothing |
-| confirm | every limit again, as it is at that moment — authoritative | at confirm, for the preparer, in the owner's cell |
+| confirm | every limit again, as it is at that moment — authoritative | at confirm, in the agent's own cell, as a confirmed action |
 
 The check at prepare is an early refusal: the owner is never shown what the
 policy forbids, and no task is made for it. The check at confirm is the one
@@ -263,26 +278,24 @@ that counts, because time passed and other actions ran. The policy itself
 cannot differ (a changed policy voids the task); what differs is counts,
 balances, and the venue's own answer.
 
-The count is kept in the owner's storage cell because the run that acts is
-the owner's, and a run writes its own cell and no other. It is kept per
-preparer, so the owner's cap bounds each agent as it does for the agent's own
-direct actions. Gmail's key for it is `gm:sends:<day>:confirmed:<preparer>`,
-beside the agent's own `gm:sends:<day>` in the agent's cell:
+Both runs that act are the agent's — the direct action, and the `confirm`
+the platform starts on the owner's approval — and a run writes its own cell
+and no other, so both counts are in the agent's cell, and the owner's cap
+bounds each. Gmail's keys are `gm:sends:<day>` and
+`gm:sends:<day>:confirmed`:
 
 ```rust
-pub enum Counted<'a> {
-    /// An action the caller takes itself: counted in the caller's cell.
+pub enum Counted {
+    /// A message the caller sends itself: one count a day.
     Own,
-    /// An action the owner confirmed, prepared by this account: counted in
-    /// the OWNER's cell, one count for each preparer.
-    ConfirmedFor(&'a str),
+    /// A message the owner confirmed, sent by the run started for it: one
+    /// count a day, beside the caller's own.
+    Confirmed,
 }
 ```
 
-A count in the owner's cell is not readable by the preparer's run, so it is
-checked at confirm only. The count is taken as a reservation before the
-action leaves and released on any return that did not act (Gmail's
-`policy::reserve`).
+The count is taken as a reservation before the action leaves and released on
+any return that did not act (Gmail's `policy::reserve`).
 
 **(d) The owner can read `state_hash`.** The envelope carries the SHA-256 of
 the state, and the owner's page holds the envelope. A state drawn from a small
@@ -299,11 +312,12 @@ let state = serde_json::to_vec(&json!({ "salt": hex::encode(salt), "secret": num
 
 A state whose content is on the task anyway (Gmail's message) needs no salt.
 
-**(e) An answer on chain names nobody.** The owner's `confirm` from a wallet
-is a transaction, and its output stays in it for ever. On chain, `confirm`
-answers the members of a fixed list, picked by name, and nothing that names a
-person, an address, a subject or an amount the owner would not publish; over
-HTTPS the answer may be whole. Gmail answers `status`, `task_id`,
+**(e) An answer on chain names nobody.** The run the platform starts for an
+approval is an HTTPS call, whose answer may be whole. A connector still
+answers by where it runs, as every operation does: on chain, the members of
+a fixed list, picked by name, and nothing that names a person, an address, a
+subject or an amount the owner would not publish — the output of a run on
+chain stays in its transaction for ever. Gmail answers `status`, `task_id`,
 `message_id`, `thread_id`, `attachments`, `sent_today`, `remaining_today`:
 
 ```rust
@@ -333,7 +347,7 @@ the task. Gmail's words:
 
 | Refused | The task | The refusal |
 |---|---|---|
-| before the answer: no `task_id` or `task_hash`, no policy, anything the host refuses (`task_not_found`, `not_the_owner`, `task_hash_mismatch`, `task_answer_invalid`, `task_closed`, `task_expired`, `task_void`, `task_store_unavailable`) | as it was; an open one can be confirmed again | as it is |
+| before the answer: no `task_id` or `task_hash`, no policy, anything the host refuses (`task_not_found`, `not_the_preparer`, `task_approval_invalid`, `task_hash_mismatch`, `task_answer_invalid`, `task_closed`, `task_expired`, `task_void`, `task_store_unavailable`) | as it was in the run; the platform ends it `failed` with `run_refused:unreported` (a refusal of the connector's own, which the host never saw) or `run_refused:<reason>` (one of the host's) when the run ends without taking the answer | as it is |
 | after the answer, before the action: a state that does not read, a limit, the credential, the venue's refusal | `failed` | `<code>: <sentence>. The task is closed: to send this message, prepare it again` |
 | after the action: the result could not be reported | `failed` | `<code>: <sentence>. The message WAS sent (Gmail message <id>) and the task is closed without its result: do not prepare it again` |
 
@@ -341,22 +355,29 @@ The last row matters most where money moves: an owner who reads "failed"
 and prepares the action again would pay twice. The sentence names what
 happened and the venue's id for it.
 
-**(g) Only the owner answers, and the host enforces it.** `answered` refuses
-`not-the-owner` in any run not made by the owner of the row, and `relayed` in
-a run a contract made on the owner's behalf; it refuses an operation other
-than the one the task names (`answer-invalid`), a hash that is not the task's,
-a policy that changed, another build. A connector does not re-implement any
-of it and does not compare accounts itself: it calls `answered` and answers
-the refusal.
+**(g) Only the run the platform started answers, and the host enforces it.**
+`answered` refuses `not-the-preparer` in any run that is not the preparer's
+on the preparer's key, wallet, identity and compute limit as sealed in the
+task — an owner's call, another agent's, the preparer's own call with a
+larger limit — and `approval-invalid` without the owner's signature over
+this task, this hash and the sealed words, by a full-access key of the
+owner's account, within the window; `relayed` in a run a contract made; an
+operation other than the one the task names (`answer-invalid`), a hash that
+is not the task's, a policy that changed, another build. A connector does
+not re-implement any of it and does not compare accounts or verify
+signatures itself: it calls `answered` and answers the refusal.
 
 ## 5. Prices
 
 A task is paid for when it is prepared. The preparing operation keeps its
 price, paid by the agent when the task is made, whether or not the owner
 says yes. `confirm` and the five task operations are free: the action was
-paid for by whoever asked for it, and a call from a wallet attaches the
-operation's exact price, so a free `confirm` is one the owner makes with
-nothing but the run's deposit. From `connectors/gmail-connector/set-prices.sh`:
+paid for by whoever asked for it. The run of `confirm` the platform starts on
+an approval is admitted only when `confirm` is priced zero — a priced
+`confirm` fails every task `operation_priced` — and its compute is paid by
+the agent's payment key, as any call of the agent's, within the compute
+limit of the run that prepared the task. From
+`connectors/gmail-connector/set-prices.sh`:
 
 ```json
 {"operation": "status",       "price_usd": "0",     "developer_share_bp": 0},
@@ -376,15 +397,17 @@ checks that the priced operations are exactly the manifest's.
 
 **Manifest** (`connectors/gmail-connector/manifest.json`):
 
-* `"tasks": true`. A `callers` block beside it must leave the direct door
-  open: the owner answers with a direct call.
+* `"tasks": true`. A `callers` block beside it must leave the HTTPS door
+  open — the run that answers is an HTTPS call of the agent's — and the
+  direct door: the owner opens tasks for a new device with a direct call.
 * `operations` lists `confirm` and `task_status`, `task_cancel`,
   `task_delete`, `tasks`, `tasks_unlock` beside the connector's own, and so
   does the code's `OPERATIONS` list and its dispatch.
 * `describe.operations` has an entry for each: `confirm` (`class: write`,
-  params `task_id` and `task_hash`, a doc that says it carries out the
-  prepared action, what it answers on chain, and that a refusal after the
-  answer closes the task); `task_status` and `tasks` (`read`); `task_cancel`,
+  params `task_id`, `task_hash`, `approval` and `note`, a doc that says the
+  platform runs it on the owner's approval, that it carries out the prepared
+  action, what it answers on chain, and that a refusal after the answer
+  closes the task); `task_status` and `tasks` (`read`); `task_cancel`,
   `task_delete`, `tasks_unlock` (`write`). The preparing operation's doc says
   it answers `awaiting_owner` when the policy lists it under `confirm`.
 * A `limits` entry on the preparing operation has its counterpart on
@@ -428,23 +451,24 @@ action and report. Gmail's, by name:
 | what cannot be shown whole is refused | `a_body_is_shown_whole_or_the_message_is_refused` |
 | a refusal before the answer leaves the task as it was | `before_the_answer_a_refusal_leaves_the_task_as_it_was` |
 | every refusal after the answer keeps its code and says the task is closed; nothing acts on a refused state | `after_the_answer_every_refusal_keeps_its_code_and_says_the_task_is_closed` |
-| `confirm` acts once, on exactly the sealed action, counted for the preparer, and reports after acting | `what_is_sent_is_what_the_task_held_and_what_is_reported_is_whole` |
+| `confirm` acts once, on exactly the sealed action, counted as confirmed in the run's own cell, and reports after acting | `what_is_sent_is_what_the_task_held_and_what_is_reported_is_whole` |
+| the owner's note reaches the agent with the result, changes nothing of the action, stays off a chain answer, and is cut before the message's own members when the report would not hold it | `the_note_reaches_the_connector_and_changes_nothing_of_the_action` |
 | an action that happened and could not be reported says so | `a_message_that_left_and_was_not_reported_is_said_to_have_left` |
 | on chain the answer names nobody; a new member stays off | `on_chain_the_answer_names_no_person_and_no_subject` |
-| the confirmed count is the preparer's, in its own record | `a_confirmed_send_is_counted_for_the_agent_that_prepared_it` |
+| the confirmed count is a record of its own beside the agent's direct count, each bounded by the cap | `a_confirmed_send_is_counted_beside_the_agents_own_and_each_count_is_bounded`, `each_count_has_a_record_of_its_own` |
 
 That the preparing operation opens a task and does not act needs the host,
 and is proved live (GT1).
 
 **Live rows** on testnet, modelled on `tests/gmail_delegation_e2e.sh`, whose
 owner's page is played by `tests/lib/tasks_owner.mjs` (it signs in with the
-owner's key and reads the inbox on a device of its own) and whose owner's
-`confirm` is a transaction the owner signs:
+owner's key, reads the inbox on a device of its own, and approves with the
+owner's key, as the page does):
 
 | Row | Proves |
 |---|---|
 | GT1 | with the operation under `confirm`, the agent's call answers `awaiting_owner` with the task's id, hash and link and no result of the action; the task waits in the owner's inbox under that hash, addressed to the owner, prepared by the agent, showing the action's values; `task_status` says `open`; the agent's counter did not move |
-| GT2 | the owner's `confirm` with the id and hash acts once and answers the result; `task_status` says `done` with it; the same `confirm` again is refused `task_closed` and nothing acts twice |
+| GT2 | the owner's approval of the task, signed, starts the agent's run of `confirm`, which acts once; `task_status` says `done` with the result and the run; approving again is refused `task_closed`, and nothing acts twice |
 | GT3 | with no `confirm` in the policy the operation acts at once: the answer is the action's and not a task's, and neither the inbox nor `tasks` gains one |
 | GT4 | a task with files: the owner's page opens each to the same bytes, and `confirm` acts with them |
 | GT5 | the prices on chain: `confirm` and the five task operations cost 0, the preparing operation its price; SKIP when the project has no price rows |
@@ -465,15 +489,17 @@ Suites run through a keyed RPC (`tests/lib/rpc.sh`).
 5. An order is sealed and shown with its limit price; a market order becomes a
    limit at the slippage bound; its task has a short life.
 6. A state the owner must not recover from its hash carries a random salt.
-7. `confirm` takes the answer, reads the action from the state, re-checks
-   limits, counts for `answer.preparer` in the owner's cell, carries out
-   exactly the action, reports, answers.
+7. `confirm` takes the answer with the owner's approval, reads the action
+   from the state, re-checks limits, counts the action as confirmed in the
+   run's own cell, carries out exactly the action, reports with the owner's
+   note, answers.
 8. Refusals after the answer say the task is closed, and say so when the
    action happened.
 9. On chain, `confirm` answers a fixed list of members that names nobody.
 10. `tasks::dispatch` serves the five task operations.
-11. Manifest: `"tasks": true`, the direct door open, `confirm` and the five in
-    `operations` and `describe`, a `confirm` limit beside the preparing one's.
+11. Manifest: `"tasks": true`, the HTTPS and the direct door open, `confirm`
+    and the five in `operations` and `describe`, a `confirm` limit beside the
+    preparing one's.
 12. Cargo: the SDK's `tasks` feature. `build.sh`: the WIT copy check, the
     import check, the manifest check.
 13. `set-prices.sh`: the preparing operation keeps its price; `confirm` and

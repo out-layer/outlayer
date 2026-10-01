@@ -104,9 +104,16 @@ impl Callers {
     }
 
     /// Whether an account calling OutLayer itself, signing its own
-    /// transaction, is admitted — what the owner answering a task does.
+    /// transaction, is admitted — what the owner opening their tasks for a
+    /// new device does (`tasks_unlock`).
     pub fn admits_direct(&self) -> bool {
         !matches!(self.contract, ContractDoor::Only(_)) && self.direct == Door::Allow
+    }
+
+    /// Whether a call over HTTPS, paid by a payment key, is admitted — what
+    /// the run the platform starts for an approved task is.
+    pub fn admits_https(&self) -> bool {
+        !matches!(self.contract, ContractDoor::Only(_)) && self.https == Door::Allow
     }
 }
 

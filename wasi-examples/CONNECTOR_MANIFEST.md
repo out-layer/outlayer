@@ -520,8 +520,9 @@ unreadable, and the run is refused. The `@worker` storage (`set-worker`,
 ```
 
 A module that declares it may leave the owner of the secret row a run names a
-**task** — an action prepared and waiting for the owner's own call — and take
-the owner's answer, through the `outlayer:tasks` host functions
+**task** — an action prepared and waiting for the owner's approval, which
+the platform carries out in a run of the agent that prepared it — and take
+the owner's answer in that run, through the `outlayer:tasks` host functions
 (`docs/TASKS.md`). Absent means `false`; any other value than the two does not
 parse.
 
@@ -541,9 +542,11 @@ it, and `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` —
 is an operation like any other: listed in `operations`, and priced when the
 module is a connector.
 
-The owner answers a task with a direct call of their own, so a manifest that
-declares `tasks` with a `callers` block that shuts the direct door does not
-parse.
+The run that answers a task is an HTTPS call of the agent's, started by the
+platform, and the owner opens their waiting tasks for a new device with a
+direct call of their own (`tasks_unlock`), so a manifest that declares
+`tasks` with a `callers` block that shuts the HTTPS door or the direct door
+does not parse.
 
 ### `callers`: who may run it
 

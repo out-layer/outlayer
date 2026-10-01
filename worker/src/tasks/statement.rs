@@ -1,4 +1,6 @@
-//! A device's statement, checked before anything is encrypted to the device.
+//! The owner's signed statements: a device's statement, checked before
+//! anything is encrypted to the device; and a task's approval, checked before
+//! the task is handed to the run that carries it out.
 //!
 //! The owner's wallet signs one sentence (NEP-413, recipient: the OutLayer
 //! contract) naming the public key of a key pair their browser made:
@@ -19,6 +21,18 @@
 //! a device, and nothing is encrypted to it. A chain that cannot be asked is
 //! not an answer: the whole call is refused as unavailable, never served as
 //! if the owner had no device.
+//!
+//! **An approval** is one more sentence the owner's wallet signs, for one
+//! task:
+//!
+//! > Approve in OutLayer as `alice.near`: task `<id>` with hash `<64 hex>` and supply `<64 hex>`. At `2026-10-01T12:00:00Z`.
+//!
+//! It names the task, the hash of the envelope the owner was shown, and the
+//! digest of what they supplied and wrote ([`supply_digest`]), at a minute.
+//! The host rebuilds it from what is sealed and from the bytes handed to
+//! `answered`, and holds it by the same three rules as a device's statement,
+//! within ten minutes of its clock and within the task's life
+//! ([`approval_holds`]).
 
 use base64::Engine;
 use serde::Deserialize;
@@ -104,7 +118,6 @@ pub fn signed_by_its_signer(
     now: i64,
     recipient: &str,
 ) -> Result<p256::PublicKey, String> {
-    use ed25519_dalek::Verifier;
     if statement.account_id != owner {
         return Err("the statement is for another account".to_string());
     }
@@ -118,8 +131,23 @@ pub fn signed_by_its_signer(
     let message = sentence(&statement.account_id, &statement.device_pubkey, statement.valid_until)
         .ok_or("the deadline is not a time")?;
 
-    let signer = statement
-        .signer_pubkey
+    verify_nep413(&message, &statement.signer_pubkey, &statement.signature, &statement.nonce, recipient)?;
+    Ok(device)
+}
+
+/// Does `signature` (base64, 64 bytes) by `signer_pubkey` (`ed25519:<base58>`)
+/// sign `message` under NEP-413 with `nonce` (base64, 32 bytes) for
+/// `recipient`? The refusal says what was wrong with the parts, or that the
+/// signature does not verify.
+pub fn verify_nep413(
+    message: &str,
+    signer_pubkey: &str,
+    signature: &str,
+    nonce: &str,
+    recipient: &str,
+) -> Result<(), String> {
+    use ed25519_dalek::Verifier;
+    let signer = signer_pubkey
         .strip_prefix("ed25519:")
         .and_then(|key| bs58::decode(key).into_vec().ok())
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
@@ -127,22 +155,123 @@ pub fn signed_by_its_signer(
         .ok_or("the signer's key is not `ed25519:` and 32 bytes of base58")?;
     let standard = base64::engine::general_purpose::STANDARD;
     let signature = standard
-        .decode(statement.signature.as_bytes())
+        .decode(signature.as_bytes())
         .ok()
         .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
         .map(|bytes| ed25519_dalek::Signature::from_bytes(&bytes))
         .ok_or("the signature is not 64 bytes of base64")?;
     let nonce = standard
-        .decode(statement.nonce.as_bytes())
+        .decode(nonce.as_bytes())
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .ok_or("the nonce is not 32 bytes of base64")?;
 
-    let payload = Nep413Payload { message, nonce, recipient: recipient.to_string(), callback_url: None };
+    let payload = Nep413Payload { message: message.to_string(), nonce, recipient: recipient.to_string(), callback_url: None };
     let payload = borsh::to_vec(&payload).map_err(|_| "the statement could not be serialised".to_string())?;
     let signed = Sha256::digest([&NEP413_TAG.to_le_bytes()[..], &payload].concat());
-    signer.verify(&signed, &signature).map_err(|_| "the signature does not verify".to_string())?;
-    Ok(device)
+    signer.verify(&signed, &signature).map_err(|_| "the signature does not verify".to_string())
+}
+
+// ── the approval ────────────────────────────────────────────────────────────
+
+/// How far ahead of the host's clock an approval may be dated, in seconds:
+/// the clocks' disagreement, and no more.
+pub const APPROVAL_AHEAD_SECS: i64 = 10 * 60;
+/// How old an approval may be when the run meets it, in seconds. The door
+/// took it within ten minutes of its signing and spent its nonce; what this
+/// bounds is the queue between the door and the run, which is as long as a
+/// run may act (the coordinator's `APPROVED_LIMIT_MINUTES`).
+pub const APPROVAL_AGE_SECS: i64 = 30 * 60;
+
+/// The owner's approval of a task, as the run's input carries it and the
+/// component hands it to `answered`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Approval {
+    /// Unix seconds: the minute the sentence names.
+    pub at: u64,
+    /// `ed25519:<base58>`.
+    pub public_key: String,
+    /// Base64, 64 bytes.
+    pub signature: String,
+    /// Base64, 32 bytes.
+    pub nonce: String,
+}
+
+/// The sentence an approval signs, rebuilt from the facts the host holds.
+pub fn approval_sentence(owner: &str, id: &str, hash: &str, supply_digest: &str, at: i64) -> Option<String> {
+    Some(format!(
+        "Approve in OutLayer as {owner}: task {id} with hash {hash} and supply {supply_digest}. At {}.",
+        iso8601_utc(at)?
+    ))
+}
+
+/// The digest of what the owner supplied and wrote, as the sentence names it:
+/// SHA-256, hex, of the canonical JSON `{"note":<base64|null>,"supplied":<base64|null>}`
+/// — members in alphabetical order, standard base64, no whitespace — over the
+/// sealed bytes as the page sent them. Nothing supplied and no note is the
+/// digest of `{"note":null,"supplied":null}`, a constant; it is still in the
+/// sentence, so the sentence has one shape.
+pub fn supply_digest(supplied: Option<&[u8]>, note: Option<&[u8]>) -> String {
+    let standard = base64::engine::general_purpose::STANDARD;
+    let member = |bytes: Option<&[u8]>| match bytes {
+        Some(bytes) => format!("\"{}\"", standard.encode(bytes)),
+        None => "null".to_string(),
+    };
+    let canonical = format!("{{\"note\":{},\"supplied\":{}}}", member(note), member(supplied));
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// Why an approval does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalRefused {
+    /// Which part does not hold: the time, the sentence, the signature or
+    /// the key.
+    Invalid(String),
+    /// The chain gave no answer about the key.
+    Unavailable(String),
+}
+
+/// Does `approval` approve the task `id` of `owner`, whose envelope hashes to
+/// `hash`, with `supplied` and `note` as the run was handed them, at `now`?
+/// The signature must verify over the rebuilt sentence, be dated no more
+/// than [`APPROVAL_AHEAD_SECS`] ahead of `now` and no more than
+/// [`APPROVAL_AGE_SECS`] before it, and before `expires_at`; and the key that
+/// signed must be a full-access key of the owner's account on chain.
+#[allow(clippy::too_many_arguments)]
+pub fn approval_holds(
+    approval: &Approval,
+    owner: &str,
+    id: &str,
+    hash: &str,
+    supplied: Option<&[u8]>,
+    note: Option<&[u8]>,
+    now: i64,
+    expires_at: u64,
+    recipient: &str,
+    chain: &dyn Chain,
+) -> Result<(), ApprovalRefused> {
+    let invalid = |why: &str| Err(ApprovalRefused::Invalid(why.to_string()));
+    let Ok(at) = i64::try_from(approval.at) else {
+        return invalid("the approval's time is not a time");
+    };
+    if at > now + APPROVAL_AHEAD_SECS {
+        return invalid("the approval is dated ahead");
+    }
+    if at < now - APPROVAL_AGE_SECS {
+        return invalid("the approval is older than thirty minutes");
+    }
+    if approval.at >= expires_at {
+        return invalid("the approval is dated past the task's life");
+    }
+    let Some(message) = approval_sentence(owner, id, hash, &supply_digest(supplied, note), at) else {
+        return invalid("the approval's time is not a time");
+    };
+    verify_nep413(&message, &approval.public_key, &approval.signature, &approval.nonce, recipient)
+        .map_err(|why| ApprovalRefused::Invalid(format!("the approval {why}")))?;
+    match chain.access_key(owner, &approval.public_key).map_err(|down| ApprovalRefused::Unavailable(down.0))? {
+        OnChain::ItsKey => Ok(()),
+        OnChain::NotItsKey => invalid("the key that signed the approval is not a full-access key of the owner's account"),
+    }
 }
 
 /// What the chain says of a key and an account.
@@ -374,6 +503,126 @@ pub(crate) mod tests {
         p256::SecretKey::random(&mut rand::rngs::OsRng)
     }
 
+    /// An approval as the owner's wallet signs it: the sentence of `id`,
+    /// `hash` and the digest of `supplied` and `note`, at `at`, by `wallet`.
+    pub(crate) fn approved(
+        owner: &str,
+        id: &str,
+        hash: &str,
+        supplied: Option<&[u8]>,
+        note: Option<&[u8]>,
+        at: i64,
+        wallet: &ed25519_dalek::SigningKey,
+        recipient: &str,
+    ) -> Approval {
+        use ed25519_dalek::Signer;
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let payload = Nep413Payload {
+            message: approval_sentence(owner, id, hash, &supply_digest(supplied, note), at).unwrap(),
+            nonce,
+            recipient: recipient.to_string(),
+            callback_url: None,
+        };
+        let signed = Sha256::digest([&NEP413_TAG.to_le_bytes()[..], &borsh::to_vec(&payload).unwrap()].concat());
+        let standard = base64::engine::general_purpose::STANDARD;
+        Approval {
+            at: at as u64,
+            public_key: near_key(wallet),
+            signature: standard.encode(wallet.sign(&signed).to_bytes()),
+            nonce: standard.encode(nonce),
+        }
+    }
+
+    const TASK: &str = "0b9c1a52-7c1e-4a53-9c58-2f0c8f6f3b11-0";
+    const HASH: &str = "ab";
+
+    #[test]
+    fn the_approval_sentence_names_the_task_the_hash_and_the_supply_at_the_minute() {
+        let hash = HASH.repeat(32);
+        let digest = supply_digest(None, None);
+        assert_eq!(
+            approval_sentence("alice.near", TASK, &hash, &digest, 1_793_275_200).unwrap(),
+            format!("Approve in OutLayer as alice.near: task {TASK} with hash {hash} and supply {digest}. At 2026-10-29T12:00:00Z.")
+        );
+        assert!(approval_sentence("alice.near", TASK, &hash, &digest, -1).is_none());
+    }
+
+    /// The digest is of one canonical document, shared with the coordinator
+    /// and the page: these vectors are theirs too.
+    #[test]
+    fn the_supply_digest_is_of_the_canonical_document() {
+        let empty = hex::encode(Sha256::digest(br#"{"note":null,"supplied":null}"#));
+        assert_eq!(supply_digest(None, None), empty);
+        // `supplied` and `note` are the SEALED bytes as sent, base64.
+        assert_eq!(
+            supply_digest(Some(b"abc"), None),
+            hex::encode(Sha256::digest(br#"{"note":null,"supplied":"YWJj"}"#))
+        );
+        assert_eq!(
+            supply_digest(Some(b"abc"), Some(b"hi")),
+            hex::encode(Sha256::digest(br#"{"note":"aGk=","supplied":"YWJj"}"#))
+        );
+        assert_eq!(supply_digest(None, Some(b"hi")), hex::encode(Sha256::digest(br#"{"note":"aGk=","supplied":null}"#)));
+        assert_ne!(supply_digest(Some(b"abc"), None), supply_digest(None, Some(b"abc")), "a note is not a supply");
+    }
+
+    #[test]
+    fn an_approval_the_owners_wallet_signed_holds_and_one_changed_in_any_part_does_not() {
+        let hash = HASH.repeat(32);
+        let chain = FakeChain::holding(&[("owner.testnet", &near_key(&wallet(1)))]);
+        let good = approved("owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, &wallet(1), RECIPIENT);
+        let holds = |approval: &Approval, owner: &str, id: &str, hash: &str, supplied: Option<&[u8]>, note: Option<&[u8]>, now: i64, expires: u64, recipient: &str| {
+            approval_holds(approval, owner, id, hash, supplied, note, now, expires, recipient, &chain)
+        };
+        let expires = (NOW + 3600) as u64;
+        assert_eq!(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), Ok(()));
+        assert_eq!(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW + APPROVAL_AGE_SECS, expires, RECIPIENT), Ok(()));
+        assert_eq!(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW - APPROVAL_AHEAD_SECS, expires, RECIPIENT), Ok(()));
+
+        let invalid = |r: Result<(), ApprovalRefused>, said: &str| match r {
+            Err(ApprovalRefused::Invalid(why)) => assert!(why.contains(said), "{why}"),
+            other => panic!("{said}: {other:?}"),
+        };
+        invalid(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW + APPROVAL_AGE_SECS + 1, expires, RECIPIENT), "older than thirty minutes");
+        invalid(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW - APPROVAL_AHEAD_SECS - 1, expires, RECIPIENT), "dated ahead");
+        invalid(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, NOW as u64, RECIPIENT), "past the task's life");
+        invalid(holds(&good, "other.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "does not verify");
+        invalid(holds(&good, "owner.testnet", "run-x-0", &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "does not verify");
+        invalid(holds(&good, "owner.testnet", TASK, &"cd".repeat(32), Some(b"sealed"), None, NOW, expires, RECIPIENT), "does not verify");
+        invalid(holds(&good, "owner.testnet", TASK, &hash, Some(b"other"), None, NOW, expires, RECIPIENT), "does not verify");
+        invalid(holds(&good, "owner.testnet", TASK, &hash, None, None, NOW, expires, RECIPIENT), "does not verify");
+        invalid(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), Some(b"note"), NOW, expires, RECIPIENT), "does not verify");
+        invalid(holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, "other.testnet"), "does not verify");
+        invalid(holds(&Approval { at: NOW as u64 + 1, ..good.clone() }, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "does not verify");
+        invalid(holds(&Approval { signature: "AAAA".into(), ..good.clone() }, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "64 bytes");
+        invalid(holds(&Approval { nonce: "AAAA".into(), ..good.clone() }, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "32 bytes");
+        invalid(holds(&Approval { public_key: near_key(&wallet(2)), ..good.clone() }, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "does not verify");
+
+        // Signed, correctly, by a key that is not the owner's.
+        let forged = approved("owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, &wallet(9), RECIPIENT);
+        invalid(holds(&forged, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "not a full-access key");
+        // A key that may only call functions.
+        let limited = Saying(serde_json::json!({"result": {"nonce": 5, "block_height": 1, "permission": {"FunctionCall": {
+            "allowance": null, "receiver_id": "app.near", "method_names": []}}}}));
+        assert!(matches!(
+            approval_holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT, &limited),
+            Err(ApprovalRefused::Invalid(why)) if why.contains("not a full-access key")
+        ));
+        // A chain that gives no answer is no answer, not a refusal of the owner.
+        let mut down = FakeChain::holding(&[("owner.testnet", &near_key(&wallet(1)))]);
+        down.down = true;
+        assert!(matches!(
+            approval_holds(&good, "owner.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT, &down),
+            Err(ApprovalRefused::Unavailable(_))
+        ));
+        assert_eq!(down.asked.load(std::sync::atomic::Ordering::SeqCst), 1, "the chain is asked after the signature holds");
+        // And it is not asked of a signature that does not hold.
+        let before = chain.asked.load(std::sync::atomic::Ordering::SeqCst);
+        invalid(holds(&forged, "other.testnet", TASK, &hash, Some(b"sealed"), None, NOW, expires, RECIPIENT), "does not verify");
+        assert_eq!(chain.asked.load(std::sync::atomic::Ordering::SeqCst), before);
+    }
+
     #[test]
     fn the_sentence_is_the_coordinators() {
         assert_eq!(
@@ -396,6 +645,42 @@ pub(crate) mod tests {
     /// Signed by the page's side (`tests/lib/tasks_page.mjs`, `signStatement`)
     /// on WebCrypto: the wallet key of seed `01 … 01`, the device of the
     /// golden vectors, the nonce `03 … 03`.
+    /// The approval `tests/lib/tasks_page.test.mjs` signs on WebCrypto with
+    /// the wallet key of seed 01 01 … 01 and the nonce 03 03 … 03, printed by
+    /// `TASKS_PRINT=1`: the page's side and the host's agree on the sentence,
+    /// the digest and what NEP-413 signs.
+    #[test]
+    fn the_approval_the_page_signs_holds() {
+        let message = approval_sentence(
+            "owner.testnet",
+            "0b9c1a52-7c1e-4a53-9c58-2f0c8f6f3b11-0",
+            &"ab".repeat(32),
+            &supply_digest(None, None),
+            1_793_275_200,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_nep413(
+                &message,
+                "ed25519:AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9",
+                "WgV89Ht8S2OKYpg7iEDDLyVpUEDrutueFVcoNQF4iNKTPWC1ySUBm7ROZJfdoovasxCsRysmjJo8P8xK8O+oCA==",
+                "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+                "outlayer.testnet",
+            ),
+            Ok(())
+        );
+        // The same signature over any other sentence does not hold.
+        let other = approval_sentence("owner.testnet", "0b9c1a52-7c1e-4a53-9c58-2f0c8f6f3b11-0", &"ab".repeat(32), &supply_digest(None, None), 1_793_275_201).unwrap();
+        assert!(verify_nep413(
+            &other,
+            "ed25519:AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9",
+            "WgV89Ht8S2OKYpg7iEDDLyVpUEDrutueFVcoNQF4iNKTPWC1ySUBm7ROZJfdoovasxCsRysmjJo8P8xK8O+oCA==",
+            "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "outlayer.testnet",
+        )
+        .is_err());
+    }
+
     #[test]
     fn the_statement_the_page_signs_holds() {
         let statement: DeviceStatement = serde_json::from_value(serde_json::json!({
