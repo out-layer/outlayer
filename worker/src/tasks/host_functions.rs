@@ -24,6 +24,8 @@
 //! Nothing of what a task shows, no key and no statement is logged: ids,
 //! kinds, counts and reasons only.
 
+use std::collections::BTreeMap;
+
 use base64::Engine;
 use wasmtime::component::Linker;
 
@@ -87,17 +89,46 @@ pub struct TasksHostState {
     /// The owner's devices in force, read and checked once per run: held
     /// from the read that answered, by whatever call made it.
     devices: Option<Vec<Device>>,
-    /// The conversation a task opened in this run continues: that of the
-    /// first task this run answered.
-    thread: Option<Thread>,
+    /// The conversation a task opened in this run continues, as the tasks
+    /// this run answered say.
+    conversation: Conversation,
+    /// The preparer of each task this run opened, by its id: `status`,
+    /// `cancel` and `delete` of such a task ask for it as that preparer's.
+    opened_as: BTreeMap<String, String>,
 }
 
 /// A conversation a run continues, as the task it answered sealed it: its
 /// id and the account it is with.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Thread {
     id: String,
     preparer: String,
+}
+
+/// What the tasks a run answered make of a task it opens.
+#[derive(Debug, Clone, Default)]
+enum Conversation {
+    /// The run answered no task: a task it opens is its caller's, in a
+    /// conversation of its own.
+    #[default]
+    Unanswered,
+    /// Every task the run answered is of this conversation: a task it opens
+    /// is the next turn of it.
+    One(Thread),
+    /// The run answered tasks of more than one conversation: a task it opens
+    /// belongs to none, and is refused.
+    Several,
+}
+
+impl Conversation {
+    /// The run answered a task of `thread`.
+    fn answered(&mut self, thread: Thread) {
+        *self = match std::mem::take(self) {
+            Conversation::Unanswered => Conversation::One(thread),
+            Conversation::One(held) if held == thread => Conversation::One(held),
+            Conversation::One(_) | Conversation::Several => Conversation::Several,
+        };
+    }
 }
 
 impl TasksHostState {
@@ -111,7 +142,14 @@ impl TasksHostState {
                 "this component's manifest does not declare tasks: add \"tasks\": true".to_string(),
             ),
         };
-        Self { access, calls: 0, opened: 0, devices: None, thread: None }
+        Self {
+            access,
+            calls: 0,
+            opened: 0,
+            devices: None,
+            conversation: Conversation::Unanswered,
+            opened_as: BTreeMap::new(),
+        }
     }
 
     fn access_of(run: TasksRun) -> Access {
@@ -201,6 +239,11 @@ impl TasksHostState {
     fn enter(&mut self) -> Result<&Ready, wit::TaskError> {
         self.count()?;
         self.access.ready()
+    }
+
+    /// The preparer this run opened the task `id` as, when it opened it.
+    fn opened_as(&self, id: &str) -> Option<String> {
+        self.opened_as.get(id).cloned()
     }
 }
 
@@ -478,7 +521,7 @@ fn display_in(display: wit::Display) -> envelope::Display {
 
 impl wit::Host for TasksHostState {
     fn open(&mut self, request: wit::Request) -> Result<wit::Opened, wit::TaskError> {
-        let (opened, thread) = (self.opened, self.thread.clone());
+        let (opened, conversation) = (self.opened, self.conversation.clone());
         self.count()?;
         let ready = self.access.ready()?;
         if !ready.is_the_owners() && !ready.grant.admitted_by_name {
@@ -494,6 +537,21 @@ impl wit::Host for TasksHostState {
                 format!("this run opened {opened} tasks, as many as one run may"),
             ));
         }
+        let id = format!("{}-{opened}", ready.run);
+        // A task opened in a run that answered one is the next turn of that
+        // task's conversation, with that task's preparer: what makes this
+        // sound, and what it means in the owner's inbox, is in
+        // `docs/TASKS.md`, "Whose task, and who may do what".
+        let (preparer, thread) = match conversation {
+            Conversation::Unanswered => (ready.caller.clone(), id.clone()),
+            Conversation::One(Thread { id: thread, preparer }) => (preparer, thread),
+            Conversation::Several => {
+                return Err(refused(
+                    wit::Reason::Internal,
+                    "this run answered tasks of more than one conversation, so a task it opens belongs to none",
+                ))
+            }
+        };
         if request.state.len() > super::MAX_STATE_BYTES {
             return Err(refused(
                 wit::Reason::TooLarge,
@@ -538,26 +596,6 @@ impl wit::Host for TasksHostState {
 
         let devices = devices_of_the_run(&mut self.devices, ready)?;
 
-        let id = format!("{}-{opened}", ready.run);
-        // A task opened in a run that answered one is the next turn of that
-        // task's conversation, and is with the same account: its preparer is
-        // the answered task's, not this run's caller. The owner's inbox shows
-        // the turn from that agent, the agent's `mine` and `status` list it,
-        // and the store counts it in that agent's share and under its mute.
-        //
-        // This lets an owner's run name another account as a preparer, and
-        // only this way: `answered` takes an answer from the owner's own run
-        // alone, so a thread is held only by one; the thread and its preparer
-        // are the ones sealed in the task answered, which opened under this
-        // project's and this owner's key; and the new task's owner is the
-        // row's owner, that same owner. An owner attributes a task to an
-        // agent only inside a conversation that agent started, in their own
-        // inbox. A run that answered nothing opens as its caller, in a
-        // conversation of its own.
-        let (preparer, thread) = match thread {
-            Some(Thread { id: thread, preparer }) => (preparer, thread),
-            None => (ready.caller.clone(), id.clone()),
-        };
         let keys = ready.keys(&id);
         let now = u64::try_from((ready.now)()).unwrap_or(0);
         let kind = match request.kind {
@@ -647,8 +685,10 @@ impl wit::Host for TasksHostState {
         let files = new.files.len();
         // The number is taken whether the store answered or not: a task whose
         // making was not heard of may have been made, and the next task of
-        // this run is another task under another id.
+        // this run is another task under another id. Its preparer is held
+        // with it for the same reason.
         self.opened = self.opened.saturating_add(1);
+        self.opened_as.insert(id.clone(), new.preparer.clone());
         // The devices that read the task with no run are those whose copy the
         // store wrote, which is not more than were in force when it was asked.
         let written = stored?;
@@ -671,9 +711,11 @@ impl wit::Host for TasksHostState {
     }
 
     fn status(&mut self, id: String) -> Result<wit::Outcome, wit::TaskError> {
+        let opened_as = self.opened_as(&id);
         let ready = self.enter()?;
         an_id(&id)?;
-        let mut tasks = ready.store.mine(&ready.scope, &ready.caller, Some(&id)).map_err(|e| store_failed(&e))?;
+        let preparer = opened_as.as_deref().unwrap_or(&ready.caller);
+        let mut tasks = ready.store.mine(&ready.scope, preparer, Some(&id)).map_err(|e| store_failed(&e))?;
         match (tasks.pop(), tasks.is_empty()) {
             (Some(task), true) if task.id == id => ready.outcome(task, Asked::ThisTask),
             (None, _) => Err(refused(wit::Reason::NotFound, "no such task")),
@@ -791,19 +833,25 @@ impl wit::Host for TasksHostState {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Recorded before the store is asked: an answer the store took and
-        // whose reply was lost is still reported on when the run ends, and
-        // one the store refused is forgotten. The store's report of a task
-        // it did not move to this run does nothing.
+        // Recorded before the store is asked, and forgotten only when the
+        // store refuses by name, which moves nothing. An answer whose reply
+        // did not come may have been taken, and is reported on when the run
+        // ends; the store's report of a task it did not move to this run
+        // changes nothing.
         ready.report.answered(&id);
         if let Err(e) = ready.store.answer(&ready.scope, &id, &ready.run) {
-            ready.report.forget(&id);
+            match &e {
+                StoreError::Refused(..) => ready.report.forget(&id),
+                StoreError::Unavailable(_) => {
+                    tracing::warn!(task = %id, run = %ready.run, "the store did not reply to an answer; the run reports on the task in case it was taken")
+                }
+            }
             return Err(store_failed(&e));
         }
         tracing::info!(task = %id, run = %ready.run, "task answered");
 
-        self.thread
-            .get_or_insert_with(|| Thread { id: task.envelope.thread.clone(), preparer: task.envelope.preparer.clone() });
+        self.conversation
+            .answered(Thread { id: task.envelope.thread.clone(), preparer: task.envelope.preparer.clone() });
         let answer = wit::Answer {
             id,
             thread: task.envelope.thread,
@@ -841,15 +889,19 @@ impl wit::Host for TasksHostState {
     }
 
     fn cancel(&mut self, id: String) -> Result<(), wit::TaskError> {
+        let opened_as = self.opened_as(&id);
         let ready = self.enter()?;
         an_id(&id)?;
-        ready.store.cancel(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
+        let preparer = opened_as.as_deref().unwrap_or(&ready.caller);
+        ready.store.cancel(&ready.scope, preparer, &id).map_err(|e| store_failed(&e))
     }
 
     fn delete(&mut self, id: String) -> Result<(), wit::TaskError> {
+        let opened_as = self.opened_as(&id);
         let ready = self.enter()?;
         an_id(&id)?;
-        ready.store.delete(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
+        let preparer = opened_as.as_deref().unwrap_or(&ready.caller);
+        ready.store.delete(&ready.scope, preparer, &id).map_err(|e| store_failed(&e))
     }
 
     fn unlock(&mut self) -> Result<u32, wit::TaskError> {

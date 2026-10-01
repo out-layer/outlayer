@@ -29,7 +29,7 @@
 #   C6   the same answer again: task_closed
 #   F13  a file: listed, opened by the owner, handed back on the answer
 #   F7   the owner rejects with a reason; the agent reads it as written
-#   F8   a turn: what the owner supplied arrives, and the next task opens
+#   F8   a turn: what the owner supplied arrives, and the next task opens as the agent's
 #   F9   the agent cancels
 #   F12  the owner deletes; the agent finds nothing
 #   C7   the run that acts traps: failed, with the run
@@ -703,8 +703,14 @@ if want F8; then
     [[ "$(said .output.next.status)" == "awaiting_owner" && "$(said .output.next.thread)" == "$FIRST" ]] \
       && pass "F8 the turn opened the next task of the same conversation" \
       || fail "F8 next: $(said .output.next)"
-    in_inbox "$NEXT" && [[ "$(row .read.envelope.thread)" == "$FIRST" && "$(row .preparer)" == "$PARENT" ]] \
-      && pass "F8 the next task waits in the inbox" || fail "F8 the next task in the inbox: $ROW"
+    # A turn keeps the conversation's preparer: the next task is the agent's,
+    # sealed and listed so, though the owner's run opened it.
+    in_inbox "$NEXT" && [[ "$(row .read.envelope.thread)" == "$FIRST" && "$(row .preparer)" == "$AGENT_ACCOUNT" \
+        && "$(row .read.envelope.preparer)" == "$AGENT_ACCOUNT" ]] \
+      && pass "F8 the next task waits in the inbox, from the agent" || fail "F8 the next task in the inbox: $ROW"
+    status_of "$NEXT"
+    [[ "$(said .output.state)" == "open" ]] && pass "F8 the agent's task_status reads the turn open" \
+      || fail "F8 the agent's status of the turn: '$(said .output.state)' error='$(said .error | head -c 200)'"
   else
     fail "F8 prepare: error='$(said .error | head -c 200)'"
   fi

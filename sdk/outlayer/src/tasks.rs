@@ -220,12 +220,13 @@ pub fn input(display: Display, operation: &str, supplies: Supplies, state: &[u8]
     Task::new(TaskKind::Input, display, operation, supplies, state, policy)
 }
 
-/// The tasks this caller made in this project for this owner.
+/// The tasks whose preparer is this caller in this project for this owner;
+/// a turn is the preparer's of its conversation.
 pub fn mine() -> Result<Vec<Outcome>> {
     raw::mine().map_err(TaskError::from)
 }
 
-/// One of them.
+/// One of them, or a task this run opened.
 pub fn status(id: &str) -> Result<Outcome> {
     raw::status(id).map_err(TaskError::from)
 }
@@ -247,12 +248,14 @@ pub fn report(id: &str, result: &[u8]) -> Result<()> {
     raw::report(id, result).map_err(TaskError::from)
 }
 
-/// Withdraw an open task this caller made.
+/// Withdraw an open task whose preparer is this caller, or one this run
+/// opened.
 pub fn cancel(id: &str) -> Result<()> {
     raw::cancel(id).map_err(TaskError::from)
 }
 
-/// Delete a task this caller made, in any state.
+/// Delete a task whose preparer is this caller, or one this run opened, in
+/// any state.
 pub fn delete(id: &str) -> Result<()> {
     raw::delete(id).map_err(TaskError::from)
 }

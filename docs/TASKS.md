@@ -108,13 +108,19 @@ question in the same run; the inbox shows it from that agent, the agent's
 its mute. Only the owner's own run answers, the thread and its preparer are
 sealed in the task answered, and the new task is the same owner's — so an
 owner's run names another account as a preparer only inside a conversation
-that account started, in the owner's own inbox. A run that answered nothing
-opens as its caller, in a conversation of its own.
+that account started, in the owner's own inbox. A turn is opened whatever the
+owner's row says of that agent now: one the row no longer admits is still the
+preparer of a turn in the owner's own inbox, which muting that agent and
+deleting its waiting tasks clears. The run that opened a turn reads, cancels and deletes it with
+`status`, `cancel` and `delete`. A run that answered tasks of more than one
+conversation opens none: `open` is refused `internal`. A run that answered
+nothing — or whose every answer was refused — opens as its caller, in a
+conversation of its own.
 
 | The run is | It may |
 |---|---|
-| the project's, made by an account the owner's row admits **by name** | open a task for that owner; read, cancel and delete the tasks it made; read their outcomes |
-| the project's, made by the owner | open tasks for themselves; answer the tasks of this project addressed to them; open them for a new device |
+| the project's, made by an account the owner's row admits **by name** | open a task for that owner; read, cancel and delete its tasks — those it made and the turns of its conversations; read their outcomes |
+| the project's, made by the owner | open tasks for themselves, or the next turn of the conversation a task the run answered belongs to; read, cancel and delete a turn the run opened; answer the tasks of this project addressed to them; open them for a new device |
 | the project's, admitted by a row open to everyone, to a pattern, or to holders of a token or a role | run; `open` is refused `not-granted-by-name` |
 | the project's, made by another agent of the same owner | nothing of the first agent's tasks |
 | another project's | nothing of this project's tasks |
@@ -393,8 +399,8 @@ is `ok([])`.
 | Function | Who | Does |
 |---|---|---|
 | `open(request)` | preparer | makes the task |
-| `mine()`, `status(id)` | preparer | its tasks, or one of them |
-| `cancel(id)`, `delete(id)` | preparer | withdraws, deletes |
+| `mine()`, `status(id)` | preparer | its tasks — a turn is the preparer's of its conversation — or one of them; `status` also reads a task this run opened |
+| `cancel(id)`, `delete(id)` | preparer; or the run that opened the task | withdraws, deletes |
 | `answered(id, hash, operation, policy, supplied)` | owner | takes the answer; hands back `state` |
 | `report(id, result)` | owner | leaves the result for the preparer |
 | `unlock()` | owner | writes the copies for the devices now in force |
@@ -420,7 +426,7 @@ is `ok([])`.
 | `void` | `task_void` | the policy changed, or another build than the one that made the task answers it |
 | `unreadable` | `task_unreadable` | a sealed copy that does not open. The message is `decryption failed` |
 | `unavailable` | `task_store_unavailable` | the store or the chain did not answer. The one a caller repeats later |
-| `internal` | `task_internal_error` | a fault of the platform's own, which a repeat does not mend. Where a task's id is named, an earlier run of the same call took it: the task is among the caller's |
+| `internal` | `task_internal_error` | a fault of the platform's own, which a repeat does not mend. Where a task's id is named, an earlier run of the same call took it: the task is among the caller's. Also `open` in a run that answered tasks of more than one conversation |
 
 ## Tests
 

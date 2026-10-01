@@ -23,8 +23,10 @@ package outlayer:tasks@0.1.0;
 /// - `open`: a run admitted to the owner's row BY NAME — the row's condition
 ///   lists the caller — or the owner's own run. A row open to everyone, to a
 ///   pattern or to holders of a token admits the run and refuses the task.
-/// - `mine`, `status`, `cancel`, `delete`: the tasks THIS caller made in this
-///   project for this owner, and no others.
+/// - `mine`, `status`, `cancel`, `delete`: the tasks whose preparer is this
+///   caller (a turn is the preparer's of its conversation) in this project
+///   for this owner, and no others; `status`, `cancel` and `delete` also
+///   reach a task this run opened.
 /// - `answered`, `report`, `unlock`: the owner's own run.
 ///
 /// A run of another project reaches nothing of this project's tasks: they are
@@ -265,6 +267,8 @@ interface api {
         /// A fault of the platform's own: the host or the store could not do
         /// what was asked, and the same call will not do better. The task's
         /// id, where one is named, was taken by an earlier run of this call.
+        /// Also `open` in a run that answered tasks of more than one
+        /// conversation: a task it opens belongs to none.
         internal,
     }
 
@@ -276,11 +280,11 @@ interface api {
     /// Open a task for the owner of the secret row this run was admitted to.
     open: func(request: request) -> result<opened, task-error>;
 
-    /// The tasks this caller made in this project for this owner: the open
-    /// ones, and the outcomes kept.
+    /// The tasks whose preparer is this caller in this project for this
+    /// owner: the open ones, and the outcomes kept.
     mine: func() -> result<list<outcome>, task-error>;
 
-    /// One of them.
+    /// One of them, or a task this run opened.
     status: func(id: string) -> result<outcome, task-error>;
 
     /// Take the owner's answer to the task `id`, whose envelope hashes to
@@ -297,10 +301,12 @@ interface api {
     /// success; a task this run answered and did not report on is `failed`.
     report: func(id: string, %result: list<u8>) -> result<_, task-error>;
 
-    /// Withdraw an open task this caller made.
+    /// Withdraw an open task whose preparer is this caller, or one this run
+    /// opened.
     cancel: func(id: string) -> result<_, task-error>;
 
-    /// Delete a task this caller made, in any state.
+    /// Delete a task whose preparer is this caller, or one this run opened,
+    /// in any state.
     delete: func(id: string) -> result<_, task-error>;
 
     /// Write the copies of this project's open tasks for every device the

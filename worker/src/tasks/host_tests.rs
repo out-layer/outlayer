@@ -50,6 +50,18 @@ struct Mem {
     most_copies: Mutex<Option<usize>>,
     /// Every request is refused as one the store could not read.
     reads_nothing: AtomicBool,
+    /// What becomes of the next `answer`, when not what the store does.
+    answer_fault: Mutex<Option<AnswerFault>>,
+}
+
+/// An `answer` that does not go as the store's own.
+#[derive(Debug, Clone, Copy)]
+enum AnswerFault {
+    /// The store moves the task to the run, and its reply is lost.
+    ReplyLost,
+    /// The store refuses by name and moves nothing: another run took the
+    /// task between its reading and its answer.
+    Refused,
 }
 
 impl Mem {
@@ -230,6 +242,10 @@ impl Store for Shared {
 
     fn answer(&self, scope: &Scope, id: &str, run: &str) -> Result<(), StoreError> {
         self.0.up()?;
+        let fault = self.0.answer_fault.lock().unwrap().take();
+        if let Some(AnswerFault::Refused) = fault {
+            return Err(StoreError::Refused(Refusal::Closed, Some(State::Answering)));
+        }
         let mut rows = self.0.rows.lock().unwrap();
         let row = rows.get_mut(id).filter(|r| &r.scope == scope).ok_or(StoreError::Refused(Refusal::NotFound, None))?;
         if row.state != State::Open {
@@ -237,7 +253,10 @@ impl Store for Shared {
         }
         Mem::close(row, State::Answering);
         row.run = Some(run.to_string());
-        Ok(())
+        match fault {
+            Some(AnswerFault::ReplyLost) => Err(StoreError::Unavailable("the task store did not answer".to_string())),
+            Some(AnswerFault::Refused) | None => Ok(()),
+        }
     }
 
     fn void(&self, scope: &Scope, id: &str) -> Result<(), StoreError> {
@@ -348,8 +367,7 @@ impl World {
             report: report.clone(),
             now: Box::new(move || clock.load(Ordering::SeqCst)),
         };
-        let state =
-            TasksHostState { access: Access::Ready(Box::new(ready)), calls: 0, opened: 0, devices: None, thread: None };
+        let state = TasksHostState { access: Access::Ready(Box::new(ready)), ..TasksHostState::new(None) };
         (state, report)
     }
 
@@ -583,6 +601,121 @@ fn a_run_that_answered_nothing_opens_as_its_caller_in_a_conversation_of_its_own(
     let after = late.open(email()).unwrap();
     assert_eq!(world.page_reads(&before.id).0.preparer, OWNER);
     assert_eq!((after.thread.as_str(), world.page_reads(&after.id).0.preparer.as_str()), (first.id.as_str(), AGENT));
+}
+
+/// The owner's run confirms `task` with the hash it was opened with.
+fn confirm(run: &mut TasksHostState, task: &wit::Opened) -> Result<wit::Answer, wit::TaskError> {
+    run.answered(task.id.clone(), task.hash.clone(), "confirm".to_string(), POLICY.to_vec(), None)
+}
+
+/// What a run that answered of a task, and was refused, does next.
+type Refused = fn(&World, &wit::Opened) -> (TasksHostState, Result<wit::Answer, wit::TaskError>);
+
+#[test]
+fn an_answer_that_was_refused_starts_no_conversation() {
+    let cases: Vec<(&str, wit::Reason, Refused)> = vec![
+        ("a policy that changed", wit::Reason::Void, |world, task| {
+            let (mut run, _) = world.owner("run-o");
+            let changed = br#"{"confirm":[]}"#.to_vec();
+            let answered = run.answered(task.id.clone(), task.hash.clone(), "confirm".to_string(), changed, None);
+            (run, answered)
+        }),
+        ("another build", wit::Reason::Void, |world, task| {
+            let (mut run, _) = world.owner_of_another_build("run-o");
+            let answered = confirm(&mut run, task);
+            (run, answered)
+        }),
+        ("a task past its life", wit::Reason::Expired, |world, task| {
+            world.clock.store(NOW + 3601, Ordering::SeqCst);
+            let (mut run, _) = world.owner("run-o");
+            let answered = confirm(&mut run, task);
+            (run, answered)
+        }),
+        ("a task the agent withdrew", wit::Reason::Closed, |world, task| {
+            world.agent("run-b").cancel(task.id.clone()).unwrap();
+            let (mut run, _) = world.owner("run-o");
+            let answered = confirm(&mut run, task);
+            (run, answered)
+        }),
+        ("another project", wit::Reason::NotFound, |world, task| {
+            let other = "p0000000000000002";
+            let mut run = world
+                .host(Run { caller: OWNER, owner: OWNER, project_uuid: other, by_name: false, id: "run-o", build: BUILD, vault: None, operation: None })
+                .0;
+            let answered = confirm(&mut run, task);
+            (run, answered)
+        }),
+        ("a store that refused the answer", wit::Reason::Closed, |world, task| {
+            *world.store.answer_fault.lock().unwrap() = Some(AnswerFault::Refused);
+            let (mut run, _) = world.owner("run-o");
+            let answered = confirm(&mut run, task);
+            (run, answered)
+        }),
+        ("a store whose reply was lost", wit::Reason::Unavailable, |world, task| {
+            *world.store.answer_fault.lock().unwrap() = Some(AnswerFault::ReplyLost);
+            let (mut run, _) = world.owner("run-o");
+            let answered = confirm(&mut run, task);
+            (run, answered)
+        }),
+    ];
+    for (case, expected, refused) in cases {
+        let world = World::new();
+        let task = world.agent("run-a").open(email()).unwrap();
+        let (mut run, answered) = refused(&world, &task);
+        assert_eq!(reason(answered), expected, "{case}");
+        let own = run.open(email()).unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        assert_eq!(own.thread, own.id, "{case}: a conversation of its own");
+        assert_eq!(world.page_reads(&own.id).0.preparer, OWNER, "{case}: sealed as the caller's");
+        assert_eq!(world.store.row(&own.id).task.preparer, OWNER, "{case}: recorded as the caller's");
+    }
+}
+
+#[test]
+fn a_run_that_answered_two_conversations_opens_no_turn() {
+    let world = World::new();
+    let first = world.agent("run-a").open(email()).unwrap();
+    let second = world.agent("run-b").open(email()).unwrap();
+    let (mut owner, _) = world.owner("run-o");
+    confirm(&mut owner, &first).unwrap();
+    assert_eq!(owner.open(email()).unwrap().thread, first.id, "one conversation answered: its turn");
+    confirm(&mut owner, &second).unwrap();
+    let made = world.store.rows.lock().unwrap().len();
+    let refused = owner.open(email()).expect_err("refused");
+    assert_eq!(refused.reason, wit::Reason::Internal);
+    assert_eq!(refused.message, "this run answered tasks of more than one conversation, so a task it opens belongs to none");
+    assert_eq!(world.store.rows.lock().unwrap().len(), made, "no task is made");
+
+    // Two tasks of one conversation are one conversation.
+    let start = world.agent("run-c").open(email()).unwrap();
+    let (mut middle, _) = world.owner("run-p");
+    confirm(&mut middle, &start).unwrap();
+    let (one, two) = (middle.open(email()).unwrap(), middle.open(email()).unwrap());
+    let (mut last, _) = world.owner("run-q");
+    confirm(&mut last, &one).unwrap();
+    confirm(&mut last, &two).unwrap();
+    let next = last.open(email()).unwrap();
+    assert_eq!((next.thread.as_str(), world.page_reads(&next.id).0.preparer.as_str()), (start.id.as_str(), AGENT));
+}
+
+#[test]
+fn the_owners_run_reads_withdraws_and_deletes_the_turns_it_opened() {
+    let world = World::new();
+    let first = world.agent("run-a").open(email()).unwrap();
+    let (mut owner, _) = world.owner("run-o");
+    confirm(&mut owner, &first).unwrap();
+    let turn = owner.open(email()).unwrap();
+    assert_eq!(world.store.row(&turn.id).task.preparer, AGENT);
+    assert_eq!(owner.status(turn.id.clone()).unwrap().state, wit::TaskState::Open);
+    owner.cancel(turn.id.clone()).unwrap();
+    assert_eq!(owner.status(turn.id.clone()).unwrap().state, wit::TaskState::Cancelled);
+    assert_eq!(world.agent("run-b").status(turn.id.clone()).unwrap().state, wit::TaskState::Cancelled);
+
+    let other = owner.open(email()).unwrap();
+    owner.delete(other.id.clone()).unwrap();
+    assert_eq!(reason(owner.status(other.id)), wit::Reason::NotFound);
+
+    // Another run of the owner's opened none of them: a turn is the agent's.
+    assert_eq!(reason(world.owner("run-p").0.status(turn.id)), wit::Reason::NotFound);
 }
 
 #[test]
@@ -1103,20 +1236,35 @@ fn an_answer_names_the_operation_the_call_runs_and_the_row_the_task_was_made_for
     assert_eq!(world.store.row(&other.id).state, State::Open);
 }
 
-/// An answer the store took is reported on even when its reply was lost,
-/// and one the store refused is not.
+/// An answer the store took is reported on even when its reply was lost, so
+/// the run's end closes it; one the store refused by name is not.
 #[test]
-fn an_answer_is_reported_when_the_store_took_it_and_not_when_it_refused() {
+fn an_answer_is_reported_when_the_store_took_it_even_with_its_reply_lost_and_not_when_it_refused() {
     let world = World::new();
-    let opened = world.agent("run-a").open(email()).unwrap();
+
+    // The store refuses by name and moves nothing: the task is not among
+    // the run's answers, and the next answer takes it.
+    let refused = world.agent("run-a").open(email()).unwrap();
     let (mut owner, report) = world.owner("run-o");
-    // The store refuses: the task is not among the run's answers.
-    world.store.down.store(true, Ordering::SeqCst);
-    assert_eq!(reason(owner.answered(opened.id.clone(), opened.hash.clone(), "confirm".to_string(), POLICY.to_vec(), None)), wit::Reason::Unavailable);
-    assert!(report.tasks().is_empty());
-    world.store.down.store(false, Ordering::SeqCst);
-    assert!(owner.answered(opened.id.clone(), opened.hash.clone(), "confirm".to_string(), POLICY.to_vec(), None).is_ok());
+    *world.store.answer_fault.lock().unwrap() = Some(AnswerFault::Refused);
+    assert_eq!(reason(confirm(&mut owner, &refused)), wit::Reason::Closed);
+    assert_eq!(report.tasks().len(), 0);
+    assert_eq!(world.store.row(&refused.id).state, State::Open);
+    assert!(confirm(&mut owner, &refused).is_ok());
     assert_eq!(report.tasks().len(), 1);
+
+    // The store moves the task to the run and its reply is lost: the run is
+    // told the store did not answer, and reports on the task all the same.
+    let lost = world.agent("run-b").open(email()).unwrap();
+    let (mut owner, report) = world.owner("run-p");
+    *world.store.answer_fault.lock().unwrap() = Some(AnswerFault::ReplyLost);
+    assert_eq!(reason(confirm(&mut owner, &lost)), wit::Reason::Unavailable);
+    assert_eq!(report.tasks().len(), 1);
+    let row = world.store.row(&lost.id);
+    assert_eq!((row.state, row.run.as_deref()), (State::Answering, Some("run-p")));
+    // The run's end closes it, rather than the sweep half an hour later.
+    world.store.finish("run-p", true, &report.tasks());
+    assert_eq!(world.agent("run-c").status(lost.id).unwrap().state, wit::TaskState::Failed);
 }
 
 /// A run whose chain is a node that says `answer` of every key.

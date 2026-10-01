@@ -196,8 +196,9 @@ pub struct TasksRun {
     /// task is answered in the operation it names, and this is the host's
     /// word for which one is running.
     pub operation: Option<String>,
-    /// The account that made the run: the signer on chain, the sender over
-    /// HTTPS.
+    /// The account that made the run: the signer on chain — for a
+    /// meta-transaction, the sender of the delegate action, not the relayer
+    /// that signed the transaction — and the sender over HTTPS.
     pub caller: Option<String>,
     /// The account that called OutLayer: the receipt's predecessor on chain,
     /// the sender over HTTPS. A run uses tasks only when this is the caller:
