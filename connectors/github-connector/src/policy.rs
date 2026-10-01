@@ -19,7 +19,7 @@
 //! module's job, and four refusals have no other guard at all: a public gist, a
 //! write under `.github/`, a merge, and an approval.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const POLICY_ENV: &str = "GITHUB_POLICY";
@@ -35,7 +35,9 @@ pub const DEFAULT_MARKER: &str = "\n\n— posted by an AI agent via OutLayer";
 /// binary file is a request of its own, and a run has a fixed time to live.
 pub const MAX_FILES_PER_COMMIT: usize = 50;
 
-#[derive(Debug, Deserialize)]
+/// Serialised, it is what `status` reports: every member, under the name the
+/// policy spells it with.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     /// Operations the agent may run, by name, or `["any"]`. Absent: none.
@@ -63,12 +65,85 @@ pub struct Policy {
     pub allow_public_gists: Option<bool>,
     /// Replaces [`DEFAULT_MARKER`]; an empty string posts without one.
     pub marker: Option<String>,
+    /// The writes that need the owner: one listed here is checked and
+    /// prepared, and left as a task; the owner's own call of `confirm` carries
+    /// it out. Absent or empty: none. Reported by `status` as the policy holds
+    /// it, `null` when the policy has none, so that a reader can tell a policy
+    /// without it from a report that does not know the member.
+    pub confirm: Option<Vec<Confirmable>>,
+}
+
+/// A write the owner may ask to confirm: every write operation of this
+/// connector, spelled as the operation is. A name that is not one — a read, a
+/// misspelling, another case — does not parse, and a policy that does not
+/// parse refuses everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confirmable {
+    BranchCreate,
+    FilePut,
+    Commit,
+    IssueCreate,
+    IssueComment,
+    IssueUpdate,
+    PrCreate,
+    PrReview,
+    PrMerge,
+    GistCreate,
+    GistUpdate,
+    RepoStar,
+    RepoUnstar,
+}
+
+impl Confirmable {
+    /// Every one, in the order the manifest lists the operations.
+    #[cfg(test)]
+    pub const ALL: [Confirmable; 13] = [
+        Self::BranchCreate,
+        Self::FilePut,
+        Self::Commit,
+        Self::IssueCreate,
+        Self::IssueComment,
+        Self::IssueUpdate,
+        Self::PrCreate,
+        Self::PrReview,
+        Self::PrMerge,
+        Self::GistCreate,
+        Self::GistUpdate,
+        Self::RepoStar,
+        Self::RepoUnstar,
+    ];
+
+    /// The operation's name: what the policy's `actions` and `confirm` say.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BranchCreate => "branch_create",
+            Self::FilePut => "file_put",
+            Self::Commit => "commit",
+            Self::IssueCreate => "issue_create",
+            Self::IssueComment => "issue_comment",
+            Self::IssueUpdate => "issue_update",
+            Self::PrCreate => "pr_create",
+            Self::PrReview => "pr_review",
+            Self::PrMerge => "pr_merge",
+            Self::GistCreate => "gist_create",
+            Self::GistUpdate => "gist_update",
+            Self::RepoStar => "repo_star",
+            Self::RepoUnstar => "repo_unstar",
+        }
+    }
 }
 
 pub enum Loaded {
     None,
     Unreadable(String),
     Some(Policy),
+}
+
+/// The policy as it is stored, byte for byte: what a task is made under, and
+/// what an answer to it is judged against. Empty when there is none.
+pub fn stored() -> Vec<u8> {
+    std::env::var(POLICY_ENV).unwrap_or_default().into_bytes()
 }
 
 pub fn load() -> Loaded {
@@ -87,7 +162,12 @@ pub fn load() -> Loaded {
 pub const OWNER_PAGE: &str = "https://app.outlayer.ai/connect/github";
 
 pub fn require() -> Result<Policy, String> {
-    match load() {
+    required(load())
+}
+
+/// [`require`], of a policy already loaded.
+pub fn required(loaded: Loaded) -> Result<Policy, String> {
+    match loaded {
         Loaded::Some(p) => Ok(p),
         Loaded::None => Err(format!(
             "policy_missing: the owner has stored no policy, and without one only `status` runs. \
@@ -132,6 +212,11 @@ fn is_any(list: &[String]) -> bool {
 }
 
 impl Policy {
+    /// Does `operation` need the owner?
+    pub fn confirms(&self, operation: Confirmable) -> bool {
+        self.confirm.as_ref().is_some_and(|listed| listed.contains(&operation))
+    }
+
     pub fn check_action(&self, operation: &str) -> Result<(), String> {
         let allowed = self.actions.as_deref().unwrap_or(&[]);
         if is_any(allowed) || allowed.iter().any(|a| a.trim() == operation) {
@@ -229,15 +314,20 @@ impl Policy {
         format!("{}{}", text.trim_end(), marker)
     }
 
-    /// A place in today's write budget, or the refusal.
-    pub fn reserve_write(&self) -> Result<(Reservation, u32), String> {
-        let cap = self.max_writes_per_day.ok_or_else(|| {
+    /// The owner's daily cap on writes, or the refusal: a policy that sets
+    /// none allows no write.
+    pub fn write_cap(&self) -> Result<u32, String> {
+        self.max_writes_per_day.ok_or_else(|| {
             format!(
                 "policy_denied: the owner's policy sets no `max_writes_per_day`, and without it \
                  nothing is written. The owner sets it at {OWNER_PAGE}"
             )
-        })?;
-        reserve(&day_key(now_ms()), cap)
+        })
+    }
+
+    /// A place in today's write budget of `counted`, or the refusal.
+    pub fn reserve_write(&self, counted: Counted) -> Result<(Reservation, u32), String> {
+        reserve(&day_key(now_ms()), counted, self.write_cap()?)
     }
 }
 
@@ -336,12 +426,30 @@ pub fn day_key(ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Whose count a write is taken from.
+///
+/// Every count is a record in the storage cell of the account that makes the
+/// run, sealed under that account's key: a run reads and writes its own cell
+/// and no other, so a count is kept where the run that writes can write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counted<'a> {
+    /// A write the caller makes itself: one count a day, in the caller's cell.
+    Own,
+    /// A write the owner confirmed, prepared by this account: one count a day
+    /// for each preparer, in the OWNER's cell. It is not the count of the
+    /// preparer's own writes, which lives in the preparer's cell.
+    ConfirmedFor(&'a str),
+}
+
 /// The day's count, touched only through `store::increment` — atomic
 /// (compare-and-set on the sealed record, with retries). Never read and then
 /// written back: two calls of one agent can run at once, and a read-then-write
 /// lets both see room for one more write.
-fn key(day: &str) -> String {
-    format!("gh:writes:{day}")
+fn key(day: &str, counted: Counted) -> String {
+    match counted {
+        Counted::Own => format!("gh:writes:{day}"),
+        Counted::ConfirmedFor(preparer) => format!("gh:writes:{day}:confirmed:{preparer}"),
+    }
 }
 
 /// How the day's count is changed: the storage primitive in a run, a stand-in in
@@ -352,9 +460,10 @@ fn storage_bump(key: &str, delta: i64) -> Result<i64, String> {
     crate::store::increment(key, delta).map_err(|e| e.to_string())
 }
 
-/// Writes counted today, including any a call in flight has reserved.
+/// The caller's own writes counted today, including any a call in flight has
+/// reserved.
 pub fn writes_today() -> Result<u32, String> {
-    let count = storage_bump(&key(&day_key(now_ms())), 0)
+    let count = storage_bump(&key(&day_key(now_ms()), Counted::Own), 0)
         .map_err(|e| format!("the day's write count could not be read: {e}"))?;
     Ok(count.max(0) as u32)
 }
@@ -388,12 +497,12 @@ impl Drop for Reservation {
     }
 }
 
-pub fn reserve(day: &str, max_per_day: u32) -> Result<(Reservation, u32), String> {
-    reserve_with(storage_bump, day, max_per_day)
+pub fn reserve(day: &str, counted: Counted, max_per_day: u32) -> Result<(Reservation, u32), String> {
+    reserve_with(storage_bump, day, counted, max_per_day)
 }
 
-fn reserve_with(bump: Bump, day: &str, max_per_day: u32) -> Result<(Reservation, u32), String> {
-    let key = key(day);
+fn reserve_with(bump: Bump, day: &str, counted: Counted, max_per_day: u32) -> Result<(Reservation, u32), String> {
+    let key = key(day, counted);
     let after = bump(&key, 1).map_err(|e| format!("the day's write count could not be updated: {e}"))?;
     let reservation = Reservation { key, kept: false, bump };
     if after > max_per_day as i64 {
@@ -522,7 +631,7 @@ mod tests {
 
     #[test]
     fn writing_needs_a_number() {
-        let err = policy(r#"{"actions":["any"]}"#).reserve_write().err().unwrap();
+        let err = policy(r#"{"actions":["any"]}"#).reserve_write(Counted::Own).err().unwrap();
         assert!(err.contains("max_writes_per_day"), "{err}");
     }
 
@@ -538,19 +647,62 @@ mod tests {
     #[test]
     fn only_writes_that_happened_are_counted() {
         COUNT.with(|c| c.set(0));
-        let (first, used) = reserve_with(fake_bump, "2026-09-20", 2).unwrap();
+        let (first, used) = reserve_with(fake_bump, "2026-09-20", Counted::Own, 2).unwrap();
         assert_eq!(used, 1);
         drop(first); // GitHub said no
         assert_eq!(COUNT.with(Cell::get), 0);
 
-        let (a, _) = reserve_with(fake_bump, "2026-09-20", 2).unwrap();
+        let (a, _) = reserve_with(fake_bump, "2026-09-20", Counted::Own, 2).unwrap();
         a.keep();
-        let (b, used) = reserve_with(fake_bump, "2026-09-20", 2).unwrap();
+        let (b, used) = reserve_with(fake_bump, "2026-09-20", Counted::Own, 2).unwrap();
         b.keep();
         assert_eq!(used, 2);
-        let err = reserve_with(fake_bump, "2026-09-20", 2).err().unwrap();
+        let err = reserve_with(fake_bump, "2026-09-20", Counted::Own, 2).err().unwrap();
         assert!(err.contains("2 of the owner's 2"), "{err}");
         assert_eq!(COUNT.with(Cell::get), 2, "the refused third gave its place back");
+    }
+
+    thread_local! { static KEYED: std::cell::RefCell<std::collections::HashMap<String, i64>> = Default::default(); }
+    fn keyed_bump(key: &str, delta: i64) -> Result<i64, String> {
+        KEYED.with(|map| {
+            let mut map = map.borrow_mut();
+            let value = map.entry(key.to_string()).or_insert(0);
+            *value += delta;
+            Ok(*value)
+        })
+    }
+
+    #[test]
+    fn a_confirmed_write_is_counted_for_the_agent_that_prepared_it() {
+        let day = "2026-09-30";
+        let (alice, bob) = (Counted::ConfirmedFor("alice.testnet"), Counted::ConfirmedFor("bob.testnet"));
+        for n in 1..=2 {
+            let (place, used) = reserve_with(keyed_bump, day, alice, 2).unwrap();
+            assert_eq!(used, n);
+            place.keep();
+        }
+        // The cap is each agent's: one that used its own up takes nothing from
+        // another, nor from the caller's own writes.
+        let err = reserve_with(keyed_bump, day, alice, 2).err().expect("the third of one agent is refused");
+        assert!(err.starts_with("policy_denied: 2 of the owner's 2"), "{err}");
+        let (place, used) = reserve_with(keyed_bump, day, bob, 2).unwrap();
+        assert_eq!(used, 1);
+        place.keep();
+        let (place, used) = reserve_with(keyed_bump, day, Counted::Own, 2).unwrap();
+        assert_eq!(used, 1);
+        drop(place);
+        let count = |counted| keyed_bump(&key(day, counted), 0).unwrap();
+        assert_eq!((count(alice), count(bob), count(Counted::Own)), (2, 1, 0));
+    }
+
+    #[test]
+    fn each_count_has_a_record_of_its_own() {
+        assert_eq!(key("2026-09-30", Counted::Own), "gh:writes:2026-09-30");
+        assert_eq!(key("2026-09-30", Counted::ConfirmedFor("agent.testnet")), "gh:writes:2026-09-30:confirmed:agent.testnet");
+        // An account id holds no `:`, so no preparer's record is another's,
+        // and none is the caller's own.
+        assert_ne!(key("d", Counted::ConfirmedFor("a")), key("d", Counted::ConfirmedFor("b")));
+        assert_ne!(key("d", Counted::ConfirmedFor("")), key("d", Counted::Own));
     }
 
     #[test]

@@ -19,8 +19,16 @@
     "trap",
     "fail",
     "sleep",
-    "budget"
+    "budget",
+    "guess_start",
+    "guess",
+    "task_status",
+    "task_cancel",
+    "task_delete",
+    "tasks",
+    "tasks_unlock"
   ],
+  "tasks": true,
   "capabilities": {
     "network": [
       "rpc.testnet.fastnear.com"

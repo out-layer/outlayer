@@ -93,6 +93,12 @@ near_call() {
 #                                          integer and reads as ZERO — the whole
 #                                          of the authors' money reported as
 #                                          ours
+#   guess_start        10000, share 0    — a task is paid for when it is
+#                                          prepared, as `whoami` is priced
+#   guess and the five task operations
+#                      0                 — the owner answers a task, and reads
+#                                          and withdraws them, for nothing
+#                                          (docs/TASKS.md)
 #
 # `unpriced` is deliberately ABSENT. An operation with no row must be refused
 # before anything runs; the probe implements no such operation either, so if a
@@ -151,7 +157,14 @@ near_call set_project_pricing "$(cat <<EOF
       {"operation": "trap",            "price_usd": "10000", "developer_share_bp": 7000},
       {"operation": "fail",            "price_usd": "10000", "developer_share_bp": 7000},
       {"operation": "sleep",           "price_usd": "10000", "developer_share_bp": 7000},
-      {"operation": "budget",          "price_usd": "0",     "developer_share_bp": 0}
+      {"operation": "budget",          "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "guess_start",     "price_usd": "10000", "developer_share_bp": 0},
+      {"operation": "guess",           "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "task_status",     "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "task_cancel",     "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "task_delete",     "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "tasks",           "price_usd": "0",     "developer_share_bp": 0},
+      {"operation": "tasks_unlock",    "price_usd": "0",     "developer_share_bp": 0}
     ]
   }
 }

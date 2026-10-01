@@ -16,7 +16,7 @@
 #
 # Prerequisites, in order:
 #   1. the contract is at storage version 8 (`project_pricing` is a v8 field);
-#   2. `connectors.outlayer.near/gmail` is published — `set_project_pricing`
+#   2. `connectors.outlayer.near/github` is published — `set_project_pricing`
 #      refuses a project nobody registered.
 #
 set -euo pipefail
@@ -72,7 +72,10 @@ PYCHECK
 
 # `status` is free, so an agent can see what it may do before spending anything.
 # A read is a tenth of a cent; a write is a cent — it leaves a trace in somebody's
-# repository under the owner's name, and that is what the price is for.
+# repository under the owner's name, and that is what the price is for. A write
+# the owner confirms is paid for once, by the agent that asked for it, when the
+# task is made: the owner's `confirm` is free, and so is asking where a task
+# stands.
 near call "$CONTRACT" set_project_pricing "$(cat <<JSON
 {
   "project_id": "$PROJECT",
@@ -104,7 +107,13 @@ near call "$CONTRACT" set_project_pricing "$(cat <<JSON
       {"operation": "gist_create", "price_usd": "10000", "developer_share_bp": 0},
       {"operation": "gist_update", "price_usd": "10000", "developer_share_bp": 0},
       {"operation": "repo_star", "price_usd": "10000", "developer_share_bp": 0},
-      {"operation": "repo_unstar", "price_usd": "10000", "developer_share_bp": 0}
+      {"operation": "repo_unstar", "price_usd": "10000", "developer_share_bp": 0},
+      {"operation": "confirm", "price_usd": "0", "developer_share_bp": 0},
+      {"operation": "task_status", "price_usd": "0", "developer_share_bp": 0},
+      {"operation": "task_cancel", "price_usd": "0", "developer_share_bp": 0},
+      {"operation": "task_delete", "price_usd": "0", "developer_share_bp": 0},
+      {"operation": "tasks", "price_usd": "0", "developer_share_bp": 0},
+      {"operation": "tasks_unlock", "price_usd": "0", "developer_share_bp": 0}
     ]
   }
 }

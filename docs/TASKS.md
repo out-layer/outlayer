@@ -90,7 +90,8 @@ What it is not:
 
 `connectors/tasks-probe` is a project that does nothing else, and
 `connectors/gmail-connector` is a connector whose `send` asks the owner when
-their policy lists it under `confirm`.
+their policy lists it under `confirm`. How a connector puts an action behind
+the owner's confirmation: [CONNECTOR_TASKS.md](CONNECTOR_TASKS.md).
 
 ## Whose task, and who may do what
 
@@ -98,6 +99,17 @@ The **owner** of a task is the owner of the secret row the run named and the
 keystore opened. The **preparer** is the account that made the run. Both are
 the worker's facts, from the job and the keystore: no function of the host
 interface takes an account.
+
+A task opened by a run that answered one is the next **turn** of that task's
+conversation: it carries the answered task's `thread` and keeps its
+preparer. The owner answers an agent's task and the project asks the next
+question in the same run; the inbox shows it from that agent, the agent's
+`mine` and `status` list it, and it counts in that agent's share and under
+its mute. Only the owner's own run answers, the thread and its preparer are
+sealed in the task answered, and the new task is the same owner's — so an
+owner's run names another account as a preparer only inside a conversation
+that account started, in the owner's own inbox. A run that answered nothing
+opens as its caller, in a conversation of its own.
 
 | The run is | It may |
 |---|---|
@@ -144,7 +156,7 @@ and under the default master for a row bound to none: what a vault seals, it
 seals with its own key, tasks included. The store records the vault beside
 each task (`vault` in the inbox's list), so what a vault's owner did is
 known as the vault's.
-| `thread` | the id of the first task of the conversation |
+| `thread` | the id of the first task of the conversation; a turn keeps the conversation's preparer |
 | life | 24 hours at most; a project may ask for less |
 
 Everything but `state` is one document, the **envelope**, written once in a

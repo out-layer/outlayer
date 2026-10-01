@@ -151,6 +151,7 @@ cd keystore-worker && cargo run          # Run keystore
 - [wasi-examples/WASI_TUTORIAL.md](wasi-examples/WASI_TUTORIAL.md) - WASI guide
 - [docs/CONNECTORS.md](docs/CONNECTORS.md) - Building a connector: model, secrets, limits
 - [docs/TASKS.md](docs/TASKS.md) - Tasks between an agent and its owner: the model, the inbox, the host interface
+- [docs/CONNECTOR_TASKS.md](docs/CONNECTOR_TASKS.md) - Owner confirmation in a connector: the policy's `confirm`, the `confirm` operation, rules, prices, tests
 - [docs/ADMIN.md](docs/ADMIN.md) - Coordinator `/admin/*` endpoints, auth model, what a leaked token reaches
 - [contract/README.md](contract/README.md) - Contract API
 - [worker/README.md](worker/README.md) - Worker config

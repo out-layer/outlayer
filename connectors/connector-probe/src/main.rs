@@ -26,6 +26,9 @@
 //! | `forbidden_fetch` | $0.015 | an undeclared host is NOT, and the refusal comes from the worker rather than from politeness here |
 //! | `vrf` | $0.01 | the ALPHA the randomness is bound to — the same seed through both doors must name the same account, differing only in the request id |
 //! | `refund` | $0.01 | money handed back reaches `earnings_history`: a non-zero `refund_usd` and an `amount` reduced by it. The worker computed this for a while and never sent it |
+//! | `guess_start` | $0.01 | a game of several turns through tasks: picks a number from 1 to `max` and opens an `input` task for the owner (`guess.rs`) |
+//! | `guess` | free | the owner's answer to a turn: judges it, reports, and opens the next turn in the same thread until the guess is right |
+//! | `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | free | the SDK's own, served by `tasks::dispatch` |
 //!
 //! And one operation that is deliberately absent from the price list —
 //! `unpriced` — which the coordinator must refuse BEFORE this module runs. It
@@ -39,8 +42,11 @@
 //! an SSRF gadget with a TEE's network access, and one that echoed secrets
 //! would make every test run a leak.
 
-use outlayer::env;
+mod guess;
+
+use outlayer::{env, tasks};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 // ==================== Connector manifest ====================
@@ -53,6 +59,7 @@ use sha2::{Digest, Sha256};
 /// linker from dropping a static nothing references — without it the module
 /// would publish with no allowlist and, being a connector, be refused all
 /// outbound network. See `wasi-examples/CONNECTOR_MANIFEST.md`.
+#[cfg(target_family = "wasm")]
 #[used]
 #[link_section = "outlayer.manifest"]
 static OUTLAYER_MANIFEST: [u8; include_bytes!("../manifest.json").len()] =
@@ -117,6 +124,8 @@ const SYSTEM_VARS: &[&str] = &[
     "NEAR_USER_ACCOUNT_ID",
     "NEAR_PREDECESSOR_ID",
     "NEAR_SIGNER_PUBLIC_KEY",
+    // The account that relayed a meta-transaction; blank for every other call.
+    "NEAR_RELAYER_ID",
     // Where and what kind of run.
     "NEAR_NETWORK_ID",
     "OUTLAYER_EXECUTION_TYPE",
@@ -205,7 +214,7 @@ const SECRET_KEYS: [&str; 2] = ["PROBE_TOKEN", "PROBE_SECOND"];
 /// environment of EVERY run — no header, no `secrets_ref` in the call.
 const AUTHOR_SECRET_KEYS: [&str; 1] = ["PROBE_AUTHOR_SECRET"];
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Input {
     /// Which operation, under the ONE universal field name every connector
     /// uses.
@@ -370,6 +379,18 @@ struct Output {
     // ---- sleep ----
     #[serde(skip_serializing_if = "Option::is_none")]
     slept_ms: Option<u64>,
+    // ---- tasks ----
+    /// `guess_start`: the task opened, as `tasks::awaiting_owner` spells it;
+    /// the SDK's task operations: their answer. Beside `ok` and `detail`, so
+    /// an answer names its task where every tasks project names it.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    task: Option<Map<String, Value>>,
+    /// `guess`: what the turn reported to the preparer of the task answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    /// `guess`: the next turn's task, as `tasks::awaiting_owner` spells it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<Value>,
 }
 
 /// Verifiable randomness, and — the reason this exists — the ALPHA it was
@@ -450,18 +471,14 @@ fn refund(op: &str, amount: Option<u64>) -> Output {
 }
 
 fn main() {
-    let input = match env::input_json::<Input>() {
-        Ok(Some(i)) => i,
-        Ok(None) => Input {
-            mode: None,
-            cap: None,
-            run: None,
-            operation: String::new(),
-            rounds: None,
-            seed: None,
-            refund_usd: None,
-            seconds: None,
-        },
+    // The input as sent, for the task operations, which read members `Input`
+    // does not name; and as `Input`, for the rest.
+    let parsed = env::input_json::<Value>().and_then(|raw| {
+        let raw = raw.unwrap_or_else(|| Value::Object(Map::new()));
+        serde_json::from_value::<Input>(raw.clone()).map(|input| (input, raw))
+    });
+    let (input, raw) = match parsed {
+        Ok(both) => both,
         Err(e) => {
             let _ = env::output_json(&Output {
                 ok: false,
@@ -473,11 +490,11 @@ fn main() {
         }
     };
 
-    let out = run(&input);
+    let out = run(&input, &raw);
     let _ = env::output_json(&out);
 }
 
-fn run(input: &Input) -> Output {
+fn run(input: &Input, raw: &Value) -> Output {
     let op = input.operation.trim();
     match op {
         "ping" => Output {
@@ -504,6 +521,13 @@ fn run(input: &Input) -> Output {
         "fail" => fail(op),
         "sleep" => sleep(op, input.seconds.unwrap_or(1)),
         "budget" => budget(op, input.mode.as_deref(), input.cap, input.run.as_deref()),
+        "guess_start" => guess_start(op, raw),
+        "guess" => guess_turn(op, raw),
+        "task_status" => task_operation(op, raw),
+        "task_cancel" => task_operation(op, raw),
+        "task_delete" => task_operation(op, raw),
+        "tasks" => task_operation(op, raw),
+        "tasks_unlock" => task_operation(op, raw),
         "" => Output {
             ok: false,
             operation: op.into(),
@@ -908,5 +932,73 @@ fn budget(op: &str, mode: Option<&str>, cap: Option<i64>, run: Option<&str>) -> 
             answer(true, Some(true), Some(after), format!("admitted: {after} of {cap}"))
         }
         other => answer(false, None, None, format!("`mode` must be reserve, release or read, not `{other}`")),
+    }
+}
+
+fn refused(op: &str, refusal: String) -> Output {
+    Output { ok: false, operation: op.into(), detail: refusal, ..Default::default() }
+}
+
+fn object(value: Value) -> Map<String, Value> {
+    match value {
+        Value::Object(members) => members,
+        other => Map::from_iter([("answer".to_string(), other)]),
+    }
+}
+
+/// A new guessing game: a secret from 1 to `max`, and the owner's first task.
+fn guess_start(op: &str, raw: &Value) -> Output {
+    match guess::start(raw) {
+        Ok((max, opened)) => Output {
+            ok: true,
+            operation: op.into(),
+            detail: format!("awaiting the owner: a number from 1 to {max} is picked, and the first guess is theirs"),
+            task: Some(object(opened)),
+            ..Default::default()
+        },
+        Err(refusal) => refused(op, refusal),
+    }
+}
+
+/// The owner's guess. `ok` is false when the game goes on and its next turn
+/// could not be opened: the guess was judged and reported, and the game stops
+/// there.
+fn guess_turn(op: &str, raw: &Value) -> Output {
+    let answered = match guess::answer(raw) {
+        Ok(answered) => answered,
+        Err(refusal) => return refused(op, refusal),
+    };
+    let sentence = answered.turn.sentence();
+    let (ok, detail, next) = match answered.next {
+        None => (true, sentence, None),
+        Some(Ok(next)) => (true, format!("{sentence}; the next turn waits for the owner"), Some(next)),
+        Some(Err(refusal)) => (false, format!("{sentence}; the next turn could not be opened: {refusal}"), None),
+    };
+    Output { ok, operation: op.into(), detail, result: Some(answered.result), next, ..Default::default() }
+}
+
+/// `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock`: the
+/// SDK's own.
+fn task_operation(op: &str, raw: &Value) -> Output {
+    match tasks::dispatch(op, raw) {
+        Some(Ok(answer)) => Output { ok: true, operation: op.into(), detail: format!("{op}: answered"), task: Some(object(answer)), ..Default::default() },
+        Some(Err(refusal)) => refused(op, refusal),
+        None => refused(op, format!("`{op}` is not one of the SDK's task operations")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_task_answer_sits_beside_ok_and_detail_and_is_absent_when_there_is_none() {
+        let plain = serde_json::to_value(Output { ok: true, operation: "ping".into(), ..Default::default() }).unwrap();
+        assert_eq!(plain, serde_json::json!({ "ok": true, "operation": "ping", "detail": "" }));
+
+        let opened = serde_json::json!({ "status": "awaiting_owner", "task_id": "c-0", "task_hash": "ab" });
+        let out = Output { ok: true, operation: "guess_start".into(), task: Some(object(opened)), ..Default::default() };
+        let out = serde_json::to_value(out).unwrap();
+        assert_eq!((out["status"].as_str(), out["task_id"].as_str(), out["ok"].as_bool()), (Some("awaiting_owner"), Some("c-0"), Some(true)));
     }
 }

@@ -42,6 +42,8 @@ struct Mem {
     muted: Mutex<Vec<String>>,
     down: AtomicBool,
     most_open: Mutex<Option<usize>>,
+    /// The most open tasks of the owner's from one preparer.
+    most_of_preparer: Mutex<Option<usize>>,
     most_stored: Mutex<Option<usize>>,
     /// The most copies one request writes: a device that left since the
     /// devices were read gets none.
@@ -115,6 +117,13 @@ impl Store for Shared {
         let mut rows = self.0.rows.lock().unwrap();
         let open = rows.values().filter(|r| r.scope.owner == scope.owner && r.state == State::Open).count();
         if self.0.most_open.lock().unwrap().is_some_and(|most| open >= most) {
+            return Err(StoreError::Refused(Refusal::InboxFull, None));
+        }
+        let of_preparer = rows
+            .values()
+            .filter(|r| r.scope.owner == scope.owner && r.state == State::Open && r.task.preparer == task.preparer)
+            .count();
+        if self.0.most_of_preparer.lock().unwrap().is_some_and(|most| of_preparer >= most) {
             return Err(StoreError::Refused(Refusal::InboxFull, None));
         }
         let held: usize = rows
@@ -525,7 +534,84 @@ fn the_owner_supplies_what_was_asked_and_the_turn_opens_the_next_task_of_the_con
     let next = owner.open(photo()).unwrap();
     assert_eq!(next.id, "run-o-0");
     assert_eq!(next.thread, first.id, "both are one conversation");
-    assert_eq!(world.page_reads(&next.id).0.thread, first.id);
+    let (shown, _) = world.page_reads(&next.id);
+    assert_eq!(shown.thread, first.id);
+    // The turn is with the agent that started the conversation: sealed so,
+    // recorded so, and listed among the agent's tasks, not the owner's.
+    assert_eq!((shown.owner.as_str(), shown.preparer.as_str()), (OWNER, AGENT));
+    assert_eq!(world.store.row(&next.id).task.preparer, AGENT);
+    let (mut agent, mut own) = (world.agent("run-b"), world.owner("run-p").0);
+    assert_eq!(agent.status(next.id.clone()).unwrap().state, wit::TaskState::Open);
+    assert!(agent.mine().unwrap().iter().any(|task| task.id == next.id));
+    assert!(own.mine().unwrap().is_empty(), "the owner prepared nothing");
+
+    // The turn is answered as any task of the agent's is, and the run that
+    // answers it continues the same conversation with the same agent.
+    let (_, hash) = world.page_reads(&next.id);
+    let supplied = world.page_writes(&next.id, Purpose::Answer, b"ipfs://photo2");
+    let (mut again, _) = world.owner("run-q");
+    let answer = again.answered(next.id.clone(), hash, "upload_photo".to_string(), POLICY.to_vec(), Some(supplied)).unwrap();
+    assert_eq!((answer.thread.as_str(), answer.preparer.as_str()), (first.id.as_str(), AGENT));
+    let third = again.open(photo()).unwrap();
+    assert_eq!(third.thread, first.id);
+    assert_eq!(world.page_reads(&third.id).0.preparer, AGENT);
+}
+
+#[test]
+fn a_run_that_answered_nothing_opens_as_its_caller_in_a_conversation_of_its_own() {
+    let world = World::new();
+    let first = world.agent("run-a").open(email()).unwrap();
+    let (_, hash) = world.page_reads(&first.id);
+
+    // The owner's run whose answer was refused holds no conversation.
+    let (mut owner, _) = world.owner("run-o");
+    assert_eq!(
+        reason(owner.answered(first.id.clone(), "0".repeat(64), "confirm".to_string(), POLICY.to_vec(), None)),
+        wit::Reason::HashMismatch
+    );
+    let own = owner.open(email()).unwrap();
+    assert_eq!(own.thread, own.id);
+    let (shown, _) = world.page_reads(&own.id);
+    assert_eq!((shown.owner.as_str(), shown.preparer.as_str()), (OWNER, OWNER));
+    assert_eq!(world.store.row(&own.id).task.preparer, OWNER);
+
+    // Nor does the run that answered after it opened: the task it opened
+    // stays its own, and the next one is the turn.
+    let (mut late, _) = world.owner("run-l");
+    let before = late.open(email()).unwrap();
+    late.answered(first.id.clone(), hash, "confirm".to_string(), POLICY.to_vec(), None).unwrap();
+    let after = late.open(email()).unwrap();
+    assert_eq!(world.page_reads(&before.id).0.preparer, OWNER);
+    assert_eq!((after.thread.as_str(), world.page_reads(&after.id).0.preparer.as_str()), (first.id.as_str(), AGENT));
+}
+
+#[test]
+fn a_turn_counts_in_the_agents_share_and_under_the_agents_mute() {
+    let world = World::new();
+    *world.store.most_of_preparer.lock().unwrap() = Some(2);
+    let first = world.agent("run-a").open(photo()).unwrap();
+    world.agent("run-b").open(email()).unwrap();
+    assert_eq!(reason(world.agent("run-c").open(email())), wit::Reason::InboxFull, "the agent's share is full");
+    let (_, hash) = world.page_reads(&first.id);
+    let supplied = world.page_writes(&first.id, Purpose::Answer, b"ipfs://photo");
+
+    // The answer takes the first task out of the open ones: one of the
+    // agent's is open, and the turn is the second.
+    let (mut owner, _) = world.owner("run-o");
+    owner.answered(first.id.clone(), hash, "upload_photo".to_string(), POLICY.to_vec(), Some(supplied)).unwrap();
+    owner.open(photo()).unwrap();
+    assert_eq!(reason(owner.open(photo())), wit::Reason::InboxFull, "a third of the agent's is over its share");
+
+    // The owner's own share is untouched by the turns.
+    let (mut own, _) = world.owner("run-p");
+    for _ in 0..2 {
+        own.open(email()).unwrap();
+    }
+
+    // A muted agent's conversation takes no more turns.
+    world.store.muted.lock().unwrap().push(AGENT.to_string());
+    *world.store.most_of_preparer.lock().unwrap() = None;
+    assert_eq!(reason(owner.open(photo())), wit::Reason::Muted);
 }
 
 #[test]

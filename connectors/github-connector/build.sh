@@ -8,6 +8,14 @@ MAX_SIZE=$((2 * 1024 * 1024))  # 2MB in bytes
 
 echo "Building WASI module (wasm32-wasip2)..."
 rustup target add wasm32-wasip2 2>/dev/null || true
+
+# The SDK's copy of the tasks interface must be the worker's, or this module is
+# generated against an interface the host does not implement.
+if ! diff -q ../../worker/wit/deps/tasks.wit ../../sdk/outlayer/wit/deps/tasks.wit >/dev/null; then
+    echo "ERROR: sdk/outlayer/wit/deps/tasks.wit has drifted from worker/wit/deps/tasks.wit"
+    exit 1
+fi
+
 cargo build --target wasm32-wasip2 --release
 echo ""
 
@@ -25,6 +33,18 @@ if ! grep -qa 'outlayer.manifest' "$WASM_FILE"; then
 fi
 echo "Manifest section: present"
 
+# A write the owner confirms is a task: without the import the owner's
+# confirmation cannot be asked for, and every such write would be refused.
+if ! command -v wasm-tools >/dev/null 2>&1; then
+    echo "ERROR: wasm-tools is not installed; it checks that $WASM_FILE imports outlayer:tasks"
+    exit 1
+fi
+if ! wasm-tools component wit "$WASM_FILE" 2>/dev/null | grep -q "outlayer:tasks"; then
+    echo "ERROR: $WASM_FILE does not import outlayer:tasks"
+    exit 1
+fi
+echo "OK: outlayer:tasks is imported"
+
 # The manifest's operations must be exactly the ones the code dispatches on, and
 # its limit words must be ones the platform knows: an unknown word is read at its
 # strictest, which would bind every caller instead of the intended few.
@@ -41,6 +61,15 @@ if declared != advertised:
     bad.append(f"manifest {sorted(declared)} vs the OPERATIONS list {sorted(advertised)}")
 if declared != dispatched:
     bad.append(f"manifest {sorted(declared)} vs dispatched {sorted(dispatched)}")
+# Owner confirmation: the manifest declares tasks, and the SDK's five task
+# operations are sold and dispatched with `confirm`.
+if m.get("tasks") is not True:
+    bad.append('the manifest does not say "tasks": true')
+missing = {"confirm", "task_status", "task_cancel", "task_delete", "tasks", "tasks_unlock"} - declared
+if missing:
+    bad.append(f"the operations of owner confirmation are not all sold: {sorted(missing)} missing")
+if "confirm" in declared and not any(l.get("operation") == "confirm" for l in m.get("limits", [])):
+    bad.append("`confirm` has no daily limit beside the writes'")
 for limit in m.get("limits", []):
     if limit.get("window") not in WINDOWS:
         bad.append(f"window {limit.get('window')!r}")

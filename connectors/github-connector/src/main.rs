@@ -19,8 +19,14 @@
 //! was written by somebody, and may have been written for the agent. The policy
 //! is what bounds the damage when an agent believes it.
 //!
+//! Every write can be put behind the owner's confirmation: an operation the
+//! policy lists under `confirm` is checked, prepared and left as a task for the
+//! owner, and the owner's own call of `confirm` carries it out (`confirm.rs`).
+//!
 //! One host in the manifest: `api.github.com`.
 
+mod action;
+mod confirm;
 mod github;
 mod ops;
 mod policy;
@@ -122,6 +128,10 @@ pub struct Input {
     /// `eciesjs` gives it) to seal the policy to. Required for the policy to be
     /// shown at all when the run's output lands on chain.
     pub reply_pubkey: Option<String>,
+    /// `confirm` and the `task_*` operations: the task's id.
+    pub task_id: Option<String>,
+    /// `confirm`: SHA-256 of the task as the owner's page showed it.
+    pub task_hash: Option<String>,
 }
 
 /// Everything this connector sells. A name not here is refused with the list.
@@ -129,7 +139,8 @@ const OPERATIONS: &[&str] = &[
     "status", "repo_list", "repo_get", "dir_list", "file_get", "branch_list", "issue_list", "issue_get",
     "pr_list", "pr_get", "pr_files", "gist_list", "gist_get", "branch_create", "file_put", "commit",
     "issue_create", "issue_comment", "issue_update", "pr_create", "pr_review", "pr_merge", "gist_create",
-    "gist_update", "repo_star", "repo_unstar",
+    "gist_update", "repo_star", "repo_unstar", "confirm", "task_status", "task_cancel", "task_delete", "tasks",
+    "tasks_unlock",
 ];
 
 fn main() {
@@ -181,6 +192,12 @@ fn run(op: &str, input: &Input) -> Result<Value, String> {
         "gist_update" => ops::gist_update(input),
         "repo_star" => ops::repo_star(input),
         "repo_unstar" => ops::repo_unstar(input),
+        "confirm" => confirm::confirm(input),
+        "task_status" => confirm::task(op, input),
+        "task_cancel" => confirm::task(op, input),
+        "task_delete" => confirm::task(op, input),
+        "tasks" => confirm::task(op, input),
+        "tasks_unlock" => confirm::task(op, input),
         "" => Err(format!("invalid: no `operation` in the input. This connector sells: {}", OPERATIONS.join(", "))),
         other => Err(format!("invalid: unknown operation `{other}`. This connector sells: {}", OPERATIONS.join(", "))),
     }
@@ -227,7 +244,7 @@ fn status(input: &Input) -> Result<Value, String> {
 /// Where this run's output goes. The worker names an HTTPS run in so many
 /// words; anything else is treated as public — the direction that leaks nothing
 /// when the variable is missing.
-fn on_chain() -> bool {
+pub(crate) fn on_chain() -> bool {
     std::env::var("OUTLAYER_EXECUTION_TYPE").map(|v| v != "HTTPS").unwrap_or(true)
 }
 
@@ -240,20 +257,17 @@ fn on_chain() -> bool {
 /// one on chain the fields are withheld: the output of an on-chain run sits in
 /// the transaction for ever, and the policy names the owner's repositories —
 /// private ones among them.
+///
+/// The full policy is the policy serialised, so every member it has is
+/// reported, under its own name and as the policy holds it: `confirm` with
+/// the rest, sealed or clear as they are.
 fn policy_view(loaded: policy::Loaded, reply_pubkey: Option<&str>, on_chain: bool) -> Result<(Value, Option<String>), String> {
     let full = match loaded {
-        policy::Loaded::Some(p) => json!({
-            "present": true,
-            "actions": p.actions,
-            "repos": p.repos,
-            "branches": p.branches,
-            "paths": p.paths,
-            "max_writes_per_day": p.max_writes_per_day,
-            "allow_merge": p.allow_merge,
-            "allow_approve": p.allow_approve,
-            "allow_public_gists": p.allow_public_gists,
-            "marker": p.marker,
-        }),
+        policy::Loaded::Some(p) => {
+            let mut full = serde_json::to_value(&p).map_err(|e| format!("the policy could not be reported: {e}"))?;
+            full["present"] = json!(true);
+            full
+        }
         policy::Loaded::None => json!({
             "present": false,
             "effect": "only `status` runs until the owner stores a policy",
@@ -312,15 +326,37 @@ mod tests {
         assert!(serde_json::from_str::<Input>(r#"{"operation":"file_get","repo":"a/b","path":"x","ref":"main"}"#).is_ok());
     }
 
-    /// Without a policy every operation but `status` is refused before GitHub is
-    /// asked anything — reading a private repository is a disclosure too.
+    /// Without a policy every operation of this connector's own but `status` is
+    /// refused before GitHub is asked anything — reading a private repository
+    /// is a disclosure too. `confirm` asks for its task first, and the task
+    /// operations are the host's.
     #[test]
     fn without_a_policy_nothing_but_status_runs() {
         std::env::remove_var(policy::POLICY_ENV);
-        for op in OPERATIONS.iter().filter(|op| **op != "status") {
+        let own = OPERATIONS.iter().filter(|op| **op != "status" && **op != "confirm" && !outlayer::tasks::OPERATIONS.contains(op));
+        for op in own {
             let err = run(op, &Input { repo: Some("a/b".into()), ..Input::default() }).unwrap_err();
             assert!(err.starts_with("policy_missing:"), "{op} → {err}");
         }
+        let named = Input { task_id: Some("run-0".into()), task_hash: Some("ab".repeat(32)), ..Input::default() };
+        assert!(run("confirm", &named).unwrap_err().starts_with("policy_missing:"));
+    }
+
+    /// Every write the policy can name under `confirm` is an operation this
+    /// connector sells and describes as a write, and nothing else is.
+    #[test]
+    fn every_write_and_only_a_write_can_be_confirmed() {
+        let manifest: Value = serde_json::from_str(include_str!("../manifest.json")).unwrap();
+        let described = manifest["describe"]["operations"].as_object().unwrap();
+        let writes: Vec<&str> = OPERATIONS
+            .iter()
+            .copied()
+            .filter(|op| described[*op]["class"] == "write")
+            .filter(|op| *op != "confirm" && !outlayer::tasks::OPERATIONS.contains(op))
+            .collect();
+        let confirmable: Vec<&str> = policy::Confirmable::ALL.iter().map(|c| c.name()).collect();
+        assert_eq!(confirmable, writes);
+        assert_eq!(manifest["tasks"], json!(true));
     }
 
     fn loaded(json: &str) -> policy::Loaded {
@@ -361,5 +397,111 @@ mod tests {
     #[test]
     fn a_key_that_is_not_one_is_refused() {
         assert!(policy_view(loaded("{}"), Some("not-hex"), true).is_err());
+    }
+
+    /// A policy with every member set. Written member by member, so a member
+    /// added to the policy does not compile here until it is given a value.
+    fn every_member() -> policy::Policy {
+        policy::Policy {
+            actions: Some(vec!["any".into()]),
+            repos: Some(vec!["alice/*".into()]),
+            branches: Some(vec!["agent/*".into()]),
+            paths: Some(vec!["docs/*".into()]),
+            max_writes_per_day: Some(20),
+            allow_merge: Some(true),
+            allow_approve: Some(false),
+            allow_public_gists: Some(false),
+            marker: Some("~bot".into()),
+            confirm: Some(vec![policy::Confirmable::PrMerge, policy::Confirmable::Commit]),
+        }
+    }
+
+    fn names(value: &Value) -> Vec<String> {
+        let mut names: Vec<String> = value.as_object().expect("an object").keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// What rewrites a policy from what `status` answered keeps every member
+    /// only if every member is answered.
+    #[test]
+    fn status_reports_every_member_of_the_policy() {
+        // The members, taken apart with no `..`: one more in the policy does
+        // not compile here until it is named and compared below.
+        let policy::Policy {
+            actions,
+            repos,
+            branches,
+            paths,
+            max_writes_per_day,
+            allow_merge,
+            allow_approve,
+            allow_public_gists,
+            marker,
+            confirm,
+        } = every_member();
+        let expected = json!({
+            "present": true,
+            "actions": actions,
+            "repos": repos,
+            "branches": branches,
+            "paths": paths,
+            "max_writes_per_day": max_writes_per_day,
+            "allow_merge": allow_merge,
+            "allow_approve": allow_approve,
+            "allow_public_gists": allow_public_gists,
+            "marker": marker,
+            "confirm": ["pr_merge", "commit"],
+        });
+        assert_eq!(confirm, Some(vec![policy::Confirmable::PrMerge, policy::Confirmable::Commit]));
+
+        // The names the policy is spelled with are the names it reads back by.
+        let spelled = serde_json::to_value(every_member()).unwrap();
+        assert!(serde_json::from_value::<policy::Policy>(spelled.clone()).is_ok());
+        let mut with_present = names(&spelled);
+        with_present.push("present".into());
+        with_present.sort();
+        assert_eq!(with_present, names(&expected), "a member of the policy is missing from this test");
+
+        // In the clear.
+        let (open, sealed) = policy_view(policy::Loaded::Some(every_member()), None, false).unwrap();
+        assert_eq!(open, expected);
+        assert!(sealed.is_none());
+
+        // Sealed, on chain and off it: the same members inside.
+        let secret = [7u8; 32];
+        let public = libsecp256k1::PublicKey::from_secret_key(&libsecp256k1::SecretKey::parse(&secret).unwrap());
+        let hex: String = public.serialize_compressed().iter().map(|b| format!("{b:02x}")).collect();
+        for on_chain in [true, false] {
+            let (open, sealed) = policy_view(policy::Loaded::Some(every_member()), Some(&hex), on_chain).unwrap();
+            assert_eq!(open, json!({"present": true, "sealed": true}));
+            let blob = BASE64.decode(sealed.expect("a sealed policy")).unwrap();
+            let inside: Value = serde_json::from_slice(&seal::open(&secret, &blob).unwrap()).unwrap();
+            assert_eq!(inside, expected);
+        }
+
+        // On chain with no key nothing of the policy leaves, `confirm` included.
+        let (open, _) = policy_view(policy::Loaded::Some(every_member()), None, true).unwrap();
+        assert_eq!(names(&open), ["note", "present", "sealed"]);
+    }
+
+    #[test]
+    fn status_reports_confirm_as_the_policy_holds_it() {
+        let reported = |json: &str| policy_view(loaded(json), None, false).unwrap().0;
+        assert_eq!(reported(r#"{"confirm":["pr_merge"]}"#)["confirm"], json!(["pr_merge"]));
+        assert_eq!(reported(r#"{"confirm":[]}"#)["confirm"], json!([]));
+        // A policy with none reports the member as null, like the members
+        // beside it: its absence would read as a report that does not know it.
+        for none in [r#"{"actions":["any"]}"#, r#"{"confirm":null}"#] {
+            let open = reported(none);
+            assert_eq!(open.get("confirm"), Some(&Value::Null), "{open}");
+            assert_eq!(open["max_writes_per_day"], Value::Null);
+            assert_eq!(names(&open).len(), 11, "{open}");
+        }
+        // What is reported, less the word about the row, is a policy again.
+        let mut back = reported(r#"{"confirm":["issue_comment"],"max_writes_per_day":3}"#);
+        back.as_object_mut().unwrap().remove("present");
+        let again: policy::Policy = serde_json::from_value(back).unwrap();
+        assert!(again.confirms(policy::Confirmable::IssueComment) && again.max_writes_per_day == Some(3));
     }
 }

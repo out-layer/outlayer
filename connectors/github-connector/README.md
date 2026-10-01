@@ -44,7 +44,8 @@ repository is a disclosure too.
   "allow_merge": false,
   "allow_approve": false,
   "allow_public_gists": false,
-  "marker": "\n\n— posted by an AI agent via OutLayer"
+  "marker": "\n\n— posted by an AI agent via OutLayer",
+  "confirm": ["pr_review"]          // writes that wait for the owner; absent: none
 }
 ```
 
@@ -61,7 +62,8 @@ Two rules worth stating on their own:
 
 ## Operations
 
-`status` is free, a read costs $0.001, a write $0.01.
+`status` is free, a read costs $0.001, a write $0.01. `confirm` and the task
+operations are free.
 
 | read | |
 |---|---|
@@ -85,12 +87,120 @@ Two rules worth stating on their own:
 | `gist_create`, `gist_update` | secret unless `allow_public_gists` |
 | `repo_star`, `repo_unstar` | needs the app's Starring permission |
 
+Every write answers `awaiting_owner` instead when the policy lists it under
+`confirm` — see below.
+
+| owner confirmation | |
+|---|---|
+| `confirm` | the owner's own call, with `task_id` and `task_hash`: makes the write the task holds |
+| `task_status`, `task_cancel`, `task_delete` | a task this caller made, by `task_id`: where it stands, withdraw it, delete it |
+| `tasks` | the tasks this caller made for this owner |
+| `tasks_unlock` | the owner's own call: opens the waiting tasks for a device that was not signed in when they were made |
+
 There is no operation that forwards a request of the agent's choosing. The
 platform prices by operation and the policy allows by action; a passthrough
 would be one price and one permission for everything.
 
 Answers are cut down to what an agent uses. GitHub describes one pull request in
 15 KB, most of it URLs of other endpoints.
+
+## Asking the owner first
+
+Any write can wait for the owner: `branch_create`, `file_put`, `commit`,
+`issue_create`, `issue_comment`, `issue_update`, `pr_create`, `pr_review`,
+`pr_merge`, `gist_create`, `gist_update`, `repo_star`, `repo_unstar`. The owner
+names the ones they want to see in the policy's `confirm`. A read cannot be
+listed, and a name that is not one of these — another case included — makes
+the policy unreadable. Absent or `[]`: none, and every write is made at once.
+
+With a write listed, the agent's call is checked as it would be before writing
+— the action, the repository, the branch and the default-branch rule, the
+paths, `allow_merge`, `allow_approve`, `allow_public_gists`, that
+`max_writes_per_day` is set — and instead of writing it leaves a task for the
+owner and answers
+
+```json
+{"status": "awaiting_owner", "task_id": "…", "task_hash": "…", "thread": "…", "expires_at": 1790000000, "link": "https://app.outlayer.ai/inbox/…"}
+```
+
+which is a success: the agent did its part, and paid the write's price. It
+learns the outcome from `task_status`. The write waits sealed, and the owner's
+`confirm` makes exactly it: nothing in the task says what to do on a yes.
+
+### What the owner is shown
+
+Every value the write will use, and whose words each is — the agent's, or
+what the connector read from GitHub:
+
+| write | shown |
+|---|---|
+| `branch_create` | repository, branch, the branch it starts from, and the commit it starts at, read when the task is made |
+| `file_put` | repository, branch, path, commit message, the blob it replaces, the content |
+| `commit` | repository, branch, commit message, each changed path with its size — and each content |
+| `issue_create` | repository, title, body with its marker, labels, assignees |
+| `issue_comment` | repository, number, the comment with its marker |
+| `issue_update` | repository, number, and each of state, title, body, labels, assignees it changes — an empty list as "every label is removed" |
+| `pr_create` | repository, from and into branch, title, body, draft |
+| `pr_review` | repository, number, the pull request's title and head commit, verdict, summary, each line comment with its path, line and side |
+| `pr_merge` | repository, number, the pull request's title, its branches, the head commit, the method |
+| `gist_create`, `gist_update` | visibility or gist id, description, each file — and each content |
+| `repo_star`, `repo_unstar` | repository |
+
+A file's content is shown in a field when it is text a field draws exactly as
+written — no carriage return, no character that is invisible or reorders text,
+at most 50000 characters — and there is room: a task shows 12 fields, and the
+contents shown together hold at most 128 KiB. Any other content is given to the
+owner as a file of the task, named `<n>-<name>` after its place in the list,
+byte for byte; the list says which is where. A review's line comments that do
+not fit a field each are given together as `review-comments.json`. At most 20
+changed files, 10 files to open and 6 MiB of them: a write over that is refused
+`display_invalid` or `task_too_large` and never shown in part — split it.
+
+Texts are shown and posted with `\n` line ends; a file's content is written as
+it was given.
+
+A pull request the owner is asked to merge or review is read when the task is
+made, and the owner's yes is bound to the head commit they were shown: the
+merge is made with that `sha`, so GitHub refuses it if the pull request moved,
+and an approval of any other head is refused `conflict`. A branch is created at
+the commit shown. A `commit` is made on the branch's head as it is at
+confirmation, and moves the branch without force.
+
+### `confirm`
+
+The owner's page calls `confirm` with `task_id` and `task_hash`. The policy the
+write is judged by is the one the task was made under — a task made under
+another is refused `task_void` — and it is judged again in full, with the
+default-branch rule asked of GitHub again. The write is counted for the agent
+that prepared it, then made, and its whole result is left for that agent,
+sealed, in `task_status`.
+
+| refused | the task | the refusal |
+|---|---|---|
+| before the answer is taken: no `task_id` or `task_hash`, no policy or an unreadable one, anything the host refuses the answer for (`task_not_found`, `not_the_owner`, `task_hash_mismatch`, `task_answer_invalid`, `task_store_unavailable`, `task_closed`, `task_expired`, `task_void`) | stays as it was; an open one can be confirmed again | as it is |
+| after: a state that is not a write, the policy, the day's count, the token, GitHub's refusal of the write | ends `failed` | its own code, and a sentence ending "The task is closed: to make this write, prepare it again" |
+| after the write was made: its result could not be left for the agent | ends `failed` | its own code, and "The write WAS made on GitHub (…) and the task is closed without its result: do not prepare it again" |
+
+**What `confirm` answers.** Over HTTPS, what the write answers, with `status`,
+`task_id` and `action`. On chain (`OUTLAYER_EXECUTION_TYPE` is anything but
+`HTTPS`) the answer is the output of a transaction the owner signed and stays
+public, so it carries `status`, `task_id`, `action`, and of the write's answer
+only `number`, `comment_id`, `review_id`, `commit`, `sha`, `created`, `merged`,
+`starred`, `state` and `writes_today`: no repository, branch, path, URL or text,
+and no gist id — a secret gist's id is its address. A refusal on chain keeps its
+code and says what happened in words that name nothing.
+
+**The daily cap counts confirmed writes for the agent that prepared them.** A
+run reads and writes the storage cell of the account that made it and no other,
+so there are two counts, and `max_writes_per_day` bounds each:
+
+| count | record | whose cell | written by |
+|---|---|---|---|
+| the writes an agent makes itself | `gh:writes:<day>` | the agent's | the agent's write |
+| the writes the owner confirmed for an agent | `gh:writes:<day>:confirmed:<preparer>` | the owner's | the owner's `confirm` |
+
+The manifest's per-wallet ceiling on `confirm`, 200 a day, stands beside the
+ceilings of the writes.
 
 ## Refusals
 
@@ -141,7 +251,7 @@ place to read them from.
 ## Build, publish, price
 
 ```bash
-./build.sh                    # checks the manifest against the code; prints the SHA256
+./build.sh                    # checks the manifest against the code and the tasks interface; prints the SHA256
 
 OUTLAYER_NETWORK=testnet outlayer upload target/wasm32-wasip2/release/github-connector.wasm \
   --receiver outlayer.testnet
@@ -166,6 +276,8 @@ no outbound allowlist.
 |---|---|
 | `src/main.rs` | the input shape, the dispatch, `status`, and the sealed policy readback |
 | `src/ops.rs` | every operation: the policy checks, the call, and what comes back |
+| `src/action.rs` | a write as one value: read from the call, checked, resolved, made — what a task holds sealed |
+| `src/confirm.rs` | a write the owner confirms: what they are shown, the task, the owner's `confirm`, what it answers on chain |
 | `src/policy.rs` | the owner's rules, the globs, and the day's counter |
 | `src/github.rs` | the REST client and GitHub's refusals turned into what to do |
 | `src/seal.rs` | sealing the policy to a caller's `reply_pubkey`, for answers that land on chain |
@@ -173,6 +285,9 @@ no outbound allowlist.
 ## Tests
 
 `cargo test` covers the policy (globs, fail-closed, the four refusals nothing
-else makes, paths that try to climb out), the translation of GitHub's answers,
-the day's counter with its give-back, and the seal against the golden vector the
-dashboard's test opens.
+else makes, paths that try to climb out, `confirm` naming only writes), the
+translation of GitHub's answers, the day's counter with its give-back and its
+count per preparer, that `status` reports every member of the policy, what each
+write shows the owner and keeps sealed, what refuses before and after the
+owner's answer is taken, what `confirm` answers on chain and off it, and the
+seal against the golden vector the dashboard's test opens.

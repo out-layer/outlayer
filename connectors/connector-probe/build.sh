@@ -31,6 +31,17 @@ for w in vrf payment; do
     fi
 done
 
+# The task interface comes through the SDK of this repository; its copy must be
+# the worker's for the same reason.
+if [ -f ../../worker/wit/deps/tasks.wit ]; then
+    if ! diff -q ../../worker/wit/deps/tasks.wit ../../sdk/outlayer/wit/deps/tasks.wit >/dev/null; then
+        echo "ERROR: sdk/outlayer/wit/deps/tasks.wit has drifted from worker/wit/deps/tasks.wit"
+        exit 1
+    fi
+else
+    echo "WARNING: ../../worker/wit/deps/tasks.wit not found — cannot check the SDK's tasks.wit for drift"
+fi
+
 # Build
 cargo build --target wasm32-wasip2 --release
 
@@ -59,15 +70,15 @@ echo "Size: ${SIZE_KB} KB (${SIZE_MB} MB)"
 # would still run every existing operation and silently test nothing in the two
 # that were added for it.
 if command -v wasm-tools >/dev/null 2>&1; then
-    for iface in "near:vrf" "near:payment"; do
+    for iface in "near:vrf" "near:payment" "outlayer:tasks"; do
         if ! wasm-tools component wit "$WASM_FILE" 2>/dev/null | grep -q "$iface"; then
             echo ""
             echo "ERROR: $WASM_FILE does not import $iface"
-            echo "The vrf/refund operations depend on it; a build without it tests nothing."
+            echo "The vrf, refund and guessing-game operations depend on it; a build without it tests nothing."
             exit 1
         fi
     done
-    echo "OK: near:vrf and near:payment are imported"
+    echo "OK: near:vrf, near:payment and outlayer:tasks are imported"
 fi
 
 if ! grep -qa 'outlayer.manifest' "$WASM_FILE"; then
@@ -129,6 +140,10 @@ readme = (root / "README.md").read_text(encoding="utf-8")
 documented = {op for op in manifest | dispatched if re.search(r"`" + re.escape(op) + r"`", readme)}
 
 problems = []
+# The game leaves the owner tasks, which the host allows only a manifest that
+# says so.
+if json.load(open(root / "manifest.json")).get("tasks") is not True:
+    problems.append('the manifest does not say "tasks": true, and `guess_start` opens tasks')
 if dispatched - manifest:
     problems.append("served but not declared in the manifest: %s" % sorted(dispatched - manifest))
 if manifest - dispatched:

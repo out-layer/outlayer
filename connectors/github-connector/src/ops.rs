@@ -2,54 +2,47 @@
 //! call to GitHub, and the part of GitHub's answer an agent can use.
 //!
 //! Every operation on a repository checks the action and the repository before
-//! anything else. Every write then takes a place in the owner's daily budget
-//! BEFORE GitHub is called and keeps it only when GitHub accepted — a refused
-//! write costs the owner nothing.
+//! anything else. Every write is an [`Action`]: read from the call and checked,
+//! then carried out — or, when the owner's policy lists it under `confirm`,
+//! left as a task for the owner (`crate::confirm`). Carrying it out takes a
+//! place in the owner's daily budget BEFORE GitHub is called and keeps it only
+//! when GitHub accepted — a refused write costs the owner nothing.
 //!
 //! Answers are cut down on purpose. GitHub describes one pull request in fifteen
 //! kilobytes, most of it URLs of other endpoints; what is returned here is what
 //! an agent reads or passes to the next call.
 
-use crate::github::{self as gh, file_path, query, segment};
-use crate::policy::{self, Policy};
-use crate::Input;
+use crate::action::Action;
+use crate::github::{self as gh, file_path, query};
+use crate::policy::{self, Confirmable, Counted, Policy};
+use crate::{confirm, Input};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::{json, Value};
 
 /// The largest file `file_get` returns, decoded.
-const MAX_FILE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_FILE_BYTES: usize = 256 * 1024;
 /// The most of one file's patch `pr_files` returns, and of all of them together.
 const MAX_PATCH_BYTES: usize = 8 * 1024;
 const MAX_PATCHES_TOTAL: usize = 120 * 1024;
-/// The longest text taken from an agent for a body, a comment or a description.
-const MAX_TEXT_BYTES: usize = 60 * 1024;
 
 // ==================== input helpers ====================
 
-fn need<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
+pub(crate) fn need<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
     match value.as_deref().map(str::trim) {
         Some(v) if !v.is_empty() => Ok(v),
         _ => Err(format!("invalid: `{name}` is required")),
     }
 }
 
-fn repo(input: &Input) -> Result<&str, String> {
+pub(crate) fn repo(input: &Input) -> Result<&str, String> {
     let repo = need(&input.repo, "repo")?;
     policy::clean_repo(repo)?;
     Ok(repo)
 }
 
-fn number(input: &Input) -> Result<u64, String> {
+pub(crate) fn number(input: &Input) -> Result<u64, String> {
     input.number.filter(|n| *n > 0).ok_or_else(|| "invalid: `number` is required".to_string())
-}
-
-fn text(value: &Option<String>, name: &str) -> Result<String, String> {
-    let text = value.clone().unwrap_or_default();
-    if text.len() > MAX_TEXT_BYTES {
-        return Err(format!("invalid: `{name}` is {} bytes; the most taken is {MAX_TEXT_BYTES}", text.len()));
-    }
-    Ok(text)
 }
 
 fn paging(input: &Input) -> [(&'static str, Option<String>); 2] {
@@ -59,7 +52,7 @@ fn paging(input: &Input) -> [(&'static str, Option<String>); 2] {
     ]
 }
 
-fn one_of(value: &Option<String>, name: &str, allowed: &[&str]) -> Result<Option<String>, String> {
+pub(crate) fn one_of(value: &Option<String>, name: &str, allowed: &[&str]) -> Result<Option<String>, String> {
     match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(None),
         Some(v) if allowed.contains(&v) => Ok(Some(v.to_string())),
@@ -78,7 +71,7 @@ fn reading<'a>(input: &'a Input, operation: &str) -> Result<(Policy, &'a str), S
 
 // ==================== what an agent gets back ====================
 
-fn s(value: &Value, key: &str) -> Value {
+pub(crate) fn s(value: &Value, key: &str) -> Value {
     value.get(key).cloned().unwrap_or(Value::Null)
 }
 
@@ -182,21 +175,12 @@ pub fn repo_get(input: &Input) -> Result<Value, String> {
     Ok(repo_view(&gh::get(&format!("/repos/{repo}"))?))
 }
 
-fn star(input: &Input, operation: &str, on: bool) -> Result<Value, String> {
-    let (rules, repo) = reading(input, operation)?;
-    let (place, used) = rules.reserve_write()?;
-    let path = format!("/user/starred/{repo}");
-    if on { gh::put(&path, None)? } else { gh::delete(&path)? };
-    place.keep();
-    Ok(json!({"repo": repo, "starred": on, "writes_today": used}))
-}
-
 pub fn repo_star(input: &Input) -> Result<Value, String> {
-    star(input, "repo_star", true)
+    write(input, Confirmable::RepoStar)
 }
 
 pub fn repo_unstar(input: &Input) -> Result<Value, String> {
-    star(input, "repo_unstar", false)
+    write(input, Confirmable::RepoUnstar)
 }
 
 // ==================== files and branches ====================
@@ -272,149 +256,17 @@ pub fn branch_list(input: &Input) -> Result<Value, String> {
     Ok(json!({"repo": repo, "branches": branches}))
 }
 
-fn default_branch(repo: &str) -> Result<String, String> {
-    gh::get(&format!("/repos/{repo}"))?
-        .get("default_branch")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| "github_refused: the repository did not name its default branch".to_string())
-}
-
-/// A branch the agent may write to. One more request only when the policy
-/// reached it through a pattern — then the default branch has to be ruled out.
-fn writable_branch(rules: &Policy, repo: &str, branch: &str) -> Result<(), String> {
-    policy::clean_branch(branch)?;
-    let matched = rules.check_branch(branch)?;
-    if matched == policy::BranchMatch::Pattern {
-        Policy::check_not_default(matched, branch, &default_branch(repo)?)?;
-    }
-    Ok(())
-}
-
 pub fn branch_create(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "branch_create")?;
-    let branch = need(&input.branch, "branch")?;
-    writable_branch(&rules, repo, branch)?;
-    let from = match input.from.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
-        Some(from) => {
-            policy::clean_branch(from)?;
-            from.to_string()
-        }
-        None => default_branch(repo)?,
-    };
-    let (place, used) = rules.reserve_write()?;
-    let sha = gh::get(&format!("/repos/{repo}/git/ref/heads/{from}"))?
-        .get("object")
-        .and_then(|o| o.get("sha"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("not_found: the branch `{from}` has no commit to start from"))?;
-    gh::post(&format!("/repos/{repo}/git/refs"), &json!({"ref": format!("refs/heads/{branch}"), "sha": sha}))?;
-    place.keep();
-    Ok(json!({"repo": repo, "branch": branch, "from": from, "sha": sha, "writes_today": used}))
-}
-
-/// Text as it is, or bytes as base64 — the two ways an agent hands over a file.
-fn content_bytes(content: &Option<String>, encoding: &Option<String>, what: &str) -> Result<Vec<u8>, String> {
-    let content = content.as_deref().ok_or_else(|| format!("invalid: {what} needs `content`"))?;
-    match encoding.as_deref().map(str::trim).unwrap_or("utf-8") {
-        "utf-8" | "" => Ok(content.as_bytes().to_vec()),
-        "base64" => BASE64
-            .decode(content.chars().filter(|c| !c.is_whitespace()).collect::<String>().as_bytes())
-            .map_err(|e| format!("invalid: {what} says base64 and is not: {e}")),
-        other => Err(format!("invalid: `encoding` is `utf-8` or `base64`, got `{other}`")),
-    }
+    write(input, Confirmable::BranchCreate)
 }
 
 pub fn file_put(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "file_put")?;
-    let branch = need(&input.branch, "branch")?;
-    let path = need(&input.path, "path")?;
-    let message = need(&input.message, "message")?;
-    rules.check_path(path)?;
-    writable_branch(&rules, repo, branch)?;
-    let bytes = content_bytes(&input.content, &input.encoding, "`file_put`")?;
-    if bytes.len() > MAX_FILE_BYTES * 4 {
-        return Err(format!("too_large: the file is {} bytes; the most written is {}", bytes.len(), MAX_FILE_BYTES * 4));
-    }
-    let mut body = json!({"message": message, "content": BASE64.encode(&bytes), "branch": branch});
-    // Present for an update, absent for a new file: GitHub refuses an update
-    // without it, which is what stops one write landing on top of another.
-    if let Some(sha) = input.sha.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        body["sha"] = json!(sha);
-    }
-    let (place, used) = rules.reserve_write()?;
-    let answer = gh::put(&format!("/repos/{repo}/contents/{}", file_path(path)), Some(&body)).map_err(|e| {
-        if e.starts_with("invalid:") && e.contains("sha") {
-            format!("{e}. The file exists: read it with `file_get` and pass its `sha` to replace it")
-        } else {
-            e
-        }
-    })?;
-    place.keep();
-    Ok(json!({
-        "repo": repo, "branch": branch, "path": path, "created": answer.status == 201,
-        "sha": answer.body.get("content").map(|c| s(c, "sha")).unwrap_or(Value::Null),
-        "commit": answer.body.get("commit").map(|c| s(c, "sha")).unwrap_or(Value::Null),
-        "url": answer.body.get("content").map(|c| s(c, "html_url")).unwrap_or(Value::Null),
-        "writes_today": used,
-    }))
+    write(input, Confirmable::FilePut)
 }
 
-/// Several files in one commit, through the Git Data API: the tree is built on
-/// the branch's own tree, the commit on its head, and the branch is moved
-/// without force — a branch that moved meanwhile answers `conflict`.
+/// Several files in one commit, through the Git Data API.
 pub fn commit(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "commit")?;
-    let branch = need(&input.branch, "branch")?;
-    let message = need(&input.message, "message")?;
-    if input.files.is_empty() {
-        return Err("invalid: `files` is required: [{\"path\", \"content\"}] or [{\"path\", \"delete\": true}]".to_string());
-    }
-    if input.files.len() > policy::MAX_FILES_PER_COMMIT {
-        return Err(format!(
-            "too_large: {} files in one commit; a run has time for {}. Split it into several commits",
-            input.files.len(),
-            policy::MAX_FILES_PER_COMMIT
-        ));
-    }
-    for file in &input.files {
-        rules.check_path(&file.path)?;
-    }
-    writable_branch(&rules, repo, branch)?;
-
-    let (place, used) = rules.reserve_write()?;
-    let head = gh::get(&format!("/repos/{repo}/git/ref/heads/{branch}"))?
-        .get("object").and_then(|o| o.get("sha")).and_then(Value::as_str).map(str::to_string)
-        .ok_or_else(|| format!("not_found: the branch `{branch}` does not exist; create it with `branch_create`"))?;
-    let base_tree = gh::get(&format!("/repos/{repo}/git/commits/{head}"))?
-        .get("tree").and_then(|t| t.get("sha")).and_then(Value::as_str).map(str::to_string)
-        .ok_or_else(|| "github_refused: the branch's head has no tree".to_string())?;
-
-    let mut tree = Vec::with_capacity(input.files.len());
-    for file in &input.files {
-        if file.delete {
-            tree.push(json!({"path": file.path, "mode": "100644", "type": "blob", "sha": Value::Null}));
-            continue;
-        }
-        let bytes = content_bytes(&file.content, &file.encoding, &format!("`{}`", file.path))?;
-        match String::from_utf8(bytes) {
-            // Text rides in the tree itself: no request of its own.
-            Ok(text) => tree.push(json!({"path": file.path, "mode": "100644", "type": "blob", "content": text})),
-            Err(binary) => {
-                let blob = gh::post(&format!("/repos/{repo}/git/blobs"), &json!({"content": BASE64.encode(binary.into_bytes()), "encoding": "base64"}))?;
-                tree.push(json!({"path": file.path, "mode": "100644", "type": "blob", "sha": s(&blob, "sha")}));
-            }
-        }
-    }
-    let new_tree = gh::post(&format!("/repos/{repo}/git/trees"), &json!({"base_tree": base_tree, "tree": tree}))?;
-    let new_commit = gh::post(&format!("/repos/{repo}/git/commits"), &json!({"message": message, "tree": s(&new_tree, "sha"), "parents": [head]}))?;
-    let sha = s(&new_commit, "sha");
-    // Never forced. A branch that moved since `head` was read refuses this, and
-    // the agent reads again rather than overwriting somebody's push.
-    gh::patch(&format!("/repos/{repo}/git/refs/heads/{branch}"), &json!({"sha": sha, "force": false}))?;
-    place.keep();
-    Ok(json!({"repo": repo, "branch": branch, "commit": sha, "parent": head, "files": input.files.len(), "url": s(&new_commit, "html_url"), "writes_today": used}))
+    write(input, Confirmable::Commit)
 }
 
 // ==================== issues ====================
@@ -455,48 +307,17 @@ pub fn issue_get(input: &Input) -> Result<Value, String> {
 }
 
 pub fn issue_create(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "issue_create")?;
-    let title = need(&input.title, "title")?;
-    let mut body = json!({"title": title, "body": rules.mark(&text(&input.body, "body")?)});
-    if let Some(labels) = &input.labels { body["labels"] = json!(labels); }
-    if let Some(assignees) = &input.assignees { body["assignees"] = json!(assignees); }
-    let (place, used) = rules.reserve_write()?;
-    let issue = gh::post(&format!("/repos/{repo}/issues"), &body)?;
-    place.keep();
-    Ok(json!({"repo": repo, "number": s(&issue, "number"), "url": s(&issue, "html_url"), "writes_today": used}))
+    write(input, Confirmable::IssueCreate)
 }
 
 /// A comment on an issue — or on a pull request's conversation, which GitHub
 /// keeps in the same place under the same number.
 pub fn issue_comment(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "issue_comment")?;
-    let n = number(input)?;
-    let said = text(&input.body, "body")?;
-    if said.trim().is_empty() {
-        return Err("invalid: `body` is required".to_string());
-    }
-    let (place, used) = rules.reserve_write()?;
-    let comment = gh::post(&format!("/repos/{repo}/issues/{n}/comments"), &json!({"body": rules.mark(&said)}))?;
-    place.keep();
-    Ok(json!({"repo": repo, "number": n, "comment_id": s(&comment, "id"), "url": s(&comment, "html_url"), "writes_today": used}))
+    write(input, Confirmable::IssueComment)
 }
 
 pub fn issue_update(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "issue_update")?;
-    let n = number(input)?;
-    let mut body = json!({});
-    if let Some(state) = one_of(&input.state, "state", &["open", "closed"])? { body["state"] = json!(state); }
-    if let Some(title) = input.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) { body["title"] = json!(title); }
-    if input.body.is_some() { body["body"] = json!(rules.mark(&text(&input.body, "body")?)); }
-    if let Some(labels) = &input.labels { body["labels"] = json!(labels); }
-    if let Some(assignees) = &input.assignees { body["assignees"] = json!(assignees); }
-    if body.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        return Err("invalid: nothing to change — give `state`, `title`, `body`, `labels` or `assignees`".to_string());
-    }
-    let (place, used) = rules.reserve_write()?;
-    let issue = gh::patch(&format!("/repos/{repo}/issues/{n}"), &body)?;
-    place.keep();
-    Ok(json!({"repo": repo, "number": n, "state": s(&issue, "state"), "url": s(&issue, "html_url"), "writes_today": used}))
+    write(input, Confirmable::IssueUpdate)
 }
 
 // ==================== pull requests ====================
@@ -561,66 +382,16 @@ pub fn pr_files(input: &Input) -> Result<Value, String> {
 }
 
 pub fn pr_create(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "pr_create")?;
-    let title = need(&input.title, "title")?;
-    let head = need(&input.head, "head")?;
-    let base = need(&input.base, "base")?;
-    // The agent opens pull requests FROM branches it may write; where they point
-    // is the owner's review to make.
-    writable_branch(&rules, repo, head)?;
-    policy::clean_branch(base)?;
-    let body = json!({"title": title, "head": head, "base": base, "body": rules.mark(&text(&input.body, "body")?), "draft": input.draft.unwrap_or(false)});
-    let (place, used) = rules.reserve_write()?;
-    let pr = gh::post(&format!("/repos/{repo}/pulls"), &body)?;
-    place.keep();
-    Ok(json!({"repo": repo, "number": s(&pr, "number"), "url": s(&pr, "html_url"), "writes_today": used}))
+    write(input, Confirmable::PrCreate)
 }
 
 /// A review: a verdict, a summary, and comments on lines of the diff.
 pub fn pr_review(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "pr_review")?;
-    let n = number(input)?;
-    let event = one_of(&input.event, "event", &["COMMENT", "REQUEST_CHANGES", "APPROVE"])?.unwrap_or_else(|| "COMMENT".to_string());
-    if event == "APPROVE" {
-        rules.check_approve()?;
-    }
-    let summary = text(&input.body, "body")?;
-    if summary.trim().is_empty() && input.comments.is_empty() {
-        return Err("invalid: a review needs a `body`, `comments`, or both".to_string());
-    }
-    if input.comments.len() > 50 {
-        return Err(format!("invalid: {} comments in one review; the most taken is 50", input.comments.len()));
-    }
-    let mut comments = Vec::with_capacity(input.comments.len());
-    for c in &input.comments {
-        if c.path.trim().is_empty() || c.line == 0 || c.body.trim().is_empty() {
-            return Err("invalid: each review comment needs `path`, `line` and `body`".to_string());
-        }
-        let side = one_of(&c.side, "side", &["LEFT", "RIGHT"])?.unwrap_or_else(|| "RIGHT".to_string());
-        comments.push(json!({"path": c.path, "line": c.line, "side": side, "body": c.body}));
-    }
-    // The marker goes on the summary, once per review, not on every line comment.
-    let body = json!({"event": event, "body": rules.mark(&summary), "comments": comments});
-    let (place, used) = rules.reserve_write()?;
-    let review = gh::post(&format!("/repos/{repo}/pulls/{n}/reviews"), &body)?;
-    place.keep();
-    Ok(json!({"repo": repo, "number": n, "review_id": s(&review, "id"), "state": s(&review, "state"), "url": s(&review, "html_url"), "writes_today": used}))
+    write(input, Confirmable::PrReview)
 }
 
 pub fn pr_merge(input: &Input) -> Result<Value, String> {
-    let (rules, repo) = reading(input, "pr_merge")?;
-    rules.check_merge()?;
-    let n = number(input)?;
-    let method = one_of(&input.merge_method, "merge_method", &["merge", "squash", "rebase"])?.unwrap_or_else(|| "squash".to_string());
-    let mut body = json!({"merge_method": method});
-    // Merges only the head the agent looked at, when it says which.
-    if let Some(sha) = input.sha.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        body["sha"] = json!(sha);
-    }
-    let (place, used) = rules.reserve_write()?;
-    let answer = gh::put(&format!("/repos/{repo}/pulls/{n}/merge"), Some(&body))?;
-    place.keep();
-    Ok(json!({"repo": repo, "number": n, "merged": s(&answer.body, "merged"), "commit": s(&answer.body, "sha"), "writes_today": used}))
+    write(input, Confirmable::PrMerge)
 }
 
 // ==================== gists ====================
@@ -633,7 +404,7 @@ pub fn gist_list(input: &Input) -> Result<Value, String> {
     Ok(json!({"gists": gists, "page": input.page.unwrap_or(1).max(1)}))
 }
 
-fn gist_id(input: &Input) -> Result<&str, String> {
+pub(crate) fn gist_id(input: &Input) -> Result<&str, String> {
     let id = need(&input.gist_id, "gist_id")?;
     if id.len() > 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("invalid: `gist_id` is the hexadecimal id from a gist's URL, got `{id}`"));
@@ -647,63 +418,29 @@ pub fn gist_get(input: &Input) -> Result<Value, String> {
     Ok(gist_view(&gh::get(&format!("/gists/{}", gist_id(input)?))?, true))
 }
 
-/// `files` as GitHub's gist API takes them: a name to its content, or to `null`
-/// to remove it.
-fn gist_files(input: &Input, removing_allowed: bool) -> Result<Value, String> {
-    if input.files.is_empty() {
-        return Err("invalid: `files` is required: [{\"path\": \"notes.md\", \"content\": \"…\"}]".to_string());
-    }
-    let mut files = serde_json::Map::new();
-    for file in &input.files {
-        let name = file.path.trim();
-        if name.is_empty() || name.contains('/') || name.len() > 255 {
-            return Err(format!("invalid: a gist file's `path` is a plain file name, got `{}`", file.path));
-        }
-        if file.delete {
-            if !removing_allowed {
-                return Err("invalid: a new gist has no file to delete".to_string());
-            }
-            files.insert(name.to_string(), Value::Null);
-            continue;
-        }
-        let bytes = content_bytes(&file.content, &file.encoding, &format!("`{name}`"))?;
-        let content = String::from_utf8(bytes).map_err(|_| format!("invalid: `{name}` is not text; a gist holds text"))?;
-        if content.trim().is_empty() {
-            return Err(format!("invalid: `{name}` is empty; GitHub does not keep an empty gist file"));
-        }
-        files.insert(name.to_string(), json!({"content": content}));
-    }
-    Ok(Value::Object(files))
-}
-
 pub fn gist_create(input: &Input) -> Result<Value, String> {
-    let rules = policy::require()?;
-    rules.check_action("gist_create")?;
-    let public = input.public.unwrap_or(false);
-    rules.check_public_gist(public)?;
-    let body = json!({"description": text(&input.description, "description")?, "public": public, "files": gist_files(input, false)?});
-    let (place, used) = rules.reserve_write()?;
-    let gist = gh::post("/gists", &body)?;
-    place.keep();
-    Ok(json!({"gist_id": s(&gist, "id"), "public": s(&gist, "public"), "url": s(&gist, "html_url"), "writes_today": used}))
+    write(input, Confirmable::GistCreate)
 }
 
-/// Changes a gist's files or description. It cannot make a secret gist public:
-/// GitHub's API has no such switch, and this does not pretend to have one.
+/// Changes a gist's files or description.
 pub fn gist_update(input: &Input) -> Result<Value, String> {
+    write(input, Confirmable::GistUpdate)
+}
+
+// ==================== every write ====================
+
+/// A write: read and checked, then carried out for the caller — or, when the
+/// owner's policy lists the operation under `confirm`, left as a task for the
+/// owner, and answered `awaiting_owner`.
+fn write(input: &Input, operation: Confirmable) -> Result<Value, String> {
     let rules = policy::require()?;
-    rules.check_action("gist_update")?;
-    let id = gist_id(input)?;
-    let mut body = json!({});
-    if !input.files.is_empty() { body["files"] = gist_files(input, true)?; }
-    if input.description.is_some() { body["description"] = json!(text(&input.description, "description")?); }
-    if body.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        return Err("invalid: nothing to change — give `files`, `description` or both".to_string());
+    let for_owner = rules.confirms(operation);
+    // Everything is checked before anything is written or shown to the owner.
+    let action = Action::prepare(operation, input, &rules, for_owner)?;
+    if for_owner {
+        return confirm::ask(&action);
     }
-    let (place, used) = rules.reserve_write()?;
-    let gist = gh::patch(&format!("/gists/{}", segment(id)), &body)?;
-    place.keep();
-    Ok(json!({"gist_id": s(&gist, "id"), "public": s(&gist, "public"), "url": s(&gist, "html_url"), "writes_today": used}))
+    action.execute(&rules, Counted::Own)
 }
 
 #[cfg(test)]
@@ -727,15 +464,5 @@ mod tests {
         assert_eq!(view["head"], json!({"branch":"agent/x","sha":"abc","repo":"a/b"}));
         assert_eq!(view["author"], "alice");
         assert!(view.get("_links").is_none() && view.get("statuses_url").is_none());
-    }
-
-    #[test]
-    fn a_gist_file_is_a_name_and_text() {
-        let input = |json: &str| serde_json::from_str::<Input>(json).unwrap();
-        assert!(gist_files(&input(r#"{"files":[{"path":"a.md","content":"x"}]}"#), false).is_ok());
-        assert!(gist_files(&input(r#"{"files":[{"path":"dir/a.md","content":"x"}]}"#), false).is_err());
-        assert!(gist_files(&input(r#"{"files":[{"path":"a.md","content":"  "}]}"#), false).is_err());
-        assert!(gist_files(&input(r#"{"files":[{"path":"a.md","delete":true}]}"#), false).is_err());
-        assert_eq!(gist_files(&input(r#"{"files":[{"path":"a.md","delete":true}]}"#), true).unwrap()["a.md"], Value::Null);
     }
 }

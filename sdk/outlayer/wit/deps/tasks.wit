@@ -14,8 +14,9 @@ package outlayer:tasks@0.1.0;
 ///
 /// **Whose task.** The owner of a task is the owner of the secret row the run
 /// named and the keystore opened — never an account the component names. The
-/// preparer is the account that made the run. The host decides both from the
-/// job; no function here takes an account.
+/// preparer is the account that made the run; a task opened by a run that
+/// answered one continues that task's conversation and keeps its preparer.
+/// The host decides both from the job; no function here takes an account.
 ///
 /// **Who may do what.**
 ///
@@ -153,7 +154,7 @@ interface api {
         /// SHA-256 of the task's envelope, hex: what the owner's answer names.
         hash: string,
         /// The id of the first task of the conversation: this task's own, or
-        /// that of the task this run answered.
+        /// that of the task this run answered, whose preparer it keeps.
         thread: string,
         /// Unix seconds.
         expires-at: u64,

@@ -89,7 +89,15 @@ pub struct TasksHostState {
     devices: Option<Vec<Device>>,
     /// The conversation a task opened in this run continues: that of the
     /// first task this run answered.
-    thread: Option<String>,
+    thread: Option<Thread>,
+}
+
+/// A conversation a run continues, as the task it answered sealed it: its
+/// id and the account it is with.
+#[derive(Debug, Clone)]
+struct Thread {
+    id: String,
+    preparer: String,
 }
 
 impl TasksHostState {
@@ -531,6 +539,25 @@ impl wit::Host for TasksHostState {
         let devices = devices_of_the_run(&mut self.devices, ready)?;
 
         let id = format!("{}-{opened}", ready.run);
+        // A task opened in a run that answered one is the next turn of that
+        // task's conversation, and is with the same account: its preparer is
+        // the answered task's, not this run's caller. The owner's inbox shows
+        // the turn from that agent, the agent's `mine` and `status` list it,
+        // and the store counts it in that agent's share and under its mute.
+        //
+        // This lets an owner's run name another account as a preparer, and
+        // only this way: `answered` takes an answer from the owner's own run
+        // alone, so a thread is held only by one; the thread and its preparer
+        // are the ones sealed in the task answered, which opened under this
+        // project's and this owner's key; and the new task's owner is the
+        // row's owner, that same owner. An owner attributes a task to an
+        // agent only inside a conversation that agent started, in their own
+        // inbox. A run that answered nothing opens as its caller, in a
+        // conversation of its own.
+        let (preparer, thread) = match thread {
+            Some(Thread { id: thread, preparer }) => (preparer, thread),
+            None => (ready.caller.clone(), id.clone()),
+        };
         let keys = ready.keys(&id);
         let now = u64::try_from((ready.now)()).unwrap_or(0);
         let kind = match request.kind {
@@ -564,13 +591,13 @@ impl wit::Host for TasksHostState {
             kind: kind.0,
             owner: ready.scope.owner.clone(),
             policy_hash: envelope::hash(&request.policy),
-            preparer: ready.caller.clone(),
+            preparer: preparer.clone(),
             profile: ready.profile.clone(),
             project: ready.project_id.clone(),
             project_uuid: ready.scope.project_uuid.clone(),
             reply_pubkey: keys.reply_pubkey(),
             state_hash: envelope::hash(&request.state),
-            thread: thread.unwrap_or_else(|| id.clone()),
+            thread,
             v: envelope::VERSION,
         };
         let document = task.to_bytes().map_err(|why| refused(wit::Reason::Unavailable, why))?;
@@ -605,7 +632,7 @@ impl wit::Host for TasksHostState {
         let new = NewTask {
             id: id.clone(),
             project_id: ready.project_id.clone(),
-            preparer: ready.caller.clone(),
+            preparer,
             profile: ready.profile.clone(),
             vault: ready.grant.vault.clone(),
             kind: kind.1,
@@ -775,9 +802,11 @@ impl wit::Host for TasksHostState {
         }
         tracing::info!(task = %id, run = %ready.run, "task answered");
 
+        self.thread
+            .get_or_insert_with(|| Thread { id: task.envelope.thread.clone(), preparer: task.envelope.preparer.clone() });
         let answer = wit::Answer {
             id,
-            thread: task.envelope.thread.clone(),
+            thread: task.envelope.thread,
             preparer: task.envelope.preparer,
             kind: match task.envelope.kind {
                 envelope::Kind::Confirm => wit::TaskKind::Confirm,
@@ -788,7 +817,6 @@ impl wit::Host for TasksHostState {
             files,
             supplied,
         };
-        self.thread.get_or_insert(task.envelope.thread);
         Ok(answer)
     }
 

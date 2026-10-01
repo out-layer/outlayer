@@ -81,11 +81,61 @@ with no price and no fee.
 | `fail` | $0.01 | the module answers `ok: false` and exits 1 — shows how a non-zero exit is reported and billed |
 | `sleep` | $0.01 | sleeps `seconds` (≤ 600) so the execution limit, not the module, ends the run |
 | `budget` | free | a daily budget kept the way the connectors keep theirs: `mode` reserve / release / read against `cap` on counter `run`, through the atomic `storage::increment`; `tests/connector_budget_parallel_e2e.sh` fires it in parallel to show the cap holds |
+| `guess_start` | $0.01, share 0 | tasks between an agent and its owner, over several turns: picks a number and leaves the owner the first task of a game (below) |
+| `guess` | free | the owner's answer to a turn of the game: judges the guess, reports it, and opens the next turn in the same thread |
+| `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | free | the SDK's own task operations (`outlayer::tasks::dispatch`) |
 | `unpriced` | — | absent from the price table AND unimplemented here: must be refused before anything runs |
 
 `forbidden_fetch` **passes when it fails**: `ok: false` with an `http_error` is
 the expected result. A success means an undeclared host was reachable from
 inside a TEE that holds keys, and the manifest allowlist is not being enforced.
+
+## The guessing game
+
+A conversation of several turns through tasks (`docs/TASKS.md`): the agent
+starts a game, the owner plays it from the inbox, and neither of them reads the
+number.
+
+**The agent starts it.** The call names the owner's row, which must admit the
+agent's account **by name** (a `whitelist:` access, as in the next section);
+a row open to everyone is refused `not_granted_by_name`.
+
+```bash
+curl -s https://testnet-api.outlayer.ai/call/connectors.outlayer.testnet/connector-probe \
+  -H "X-Payment-Key: $AGENT_PAYMENT_KEY" -H 'Content-Type: application/json' \
+  -d '{"input": {"operation": "guess_start", "max": 100},
+       "secrets_ref": {"account_id": "you.testnet", "profile": "shared"}}'
+```
+
+`max` is a whole number from 2 to 1000, and 100 when it is not named. The run
+picks a number from 1 to `max` and opens an `input` task, `Guess my number`,
+asking `I picked a number from 1 to {max}. Your guess?`; the answer carries
+`status: "awaiting_owner"`, `task_id`, `task_hash` and the inbox `link`.
+
+**The owner plays it in the inbox.** The page seals the text they type, and
+their own call runs `guess`, which judges it:
+
+- wrong — reports `higher` or `lower` with the attempt count, and opens the
+  next task of the same thread, which shows the guess, the answer and the
+  attempts so far;
+- not a whole number from 1 to `max` — a wrong turn too: an answered task
+  cannot be un-answered, so the next task says `not a number from 1 to {max}`
+  and the game goes on;
+- right — reports `guessed in {n} attempts`, and opens nothing.
+
+**The agent reads the outcome** with `task_status` (`{"operation":
+"task_status", "task_id": "…"}`) or `tasks`. The result of a turn is
+`{attempt, guess, verdict, max, detail}`, with `next_task_id` when the game goes
+on. Every turn is the agent's: a task opened by the owner's answering run keeps
+the conversation's preparer, so the agent follows the whole game with
+`task_status` on each `next_task_id`, or with `tasks`.
+
+**Where the number is.** In the task's sealed `state`, handed from turn to
+turn — not in storage, which is per account, so the agent's run and the
+owner's would read different cells. The envelope the owner reads carries
+`state_hash`, the SHA-256 of the state, so the state carries 32 random bytes
+beside `{secret, max, attempts}`: without them, hashing the state of every
+number from 1 to `max` would name the secret.
 
 ## The secret
 

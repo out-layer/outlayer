@@ -10,15 +10,19 @@ name = "connector-probe"
 path = "src/main.rs"
 
 [dependencies]
-outlayer = "0.1"
-# The VRF and payment host functions are NOT in the `outlayer` SDK crate — its
-# world covers env and storage only — so their bindings are generated here from
-# the copies in `wit/`.
+# The SDK of this repository. `tasks`: the guessing game leaves the owner a
+# task each turn, and `tasks::dispatch` serves the five task operations.
+outlayer = { version = "0.2", path = "../../sdk/outlayer", features = ["tasks"] }
+# The payment host functions are NOT in the `outlayer` SDK crate, so their
+# bindings — and VRF's, from the same checked copies — are generated here from
+# `wit/`.
 wit-bindgen = "0.36"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 hex = "0.4"
+# The game's secret number and the salt sealed beside it.
+getrandom = "0.2"
 # The same client near.email uses, so the egress path under test is the real one.
 wasi-http-client = "0.2"
 

@@ -573,6 +573,9 @@ Four rules a connector keeps:
 The owner answers with a direct call of their own, so a connector that declares
 `tasks` cannot shut the direct door (§4.9).
 
+The pattern in code — the policy's `confirm`, the operation `confirm`, what it
+answers on chain, prices, manifest, tests — is [CONNECTOR_TASKS.md](CONNECTOR_TASKS.md).
+
 ### 4.9 Who may call you
 
 The manifest's `callers` block says which doors a run may come through: a
