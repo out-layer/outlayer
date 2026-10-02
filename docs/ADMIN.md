@@ -45,7 +45,7 @@ Ordered by what it costs, not by how it reads.
 |---|---|
 | **Spends our money** | `POST /admin/grant-payment-key` — funds an existing key from our balance and marks it `is_grant`: that balance cannot be withdrawn or forwarded to a developer. Refuses the trial key (nonce 0) with 400 and points to `grant-subscription`. `POST /admin/grant-subscription` `{owner, nonce, amount_usd?, days?, note?}` — sets what an existing key (the trial included) can spend from its allowance to exactly `amount_usd` (default `GIFT_SUBSCRIPTION_USD`) and runs it until at least now + `days` (default `GIFT_SUBSCRIPTION_DAYS`, 1–3650). `amount_usd` may be lower than `GIFT_SUBSCRIPTION_USD`, never higher (400). 409 when the key can already spend more than `amount_usd`; 404 when the key, or on nonce 0 the claimed trial, does not exist. On nonce 0 it converts the trial (`trial_converted`: no call count, `has_subscription: true`). It does not touch the key's balance or set `is_grant`; the allowance cannot be withdrawn or attached as `X-Attached-Deposit` (`allowance_no_deposit`). Neither route can CREATE a key. So a leaked token reaches: arbitrary non-withdrawable value on any existing key through `grant-payment-key`, and up to `GIFT_SUBSCRIPTION_USD` of allowance at a time through `grant-subscription` — the attacker's own keys included — spendable on compute and connector operations at our cost. |
 | **Breaks operations** | `DELETE /admin/workers/{worker_id}`, `DELETE /admin/grant-keys/{owner}/{nonce}` — remove records other things rely on. |
-| **Widens what the coordinator concludes** | `POST /admin/binding-zones`, `POST /admin/hos-impl-code-hashes`, `POST /admin/hos-impl-versions`, `POST /admin/wallet-code-hashes` — see below; all are lists whose growth relaxes a check. |
+| **Widens what the coordinator concludes** | `POST /admin/binding-zones`, `POST /admin/hos-impl-code-hashes`, `POST /admin/hos-impl-versions`, `POST /admin/wallet-code-hashes`, `POST /admin/contract-wallet-code-hashes` — see below; all are lists whose growth relaxes a check. |
 | **Reads customer data** | `GET /admin/earnings`, `/admin/connector-calls`, `/admin/egress-audit`, `/admin/compile-logs/{job_id}`, `/admin/health/detailed`. Egress audit is every outbound attempt every guest made. |
 | **Harmless to repeat** | `POST /admin/collateral/check`, `GET /admin/collateral/status`, `GET /admin/binding-implementations`, `POST /admin/keystore-stats/refresh`, `POST /admin/connector-prices/refresh` — refreshes and reads, idempotent by construction. |
 
@@ -59,7 +59,7 @@ a row. The rule that put them here: the enclave carries only what it *does*
 version, which zone) is data with an audit trail. They move in **opposite
 safety directions**, which is the only thing worth memorising about them.
 
-Four lists, one question each:
+Five lists, one question each:
 
 | List | Mode | Question it answers |
 |---|---|---|
@@ -67,6 +67,7 @@ Four lists, one question each:
 | `/admin/hos-impl-code-hashes` | `hos_lease` | which implementation code we recognize on a leased account |
 | `/admin/hos-impl-versions` | `hos_lease` | which nested-request decoder reads each partner `impl_version` |
 | `/admin/wallet-code-hashes` | `personal_account` | which wallet builds we recognize on an owner's own account |
+| `/admin/contract-wallet-code-hashes` | multisig votes | which contract-wallet builds may vote on an approval, and how their votes are resolved |
 
 `GET /admin/binding-implementations` reads what every live binding runs right
 now and holds it against the lists — the operator's early warning.
@@ -119,15 +120,20 @@ POST   /admin/hos-impl-code-hashes   {"from_account": "...", "note": "..."}
 DELETE /admin/hos-impl-code-hashes/{code_hash}
 ```
 
-**Do not read the hash off the leased account.** These accounts reference a
-global contract BY ACCOUNT ID, which leaves their own `code_hash` at the
-all-zeros sentinel — the code that identifies them is on the implementation
-account, one view further on. Send `from_account` and the coordinator makes that
-hop itself (`near_client::fetch_impl_code_hash`); the sentinel is rejected
-explicitly, because listing it would make every codeless account "recognized".
+**Do not read the hash off the leased account, nor off the account it names.**
+These accounts reference a global contract BY ACCOUNT ID, which leaves their own
+`code_hash` at the all-zeros sentinel. The code they run is the global contract
+that account has PUBLISHED (`view_global_contract_code_by_account_id`), and that
+is not the code the publishing account runs itself: on testnet
+`impl.tlademo.testnet` runs `E7MnVKJe…` and publishes `6a7LjLMn…`, the wallet
+the leased accounts run. Send `from_account` naming a LEASED account and the
+coordinator follows its reference to the published code itself
+(`near_client::fetch_impl_code_hash`). Naming the publisher instead answers the
+publisher's own contract, a hash no leased account runs. The sentinel is rejected explicitly,
+because listing it would make every codeless account "recognized".
 
-And because the indirection is **mutable** — whoever owns the implementation
-account can redeploy it with no event on the leased accounts at all — a hash
+And because the indirection is **mutable** — whoever owns the publishing account
+can republish with no event on the leased accounts at all — a hash
 here is a fact about a moment, never a guarantee about a period. An upgrade on
 their side stops matching, the affected bindings go `suspended`, and adding the
 new hash restores them.
@@ -162,10 +168,10 @@ before any RPC, so an unused list costs one local query per observation. With a
 list, the extra work depends on the account: one that deploys its code inline
 states its hash in the view already fetched and costs nothing more; one that
 names a global contract by account id — which is what these leased accounts do —
-costs one further `view_account`. On the refusing path that lands exactly when
-the chain is already slow, which is the trade the table buys. The five-second
-observation cache absorbs bursts on the signing path; nothing caches it on the
-status path.
+costs a read of the published code, and that read downloads the whole wasm
+(about half a megabyte). The gate keeps that hash for a minute per publishing
+account, so a republished implementation is noticed up to a minute late; the
+list itself is read fresh every time, so a `POST` or `DELETE` acts at once.
 
 **On testnet, the list and the `hos_lease` stub suite collide.**
 `tests/hos_lease_stub_e2e.sh` binds to a stub contract we deploy, and that stub
@@ -230,10 +236,53 @@ worker-token authenticated): it verifies a bound account on chain with the same
 crate verdict before running as it, and that verdict needs the deployment's
 answer to "is this build recognized?".
 
+### `/admin/contract-wallet-code-hashes` — wallets that vote by contract
+
+```
+GET    /admin/contract-wallet-code-hashes
+POST   /admin/contract-wallet-code-hashes   {"from_account": "...", "shape": "eip712|nep641", "note": "..."}
+                                            {"code_hash": "...",    "shape": "eip712|nep641", "note": "..."}
+DELETE /admin/contract-wallet-code-hashes/{code_hash}
+```
+
+A multisig approver without access keys — a NEP-616 wallet contract owned by an
+EVM key or a passkey — votes with an `authorization` blob that its own contract
+resolves (`w_resolve_auth`). Only an account running a build listed here may
+vote that way. At ingest the coordinator reads the account's code hash (for a
+global contract referenced by account id, the hash of the code published there)
+and the row's `shape` says how to call the resolver: `eip712` for the EVM-owner
+wallet, `nep641` for the passkey wallet. Every read for one vote is made at one
+block and nothing is cached. An **empty table accepts no contract votes at
+all**; key holders vote with NEP-413 signatures whatever this list holds.
+
+`from_account` takes an approver wallet, not the account that publishes its
+code: the coordinator follows the wallet's reference to the published code
+itself. The migration seeds nothing — a build is a fact about one network —
+so each network gets its rows here:
+
+| Network | `code_hash` | `shape` | Wallet |
+|---|---|---|---|
+| mainnet | `FkAmDpjc2HaoFmU9xwgG6x5oJUXnpxAREtTMZi5UcgRy` | `eip712` | published by `eip712-wallet-contract.trezu.near` |
+| mainnet | `qD9cxbe38rJn7BwUBtqaC2vVAiYD7TS4vnrafccHsRp` | `nep641` | passkey, published by `0saf343be226341c0eca7dba6d0b29d49bdff3ad03` |
+| testnet | `BBL8qKk7uKDDairkMqtqGa3QBuZLiXS8zTowDeeL823y` | `nep641` | passkey, referenced by hash |
+
+What a row is trusted for. The keystore does not read code hashes: at sign time
+it checks that the approver is in the policy without a pinned key, calls
+`w_is_signature_allowed` and `w_resolve_auth` on the approver's own account at
+one block, and counts the vote only when the answer is the exact vote message.
+So the keystore establishes that the approver's code cast the vote; that this
+code is a supported wallet is established here. Forging a vote takes both a
+row for code that approves anything AND control of the code on the approver's
+account — a leaked token alone gives the first, not the second.
+
+`DELETE` narrows: votes from that build are refused from then on. Votes already
+stored stay; the keystore resolves them again before anything is signed.
+
 ### `GET /admin/binding-implementations` — what the live bindings run
 
 On demand, like the collateral check: one or two view calls per live binding,
-nothing cached, nothing changed. For each binding: the code hash the account
+nothing cached, nothing changed. A leased account adds a download of the wasm
+its publisher published, once per publisher per report. For each binding: the code hash the account
 actually runs (through the global-contract reference where there is one) and
 whether the relevant list has it; for leased accounts also the `impl_version`
 the account reports now, the one recorded at PUT, and whether a row maps it.

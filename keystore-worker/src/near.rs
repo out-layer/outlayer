@@ -973,69 +973,84 @@ impl NearClient {
         Ok(ViewAt { value, block_height: response.block_height, block_hash: response.block_hash })
     }
 
-    /// Verify that a public key belongs to an account.
+    /// One raw JSON-RPC `query` with these params, answered as the whole
+    /// response for `shared_tee_helpers::contract_vote::classify_call` to read.
+    /// `Err` only when there is no response to read: transport, timeout, a
+    /// body that is not JSON. The URL is stripped from the error — it can carry
+    /// an API key.
+    pub async fn query_raw(&self, params: serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+        let body = json!({"jsonrpc": "2.0", "id": "dontcare", "method": "query", "params": params});
+        raw_rpc_client()
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("RPC POST failed: {}", e.without_url()))?
+            .json()
+            .await
+            .map_err(|e| format!("RPC body not JSON: {}", e.without_url()))
+    }
+
+    /// Verify that a public key is a FULL-ACCESS key of an account — the only
+    /// key whose signature is the owner's word. A function-call key is held by
+    /// whatever application the owner once logged into; the key of an implicit
+    /// account not made yet is that account's full-access key
+    /// (`shared_tee_helpers::signer_key`, the coordinator asks the same way).
     ///
     /// Asks the chain for that ONE key (`view_access_key`), never for the
     /// account's whole list: the RPC refuses the list for an account with many
     /// keys (`TOO_MANY_ACCESS_KEYS`), and the owner of such an account could
-    /// then never approve, reject or edit a secret. An unknown key or account
-    /// is "does not belong"; any other failure is an RPC error.
+    /// then never approve, reject or edit a secret. A function-call key, an
+    /// unknown key or account is a refusal (`KeyOwnerRefusal::NotOwned`); a
+    /// chain that would not say is an error that is not a refusal.
     pub async fn verify_access_key_owner(
         &self,
         account_id: &str,
         public_key: &str,
     ) -> Result<()> {
-        use near_jsonrpc_primitives::types::query::RpcQueryError;
+        use shared_tee_helpers::signer_key::{signer_key_by, SignerKey};
 
-        let account_id_parsed = AccountId::from_str(account_id).map_err(|e| {
+        AccountId::from_str(account_id).map_err(|e| {
             anyhow::Error::new(KeyOwnerRefusal::Malformed(format!("Invalid account ID: {e}")))
         })?;
-        let parsed = near_crypto::PublicKey::from_str(public_key).map_err(|e| {
+        near_crypto::PublicKey::from_str(public_key).map_err(|e| {
             anyhow::Error::new(KeyOwnerRefusal::Malformed(format!("Invalid public key: {e}")))
         })?;
         let shown = key_for_display(public_key);
 
-        tracing::debug!(
-            account_id = %account_id,
-            public_key = %shown,
-            "Verifying access key ownership"
-        );
-
-        let query = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::latest(),
-            request: near_primitives::views::QueryRequest::ViewAccessKey {
-                account_id: account_id_parsed,
-                public_key: parsed,
+        let said = signer_key_by(
+            account_id,
+            public_key,
+            // Optimistic, as the coordinator asks: a key the owner added a moment ago
+            // is the owner's key now, and a refusal here is final for the request.
+            |mut params| {
+                params["finality"] = json!("optimistic");
+                self.query_raw(params)
             },
-        };
-
-        match self.rpc_client.call(query).await {
-            Ok(response) => match response.kind {
-                QueryResponseKind::AccessKey(_) => {
-                    tracing::debug!(
-                        account_id = %account_id,
-                        public_key = %shown,
-                        "✅ Access key verified"
-                    );
-                    Ok(())
-                }
-                _ => anyhow::bail!("Unexpected query response"),
-            },
-            Err(e) if matches!(
-                e.handler_error(),
-                Some(RpcQueryError::UnknownAccessKey { .. } | RpcQueryError::UnknownAccount { .. })
-            ) => {
-                tracing::warn!(
-                    account_id = %account_id,
-                    public_key = %shown,
-                    "❌ Access key not found for account"
-                );
+            |what| format!("the chain's answer about {what} of {account_id} could not be read"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("Failed to query access key")?;
+        match said {
+            SignerKey::FullAccess => {
+                tracing::debug!(account_id = %account_id, public_key = %shown, "✅ Full-access key verified");
+                Ok(())
+            }
+            SignerKey::FunctionCall => {
+                tracing::warn!(account_id = %account_id, public_key = %shown, "❌ A function-call key signed for the account");
+                Err(anyhow::Error::new(KeyOwnerRefusal::NotOwned(format!(
+                    "Public key {} of {} may only call functions: sign with the account's wallet, whose key has full access",
+                    shown, account_id
+                ))))
+            }
+            SignerKey::Absent => {
+                tracing::warn!(account_id = %account_id, public_key = %shown, "❌ Access key not found for account");
                 Err(anyhow::Error::new(KeyOwnerRefusal::NotOwned(format!(
                     "Public key {} does not belong to account {}",
                     shown, account_id
                 ))))
             }
-            Err(e) => Err(anyhow::Error::new(e)).context("Failed to query access key"),
         }
     }
 }
@@ -1187,6 +1202,42 @@ mod tests {
         let dead = NearClient::new(KEYED_DEAD_URL, "outlayer.testnet").expect("client");
         let err = dead.verify_access_key_owner("bob.testnet", A_KEY).await.expect_err("nothing listens");
         assert!(err.downcast_ref::<KeyOwnerRefusal>().is_none(), "an RPC that did not answer is not a refusal: {err:#}");
+    }
+
+    /// Only a full-access key is the owner's word: a function-call key, held
+    /// by an application the owner logged into, is refused as not the owner's.
+    #[tokio::test]
+    async fn only_a_full_access_key_speaks_for_the_owner() {
+        let answer = |permission: serde_json::Value| {
+            serde_json::json!({"jsonrpc": "2.0", "id": "dontcare", "result": {
+                "nonce": 7, "permission": permission, "block_height": 1,
+                "block_hash": "11111111111111111111111111111111"}})
+            .to_string()
+        };
+        let (url, server) = serving_rpc(answer(serde_json::json!("FullAccess")));
+        let client = NearClient::new(&url, "outlayer.testnet").expect("client");
+        client.verify_access_key_owner("bob.testnet", A_KEY).await.expect("a full-access key is the owner's");
+        server.join().ok();
+
+        let (url, server) = serving_rpc(answer(serde_json::json!({"FunctionCall": {
+            "allowance": null, "receiver_id": "app.testnet", "method_names": []}})));
+        let client = NearClient::new(&url, "outlayer.testnet").expect("client");
+        let err = client.verify_access_key_owner("bob.testnet", A_KEY).await.expect_err("an app's key");
+        server.join().ok();
+        assert!(
+            matches!(err.downcast_ref::<KeyOwnerRefusal>(), Some(KeyOwnerRefusal::NotOwned(m)) if m.contains("may only call functions")),
+            "a function-call key is a final refusal: {err:#}"
+        );
+    }
+
+    /// The owner check reads the optimistic block, so a key added a moment ago
+    /// counts — the same block the coordinator reads at the door.
+    #[test]
+    fn the_owner_check_reads_the_optimistic_block() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/near.rs")).unwrap();
+        let start = src.find("pub async fn verify_access_key_owner(").expect("the owner check");
+        let body = &src[start..start + src[start..].find("\n    }\n").expect("its end")];
+        assert!(body.contains(r#"params["finality"] = json!("optimistic")"#), "{body}");
     }
 
     /// One JSON-RPC answer, served once from a throwaway socket.

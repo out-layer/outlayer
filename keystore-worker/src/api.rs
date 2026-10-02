@@ -39,6 +39,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use shared_tee_helpers::{is_evm_chain, is_solana_chain};
+use shared_tee_helpers::contract_vote::VoteVerb;
 use tower_http::trace::TraceLayer;
 
 #[path = "api_support.rs"]
@@ -2639,7 +2640,9 @@ async fn update_user_secrets_handler(
         }
     }
 
-    // 3. Verify public key belongs to owner via NEAR RPC
+    // 3. Verify the public key is a FULL-ACCESS key of the owner via NEAR RPC: a
+    //    function-call key is held by an application, and its signature is not the
+    //    owner's word about their secrets.
     let near_client = state.near_client.as_ref();
     if let Some(client) = near_client {
         match client.verify_access_key_owner(&req.owner, &req.public_key).await {
@@ -4564,8 +4567,58 @@ async fn wallet_sign_policy_handler(
 /// The exact NEP-413 message an approver/rejecter signs. Binds the vote to (a) the approval
 /// id, (b) THIS wallet's on-chain pubkey — so a signature collected for wallet A can never be
 /// replayed onto wallet B — and (c) the canonical request hash. Pure + unit-tested.
-fn approval_vote_message(vote: &str, approval_id: &str, wallet_pubkey: &str, request_hash: &str) -> String {
-    format!("{}:{}:{}:{}", vote, approval_id, wallet_pubkey, request_hash)
+/// The same string a contract-wallet approver's resolver must answer
+/// (`shared_tee_helpers::contract_vote::vote_message`, one function for both).
+fn approval_vote_message(verb: VoteVerb, approval_id: &str, wallet_pubkey: &str, request_hash: &str) -> String {
+    shared_tee_helpers::contract_vote::vote_message(verb, approval_id, wallet_pubkey, request_hash)
+}
+
+/// Re-resolve one contract-wallet vote on chain: the approver's own contract
+/// answers `w_is_signature_allowed` and `w_resolve_auth` at one block, and the
+/// vote counts only when the resolution is `expected` byte for byte.
+///
+/// The code the approver runs is not checked here — the coordinator's
+/// allowlist decided which wallets may vote this way, and forwarded the shape.
+/// What the coordinator cannot forge is checked: the call goes to the
+/// approver's account, so the answer is that account's code speaking, and the
+/// EIP-712 recipient is this keystore's own contract.
+///
+/// `Ok(false)` — the chain answered and the vote does not count. An RPC that
+/// could not be asked fails the operation, retryably, as a key-ownership read
+/// does: dropping a real vote below threshold on a blip is not an answer.
+async fn contract_vote_counts(
+    near_client: &crate::near::NearClient,
+    vote: &ContractVote,
+    recipient: &str,
+    expected: &str,
+) -> Result<bool, ApiError> {
+    use shared_tee_helpers::contract_vote::{resolve_contract_vote, At, AUTHORIZATION_MAX_BYTES};
+    if vote.authorization.len() > AUTHORIZATION_MAX_BYTES {
+        return Ok(false);
+    }
+    let verdict = resolve_contract_vote(
+        |params| near_client.query_raw(params),
+        &vote.approver_id,
+        vote.shape,
+        recipient,
+        &vote.authorization,
+        expected,
+        At::Final,
+    )
+    .await
+    .map_err(|e| {
+        ApiError::InternalError(format!(
+            "could not resolve the contract vote of {}: {}",
+            vote.approver_id, e
+        ))
+    })?;
+    match verdict {
+        Ok(()) => Ok(true),
+        Err(not) => {
+            tracing::info!(approver = %vote.approver_id, reason = %not.reason(), "contract vote not counted");
+            Ok(false)
+        }
+    }
 }
 
 /// Trusted-artifact NEP-413 recipients (intents verifiers only). `intents.near` for the
@@ -4610,15 +4663,10 @@ async fn verify_approvals(
             threshold
         )));
     }
-    // Pinned-pubkey lookup: a vote from approver `id` whose policy entry pins a pubkey is
-    // only valid if signed by THAT pubkey. Returns Ok(()) when allowed, Err otherwise.
-    let pinned_ok = |id: &str, pubkey: &str| -> bool {
-        match approvers.iter().find(|(aid, _)| *aid == id) {
-            Some((_, Some(pinned))) => *pinned == pubkey,
-            Some((_, None)) => true, // no pin → ownership check below is the gate
-            None => false,           // not a policy approver
-        }
-    };
+    // Where an approver stands in the policy, over EVERY entry naming it: a pin on any of
+    // them pins it. A NEP-413 vote from a pinned approver counts only when signed by a
+    // pinned key; a contract vote from it never counts — the pin means "only this key".
+    let standing = |id: &str| shared_tee_helpers::contract_vote::approver_standing(policy, id);
 
     // Multisig is required → approvals MUST be present and valid (no skipping).
     let info = approval_info.ok_or_else(|| {
@@ -4648,6 +4696,18 @@ async fn verify_approvals(
             MAX_APPROVAL_VOTES
         )));
     }
+    // The same cap on contract votes, each of which costs two view calls.
+    if info.contract_approvals.len() > MAX_APPROVAL_VOTES
+        || info.contract_rejections.len() > MAX_APPROVAL_VOTES
+    {
+        return Err(ApiError::BadRequest(format!(
+            "too many contract votes: {} approvals / {} rejections (limit {} each). \
+             Send only the votes that count toward the threshold.",
+            info.contract_approvals.len(),
+            info.contract_rejections.len(),
+            MAX_APPROVAL_VOTES
+        )));
+    }
 
     // recipient = THIS keystore's contract (the on-chain trust anchor). Assert the
     // coordinator agrees, so a config mismatch fails loudly instead of looking like a
@@ -4665,13 +4725,13 @@ async fn verify_approvals(
     // by a key that belongs to a policy approver's account. The `wallet_pubkey` binds the
     // vote to THIS wallet — a signature collected for wallet A cannot be replayed onto
     // wallet B (shared approvers + shared whitelisted destination). Count distinct approvers.
-    let message = approval_vote_message("approve", &info.approval_id, wallet_pubkey, request_hash);
+    let message = approval_vote_message(VoteVerb::Approve, &info.approval_id, wallet_pubkey, request_hash);
     let mut approved_by: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for ap in &info.approvals {
         if approved_by.contains(ap.approver_id.as_str()) {
             continue;
         }
-        if !pinned_ok(&ap.approver_id, &ap.public_key) {
+        if !standing(&ap.approver_id).admits_key(&ap.public_key) {
             continue; // not a policy approver, or signed by a non-pinned key
         }
         if verify_near_signature(&message, &ap.signature, &ap.public_key, &ap.nonce, &recipient)
@@ -4692,14 +4752,26 @@ async fn verify_approvals(
             })?;
         approved_by.insert(ap.approver_id.as_str());
     }
+    // Contract-wallet approvers. One approver counts once, whichever way it voted.
+    for cv in &info.contract_approvals {
+        if approved_by.contains(cv.approver_id.as_str()) {
+            continue;
+        }
+        if !standing(&cv.approver_id).admits_contract_vote() {
+            continue; // not a policy approver, or pinned to a key
+        }
+        if contract_vote_counts(near_client, cv, &recipient, &message).await? {
+            approved_by.insert(cv.approver_id.as_str());
+        }
+    }
 
     // Veto: a NO vote from ANY real policy approver (valid sig over
     // `reject:{id}:{wallet_pubkey}:{request_hash}` + on-chain key ownership + in the approver set)
     // refuses the operation, regardless of how many approvals were collected.
     // Non-approver rejections are ignored — filtered exactly like non-approver approvals.
-    let reject_message = approval_vote_message("reject", &info.approval_id, wallet_pubkey, request_hash);
+    let reject_message = approval_vote_message(VoteVerb::Reject, &info.approval_id, wallet_pubkey, request_hash);
     for rj in &info.rejections {
-        if !pinned_ok(&rj.approver_id, &rj.public_key) {
+        if !standing(&rj.approver_id).admits_key(&rj.public_key) {
             continue; // not a policy approver, or signed by a non-pinned key
         }
         if verify_near_signature(&reject_message, &rj.signature, &rj.public_key, &rj.nonce, &recipient)
@@ -4720,6 +4792,17 @@ async fn verify_approvals(
             "Operation vetoed by approver {}",
             rj.approver_id
         )));
+    }
+    for cv in &info.contract_rejections {
+        if !standing(&cv.approver_id).admits_contract_vote() {
+            continue; // not a policy approver, or pinned to a key
+        }
+        if contract_vote_counts(near_client, cv, &recipient, &reject_message).await? {
+            return Err(ApiError::Forbidden(format!(
+                "Operation vetoed by approver {}",
+                cv.approver_id
+            )));
+        }
     }
 
     if approved_by.len() < threshold {

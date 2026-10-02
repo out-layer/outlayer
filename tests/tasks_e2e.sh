@@ -1306,7 +1306,8 @@ if want N7; then
     READS=0; NAMED=0; ANSWERED=0
     for path in /admin/compile-logs/0 /admin/connector-calls /admin/earnings /admin/egress-audit /admin/grant-keys \
                 /admin/health/detailed /admin/collateral/status /admin/binding-zones /admin/hos-impl-code-hashes \
-                /admin/hos-impl-versions /admin/wallet-code-hashes /admin/binding-implementations; do
+                /admin/hos-impl-versions /admin/wallet-code-hashes /admin/contract-wallet-code-hashes \
+                /admin/binding-implementations; do
       admin GET "$path"
       READS=$((READS + 1))
       [[ "$N7_CODE" == "200" ]] && ANSWERED=$((ANSWERED + 1))

@@ -789,7 +789,8 @@ Base: `https://api.outlayer.ai`
 | GET | `/wallet/v1/requests/{id}` | Bearer | Poll async status |
 | GET | `/wallet/v1/policy` | Bearer | View decrypted policy |
 | POST | `/wallet/v1/encrypt-policy` | Bearer | Encrypt policy for on-chain storage |
-| POST | `/wallet/v1/approve/{id}` | Bearer | Multisig approval (NEP-413 sig) |
+| POST | `/wallet/v1/approve/{id}` | None — the vote proves the voter | Multisig vote: a NEP-413 signature by an approver's access key, or an authorization a keyless approver's wallet contract resolves |
+| POST | `/wallet/v1/reject/{id}` | None — the vote proves the voter | Multisig NO vote, proven the same two ways; a policy approver's reject vetoes |
 | GET | `/wallet/v1/audit` | Bearer | Full event history |
 
 ### Database Tables
@@ -802,7 +803,8 @@ Base: `https://api.outlayer.ai`
 | `wallet_api_keys` | SHA-256(api_key) → wallet_id |
 | `wallet_requests` | Async operations (withdraw, deposit, call) |
 | `wallet_pending_approvals` | Multisig state machine |
-| `wallet_approval_signatures` | Individual approver signatures |
+| `wallet_approval_signatures` | One vote per account per approval: a NEP-413 signature, or a contract wallet's authorization (`proof_kind`) |
+| `contract_wallet_code_hashes` | Wallet builds whose contract votes are accepted, and the resolver each runs |
 | `wallet_usage` | Per-token per-period spending (hourly/daily/monthly) |
 | `wallet_audit_log` | Complete event history |
 | `wallet_webhook_deliveries` | Webhook retry queue |

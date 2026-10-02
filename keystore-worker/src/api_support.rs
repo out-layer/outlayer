@@ -869,6 +869,26 @@ pub struct ApprovalInfo {
     /// vetoes the operation; non-approver rejections are ignored. Symmetric with approvals.
     #[serde(default)]
     pub rejections: Vec<ApproverSig>,
+    /// YES votes from contract-wallet approvers (accounts without keys): an
+    /// `authorization` blob the approver's own contract resolves to
+    /// `approve:{approval_id}:{wallet_pubkey}:{request_hash}`. The keystore
+    /// re-resolves each on chain; the coordinator only carries them.
+    #[serde(default)]
+    pub contract_approvals: Vec<ContractVote>,
+    /// NO votes (vetoes) from contract-wallet approvers, resolving to
+    /// `reject:{approval_id}:{wallet_pubkey}:{request_hash}`.
+    #[serde(default)]
+    pub contract_rejections: Vec<ContractVote>,
+}
+
+/// One contract-wallet vote. `shape` is the resolver the coordinator found
+/// running on the approver's account (its code allowlist); a wrong one makes
+/// the resolution fail, never succeed.
+#[derive(Debug, Deserialize)]
+pub struct ContractVote {
+    pub approver_id: String,
+    pub shape: shared_tee_helpers::contract_vote::Shape,
+    pub authorization: String,
 }
 
 /// Unified wallet signing request (the single `/wallet/sign` endpoint).

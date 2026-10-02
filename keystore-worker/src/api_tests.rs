@@ -763,14 +763,14 @@ mod tests {
         let pub_b = "ed25519:BBBB";
         // The wallet pubkey is part of the signed string, so a signature collected for
         // wallet A's message can never satisfy wallet B's (different message → different sig).
-        let a = approval_vote_message("approve", id, pub_a, hash);
-        let b = approval_vote_message("approve", id, pub_b, hash);
+        let a = approval_vote_message(VoteVerb::Approve, id, pub_a, hash);
+        let b = approval_vote_message(VoteVerb::Approve, id, pub_b, hash);
         assert_ne!(a, b, "approval message must differ per wallet pubkey");
         assert_eq!(a, "approve:appr-1:ed25519:AAAA:abc123");
         // approve vs reject are domain-separated for the SAME wallet.
         assert_ne!(
-            approval_vote_message("approve", id, pub_a, hash),
-            approval_vote_message("reject", id, pub_a, hash)
+            approval_vote_message(VoteVerb::Approve, id, pub_a, hash),
+            approval_vote_message(VoteVerb::Reject, id, pub_a, hash)
         );
     }
 
@@ -1194,6 +1194,8 @@ mod tests {
                 recipient: "definitely-not-this-keystore.testnet".to_string(),
                 approvals: votes(MAX_APPROVAL_VOTES + 1),
                 rejections: vec![],
+                contract_approvals: vec![],
+                contract_rejections: vec![],
             }),
             1,
         )
@@ -1224,6 +1226,8 @@ mod tests {
                 recipient: "outlayer.test".to_string(),
                 approvals: vec![],
                 rejections: votes(MAX_APPROVAL_VOTES + 1),
+                contract_approvals: vec![],
+                contract_rejections: vec![],
             }),
             1,
         )
@@ -1253,6 +1257,8 @@ mod tests {
                 recipient: "definitely-not-this-keystore.testnet".to_string(),
                 approvals: votes(MAX_APPROVAL_VOTES),
                 rejections: vec![],
+                contract_approvals: vec![],
+                contract_rejections: vec![],
             }),
             1,
         )
@@ -5669,5 +5675,372 @@ mod signing_keys_at_the_door {
                 assert!(answer.get("plaintext_secrets").is_some(), "a secrets-only answer: {answer}");
             }
         }
+    }
+}
+
+mod contract_vote_tests {
+    use super::*;
+    use axum::Json;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    const WALLET: &str = "ed25519:wallet";
+    const HASH: &str = "hash";
+    const AID: &str = "a1";
+
+    fn msg(verb: VoteVerb) -> String {
+        approval_vote_message(verb, AID, WALLET, HASH)
+    }
+
+    fn policy(approvers: serde_json::Value, required: u64) -> shared_tee_helpers::wallet_policy::Policy {
+        serde_json::from_value(json!({"approval": {"threshold": {"required": required}, "approvers": approvers}}))
+            .expect("policy")
+    }
+
+    fn cvote(id: &str, auth: &str) -> ContractVote {
+        ContractVote {
+            approver_id: id.to_string(),
+            shape: shared_tee_helpers::contract_vote::Shape::Nep641,
+            authorization: auth.to_string(),
+        }
+    }
+
+    fn ballot(approvals: Vec<ContractVote>, rejections: Vec<ContractVote>) -> ApprovalInfo {
+        ApprovalInfo {
+            approval_id: AID.to_string(),
+            recipient: "outlayer.test".to_string(),
+            approvals: vec![],
+            rejections: vec![],
+            contract_approvals: approvals,
+            contract_rejections: rejections,
+        }
+    }
+
+    fn dead() -> AppState {
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: "http://127.0.0.1:1".into(),
+            offchainvm_contract_id: "outlayer.test".into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let near_client = crate::near::NearClient::new("http://127.0.0.1:1", "outlayer.test").unwrap();
+        AppState::new(crate::crypto::Keystore::generate(), config, Some(near_client))
+    }
+
+    /// The answer of one `query`: `(account, method-or-request_type, authorization)` → the
+    /// contract's bytes (`Ok`) or a VM error string (`Err`).
+    type Wallets = dyn Fn(&str, &str, &str) -> Result<String, String> + Send + Sync;
+
+    /// A chain serving `wallets`, recording every `query`'s params. `view_access_key`
+    /// answers FullAccess for any key.
+    async fn chain(wallets: Arc<Wallets>) -> (AppState, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let wallets = wallets.clone();
+                let log = log.clone();
+                async move {
+                    let params = body["params"].clone();
+                    log.lock().unwrap().push(params.clone());
+                    let id = body["id"].clone();
+                    if params["request_type"] == "view_access_key" {
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "nonce": 1, "permission": "FullAccess", "block_height": 9,
+                            "block_hash": "11111111111111111111111111111111"}}));
+                    }
+                    let account = params["account_id"].as_str().unwrap_or_default().to_string();
+                    let method = params["method_name"].as_str().unwrap_or_default().to_string();
+                    let args: serde_json::Value = base64::decode(params["args_base64"].as_str().unwrap_or_default())
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok())
+                        .unwrap_or(json!({}));
+                    let auth = args["authorization"].as_str().unwrap_or_default().to_string();
+                    Json(match wallets(&account, &method, &auth) {
+                        Ok(bytes) => json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "block_hash": "B9", "block_height": 9, "logs": [], "result": bytes.into_bytes()}}),
+                        Err(vm) => json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "block_hash": "B9", "block_height": 9, "logs": [], "error": vm}}),
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: url.clone(),
+            offchainvm_contract_id: "outlayer.test".into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
+        (AppState::new(crate::crypto::Keystore::generate(), config, Some(near_client)), seen)
+    }
+
+    /// Every wallet allows signatures and resolves the blob `good-<verb>` to that verb's
+    /// message; anything else panics like the passkey wallet does.
+    fn honest() -> Arc<Wallets> {
+        Arc::new(|_account: &str, method: &str, auth: &str| match method {
+            "w_is_signature_allowed" => Ok("true".to_string()),
+            "w_resolve_auth" => match auth {
+                "good-approve" => Ok(json!({"payload": msg(VoteVerb::Approve)}).to_string()),
+                "good-reject" => Ok(json!({"payload": msg(VoteVerb::Reject)}).to_string()),
+                "other-payload" => Ok(json!({"payload": "approve:other:ed25519:wallet:hash"}).to_string()),
+                _ => Err("wasm execution failed with error: HostError(GuestPanic { panic_msg: \"invalid signature\" })".into()),
+            },
+            _ => Err("wasm execution failed with error: MethodResolveError(MethodNotFound)".into()),
+        })
+    }
+
+    fn resolver_calls(seen: &Arc<Mutex<Vec<serde_json::Value>>>) -> usize {
+        seen.lock().unwrap().iter().filter(|p| p["method_name"] == "w_resolve_auth").count()
+    }
+
+    #[test]
+    fn a_ballot_without_contract_votes_still_reads() {
+        let old: ApprovalInfo = serde_json::from_value(json!({
+            "approval_id": "a", "recipient": "r", "approvals": [], "rejections": []
+        }))
+        .unwrap();
+        assert!(old.contract_approvals.is_empty() && old.contract_rejections.is_empty());
+        let new: ApprovalInfo = serde_json::from_value(json!({
+            "approval_id": "a", "recipient": "r", "approvals": [],
+            "contract_approvals": [{"approver_id": "w.near", "shape": "eip712", "authorization": "{}"}]
+        }))
+        .unwrap();
+        assert_eq!(new.contract_approvals[0].shape, shared_tee_helpers::contract_vote::Shape::Eip712);
+        assert!(serde_json::from_value::<ApprovalInfo>(json!({
+            "approval_id": "a", "recipient": "r", "approvals": [],
+            "contract_approvals": [{"approver_id": "w.near", "shape": "passkey", "authorization": "{}"}]
+        }))
+        .is_err(), "an unknown shape must not parse");
+    }
+
+    #[tokio::test]
+    async fn a_contract_vote_counts_when_the_wallet_resolves_the_exact_message() {
+        let (state, seen) = chain(honest()).await;
+        let pol = policy(json!([{"id": "wallet.testnet"}]), 1);
+        verify_approvals(&state, &pol, WALLET, HASH, Some(&ballot(vec![cvote("wallet.testnet", "good-approve")], vec![])), 1)
+            .await
+            .expect("a resolved vote counts");
+        let seen = seen.lock().unwrap();
+        let reads: Vec<_> = seen.iter().filter(|p| p["account_id"] == "wallet.testnet").collect();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0]["method_name"], "w_is_signature_allowed");
+        assert_eq!(reads[1]["method_name"], "w_resolve_auth");
+        assert_eq!(reads[1]["block_id"], "B9", "the resolution is read at the flag's block");
+    }
+
+    #[tokio::test]
+    async fn a_valid_signature_over_another_payload_does_not_count() {
+        let (state, _) = chain(honest()).await;
+        let pol = policy(json!([{"id": "wallet.testnet"}]), 1);
+        let err = verify_approvals(&state, &pol, WALLET, HASH, Some(&ballot(vec![cvote("wallet.testnet", "other-payload")], vec![])), 1)
+            .await
+            .expect_err("another payload is not this vote");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("Insufficient")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_wallet_that_disallows_signatures_does_not_vote() {
+        let wallets: Arc<Wallets> = Arc::new(|a: &str, m: &str, auth: &str| match m {
+            "w_is_signature_allowed" => Ok("false".to_string()),
+            _ => honest()(a, m, auth),
+        });
+        let (state, seen) = chain(wallets).await;
+        let pol = policy(json!([{"id": "wallet.testnet"}]), 1);
+        let err = verify_approvals(&state, &pol, WALLET, HASH, Some(&ballot(vec![cvote("wallet.testnet", "good-approve")], vec![])), 1)
+            .await
+            .expect_err("signatures are off on this wallet");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("Insufficient")), "{err:?}");
+        assert_eq!(resolver_calls(&seen), 0);
+    }
+
+    #[tokio::test]
+    async fn a_vote_that_does_not_count_leaves_the_rest_of_the_ballot() {
+        let (state, _) = chain(honest()).await;
+        let pol = policy(json!([{"id": "a.testnet"}, {"id": "b.testnet"}]), 1);
+        verify_approvals(
+            &state, &pol, WALLET, HASH,
+            Some(&ballot(vec![cvote("a.testnet", "forged"), cvote("b.testnet", "good-approve")], vec![])),
+            1,
+        )
+        .await
+        .expect("b's vote carries the threshold");
+    }
+
+    #[tokio::test]
+    async fn one_approver_counts_once_whichever_way_it_voted() {
+        let (state, seen) = chain(honest()).await;
+        let pol = policy(json!([{"id": "a.testnet"}, {"id": "b.testnet"}]), 2);
+        let err = verify_approvals(
+            &state, &pol, WALLET, HASH,
+            Some(&ballot(vec![cvote("a.testnet", "good-approve"), cvote("a.testnet", "good-approve")], vec![])),
+            2,
+        )
+        .await
+        .expect_err("one approver is one vote");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("1 of 2")), "{err:?}");
+        assert_eq!(resolver_calls(&seen), 1, "the repeat is skipped before the chain is asked");
+
+        // And across the two mechanisms: a NEP-413 vote and a contract vote from one account.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let (sig, pk, nonce) = nep413_vote(&msg(VoteVerb::Approve), &sk);
+        let key_vote = || ApproverSig {
+            approver_id: "a.testnet".into(),
+            public_key: pk.clone(),
+            signature: sig.clone(),
+            nonce: nonce.clone(),
+        };
+        // The key vote on its own counts here — otherwise the case below proves nothing.
+        let mut alone = ballot(vec![], vec![]);
+        alone.approvals = vec![key_vote()];
+        verify_approvals(&state, &policy(json!([{"id": "a.testnet"}]), 1), WALLET, HASH, Some(&alone), 1)
+            .await
+            .expect("the key vote counts on this chain");
+        let mut info = ballot(vec![cvote("a.testnet", "good-approve")], vec![]);
+        info.approvals = vec![key_vote()];
+        let err = verify_approvals(&state, &pol, WALLET, HASH, Some(&info), 2)
+            .await
+            .expect_err("a key vote and a contract vote from one account are one vote");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("1 of 2")), "{err:?}");
+    }
+
+    fn nep413_vote(message: &str, sk: &ed25519_dalek::SigningKey) -> (String, String, String) {
+        use ed25519_dalek::Signer;
+        use sha2::{Digest, Sha256};
+        let nonce = [9u8; 32];
+        let payload = Nep413Payload { message: message.to_string(), nonce, recipient: "outlayer.test".to_string(), callback_url: None };
+        let bytes = borsh::to_vec(&payload).unwrap();
+        let mut to_hash = NEP413_TAG.to_le_bytes().to_vec();
+        to_hash.extend_from_slice(&bytes);
+        let sig = sk.sign(&Sha256::digest(&to_hash));
+        (
+            base64::encode(sig.to_bytes()),
+            format!("ed25519:{}", bs58::encode(sk.verifying_key().to_bytes()).into_string()),
+            base64::encode(nonce),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_contract_reject_from_an_approver_vetoes() {
+        let (state, _) = chain(honest()).await;
+        let pol = policy(json!([{"id": "a.testnet"}, {"id": "b.testnet"}]), 1);
+        let err = verify_approvals(
+            &state, &pol, WALLET, HASH,
+            Some(&ballot(vec![cvote("a.testnet", "good-approve")], vec![cvote("b.testnet", "good-reject")])),
+            1,
+        )
+        .await
+        .expect_err("a real approver's reject is a veto");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("vetoed by approver b.testnet")), "{err:?}");
+
+        // A reject blob resolving to the APPROVE message is not a reject.
+        verify_approvals(
+            &state, &pol, WALLET, HASH,
+            Some(&ballot(vec![cvote("a.testnet", "good-approve")], vec![cvote("b.testnet", "good-approve")])),
+            1,
+        )
+        .await
+        .expect("an approve payload cannot veto");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_approver_never_votes_by_contract_and_the_chain_is_not_asked() {
+        let state = dead();
+        for approvers in [
+            json!([{"id": "a.testnet", "pubkey": "ed25519:K"}]),
+            json!([{"id": "a.testnet"}, {"id": "a.testnet", "pubkey": "ed25519:K"}]),
+        ] {
+            let pol = policy(approvers.clone(), 1);
+            let err = verify_approvals(&state, &pol, WALLET, HASH, Some(&ballot(vec![cvote("a.testnet", "good-approve")], vec![])), 1)
+                .await
+                .expect_err("pinned means key only");
+            assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("Insufficient")), "{approvers}: {err:?}");
+            let err = verify_approvals(&state, &pol, WALLET, HASH, Some(&ballot(vec![], vec![cvote("a.testnet", "good-reject")])), 1)
+                .await
+                .expect_err("no approvals at all");
+            assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("Insufficient")), "{approvers}: a pinned contract reject is ignored, {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stranger_never_reaches_the_chain() {
+        let state = dead();
+        let pol = policy(json!([{"id": "a.testnet"}]), 1);
+        let err = verify_approvals(
+            &state, &pol, WALLET, HASH,
+            Some(&ballot(vec![cvote("stranger.testnet", "good-approve")], vec![cvote("stranger.testnet", "good-reject")])),
+            1,
+        )
+        .await
+        .expect_err("a stranger counts for nothing");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("Insufficient")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_chain_fails_the_operation_rather_than_drop_a_vote() {
+        let state = dead();
+        let pol = policy(json!([{"id": "a.testnet"}]), 1);
+        for info in [
+            ballot(vec![cvote("a.testnet", "good-approve")], vec![]),
+            ballot(vec![], vec![cvote("a.testnet", "good-reject")]),
+        ] {
+            let err = verify_approvals(&state, &pol, WALLET, HASH, Some(&info), 1)
+                .await
+                .expect_err("nothing can be concluded");
+            assert!(matches!(&err, ApiError::InternalError(m) if m.contains("could not resolve the contract vote of a.testnet")), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_contract_ballot_is_refused_before_any_read() {
+        let state = dead();
+        let pol = policy(json!([{"id": "a.testnet"}]), 1);
+        for info in [
+            ballot((0..=MAX_APPROVAL_VOTES).map(|_| cvote("a.testnet", "x")).collect(), vec![]),
+            ballot(vec![], (0..=MAX_APPROVAL_VOTES).map(|_| cvote("a.testnet", "x")).collect()),
+        ] {
+            let err = verify_approvals(&state, &pol, WALLET, HASH, Some(&info), 1).await.expect_err("too many");
+            assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("too many contract votes")), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_eip712_recipient_is_this_keystores_contract() {
+        let (state, seen) = chain(Arc::new(|_: &str, m: &str, _: &str| match m {
+            "w_is_signature_allowed" => Ok("true".into()),
+            _ => Ok(json!({"status": "RESOLVED", "payload": msg(VoteVerb::Approve)}).to_string()),
+        }))
+        .await;
+        let pol = policy(json!([{"id": "evm.near"}]), 1);
+        let mut vote = cvote("evm.near", "blob");
+        vote.shape = shared_tee_helpers::contract_vote::Shape::Eip712;
+        let mut info = ballot(vec![vote], vec![]);
+        info.recipient = "outlayer.test".into();
+        verify_approvals(&state, &pol, WALLET, HASH, Some(&info), 1).await.expect("resolved");
+        let seen = seen.lock().unwrap();
+        let resolve = seen.iter().find(|p| p["method_name"] == "w_resolve_auth").unwrap();
+        let args: serde_json::Value =
+            serde_json::from_slice(&base64::decode(resolve["args_base64"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(args["recipient"], "outlayer.test");
+        assert_eq!(args["purpose"], "PROVE_OWNERSHIP");
     }
 }
