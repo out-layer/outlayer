@@ -73,7 +73,7 @@ headers = {"User-Agent": "curl/8.7.1", "Content-Type": "application/json"}
 if key_var:
     headers["Authorization"] = "Bearer " + os.environ[key_var]
 if idem:
-    headers["Idempotency-Key"] = idem
+    headers["X-Idempotency-Key"] = idem
 req = urllib.request.Request(url, data=body.encode() if body else None, headers=headers, method=method)
 try:
     with urllib.request.urlopen(req, timeout=timeout) as r:
