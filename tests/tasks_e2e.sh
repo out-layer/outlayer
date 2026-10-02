@@ -13,6 +13,8 @@
 # a task out is the agent's too, started by the platform on the approval.
 #
 #   S1   a statement opens one session; the same statement again opens none
+#   S3   a custody account that is not on chain yet signs in with its own
+#        key, through its wallet's sign-message
 #   A1   no session, or a token that is none: 401 session_required, no list
 #   A18  what waits on a wallet, without a session: 401; one approval by
 #        its id needs none
@@ -62,10 +64,11 @@
 #        at the door; a full-access key REMOVED after the door last asked the
 #        chain about it passes the door (its word is kept five minutes) and is
 #        refused in the enclave: failed, run_refused:approval-invalid
-#   N6   the agent's key cannot pay: a key of the agent's, funded, prepares a
-#        task and is deleted; the approval is 200 with state failed and
-#        failure_reason preparer_key_unavailable, the agent reads it, and no
-#        run was started (no attestation by the run named)
+#   N6   the preparer's key cannot pay: a key of the owner's own, made and
+#        funded here, prepares a task and is deleted; the approval is 200 with
+#        state failed and failure_reason preparer_key_unavailable, the
+#        preparer reads it, and no run was started (nothing attested by the
+#        run named). The owner's key is a preparer like any other (L1)
 #   N7   the admin bearer reaches no task: every reading /admin route answers
 #        without naming the task, every invented task route under /admin is
 #        404 or 405, and the task is as it was. The routes that spend or break
@@ -80,8 +83,11 @@
 #        carries more than the consent, not-the-preparer, failed
 #   N17  the sealed task changed in the store (PSQL_CMD): unreadable, failed,
 #        nothing acts
-#   N4   the voucher's key rewritten to another agent's (PSQL_CMD, AGENT2):
-#        the run is the other agent's, not-the-preparer, failed
+#   N4   the voucher rewritten in the store (PSQL_CMD): its owner column
+#        naming another agent decides nothing — the run goes on the
+#        preparer's key, done; its nonce naming another FUNDED key of the
+#        same agent (AGENT_SPARE_NONCE) runs on that key, and the enclave
+#        refuses it: failed, run_refused:not-the-preparer
 #   A10  a row open to everyone: the run works, the task is refused
 #   A12  a run that names no row: no_owner
 #   A13  a muted agent is refused; unmuted, it opens again
@@ -137,6 +143,20 @@
 #        confirmation_required, and nothing changed; with one: 200
 #   P9   withdrawing another device without the signature: 403, its session
 #        goes on; with it: revoked, and its token is 401 session_required
+#   NT1  the agent notifies: `notified` with id and hash; the owner reads a
+#        notice — no operation, no reply key — and the hash is the run's; the
+#        agent reads it open; no voucher is kept for it (PSQL_CMD)
+#   NT2  an approval sent to a notice: 400 before the nonce is spent — the
+#        same body then approves the task it was signed for
+#   NT3  Got it: the agent reads done; a second Got it 409; a reject of a
+#        notice 400; another notice deleted: the agent finds nothing
+#   NT4  a run on chain, with no payment key, notifies: the owner's own call
+#   NT5  not granted by name, relayed, muted: refused as a task is
+#   NT6  ten notices of one agent: its next task of any kind is inbox_full;
+#        one Got it, and it opens
+#   NT7  a notice reaches the owner's URL as task_created, kind notice, and
+#        nothing of what it shows; Got it sends no event (HOOK_URL)
+#   NT8  the proof holds for a notice: the run's answer names it with its hash
 #   L5   the inbox API called in a loop: 429, with no number and no window.
 #        Runs last, and only when asked for by name: ONLY=L5
 #
@@ -153,8 +173,6 @@
 #   AGENT2_PAYMENT_KEY, AGENT2_ACCOUNT   a second agent wallet (A5, L2, L1, N4)
 #   OWNER_PAYMENT_KEY    a payment key of the owner's own account (A7, L1: it
 #                        prepares the twentieth task, and the owner approves it)
-#   AGENT_WALLET_KEY     the agent wallet's `wk_`: N6 makes, funds and deletes
-#                        a payment key of the agent's with it
 #   ADMIN_BEARER_TOKEN_TESTNET in scripts/.env (or ENV_FILE): the admin bearer
 #                        for N7, read where it is used and never printed
 #   RELAY_CONTRACT       the relay of wasi-examples/test-storage-ark, relaying
@@ -166,6 +184,9 @@
 #                        under "requests"
 #   HOOK_REDIRECT_URL, HOOK_REDIRECT_LOG_URL   a second receiver, which
 #                        answers 307 to HOOK_URL, and its log (W3)
+#   AGENT_SPARE_NONCE    the nonce of a second FUNDED payment key of AGENT_ACCOUNT (N4)
+#   CUSTODY_WALLET_KEY   the `wk_` key of a custody wallet whose implicit
+#                        account was never sent NEAR (S3); read where it is used
 #   PSQL_CMD             one statement of SQL against the coordinator's
 #                        database (W3's record of the delivery; N4, N11 and
 #                        N17 rewrite a task's voucher or its sealed copy)
@@ -244,7 +265,7 @@ what_is() {
     AGENT2_ACCOUNT) echo "the account of a second agent wallet" ;;
     OWNER_PAYMENT_KEY) echo "a payment key of the owner's own account" ;;
     PSQL_CMD) echo "one statement of SQL against the coordinator's database" ;;
-    AGENT_WALLET_KEY) echo "the agent wallet's wk_, which makes and deletes its payment keys" ;;
+    AGENT_SPARE_NONCE) echo "the nonce of a second funded payment key of the agent" ;;
     RELAY_CONTRACT) echo "a relay contract on testnet, e.g. relay.outlayer-alice.testnet" ;;
     HOOK_URL) echo "a public HTTPS receiver that records what it is sent" ;;
     HOOK_LOG_URL) echo "where that receiver's log is read" ;;
@@ -344,7 +365,10 @@ fill() {
   done
   [[ "$opened" == "$2" ]]
 }
-status_of() { agent "$(jq -nc --arg t "$1" '{operation:"task_status", task_id:$t}')"; }
+# status_of <task> — `task_status` by the key that prepared it: the agent's,
+# or the one STATUS_KEY names (a task is its preparer's to read).
+STATUS_KEY=AGENT_PAYMENT_KEY
+status_of() { https_as "$STATUS_KEY" "$PARENT/$PROFILE" "$(jq -nc --arg t "$1" '{operation:"task_status", task_id:$t}')"; }
 # clear_tasks — every task of the owner deleted, so that a row starts with
 # the agent's share empty. Through the device signed in last, or a new one when
 # that session is over.
@@ -563,6 +587,30 @@ owner replay a
   || fail "S1 a replayed statement answered $(own .status) $(own .reason)"
 owner raw DELETE /inbox/tasks "" a
 
+if want S3; then
+  log "S3 a custody account not on chain yet signs in with its own key"
+  if [[ -z "${CUSTODY_WALLET_KEY:-}" ]]; then
+    skip "S3 no CUSTODY_WALLET_KEY"
+  else
+    owner sign-in-custody custody
+    custody_account=$(own .account)
+    custody_on_chain=$(curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' --max-time 30 \
+      -d "$(jq -nc --arg a "$custody_account" '{jsonrpc:"2.0",id:1,method:"query",params:{request_type:"view_account",finality:"final",account_id:$a}}')" \
+      2>/dev/null | jq -r 'if .result.amount then "made" elif .error.cause.name == "UNKNOWN_ACCOUNT" then "not made" else "no answer" end' 2>/dev/null)
+    if [[ ! "$custody_account" =~ ^[0-9a-f]{64}$ ]]; then
+      fail "S3 the wallet named no implicit account: sign-message $(own .sign_message_status) $(own '.said // .failed' | head -c 200)"
+    elif [[ "$custody_on_chain" != "not made" ]]; then
+      skip "S3 ${custody_account:0:8}… is $custody_on_chain on chain; the row needs a custody account never sent NEAR"
+    elif [[ "$(own .status)" == "200" && "$(own .token_returned)" == "true" && "$(own .account_id)" == "$custody_account" ]]; then
+      pass "S3 ${custody_account:0:8}…, not on chain, signed in with its own key"
+      owner_as "$custody_account" "" sign-out custody
+      [[ "$(own .status)" == "200" ]] && pass "S3 and signed out" || fail "S3 sign-out answered $(own .status)"
+    else
+      fail "S3 sign-in answered $(own .status) $(own .reason): $(own '.error // .said // .failed' | head -c 200)"
+    fi
+  fi
+fi
+
 if want A1; then
   log "A1 without a session nothing is told"
   for who in none garbage; do
@@ -601,8 +649,10 @@ if want F1 || want F3 || want F5 || want F6 || want F6a || want A7 || want D8 ||
   log "F1 the agent prepares"
   if prepare '{"title":"Send an email","body":"Hello Bob, the report is attached."}'; then
     pass "F1 awaiting_owner, task $TASK"
-    [[ "$(said .output.devices)" == "1" ]] && pass "F1 one device of the owner reads it at once" \
-      || fail "F1 devices: $(said .output.devices), expected 1"
+    owner devices a
+    [[ "$(said .output.devices)" == "$(own .count)" && "$(own .count)" -ge 1 ]] \
+      && pass "F1 the task is encrypted to every device of the owner in force ($(own .count))" \
+      || fail "F1 devices: $(said .output.devices), the owner has $(own .count) in force"
   else
     fail "F1 prepare answered success=$(said .success) error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
   fi
@@ -703,7 +753,7 @@ if want D8; then
     approves "$TASK" - - a --hash "$(printf '0%.0s' $(seq 1 64))"
     if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
       pass "D8 the door cannot know the hash: approved, the run $(own .run) started"
-      ENDED=$(await_run "$TASK")
+      await_run "$TASK"
       [[ "$ENDED" == "failed" && "$(said .output.failure_reason)" == "run_refused:hash-mismatch" ]] \
         && pass "D8 the enclave refused: failed, run_refused:hash-mismatch" \
         || fail "D8 the task ended '$ENDED' with failure_reason '$(said .output.failure_reason)'"
@@ -820,7 +870,7 @@ if want C7; then
     in_inbox "$TASK"
     approves "$TASK" - - a
     if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
-      ENDED=$(await_run "$TASK")
+      await_run "$TASK"
       [[ "$ENDED" == "failed" && -n "$(said .output.run)" && -z "$(said .output.result)" ]] \
         && pass "C7 failed, with the run $(said .output.run) and no result" || fail "C7 the task ended '$ENDED': $(said .output | head -c 240)"
       in_inbox "$TASK" && [[ "$(row .state)" == "open" ]] && fail "C7 the task reopened" || pass "C7 the task did not reopen"
@@ -839,7 +889,7 @@ if want F11; then
     store_row '{"v":2}' "$GRANTED"
     approves "$TASK" - - a
     if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
-      ENDED=$(await_run "$TASK")
+      await_run "$TASK"
       [[ "$ENDED" == "void" ]] && pass "F11 the run met the changed policy: void to the agent" \
         || fail "F11 the task ended '$ENDED' (failure_reason '$(said .output.failure_reason)')"
     else
@@ -914,7 +964,7 @@ if want N19; then
     [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]] \
       && pass "N19 the same nonce then approves: the refusal spent nothing" \
       || fail "N19 the same nonce afterwards answered $(own .status) $(own .reason) state='$(own .state)'"
-    await_run "$TASK" >/dev/null
+    await_run "$TASK"
   else
     fail "N19 prepare: error='$(said .error | head -c 200)'"
   fi
@@ -948,7 +998,8 @@ if want N5; then
     if prepare '{"title":"Failed, then replayed"}'; then
       in_inbox "$TASK"
       approves "$TASK" - - a --hash "$(printf '0%.0s' $(seq 1 64))"
-      if [[ "$(own .status)" == "200" ]] && [[ "$(await_run "$TASK")" == "failed" ]]; then
+      await_run "$TASK"
+      if [[ "$(own .status)" == "200" && "$ENDED" == "failed" ]]; then
         owner replay-approval "$TASK" a
         [[ "$(own .status)" == "409" && "$(own .reason)" == "task_closed" && "$(own .state)" == "failed" ]] \
           && pass "N5 the same body on a failed task: 409 task_closed, state failed" \
@@ -975,7 +1026,8 @@ if want N9; then
     [[ "$STATUSES" == "200 409 " && "$RUNS" == "1" ]] \
       && pass "N9 one 200 approved and one 409, one run" \
       || fail "N9 the two approvals answered: $STATUSES, runs started: $RUNS ($(jq -c '{status,reason,state}' "$N9_A" "$N9_B" | tr '\n' ' '))"
-    [[ "$(await_run "$TASK")" == "done" ]] && pass "N9 done once" || fail "N9 the task ended '$(said .output.state)'"
+    await_run "$TASK"
+    [[ "$ENDED" == "done" ]] && pass "N9 done once" || fail "N9 the task ended '$ENDED'"
   else
     fail "N9 prepare: error='$(said .error | head -c 200)'"
   fi
@@ -1112,7 +1164,8 @@ if want N18; then
         && pass "N18 the new device reads it after the owner's tasks_unlock" || fail "N18 after the run: $ROW"
       approves "$TASK" - - n18
       if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
-        [[ "$(await_run "$TASK")" == "done" ]] && pass "N18 approved from the new device: done" \
+        await_run "$TASK"
+        [[ "$ENDED" == "done" ]] && pass "N18 approved from the new device: done" \
           || fail "N18 the task ended '$(said .output.state)' (failure_reason '$(said .output.failure_reason)')"
       else
         fail "N18 approve from the new device answered $(own .status) $(own .reason) state='$(own .state)'"
@@ -1144,7 +1197,7 @@ if want N3; then
           approves "$TASK" - - a --key "$N3_FILE"
           if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
             pass "N3 the door still takes the removed key: its word is kept, the run $(own .run) started"
-            ENDED=$(await_run "$TASK")
+            await_run "$TASK"
             [[ "$ENDED" == "failed" && "$(said .output.failure_reason)" == "run_refused:approval-invalid" ]] \
               && pass "N3 the enclave asked the chain: failed, run_refused:approval-invalid" \
               || fail "N3 the task ended '$ENDED' with failure_reason '$(said .output.failure_reason)'"
@@ -1166,40 +1219,46 @@ if want N3; then
 fi
 
 if want N6; then
-  log "N6 the agent's key cannot pay for the run"
-  if lacks N6 AGENT_WALLET_KEY; then :
+  log "N6 the preparer's key cannot pay for the run"
+  # A payment key made for this row and deleted in it, so that nothing else
+  # of the suite depends on it. The suite's CLI signs as the owner, so the key
+  # is the owner's: the owner's own key is a preparer like any other (L1), and
+  # the consent it leaves is the one the run is admitted with. The key's
+  # string is read back from the CLI's home and reaches curl through the
+  # environment; refusals are counted, not printed.
+  N6_LOG=$(mktemp -d "$STATE_DIR/n6.XXXXXX")
+  N6_OUT=$(OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys create 2>"$N6_LOG/err")
+  N6_NONCE=$({ cat "$N6_LOG/err"; printf '%s\n' "$N6_OUT"; } | grep -oE 'nonce: [0-9]+' | grep -oE '[0-9]+' | tail -1)
+  if [[ -z "$N6_NONCE" ]]; then
+    skip "N6 a key of $PARENT could not be made (outlayer keys create: $(wc -c < "$N6_LOG/err" | tr -d ' ') bytes of refusal, not printed) — the row is left alone"
   else
-    # A key of the agent's own, made and funded for this row and deleted in
-    # it: nothing else of the suite depends on it. The CLI works in a home of
-    # its own, under the wallet's key, which reaches it through the environment.
-    N6_HOME=$(mktemp -d "$STATE_DIR/n6-home.XXXXXX")
-    N6_OUT=$(OUTLAYER_HOME="$N6_HOME" OUTLAYER_WALLET_KEY="$AGENT_WALLET_KEY" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys create 2>"$N6_HOME/err")
-    N6_NONCE=$({ cat "$N6_HOME/err"; printf '%s\n' "$N6_OUT"; } | grep -oE 'nonce: [0-9]+' | grep -oE '[0-9]+' | tail -1)
-    N6_KEY=$(grep -oE "$AGENT_ACCOUNT:[0-9]+:[0-9a-fA-F]{16,}" <<<"$N6_OUT" | head -1)
-    [[ -z "$N6_NONCE" && -n "$N6_KEY" ]] && N6_NONCE=$(cut -d: -f2 <<<"$N6_KEY")
-    if [[ -z "$N6_KEY" ]]; then
-      skip "N6 the agent's key could not be made (outlayer keys create: $(wc -c < "$N6_HOME/err" | tr -d ' ') bytes of refusal, not printed) — the row is left alone"
+    N6_KEY=$(OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys show "$N6_NONCE" 2>/dev/null | tr -d ' \r\n')
+    n6_delete() { OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys delete "$N6_NONCE" >/dev/null 2>"$N6_LOG/delete"; }
+    if [[ ! "$N6_KEY" =~ ^[a-z0-9._-]+:[0-9]+:[0-9a-fA-F]{16,}$ ]]; then
+      fail "N6 the key at nonce $N6_NONCE could not be read back from the CLI's home"
+      n6_delete || true
     else
-      note "N6 a key of $AGENT_ACCOUNT at nonce $N6_NONCE was made"
-      OUTLAYER_HOME="$N6_HOME" OUTLAYER_WALLET_KEY="$AGENT_WALLET_KEY" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys topup "$N6_NONCE" 0.05 >/dev/null 2>"$N6_HOME/topup" \
-        || warn "N6 topping the key up was refused ($(wc -c < "$N6_HOME/topup" | tr -d ' ') bytes); trying to prepare with it as it is"
+      note "N6 a key of $PARENT at nonce $N6_NONCE was made"
+      OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys topup "$N6_NONCE" --usd 1 >/dev/null 2>"$N6_LOG/topup" \
+        || warn "N6 topping the key up was refused ($(wc -c < "$N6_LOG/topup" | tr -d ' ') bytes); trying to prepare with it as it is"
       if prepare_as N6_KEY '{"title":"Paid by a key about to be deleted"}'; then
         N6_TASK=$TASK
-        if OUTLAYER_HOME="$N6_HOME" OUTLAYER_WALLET_KEY="$AGENT_WALLET_KEY" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys delete "$N6_NONCE" >/dev/null 2>"$N6_HOME/delete"; then
+        if n6_delete; then
           pass "N6 the key that prepared the task is deleted"
           approves "$N6_TASK" - - a
           if [[ "$(own .status)" == "200" && "$(own .state)" == "failed" && "$(own .failure_reason)" == "preparer_key_unavailable" ]]; then
             pass "N6 the approval answered 200 with state failed, preparer_key_unavailable"
             N6_RUN=$(own .run)
+            STATUS_KEY=OWNER_PAYMENT_KEY
             status_of "$N6_TASK"
+            STATUS_KEY=AGENT_PAYMENT_KEY
             [[ "$(said .output.state)" == "failed" && "$(said .output.failure_reason)" == "preparer_key_unavailable" ]] \
-              && pass "N6 the agent reads failed with the reason" || fail "N6 status: $(said .output | head -c 200)"
+              && pass "N6 the preparer's account reads failed with the reason" || fail "N6 status: $(said .output | head -c 200) error='$(said .error | head -c 120)'"
             owner list a closed
             [[ "$(jq -r --arg t "$N6_TASK" '[.tasks[]? | select(.id == $t and .state == "failed" and .failure_reason == "preparer_key_unavailable")] | length' <<<"$OWN")" == "1" ]] \
               && pass "N6 the owner's closed list shows why" || fail "N6 the closed list: $(jq -c --arg t "$N6_TASK" '.tasks[]? | select(.id == $t)' <<<"$OWN")"
             if [[ -n "$N6_RUN" ]]; then
-              # A run that did start attests within the wait (lib: attestation_of_run); one that
-              # was never queued never does.
+              # A run that did start attests within the wait; one that was never queued never does.
               if attestation_of_run "$N6_RUN" 6 >/dev/null; then
                 fail "N6 the run $N6_RUN attested: something ran on a key that could not pay"
               else
@@ -1212,16 +1271,16 @@ if want N6; then
             fail "N6 approve answered $(own .status) state='$(own .state)' failure='$(own .failure_reason)' reason='$(own .reason)' $(own .said)"
           fi
         else
-          fail "N6 the key could not be deleted ($(wc -c < "$N6_HOME/delete" | tr -d ' ') bytes of refusal, not printed)"
+          fail "N6 the key could not be deleted ($(wc -c < "$N6_LOG/delete" | tr -d ' ') bytes of refusal, not printed)"
         fi
       else
         skip "N6 the new key could not prepare a task (it may hold no balance): run=$RUN_OK error='$(said .error | head -c 120)' — the row is left alone"
-        OUTLAYER_HOME="$N6_HOME" OUTLAYER_WALLET_KEY="$AGENT_WALLET_KEY" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" keys delete "$N6_NONCE" >/dev/null 2>&1 || true
+        n6_delete || warn "N6 the key at nonce $N6_NONCE is still on $PARENT"
       fi
-      N6_KEY=""
     fi
-    rm -rf "$N6_HOME"
+    N6_KEY=""
   fi
+  rm -rf "$N6_LOG"
 fi
 
 if want N7; then
@@ -1240,7 +1299,7 @@ if want N7; then
       local body=${3:-} extra=()
       [[ -n "$body" ]] && extra=(-H 'Content-Type: application/json' --data-binary "$body")
       N7_BODY=$(printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_TOKEN" \
-        | curl -sS --max-time 30 -K - -w '\nHTTP:%{http_code}' -X "$1" "$COORDINATOR_URL$2" "${extra[@]}" 2>/dev/null)
+        | curl -sS --max-time 30 -K - -w '\nHTTP:%{http_code}' -X "$1" "$COORDINATOR_URL$2" ${extra[@]+"${extra[@]}"} 2>/dev/null)
       N7_CODE=${N7_BODY##*HTTP:}; N7_BODY=${N7_BODY%$'\n'HTTP:*}
     }
     # What a bearer may read (docs/ADMIN.md): none of it names the task.
@@ -1300,7 +1359,7 @@ if want N11 || want N17 || want N4; then
         sql "UPDATE owner_task_vouchers SET compute_limit_usd = '999999' WHERE task_id = '$TASK'" >/dev/null
         approves "$TASK" - - a
         if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
-          ENDED=$(await_run "$TASK")
+          await_run "$TASK"
           [[ "$ENDED" == "failed" && "$(said .output.failure_reason)" == "run_refused:not-the-preparer" ]] \
             && pass "N11 the run carried more than the consent: failed, run_refused:not-the-preparer" \
             || fail "N11 the task ended '$ENDED' with failure_reason '$(said .output.failure_reason)'"
@@ -1320,7 +1379,7 @@ if want N11 || want N17 || want N4; then
           || fail "N17 the page: $ROW"
         approves "$TASK" - - a
         if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
-          ENDED=$(await_run "$TASK")
+          await_run "$TASK"
           [[ "$ENDED" == "failed" && "$(said .output.failure_reason)" == "run_refused:unreadable" && -z "$(said .output.result)" ]] \
             && pass "N17 the enclave could not open it: failed, run_refused:unreadable, nothing acted" \
             || fail "N17 the task ended '$ENDED' with failure_reason '$(said .output.failure_reason)' result '$(said .output.result | head -c 80)'"
@@ -1332,33 +1391,45 @@ if want N11 || want N17 || want N4; then
       fi
     fi
     if want N4; then
-      log "N4 the voucher's key rewritten to another agent's"
-      if lacks N4 AGENT2_PAYMENT_KEY AGENT2_ACCOUNT; then :
-      elif prepare_as AGENT2_PAYMENT_KEY '{"title":"N4 the other agent, for its nonce"}' && an_id "$TASK"; then
-        OTHER=$TASK
-        NONCE2=$(sql "SELECT payment_key_nonce FROM owner_task_vouchers WHERE task_id = '$OTHER'" | tr -d ' ')
-        if [[ ! "$NONCE2" =~ ^[0-9]+$ ]] || ! an_id "$AGENT2_ACCOUNT"; then
-          fail "N4 the other agent's voucher was not read: '$NONCE2'"
-        elif prepare '{"title":"N4 carried out by the wrong agent"}' && an_id "$TASK"; then
-          sql "UPDATE owner_task_vouchers SET payment_key_owner = '$AGENT2_ACCOUNT', payment_key_nonce = $NONCE2 WHERE task_id = '$TASK'" >/dev/null
-          approves "$TASK" - - a
-          if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
-            ENDED=$(await_run "$TASK")
-            [[ "$ENDED" == "failed" && "$(said .output.failure_reason)" == "run_refused:not-the-preparer" ]] \
-              && pass "N4 the run was the other agent's: failed, run_refused:not-the-preparer" \
-              || fail "N4 the task ended '$ENDED' with failure_reason '$(said .output.failure_reason)'"
-            run_is_the_agents "N4 (the run that was started)" "$(own .run)" "$AGENT2_ACCOUNT"
-          else
-            fail "N4 approve answered $(own .status) state='$(own .state)' reason='$(own .reason)' failure='$(own .failure_reason)'"
-          fi
-          if prepare '{"title":"N4 prepared again, by the right agent"}' && approved_and_done N4 "$TASK"; then
-            pass "N4 a new task prepared by the agent, approved: done"
-          fi
+      log "N4 the voucher rewritten in the store"
+      # Who pays is not the voucher's to say: the coordinator loads the key of
+      # the task's PREPARER, by the voucher's nonce. So a voucher whose owner
+      # column names another agent still runs on the preparer's key — and one
+      # whose nonce names another key of the preparer runs on that key, which
+      # the enclave holds to the consent sealed in the task and refuses.
+      if prepare '{"title":"N4 a voucher that names another agent"}' && an_id "$TASK" && an_id "${AGENT2_ACCOUNT:-x}"; then
+        sql "UPDATE owner_task_vouchers SET payment_key_owner = '${AGENT2_ACCOUNT:-other.testnet}' WHERE task_id = '$TASK'" >/dev/null
+        if approved_and_done "N4 (another agent named)" "$TASK"; then
+          pass "N4 a voucher naming another agent decided nothing: the run went on the preparer's key, done"
+          run_is_the_agents "N4 (another agent named)" "$RUN_OF" "$AGENT_ACCOUNT"
         fi
-        agent "$(jq -nc --arg t "$OTHER" '{operation:"task_delete", task_id:$t}')" >/dev/null 2>&1 || true
-        https_as AGENT2_PAYMENT_KEY "$PARENT/$PROFILE" "$(jq -nc --arg t "$OTHER" '{operation:"task_delete", task_id:$t}')"
       else
-        fail "N4 the other agent's prepare: error='$(said .error | head -c 200)'"
+        fail "N4 prepare: error='$(said .error | head -c 200)'"
+      fi
+      if lacks N4 AGENT_SPARE_NONCE; then :
+      elif ! [[ "$AGENT_SPARE_NONCE" =~ ^[0-9]+$ ]]; then
+        fail "N4 AGENT_SPARE_NONCE is not a nonce"
+      elif prepare '{"title":"N4 carried out on another key of the agent"}' && an_id "$TASK"; then
+        sql "UPDATE owner_task_vouchers SET payment_key_nonce = $AGENT_SPARE_NONCE WHERE task_id = '$TASK'" >/dev/null
+        approves "$TASK" - - a
+        if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
+          N4_RUN=$(own .run)
+          await_run "$TASK"
+          [[ "$ENDED" == "failed" && "$(said .output.failure_reason)" == "run_refused:not-the-preparer" ]] \
+            && pass "N4 the run on another key of the agent: failed, run_refused:not-the-preparer" \
+            || fail "N4 the task ended '$ENDED' with failure_reason '$(said .output.failure_reason)'"
+          if N4_ATT=$(attestation_of_run "$N4_RUN"); then
+            [[ "$(jq -r '.payment_key_nonce // ""' <<<"$N4_ATT")" == "$AGENT_SPARE_NONCE" ]] \
+              && pass "N4 and the run was indeed on the key at nonce $AGENT_SPARE_NONCE" \
+              || fail "N4 the run was on the key at nonce '$(jq -r '.payment_key_nonce // ""' <<<"$N4_ATT")', not $AGENT_SPARE_NONCE"
+          else
+            skip "N4 the run $N4_RUN has no attestation after the wait: which key it ran on is not read"
+          fi
+        else
+          fail "N4 approve answered $(own .status) state='$(own .state)' reason='$(own .reason)' failure='$(own .failure_reason)' — the key at nonce $AGENT_SPARE_NONCE must be funded"
+        fi
+      else
+        fail "N4 prepare: error='$(said .error | head -c 200)'"
       fi
     fi
   fi
@@ -1577,13 +1648,16 @@ if want L1; then
       https_as OWNER_PAYMENT_KEY "$PARENT/$PROFILE" '{"operation":"prepare","title":"L1 the twenty-first"}'
       expect_refusal L1 inbox_full
       # The owner approves the task their own key prepared: the run is that
-      # key's, and the key is the owner's — the legitimate twin of N14.
+      # key's, and the key is the owner's — the legitimate twin of N14. The
+      # task is that key's to read, so task_status is asked with it.
+      STATUS_KEY=OWNER_PAYMENT_KEY
       if approved_and_done L1 "$OWN_TASK"; then
         run_is_the_agents L1 "$RUN_OF" "$PARENT"
         prepare_as OWNER_PAYMENT_KEY '{"title":"L1 after one was answered"}' \
           && pass "L1 one answered, one more opens" \
           || fail "L1 after an answer the next task: error='$(said .error | head -c 200)'"
       fi
+      STATUS_KEY=AGENT_PAYMENT_KEY
     else
       fail "L1 the twenty tasks did not all open: error='$(said .error | head -c 200)'"
     fi
@@ -2140,6 +2214,205 @@ if want P9; then
     fi
   else
     fail "P9 the sign-ins answered $(own .status) $(own .reason)"
+  fi
+fi
+
+# ── notices ──────────────────────────────────────────────────────────────────
+
+# notify_as <VARIABLE holding a payment key> <input-json> — that preparer
+# notifies over HTTPS; leaves TASK and HASH.
+notify_as() {
+  https_as "$1" "$PARENT/$PROFILE" "$(jq -c '. + {operation:"notify"}' <<<"$2")"
+  TASK=$(said .output.task_id); HASH=$(said .output.task_hash)
+  [[ "$(said .output.status)" == "notified" && -n "$TASK" ]]
+}
+notify() { notify_as AGENT_PAYMENT_KEY "$1"; }
+
+if want NT1 || want NT2 || want NT3 || want NT8; then
+  log "NT1 the agent notifies"
+  NOTICE_TITLE="NT1 sent $(openssl rand -hex 4)"
+  if notify "$(jq -nc --arg t "$NOTICE_TITLE" '{title:$t, body:"The email to Bob was sent."}')"; then
+    NOTICE=$TASK NOTICE_HASH=$HASH
+    pass "NT1 notified, task $NOTICE"
+    in_inbox "$NOTICE"
+    [[ "$(row .kind)" == "notice" && "$(row .state)" == "open" && "$(row .reply_pubkey)" == "" ]] \
+      && pass "NT1 listed as an open notice, with no reply key" || fail "NT1 the listed row: $(jq -c 'del(.read)' <<<"$ROW")"
+    [[ "$(row .read.hash)" == "$NOTICE_HASH" && "$(row .read.envelope.kind)" == "notice" \
+       && "$(row '.read.envelope | has("answer_by")')" == "false" && "$(row '.read.envelope | has("reply_pubkey")')" == "false" \
+       && "$(row .read.envelope.display.title)" == "$NOTICE_TITLE" ]] \
+      && pass "NT1 the owner reads it: the run's hash, kind notice, no operation, no reply key" \
+      || fail "NT1 the page read: hash '$(row .read.hash)' kind '$(row .read.envelope.kind)' title '$(row .read.envelope.display.title)'"
+    status_of "$NOTICE"
+    [[ "$(said .output.state)" == "open" && "$(said .output.kind)" == "notice" ]] \
+      && pass "NT1 the agent reads it open" || fail "NT1 task_status: state '$(said .output.state)' kind '$(said .output.kind)'"
+    if [[ -z "${PSQL_CMD:-}" ]]; then
+      skip "NT1 no voucher: needs PSQL_CMD — $(what_is PSQL_CMD)"
+    else
+      VOUCHERS=$(sql_row "SELECT count(*) FROM owner_task_vouchers WHERE task_id = '$NOTICE'" 3)
+      [[ "$VOUCHERS" == "0" ]] && pass "NT1 no voucher is kept for a notice" || fail "NT1 vouchers of the notice: '$VOUCHERS'"
+    fi
+
+    if want NT8; then
+      log "NT8 the proof of a notice"
+      owner proof "$NOTICE" a
+      if [[ "$(own .attested)" == "false" ]]; then
+        skip "NT8 the run $(own .run) has no attestation: this worker attests nothing"
+      elif [[ "$(own .attested)" == "true" ]]; then
+        [[ "$(own .answer_matches)" == "true" && "$(own .names_task)" == "true" && "$(own .names_another_hash)" == "false" ]] \
+          && pass "NT8 the attested answer names the notice with the hash of what the page opened" \
+          || fail "NT8 matches=$(own .answer_matches) names_task=$(own .names_task) another=$(own .names_another_hash)"
+      else
+        fail "NT8 the proof could not be read: $(own .failed | head -c 200)"
+      fi
+    fi
+
+    if want NT2; then
+      log "NT2 an approval sent to a notice"
+      if prepare '{"title":"NT2 the task the approval is for"}'; then
+        NONCE=$(openssl rand -base64 32)
+        approves "$NOTICE" - - a --for "$TASK" --hash "$HASH" --nonce "$NONCE"
+        [[ "$(own .status)" == "400" && "$(own .reason)" == "invalid_request" ]] \
+          && pass "NT2 approve of a notice: 400" || fail "NT2 approve of a notice answered $(own .status) $(own .reason)"
+        owner replay-approval "$NOTICE" a against "$TASK"
+        if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
+          pass "NT2 the same signature and nonce then approve the task they were for"
+          await_run "$TASK"
+          [[ "$ENDED" == "done" ]] || fail "NT2 the approved task ended '$ENDED'"
+        else
+          fail "NT2 the same body on its task answered $(own .status) $(own .reason) state '$(own .state)'"
+        fi
+        in_inbox "$NOTICE" && [[ "$(row .state)" == "open" ]] \
+          && pass "NT2 the notice is as it was" || fail "NT2 the notice after the approval: '$(row .state)'"
+      else
+        fail "NT2 prepare: error='$(said .error | head -c 200)'"
+      fi
+    fi
+
+    if want NT3; then
+      log "NT3 Got it"
+      owner reject "$NOTICE" "" a
+      [[ "$(own .status)" == "400" && "$(own .body.reason)" == "invalid_request" ]] \
+        && pass "NT3 a reject of a notice: 400" || fail "NT3 reject of a notice answered $(own .status) $(own .body.reason)"
+      owner got-it "$NOTICE" a
+      [[ "$(own .status)" == "200" && "$(own .body.state)" == "done" ]] \
+        && pass "NT3 Got it: done" || fail "NT3 Got it answered $(own .status) $(own .body.reason) $(own .body.state)"
+      status_of "$NOTICE"
+      [[ "$(said .output.state)" == "done" && -z "$(said .output.run)" ]] \
+        && pass "NT3 the agent reads it done, with no run" || fail "NT3 task_status after Got it: '$(said .output.state)' run '$(said .output.run)'"
+      gone_from_inbox NT3 "$NOTICE" && pass "NT3 it left the inbox"
+      owner got-it "$NOTICE" a
+      [[ "$(own .status)" == "409" && "$(own .body.reason)" == "task_closed" ]] \
+        && pass "NT3 a second Got it: 409 task_closed" || fail "NT3 a second Got it answered $(own .status) $(own .body.reason)"
+      if prepare '{"title":"NT3 a task, not a notice"}'; then
+        owner got-it "$TASK" a
+        [[ "$(own .status)" == "400" ]] && pass "NT3 Got it on a task that takes an answer: 400" \
+          || fail "NT3 Got it on a confirm answered $(own .status) $(own .body.reason)"
+      fi
+      if notify '{"title":"NT3 deleted unseen"}'; then
+        owner delete "$TASK" a
+        status_of "$TASK"
+        [[ "$(code)" == "task_not_found" ]] && pass "NT3 a deleted notice: the agent finds nothing" \
+          || fail "NT3 after a delete the agent read '$(said .output.state)' error '$(said .error | head -c 120)'"
+      else
+        fail "NT3 notify: error='$(said .error | head -c 200)'"
+      fi
+    fi
+  else
+    fail "NT1 notify: error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
+  fi
+fi
+
+if want NT4; then
+  log "NT4 a run on chain notifies"
+  acts '{"operation":"notify","title":"NT4 from a transaction"}'
+  if [[ "$(said .success)" == "true" && "$(said .output.status)" == "notified" ]]; then
+    TASK=$(said .output.task_id)
+    pass "NT4 a run with no payment key notified: $TASK"
+    in_inbox "$TASK"
+    [[ "$(row .kind)" == "notice" && "$(row .preparer)" == "$PARENT" && "$(row .read.envelope.display.title)" == "NT4 from a transaction" ]] \
+      && pass "NT4 the owner reads it, the owner's own" || fail "NT4 the listed row: $(jq -c 'del(.read)' <<<"$ROW")"
+  else
+    fail "NT4 the owner's call answered success=$(said .success) status='$(said .output.status)' error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
+  fi
+  acts '{"operation":"prepare","title":"NT4 a confirm from a transaction"}'
+  expect_refusal NT4 task_no_payment_key
+fi
+
+if want NT5; then
+  log "NT5 who may notify"
+  store_row "$POLICY_V1" '"AllowAll"'
+  agent '{"operation":"notify"}'
+  expect_refusal NT5 not_granted_by_name
+  store_row "$POLICY_V1" "$GRANTED"
+  owner mute agent "$AGENT_ACCOUNT" a
+  agent '{"operation":"notify"}'
+  expect_refusal NT5 muted
+  owner unmute agent "$AGENT_ACCOUNT" a
+  if relay_lacks NT5; then :
+  else
+    relayed '{"operation":"notify"}'
+    if [[ "$RUN_OK" == "absent" ]]; then
+      skip "NT5 the relayed run gave no completion event, so nothing was judged"
+    else
+      expect_refusal NT5 relayed
+    fi
+  fi
+fi
+
+if want NT6; then
+  log "NT6 notices count in the agent's share"
+  clear_tasks
+  https_as AGENT_PAYMENT_KEY "$PARENT/$PROFILE" '{"operation":"prepare_many","count":5,"kind":"notice","title":"NT6"}'
+  FIRST=$(said .output.opened); SEEN_FIRST=$(said '.output.tasks[0].task_id')
+  https_as AGENT_PAYMENT_KEY "$PARENT/$PROFILE" '{"operation":"prepare_many","count":5,"kind":"notice","title":"NT6"}'
+  if [[ "$FIRST" == "5" && "$(said .output.opened)" == "5" && "$(said .output.status)" == "notified" ]]; then
+    pass "NT6 ten notices opened"
+    prepare '{"title":"NT6 the eleventh, a confirm"}'
+    expect_refusal NT6 inbox_full
+    notify '{"title":"NT6 the eleventh, a notice"}'
+    expect_refusal NT6 inbox_full
+    owner got-it "$SEEN_FIRST" a
+    [[ "$(own .status)" == "200" ]] || fail "NT6 Got it answered $(own .status) $(own .body.reason)"
+    prepare '{"title":"NT6 after one was seen"}' && pass "NT6 one seen, and a task opens" \
+      || fail "NT6 after Got it: error='$(said .error | head -c 200)'"
+  else
+    fail "NT6 opened $FIRST and $(said .output.opened): $(said .output.refused | head -c 200)"
+  fi
+  clear_tasks
+fi
+
+if want NT7; then
+  log "NT7 a notice at the owner's URL"
+  if lacks NT7 HOOK_URL HOOK_LOG_URL; then :
+  else
+    export HOOK_URL
+    owner webhook set HOOK_URL a
+    if [[ "$(own .status)" == "200" && "$(own .url_matches)" == "true" ]]; then
+      HOOK_NAMED=true
+      SHOWN_TITLE="NT7 title $(openssl rand -hex 6)"; SHOWN_BODY="NT7 body $(openssl rand -hex 6)"
+      if notify "$(jq -nc --arg t "$SHOWN_TITLE" --arg b "$SHOWN_BODY" '{title:$t, body:$b}')"; then
+        TOLD_TASK=$TASK
+        if told HOOK_LOG_URL task_created "$TOLD_TASK" 9 "$SHOWN_TITLE" "$SHOWN_BODY"; then
+          judge_event NT7 task_created
+          [[ "$(event .kind)" == "notice" ]] && pass "NT7 the event says kind notice" || fail "NT7 the event's kind is '$(event .kind)'"
+          [[ "$(jq -r '.leaked | length' <<<"$HOOK")" == "0" ]] && pass "NT7 nothing of what the notice shows reached the receiver" \
+            || fail "NT7 $(jq -r '.leaked | length' <<<"$HOOK") of what the notice shows found in a body"
+        else
+          fail "NT7 task_created of $TOLD_TASK did not reach the receiver: $(jq -r '.failed // "not among the events"' <<<"$HOOK")"
+        fi
+        owner got-it "$TOLD_TASK" a
+        # The events of the notice are sent within seconds of their move;
+        # the receiver's log is read once that long has passed.
+        sleep 20
+        hook_log HOOK_LOG_URL
+        AFTER=$(jq -r --arg t "$TOLD_TASK" '[.events[]? | select(.task_id == $t and .type != "task_created")] | length' <<<"$HOOK" 2>/dev/null)
+        [[ "$AFTER" == "0" ]] && pass "NT7 Got it sends no event" || fail "NT7 events after Got it: $AFTER"
+      else
+        fail "NT7 notify: error='$(said .error | head -c 200)'"
+      fi
+    else
+      fail "NT7 naming the URL answered $(own .status)"
+    fi
   fi
 fi
 

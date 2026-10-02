@@ -82,7 +82,7 @@ with no price and no fee.
 | `sleep` | $0.01 | sleeps `seconds` (≤ 600) so the execution limit, not the module, ends the run |
 | `budget` | free | a daily budget kept the way the connectors keep theirs: `mode` reserve / release / read against `cap` on counter `run`, through the atomic `storage::increment`; `tests/connector_budget_parallel_e2e.sh` fires it in parallel to show the cap holds |
 | `guess_start` | $0.01, share 0 | tasks between an agent and its owner, over several turns: picks a number and leaves the owner the first task of a game (below) |
-| `guess` | free | the agent's run on the owner's answer to a turn, started by the platform on the owner's approval: judges the guess, reports it, and opens the next turn in the same thread |
+| `guess` | free | the agent's run on the owner's answer to a turn, started by the platform on the owner's approval: judges the guess, reports it, and opens the next turn in the same thread — or, on a right guess, a notice that says so |
 | `task_status`, `task_cancel`, `task_delete`, `tasks`, `tasks_unlock` | free | the SDK's own task operations (`outlayer::tasks::dispatch`) |
 | `unpriced` | — | absent from the price table AND unimplemented here: must be refused before anything runs |
 
@@ -122,12 +122,15 @@ the agent — on the agent's own payment key — which judges it:
 - not a whole number from 1 to `max` — a wrong turn too: an answered task
   cannot be un-answered, so the next task says `not a number from 1 to {max}`
   and the game goes on;
-- right — reports `guessed in {n} attempts`, and opens nothing.
+- right — reports `guessed in {n} attempts`, and leaves the owner a notice in
+  the same thread, `You guessed it: {number}, in {n} attempts`, which asks
+  nothing: the owner closes it with Got it.
 
 **The agent reads the outcome** with `task_status` (`{"operation":
 "task_status", "task_id": "…"}`) or `tasks`. The result of a turn is
 `{attempt, guess, verdict, max, detail}`, with `next_task_id` when the game goes
-on. Every turn is the agent's: the run that judges a guess is the agent's, so
+on and `notice_task_id` when it was won (`next_error` or `notice_error` when
+that could not be opened). Every turn is the agent's: the run that judges a guess is the agent's, so
 the task it opens is the agent's too, and the agent follows the whole game
 with `task_status` on each `next_task_id`, or with `tasks`. Each turn costs
 the agent one run; the owner pays nothing and sends no transaction.

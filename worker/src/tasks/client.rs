@@ -35,6 +35,7 @@ pub enum State {
 pub enum Kind {
     Confirm,
     Input,
+    Notice,
 }
 
 /// Why the store refused.
@@ -101,7 +102,8 @@ pub struct NewTask {
     pub id: String,
     pub project_id: String,
     pub preparer: String,
-    pub voucher: Voucher,
+    /// Absent for a notice, which no run follows.
+    pub voucher: Option<Voucher>,
     /// The profile of the owner's secret row the run named.
     pub profile: String,
     /// The vault that row is bound to, whose master seals the task.
@@ -109,7 +111,8 @@ pub struct NewTask {
     pub kind: Kind,
     /// Unix seconds.
     pub expires_at: u64,
-    pub reply_pubkey: String,
+    /// Absent for a notice, which takes nothing back.
+    pub reply_pubkey: Option<String>,
     pub sealed: Vec<u8>,
     pub content: Vec<u8>,
     /// The task's files under its content key, in order.

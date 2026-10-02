@@ -38,6 +38,19 @@ pub const MAX_COMBINING_RUN: usize = 4;
 pub enum Kind {
     Confirm,
     Input,
+    /// Tells the owner something and asks nothing: no operation answers it,
+    /// nothing is written back to it, no run follows it.
+    Notice,
+}
+
+impl Kind {
+    /// Does the owner answer it, and a run of the preparer carry the answer out?
+    pub fn takes_an_answer(self) -> bool {
+        match self {
+            Self::Confirm | Self::Input => true,
+            Self::Notice => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,7 +201,11 @@ pub fn check_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> R
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
-    pub answer_by: AnswerBy,
+    /// The operation that carries the owner's answer out; absent for a
+    /// notice, which takes none. Absent members are not written, so a task
+    /// that takes an answer is the same document it always was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_by: Option<AnswerBy>,
     /// SHA-256 of the build that made the task, hex: the code the owner's
     /// proof names. The answer is taken by that build and no other.
     pub build: String,
@@ -207,8 +224,9 @@ pub struct Envelope {
     pub profile: String,
     pub project: String,
     pub project_uuid: String,
-    /// What the owner's answer is encrypted to.
-    pub reply_pubkey: String,
+    /// What the owner's answer is encrypted to; absent for a notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_pubkey: Option<String>,
     /// SHA-256 of the component's `state`, hex.
     pub state_hash: String,
     pub thread: String,
@@ -222,9 +240,23 @@ impl Envelope {
     }
 
     /// Read a document this host wrote. One with a member missing, unknown or
-    /// of another type is not an envelope.
+    /// of another type, or whose kind disagrees with what it holds, is not an
+    /// envelope.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|_| "the envelope cannot be read".to_string())
+        let envelope: Self = serde_json::from_slice(bytes).map_err(|_| "the envelope cannot be read".to_string())?;
+        envelope.check_kind()?;
+        Ok(envelope)
+    }
+
+    /// A task that takes an answer names the operation that carries it out
+    /// and the key the owner's answer is sealed to; a notice names neither.
+    /// The one place the rule lives.
+    pub fn check_kind(&self) -> Result<(), String> {
+        match (self.kind.takes_an_answer(), self.answer_by.is_some(), self.reply_pubkey.is_some()) {
+            (true, true, true) | (false, false, false) => Ok(()),
+            (true, _, _) => Err("a task that takes an answer names its operation and its reply key".to_string()),
+            (false, _, _) => Err("a notice takes no answer: it names no operation and no reply key".to_string()),
+        }
     }
 }
 
@@ -421,8 +453,10 @@ pub struct SealedTask {
     pub envelope: String,
     /// The component's `state`, base64.
     pub state: String,
-    /// The preparer's consent to the run that carries the task out.
-    pub consent: Consent,
+    /// The preparer's consent to the run that carries the task out; absent
+    /// for a notice, which no run follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent: Option<Consent>,
 }
 
 /// What the preparing run was, as the run that carries the task out must be
@@ -467,7 +501,7 @@ impl Consent {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn field(kind: FieldKind, values: &[&str]) -> Field {
@@ -480,7 +514,7 @@ mod tests {
 
     pub(crate) fn envelope() -> Envelope {
         Envelope {
-            answer_by: AnswerBy { operation: "confirm".into(), supplies: Supplies::Nothing },
+            answer_by: Some(AnswerBy { operation: "confirm".into(), supplies: Supplies::Nothing }),
             build: "ab".repeat(32),
             created_at: 1_790_000_000,
             display: display(vec![field(FieldKind::Address, &["bob@example.com"])]),
@@ -494,7 +528,7 @@ mod tests {
             profile: "gmail".into(),
             project: "connectors.outlayer.near/gmail".into(),
             project_uuid: "p0000000000000001".into(),
-            reply_pubkey: "p256:abc".into(),
+            reply_pubkey: Some("p256:abc".into()),
             state_hash: hash(b"state"),
             thread: "run-0".into(),
             v: VERSION,
@@ -520,6 +554,41 @@ mod tests {
         assert_eq!(Envelope::from_bytes(&bytes).unwrap(), envelope());
         assert_eq!(bytes, envelope().to_bytes().unwrap());
         assert_eq!(hash(&bytes).len(), 64);
+    }
+
+    pub(crate) fn notice() -> Envelope {
+        Envelope { kind: Kind::Notice, answer_by: None, reply_pubkey: None, ..envelope() }
+    }
+
+    #[test]
+    fn the_envelope_holds_notice_iff_no_answer_and_no_reply_key() {
+        let read = |e: &Envelope| Envelope::from_bytes(&e.to_bytes().unwrap());
+        assert_eq!(read(&notice()).unwrap(), notice());
+        assert_eq!(read(&envelope()).unwrap(), envelope());
+        let text = String::from_utf8(notice().to_bytes().unwrap()).unwrap();
+        assert!(!text.contains("answer_by") && !text.contains("reply_pubkey") && text.contains("\"kind\":\"notice\""), "{text}");
+        for (why, bad) in [
+            ("a notice with an operation", Envelope { answer_by: envelope().answer_by, ..notice() }),
+            ("a notice with a reply key", Envelope { reply_pubkey: envelope().reply_pubkey, ..notice() }),
+            ("a confirm with no operation", Envelope { answer_by: None, ..envelope() }),
+            ("a confirm with no reply key", Envelope { reply_pubkey: None, ..envelope() }),
+            ("an input with neither", Envelope { kind: Kind::Input, answer_by: None, reply_pubkey: None, ..envelope() }),
+        ] {
+            assert!(read(&bad).is_err(), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_confirms_document_is_the_one_it_always_was() {
+        // The bytes of a task that takes an answer, as this host wrote them
+        // before a notice was a kind: the same hash, member for member.
+        let written = concat!(
+            r#"{"answer_by":{"operation":"confirm","supplies":"nothing"},"build":""#, "abababababababababababababababababababababababababababababababab",
+            r#"","created_at":1790000000,"display":{"fields":[{"kind":"address","label":"To","values":["bob@example.com"],"written_by":"agent"}],"title":"Send an email"},"#,
+            r#""expires_at":1790003600,"files":[],"id":"run-0","kind":"confirm","owner":"owner.near","policy_hash":""#,
+        );
+        let bytes = envelope().to_bytes().unwrap();
+        assert!(String::from_utf8(bytes).unwrap().starts_with(written));
     }
 
     #[test]
@@ -837,9 +906,11 @@ mod tests {
             "content_key": "00", "envelope": "{}", "state": "", "consent": serde_json::to_value(consent()).unwrap()
         });
         assert!(serde_json::from_value::<SealedTask>(sealed.clone()).is_ok());
+        // A notice is sealed with no consent; whether that agrees with its
+        // kind is the unsealing host's to hold.
         let mut without = sealed.clone();
         without.as_object_mut().unwrap().remove("consent");
-        assert!(serde_json::from_value::<SealedTask>(without).is_err(), "a task sealed with no consent is not one");
+        assert!(serde_json::from_value::<SealedTask>(without).unwrap().consent.is_none());
         let mut more = sealed;
         more["consent"]["valid_from"] = serde_json::json!(0);
         assert!(serde_json::from_value::<SealedTask>(more).is_err());

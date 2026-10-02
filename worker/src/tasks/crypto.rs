@@ -423,8 +423,15 @@ mod tests {
             "device_copy": hex::encode(seal_to(&golden_device().public_key(), Purpose::DeviceCopy, GOLDEN_TASK, &content_key).unwrap()),
             "content": hex::encode(encrypt_content(&content_key, GOLDEN_TASK, GOLDEN_DOCUMENT.as_bytes()).unwrap()),
             "reply_pubkey": TaskKeys::derive(&PROJECT_KEY, GOLDEN_TASK).reply_pubkey(),
+            "notice_envelope": golden_notice(),
+            "notice_hash": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(golden_notice().as_bytes())),
         });
         println!("{}", serde_json::to_string_pretty(&golden).unwrap());
+    }
+
+    /// A notice's envelope as this host writes it: the page reads it as one.
+    fn golden_notice() -> String {
+        String::from_utf8(crate::tasks::envelope::tests::notice().to_bytes().unwrap()).unwrap()
     }
 
     /// The bytes the page's test opens with WebCrypto
@@ -441,6 +448,8 @@ mod tests {
         assert_eq!(key.as_slice(), &[9u8; 32]);
         let document = decrypt_content(&[9u8; 32], GOLDEN_TASK, &bytes("content")).unwrap();
         assert_eq!(document, GOLDEN_DOCUMENT.as_bytes());
+        assert_eq!(golden["notice_envelope"], golden_notice(), "a notice is written as the page reads it");
+        assert_eq!(golden["notice_hash"], hex::encode(<sha2::Sha256 as sha2::Digest>::digest(golden_notice().as_bytes())));
 
         let answer = hex::decode(ANSWER_FROM_THE_PAGE).unwrap();
         let opened = TaskKeys::derive(&PROJECT_KEY, GOLDEN_TASK).open_reply(Purpose::Answer, GOLDEN_TASK, &answer).unwrap();

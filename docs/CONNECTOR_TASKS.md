@@ -247,6 +247,26 @@ conversation from inside `supply`, and a game over several turns is one
 thread in the owner's inbox. The run that answers is the agent's, so a turn
 is the agent's too, opened over HTTPS with the agent's key.
 
+### Telling the owner: notices
+
+When there is nothing to ask — the action is done, or it is the owner's to
+know of but not to decide — a connector opens a notice and answers
+`notified`:
+
+```rust
+let opened = tasks::notice(display, &policy).open().map_err(|e| e.refusal())?;
+return Ok(tasks::notified(&opened));
+```
+
+A notice names no operation, takes no answer (`answered` on it is
+`answer-invalid`) and carries no consent, so it needs no payment key. It is
+shown, sealed and limited as a task is, and the owner closes it with Got it.
+It is not a receipt: an agent learns what an action did from the outcome of
+the task that acted, not from whether a notice was seen. A turn may be a
+notice: `connectors/connector-probe` ends the guessing game with one in the
+game's thread. A connector that notifies keeps the rules below that concern
+what is shown; the rules about acting concern the tasks that are answered.
+
 ## 4. Rules
 
 **(a) The action is carried out exactly as it was shown.** `confirm` acts on

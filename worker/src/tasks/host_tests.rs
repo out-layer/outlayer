@@ -460,7 +460,7 @@ impl World {
     /// What the owner's page sends with an answer, a note or a rejection.
     fn page_writes(&self, id: &str, purpose: Purpose, text: &[u8]) -> Vec<u8> {
         let (envelope, _) = self.page_reads(id);
-        crypto::seal_to(&crypto::read_pubkey(&envelope.reply_pubkey).unwrap(), purpose, id, text).unwrap()
+        crypto::seal_to(&crypto::read_pubkey(envelope.reply_pubkey.as_deref().expect("a task that takes an answer")).unwrap(), purpose, id, text).unwrap()
     }
 
     /// The owner's wallet signs the approval of the task `id` showing `hash`,
@@ -476,6 +476,15 @@ impl World {
     /// the task. The approval the run's input carries.
     fn approve(&self, task: &wit::Opened, run: &str) -> wit::Approval {
         self.approve_with(task, run, None, None)
+    }
+
+    /// The owner's Got it: the store closes the notice as `done`, and what it
+    /// showed goes, as the coordinator's acknowledge does.
+    fn got_it(&self, id: &str) {
+        self.store.change(id, |row| {
+            assert_eq!((row.task.kind, row.state), (client::Kind::Notice, State::Open), "only an open notice is seen");
+            Mem::close(row, State::Done);
+        });
     }
 
     fn approve_with(&self, task: &wit::Opened, run: &str, supplied: Option<&[u8]>, note: Option<&[u8]>) -> wit::Approval {
@@ -504,7 +513,7 @@ fn email() -> wit::Request {
                 },
             ],
         },
-        answer_by: wit::AnswerBy { operation: "confirm".to_string(), supplies: wit::Supplies::Nothing },
+        answer_by: Some(wit::AnswerBy { operation: "confirm".to_string(), supplies: wit::Supplies::Nothing }),
         files: vec![],
         state: b"the prepared message".to_vec(),
         policy: POLICY.to_vec(),
@@ -516,9 +525,29 @@ fn photo() -> wit::Request {
     wit::Request {
         kind: wit::TaskKind::Input,
         display: wit::Display { title: "Give me your photo".to_string(), fields: vec![] },
-        answer_by: wit::AnswerBy { operation: "upload_photo".to_string(), supplies: wit::Supplies::File },
+        answer_by: Some(wit::AnswerBy { operation: "upload_photo".to_string(), supplies: wit::Supplies::File }),
         files: vec![],
         state: b"video job 7".to_vec(),
+        policy: POLICY.to_vec(),
+        life_seconds: 0,
+    }
+}
+
+fn guessed() -> wit::Request {
+    wit::Request {
+        kind: wit::TaskKind::Notice,
+        display: wit::Display {
+            title: "You guessed it".to_string(),
+            fields: vec![wit::Field {
+                label: "Attempts".to_string(),
+                kind: wit::FieldKind::Text,
+                values: vec!["6".to_string()],
+                written_by: wit::WrittenBy::Project,
+            }],
+        },
+        answer_by: None,
+        files: vec![],
+        state: vec![],
         policy: POLICY.to_vec(),
         life_seconds: 0,
     }
@@ -1077,7 +1106,7 @@ fn a_run_admitted_by_a_rule_that_names_nobody_opens_no_task() {
 }
 
 /// The consent to carry a task out is a payment key: a run with none — one
-/// on chain — opens no task, whoever made it.
+/// on chain — opens no task that takes an answer, whoever made it.
 #[test]
 fn a_run_with_no_payment_key_opens_no_task() {
     let world = World::new();
@@ -1868,7 +1897,7 @@ fn a_task_outside_the_bounds_is_refused_by_name_and_none_is_made() {
     assert!(display.message.contains("the title is 81 characters"), "{}", display.message);
     assert_eq!(refused(|r| r.display.fields[0].values.push("two".into())).reason, wit::Reason::DisplayInvalid);
     assert_eq!(refused(|r| r.display.fields[0].values[0] = "evil\u{202E}moc.elpmaxe".into()).reason, wit::Reason::DisplayInvalid);
-    assert_eq!(refused(|r| r.answer_by.operation = "send {\"to\":\"x\"}".into()).reason, wit::Reason::DisplayInvalid);
+    assert_eq!(refused(|r| r.answer_by.as_mut().unwrap().operation = "send {\"to\":\"x\"}".into()).reason, wit::Reason::DisplayInvalid);
     assert_eq!(refused(|r| r.state = vec![0; crate::tasks::MAX_STATE_BYTES + 1]).reason, wit::Reason::TooLarge);
     assert_eq!(refused(|r| r.policy = vec![0; crate::tasks::MAX_POLICY_BYTES + 1]).reason, wit::Reason::TooLarge);
     let life = refused(|r| r.life_seconds = crate::tasks::MAX_LIFE_SECS + 1);
@@ -1992,7 +2021,7 @@ fn nothing_of_a_task_is_logged() {
     let mut request = photo();
     request.display.title = "MARKER-TITLE give me your photo".to_string();
     request.state = b"MARKER-STATE video job".to_vec();
-    request.answer_by.operation = "marker_operation".to_string();
+    request.answer_by.as_mut().unwrap().operation = "marker_operation".to_string();
     let opened = world.agent("run-logged").open(request).unwrap();
     let supplied = world.page_writes(&opened.id, Purpose::Answer, b"MARKER-SUPPLIED ipfs://photo");
     let note = world.page_writes(&opened.id, Purpose::Note, b"MARKER-NOTE take the second one");
@@ -2202,24 +2231,146 @@ fn the_voucher_the_store_is_told_is_the_consent_that_is_sealed() {
     let row = world.store.row(&opened.id);
     assert_eq!(
         row.task.voucher,
-        client::Voucher {
+        Some(client::Voucher {
             payment_key_nonce: 5,
             wallet_id: Some("w-9".into()),
             bound_identity: true,
             compute_limit_usd: "2500".into(),
             operation: "confirm".into(),
             build: BUILD.into(),
-        }
+        })
     );
     let keys = TaskKeys::derive(&world.project_key, &opened.id);
     let plain = keys.open(Sealed::Task, &opened.id, row.sealed.as_deref().unwrap()).unwrap();
     let sealed: SealedTask = serde_json::from_slice(&plain).unwrap();
     assert_eq!(
         sealed.consent,
-        Consent { payment_key_nonce: 5, wallet: Some("w-9".into()), bound_identity: true, compute_limit_usd: "2500".into() }
+        Some(Consent { payment_key_nonce: 5, wallet: Some("w-9".into()), bound_identity: true, compute_limit_usd: "2500".into() })
     );
     // The envelope the owner reads carries no consent: nothing of the key.
     let (shown, _) = world.page_reads(&opened.id);
     let document = serde_json::to_string(&shown).unwrap();
     assert!(!document.contains("w-9") && !document.contains("2500") && !document.contains("nonce"));
+}
+
+
+// ── notices ─────────────────────────────────────────────────────────────────
+
+/// A notice is opened by a run with no payment key — one on chain — and
+/// carries no consent: the store is told no voucher and no reply key, and
+/// the sealed copy holds none.
+#[test]
+fn a_notice_opens_without_a_payment_key_and_seals_no_consent() {
+    let world = World::new();
+    let mut keyless = world.host(Run { id: "run-k", consent: None, ..world.agent_run() }).0;
+    let opened = keyless.open(guessed()).unwrap();
+    assert_eq!((opened.id.as_str(), opened.devices), ("run-k-0", 1));
+    let row = world.store.row(&opened.id);
+    assert_eq!((row.task.kind, row.task.voucher.as_ref(), row.task.reply_pubkey.as_ref()), (client::Kind::Notice, None, None));
+    let keys = TaskKeys::derive(&world.project_key, &opened.id);
+    let plain = keys.open(Sealed::Task, &opened.id, row.sealed.as_deref().unwrap()).unwrap();
+    let sealed: SealedTask = serde_json::from_slice(&plain).unwrap();
+    assert!(sealed.consent.is_none());
+    // The owner's page reads it as any task, and its hash is the run's.
+    let (shown, hash) = world.page_reads(&opened.id);
+    assert_eq!((shown.kind, shown.answer_by.as_ref(), shown.reply_pubkey.as_ref()), (envelope::Kind::Notice, None, None));
+    assert_eq!((shown.display.title.as_str(), hash), ("You guessed it", opened.hash.clone()));
+    // A run with a key seals none either.
+    let opened = world.agent("run-a").open(guessed()).unwrap();
+    assert!(world.store.row(&opened.id).task.voucher.is_none());
+    // The agent reads it open; the owner's Got it makes it `done`, with no run and no result.
+    assert_eq!(world.agent("run-b").status(opened.id.clone()).unwrap().kind, wit::TaskKind::Notice);
+    world.got_it(&opened.id);
+    let seen = world.agent("run-b").status(opened.id.clone()).unwrap();
+    assert_eq!((seen.state, seen.run, seen.result), (wit::TaskState::Done, None, None));
+}
+
+/// A notice and an answer do not go together, either way round.
+#[test]
+fn a_notice_names_no_operation_and_a_task_that_takes_an_answer_names_one() {
+    let world = World::new();
+    let mut with_answer = guessed();
+    with_answer.answer_by = email().answer_by;
+    let mut without = email();
+    without.answer_by = None;
+    for (why, request) in [("a notice with an operation", with_answer), ("a confirm without one", without)] {
+        let refused = world.agent("run-a").open(request).expect_err(why);
+        assert_eq!(refused.reason, wit::Reason::DisplayInvalid, "{why}: {}", refused.message);
+    }
+    assert!(world.store.rows.lock().unwrap().is_empty());
+}
+
+/// `answered` on a notice is `answer-invalid` for every operation, nothing
+/// is recorded, and the notice stays open; `report` on it is `not-found`.
+#[test]
+fn a_notice_takes_no_answer_and_a_run_reports_nothing_on_it() {
+    let world = World::new();
+    let opened = world.agent("run-a").open(guessed()).unwrap();
+    let approval = world.signed(&opened.id, &opened.hash, None, None);
+    for operation in ["confirm", "guess", ""] {
+        let (mut run, report) = world.agent_with("run-o");
+        let refused = run
+            .answered(opened.id.clone(), opened.hash.clone(), operation.to_string(), POLICY.to_vec(), approval.clone(), None, None)
+            .expect_err("refused");
+        assert_eq!(refused.reason, wit::Reason::AnswerInvalid, "{operation}: {}", refused.message);
+        assert!(refused.message.contains("notice"), "{}", refused.message);
+        assert!(report.refusals().is_empty() && report.tasks().is_empty(), "nothing recorded");
+        assert_eq!(reason(run.report(opened.id.clone(), b"seen".to_vec())), wit::Reason::NotFound);
+    }
+    let row = world.store.row(&opened.id);
+    assert!(row.state == State::Open && row.sealed.is_some() && row.content.is_some());
+    // Even a store that says it was approved hands it to no run: the sealed
+    // envelope names no operation, and the copy no consent.
+    world.store.change(&opened.id, |row| {
+        row.state = State::Approved;
+        row.task.kind = client::Kind::Confirm;
+    });
+    let (mut run, _) = world.agent_with("run-o");
+    let refused = run
+        .answered(opened.id.clone(), opened.hash.clone(), "confirm".to_string(), POLICY.to_vec(), approval, None, None)
+        .expect_err("refused");
+    assert_eq!(refused.reason, wit::Reason::AnswerInvalid, "{}", refused.message);
+}
+
+/// Who may notify is who may open a task: by name, not relayed, not muted,
+/// within the run's five.
+#[test]
+fn a_notice_is_gated_as_a_task_is() {
+    let world = World::new();
+    let mut stranger = world.host(Run { by_name: false, id: "run-s", ..world.agent_run() }).0;
+    assert_eq!(reason(stranger.open(guessed())), wit::Reason::NotGrantedByName);
+    world.store.muted.lock().unwrap().push(AGENT.to_string());
+    assert_eq!(reason(world.agent("run-m").open(guessed())), wit::Reason::Muted);
+    world.store.muted.lock().unwrap().clear();
+    let mut busy = world.agent("run-b");
+    for _ in 0..crate::tasks::MAX_OPENS_PER_RUN {
+        busy.open(guessed()).unwrap();
+    }
+    assert_eq!(reason(busy.open(guessed())), wit::Reason::RunLimit);
+}
+
+/// The run the platform started for an approved task may tell the owner how
+/// it went: a notice in the same conversation, as the agent.
+#[test]
+fn a_turn_may_be_a_notice() {
+    let world = World::new();
+    let asked = world.agent("run-a").open(email()).unwrap();
+    let approval = world.approve(&asked, "run-o");
+    let (mut carrier, _) = world.agent_with("run-o");
+    confirm(&mut carrier, &asked, &approval).unwrap();
+    let told = carrier.open(guessed()).unwrap();
+    assert_eq!(told.thread, asked.id);
+    let (shown, _) = world.page_reads(&told.id);
+    assert_eq!((shown.kind, shown.thread.as_str(), shown.preparer.as_str()), (envelope::Kind::Notice, asked.id.as_str(), AGENT));
+}
+
+/// A new device gets its copy of a waiting notice from the owner's `unlock`.
+#[test]
+fn unlock_writes_a_notices_copy_as_any_tasks() {
+    let world = World::new();
+    let opened = world.agent("run-a").open(guessed()).unwrap();
+    world.store.change(&opened.id, |row| row.copies.clear());
+    assert_eq!(world.owner("run-u").0.unlock().unwrap(), 1);
+    assert!(world.store.row(&opened.id).copies.contains_key("d1"));
+    world.page_reads(&opened.id);
 }

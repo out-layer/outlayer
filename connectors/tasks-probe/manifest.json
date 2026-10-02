@@ -3,6 +3,7 @@
     "prepare",
     "prepare_many",
     "prepare_raw",
+    "notify",
     "confirm",
     "confirm_slow",
     "supply",
@@ -38,7 +39,7 @@
           {
             "name": "kind",
             "type": "string",
-            "doc": "`confirm` (when it is not named), `text` or `file`: what the owner answers with."
+            "doc": "`confirm` (when it is not named), `text` or `file`: what the owner answers with; or `notice`, which asks nothing and is answered `notified`."
           },
           {
             "name": "answer_by",
@@ -90,7 +91,7 @@
           {
             "name": "kind",
             "type": "string",
-            "doc": "`confirm` (when it is not named), `text` or `file`: what the owner answers with."
+            "doc": "`confirm` (when it is not named), `text` or `file`: what the owner answers with; or `notice`, which asks nothing and is answered `notified`."
           },
           {
             "name": "answer_by",
@@ -138,6 +139,32 @@
             "name": "life_seconds",
             "type": "number",
             "doc": "How long the task waits; 86400 at most."
+          }
+        ]
+      },
+      "notify": {
+        "class": "write",
+        "doc": "Opens a notice for the owner of the row the run names: it tells them something and asks nothing, and needs no payment key. Answers `notified` with its id and hash; `task_status` reads it `open` until the owner presses Got it, then `done`.",
+        "params": [
+          {
+            "name": "title",
+            "type": "string",
+            "doc": "The notice's title, 80 characters at most. `Tasks probe` when it is not named."
+          },
+          {
+            "name": "body",
+            "type": "string",
+            "doc": "Shown as the field `Body`."
+          },
+          {
+            "name": "life_seconds",
+            "type": "number",
+            "doc": "How long the notice waits; 86400 at most, and that long when it is not named."
+          },
+          {
+            "name": "files",
+            "type": "object[]",
+            "doc": "`{name, content_type, text, repeat}`: a file of `text` written `repeat` times."
           }
         ]
       },

@@ -51,6 +51,24 @@
 //! `run_refused:<reason>`, which the agent reads in `task_status`, and the
 //! agent prepares again.
 //!
+//! # Telling the owner something
+//!
+//! A notice asks nothing: the owner reads it and presses Got it. No
+//! operation answers it and no run follows it, so a run with no payment key
+//! — one made on chain — may open one.
+//!
+//! ```rust,ignore
+//! let opened = tasks::notice(
+//!     Display::new("The email was sent").field("To", FieldKind::Address, &to, WrittenBy::Project),
+//!     policy_json.as_bytes(),
+//! )
+//! .open()?;
+//! return Ok(tasks::notified(&opened));
+//! ```
+//!
+//! The agent reads it `open` in `task_status` until the owner saw it, then
+//! `done`.
+//!
 //! # The operations every project gets
 //!
 //! [`dispatch`] answers `task_status`, `task_cancel`, `task_delete`, `tasks`
@@ -181,12 +199,12 @@ pub struct Task {
 }
 
 impl Task {
-    fn new(kind: TaskKind, display: Display, operation: &str, supplies: Supplies, state: &[u8], policy: &[u8]) -> Self {
+    fn new(kind: TaskKind, display: Display, answer_by: Option<raw::AnswerBy>, state: &[u8], policy: &[u8]) -> Self {
         Self {
             request: raw::Request {
                 kind,
                 display: raw::Display { title: display.title, fields: display.fields },
-                answer_by: raw::AnswerBy { operation: operation.to_string(), supplies },
+                answer_by,
                 files: Vec::new(),
                 state: state.to_vec(),
                 policy: policy.to_vec(),
@@ -218,7 +236,8 @@ impl Task {
     /// Open it for the owner of the secret row this run was admitted to, with
     /// this run's consent to the run that will carry it out: the same
     /// payment key, wallet and identity, within this run's compute limit. A
-    /// run with no payment key is refused [`Reason::NoPaymentKey`].
+    /// run with no payment key is refused [`Reason::NoPaymentKey`], except
+    /// for a notice, which no run follows.
     pub fn open(self) -> Result<Opened> {
         raw::open(&self.request).map_err(TaskError::from)
     }
@@ -229,13 +248,20 @@ impl Task {
 /// is handed back to it and never shown; `policy` is the policy the task is
 /// made under, as the project reads it.
 pub fn confirm(display: Display, operation: &str, state: &[u8], policy: &[u8]) -> Task {
-    Task::new(TaskKind::Confirm, display, operation, Supplies::Nothing, state, policy)
+    Task::new(TaskKind::Confirm, display, Some(raw::AnswerBy { operation: operation.to_string(), supplies: Supplies::Nothing }), state, policy)
 }
 
 /// A task the owner answers by supplying something: [`Supplies::Text`], or
 /// [`Supplies::File`] — a reference to a file and its hash.
 pub fn input(display: Display, operation: &str, supplies: Supplies, state: &[u8], policy: &[u8]) -> Task {
-    Task::new(TaskKind::Input, display, operation, supplies, state, policy)
+    Task::new(TaskKind::Input, display, Some(raw::AnswerBy { operation: operation.to_string(), supplies }), state, policy)
+}
+
+/// A notice: it tells the owner something and asks nothing. No operation
+/// answers it, nothing is handed back, no run follows; the owner closes it
+/// with Got it, and the agent reads it `done`. Files may go with it.
+pub fn notice(display: Display, policy: &[u8]) -> Task {
+    Task::new(TaskKind::Notice, display, None, &[], policy)
 }
 
 /// The tasks whose preparer is this caller in this project for this owner.
@@ -387,6 +413,7 @@ fn kind_name(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Confirm => "confirm",
         TaskKind::Input => "input",
+        TaskKind::Notice => "notice",
     }
 }
 
@@ -413,6 +440,21 @@ pub fn state_name(state: TaskState) -> &'static str {
 pub fn awaiting_owner(opened: &Opened) -> serde_json::Value {
     serde_json::json!({
         "status": "awaiting_owner",
+        "task_id": opened.id,
+        "task_hash": opened.hash,
+        "thread": opened.thread,
+        "expires_at": opened.expires_at,
+        "link": format!("https://app.outlayer.ai/inbox/{}", opened.id),
+    })
+}
+
+/// What a project answers when it told the owner something. Nothing waits
+/// on the owner: `task_status` reads `open` until they saw it, then `done`.
+/// `task_hash` lets the owner's page prove that this answer named this
+/// notice.
+pub fn notified(opened: &Opened) -> serde_json::Value {
+    serde_json::json!({
+        "status": "notified",
         "task_id": opened.id,
         "task_hash": opened.hash,
         "thread": opened.thread,
@@ -586,6 +628,22 @@ mod tests {
         assert_eq!(answer["status"], "awaiting_owner");
         assert_eq!(answer["task_id"], "run-0");
         assert_eq!(answer["link"], "https://app.outlayer.ai/inbox/run-0");
+    }
+
+    #[test]
+    fn a_notice_names_no_operation_and_is_answered_as_notified() {
+        let task = notice(Display::new("Sent"), b"{}").file("a.txt", "text/plain", b"a");
+        assert_eq!(task.request.kind, TaskKind::Notice);
+        assert!(task.request.answer_by.is_none() && task.request.state.is_empty());
+        assert_eq!(task.request.files.len(), 1);
+        let asked = confirm(Display::new("Send"), "confirm", b"s", b"{}");
+        assert_eq!(asked.request.answer_by.as_ref().map(|by| by.operation.as_str()), Some("confirm"));
+        let opened = Opened { id: "run-0".into(), hash: "cd".repeat(32), thread: "run-0".into(), expires_at: 9, devices: 1 };
+        let told = notified(&opened);
+        assert_eq!((told["status"].as_str(), told["task_id"].as_str()), (Some("notified"), Some("run-0")));
+        assert_eq!(told["task_hash"], "cd".repeat(32));
+        assert_eq!(kind_name(TaskKind::Notice), "notice");
+        assert_eq!(outcome_json(&Outcome { kind: TaskKind::Notice, ..outcome(TaskState::Done) })["kind"], "notice");
     }
 
     #[test]

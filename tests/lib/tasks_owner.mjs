@@ -23,6 +23,11 @@
 //                                    is named
 //   sign-in-stranger [device]        the same, signed with a key made on the
 //                                    spot, which is on no account
+//   sign-in-custody [device]         the same for the custody wallet whose `wk_`
+//                                    key CUSTODY_WALLET_KEY holds: the wallet's
+//                                    own `POST /wallet/v1/sign-message` signs, for
+//                                    the account it names; prints that account
+//                                    beside what `sign-in` prints
 //   keygen <name>                    make an ed25519 key, keep it in STATE_DIR
 //                                    as a credentials file; prints
 //                                    {"public_key", "file"}
@@ -57,6 +62,7 @@
 //                                    byte and length, never plaintext), and whether
 //                                    `words` occur in it (never the input itself)
 //   reject <task> [text] [device]    say no, with a reason
+//   got-it <task> [device]           Got it: close a notice as seen
 //   delete <task> [device]           delete one
 //   mute <agent|project> <subject> [device]
 //   unmute <agent|project> <subject> [device]
@@ -274,7 +280,9 @@ async function listed(state, show) {
       profile: task.profile,
       kind: task.kind,
       state: task.state,
+      reply_pubkey: task.reply_pubkey,
       run: task.run ?? null,
+      failure_reason: task.failure_reason ?? null,
       locked: task.locked,
       has_content: task.content !== null,
       has_copy: task.device_copy !== null,
@@ -328,6 +336,45 @@ const commands = {
   // A statement whose signature verifies, by a key the account does not have.
   async 'sign-in-stranger'([device = 'stranger']) {
     return openSession(device, (await makeWalletKey()).private_key);
+  },
+
+  // The statement signed by a custody wallet, as an app with its `wk_` key
+  // signs it: the wallet names its account, then signs the sentence for it.
+  async 'sign-in-custody'([device = 'custody']) {
+    const wallet = need('CUSTODY_WALLET_KEY');
+    const sign = (message) =>
+      request('POST', '/wallet/v1/sign-message', { token: wallet, body: { message, recipient: need('RECIPIENT') } });
+    const named = await sign('which account');
+    if (named.status !== 200) return { sign_message_status: named.status, said: JSON.stringify(named.body).slice(0, 200) };
+    const account = named.body.account_id;
+    const made = await makeDevice();
+    const validUntil = Math.floor(Date.now() / 1000) + Number(process.env.SESSION_SECONDS ?? 3600);
+    const until = new Date(validUntil * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const signed = await sign(`Sign in to OutLayer as ${account}. Device key: ${made.pubkey}. Valid until ${until}.`);
+    if (signed.status !== 200) {
+      return { account, sign_message_status: signed.status, said: JSON.stringify(signed.body).slice(0, 200) };
+    }
+    const statement = {
+      account_id: account,
+      device_pubkey: made.pubkey,
+      valid_until: validUntil,
+      public_key: signed.body.public_key,
+      signature: signed.body.signature_base64,
+      nonce: signed.body.nonce,
+    };
+    const answer = await request('POST', '/inbox/session', { body: statement });
+    if (answer.status === 200) {
+      saveState(device, { ...made, token: answer.body.token, device_id: answer.body.device_id, statement });
+    }
+    const { token: _, ...shown } = typeof answer.body === 'object' && answer.body !== null ? answer.body : { said: answer.body };
+    return {
+      account,
+      sign_message_status: signed.status,
+      status: answer.status,
+      ...shown,
+      signed_by: statement.public_key,
+      token_returned: answer.status === 200 && typeof answer.body.token === 'string',
+    };
   },
 
   async keygen([name = '']) {
@@ -500,6 +547,10 @@ const commands = {
       reason = Buffer.from(await writeReply(read.envelope, Purpose.Rejection, text)).toString('base64');
     }
     return request('POST', `/inbox/tasks/${id}/reject`, { token: state.token, body: { reason } });
+  },
+
+  async 'got-it'([id, device = 'a']) {
+    return request('POST', `/inbox/tasks/${id}/acknowledge`, { token: loadState(device).token });
   },
 
   async delete([id, device = 'a']) {

@@ -314,7 +314,8 @@ impl Ready {
             && envelope.owner == self.scope.owner
             && envelope.project_uuid == self.scope.project_uuid
             && envelope.v == envelope::VERSION
-            && envelope::hash(&state) == envelope.state_hash;
+            && envelope::hash(&state) == envelope.state_hash
+            && envelope.kind.takes_an_answer() == task.consent.is_some();
         if !its_own {
             return Err(unreadable());
         }
@@ -446,7 +447,10 @@ impl Ready {
         if self.operation.as_deref().is_some_and(|running| running != operation) {
             return Err(before(refused(wit::Reason::AnswerInvalid, "the operation named is not the one this call runs")));
         }
-        if operation != task.envelope.answer_by.operation {
+        let Some(answer_by) = task.envelope.answer_by.clone() else {
+            return Err(before(notice_takes_no_answer()));
+        };
+        if operation != answer_by.operation {
             return Err(before(refused(
                 wit::Reason::AnswerInvalid,
                 "the task is answered by another operation of this project than the one running",
@@ -476,7 +480,10 @@ impl Ready {
         let Some(consent) = self.consent.as_ref() else {
             return Err(not_the_preparer("made with no payment key"));
         };
-        if let Some(differs) = task.consent.refuses(consent) {
+        let Some(consented) = task.consent.as_ref() else {
+            return Err(before(notice_takes_no_answer()));
+        };
+        if let Some(differs) = consented.refuses(consent) {
             return Err(not_the_preparer(&format!("on {differs}")));
         }
         // The task is answered under the policy and by the build it was made
@@ -519,7 +526,7 @@ impl Ready {
                 ApprovalRefused::Unavailable(why) => refused(wit::Reason::Unavailable, why),
             }));
         }
-        let supplied = match (task.envelope.answer_by.supplies, supplied) {
+        let supplied = match (answer_by.supplies, supplied) {
             (envelope::Supplies::Nothing, None) => None,
             (envelope::Supplies::Nothing, Some(_)) => {
                 return Err(before(refused(wit::Reason::AnswerInvalid, "the task asks for nothing, and the answer supplies something")));
@@ -597,11 +604,8 @@ impl Ready {
             id: id.to_string(),
             thread: task.envelope.thread,
             preparer: task.envelope.preparer,
-            kind: match task.envelope.kind {
-                envelope::Kind::Confirm => wit::TaskKind::Confirm,
-                envelope::Kind::Input => wit::TaskKind::Input,
-            },
-            operation: task.envelope.answer_by.operation,
+            kind: kind_of(task.envelope.kind),
+            operation: answer_by.operation,
             state: task.state,
             files,
             supplied,
@@ -625,15 +629,28 @@ struct Unsealed {
     hash: String,
     state: Vec<u8>,
     content_key: zeroize::Zeroizing<[u8; 32]>,
-    /// The preparer's consent, as sealed with the task.
-    consent: Consent,
+    /// The preparer's consent, as sealed with the task; none for a notice.
+    consent: Option<Consent>,
 }
 
 fn kind_out(kind: client::Kind) -> wit::TaskKind {
     match kind {
         client::Kind::Confirm => wit::TaskKind::Confirm,
         client::Kind::Input => wit::TaskKind::Input,
+        client::Kind::Notice => wit::TaskKind::Notice,
     }
+}
+
+fn kind_of(kind: envelope::Kind) -> wit::TaskKind {
+    match kind {
+        envelope::Kind::Confirm => wit::TaskKind::Confirm,
+        envelope::Kind::Input => wit::TaskKind::Input,
+        envelope::Kind::Notice => wit::TaskKind::Notice,
+    }
+}
+
+fn notice_takes_no_answer() -> wit::TaskError {
+    refused(wit::Reason::AnswerInvalid, "the task is a notice: it takes no answer, and the owner closes it with Got it")
 }
 
 fn state_out(state: client::State) -> wit::TaskState {
@@ -797,16 +814,32 @@ impl wit::Host for TasksHostState {
                 format!("this run opened {opened} tasks, as many as one run may"),
             ));
         }
-        // The consent the task carries: the run that carries it out is paid
-        // by this run's payment key, with this run's wallet, identity and
-        // compute limit. A run with no payment key has nothing to consent
-        // with, and opens no task.
-        let Some(consent) = ready.consent.clone() else {
-            return Err(refused(
-                wit::Reason::NoPaymentKey,
-                "the consent to carry out the owner's answer is a payment key — the run that carries it out is paid \
-                 by that key — so a task is opened over HTTPS with one",
-            ));
+        // What the task takes back, and the consent it carries: the run that
+        // carries an answer out is paid by this run's payment key, with this
+        // run's wallet, identity and compute limit. A run with no payment key
+        // has nothing to consent with, and opens no task that takes an
+        // answer. A notice takes none, and carries no consent.
+        let (kind, answer_by) = match (request.kind, request.answer_by) {
+            (wit::TaskKind::Notice, None) => ((envelope::Kind::Notice, client::Kind::Notice), None),
+            (wit::TaskKind::Notice, Some(_)) => {
+                return Err(refused(wit::Reason::DisplayInvalid, "a notice takes no answer, and names no operation to answer by"));
+            }
+            (wit::TaskKind::Confirm | wit::TaskKind::Input, None) => {
+                return Err(refused(wit::Reason::DisplayInvalid, "a task that takes an answer names the operation that carries it out"));
+            }
+            (wit::TaskKind::Confirm, Some(by)) => ((envelope::Kind::Confirm, client::Kind::Confirm), Some(by)),
+            (wit::TaskKind::Input, Some(by)) => ((envelope::Kind::Input, client::Kind::Input), Some(by)),
+        };
+        let consent = match (kind.0.takes_an_answer(), ready.consent.clone()) {
+            (false, _) => None,
+            (true, Some(consent)) => Some(consent),
+            (true, None) => {
+                return Err(refused(
+                    wit::Reason::NoPaymentKey,
+                    "the consent to carry out the owner's answer is a payment key — the run that carries it out is paid \
+                     by that key — so a task that takes an answer is opened over HTTPS with one",
+                ));
+            }
         };
         let id = format!("{}-{opened}", ready.run);
         // A task opened in a run that answered one is the next turn of that
@@ -861,8 +894,9 @@ impl wit::Host for TasksHostState {
         }
         envelope::check_files(request.files.iter().map(|file| (file.name.as_str(), file.content_type.as_str())))
             .map_err(|why| refused(wit::Reason::DisplayInvalid, why))?;
-        envelope::check_operation(&request.answer_by.operation)
-            .map_err(|why| refused(wit::Reason::DisplayInvalid, why))?;
+        if let Some(by) = &answer_by {
+            envelope::check_operation(&by.operation).map_err(|why| refused(wit::Reason::DisplayInvalid, why))?;
+        }
         let display = display_in(request.display);
         envelope::check_display(&display).map_err(|why| refused(wit::Reason::DisplayInvalid, why))?;
 
@@ -870,20 +904,16 @@ impl wit::Host for TasksHostState {
 
         let keys = ready.keys(&id);
         let now = u64::try_from((ready.now)()).unwrap_or(0);
-        let kind = match request.kind {
-            wit::TaskKind::Confirm => (envelope::Kind::Confirm, client::Kind::Confirm),
-            wit::TaskKind::Input => (envelope::Kind::Input, client::Kind::Input),
-        };
         let task = Envelope {
             build: ready.build.clone(),
-            answer_by: envelope::AnswerBy {
-                operation: request.answer_by.operation,
-                supplies: match request.answer_by.supplies {
+            answer_by: answer_by.map(|by| envelope::AnswerBy {
+                operation: by.operation,
+                supplies: match by.supplies {
                     wit::Supplies::Nothing => envelope::Supplies::Nothing,
                     wit::Supplies::Text => envelope::Supplies::Text,
                     wit::Supplies::File => envelope::Supplies::File,
                 },
-            },
+            }),
             created_at: now,
             display,
             expires_at: now + u64::from(life),
@@ -905,7 +935,7 @@ impl wit::Host for TasksHostState {
             profile: ready.profile.clone(),
             project: ready.project_id.clone(),
             project_uuid: ready.scope.project_uuid.clone(),
-            reply_pubkey: keys.reply_pubkey(),
+            reply_pubkey: kind.0.takes_an_answer().then(|| keys.reply_pubkey()),
             state_hash: envelope::hash(&request.state),
             thread,
             v: envelope::VERSION,
@@ -929,13 +959,16 @@ impl wit::Host for TasksHostState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(unavailable)?;
         let copies = ready.copies_for(&id, &content_key, &devices)?;
-        let voucher = Voucher {
-            payment_key_nonce: consent.payment_key_nonce,
-            wallet_id: consent.wallet.clone(),
-            bound_identity: consent.bound_identity,
-            compute_limit_usd: consent.compute_limit_usd.clone(),
-            operation: task.answer_by.operation.clone(),
-            build: task.build.clone(),
+        let voucher = match (&consent, &task.answer_by) {
+            (Some(consent), Some(by)) => Some(Voucher {
+                payment_key_nonce: consent.payment_key_nonce,
+                wallet_id: consent.wallet.clone(),
+                bound_identity: consent.bound_identity,
+                compute_limit_usd: consent.compute_limit_usd.clone(),
+                operation: by.operation.clone(),
+                build: task.build.clone(),
+            }),
+            _ => None,
         };
         let sealed_task = SealedTask {
             content_key: hex::encode(content_key.as_ref()),
@@ -1019,6 +1052,9 @@ impl wit::Host for TasksHostState {
         let stored = ready.store.get(&ready.scope, &id).map_err(|e| store_failed(&e))?;
         if stored.id != id {
             return Err(unreadable());
+        }
+        if stored.kind == client::Kind::Notice {
+            return Err(notice_takes_no_answer());
         }
         if stored.state != client::State::Approved {
             return Err(not_open(stored.state));

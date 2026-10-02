@@ -578,6 +578,11 @@ The run that answers is an HTTPS call of the agent's, and the owner opens
 tasks for a new device with a direct call of their own, so a connector that
 declares `tasks` can shut neither door (§4.9).
 
+A connector can also tell the owner something without asking: a **notice**
+(`tasks::notice`, answered `notified`) is read in the same inbox and closed
+with Got it. It names no operation and no run follows it, so it needs no
+payment key; it counts in the owner's limits as a task does.
+
 The pattern in code — the policy's `confirm`, the operation `confirm`, what it
 answers on chain, prices, manifest, tests — is [CONNECTOR_TASKS.md](CONNECTOR_TASKS.md).
 

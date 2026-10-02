@@ -511,7 +511,9 @@ fi
 # send and allowing a file. The policy GT3 runs under: the owner's, asking for
 # nothing. A task is void once the policy it was made under changes, so the
 # policy stays as it is from a send to its `confirm`.
-ASKS=$(jq -c '.confirm = ["send"] | .max_attachment_kb = (.max_attachment_kb // 64)' <<<"${CAPPED:-$NO_POLICY}")
+# A cap, the owner's or 50, so that the confirmed send is counted and GT2
+# can read the count: a policy without `max_per_day` counts nothing.
+ASKS=$(jq -c '.confirm = ["send"] | .max_attachment_kb = (.max_attachment_kb // 64) | .max_per_day = (.max_per_day // 50)' <<<"${CAPPED:-$NO_POLICY}")
 ASKS_NOTHING=$(jq -c 'del(.confirm)' <<<"${CAPPED:-$NO_POLICY}")
 # The subject as the connector sends it: the owner's prefix, then the subject.
 GT_PREFIX=$(jq -rn --arg p "$EXPECT_PREFIX" '$p | gsub("^\\s+|\\s+$"; "")')
@@ -621,7 +623,7 @@ else
       if approved_and_done GT2 "$TASK"; then
         pass "GT2 approved with one signature: the platform started the run $RUN_OF, and the task ended done"
         GT2_MESSAGE=$(field .output.result.message_id)
-        [[ -n "$GT2_MESSAGE" && "$(field .output.result.sent_today)" -ge 1 ]] \
+        [[ -n "$GT2_MESSAGE" && "$(field .output.result.sent_today)" =~ ^[0-9]+$ && "$(field .output.result.sent_today)" -ge 1 ]] \
           && pass "GT2 the agent reads done, with the message sent (message_id=$GT2_MESSAGE) and its confirmed count at $(field .output.result.sent_today)" \
           || fail "GT2 task_status: result.message_id '$GT2_MESSAGE' sent_today '$(field .output.result.sent_today)' code='$(code | head -c 60)'"
         run_is_the_agents GT2 "$RUN_OF"

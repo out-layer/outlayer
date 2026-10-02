@@ -15,7 +15,8 @@
 //! 2. the sentence rebuilt from its account, device key and deadline is what
 //!    the signature signs;
 //! 3. the key that signed is an access key of the owner's account ON CHAIN,
-//!    at the final block.
+//!    at the final block — or the account is the implicit account of that
+//!    key and does not exist on chain yet ([`is_implicit_of`]).
 //!
 //! A row that fails 1 or 2, or whose signer is not the account's key, is not
 //! a device, and nothing is encrypted to it. A chain that cannot be asked is
@@ -277,7 +278,8 @@ pub fn approval_holds(
 /// What the chain says of a key and an account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnChain {
-    /// A full-access key of the account.
+    /// A full-access key of the account, or the key of an implicit account
+    /// that does not exist yet.
     ItsKey,
     /// Not one: no such key on the account, no such account, or a key that
     /// may only call functions.
@@ -315,6 +317,36 @@ pub fn read_access_key_answer(answer: &serde_json::Value) -> Result<OnChain, Cha
     }
 }
 
+/// Is `account` the implicit account of `public_key`: the 64 lowercase hex of
+/// its 32 bytes? Such an account comes into being, by any transfer to it,
+/// with exactly that key as its full-access key, and has no other until that
+/// key adds one; so while it does not exist, the key speaks for it.
+pub fn is_implicit_of(account: &str, public_key: &str) -> bool {
+    public_key
+        .strip_prefix("ed25519:")
+        .and_then(|key| bs58::decode(key).into_vec().ok())
+        .is_some_and(|bytes| bytes.len() == 32 && hex::encode(bytes) == account)
+}
+
+/// Read the answer of `query` / `view_account`: does the account exist?
+/// Anything the node says other than the account or its absence is no answer.
+pub fn read_account_answer(answer: &serde_json::Value) -> Result<bool, ChainUnavailable> {
+    let no_answer = || ChainUnavailable("the chain's answer about an account could not be read".to_string());
+    if let Some(error) = answer.get("error") {
+        return match error.get("cause").and_then(|c| c.get("name")).and_then(|n| n.as_str()) {
+            Some("UNKNOWN_ACCOUNT") => Ok(false),
+            _ => Err(no_answer()),
+        };
+    }
+    let result = answer.get("result").ok_or_else(no_answer)?;
+    match result.get("error").and_then(|e| e.as_str()) {
+        Some(said) if said.contains("does not exist") => Ok(false),
+        Some(_) => Err(no_answer()),
+        None if result.get("amount").is_some() => Ok(true),
+        None => Err(no_answer()),
+    }
+}
+
 /// Asks the chain whose a key is.
 ///
 /// The RPC node is trusted as the platform trusts it everywhere: what it
@@ -343,19 +375,11 @@ impl RpcChain {
     }
 }
 
-impl Chain for RpcChain {
-    fn access_key(&self, account: &str, public_key: &str) -> Result<OnChain, ChainUnavailable> {
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "tasks",
-            "method": "query",
-            "params": {
-                "request_type": "view_access_key",
-                "finality": "final",
-                "account_id": account,
-                "public_key": public_key,
-            }
-        });
+impl RpcChain {
+    /// One `query` at the final block.
+    fn query(&self, mut params: serde_json::Value) -> Result<serde_json::Value, ChainUnavailable> {
+        params["finality"] = serde_json::json!("final");
+        let request = serde_json::json!({ "jsonrpc": "2.0", "id": "tasks", "method": "query", "params": params });
         // The URL may carry a key: no error of the transport is quoted.
         let response = self
             .client
@@ -366,9 +390,38 @@ impl Chain for RpcChain {
         if !response.status().is_success() {
             return Err(ChainUnavailable(format!("the chain answered {}", response.status().as_u16())));
         }
-        let answer: serde_json::Value =
-            response.json().map_err(|_| ChainUnavailable("the chain's answer is not JSON".to_string()))?;
-        read_access_key_answer(&answer)
+        response.json().map_err(|_| ChainUnavailable("the chain's answer is not JSON".to_string()))
+    }
+}
+
+impl Chain for RpcChain {
+    fn access_key(&self, account: &str, public_key: &str) -> Result<OnChain, ChainUnavailable> {
+        access_key_by(account, public_key, |params| self.query(params))
+    }
+}
+
+/// What the chain says of `public_key` on `account`, through `query`.
+pub(crate) fn access_key_by(
+    account: &str,
+    public_key: &str,
+    query: impl Fn(serde_json::Value) -> Result<serde_json::Value, ChainUnavailable>,
+) -> Result<OnChain, ChainUnavailable> {
+    let answer = query(serde_json::json!({
+        "request_type": "view_access_key",
+        "account_id": account,
+        "public_key": public_key,
+    }))?;
+    match read_access_key_answer(&answer)? {
+        // The node says the same of a missing key and a missing account; only
+        // the account's own answer tells an implicit account not made yet from
+        // one whose key was taken away.
+        OnChain::NotItsKey if is_implicit_of(account, public_key) => {
+            match read_account_answer(&query(serde_json::json!({ "request_type": "view_account", "account_id": account }))?)? {
+                true => Ok(OnChain::NotItsKey),
+                false => Ok(OnChain::ItsKey),
+            }
+        }
+        said => Ok(said),
     }
 }
 
@@ -824,6 +877,75 @@ pub(crate) mod tests {
         assert!(devices_in_force(&statements, "owner.testnet", NOW, RECIPIENT, &chain).is_err());
         // With no statement to check, nothing is asked and nothing fails.
         assert!(devices_in_force(&[], "owner.testnet", NOW, RECIPIENT, &chain).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_implicit_account_is_the_hex_of_its_key() {
+        let key = near_key(&wallet(1));
+        let account = hex::encode(wallet(1).verifying_key().as_bytes());
+        assert!(is_implicit_of(&account, &key));
+        assert!(!is_implicit_of(&account.to_uppercase(), &key), "an account id is lowercase");
+        assert!(!is_implicit_of(&hex::encode(wallet(2).verifying_key().as_bytes()), &key), "another key's account");
+        assert!(!is_implicit_of("owner.testnet", &key));
+        assert!(!is_implicit_of(&account, &key.replace("ed25519:", "secp256k1:")));
+        assert!(!is_implicit_of(&account, "ed25519:not-base58-0OIl"));
+    }
+
+    #[test]
+    fn the_key_of_an_implicit_account_not_made_yet_speaks_for_it_and_no_other_does() {
+        use serde_json::json;
+        let key = near_key(&wallet(1));
+        let implicit = hex::encode(wallet(1).verifying_key().as_bytes());
+        let no_key = json!({"result": {"error": "access key x does not exist while viewing", "block_height": 1}});
+        let no_account = json!({"error": {"name": "HANDLER_ERROR", "cause": {"name": "UNKNOWN_ACCOUNT", "info": {}}}});
+        let an_account = json!({"result": {"amount": "1", "block_height": 1}});
+        let full = json!({"result": {"nonce": 5, "permission": "FullAccess", "block_height": 1}});
+        let asked = std::cell::RefCell::new(Vec::new());
+        let asked = &asked;
+        let chain = |key_answer: &serde_json::Value, account_answer: Option<&serde_json::Value>| {
+            let (key_answer, account_answer) = (key_answer.clone(), account_answer.cloned());
+            move |params: serde_json::Value| {
+                let kind = params["request_type"].as_str().unwrap().to_string();
+                asked.borrow_mut().push(kind.clone());
+                match kind.as_str() {
+                    "view_access_key" => Ok(key_answer.clone()),
+                    _ => account_answer.clone().ok_or(ChainUnavailable("the chain did not answer".to_string())),
+                }
+            }
+        };
+        // Not made yet: its own key speaks for it.
+        assert_eq!(access_key_by(&implicit, &key, chain(&no_key, Some(&no_account))), Ok(OnChain::ItsKey));
+        // Made, and the key is gone from it: not its key.
+        assert_eq!(access_key_by(&implicit, &key, chain(&no_key, Some(&an_account))), Ok(OnChain::NotItsKey));
+        // The account's answer missing is no answer, never a key.
+        assert!(access_key_by(&implicit, &key, chain(&no_key, None)).is_err());
+        // Another key on the implicit account, or a named account: one question, no exception.
+        asked.borrow_mut().clear();
+        assert_eq!(access_key_by(&implicit, &near_key(&wallet(2)), chain(&no_key, Some(&no_account))), Ok(OnChain::NotItsKey));
+        assert_eq!(access_key_by("owner.testnet", &key, chain(&no_key, Some(&no_account))), Ok(OnChain::NotItsKey));
+        assert_eq!(*asked.borrow(), ["view_access_key", "view_access_key"]);
+        // A key the chain holds is asked about once.
+        asked.borrow_mut().clear();
+        assert_eq!(access_key_by(&implicit, &key, chain(&full, None)), Ok(OnChain::ItsKey));
+        assert_eq!(*asked.borrow(), ["view_access_key"]);
+    }
+
+    #[test]
+    fn the_chains_answer_about_an_account_is_there_not_there_or_no_answer() {
+        use serde_json::json;
+        let read = |v: serde_json::Value| read_account_answer(&v);
+        assert_eq!(read(json!({"result": {"amount": "1", "locked": "0", "block_height": 1}})), Ok(true));
+        assert_eq!(read(json!({"error": {"name": "HANDLER_ERROR", "cause": {"name": "UNKNOWN_ACCOUNT", "info": {}}}})), Ok(false));
+        assert_eq!(read(json!({"result": {"error": "account x does not exist while viewing", "block_height": 1}})), Ok(false));
+        for no_answer in [
+            json!({"error": {"name": "HANDLER_ERROR", "cause": {"name": "UNAVAILABLE_SHARD", "info": {}}}}),
+            json!({"error": {"name": "HANDLER_ERROR", "cause": {"name": "INVALID_ACCOUNT", "info": {}}}}),
+            json!({"result": {"error": "something else", "block_height": 1}}),
+            json!({"result": {"block_height": 1}}),
+            json!({}),
+        ] {
+            assert!(read(no_answer.clone()).is_err(), "{no_answer}");
+        }
     }
 
     #[test]

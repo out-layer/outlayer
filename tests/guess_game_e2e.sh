@@ -22,7 +22,10 @@
 #        game goes on, next_task_id; the next task waits in the inbox from the
 #        agent, in the same thread, showing the hint
 #   G3   the right guess ends the game: done with verdict right and no
-#        next_task_id; nothing more waits
+#        next_task_id, and a notice in the thread — notice_task_id — that
+#        shows the number and the count and asks nothing; the agent reads it
+#        open, the owner's Got it closes it, the agent reads it done; nothing
+#        more waits
 #   G4   the agent's `tasks` lists every turn, and only turns of this thread
 #        were made; the owner signed one message per turn
 #   N1   the owner's `tasks_unlock` on connector-probe — a build that imports
@@ -155,7 +158,7 @@ while [[ $TURNS -lt $MOST_TURNS ]]; do
     break
   fi
   RUN=$(own .run)
-  ENDED=$(await_run "$TASK")
+  await_run "$TASK"
   if [[ "$ENDED" != "done" ]]; then
     fail "G2 turn $TURNS ended '$ENDED' (failure_reason '$(said .failure_reason)')"
     break
@@ -172,6 +175,29 @@ while [[ $TURNS -lt $MOST_TURNS ]]; do
     right)
       ENDED_RIGHT=true
       [[ -z "$NEXT" ]] && pass "G3 right in $TURNS turns: no next task" || fail "G3 right, and yet a next task $NEXT"
+      TOLD=$(said .result.notice_task_id)
+      if [[ -z "$TOLD" ]]; then
+        fail "G3 right, and no notice: $(said .result.notice_error | head -c 160)"
+      else
+        MADE+=("$TOLD")
+        if in_inbox "$TOLD"; then
+          [[ "$(row .kind)" == "notice" && "$(row .preparer)" == "$AGENT_ACCOUNT" && "$(row .read.envelope.thread)" == "$FIRST" \
+             && "$(shown Number)" == "$GUESS" && "$(shown Attempts)" == "$TURNS" \
+             && "$(row .read.envelope.display.title)" == "You guessed it: $GUESS, in $TURNS attempt"* ]] \
+            && pass "G3 a notice in the thread: $(row .read.envelope.display.title)" \
+            || fail "G3 the notice: kind '$(row .kind)' thread '$(row .read.envelope.thread)' title '$(row .read.envelope.display.title)'"
+          agent "$(jq -nc --arg t "$TOLD" '{operation:"task_status", task_id:$t}')"
+          [[ "$(said .state)" == "open" && "$(said .kind)" == "notice" ]] \
+            && pass "G3 the agent reads the notice open" || fail "G3 the notice's status: '$(said .state)' kind '$(said .kind)'"
+          owner got-it "$TOLD" a
+          agent "$(jq -nc --arg t "$TOLD" '{operation:"task_status", task_id:$t}')"
+          [[ "$(own .status)" == "200" && "$(said .state)" == "done" ]] \
+            && pass "G3 the owner's Got it: the agent reads it done" \
+            || fail "G3 Got it answered $(own .status) $(own .body.reason); the agent reads '$(said .state)'"
+        else
+          fail "G3 the notice $TOLD is not in the inbox"
+        fi
+      fi
       break ;;
     *) fail "G2 turn $TURNS: a verdict the suite does not know: '$VERDICT' ($(said .result.next_error))"; break ;;
   esac

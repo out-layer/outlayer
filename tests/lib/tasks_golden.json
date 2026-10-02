@@ -6,5 +6,7 @@
   "document": "{\"display\":{\"fields\":[],\"title\":\"Send an email\"},\"id\":\"run-0\"}",
   "hash": "92067502a74314ee1db26da1eb2bc195c3e4ef0d135dd5c0a9e4a988d38875ce",
   "reply_pubkey": "p256:BNuauRGLIM1_y5TyuGFWUuc1DchdnxTyepLoto5HgpAfSTZvN20m27RBD-OekVO1ERM9WATr--6-ko7G9MDcbaI",
-  "task": "run-0"
+  "task": "run-0",
+  "notice_envelope": "{\"build\":\"abababababababababababababababababababababababababababababababab\",\"created_at\":1790000000,\"display\":{\"fields\":[{\"kind\":\"address\",\"label\":\"To\",\"values\":[\"bob@example.com\"],\"written_by\":\"agent\"}],\"title\":\"Send an email\"},\"expires_at\":1790003600,\"files\":[],\"id\":\"run-0\",\"kind\":\"notice\",\"owner\":\"owner.near\",\"policy_hash\":\"823412d1eacb67956220e532959f0104603057c88704863ca38e7cd188fda812\",\"preparer\":\"agent.near\",\"profile\":\"gmail\",\"project\":\"connectors.outlayer.near/gmail\",\"project_uuid\":\"p0000000000000001\",\"state_hash\":\"4ba69735ca53765ed6a709edb56c6ea236b7193a3b29a6b390c346f0f4340e4e\",\"thread\":\"run-0\",\"v\":1}",
+  "notice_hash": "bb9b345a1a47268de61f7f6ae3dcfbab402ae99df423b109dd4e655865bbc289"
 }

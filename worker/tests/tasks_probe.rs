@@ -787,7 +787,7 @@ async fn one_run_opens_five_tasks_and_is_refused_the_sixth() {
 async fn a_task_prepared_for_the_slow_answer_is_answered_by_it_and_by_no_other() {
     let world = World::start();
     let (prepared, _) = world
-        .run(AGENT, true, "run-a", json!({ "operation": "prepare", "body": "Slowly", "answer_by": "confirm_slow" }))
+        .run(AGENT, true, "run-a", json!({ "operation": "prepare", "body": "Slowly", "answer_by": "confirm_slow", "seconds": 1 }))
         .await;
     let prepared = answer(&prepared);
     assert_eq!(prepared["output"]["status"], "awaiting_owner", "{prepared}");
@@ -871,4 +871,40 @@ async fn a_task_names_the_operation_that_answers_it_among_the_probes_own() {
         assert!(refused["error"].as_str().unwrap().starts_with("invalid_request: "), "{refused}");
     }
     assert_eq!(world.coordinator.rows.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(debug_assertions, ignore = "task runs need a release build: reqwest's blocking client asserts in debug that it is outside a tokio runtime")]
+async fn the_probes_notice_reaches_the_owner_needs_no_key_and_takes_no_answer() {
+    let world = World::start();
+    // A run with no payment key — one on chain — notifies.
+    let (told, report) = world
+        .run(AGENT, true, "run-n", json!({ "operation": "notify", "title": "The email was sent", "body": "To Bob", "nonce": null }))
+        .await;
+    let told = answer(&told);
+    let out = &told["output"];
+    assert_eq!((out["status"].as_str(), out["task_id"].as_str(), out["devices"].as_u64()), (Some("notified"), Some("run-n-0"), Some(1)), "{told}");
+    assert!(report.tasks().is_empty());
+    // The store was told no voucher and no reply key.
+    let row = world.coordinator.row("run-n-0");
+    assert_eq!((row.request["kind"].as_str(), &row.request["voucher"], &row.request["reply_pubkey"]), (Some("notice"), &Value::Null, &Value::Null));
+    // The owner's page reads it, and it names no answer.
+    let (shown, hash) = world.page_reads("run-n-0");
+    assert_eq!(hash, out["task_hash"].as_str().unwrap());
+    assert_eq!((shown["kind"].as_str(), shown["display"]["title"].as_str()), (Some("notice"), Some("The email was sent")));
+    assert!(shown.get("answer_by").is_none() && shown.get("reply_pubkey").is_none(), "{shown}");
+    let (status, _) = world.run(AGENT, true, "run-b", json!({ "operation": "task_status", "task_id": "run-n-0" })).await;
+    let status = answer(&status);
+    assert_eq!((status["output"]["state"].as_str(), status["output"]["kind"].as_str()), (Some("open"), Some("notice")), "{status}");
+    // An operation that takes an answer is refused it, and nothing moves.
+    let input = json!({ "operation": "confirm", "task_id": "run-n-0", "task_hash": hash, "approval": world.signed("run-n-0", &hash, None, None) });
+    let (refused, report) = world.run(AGENT, true, "run-o", input).await;
+    let refused = answer(&refused);
+    assert_eq!(refused["success"], false);
+    assert!(refused["error"].as_str().unwrap().starts_with("task_answer_invalid"), "{refused}");
+    assert!(report.refusals().is_empty() && report.tasks().is_empty());
+    assert_eq!(world.coordinator.row("run-n-0").state, "open");
+    // `prepare` of a notice that names an operation is refused before anything is made.
+    let (named, _) = world.run(AGENT, true, "run-x", json!({ "operation": "prepare", "kind": "notice", "answer_by": "confirm" })).await;
+    assert_eq!(answer(&named)["success"], false);
 }

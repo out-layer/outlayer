@@ -5,9 +5,10 @@
 //! `guess_start` (the agent) picks a number from 1 to `max` and opens an
 //! `input` task for the owner of the row the run names. The owner answers it
 //! in the inbox with one signature; the platform starts `guess` as a run of
-//! the agent, which judges the guess, reports the turn, and — unless the
-//! guess was right — opens the next task of the same thread, which says
-//! `higher` or `lower` and counts the attempts. Every turn is the agent's.
+//! the agent, which judges the guess, reports the turn, and opens the next
+//! task of the same thread: a turn that says `higher` or `lower` and counts
+//! the attempts, or — when the guess was right — a notice that says so and
+//! asks nothing. Every turn is the agent's.
 //!
 //! The secret lives in the task's sealed `state`, handed from turn to turn,
 //! and nowhere else: nothing but the sealed task is kept between runs, so a
@@ -192,6 +193,12 @@ impl Turn {
         }
     }
 
+    /// The title of the notice a right guess leaves the owner.
+    pub fn told(&self) -> String {
+        let n = self.game.attempts;
+        format!("You guessed it: {}, in {n} {}", self.game.secret, if n == 1 { "attempt" } else { "attempts" })
+    }
+
     /// The fields of the next task: what this turn said, and the question.
     pub fn fields(&self) -> Vec<(&'static str, String)> {
         let mut fields = Vec::new();
@@ -232,14 +239,24 @@ pub fn start(input: &Value) -> Result<(u64, Value), String> {
     Ok((max, tasks::awaiting_owner(&opened)))
 }
 
+/// The notice of a right guess: the number and the count, and nothing asked.
+fn notice(turn: &Turn) -> tasks::Task {
+    let display = Display::new(&turn.told())
+        .field("Number", FieldKind::Text, &turn.game.secret.to_string(), WrittenBy::Project)
+        .field("Attempts", FieldKind::Text, &turn.game.attempts.to_string(), WrittenBy::Project);
+    tasks::notice(display, POLICY)
+}
+
 /// What a `guess` call did.
 pub struct Answered {
     pub turn: Turn,
     /// What was reported to the preparer of the task answered.
     pub result: Value,
-    /// The next task, as `tasks::awaiting_owner` spells it; or why it was not
-    /// opened. `None` when the guess was right.
-    pub next: Option<Result<Value, String>>,
+    /// What was opened next in the thread: the next turn, as
+    /// `tasks::awaiting_owner` spells it, while the game goes on; the notice
+    /// of the right guess, as `tasks::notified` spells it, when it is won. Or
+    /// why it was not opened.
+    pub next: Result<Value, String>,
 }
 
 /// `guess`: the agent's run on the owner's answer to a turn. Judges it, opens
@@ -249,14 +266,19 @@ pub fn answer(input: &Value) -> Result<Answered, String> {
     // A state that does not read is not reported on: the task ends `failed`.
     let game = Game::from_state(&answer.state)?;
     let turn = game.play(answer.supplied.as_deref());
-    let next = turn
-        .goes_on()
-        .then(|| task(&turn.game, turn.fields()).open().map(|opened| tasks::awaiting_owner(&opened)).map_err(|e| e.refusal()));
+    let next = match turn.goes_on() {
+        true => task(&turn.game, turn.fields()).open().map(|opened| tasks::awaiting_owner(&opened)),
+        false => notice(&turn).open().map(|opened| tasks::notified(&opened)),
+    }
+    .map_err(|e| e.refusal());
     let mut result = turn.result();
+    let (named, failed) = match turn.goes_on() {
+        true => ("next_task_id", "next_error"),
+        false => ("notice_task_id", "notice_error"),
+    };
     match &next {
-        Some(Ok(opened)) => result["next_task_id"] = opened["task_id"].clone(),
-        Some(Err(refusal)) => result["next_error"] = json!(refusal),
-        None => {}
+        Ok(opened) => result[named] = opened["task_id"].clone(),
+        Err(refusal) => result[failed] = json!(refusal),
     }
     tasks::report(&answer.id, result.to_string().as_bytes()).map_err(|e| e.refusal())?;
     Ok(Answered { turn, result, next })
@@ -415,6 +437,20 @@ mod tests {
         // And the game goes on to be won.
         let won = g.play(Some(b"banana")).game.play(Some(b"42"));
         assert_eq!(won.sentence(), "guessed in 2 attempts");
+    }
+
+    #[test]
+    fn the_right_guess_tells_the_number_and_the_count_and_a_wrong_one_opens_the_next_turn() {
+        let won = game(57, 100).play(Some(b"10")).game.play(Some(b"57"));
+        assert_eq!(won.told(), "You guessed it: 57, in 2 attempts");
+        assert_eq!(game(5, 10).play(Some(b"5")).told(), "You guessed it: 5, in 1 attempt");
+        let told = notice(&won);
+        let shown = format!("{told:?}");
+        assert!(shown.contains("TaskKind::Notice") && shown.contains("answer-by: None"), "{shown}");
+        assert!(shown.contains("\"Number\"") && shown.contains("\"57\"") && shown.contains("\"Attempts\""), "{shown}");
+        assert!(!shown.contains(&won.game.salt), "the notice carries nothing of the state");
+        let longest = game(1000, 1000).play(Some(b"1000"));
+        assert!(longest.told().chars().count() <= 80, "{}", longest.told());
     }
 
     #[test]

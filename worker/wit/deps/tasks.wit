@@ -29,6 +29,14 @@ package outlayer:tasks@0.1.0;
 /// preparer's consent to that run, so `open` is refused `no-payment-key` in
 /// a run that has none: a task is opened over HTTPS with a payment key.
 ///
+/// **A notice** (`kind: notice`) tells the owner something and asks nothing:
+/// it names no operation to answer by, nothing is written back to it, and no
+/// run follows it — so it carries no consent, and a run with no payment key,
+/// one made on chain included, may open one. The owner closes it with Got
+/// it, and its preparer reads it `done`; `answered` refuses it
+/// `answer-invalid`. Everything else is a task's: who may open one, the
+/// limits, the life, what it shows, the files, the proof.
+///
 /// **Who may do what.**
 ///
 /// - `open`: a run admitted to the owner's row BY NAME — the row's condition
@@ -63,8 +71,9 @@ package outlayer:tasks@0.1.0;
 /// the preparer's run) → `answering` (that run took the task) → `done` (it
 /// ended well and reported) or `failed` (it ended any other way, or was
 /// refused the task before it took it, or could not be started). Or `open`
-/// → `rejected`, `cancelled`, `expired`, `void`. Each move is made once. A
-/// task never returns to `open`.
+/// → `rejected`, `cancelled`, `expired`, `void`. A notice is `open` →
+/// `done` (the owner saw it), `cancelled` or `expired`. Each move is made
+/// once. A task never returns to `open`.
 ///
 /// **Absence is a value, failure an error.** `mine` with nothing answers
 /// `ok([])`. A store or a chain that did not answer is `err` with
@@ -77,6 +86,8 @@ interface api {
         confirm,
         /// The owner supplies something.
         input,
+        /// Tells the owner something; asks nothing.
+        notice,
     }
 
     /// How the owner's page draws a field's values.
@@ -152,7 +163,10 @@ interface api {
     record request {
         kind: task-kind,
         display: display,
-        answer-by: answer-by,
+        /// The operation that carries the owner's answer out: present for a
+        /// `confirm` and an `input`, absent for a `notice`. Either way round
+        /// is refused `display-invalid`.
+        answer-by: option<answer-by>,
         /// The files the owner is shown beside the fields.
         files: list<file>,
         /// Bytes of the component's own, at most 262144, sealed beside the
@@ -305,14 +319,15 @@ interface api {
         /// signature does not verify, or the key that signed is not a
         /// full-access key of the owner's account. The message names which.
         approval-invalid,
-        /// `open` in a run that has no payment key: the consent to carry out
-        /// the owner's answer is a payment key — the run that carries it out
-        /// is paid by that key — so a task is opened over HTTPS with one.
+        /// `open` of a task that takes an answer in a run that has no payment
+        /// key: the consent to carry out the owner's answer is a payment key
+        /// — the run that carries it out is paid by that key — so such a
+        /// task is opened over HTTPS with one. A notice needs none.
         no-payment-key,
         /// The hash named is not the task's.
         hash-mismatch,
         /// What the owner supplied is not what the task asked for, or does
-        /// not open.
+        /// not open; or the task is a notice, which takes no answer.
         answer-invalid,
         /// The task was answered, rejected or cancelled already.
         closed,

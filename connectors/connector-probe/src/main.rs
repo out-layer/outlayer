@@ -388,7 +388,9 @@ struct Output {
     /// `guess`: what the turn reported to the preparer of the task answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
-    /// `guess`: the next turn's task, as `tasks::awaiting_owner` spells it.
+    /// `guess`: what follows in the thread — the next turn's task, as
+    /// `tasks::awaiting_owner` spells it, or the notice of a right guess, as
+    /// `tasks::notified` spells it.
     #[serde(skip_serializing_if = "Option::is_none")]
     next: Option<Value>,
 }
@@ -960,19 +962,20 @@ fn guess_start(op: &str, raw: &Value) -> Output {
     }
 }
 
-/// The owner's guess. `ok` is false when the game goes on and its next turn
-/// could not be opened: the guess was judged and reported, and the game stops
-/// there.
+/// The owner's guess. `ok` is false when what follows it in the thread —
+/// the next turn, or the notice of a right guess — could not be opened: the
+/// guess was judged and reported all the same.
 fn guess_turn(op: &str, raw: &Value) -> Output {
     let answered = match guess::answer(raw) {
         Ok(answered) => answered,
         Err(refusal) => return refused(op, refusal),
     };
     let sentence = answered.turn.sentence();
-    let (ok, detail, next) = match answered.next {
-        None => (true, sentence, None),
-        Some(Ok(next)) => (true, format!("{sentence}; the next turn waits for the owner"), Some(next)),
-        Some(Err(refusal)) => (false, format!("{sentence}; the next turn could not be opened: {refusal}"), None),
+    let (ok, detail, next) = match (answered.turn.goes_on(), answered.next) {
+        (true, Ok(next)) => (true, format!("{sentence}; the next turn waits for the owner"), Some(next)),
+        (false, Ok(told)) => (true, format!("{sentence}; the owner is told"), Some(told)),
+        (true, Err(refusal)) => (false, format!("{sentence}; the next turn could not be opened: {refusal}"), None),
+        (false, Err(refusal)) => (false, format!("{sentence}; the owner could not be told: {refusal}"), None),
     };
     Output { ok, operation: op.into(), detail, result: Some(answered.result), next, ..Default::default() }
 }

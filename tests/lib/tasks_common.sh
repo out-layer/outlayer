@@ -84,17 +84,19 @@ approves() { owner approve "$@"; }
 
 # await_run <task> [polls] — the agent's `task_status` polled every five
 # seconds until the task leaves open/approved/answering, or the polls run
-# out; prints the state and leaves the last answer where `status_of` leaves
-# it. A run that never starts leaves the task approved: the caller fails on
-# the state, and never hangs on it.
+# out; leaves the state in ENDED and the last answer where `status_of` leaves
+# it. Not a subshell: the answer is the caller's to read. A run that never
+# starts leaves the task approved: the caller fails on the state, and never
+# hangs on it.
+ENDED=""
 await_run() {
-  local i state=""
+  local i
+  ENDED=""
   for i in $(seq 1 "${2:-24}"); do
     status_of "$1"
-    state=$(task_field .state)
-    case "$state" in open|approved|answering|"") sleep 5 ;; *) break ;; esac
+    ENDED=$(task_field .state)
+    case "$ENDED" in open|approved|answering|"") sleep 5 ;; *) break ;; esac
   done
-  printf '%s' "$state"
 }
 
 # approved_and_done <row> <task> [supplied|-] [note|-] [--flag value…] — the
@@ -110,10 +112,9 @@ approved_and_done() {
     return 1
   fi
   RUN_OF=$(own .run)
-  local ended
-  ended=$(await_run "$2")
-  if [[ "$ended" != "done" ]]; then
-    fail "$1 the task ended '$ended' (failure_reason '$(task_field .failure_reason)', run '$(task_field .run)'), expected done"
+  await_run "$2"
+  if [[ "$ENDED" != "done" ]]; then
+    fail "$1 the task ended '$ENDED' (failure_reason '$(task_field .failure_reason)', run '$(task_field .run)'), expected done"
     return 1
   fi
   [[ "$(task_field .run)" == "$RUN_OF" ]] || fail "$1 task_status names the run '$(task_field .run)', the approval named $RUN_OF"

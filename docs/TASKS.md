@@ -16,6 +16,11 @@ next time it asks.
 It is one system for the platform. Any WASI project may use it, connectors
 among them, and an owner with ten agents reads their tasks in one inbox.
 
+A task asks one of two things — yes or no (`confirm`), or something the owner
+supplies (`input`) — or it asks nothing: a **notice** tells the owner that
+something happened, "the email was sent", "you guessed it in 4 attempts". The
+owner reads it and presses Got it; no run follows it.
+
 What it is not:
 
 * **Not a paused run.** Nothing waits inside the enclave. A task is a record.
@@ -100,6 +105,29 @@ What it is not:
    prepared the task. A key that cannot pay for it fails the task
    `preparer_key_unavailable`; nothing is charged to the owner.
 
+### Telling the owner something
+
+A notice is opened as a task is, from the same runs, and asks nothing: it
+names no operation, nothing is written back to it, and no run follows it, so
+it carries no consent and a run with no payment key — one on chain — may
+open one. The project answers the agent `notified`:
+
+```rust
+let opened = tasks::notice(
+    Display::new("The email was sent").field("To", FieldKind::Address, &to, WrittenBy::Project),
+    policy_json.as_bytes(),
+)
+.open()
+.map_err(|e| e.refusal())?;
+return Ok(tasks::notified(&opened)); // {"status":"notified","task_id","task_hash","thread","expires_at","link"}
+```
+
+The agent reads it `open` with `task_status` until the owner presses Got it,
+then `done`; one the owner deleted is `task_not_found`. It is not a receipt
+the agent relies on: what an operation did, the agent reads from that
+operation's own outcome. The run the platform started for an approved task
+may tell the owner how it went in a notice of the same conversation.
+
 `connectors/tasks-probe` is a project that does nothing else, and
 `connectors/gmail-connector` is a connector whose `send` asks the owner when
 their policy lists it under `confirm`. How a connector puts an action behind
@@ -149,7 +177,9 @@ so it opens, reads and answers nothing.
 A call over HTTPS is made as the account whose payment key pays for it, and a
 task is opened over HTTPS only: the consent to carry out the owner's answer
 is a payment key — the run that carries it out is paid by that key — so a
-run on chain is refused `no-payment-key` at `open`. No key answers a task by
+run on chain is refused `no-payment-key` at `open`. A notice is the one
+exception: no run follows it, so it carries no consent, and a run on chain
+may open one. No key answers a task by
 calling: a key of the owner's account is not the preparer, and the preparer's
 own call carries no approval. The run that answers is started by the platform
 and by nothing else.
@@ -169,7 +199,8 @@ the outcomes kept, stay.
 | `id` | the run that made it and its number within that run: `<call id>-<n>`, or `req-<request id>-<n>` for a run on chain |
 | `display` | what the owner is shown: a title and fields |
 | `files` | what the owner is given to open beside the fields: an attachment, a document. Each is named in the envelope by name, type, size and hash, and handed back when the task is answered |
-| `answer_by` | the operation the owner calls, and what they supply with it: nothing, text, or a reference to a file |
+| `kind` | `confirm`, `input` or `notice` |
+| `answer_by` | the operation the owner calls, and what they supply with it: nothing, text, or a reference to a file. A notice has none, and no reply key: the envelope holds the kind and what goes with it together, and a page draws no envelope in which they disagree |
 | `state` | bytes of the project's own, sealed beside the task and handed back when it is answered. The prepared action lives there. Never shown |
 | `policy_hash` | the hash of the policy the task was made under |
 | `build` | SHA-256 of the build that made the task: the code the owner's proof names, and the build the run that answers must be of |
@@ -223,6 +254,10 @@ bytes whatever type the task says it is.
 | `expired` | past its life |
 | `void` | the policy changed since it was made, or the run that answered was of another build of the project than the one that made it; found when it is answered |
 
+A notice is `open` until the owner presses Got it, then `done` — with no run
+and no result; or `cancelled` by its preparer, or `expired`. It is never
+`approved`, `answering`, `failed`, `rejected` or `void`.
+
 Each move is made once. A task never returns to `open`: a run that failed may
 have acted in part, so the owner sees `failed` and the agent prepares a new
 task if the work is still wanted. A task `approved` for thirty minutes without
@@ -247,6 +282,10 @@ every device's copy. Its outcome is kept 30 days.
 | what the owner supplies, the note beside their approval, or the reason they reject with | 8 KiB sealed each; the owner's page takes 5000 bytes of text |
 | of them, from one preparer, `open` and `approved` together | 10: an eleventh is refused `inbox-full` (`preparer_full` at the store) |
 | a result left for the preparer | 16 KiB |
+
+A notice is a task under every limit: it counts in the owner's 20 and in its
+preparer's 10, and an agent with ten notices unseen opens nothing more —
+`inbox-full` — until one is seen, expires or is cancelled.
 
 ## What is sealed, and who reads it
 
@@ -334,8 +373,13 @@ signed it in, and withdraws any of them.
 Before the host encrypts a task to a device it checks the statement itself:
 the account, the deadline, the signature over the sentence rebuilt from its
 three facts, and that the key that signed is a full-access key of the owner's
-account **on chain**. A row written into the store by anyone but the owner's
-wallet is a row the host refuses. While the chain cannot be asked, no task is
+account **on chain**. An implicit account (the 64 hex of an ed25519 key) that
+no transfer has made yet has no keys on chain; its own key counts as its
+full-access key, the key it will be made with — so a custody wallet never sent
+NEAR signs in too, through its `sign-message`. The coordinator holds the
+sign-in, the session's recheck and every confirmation to the same rule. A row
+written into the store by anyone but the owner's wallet is a row the host
+refuses. While the chain cannot be asked, no task is
 opened.
 
 | The owner | Reads |
@@ -371,6 +415,7 @@ every refusal are in the API spec under **Inbox**.
 | open a file of a task | `GET /inbox/tasks/{id}/files/{n}` | the session, and this device's key |
 | check the proof: the run, what it was asked, what it answered | `GET /inbox/tasks/{id}/origin`, and the run's attestation | the session |
 | reject, with a reason | `POST /inbox/tasks/{id}/reject` | the session |
+| Got it: close a notice as seen | `POST /inbox/tasks/{id}/acknowledge` | the session |
 | delete one, or all | `DELETE /inbox/tasks/{id}`, `DELETE /inbox/tasks` | the session |
 | mute an agent or a project, see who is muted, unmute | `POST`, `GET`, `DELETE /inbox/mutes` | the session |
 | see the devices signed in, withdraw one | `GET /inbox/devices`, `DELETE /inbox/devices/{id}` | the session; for another device, the owner's signature too |
@@ -406,7 +451,9 @@ the nonce, and moves the task `open → approved` with the run it then
 queues; the enclave rebuilds it again from the sealed envelope and the
 run's input, and takes an approval up to ten minutes ahead of its clock and
 up to thirty behind. A `confirm` task takes no `supplied`; an `input` task
-takes one. The answer is `{id, state, run}`, with `failure_reason` when the
+takes one. A notice takes no approval and no rejection: both are 400
+`invalid_request`, an approval before its nonce is spent; Got it closes it,
+and on a task that is not a notice is 400 too. The answer is `{id, state, run}`, with `failure_reason` when the
 run could not be started and the task is `failed` at once. A key removed
 from the account between the door and the run passes the door — the chain's
 word is kept five minutes, as at sign-in — and is refused in the enclave.
@@ -432,7 +479,8 @@ the body, in hex, under a secret of the owner's own. The secret is made when
 the URL is named and told to the owner once, in the answer to that call and in
 the dashboard; naming a URL again makes a new one.
 A body says who asked whom, of what kind and when, and links to the inbox. It
-carries nothing of what the task shows.
+carries nothing of what the task shows. A notice is told as `task_created`
+with `"kind": "notice"`; the owner's Got it sends nothing.
 
 The URL is an HTTPS URL on a public host, with no credentials in it. The
 sender follows no redirect, and connects only to a public address. The URL
@@ -472,16 +520,16 @@ a task refused at that door is `failed` with `run_refused:<reason>`.
 | `muted` | `muted` | the owner muted this agent or this project |
 | `inbox-full` | `inbox_full` | a limit of open tasks, or of what they hold together |
 | `run-limit` | `task_run_limit` | this run opened as many tasks (5), or made as many calls of the interface (100), as one run may |
-| `display-invalid` | `display_invalid` | what is shown is outside the bounds; the message names what |
+| `display-invalid` | `display_invalid` | what is shown is outside the bounds, or the kind and `answer-by` disagree — a notice names none, a task that takes an answer names one; the message names what |
 | `too-large` | `task_too_large` | `state`, `policy`, the files, the envelope or a result |
 | `life-too-long` | `task_life_too_long` | a life asked beyond the maximum |
-| `no-payment-key` | `task_no_payment_key` | `open` in a run on chain: a task is opened over HTTPS, with the payment key that will pay for the run that carries it out |
+| `no-payment-key` | `task_no_payment_key` | `open` of a task that takes an answer in a run on chain: such a task is opened over HTTPS, with the payment key that will pay for the run that carries it out. A notice needs none |
 | `not-found` | `task_not_found` | no such task of this project, owner and preparer |
 | `not-the-owner` | `not_the_owner` | `unlock` in another account's run |
 | `not-the-preparer` | `not_the_preparer` | `answered` or `report` in a run that is not the one the platform started for the task: another account, another payment key, another wallet, another identity, or more compute than the preparing run was allowed |
 | `approval-invalid` | `task_approval_invalid` | the owner's signature does not verify over this task, this hash and these words, is by a key that is not a full-access key of the owner's account, is too old or too far ahead, or the task was never approved |
 | `hash-mismatch` | `task_hash_mismatch` | the hash named is not the task's |
-| `answer-invalid` | `task_answer_invalid` | another operation than the one the task names; or what was supplied, or the note, is not what was asked, or does not open |
+| `answer-invalid` | `task_answer_invalid` | another operation than the one the task names; or what was supplied, or the note, is not what was asked, or does not open; or the task is a notice, which takes no answer |
 | `closed` | `task_closed` | answered, rejected or cancelled already; or approved, and this run is not the one started for it |
 | `expired` | `task_expired` | past its life |
 | `void` | `task_void` | the policy changed, or another build than the one that made the task answers it |

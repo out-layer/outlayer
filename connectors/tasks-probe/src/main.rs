@@ -12,6 +12,7 @@
 //! | `prepare` | agent | opens a task from `title`, `body`, `kind` (`confirm`, `text`, `file`), `life_seconds`, and `files` (`[{name, content_type, text}]`); answers `awaiting_owner`. `answer_by` names the operation that answers a `confirm` task: `confirm` when it is not named, `confirm_slow`, `confirm_silent` or `confirm_trap`; `seconds` is sealed with a `confirm_slow` task as the time its run takes |
 //! | `prepare_many` | agent | opens `count` tasks (1 to 10) in one run, each as `prepare` makes it, and stops at the first that is refused; answers the tasks opened and the refusal |
 //! | `prepare_raw` | agent | opens a task whose display is `display` as given — for a display outside the bounds |
+//! | `notify` | agent, or any run the row admits by name — one on chain too | opens a notice from `title`, `body`, `life_seconds` and `files`; answers `notified`. `prepare` and `prepare_many` open notices too with `"kind": "notice"` |
 //! | `confirm` | the agent's run, started by the platform on the owner's approval | takes a `confirm` task and reports what was prepared, and the owner's note when they wrote one |
 //! | `supply` | the same | takes a `text` or `file` task and reports what was supplied; with `"again": true` in the prepared body, opens the next task of the conversation |
 //! | `confirm_slow` | the same | takes a task that names it, waits `seconds` (1 to 170) — the call's, or the task's sealed one — then reports what was prepared |
@@ -43,6 +44,7 @@ const OPERATIONS: &[&str] = &[
     "prepare",
     "prepare_many",
     "prepare_raw",
+    "notify",
     "confirm",
     "confirm_slow",
     "supply",
@@ -77,16 +79,30 @@ fn life(input: &Value) -> u32 {
     input.get("life_seconds").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).unwrap_or(0)
 }
 
-fn open(task: tasks::Task, input: &Value) -> Result<Value, String> {
-    let opened = task.life_seconds(life(input)).open().map_err(|e| e.refusal())?;
-    let mut answer = tasks::awaiting_owner(&opened);
+/// A task to open, and whether it is a notice: what the call is answered
+/// differs.
+struct Made {
+    task: tasks::Task,
+    notice: bool,
+}
+
+fn open(made: Made, input: &Value) -> Result<Value, String> {
+    let opened = made.task.life_seconds(life(input)).open().map_err(|e| e.refusal())?;
+    let mut answer = match made.notice {
+        true => tasks::notified(&opened),
+        false => tasks::awaiting_owner(&opened),
+    };
     answer["devices"] = json!(opened.devices);
     Ok(answer)
 }
 
+fn asked(task: tasks::Task) -> Made {
+    Made { task, notice: false }
+}
+
 /// The task `prepare` makes of a call. `number` is the task's place among the
 /// tasks of a call that makes several: shown to the owner, and sealed.
-fn task_of(input: &Value, number: Option<(u64, u64)>) -> Result<tasks::Task, String> {
+fn task_of(input: &Value, number: Option<(u64, u64)>) -> Result<Made, String> {
     let body = text(input, "body", "a prepared body");
     let mut display = Display::new(text(input, "title", "Tasks probe"))
         .field("Body", FieldKind::LongText, body, WrittenBy::Agent)
@@ -108,6 +124,9 @@ fn task_of(input: &Value, number: Option<(u64, u64)>) -> Result<tasks::Task, Str
     }
     let state = state.to_string();
     let kind = text(input, "kind", "confirm");
+    if kind == "notice" && input.get("answer_by").is_some_and(|v| !v.is_null()) {
+        return Err("invalid_request: a notice takes no answer, and names no `answer_by`".to_string());
+    }
     let answer_by = match input.get("answer_by") {
         None | Some(Value::Null) => "confirm",
         Some(named) => match named.as_str().filter(|name| ANSWER_BY.contains(name)) {
@@ -120,7 +139,8 @@ fn task_of(input: &Value, number: Option<(u64, u64)>) -> Result<tasks::Task, Str
         "confirm" => tasks::confirm(display, answer_by, state.as_bytes(), &policy()),
         "text" => tasks::input(display, "supply", Supplies::Text, state.as_bytes(), &policy()),
         "file" => tasks::input(display, "supply", Supplies::File, state.as_bytes(), &policy()),
-        other => return Err(format!("invalid_request: `kind` is `confirm`, `text` or `file`, not `{other}`")),
+        "notice" => tasks::notice(display, &policy()),
+        other => return Err(format!("invalid_request: `kind` is `confirm`, `text`, `file` or `notice`, not `{other}`")),
     };
     for file in input.get("files").and_then(|f| f.as_array()).into_iter().flatten() {
         // `repeat` makes a file of a size a test asks for without sending it.
@@ -128,11 +148,18 @@ fn task_of(input: &Value, number: Option<(u64, u64)>) -> Result<tasks::Task, Str
         let data = text(file, "text", "").repeat(repeat);
         task = task.file(text(file, "name", ""), text(file, "content_type", "text/plain"), data.as_bytes());
     }
-    Ok(task)
+    Ok(Made { task, notice: kind == "notice" })
 }
 
 fn prepare(input: &Value) -> Result<Value, String> {
     open(task_of(input, None)?, input)
+}
+
+/// A notice: `prepare` of `kind: notice`, whatever kind the call names.
+fn notify(input: &Value) -> Result<Value, String> {
+    let mut input = input.clone();
+    input["kind"] = json!("notice");
+    open(task_of(&input, None)?, &input)
 }
 
 /// `count` tasks in one run. A refusal ends the call where it met it and is
@@ -156,7 +183,11 @@ fn prepare_many(input: &Value) -> Result<Value, String> {
             }
         }
     }
-    let status = if opened.is_empty() { "refused" } else { "awaiting_owner" };
+    let status = match (opened.is_empty(), text(input, "kind", "confirm")) {
+        (true, _) => "refused",
+        (false, "notice") => "notified",
+        (false, _) => "awaiting_owner",
+    };
     Ok(json!({ "status": status, "asked": count, "opened": opened.len(), "tasks": opened, "refused": refused }))
 }
 
@@ -194,7 +225,7 @@ fn prepare_raw(input: &Value) -> Result<Value, String> {
         };
     }
     let state = input.get("state").and_then(|v| v.as_str()).unwrap_or("").as_bytes().to_vec();
-    open(tasks::confirm(display, text(input, "answer_by", "confirm"), &state, &policy()), input)
+    open(asked(tasks::confirm(display, text(input, "answer_by", "confirm"), &state, &policy())), input)
 }
 
 fn prepared(answer: &tasks::Answer) -> Value {
@@ -229,7 +260,7 @@ fn supply(input: &Value) -> Result<Value, String> {
         let display = Display::new("Tasks probe: one more")
             .field("Received", FieldKind::Text, supplied.as_deref().unwrap_or(""), WrittenBy::Project);
         let next = tasks::input(display, "supply", Supplies::Text, br#"{"body":"the next turn","again":false}"#, &policy());
-        out["next"] = open(next, input)?;
+        out["next"] = open(asked(next), input)?;
     }
     Ok(out)
 }
@@ -302,6 +333,7 @@ fn run(operation: &str, input: &Value) -> Result<Value, String> {
         "prepare" => prepare(input),
         "prepare_many" => prepare_many(input),
         "prepare_raw" => prepare_raw(input),
+        "notify" => notify(input),
         "confirm" => confirm(input),
         "confirm_slow" => confirm_slow(input),
         "supply" => supply(input),
