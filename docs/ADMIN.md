@@ -43,10 +43,11 @@ Ordered by what it costs, not by how it reads.
 
 | Reach | Routes |
 |---|---|
-| **Spends our money** | `POST /admin/grant-payment-key` — funds an existing key from our balance and marks it `is_grant`: that balance cannot be withdrawn or forwarded to a developer. Refuses the trial key (nonce 0) with 400 and points to `grant-subscription`. `POST /admin/grant-subscription` `{owner, nonce, amount_usd?, days?, note?}` — sets what an existing key (the trial included) can spend from its allowance to exactly `amount_usd` (default `GIFT_SUBSCRIPTION_USD`) and runs it until at least now + `days` (default `GIFT_SUBSCRIPTION_DAYS`, 1–3650). `amount_usd` may be lower than `GIFT_SUBSCRIPTION_USD`, never higher (400). 409 when the key can already spend more than `amount_usd`; 404 when the key, or on nonce 0 the claimed trial, does not exist. On nonce 0 it converts the trial (`trial_converted`: no call count, `has_subscription: true`). It does not touch the key's balance or set `is_grant`; the allowance cannot be withdrawn or attached as `X-Attached-Deposit` (`allowance_no_deposit`). Neither route can CREATE a key. So a leaked token reaches: arbitrary non-withdrawable value on any existing key through `grant-payment-key`, and up to `GIFT_SUBSCRIPTION_USD` of allowance at a time through `grant-subscription` — the attacker's own keys included — spendable on compute and connector operations at our cost. |
+| **Spends our money** | `POST /admin/grant-payment-key` — funds an existing key from our balance and marks it `is_grant`: that balance cannot be withdrawn or forwarded to a developer. Refuses the trial key (nonce 0) with 400 and points to `grant-subscription`. `POST /admin/grant-subscription` `{owner, nonce, amount_usd?, days?, note?}` — sets what an existing key (the trial included) can spend from its allowance to exactly `amount_usd` (default `GIFT_SUBSCRIPTION_USD`) and runs it until at least now + `days` (default `GIFT_SUBSCRIPTION_DAYS`, 1–3650). `amount_usd` may be lower than `GIFT_SUBSCRIPTION_USD`, never higher (400). 409 when the key can already spend more than `amount_usd`; 404 when the key, or on nonce 0 the claimed trial, does not exist. On nonce 0 it converts the trial (`trial_converted`: no call count, `has_subscription: true`). It does not touch the key's balance or set `is_grant`; the allowance cannot be withdrawn or attached as `X-Attached-Deposit` (`allowance_no_deposit`). Neither route can CREATE a key. `POST /admin/sponsor-codes` mints a code any wallet can redeem for up to `GIFT_SUBSCRIPTION_USD` of allowance on its nonce-0 key (created on redeem), `max_uses` times — see below. So a leaked token reaches: arbitrary non-withdrawable value on any existing key through `grant-payment-key`, up to `GIFT_SUBSCRIPTION_USD` of allowance at a time through `grant-subscription` — the attacker's own keys included — and, through a code with no `max_uses`, that much on every wallet the attacker can mint until the code is switched off; all of it spendable on compute and connector operations at our cost. |
 | **Breaks operations** | `DELETE /admin/workers/{worker_id}`, `DELETE /admin/grant-keys/{owner}/{nonce}` — remove records other things rely on. |
 | **Widens what the coordinator concludes** | `POST /admin/binding-zones`, `POST /admin/hos-impl-code-hashes`, `POST /admin/hos-impl-versions`, `POST /admin/wallet-code-hashes`, `POST /admin/contract-wallet-code-hashes` — see below; all are lists whose growth relaxes a check. |
 | **Reads customer data** | `GET /admin/earnings`, `/admin/connector-calls`, `/admin/egress-audit`, `/admin/compile-logs/{job_id}`, `/admin/health/detailed`. Egress audit is every outbound attempt every guest made. |
+| **Reads customer data** (also) | `GET /admin/sponsor-codes` — which codes exist and how much their grants spent; no owners, no keys. |
 | **Harmless to repeat** | `POST /admin/collateral/check`, `GET /admin/collateral/status`, `GET /admin/binding-implementations`, `POST /admin/keystore-stats/refresh`, `POST /admin/connector-prices/refresh` — refreshes and reads, idempotent by construction. |
 
 ## The allowlists
@@ -295,6 +296,38 @@ shipped: every lane behind them is, or is about to be, suspended by a fact one
 `unsupported_wallet_implementation`, ...) whenever it is not `active` — but that
 is one binding at a time, read by whoever polls it. This is the fleet in one
 answer; poll it from the status page.
+
+## Sponsor codes — `/admin/sponsor-codes`
+
+A sponsor code is a secret, `spn_…`, that gives the wallet redeeming it a
+subscription on its nonce-0 key, paid by us: a link for a friend, a voucher
+posted in public, or a partner's backend giving every agent it runs premium.
+The wallet redeems it with `POST /wallet/v1/sponsorship {"code"}` under its own
+credential (`wk_` or `near:`); the coordinator's `docs/SUBSCRIPTIONS.md` has
+the redeem.
+
+| Route | Does |
+|---|---|
+| `POST /admin/sponsor-codes` `{name, allowance_usd?, grant_days?, max_uses?, redeem_until?, max_parallel?, one_per_ip?}` | Mints a code. Answers `201 {id, code, …}`; **the code is shown once**, only its hash is kept. `allowance_usd` (minimal units) defaults to and is capped by `GIFT_SUBSCRIPTION_USD`; `grant_days` defaults to `GIFT_SUBSCRIPTION_DAYS`, 1–3650; `max_uses` absent is unlimited; `redeem_until` absent is until switched off; `max_parallel` (1–1000, default 1) is how many allowance calls one sponsored key may have in flight; `one_per_ip` lets each client address redeem the code once — default true when `max_uses` is set, false when it is not. |
+| `PATCH /admin/sponsor-codes/{id}` `{active?, max_uses?, max_parallel?, redeem_until?, extend_days?, end_now?}` | `active: false` stops new redeems, what was granted runs to its end. `extend_days` tops every grant of the code back up to `allowance_usd` and moves its end to at least that many days from now (one gift per key; a key that can already spend more is skipped, counted in `skipped`). `end_now` sets every live grant's `expires_at` to now. The two contradict each other and are refused together. |
+| `GET /admin/sponsor-codes` | Every code with `uses` (times redeemed), `live` (keys carrying it whose grant has not ended) and `allowance_spent_usd` (spent by the keys carrying it). |
+
+What to set, by use:
+
+| Use | `max_uses` | `grant_days` | `one_per_ip` | `max_parallel` |
+|---|---|---|---|---|
+| a friend, premium for a year | 1 | 365 | — | 1 |
+| a voucher posted in public | 10 | 30 | true (default) | 1 |
+| a partner's backend (voulai) | absent | 90, then `extend_days` | false (default) | 99 |
+
+`one_per_ip` reads the address the rate limiter reads (`X-Real-IP`, else the
+last `X-Forwarded-For` entry nginx appended), an IPv6 caller by its /64
+(`ip_rate_limit::address_key`, shared by every per-address control); a request
+with neither header is refused on such a code. A key carries one sponsor while its grant is live; after the
+grant ends (its date, or `end_now`) the wallet may redeem another code, never
+the same one again. A redeem refused for any reason — unknown code, switched
+off, past `redeem_until`, used up, this address already redeemed it — answers
+`404 sponsor_code_invalid` and says no more.
 
 ## Adding an admin route
 

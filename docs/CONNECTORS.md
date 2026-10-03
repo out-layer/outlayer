@@ -307,6 +307,29 @@ and a malformed `account_id` fails argument deserialisation there.
 The header is meaningful only for a key owned by a custody wallet. An ordinary
 payment key's holder addresses their own secrets through the body, as always.
 
+
+### 4.2a The owner's policy (trading connectors)
+
+A connector whose writes the wallet's OWNER caps declares it in the registry
+(`Connector::owner_policy_profile` in the coordinator — `hyperliquid`,
+`polymarket`). For such a connector the policy can only be the owner's:
+
+* the coordinator reads the wallet's owner from the chain on every call
+  (`get_wallet_policy`, never cached, so a policy the owner just stored applies
+  to the next call);
+* with an owner, a call that names no `secrets_ref` gets the owner's row
+  `{owner, <profile>}`; a call that names a row of the owner's keeps it; any
+  other account's row — the agent's own included — is refused
+  `403 policy_row_not_owner`, and doing that again blocks the wallet on these
+  connectors for a while (`403 calls_suspended`);
+* without an owner, the call's own reference is used as it is;
+* the owner's row with an access rule that does not name the calling wallet
+  refuses the call (`Access denied by access condition`) — the owner adds the
+  wallet to it.
+
+With no policy in the run, the connector runs on its built-in default; a
+stored policy replaces the default whole.
+
 ### 4.3 How secrets reach your code
 
 As environment variables. Read them with `std::env::var`.

@@ -31,7 +31,8 @@ base URL that matches the network your project / wallet is deployed on.
 | Header | Used by | Meaning |
 |--------|---------|---------|
 | `X-Payment-Key: owner:nonce:secret` | Paid execution calls | Prepaid USD (stablecoin) balance |
-| `Authorization: Bearer wk_...` | All wallet endpoints and `POST /trial-key`. It runs the wallet and does not pay: on `/call` it is refused as `401 wk_is_not_a_payer` | Wallet API key |
+| `Authorization: Bearer wk_...` or `Bearer near:...` | All wallet endpoints and `POST /trial-key`. It runs the wallet and does not pay: on `/call` it is refused as `401 wk_is_not_a_payer` | Wallet API key, or a deterministic wallet's NEAR signature |
+| `X-Wallet-Id` | `/call` to a connector that acts on the wallet | The paying key's own wallet (`wallet_id` from `GET /wallet/v1/address`); without it the run has no wallet |
 | _(none)_ | `/register`, public read endpoints | No auth |
 
 > Only `X-Payment-Key` (a funded key, a subscription, or the trial key) or `Authorization: Bearer wk_...` (wallet)
@@ -43,7 +44,9 @@ base URL that matches the network your project / wallet is deployed on.
 |--------|----------|------|-------------|
 | POST | `/call/{owner}/{project}` | `X-Payment-Key` | Execute a WASI module (sync response) |
 | GET | `/calls/{call_id}` | — | Poll an async execution by id |
-| POST | `/trial-key` | `Bearer wk_...` | Claim the wallet's trial: ten connector calls in its first week |
+| POST | `/trial-key` | `Bearer wk_...` / `near:...` | Claim the wallet's trial: ten connector calls in its first week; the key is derived and read again below |
+| GET | `/wallet/v1/payment-key` | `Bearer wk_...` / `near:...` | The wallet's nonce-0 key (trial or sponsored), derived again; only the credential that claimed it reads it |
+| POST | `/wallet/v1/sponsorship` | `Bearer wk_...` / `near:...` | Redeem a sponsor code (`spn_…`): a subscription, paid by the sponsor, on the nonce-0 key |
 | GET | `/subscription/status` | `X-Payment-Key` | What a key has left — for a trial key, `trial.calls_left` |
 
 Optional execution headers: `X-Compute-Limit` (max compute budget in USD

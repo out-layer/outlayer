@@ -183,6 +183,8 @@ Payment keys are required for HTTPS API calls.
 | `outlayer keys balance <nonce>` | Check key balance |
 | `outlayer keys topup <nonce> <amount>` | Top up with NEAR (mainnet, auto-swaps to USDC) |
 | `outlayer keys delete <nonce>` | Delete key: the storage deposit is refunded, the remaining balance is forfeited |
+| `outlayer keys trial-key [--api-key wk_...]` | Print a custody wallet's nonce-0 key (trial or sponsored); it is derived, so it is read again rather than stored |
+| `outlayer redeem <spn_...> [--api-key wk_...]` | Redeem a sponsor code: a subscription on the wallet's nonce-0 key, paid by the sponsor; stdout is the key |
 
 ```bash
 outlayer keys create
