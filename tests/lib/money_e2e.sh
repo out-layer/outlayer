@@ -16,11 +16,16 @@ if body and body.startswith("@env:"):
     body = os.environ[body[5:]]
 timeout = float(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else 120.0
 idem = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else None
+# One more header, as "Name: value" (X-Answer-Within in step 3).
+extra = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] else None
 headers = {"User-Agent": "curl/8.7.1", "Content-Type": "application/json"}
 if key_var:
     headers["Authorization"] = "Bearer " + os.environ[key_var]
 if idem:
     headers["X-Idempotency-Key"] = idem
+if extra:
+    name, value = extra.split(":", 1)
+    headers[name.strip()] = value.strip()
 req = urllib.request.Request(url, data=body.encode() if body else None, headers=headers, method=method)
 try:
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -30,7 +35,7 @@ except urllib.error.HTTPError as e:
 except (socket.timeout, TimeoutError, urllib.error.URLError) as e:
     print("HUNGUP"); print(json.dumps({"error": str(e)}))
 PY
-api() { python3 "$WORK/api.py" "$@"; }          # METHOD URL KEYVAR [BODY|@env:VAR] [TIMEOUT] [IDEM]
+api() { python3 "$WORK/api.py" "$@"; }          # METHOD URL KEYVAR [BODY|@env:VAR] [TIMEOUT] [IDEM] ["Header: value"]
 code_of() { head -1 <<<"$1"; }
 body_of() { tail -n +2 <<<"$1"; }
 jget() { python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "null"); v=eval("d"+sys.argv[1]) if d is not None else None; print("" if v is None else (json.dumps(v) if isinstance(v,(dict,list)) else v))' "$1" 2>/dev/null; }
@@ -44,14 +49,14 @@ sql() { [[ -n "$PSQL_CMD" ]] && $PSQL_CMD "$1"; }
 RUN_IDS="$WORK/ids"; : >"$RUN_IDS"
 
 # Send once and hang up after 3 s; then recover the request id the way an
-# integrator does — re-send with the same key and read the duplicate answer
-# (or the busy answer naming the request in flight).
+# integrator does — re-send with the same key and read `request_id` off the
+# duplicate answer (or `in_flight_request_id` off the busy answer).
 hang_up_and_recover() {  # PATH BODY KEYVAR → prints request_id
   local path="$1" body="$2" keyvar="$3" idem="$IDEM_PREFIX-$(uuidgen | tr 'A-Z' 'a-z')" resp id i
   api POST "$API$path" "$keyvar" "$body" 3 "$idem" >/dev/null
   for i in $(seq 1 30); do
     resp="$(api POST "$API$path" "$keyvar" "$body" 30 "$idem")"
-    id="$(body_of "$resp" | jget '["message"]' | grep -oE '[0-9a-f-]{36}' | head -1)"
+    id="$(body_of "$resp" | jget '["request_id"]')"
     [[ -z "$id" ]] && id="$(body_of "$resp" | jget '["in_flight_request_id"]')"
     [[ -n "$id" ]] && { echo "$id"; echo "$id" >>"$RUN_IDS"; return 0; }
     sleep 1
