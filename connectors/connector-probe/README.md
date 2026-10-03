@@ -103,11 +103,11 @@ a row open to everyone is refused `not_granted_by_name`.
 ```bash
 curl -s https://testnet-api.outlayer.ai/call/connectors.outlayer.testnet/connector-probe \
   -H "X-Payment-Key: $AGENT_PAYMENT_KEY" -H 'Content-Type: application/json' \
-  -d '{"input": {"operation": "guess_start", "max": 100},
+  -d '{"input": {"operation": "guess_start"},
        "secrets_ref": {"account_id": "you.testnet", "profile": "shared"}}'
 ```
 
-`max` is a whole number from 2 to 1000, and 100 when it is not named. The run
+`max` is a whole number from 2 to 1000, and 10 when it is not named. The run
 picks a number from 1 to `max` and opens an `input` task, `Guess my number`,
 asking `I picked a number from 1 to {max}. Your guess?`; the answer carries
 `status: "awaiting_owner"`, `task_id`, `task_hash` and the inbox `link`.

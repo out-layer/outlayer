@@ -26,7 +26,7 @@ use std::ops::RangeInclusive;
 pub const ANSWER_BY: &str = "guess";
 
 /// `max` when the call names none.
-pub const DEFAULT_MAX: u64 = 100;
+pub const DEFAULT_MAX: u64 = 10;
 
 /// The `max` a call may name.
 pub const MAX_BOUNDS: RangeInclusive<u64> = 2..=1000;
@@ -294,9 +294,9 @@ mod tests {
     }
 
     #[test]
-    fn max_is_100_unless_named_and_named_within_2_to_1000() {
-        assert_eq!(parse_max(&json!({})), Ok(100));
-        assert_eq!(parse_max(&json!({ "max": null })), Ok(100));
+    fn max_is_10_unless_named_and_named_within_2_to_1000() {
+        assert_eq!(parse_max(&json!({})), Ok(10));
+        assert_eq!(parse_max(&json!({ "max": null })), Ok(10));
         assert_eq!(parse_max(&json!({ "max": 2 })), Ok(2));
         assert_eq!(parse_max(&json!({ "max": 1000 })), Ok(1000));
         for bad in [json!(1), json!(0), json!(1001), json!(-5), json!(50.5), json!("50"), json!(true)] {

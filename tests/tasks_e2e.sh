@@ -1354,6 +1354,8 @@ if want N11 || want N17 || want N4; then
   if ! sql_alive; then
     for r in N11 N17 N4; do want $r && skip "$r needs PSQL_CMD — one statement of SQL against the coordinator's database — and it does not answer"; done
   else
+    # The rows before leave tasks of the agent's waiting: each of these opens one.
+    clear_tasks
     if want N11; then
       log "N11 the voucher's compute limit raised in the store"
       if prepare '{"title":"More compute than consented"}' && an_id "$TASK"; then
@@ -2235,7 +2237,7 @@ if want NT1 || want NT2 || want NT3 || want NT8; then
   if notify "$(jq -nc --arg t "$NOTICE_TITLE" '{title:$t, body:"The email to Bob was sent."}')"; then
     NOTICE=$TASK NOTICE_HASH=$HASH
     pass "NT1 notified, task $NOTICE"
-    in_inbox "$NOTICE"
+    in_inbox "$NOTICE" "$NOW_ON"
     [[ "$(row .kind)" == "notice" && "$(row .state)" == "open" && "$(row .reply_pubkey)" == "" ]] \
       && pass "NT1 listed as an open notice, with no reply key" || fail "NT1 the listed row: $(jq -c 'del(.read)' <<<"$ROW")"
     [[ "$(row .read.hash)" == "$NOTICE_HASH" && "$(row .read.envelope.kind)" == "notice" \
@@ -2255,7 +2257,7 @@ if want NT1 || want NT2 || want NT3 || want NT8; then
 
     if want NT8; then
       log "NT8 the proof of a notice"
-      owner proof "$NOTICE" a
+      owner proof "$NOTICE" "$NOW_ON"
       if [[ "$(own .attested)" == "false" ]]; then
         skip "NT8 the run $(own .run) has no attestation: this worker attests nothing"
       elif [[ "$(own .attested)" == "true" ]]; then
@@ -2271,10 +2273,10 @@ if want NT1 || want NT2 || want NT3 || want NT8; then
       log "NT2 an approval sent to a notice"
       if prepare '{"title":"NT2 the task the approval is for"}'; then
         NONCE=$(openssl rand -base64 32)
-        approves "$NOTICE" - - a --for "$TASK" --hash "$HASH" --nonce "$NONCE"
+        approves "$NOTICE" - - "$NOW_ON" --for "$TASK" --hash "$HASH" --nonce "$NONCE"
         [[ "$(own .status)" == "400" && "$(own .reason)" == "invalid_request" ]] \
           && pass "NT2 approve of a notice: 400" || fail "NT2 approve of a notice answered $(own .status) $(own .reason)"
-        owner replay-approval "$NOTICE" a against "$TASK"
+        owner replay-approval "$NOTICE" "$NOW_ON" against "$TASK"
         if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
           pass "NT2 the same signature and nonce then approve the task they were for"
           await_run "$TASK"
@@ -2282,7 +2284,7 @@ if want NT1 || want NT2 || want NT3 || want NT8; then
         else
           fail "NT2 the same body on its task answered $(own .status) $(own .reason) state '$(own .state)'"
         fi
-        in_inbox "$NOTICE" && [[ "$(row .state)" == "open" ]] \
+        in_inbox "$NOTICE" "$NOW_ON" && [[ "$(row .state)" == "open" ]] \
           && pass "NT2 the notice is as it was" || fail "NT2 the notice after the approval: '$(row .state)'"
       else
         fail "NT2 prepare: error='$(said .error | head -c 200)'"
@@ -2291,26 +2293,26 @@ if want NT1 || want NT2 || want NT3 || want NT8; then
 
     if want NT3; then
       log "NT3 Got it"
-      owner reject "$NOTICE" "" a
+      owner reject "$NOTICE" "" "$NOW_ON"
       [[ "$(own .status)" == "400" && "$(own .body.reason)" == "invalid_request" ]] \
         && pass "NT3 a reject of a notice: 400" || fail "NT3 reject of a notice answered $(own .status) $(own .body.reason)"
-      owner got-it "$NOTICE" a
+      owner got-it "$NOTICE" "$NOW_ON"
       [[ "$(own .status)" == "200" && "$(own .body.state)" == "done" ]] \
         && pass "NT3 Got it: done" || fail "NT3 Got it answered $(own .status) $(own .body.reason) $(own .body.state)"
       status_of "$NOTICE"
       [[ "$(said .output.state)" == "done" && -z "$(said .output.run)" ]] \
         && pass "NT3 the agent reads it done, with no run" || fail "NT3 task_status after Got it: '$(said .output.state)' run '$(said .output.run)'"
-      gone_from_inbox NT3 "$NOTICE" && pass "NT3 it left the inbox"
-      owner got-it "$NOTICE" a
+      gone_from_inbox NT3 "$NOTICE" "$NOW_ON" && pass "NT3 it left the inbox"
+      owner got-it "$NOTICE" "$NOW_ON"
       [[ "$(own .status)" == "409" && "$(own .body.reason)" == "task_closed" ]] \
         && pass "NT3 a second Got it: 409 task_closed" || fail "NT3 a second Got it answered $(own .status) $(own .body.reason)"
       if prepare '{"title":"NT3 a task, not a notice"}'; then
-        owner got-it "$TASK" a
+        owner got-it "$TASK" "$NOW_ON"
         [[ "$(own .status)" == "400" ]] && pass "NT3 Got it on a task that takes an answer: 400" \
           || fail "NT3 Got it on a confirm answered $(own .status) $(own .body.reason)"
       fi
       if notify '{"title":"NT3 deleted unseen"}'; then
-        owner delete "$TASK" a
+        owner delete "$TASK" "$NOW_ON"
         status_of "$TASK"
         [[ "$(code)" == "task_not_found" ]] && pass "NT3 a deleted notice: the agent finds nothing" \
           || fail "NT3 after a delete the agent read '$(said .output.state)' error '$(said .error | head -c 120)'"
@@ -2329,7 +2331,7 @@ if want NT4; then
   if [[ "$(said .success)" == "true" && "$(said .output.status)" == "notified" ]]; then
     TASK=$(said .output.task_id)
     pass "NT4 a run with no payment key notified: $TASK"
-    in_inbox "$TASK"
+    in_inbox "$TASK" "$NOW_ON"
     [[ "$(row .kind)" == "notice" && "$(row .preparer)" == "$PARENT" && "$(row .read.envelope.display.title)" == "NT4 from a transaction" ]] \
       && pass "NT4 the owner reads it, the owner's own" || fail "NT4 the listed row: $(jq -c 'del(.read)' <<<"$ROW")"
   else
@@ -2345,10 +2347,10 @@ if want NT5; then
   agent '{"operation":"notify"}'
   expect_refusal NT5 not_granted_by_name
   store_row "$POLICY_V1" "$GRANTED"
-  owner mute agent "$AGENT_ACCOUNT" a
+  owner mute agent "$AGENT_ACCOUNT" "$NOW_ON"
   agent '{"operation":"notify"}'
   expect_refusal NT5 muted
-  owner unmute agent "$AGENT_ACCOUNT" a
+  owner unmute agent "$AGENT_ACCOUNT" "$NOW_ON"
   if relay_lacks NT5; then :
   else
     relayed '{"operation":"notify"}'
@@ -2372,7 +2374,7 @@ if want NT6; then
     expect_refusal NT6 inbox_full
     notify '{"title":"NT6 the eleventh, a notice"}'
     expect_refusal NT6 inbox_full
-    owner got-it "$SEEN_FIRST" a
+    owner got-it "$SEEN_FIRST" "$NOW_ON"
     [[ "$(own .status)" == "200" ]] || fail "NT6 Got it answered $(own .status) $(own .body.reason)"
     prepare '{"title":"NT6 after one was seen"}' && pass "NT6 one seen, and a task opens" \
       || fail "NT6 after Got it: error='$(said .error | head -c 200)'"
@@ -2387,7 +2389,7 @@ if want NT7; then
   if lacks NT7 HOOK_URL HOOK_LOG_URL; then :
   else
     export HOOK_URL
-    owner webhook set HOOK_URL a
+    owner webhook set HOOK_URL "$NOW_ON"
     if [[ "$(own .status)" == "200" && "$(own .url_matches)" == "true" ]]; then
       HOOK_NAMED=true
       SHOWN_TITLE="NT7 title $(openssl rand -hex 6)"; SHOWN_BODY="NT7 body $(openssl rand -hex 6)"
@@ -2401,7 +2403,7 @@ if want NT7; then
         else
           fail "NT7 task_created of $TOLD_TASK did not reach the receiver: $(jq -r '.failed // "not among the events"' <<<"$HOOK")"
         fi
-        owner got-it "$TOLD_TASK" a
+        owner got-it "$TOLD_TASK" "$NOW_ON"
         # The events of the notice are sent within seconds of their move;
         # the receiver's log is read once that long has passed.
         sleep 20
