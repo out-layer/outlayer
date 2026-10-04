@@ -97,6 +97,19 @@ anyhow::bail!("Feature X is not supported. Please use Y instead.");
 | `tests/` | - | Integration tests |
 | `scripts/` | - | Deployment & utility scripts |
 
+## Connector decisions that stay
+
+- **Polymarket and Hyperliquid work with no owner policy: everything allowed by
+  default.** No policy row, an empty `*_POLICY` value and an empty policy `{}`
+  all mean the built-in default (`Policy::default_open`): every market/coin, no
+  size, volume or leverage cap, deposits from the wallet's balance, withdrawals
+  only back to the wallet's `intents`. A policy that sets anything — even only
+  `"allow_withdraw": false` — is the owner's and is held to its fields. Do not
+  turn the default into read-only or require a policy to trade: the venue key
+  is derived in the TEE and the agent moves the wallet's funds through
+  `/wallet/v1/*` anyway, so a closed default protects nothing (decided by
+  Vadim, 2026-10-04).
+
 ## Live tests: a keyed RPC, always
 Every e2e/live run — the suites' own `curl`, near-cli, and the keystore under
 test — goes through a FastNEAR RPC **with an API key**. The unkeyed testnet

@@ -222,9 +222,10 @@ restore_cap() {
     ( restore_access ) || echo "✗ THE ACCESS WAS NOT RESTORED — set $GMAIL/gmail back to $ORIG_ACCESS by hand" >&2
     ACCESS_CHANGED=false
   fi
-  if [[ -n "$POLICY_ASKED" && ( "$POLICY_ASKED" != "$CAPPED" || "$POLICY_CONFIRMED" != "$CAPPED" ) ]]; then
+  local back="${OWNER_POLICY_AT_START:-$CAPPED}"
+  if [[ -n "$back" && "$(policy_now)" != "$back" ]]; then
     note "putting the owner's policy back before exit"
-    ( store_policy "$CAPPED" ) || echo "✗ THE POLICY WAS NOT RESTORED — store $CAPPED for $GMAIL by hand" >&2
+    ( store_policy "$back" ) || echo "✗ THE POLICY WAS NOT RESTORED — store $back for $GMAIL by hand" >&2
   fi
 }
 
@@ -318,8 +319,19 @@ gmail_ready() { # gmail_ready <row> [key] — leaves the status answer in RUN_*
 
 RUN="$(date -u +%Y%m%dT%H%M%SZ)"
 
+# The policy the owner had, put back at the end whatever the rows changed.
+OWNER_POLICY_AT_START="${CAPPED:-}"
 if [[ "$CONNECTED" == true ]]; then
   log "Fixture: the owner's connected row, as it is"
+  # G1, G2 and G4 judge a send that acts at once. An owner who asks to confirm
+  # sends would turn each into a task: those rows run on the same policy
+  # without `confirm`, and the owner's own comes back at the end.
+  if [[ -n "${CAPPED:-}" ]] && jq -e 'has("confirm")' <<<"$CAPPED" >/dev/null 2>&1; then
+    CAPPED=$(jq -c 'del(.confirm)' <<<"$CAPPED")
+    CAPLESS=$(jq -c 'del(.max_per_day)' <<<"$CAPPED")
+    note "the owner asks to confirm sends — the G rows run without confirm; the owner's policy is put back at the end"
+    store_policy "$CAPPED"
+  fi
 else
   log "Fixture: the owner's row, capped, granted to $AGENT_ACCOUNT"
   store_policy "$CAPPED"
@@ -733,9 +745,9 @@ else
 fi
 
 # The owner's policy goes back, and the tasks the rows made go.
-if [[ -n "$CAPPED" && "$(policy_now)" != "$CAPPED" ]]; then
+if [[ -n "${OWNER_POLICY_AT_START:-$CAPPED}" && "$(policy_now)" != "${OWNER_POLICY_AT_START:-$CAPPED}" ]]; then
   log "GT the owner's policy goes back"
-  store_policy "$CAPPED"
+  store_policy "${OWNER_POLICY_AT_START:-$CAPPED}"
 fi
 delete_made_tasks
 
