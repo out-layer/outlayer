@@ -57,7 +57,8 @@ IDEM_PREFIX=s2
 source "$REPO/tests/lib/money_e2e.sh"
 
 echo "── step 2 rows"
-echo "wallet B key: ${MONEY_E2E_PEER_KEY:+present, ${#MONEY_E2E_PEER_KEY} chars}${MONEY_E2E_PEER_KEY:-absent}"
+# A fact about the key, never the key: `${VAR:-absent}` would print it whole.
+if [[ -n "$MONEY_E2E_PEER_KEY" ]]; then echo "wallet B key: present, ${#MONEY_E2E_PEER_KEY} chars"; else echo "wallet B key: absent"; fi
 ACCOUNT="$(body_of "$(api GET "$API/wallet/v1/address?chain=near" MONEY_E2E_WALLET_KEY)" | jget '["address"]')"
 [[ -n "$ACCOUNT" ]] || { echo "✗ wallet A did not answer /address" >&2; exit 2; }
 USDC0="$(intents_balance "$USDC" MONEY_E2E_WALLET_KEY)"
@@ -209,6 +210,8 @@ probe="$(api GET "$API/wallet/v1/confidential/balance" MONEY_E2E_WALLET_KEY)"
 if [[ "$(code_of "$probe")" == 503 ]]; then skip $row "confidential intents are not enabled on this deployment"
 else
   before="$(usage_count "$USDC")"
+  # This call's rows only: a run minutes earlier has shield rows of its own.
+  since="$(sql "SELECT now()")"
   id="$(hang_up_and_recover /wallet/v1/confidential/shield "$sbody" MONEY_E2E_WALLET_KEY)" || { fail $row "no request id after the hang-up"; id=""; }
   if [[ -n "$id" ]]; then
     st=""
@@ -217,12 +220,13 @@ else
       [[ "$st" == success || "$st" == failed || "$st" == refunded || "$st" == needs_review ]] && break
       sleep 5
     done
-    rows="$(sql "SELECT count(*) FROM wallet_requests WHERE wallet_id='$MONEY_E2E_WALLET_ID' AND request_type='confidential_shield' AND created_at > NOW() - INTERVAL '10 minutes'")"
+    rows="$(sql "SELECT count(*) FROM wallet_requests WHERE wallet_id='$MONEY_E2E_WALLET_ID' AND request_type='confidential_shield' AND created_at >= '$since'")"
+    # Whatever the judgement, a shield that succeeded is put back.
+    [[ "$st" == success ]] && back="$(api POST "$API/wallet/v1/confidential/unshield" MONEY_E2E_WALLET_KEY "$sbody" 120 "s2-$(uuidgen)")"
     if [[ "$st" != success ]]; then fail $row "status $st"
     elif [[ -n "$PSQL_CMD" && "$rows" != 1 ]]; then fail $row "$rows shield rows for one call"
     elif [[ -n "$PSQL_CMD" && "$(usage_count "$USDC")" != "$((${before:-0}+1))" ]]; then fail $row "velocity not charged exactly once"
     else
-      back="$(api POST "$API/wallet/v1/confidential/unshield" MONEY_E2E_WALLET_KEY "$sbody" 120 "s2-$(uuidgen)")"
       pass "$row shield after a hang-up → success, one row, charged once; unshield back answered $(body_of "$back" | jget '["status"]')"
     fi
   fi
