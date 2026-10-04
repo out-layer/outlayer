@@ -30,7 +30,8 @@
 #        trial (TRIAL_WALLET_KEY in .env.testnet-keys) → 409
 #        payment_key_not_recoverable
 #   SP14 the nonce-0 key is bound to the wk_ that claimed it: another wk_ of
-#        the same wallet → 403 payment_key_other_credential; the claiming wk_
+#        the same wallet → 403 payment_key_other_credential, on the GET and on a
+#        redeem (which takes no use of the code); the claiming wk_
 #        revoked → the key's /call is 401 invalid_key, the GET 409
 #        payment_key_revoked
 #   SP15 owner policy on hyperliquid: a wallet WITH an owner (policy stored on
@@ -375,6 +376,12 @@ if [[ $r1 =~ ^2 && $r2 =~ ^2 ]]; then
   req wk "$K2" GET /wallet/v1/payment-key
   [[ "$HTTP" == 403 && "$(j .reason)" == payment_key_other_credential ]] \
     && pass "SP14 wk_ #2 of the same wallet → 403 payment_key_other_credential" || fail "SP14 wk_ #2 → HTTP $HTTP: $(short)"
+  create_code "{\"name\":\"$RUN-k2\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1,\"max_uses\":1,\"one_per_ip\":false}"; K2_CODE_ID=$CODE_ID
+  req wk "$K2" POST /wallet/v1/sponsorship "$(jq -nc --arg c "$CODE" '{code:$c}')"
+  k2_http=$HTTP; k2_reason=$(j .reason)
+  [[ "$k2_http" == 403 && "$k2_reason" == payment_key_other_credential && "$(code_uses "$K2_CODE_ID")" == 0\|* ]] \
+    && pass "SP14 wk_ #2 redeems → 403 payment_key_other_credential, no use taken" \
+    || fail "SP14 wk_ #2 redeem → HTTP $k2_http $k2_reason, uses|live $(code_uses "$K2_CODE_ID")"
   req wk "$K2" DELETE "/wallet/v1/api-key/$K1_HASH"
   [[ "$HTTP" =~ ^2 ]] && pass "SP14 wk_ #1 revoked" || fail "SP14 revoke → HTTP $HTTP: $(short)"
   req pk "$K_PK" POST "/call/$PROBE_PROJECT" '{"input":{"operation":"ping"}}'
