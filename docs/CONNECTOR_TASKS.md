@@ -65,6 +65,21 @@ impl Policy {
 One variant per confirmable operation, spelled as the operation is spelled.
 Code branches on the variant, never on a string.
 
+**Deciding per call: rules.** A list of operations asks about every call of
+them. A connector whose writes differ by what they carry — an amount, a rail,
+a payee — may instead read a `rules` member: a list of `{when, then}`, `then`
+one of `allow`, `ask`, `refuse` (a serde enum), `when` the operation and
+conditions the connector declares, each a typed field under
+`deny_unknown_fields`. The first rule that matches decides; with none
+matching the call runs as the rest of the policy allows. Rules are asked last,
+of a call every other check passed, so a rule never widens the policy. A
+condition the operation does not carry (an amount on a cancellation) makes the
+policy unreadable, like a misspelt field. `ask` then follows this document
+exactly as a listed operation does. The reference is
+[`connectors/mercury-connector`](../connectors/mercury-connector/)
+(`src/rules.rs`; conditions `min_usd`, `max_usd`, `methods`, `payee`), proved
+live by `tests/mercury_rules_e2e.sh` (MR0–MR7).
+
 **`status` reports it.** The connector's `status` (or whatever operation
 reports the policy) answers `confirm` with the other members, as the policy
 holds it: `["send"]`, `[]`, or `null` when the policy has none. The member is
