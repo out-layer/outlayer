@@ -29,6 +29,7 @@
 //! cap bounds each count.
 
 use crate::action::{Action, Change, Content, GistFile, LineComment};
+use crate::github as gh;
 use crate::policy::{self, Counted};
 use crate::Input;
 use outlayer::tasks::{self, Display, FieldKind, WrittenBy};
@@ -709,38 +710,109 @@ pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
         &answer,
         on_chain,
         |rules, action, counted| {
-            action.check_on_github(rules)?;
-            action.execute(rules, counted)
+            action.check_on_github(rules).map_err(Unmade::Refused)?;
+            gh::begin_writes();
+            action.execute(rules, counted).map_err(|e| if gh::may_have_written() { Unmade::Unknown(e) } else { Unmade::Refused(e) })
         },
         |id, result| tasks::report(id, result).map_err(|e| e.refusal()),
+        |id, refusal| tasks::failed(id, refusal).map_err(|e| e.refusal()),
+    )
+}
+
+/// Why a write the task held was not answered with a result.
+#[derive(Debug, PartialEq, Eq)]
+enum Unmade {
+    /// Nothing was changed on GitHub: refused before a write, or GitHub
+    /// refused it (4xx).
+    Refused(String),
+    /// A write may have changed something and its outcome is not known: a
+    /// lost answer, GitHub's own failure, or a later step of the write that
+    /// failed after an earlier one was made.
+    Unknown(String),
+}
+
+/// The refusal when a write may have been made and its outcome is not known:
+/// the task is not reported as not carried out, and the sentence tells the
+/// agent to look at GitHub before it prepares the write again.
+fn outcome_unknown(refusal: String) -> String {
+    format!(
+        "{}. A write reached GitHub and its outcome is not known — an earlier step was made, or GitHub's \
+         answer was lost — so it MAY have been made: check the repository before preparing it again",
+        refusal.trim_end().trim_end_matches('.')
     )
 }
 
 /// Everything that follows the answer: the task is `answering`, and any
 /// refusal from here ends it. `act` makes the write and `report` leaves the
-/// result for the agent — the host's doing in a run.
+/// result for the agent — the host's doing in a run. A refusal that says
+/// nothing was written goes to the agent through `fail` (`report-failure`):
+/// the task ends `failed` as `run_failed` with `{"error": <the refusal>}` as
+/// the result it reads. A write whose outcome is not known is NOT reported
+/// as not carried out: the run ends with the refusal, and the task as
+/// `run_unreported` — "it may have acted".
 fn after_answer(
     rules: &policy::Policy,
     answer: &tasks::Answer,
     on_chain: bool,
-    act: impl FnOnce(&policy::Policy, &Action, Counted) -> Result<Value, String>,
+    act: impl FnOnce(&policy::Policy, &Action, Counted) -> Result<Value, Unmade>,
     report: impl FnOnce(&str, &[u8]) -> Result<(), String>,
+    fail: impl FnOnce(&str, &str) -> Result<(), String>,
 ) -> Result<Value, String> {
-    let refused = |e: String| closed(as_answered(e, on_chain));
-    let action = held(&answer.state, &answer.files).map_err(refused)?;
-    action.check(rules).map_err(refused)?;
+    // Nothing was written: the agent reads why as the failed task's result. A
+    // report that does not land leaves the task failed without it, which the
+    // refusal still answers.
+    let refused = |e: String| {
+        let refusal = closed(as_answered(e, on_chain));
+        let _ = fail(&answer.id, &refusal);
+        Err(refusal)
+    };
+    let action = match held(&answer.state, &answer.files).and_then(|action| action.check(rules).map(|_| action)) {
+        Ok(action) => action,
+        Err(e) => return refused(e),
+    };
     // Counted in this run's own cell, beside the agent's direct writes: the
     // cap is the owner's bound on this agent, confirmed or not.
-    let mut done = act(rules, &action, Counted::Confirmed).map_err(refused)?;
+    let mut done = match act(rules, &action, Counted::Confirmed) {
+        Ok(done) => done,
+        Err(Unmade::Refused(e)) => return refused(e),
+        Err(Unmade::Unknown(e)) => return Err(outcome_unknown(as_answered(e, on_chain))),
+    };
     // What the owner wrote beside their yes goes to the agent with the result.
     if let Some(note) = answer.note.as_deref().and_then(|n| std::str::from_utf8(n).ok()) {
-        done["note"] = json!(note);
+        with_note(&mut done, note);
     }
     // The agent reads the whole of it, repository and URL with the rest: the
     // host seals a report for the preparer.
     report(&answer.id, done.to_string().as_bytes())
         .map_err(|e| made_unreported(as_answered(e, on_chain), &done, on_chain))?;
     Ok(answered_with(&action, &done, &answer.id, on_chain))
+}
+
+/// The most a report holds, as the host bounds it (`MAX_RESULT_BYTES`).
+const MAX_REPORT_BYTES: usize = 16 * 1024;
+
+/// Put the owner's note on the result, whole when the report stays within
+/// its bound and cut at a character otherwise, said so by `note_truncated`:
+/// a report over the bound is refused, and the write it describes would then
+/// read as unreported. The write's own members are never cut.
+fn with_note(result: &mut Value, note: &str) {
+    result["note"] = json!(note);
+    if result.to_string().len() <= MAX_REPORT_BYTES {
+        return;
+    }
+    result["note_truncated"] = json!(true);
+    let mut keep = note.len();
+    while keep > 0 {
+        while keep > 0 && !note.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        result["note"] = json!(&note[..keep]);
+        if result.to_string().len() <= MAX_REPORT_BYTES {
+            return;
+        }
+        keep = keep.saturating_sub(256);
+    }
+    result["note"] = json!("");
 }
 
 /// What `confirm` answers the owner, given what the write answered: on chain
@@ -1114,12 +1186,16 @@ mod tests {
         }
     }
 
-    fn never_acts(_: &policy::Policy, _: &Action, _: Counted) -> Result<Value, String> {
+    fn never_acts(_: &policy::Policy, _: &Action, _: Counted) -> Result<Value, Unmade> {
         panic!("nothing is written")
     }
 
     fn never_reports(_: &str, _: &[u8]) -> Result<(), String> {
-        panic!("nothing is reported")
+        panic!("a refusal is never reported as carried out")
+    }
+
+    fn never_fails(_: &str, _: &str) -> Result<(), String> {
+        panic!("nothing is reported as not carried out")
     }
 
     const ALLOWS: &str = r#"{"actions":["any"],"repos":["alice/*"],"branches":["agent/*"],"max_writes_per_day":5,"allow_merge":true,"allow_approve":true,"confirm":["pr_merge","commit"]}"#;
@@ -1181,7 +1257,7 @@ mod tests {
             *reported.borrow_mut() = Some((id.to_string(), serde_json::from_slice::<Value>(result).unwrap()));
             Ok(())
         };
-        let out = after_answer(&rules(ALLOWS), &answer_holding(&commit), true, act, report).unwrap();
+        let out = after_answer(&rules(ALLOWS), &answer_holding(&commit), true, act, report, never_fails).unwrap();
         let written = seen.into_inner().expect("a write was made");
         assert_eq!(written, commit, "the binary came back from its file, byte for byte");
         let (id, result) = reported.into_inner().expect("a result was left");
@@ -1206,7 +1282,7 @@ mod tests {
         };
         let mut answer = answer_holding(&commit);
         answer.note = Some("squash it later".as_bytes().to_vec());
-        let out = after_answer(&rules(ALLOWS), &answer, true, act, report).unwrap();
+        let out = after_answer(&rules(ALLOWS), &answer, true, act, report, never_fails).unwrap();
         assert_eq!(seen.into_inner().unwrap(), commit, "the note changes nothing of the write");
         let result = reported.into_inner().unwrap();
         assert_eq!(result["note"], "squash it later");
@@ -1238,18 +1314,27 @@ mod tests {
 
     #[test]
     fn after_the_answer_every_refusal_keeps_its_code_and_says_the_task_is_closed() {
+        // Every refusal after the answer is also left for the agent, as the
+        // failed task's result: `{"error": <the same sentence>}`.
+        let failed = RefCell::new(None);
+        let fails = |id: &str, why: &str| {
+            *failed.borrow_mut() = Some((id.to_string(), why.to_string()));
+            Ok(())
+        };
         let ends = |said: &str, code: &str| {
             assert!(said.starts_with(code), "{said}");
             assert!(said.ends_with(CLOSED), "{said}");
             assert!(!said.contains(".."), "{said}");
+            let (id, why) = failed.borrow_mut().take().expect("the refusal is reported as not carried out");
+            assert_eq!((id.as_str(), why.as_str()), ("run-0", said));
         };
         // A state that is not a write: refused before anything is written.
         let broken = tasks::Answer { state: b"not a write".to_vec(), ..answer_holding(&merge()) };
-        ends(&after_answer(&rules(ALLOWS), &broken, false, never_acts, never_reports).unwrap_err(), "task_unreadable: ");
+        ends(&after_answer(&rules(ALLOWS), &broken, false, never_acts, never_reports, fails).unwrap_err(), "task_unreadable: ");
 
         // A write its rules refuse: a merge, under rules that allow none.
         let no_merge = rules(r#"{"actions":["any"],"repos":["alice/*"],"max_writes_per_day":5}"#);
-        let said = after_answer(&no_merge, &answer_holding(&merge()), false, never_acts, never_reports).unwrap_err();
+        let said = after_answer(&no_merge, &answer_holding(&merge()), false, never_acts, never_reports, fails).unwrap_err();
         ends(&said, "policy_denied: ");
         assert!(said.contains("allow_merge"), "{said}");
 
@@ -1261,16 +1346,30 @@ mod tests {
             "not_found: GitHub has nothing at /repos/alice/private-thing/pulls/8/merge.",
             "the day's write count could not be updated: storage unavailable",
         ] {
-            let act = |_: &policy::Policy, _: &Action, _: Counted| Err(refusal.to_string());
-            let said = after_answer(&rules(ALLOWS), &answer_holding(&merge()), false, act, never_reports).unwrap_err();
+            let act = |_: &policy::Policy, _: &Action, _: Counted| Err(Unmade::Refused(refusal.to_string()));
+            let said = after_answer(&rules(ALLOWS), &answer_holding(&merge()), false, act, never_reports, fails).unwrap_err();
             ends(&said, refusal.split(' ').next().unwrap());
             assert!(said.starts_with(refusal.trim_end_matches('.')), "over HTTPS the refusal is whole: {said}");
 
             // On chain the code stays and nothing is named.
-            let act = |_: &policy::Policy, _: &Action, _: Counted| Err(refusal.to_string());
-            let said = after_answer(&rules(ALLOWS), &answer_holding(&merge()), true, act, never_reports).unwrap_err();
+            let act = |_: &policy::Policy, _: &Action, _: Counted| Err(Unmade::Refused(refusal.to_string()));
+            let said = after_answer(&rules(ALLOWS), &answer_holding(&merge()), true, act, never_reports, fails).unwrap_err();
             ends(&said, code_of(refusal));
             assert!(!said.contains("alice") && !said.contains("/repos/"), "{said}");
+        }
+    }
+
+    /// A write whose outcome GitHub did not give is reported neither way:
+    /// the task ends `run_unreported`, and the agent is told to look first.
+    #[test]
+    fn a_write_whose_outcome_is_lost_is_never_reported_as_not_made() {
+        for on_chain in [false, true] {
+            let act = |_: &policy::Policy, _: &Action, _: Counted| {
+                Err(Unmade::Unknown("github_unreachable: GitHub could not be reached for /repos/alice/site/pulls/8/merge: reset".into()))
+            };
+            let said = after_answer(&rules(ALLOWS), &answer_holding(&merge()), on_chain, act, never_reports, never_fails).unwrap_err();
+            assert!(said.starts_with("github_unreachable") && said.contains("MAY have been made"), "{said}");
+            assert!(!said.contains(CLOSED), "{said}");
         }
     }
 
@@ -1278,7 +1377,7 @@ mod tests {
     fn a_write_that_was_made_and_not_reported_is_said_to_have_been_made() {
         let act = |_: &policy::Policy, _: &Action, _: Counted| Ok(merged());
         let report = |_: &str, _: &[u8]| Err("task_store_unavailable: the task store did not answer".to_string());
-        let said = after_answer(&rules(ALLOWS), &answer_holding(&merge()), true, act, report).unwrap_err();
+        let said = after_answer(&rules(ALLOWS), &answer_holding(&merge()), true, act, report, never_fails).unwrap_err();
         assert!(said.starts_with("task_store_unavailable: the task store did not answer. "), "{said}");
         assert!(said.contains("WAS made") && said.contains("number 8") && said.contains("commit d00d") && said.contains("do not prepare it again"), "{said}");
         assert!(!said.contains(CLOSED) && !said.contains("alice"), "{said}");

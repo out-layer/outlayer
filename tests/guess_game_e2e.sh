@@ -104,7 +104,11 @@ MADE=()
 cleanup() {
   local id
   if (( ${#MADE[@]} > 0 )); then
+    # The owner deletes every task; the agent may delete only those nothing
+    # was carried out on, so it is the fallback.
     for id in "${MADE[@]}"; do
+      owner delete "$id" a >/dev/null 2>&1
+      [[ "$(own .status)" == "200" ]] && continue
       agent "$(jq -nc --arg t "$id" '{operation:"task_delete", task_id:$t}')" >/dev/null 2>&1
     done
   fi

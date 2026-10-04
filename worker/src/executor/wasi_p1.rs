@@ -120,14 +120,10 @@ pub async fn execute(
     store.epoch_deadline_trap();
     // Note: Engine::clone() is Arc clone — epoch counter is shared across all executions.
     // This is fine because main loop executes tasks sequentially (one at a time).
-    let epoch_engine = engine.clone();
-    let epoch_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        for _ in 0..timeout_secs + 5 {
-            interval.tick().await;
-            epoch_engine.increment_epoch();
-        }
-    });
+    // Stopped when dropped — on every return below, a module that does not
+    // instantiate or has no `_start` included: the engine is shared, and a
+    // ticker left running would end the next run early.
+    let _ticker = super::sandbox::Ticker::start(engine.clone(), timeout_secs + 5);
 
     // Instantiate module
     debug!("Instantiating WASI P1 module");
@@ -150,6 +146,7 @@ pub async fn execute(
     // on a clock) never returns to wasm. Dropping the future cancels the run;
     // the store is read afterwards as after any trap. Two seconds past the
     // epoch deadline, so this fires only where the epoch could not.
+    let mut wall_clock_hit = false;
     let call_result = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs + 2),
         start.call_async(&mut store, ()),
@@ -157,27 +154,46 @@ pub async fn execute(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "interrupt: wall-clock limit of {}s reached while the guest waited in a host call",
-            timeout_secs
-        )),
+        Err(_) => {
+            wall_clock_hit = true;
+            Err(anyhow::anyhow!(
+                "interrupt: wall-clock limit of {}s reached while the guest waited in a host call",
+                timeout_secs
+            ))
+        }
     };
-    epoch_handle.abort();
+    // What the run consumed, whichever way it ended.
+    let fuel_consumed = limits.max_instructions - store.get_fuel().unwrap_or(0);
+    // An explicit exit with status 0 is a success like returning from `_start`.
+    let call_result = match call_result {
+        Err(e) if matches!(super::sandbox::ended(&e, false), super::sandbox::Ended::Exited(0)) => Ok(()),
+        other => other,
+    };
+    drop(_ticker);
 
     if let Err(e) = &call_result {
-        // Check if this was an epoch interruption (timeout)
-        if e.to_string().contains("interrupt") {
-            let fuel_consumed = limits.max_instructions - store.get_fuel().unwrap_or(0);
-            anyhow::bail!(
-                "WASM execution timed out after {} seconds (penalty). \
-                Full execution cost is charged with no refund (consumed {} instructions)",
-                timeout_secs,
-                fuel_consumed
-            );
+        if matches!(super::sandbox::ended(e, wall_clock_hit), super::sandbox::Ended::TimedOut) {
+            return Err(super::sandbox::RunFailed {
+                message: format!(
+                    "WASM execution timed out after {} seconds (penalty). \
+                     Full execution cost is charged with no refund (consumed {} instructions)",
+                    timeout_secs, fuel_consumed
+                ),
+                instructions: fuel_consumed,
+                penalty: true,
+            }
+            .into());
         }
     }
 
     if let Err(e) = call_result {
+        let failed = |message: String| -> anyhow::Error {
+            super::sandbox::RunFailed { message, instructions: fuel_consumed, penalty: false }.into()
+        };
+        let exit_status = match super::sandbox::ended(&e, false) {
+            super::sandbox::Ended::Exited(code) => Some(code),
+            _ => None,
+        };
         let error_str = e.to_string();
         tracing::error!("❌ WASI P1 _start failed: {}", error_str);
 
@@ -189,35 +205,28 @@ pub async fn execute(
             String::new()
         };
 
-        // If it's an exit code error, include stderr and input data in error message
-        if error_str.contains("Exited with i32 exit status") {
+        // An exit with a status: include stderr, or the input, in the message.
+        if exit_status.is_some() {
             if !stderr_msg.is_empty() {
                 // Program printed error to stderr
-                return Err(anyhow::anyhow!("{}", stderr_msg));
+                return Err(failed(stderr_msg));
             }
 
-            let input_preview = String::from_utf8_lossy(input_data);
-            let preview = if input_preview.len() > 200 {
-                format!("{}...", &input_preview[..200])
-            } else {
-                input_preview.to_string()
-            };
+            let preview = input_preview(input_data);
 
-            return Err(anyhow::anyhow!(
+            return Err(failed(format!(
                 "WASM program exited with error status. This usually means invalid input_data or panic in code. Input received: {}. Original error: {}",
-                preview,
-                error_str
-            ));
+                preview, error_str
+            )));
         }
 
         // Other execution errors
-        return Err(anyhow::anyhow!("WASM execution failed: {}", error_str));
+        return Err(failed(format!("WASM execution failed: {}", error_str)));
     }
 
     debug!("WASI P1 module execution completed");
 
     // Get results
-    let fuel_consumed = limits.max_instructions - store.get_fuel().unwrap_or(0);
     debug!("WASM execution consumed {} instructions", fuel_consumed);
 
     // Print stderr if flag is enabled (even on success)
@@ -231,4 +240,33 @@ pub async fn execute(
 
     // P1 does not support payment host functions, so refund_usd is always None
     Ok((output, fuel_consumed, None))
+}
+
+/// The first 200 characters of the input, for an error that quotes it — cut
+/// at a character, never inside one: a byte cut through a multibyte
+/// character panics, and a panic here ends the worker's process.
+fn input_preview(input: &[u8]) -> String {
+    let text = String::from_utf8_lossy(input);
+    match text.char_indices().nth(200) {
+        Some((at, _)) => format!("{}...", &text[..at]),
+        None => text.into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::input_preview;
+
+    #[test]
+    fn a_preview_is_cut_at_a_character_whatever_the_bytes() {
+        // 199 ASCII bytes and then a two-byte character across byte 200: the
+        // old byte cut panicked here.
+        let input = format!("{}é and more", "a".repeat(199));
+        let p = input_preview(input.as_bytes());
+        assert!(p.starts_with(&"a".repeat(199)) && p.ends_with("..."), "{p}");
+        assert_eq!(input_preview("короткий".as_bytes()), "короткий");
+        let long = "я".repeat(500);
+        assert_eq!(input_preview(long.as_bytes()).chars().count(), 203);
+        assert_eq!(input_preview(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+    }
 }

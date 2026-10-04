@@ -41,9 +41,39 @@ pub struct Answer {
     pub body: Value,
 }
 
+thread_local! {
+    /// Set once a request that changes something on GitHub may have done so
+    /// — see [`may_have_written`].
+    static MAY_HAVE_WRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Start counting writes afresh: [`may_have_written`] answers for the
+/// requests made after this.
+pub fn begin_writes() {
+    MAY_HAVE_WRITTEN.with(|w| w.set(false));
+}
+
+/// Whether a request since [`begin_writes`] may have changed something on
+/// GitHub: one that is not a read was answered 2xx (made) or 5xx (GitHub's
+/// own failure, after which it may have been made), or its answer was lost —
+/// a transport error, which may come after the request went out. Only a 4xx
+/// says for certain that nothing was made. Creating a git object (a blob, a
+/// tree, a commit) changes nothing anyone sees until a ref points at it, so
+/// those do not count.
+pub fn may_have_written() -> bool {
+    MAY_HAVE_WRITTEN.with(|w| w.get())
+}
+
+/// Whether a request of `method` to `path` can change what GitHub shows.
+fn changes_something(method: &Method, path: &str) -> bool {
+    let creates_git_object = ["/git/blobs", "/git/trees", "/git/commits"].iter().any(|object| path.ends_with(object));
+    !matches!(method, Method::Get) && !creates_git_object
+}
+
 /// One request. `path` starts with `/` and is already escaped.
 pub fn call(method: Method, path: &str, body: Option<&Value>) -> Result<Answer, String> {
     let token = token()?;
+    let changes = changes_something(&method, path);
     let url = format!("{BASE}{path}");
     let mut request = HttpClient::new()
         .request(method, &url)
@@ -57,9 +87,11 @@ pub fn call(method: Method, path: &str, body: Option<&Value>) -> Result<Answer, 
         payload = serde_json::to_vec(body).map_err(|e| format!("request encoding: {e}"))?;
         request = request.header("Content-Type", "application/json").body(&payload);
     }
-    let response = request
-        .send()
-        .map_err(|e| format!("github_unreachable: GitHub could not be reached for {path}: {e}"))?;
+    let sent = request.send();
+    if changes && !matches!(&sent, Ok(response) if (400..500).contains(&response.status())) {
+        MAY_HAVE_WRITTEN.with(|w| w.set(true));
+    }
+    let response = sent.map_err(|e| format!("github_unreachable: GitHub could not be reached for {path}: {e}"))?;
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = response.body().map_err(|e| format!("github_unreachable: reading GitHub's answer for {path}: {e}"))?;
@@ -195,6 +227,22 @@ pub fn query(pairs: &[(&str, Option<String>)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read, or a git object nothing points at yet, changes nothing anyone
+    /// sees; every other request may.
+    #[test]
+    fn only_a_request_that_can_change_what_github_shows_counts_as_a_write() {
+        assert!(!changes_something(&Method::Get, "/repos/a/b/pulls/8"));
+        for object in ["/repos/a/b/git/blobs", "/repos/a/b/git/trees", "/repos/a/b/git/commits"] {
+            assert!(!changes_something(&Method::Post, object), "{object}");
+        }
+        assert!(changes_something(&Method::Patch, "/repos/a/b/git/refs/heads/main"));
+        assert!(changes_something(&Method::Post, "/repos/a/b/git/refs"));
+        assert!(changes_something(&Method::Put, "/repos/a/b/pulls/8/merge"));
+        assert!(changes_something(&Method::Delete, "/gists/abc"));
+        begin_writes();
+        assert!(!may_have_written());
+    }
 
     fn said(status: u16, body: &str, headers: &[(&str, &str)]) -> String {
         let headers: HashMap<String, String> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

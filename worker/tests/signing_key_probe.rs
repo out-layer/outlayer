@@ -460,6 +460,13 @@ async fn no_seed_is_visible_to_the_guest() {
         // The environment and stdin as the guest read them: the job's, and no
         // key material in either.
         assert_eq!(seen["env"]["NEAR_USER_ACCOUNT_ID"], "bob.near", "{variant}: reading the environment works");
+        // No directory at all while guest files are off: listing `/` or `.`
+        // is an error, not an empty list.
+        if !offchainvm_worker::executor::sandbox::GUEST_FILES_ALLOWED {
+            for dir in ["/", "."] {
+                assert!(seen["dirs"][dir]["Err"].is_string(), "{variant}: the guest lists {dir}: {}", seen["dirs"]);
+            }
+        }
         let text = seen.to_string();
         for (_, seed) in &seeds {
             use base64::Engine;

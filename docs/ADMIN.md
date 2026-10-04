@@ -308,26 +308,28 @@ the redeem.
 
 | Route | Does |
 |---|---|
-| `POST /admin/sponsor-codes` `{name, allowance_usd?, grant_days?, max_uses?, redeem_until?, max_parallel?, one_per_ip?}` | Mints a code. Answers `201 {id, code, …}`; **the code is shown once**, only its hash is kept. `allowance_usd` (minimal units) defaults to and is capped by `GIFT_SUBSCRIPTION_USD`; `grant_days` defaults to `GIFT_SUBSCRIPTION_DAYS`, 1–3650; `max_uses` absent is unlimited; `redeem_until` absent is until switched off; `max_parallel` (1–1000, default 1) is how many allowance calls one sponsored key may have in flight; `one_per_ip` lets each client address redeem the code once — default true when `max_uses` is set, false when it is not. |
-| `PATCH /admin/sponsor-codes/{id}` `{active?, max_uses?, max_parallel?, redeem_until?, extend_days?, end_now?}` | `active: false` stops new redeems, what was granted runs to its end. `extend_days` tops every grant of the code back up to `allowance_usd` and moves its end to at least that many days from now (one gift per key; a key that can already spend more is skipped, counted in `skipped`). `end_now` sets every live grant's `expires_at` to now. The two contradict each other and are refused together. |
-| `GET /admin/sponsor-codes` | Every code with `uses` (times redeemed), `live` (keys carrying it whose grant has not ended) and `allowance_spent_usd` (spent by the keys carrying it). |
+| `POST /admin/sponsor-codes` `{name, allowance_usd?, grant_days?, max_uses?, redeem_until?, max_parallel?, one_per_ip?, lifts_custody_ceiling?}` | Mints a code. Answers `201 {id, code, …}`; **the code is shown once**, only its hash is kept. `allowance_usd` (minimal units) defaults to and is capped by `GIFT_SUBSCRIPTION_USD`; `grant_days` defaults to `GIFT_SUBSCRIPTION_DAYS`, 1–3650; `max_uses` absent is unlimited; `redeem_until` absent is until switched off; `max_parallel` (1–1000, default 1) is how many allowance calls one sponsored key may have in flight; `one_per_ip` lets each client address redeem the code once — default true when `max_uses` is set, false when it is not; `lifts_custody_ceiling` (default false) lets a grant of the code lift the free tier's custody ceiling (`custody:*`, 100 a month) as a bought subscription does. |
+| `PATCH /admin/sponsor-codes/{id}` `{active?, max_uses?, max_parallel?, redeem_until?, lifts_custody_ceiling?, extend_days?, end_now?}` | `active: false` stops new redeems, what was granted runs to its end. `lifts_custody_ceiling` applies to the grants already given too: the tier is read on every custody call. `extend_days` tops every grant of the code back up to `allowance_usd` and moves its end to at least that many days from now (one gift per key; a key that can already spend more is skipped, counted in `skipped`; a key whose `wk_` was revoked is left out). `end_now` sets every live grant's `expires_at` to now. The two contradict each other and are refused together. |
+| `GET /admin/sponsor-codes` | Every code with its settings, `uses` (times redeemed), `live` (keys carrying it whose grant has not ended) and `allowance_spent_usd` (spent by the keys carrying it). |
 
 What to set, by use:
 
-| Use | `max_uses` | `grant_days` | `one_per_ip` | `max_parallel` |
-|---|---|---|---|---|
-| a friend, premium for a year | 1 | 365 | — | 1 |
-| a voucher posted in public | 10 | 30 | true (default) | 1 |
-| a partner's backend (voulai) | absent | 90, then `extend_days` | false (default) | 99 |
+| Use | `max_uses` | `grant_days` | `one_per_ip` | `max_parallel` | `lifts_custody_ceiling` |
+|---|---|---|---|---|---|
+| a friend, premium for a year | 1 | 365 | — | 1 | as you decide |
+| a voucher posted in public | 10 | 30 | true (default) | 1 | false (default) |
+| a partner's backend (voulai) | absent | 90, then `extend_days` | false (default) | 99 | as agreed with the partner |
 
 `one_per_ip` reads the address the rate limiter reads (`X-Real-IP`, else the
 last `X-Forwarded-For` entry nginx appended), an IPv6 caller by its /64
 (`ip_rate_limit::address_key`, shared by every per-address control); a request
 with neither header is refused on such a code. A key carries one sponsor while its grant is live; after the
-grant ends (its date, or `end_now`) the wallet may redeem another code, never
-the same one again. A redeem refused for any reason — unknown code, switched
-off, past `redeem_until`, used up, this address already redeemed it — answers
-`404 sponsor_code_invalid` and says no more.
+grant ends (its date, or `end_now`) the wallet may redeem another code. Every
+redeem is kept (`sponsor_redeems`): a wallet never redeems the same code twice,
+and an address never redeems a `one_per_ip` code twice, whatever the key
+carried in between. A redeem refused for any reason — unknown code, switched
+off, past `redeem_until`, used up, this wallet or this address already
+redeemed it — answers `404 sponsor_code_invalid` and says no more.
 
 ## Adding an admin route
 

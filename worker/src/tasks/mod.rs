@@ -45,6 +45,12 @@ pub use host_functions::{add_tasks_to_linker, TasksHostState};
 
 /// The longest a task waits, in seconds.
 pub const MAX_LIFE_SECS: u32 = 24 * 60 * 60;
+/// The shortest life of a task that takes an answer, in seconds. The
+/// coordinator refuses an approval in a task's last five minutes (the run it
+/// starts could not take the task in time), and the host's clock may run up
+/// to five minutes ahead of it: fifteen leaves the owner at least five to
+/// answer. A notice takes no answer and has no floor.
+pub const MIN_ANSWER_LIFE_SECS: u32 = 15 * 60;
 /// Most bytes of the component's `state`.
 pub const MAX_STATE_BYTES: usize = 256 * 1024;
 /// Most files a task carries.
@@ -138,6 +144,9 @@ pub struct Answered {
     pub id: String,
     /// The result, sealed under the task's key; `None` until reported.
     pub outcome: Option<Vec<u8>>,
+    /// The project said the task was NOT carried out (`report-failure`): the
+    /// outcome is its refusal, and the task ends `failed` as `run_failed`.
+    pub failed: bool,
 }
 
 /// An approved task this run was refused before it took it: the host's
@@ -168,7 +177,7 @@ impl RunReport {
     pub(crate) fn answered(&self, id: &str) {
         let mut report = self.lock();
         if !report.answered.iter().any(|t| t.id == id) {
-            report.answered.push(Answered { id: id.to_string(), outcome: None });
+            report.answered.push(Answered { id: id.to_string(), outcome: None, failed: false });
         }
     }
 
@@ -187,13 +196,15 @@ impl RunReport {
         }
     }
 
-    /// Record the outcome of a task this run answered; `false` when it
-    /// answered no such task.
-    pub(crate) fn reported(&self, id: &str, outcome: Vec<u8>) -> bool {
+    /// Record the outcome of a task this run answered — carried out, or not
+    /// (`failed`); `false` when it answered no such task. The last word on a
+    /// task is the one kept.
+    pub(crate) fn reported(&self, id: &str, outcome: Vec<u8>, failed: bool) -> bool {
         let mut report = self.lock();
         match report.answered.iter_mut().find(|t| t.id == id) {
             Some(task) => {
                 task.outcome = Some(outcome);
+                task.failed = failed;
                 true
             }
             None => false,
@@ -283,6 +294,7 @@ pub fn declared_in(manifest: Option<&crate::connector_manifest::ProjectManifest>
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -357,18 +369,23 @@ mod tests {
     #[test]
     fn a_report_holds_what_was_answered_and_takes_a_result_only_for_that() {
         let report = RunReport::default();
-        assert!(!report.reported("t-0", b"x".to_vec()));
+        assert!(!report.reported("t-0", b"x".to_vec(), false));
         report.answered("t-0");
         report.answered("t-0");
         report.answered("t-1");
-        assert!(report.reported("t-1", b"sealed".to_vec()));
+        assert!(report.reported("t-1", b"sealed".to_vec(), false));
         assert_eq!(
             report.tasks(),
             vec![
-                Answered { id: "t-0".into(), outcome: None },
-                Answered { id: "t-1".into(), outcome: Some(b"sealed".to_vec()) }
+                Answered { id: "t-0".into(), outcome: None, failed: false },
+                Answered { id: "t-1".into(), outcome: Some(b"sealed".to_vec()), failed: false }
             ]
         );
+        // `report-failure` marks it not carried out; the last word wins.
+        assert!(report.reported("t-0", b"refusal".to_vec(), true));
+        assert!(report.tasks()[0].failed);
+        assert!(report.reported("t-0", b"made after all".to_vec(), false));
+        assert!(!report.tasks()[0].failed);
         assert!(report.refusals().is_empty());
     }
 

@@ -78,7 +78,7 @@ policy unreadable, like a misspelt field. `ask` then follows this document
 exactly as a listed operation does. The reference is
 [`connectors/mercury-connector`](../connectors/mercury-connector/)
 (`src/rules.rs`; conditions `min_usd`, `max_usd`, `methods`, `payee`), proved
-live by `tests/mercury_rules_e2e.sh` (MR0–MR7).
+live by `tests/mercury_rules_e2e.sh` (MR0–MR8).
 
 **`status` reports it.** The connector's `status` (or whatever operation
 reports the policy) answers `confirm` with the other members, as the policy
@@ -154,7 +154,9 @@ Bulk the owner must see but a field cannot hold goes in as the task's files
 6 MiB together, and the owner can open a file.
 
 A task whose action depends on a price takes a short life:
-`tasks::confirm(…).life_seconds(n)`.
+`tasks::confirm(…).life_seconds(n)`, 900 seconds at least. A shorter one is
+refused `display-invalid`: an approval in a task's last five minutes is
+refused `task_ending`, so the owner needs time to answer before that.
 
 `tasks::awaiting_owner(&opened)` is the whole answer to the agent:
 `status: "awaiting_owner"`, `task_id`, `task_hash`, `thread`, `expires_at`,
@@ -376,15 +378,37 @@ built this way; the full result goes to the preparer through `report`, which
 is sealed.
 
 **(f) A refusal after the answer says the task is closed, and whether the
-action happened.** Once the answer is taken the task is closed whatever
-follows. A refusal from then on keeps its own code and adds what is true of
-the task. Gmail's words:
+action happened — to the run's caller and to the agent.** Once the answer is
+taken the task is closed whatever follows. A refusal from then on keeps its
+own code and adds what is true of the task, and the same sentence goes to the
+preparer as the task's verdict: `tasks::failed(id, &refusal)` — the host's
+`report-failure` — so the task ends `failed` as `run_failed` with
+`{"error": <the refusal>}` as the result the agent reads in `task_status`,
+never a bare `failed`. Each answered task ends by its own word and by how
+the run ended: `report` is "carried out" — `done`, or `failed` as
+`run_trapped` with the report kept when the run fails after;
+`report-failure` is "not carried out" — `run_failed`; no word at all is
+`run_unreported` — the agent cannot tell whether it acted, so a run that
+acted always reports.
+
+`report-failure` is for a refusal that is certain nothing reached the
+service: a check, the policy, the day's count, or the service's own 4xx. A
+request that went out and whose answer is not a refusal — the answer lost, a
+5xx, a 2xx that does not read, a later step of the write that failed after an
+earlier one was made — MAY have acted. The connector reports nothing then,
+and the refusal says the action may have happened and to look at the
+service before preparing again: an agent that read `run_failed` would prepare
+the payment again, and the service would make it twice. The connectors type
+it (`Unmade::Refused` / `Unmade::Unknown`, Gmail's `Unsent`), from the HTTP
+client's own record of what it sent (Mercury's `may_have_written`, GitHub's
+`gh::may_have_written`). Gmail's words:
 
 | Refused | The task | The refusal |
 |---|---|---|
 | before the answer: no `task_id` or `task_hash`, no policy, anything the host refuses (`task_not_found`, `not_the_preparer`, `task_approval_invalid`, `task_hash_mismatch`, `task_answer_invalid`, `task_closed`, `task_expired`, `task_void`, `task_store_unavailable`) | as it was in the run; the platform ends it `failed` with `run_refused:unreported` (a refusal of the connector's own, which the host never saw) or `run_refused:<reason>` (one of the host's) when the run ends without taking the answer | as it is |
-| after the answer, before the action: a state that does not read, a limit, the credential, the venue's refusal | `failed` | `<code>: <sentence>. The task is closed: to send this message, prepare it again` |
-| after the action: the result could not be reported | `failed` | `<code>: <sentence>. The message WAS sent (Gmail message <id>) and the task is closed without its result: do not prepare it again` |
+| after the answer, before the action: a state that does not read, a limit, the credential, the venue's refusal (4xx) | `failed` as `run_failed`, the refusal in `result` | `<code>: <sentence>. The task is closed: to send this message, prepare it again` |
+| the send went out and its outcome is not known: the answer lost, a 5xx, a 2xx that does not read | `failed` as `run_unreported` | `<code>: <sentence>. Gmail's answer to the send was lost or failed after the request went out, so the message MAY have been sent: check the Sent folder before preparing it again` |
+| after the action: the result could not be reported | `failed` as `run_unreported` | `<code>: <sentence>. The message WAS sent (Gmail message <id>) and the task is closed without its result: do not prepare it again` |
 
 The last row matters most where money moves: an owner who reads "failed"
 and prepares the action again would pay twice. The sentence names what
@@ -485,7 +509,7 @@ action and report. Gmail's, by name:
 | the state reads back whole, and one with an unknown member does not read | `what_is_kept_is_the_message_and_reads_back_whole` |
 | what cannot be shown whole is refused | `a_body_is_shown_whole_or_the_message_is_refused` |
 | a refusal before the answer leaves the task as it was | `before_the_answer_a_refusal_leaves_the_task_as_it_was` |
-| every refusal after the answer keeps its code and says the task is closed; nothing acts on a refused state | `after_the_answer_every_refusal_keeps_its_code_and_says_the_task_is_closed` |
+| every refusal after the answer keeps its code, says the task is closed, and goes to the preparer through `failed` (never `report`); nothing acts on a refused state | `after_the_answer_every_refusal_keeps_its_code_and_says_the_task_is_closed` |
 | `confirm` acts once, on exactly the sealed action, counted as confirmed in the run's own cell, and reports after acting | `what_is_sent_is_what_the_task_held_and_what_is_reported_is_whole` |
 | the owner's note reaches the agent with the result, changes nothing of the action, stays off a chain answer, and is cut before the message's own members when the report would not hold it | `the_note_reaches_the_connector_and_changes_nothing_of_the_action` |
 | an action that happened and could not be reported says so | `a_message_that_left_and_was_not_reported_is_said_to_have_left` |
@@ -529,7 +553,10 @@ Suites run through a keyed RPC (`tests/lib/rpc.sh`).
    run's own cell, carries out exactly the action, reports with the owner's
    note, answers.
 8. Refusals after the answer say the task is closed, and say so when the
-   action happened.
+   action happened; each one certain that nothing reached the service goes
+   to the preparer through `tasks::failed` (`report-failure`) before the run
+   answers it. One whose outcome is not known reports nothing and says the
+   action may have happened.
 9. On chain, `confirm` answers a fixed list of members that names nobody.
 10. `tasks::dispatch` serves the five task operations.
 11. Manifest: `"tasks": true`, the HTTPS and the direct door open, `confirm`

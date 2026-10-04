@@ -251,6 +251,27 @@ impl TasksHostState {
         self.count()?;
         self.access.ready()
     }
+
+    /// `report` and `report-failure`: the result sealed under the task's key,
+    /// kept with the word whether the task was carried out.
+    fn leave(&mut self, id: String, result: Vec<u8>, failed: bool) -> Result<(), wit::TaskError> {
+        let ready = self.enter()?;
+        an_id(&id)?;
+        if result.len() > super::MAX_RESULT_BYTES {
+            return Err(refused(
+                wit::Reason::TooLarge,
+                format!("the result is {} bytes; at most {} are kept", result.len(), super::MAX_RESULT_BYTES),
+            ));
+        }
+        let sealed = ready
+            .keys(&id)
+            .seal(Sealed::Outcome, &id, &result)
+            .map_err(|why| refused(wit::Reason::Unavailable, why))?;
+        match ready.report.reported(&id, sealed, failed) {
+            true => Ok(()),
+            false => Err(refused(wit::Reason::NotFound, "this run answered no such task")),
+        }
+    }
 }
 
 impl Access {
@@ -827,6 +848,17 @@ impl wit::Host for TasksHostState {
             (wit::TaskKind::Confirm | wit::TaskKind::Input, None) => {
                 return Err(refused(wit::Reason::DisplayInvalid, "a task that takes an answer names the operation that carries it out"));
             }
+            // A confirm takes a yes and nothing more; an input takes text or a
+            // file. The other pairings open a task no answer can carry out —
+            // the owner's page sends what the kind asks for, and the answer is
+            // then refused against what the task asks for — so they are
+            // refused here, before the owner spends an approval on it.
+            (wit::TaskKind::Confirm, Some(by)) if !matches!(by.supplies, wit::Supplies::Nothing) => {
+                return Err(refused(wit::Reason::DisplayInvalid, "a confirm task takes a yes, and supplies nothing: ask for text or a file with an input task"));
+            }
+            (wit::TaskKind::Input, Some(by)) if matches!(by.supplies, wit::Supplies::Nothing) => {
+                return Err(refused(wit::Reason::DisplayInvalid, "an input task asks for text or a file: a task that takes only a yes is a confirm task"));
+            }
             (wit::TaskKind::Confirm, Some(by)) => ((envelope::Kind::Confirm, client::Kind::Confirm), Some(by)),
             (wit::TaskKind::Input, Some(by)) => ((envelope::Kind::Input, client::Kind::Input), Some(by)),
         };
@@ -875,6 +907,15 @@ impl wit::Host for TasksHostState {
                 return Err(refused(
                     wit::Reason::LifeTooLong,
                     format!("a life of {life} seconds was asked; a task waits {} at most", super::MAX_LIFE_SECS),
+                ));
+            }
+            life if life < super::MIN_ANSWER_LIFE_SECS && kind.0.takes_an_answer() => {
+                return Err(refused(
+                    wit::Reason::DisplayInvalid,
+                    format!(
+                        "a life of {life} seconds was asked; a task that takes an answer waits {} at least, so its owner has time to answer",
+                        super::MIN_ANSWER_LIFE_SECS
+                    ),
                 ));
             }
             life => life,
@@ -1084,22 +1125,11 @@ impl wit::Host for TasksHostState {
     }
 
     fn report(&mut self, id: String, result: Vec<u8>) -> Result<(), wit::TaskError> {
-        let ready = self.enter()?;
-        an_id(&id)?;
-        if result.len() > super::MAX_RESULT_BYTES {
-            return Err(refused(
-                wit::Reason::TooLarge,
-                format!("the result is {} bytes; at most {} are kept", result.len(), super::MAX_RESULT_BYTES),
-            ));
-        }
-        let sealed = ready
-            .keys(&id)
-            .seal(Sealed::Outcome, &id, &result)
-            .map_err(|why| refused(wit::Reason::Unavailable, why))?;
-        match ready.report.reported(&id, sealed) {
-            true => Ok(()),
-            false => Err(refused(wit::Reason::NotFound, "this run answered no such task")),
-        }
+        self.leave(id, result, false)
+    }
+
+    fn report_failure(&mut self, id: String, result: Vec<u8>) -> Result<(), wit::TaskError> {
+        self.leave(id, result, true)
     }
 
     fn cancel(&mut self, id: String) -> Result<(), wit::TaskError> {

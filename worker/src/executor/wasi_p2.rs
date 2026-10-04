@@ -676,13 +676,17 @@ pub async fn execute(
     wasi_builder.allow_ip_name_lookup(false);
     wasi_builder.socket_addr_check(|_, _| Box::pin(async { false }));
 
-    // Add preopened directory (required for WASI P2 filesystem interface)
-    wasi_builder.preopened_dir(
-        "/tmp",      // host_path
-        ".",         // guest_path
-        DirPerms::all(),
-        FilePerms::all(),
-    )?;
+    // No directory while files are off (`sandbox::GUEST_FILES_ALLOWED`).
+    // When on, the guest's one directory: its own, fresh, and gone when the
+    // run ends (`sandbox::Scratch`). Never the worker's `/tmp`, where the
+    // wasm cache and every earlier run's files would be in reach.
+    let _scratch = if super::sandbox::GUEST_FILES_ALLOWED {
+        let scratch = super::sandbox::Scratch::new().context("Failed to make the run's scratch directory")?;
+        wasi_builder.preopened_dir(scratch.path(), ".", DirPerms::all(), FilePerms::all())?;
+        Some(scratch)
+    } else {
+        None
+    };
 
     // Add environment variables (from encrypted secrets)
     if let Some(env_map) = env_vars {
@@ -738,14 +742,10 @@ pub async fn execute(
     store.epoch_deadline_trap();
     // Note: Engine::clone() is Arc clone — epoch counter is shared across all executions.
     // This is fine because main loop executes tasks sequentially (one at a time).
-    let epoch_engine = engine.clone();
-    let epoch_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        for _ in 0..timeout_secs + 5 {
-            interval.tick().await;
-            epoch_engine.increment_epoch();
-        }
-    });
+    // Stopped when dropped — on every return below, an instantiation that
+    // fails included: the engine is shared, and a ticker left running would
+    // end the next run early.
+    let _ticker = super::sandbox::Ticker::start(engine.clone(), timeout_secs + 5);
 
     // Instantiate and execute component
     debug!("Instantiating component");
@@ -766,6 +766,7 @@ pub async fn execute(
     // the run (wasmtime unwinds the fiber; the store is read afterwards as
     // after any trap). Two seconds past the epoch deadline, so this fires only
     // where the epoch could not, and reports the same timeout.
+    let mut wall_clock_hit = false;
     let execution_result = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs + 2),
         command.wasi_cli_run().call_run(&mut store),
@@ -773,13 +774,16 @@ pub async fn execute(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "interrupt: wall-clock limit of {}s reached while the guest waited in a host call",
-            timeout_secs
-        )),
+        Err(_) => {
+            wall_clock_hit = true;
+            Err(anyhow::anyhow!(
+                "interrupt: wall-clock limit of {}s reached while the guest waited in a host call",
+                timeout_secs
+            ))
+        }
     };
     // Stop epoch ticker
-    epoch_handle.abort();
+    drop(_ticker);
 
     // Get fuel consumed before checking result
     let fuel_consumed = limits.max_instructions - store.get_fuel().unwrap_or(0);
@@ -813,38 +817,44 @@ pub async fn execute(
     // Check if execution was killed due to HTTP abuse (before checking result)
     let http_timeouts = store.data().http_timeout_count.load(std::sync::atomic::Ordering::Relaxed);
     if http_timeouts >= HTTP_TIMEOUT_ABORT_THRESHOLD {
-        anyhow::bail!(
-            "Execution terminated: {} HTTP requests exceeded {}s timeout limit (penalty). \
-            Full execution cost is charged with no refund (consumed {} instructions)",
-            http_timeouts,
-            HTTP_REQUEST_TIMEOUT_SECS,
-            fuel_consumed
-        );
+        return Err(super::sandbox::RunFailed {
+            message: format!(
+                "Execution terminated: {} HTTP requests exceeded {}s timeout limit (penalty). \
+                 Full execution cost is charged with no refund (consumed {} instructions)",
+                http_timeouts, HTTP_REQUEST_TIMEOUT_SECS, fuel_consumed
+            ),
+            instructions: fuel_consumed,
+            penalty: true,
+        }
+        .into());
     }
 
+    // An explicit exit with status 0 is a success like returning from main.
+    let exited_well = matches!(&execution_result, Err(e) if matches!(super::sandbox::ended(e, false), super::sandbox::Ended::Exited(0)));
     match execution_result {
         Ok(Ok(())) => {
             debug!("Component execution completed successfully");
             let output = stdout_pipe.contents().to_vec();
             Ok((output, fuel_consumed, refund_usd))
         }
+        Err(_) if exited_well => {
+            debug!("Component exited with status 0");
+            let output = stdout_pipe.contents().to_vec();
+            Ok((output, fuel_consumed, refund_usd))
+        }
         Ok(Err(_)) | Err(_) => {
-            // Check if this was an epoch interruption (timeout)
-            let err_ref = match &execution_result {
-                Err(e) => Some(e),
-                _ => None,
-            };
-            let is_epoch_timeout = err_ref
-                .map(|e| e.to_string().contains("interrupt"))
-                .unwrap_or(false);
-
+            let is_epoch_timeout = matches!(&execution_result, Err(e) if matches!(super::sandbox::ended(e, wall_clock_hit), super::sandbox::Ended::TimedOut));
             if is_epoch_timeout {
-                anyhow::bail!(
-                    "WASM execution timed out after {} seconds (penalty). \
-                    Full execution cost is charged with no refund (consumed {} instructions)",
-                    timeout_secs,
-                    fuel_consumed
-                );
+                return Err(super::sandbox::RunFailed {
+                    message: format!(
+                        "WASM execution timed out after {} seconds (penalty). \
+                         Full execution cost is charged with no refund (consumed {} instructions)",
+                        timeout_secs, fuel_consumed
+                    ),
+                    instructions: fuel_consumed,
+                    penalty: true,
+                }
+                .into());
             }
 
             // Component exited with error or trapped
@@ -866,7 +876,7 @@ pub async fn execute(
             };
 
             debug!("Component execution failed: {}", error_msg);
-            Err(anyhow::anyhow!("{}", error_msg))
+            Err(super::sandbox::RunFailed { message: error_msg, instructions: fuel_consumed, penalty: false }.into())
         }
     }
 }

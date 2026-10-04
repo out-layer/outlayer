@@ -214,7 +214,9 @@ impl Task {
     }
 
     /// How long the task waits, at most [`MAX_LIFE_SECS`]. Without it, that
-    /// long. A task whose action depends on a price takes a short life.
+    /// long. A task whose action depends on a price takes a short life — a
+    /// confirm or input task 900 seconds at least, so its owner has time to
+    /// answer; less is refused `display-invalid`.
     pub fn life_seconds(mut self, seconds: u32) -> Self {
         self.request.life_seconds = seconds;
         self
@@ -293,11 +295,50 @@ pub fn answered(
     raw::answered(id, hash, operation, policy, approval, supplied, note).map_err(TaskError::from)
 }
 
-/// Leave `result` for the preparer of a task this run answered. The task is
-/// `done` when the run ends as a success; a task answered and not reported on
-/// is `failed`.
+/// Leave `result` for the preparer of a task this run answered, and with it
+/// the word that the task was carried out: it is `done` when the run ends as
+/// a success, and `failed` as `run_trapped`, with `result`, when the run
+/// fails after. A task answered and reported nothing of is `failed` as
+/// `run_unreported` — the preparer cannot tell whether it acted, so a run
+/// that acted reports. For a task NOT carried out, [`failed`].
 pub fn report(id: &str, result: &[u8]) -> Result<()> {
     raw::report(id, result).map_err(TaskError::from)
+}
+
+/// Most bytes [`failure`] writes: what a result holds (16384), with room to spare.
+const MOST_FAILURE_BYTES: usize = 15 * 1024;
+
+/// What [`failed`] reports: `{"error": refusal}`, at most
+/// [`MOST_FAILURE_BYTES`] as written — the refusal cut at a character until
+/// its JSON, escapes included, fits. `task_status` hands it to the agent as
+/// the failed task's `result`.
+pub fn failure(refusal: &str) -> Vec<u8> {
+    let written = |text: &str| serde_json::json!({ "error": text }).to_string().into_bytes();
+    let whole = written(refusal);
+    if whole.len() <= MOST_FAILURE_BYTES {
+        return whole;
+    }
+    // Escapes can make the JSON up to six times the text: halve until it
+    // fits, then the cut is at a character.
+    let mut keep = refusal.len().min(MOST_FAILURE_BYTES);
+    loop {
+        while !refusal.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let cut = written(&refusal[..keep]);
+        if cut.len() <= MOST_FAILURE_BYTES || keep == 0 {
+            return cut;
+        }
+        keep /= 2;
+    }
+}
+
+/// Tell the preparer that a task this run answered was NOT carried out, and
+/// why: the refusal after the answer, sealed for the preparer like any
+/// result. The task ends `failed` as `run_failed` with `{"error": …}` as the
+/// `result` the agent reads in `task_status`, however the run ends.
+pub fn failed(id: &str, refusal: &str) -> Result<()> {
+    raw::report_failure(id, &failure(refusal)).map_err(TaskError::from)
 }
 
 /// Withdraw an open task whose preparer is this caller. An approved task is
@@ -306,7 +347,9 @@ pub fn cancel(id: &str) -> Result<()> {
     raw::cancel(id).map_err(TaskError::from)
 }
 
-/// Delete a task whose preparer is this caller, in any state.
+/// Delete a task whose preparer is this caller and that nothing was carried
+/// out on; one the owner's yes acted on, or may have, is refused
+/// [`Reason::Closed`] — it is the owner's record too.
 pub fn delete(id: &str) -> Result<()> {
     raw::delete(id).map_err(TaskError::from)
 }
@@ -522,6 +565,23 @@ pub fn dispatch(operation: &str, input: &serde_json::Value) -> Option<std::resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failure_is_the_refusal_under_error_whole_or_cut_at_a_character() {
+        let v: serde_json::Value = serde_json::from_slice(&failure("policy_denied: over the budget. The task is closed")).unwrap();
+        assert_eq!(v, serde_json::json!({"error": "policy_denied: over the budget. The task is closed"}));
+        let long = "é".repeat(20_000);
+        let bytes = failure(&long);
+        assert!(bytes.len() <= MOST_FAILURE_BYTES, "{} bytes", bytes.len());
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().chars().all(|c| c == 'é'), "cut at a character, never inside one");
+        // Quotes and control bytes grow when written: the bound is on the JSON.
+        for grows in ["\"".repeat(15_000), "\u{1}".repeat(15_000)] {
+            let bytes = failure(&grows);
+            assert!(bytes.len() <= MOST_FAILURE_BYTES, "{} bytes", bytes.len());
+            assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+        }
+    }
+
     use super::*;
 
     #[test]

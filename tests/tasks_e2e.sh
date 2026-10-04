@@ -45,9 +45,11 @@
 #        the next task of the conversation, as the agent's
 #   F9   the agent cancels
 #   F12  the owner deletes; the agent finds nothing
-#   C7   the run that acts traps: failed, with the run
+#   C7   the run that acts reports, then traps: failed as run_trapped, with
+#        the run and what it reported
 #   F11  the policy changed since: the run meets it, void
-#   F10  past its life: expired, and an approval is 409
+#   F10  past its life (shortened in the store, PSQL_CMD): expired, and an
+#        approval is 409
 #   N13  a note beside the approval reaches the agent's run with the result;
 #        a note swapped after signing is 403 at the door; a note over the
 #        bound is 400
@@ -76,7 +78,9 @@
 #   N2   another owner's session: the task is task_not_found; their key
 #        signing as the owner, in the owner's session: 403
 #   N10  the supply swapped after signing: 403 at the door
-#   N8   a task approved past its life: 409 task_expired
+#   N8   a task approved past its life (shortened in the store, PSQL_CMD):
+#        409 task_expired
+#   N19  a task that takes an answer asked to live 899 s: display-invalid
 #   N18  a device signed in after the task was made reads it locked; the
 #        owner's tasks_unlock opens it; the approval from that device: done
 #   N11  the voucher's compute limit raised in the store (PSQL_CMD): the run
@@ -871,8 +875,9 @@ if want C7; then
     approves "$TASK" - - a
     if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
       await_run "$TASK"
-      [[ "$ENDED" == "failed" && -n "$(said .output.run)" && -z "$(said .output.result)" ]] \
-        && pass "C7 failed, with the run $(said .output.run) and no result" || fail "C7 the task ended '$ENDED': $(said .output | head -c 240)"
+      [[ "$ENDED" == "failed" && "$(said .output.failure_reason)" == "run_trapped" && -n "$(said .output.run)" \
+         && "$(said .output.result)" == "reported before the trap" ]] \
+        && pass "C7 failed as run_trapped, with the run $(said .output.run) and what it reported" || fail "C7 the task ended '$ENDED': $(said .output | head -c 240)"
       in_inbox "$TASK" && [[ "$(row .state)" == "open" ]] && fail "C7 the task reopened" || pass "C7 the task did not reopen"
     else
       fail "C7 approve answered $(own .status) state='$(own .state)' reason='$(own .reason)' $(own .said)"
@@ -901,9 +906,18 @@ if want F11; then
   fi
 fi
 
-if want F10; then
+# A task that ends `$2` seconds from now. The host holds a task that takes an
+# answer to fifteen minutes at least, so a short life is set in the store.
+shorten() {
+  sql "UPDATE owner_tasks SET expires_at = NOW() + make_interval(secs => $2) WHERE id = '$1'" >/dev/null
+}
+
+if want F10 && ! sql_alive; then
+  skip "F10 needs PSQL_CMD to shorten the task's life — the host holds it to fifteen minutes"
+elif want F10; then
   log "F10 past its life"
-  if prepare '{"title":"Short-lived","life_seconds":20}'; then
+  if prepare '{"title":"Short-lived"}'; then
+    shorten "$TASK" 20
     in_inbox "$TASK"; SHORT_HASH=$(row .read.hash)
     note "waiting out the task's 20 seconds"
     sleep 25
@@ -1135,9 +1149,18 @@ if want N10; then
   fi
 fi
 
-if want N8; then
+if want N19; then
+  log "N19 a task that takes an answer lives fifteen minutes at least"
+  agent '{"operation":"prepare","title":"Too short","life_seconds":899}'
+  expect_refusal N19 display_invalid
+fi
+
+if want N8 && ! sql_alive; then
+  skip "N8 needs PSQL_CMD to shorten the task's life — the host holds it to fifteen minutes"
+elif want N8; then
   log "N8 a task approved past its life"
-  if prepare '{"title":"Short-lived, approved late","life_seconds":30}'; then
+  if prepare '{"title":"Short-lived, approved late"}'; then
+    shorten "$TASK" 30
     in_inbox "$TASK"; N8_HASH=$(row .read.hash)
     note "waiting out the task's 30 seconds"
     sleep 40
@@ -1902,7 +1925,10 @@ if want W1; then
       else
         fail "W1 prepare: error='$(said .error | head -c 200)'"
       fi
-      if prepare "$(jq -nc --arg t "$SHOWN_TITLE" --arg b "$SHOWN_BODY" '{title:$t, body:$b, life_seconds:20}')"; then
+      if ! sql_alive; then
+        skip "W1 task_expired needs PSQL_CMD to shorten the task's life — the host holds it to fifteen minutes"
+      elif prepare "$(jq -nc --arg t "$SHOWN_TITLE" --arg b "$SHOWN_BODY" '{title:$t, body:$b}')"; then
+        shorten "$TASK" 20
         note "waiting out the task's 20 seconds, and the sweep that finds it"
         sleep 25
         told HOOK_LOG_URL task_expired "$TASK" 15 "$SHOWN_TITLE" "$SHOWN_BODY" \

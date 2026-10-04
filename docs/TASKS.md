@@ -249,7 +249,7 @@ bytes whatever type the task says it is.
 | `approved` | the owner approved; the platform queued the preparer's run, named in `run`, which has not taken the answer yet |
 | `answering` | that run took the answer and acts |
 | `done` | that run ended well and the project reported |
-| `failed` | the run could not be started, did not start, refused the task, or ended any other way. `failure_reason` says which: `preparer_key_unavailable`, `operation_priced`, `operation_unknown`, `operation_limit_reached`, `wallet_unresolved`, `queue_unavailable`, `run_not_started`, or `run_refused:<reason>` with the host's reason — `hash-mismatch`, `answer-invalid`, `not-the-preparer`, `approval-invalid`, `expired`, `void`, `unreadable`, `unavailable`, `not-found`, `unreported` |
+| `failed` | the run could not be started, did not start, refused the task, or ended any other way. `failure_reason` says which. Before the run took the answer: `preparer_key_unavailable`, `operation_priced`, `operation_unknown`, `operation_limit_reached`, `wallet_unresolved`, `build_changed` (the connector published a new build since the task was made; decided at the approval before the owner's signature is spent, and nothing was charged), `queue_unavailable`, `run_not_started`, or `run_refused:<reason>` with the host's reason — `hash-mismatch`, `answer-invalid`, `not-the-preparer`, `approval-invalid`, `expired`, `void`, `unreadable`, `unavailable`, `not-found`, `unreported`. After: `run_failed` — the project said, with `report-failure`, that it did not carry the task out, and `result` holds why (a connector's refusal as `{"error": …}`); `run_unreported` — the run ended without a word on the task: it may have acted; `run_unfinished` — no word of the run's end within thirty minutes: it may have acted. `run_trapped` — the run reported the task carried out and then failed (trapped, ran out of time): `result` holds what it reported, and the action most likely happened |
 | `rejected`, `cancelled` | the owner said no; the preparer withdrew it |
 | `expired` | past its life |
 | `void` | the policy changed since it was made, or the run that answered was of another build of the project than the one that made it; found when it is answered |
@@ -262,8 +262,10 @@ Each move is made once. A task never returns to `open`: a run that failed may
 have acted in part, so the owner sees `failed` and the agent prepares a new
 task if the work is still wanted. A task `approved` for thirty minutes without
 a run taking its answer, and one `answering` for thirty minutes without a
-report, are ended `failed` by the platform (`run_not_started`, and the run's
-status).
+report, are ended `failed` by the platform (`run_not_started` and
+`run_unfinished`). An approval in a task's last five minutes is refused
+(`409 task_ending`) before the owner's signature is spent: the run it would
+start, paid by the agent, could not take the task in time.
 
 A task that leaves `open` loses what it showed at once — the sealed copy and
 every device's copy. Its outcome is kept 30 days.
@@ -498,7 +500,7 @@ is `ok([])`.
 |---|---|---|
 | `open(request)` | preparer | makes the task |
 | `mine()`, `status(id)` | preparer | its tasks — a turn is the preparer's of its conversation — or one of them; `status` also reads a task this run opened |
-| `cancel(id)`, `delete(id)` | preparer; or the run that opened the task | withdraws, deletes |
+| `cancel(id)`, `delete(id)` | preparer; or the run that opened the task | withdraws; deletes one nothing was carried out on (open, cancelled, rejected, expired, void, or failed with a reason that says nothing was done: `run_failed`, `run_not_started`, `run_refused:*`, a run never started) — one the owner's yes acted on, or may have, is refused `closed` |
 | `answered(id, hash, operation, policy, approval, supplied, note)` | the preparer's run the platform started for the task | verifies the owner's approval over this task, this hash and these words, and takes the answer; hands back `state`, the files, `supplied` and `note` opened |
 | `report(id, result)` | the same run | leaves the result for the preparer |
 | `unlock()` | owner | writes the copies for the devices now in force |

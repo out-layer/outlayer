@@ -317,12 +317,23 @@ A connector whose writes the wallet's OWNER caps declares it in the registry
 * the coordinator reads the wallet's owner from the chain on every call
   (`get_wallet_policy`, never cached, so a policy the owner just stored applies
   to the next call);
-* with an owner, a call that names no `secrets_ref` gets the owner's row
-  `{owner, <profile>}`; a call that names a row of the owner's keeps it; any
-  other account's row — the agent's own included — is refused
-  `403 policy_row_not_owner`, and doing that again blocks the wallet on these
-  connectors for a while (`403 calls_suspended`);
+* with an owner, the owner's row `{owner, <connector>}` is attached when the
+  call names no `secrets_ref`, and a row of the owner's the call names is
+  kept — so an owner gives different wallets different limits with a profile
+  per wallet, whitelisting each wallet on its row. Those limits bind only
+  while `{owner, <connector>}` exists too: a call that names no row runs that
+  one, and with none stored, the built-in default — no caps. An owner who caps
+  per wallet stores it as well, strict or whitelisting no wallet (then a call
+  that names nothing is `Access denied`); any other account's row —
+  the agent's own included — is refused `403 policy_row_not_owner`, and doing
+  that again blocks the wallet on these connectors for a while
+  (`403 calls_suspended`, `terminal: false`);
 * without an owner, the call's own reference is used as it is;
+* a named row that does not exist is refused by the worker
+  (`policy_row_missing`), never run with no policy: naming a profile nobody
+  stored would otherwise run the connector open, past the owner's real caps.
+  Only the owner's own row under the connector's profile, the one the
+  coordinator attaches, may be absent — then the built-in default applies;
 * the owner's row with an access rule that does not name the calling wallet
   refuses the call (`Access denied by access condition`) — the owner adds the
   wallet to it.

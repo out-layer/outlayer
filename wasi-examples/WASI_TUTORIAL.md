@@ -83,7 +83,7 @@ NEAR OutLayer executes WASM modules off-chain using wasmtime runtime. Your code 
 - **Target**: `wasm32-wasip2`
 - **Format**: Component model with typed interfaces
 - **Use case**: HTTP requests, complex I/O, modern features
-- **Features**: HTTP client, advanced filesystem, sockets
+- **Features**: HTTP client and the OutLayer host interfaces. No files and no raw sockets: keep a run's data in memory, which `max_memory_mb` bounds
 - **Size**: Larger binaries (~500KB-1MB)
 - **Example**: [ai-example](./ai-example/)
 
@@ -1442,15 +1442,13 @@ cargo build --target wasm32-wasip2 --release
 ```rust
 // In your src/main.rs or src/lib.rs
 
-// Option 1: Embed at compile time (increases WASI binary size)
+// Embed at compile time (increases WASI binary size)
 const CONTRACT_WASM: &[u8] = include_bytes!(
     "../your-contract/res/local/your_contract.wasm"
 );
 
-// Option 2: Read from filesystem (if available in WASI env)
-fn load_contract() -> Result<Vec<u8>, std::io::Error> {
-    std::fs::read("./your-contract/res/local/your_contract.wasm")
-}
+// A guest has no filesystem: embed the bytes as above, or fetch them over
+// HTTP inside the run.
 
 // Use the contract WASM
 fn deploy_contract(contract_wasm: &[u8]) {

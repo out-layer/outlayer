@@ -17,7 +17,7 @@ executor/
 - **File**: `wasi_p2.rs`
 - **Target**: `wasm32-wasip2`
 - **Format**: Component model
-- **Features**: HTTP/HTTPS, advanced I/O, filesystem
+- **Features**: HTTP/HTTPS and the OutLayer host interfaces; no directory is preopened while `sandbox::GUEST_FILES_ALLOWED` is false, and no raw sockets
 - **Runtime**: wasmtime 28+
 - **Entry**: `wasi:cli/run` interface
 

@@ -22,7 +22,7 @@
 use outlayer::tasks::{self, Display, FieldKind, WrittenBy};
 use serde_json::Value;
 
-use crate::{mime, policy};
+use crate::{gmail, mime, policy};
 use crate::{Input, Prepared};
 
 /// The operation the platform starts, as the agent, on the owner's approval.
@@ -119,6 +119,17 @@ fn closed(refusal: String) -> String {
     format!("{}. {CLOSED}", refusal.trim_end().trim_end_matches('.'))
 }
 
+/// The refusal when the message may have left and Google's answer was lost:
+/// the task is not reported as not carried out, and the sentence tells the
+/// agent to look at the mailbox before it prepares the message again.
+fn outcome_unknown(refusal: String) -> String {
+    format!(
+        "{}. Gmail's answer to the send was lost or failed after the request went out, so the message MAY \
+         have been sent: check the Sent folder before preparing it again",
+        refusal.trim_end().trim_end_matches('.')
+    )
+}
+
 /// The refusal when the message left and its result could not be left for
 /// the agent: the task ends as failed although the mail was sent, so the
 /// sentence says which of the two is true.
@@ -183,26 +194,51 @@ fn held(state: &[u8], files: &[tasks::File]) -> Result<Prepared, String> {
 pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
     let (call, rules) = before_answer(input, policy::load())?;
     let answer = tasks::answered_for(ANSWERED_BY, &call, &policy::stored()).map_err(|e| e.refusal())?;
-    after_answer(&rules, &answer, crate::on_chain(), crate::deliver, |id, result| {
-        tasks::report(id, result).map_err(|e| e.refusal())
-    })
+    after_answer(
+        &rules,
+        &answer,
+        crate::on_chain(),
+        crate::deliver,
+        |id, result| tasks::report(id, result).map_err(|e| e.refusal()),
+        |id, refusal| tasks::failed(id, refusal).map_err(|e| e.refusal()),
+    )
 }
 
 /// Everything that follows the answer: the task is `answering`, and any
 /// refusal from here ends it. `send` sends and `report` leaves the result
-/// for the agent — the host's doing in a run.
+/// for the agent — the host's doing in a run. A refusal that says nothing
+/// left goes to the agent through `fail` (`report-failure`): the task ends
+/// `failed` as `run_failed` with `{"error": <the refusal>}` as the result it
+/// reads. A send whose outcome is not known is NOT reported as not carried
+/// out: the run ends with the refusal, and the task as `run_unreported` —
+/// "it may have acted".
 fn after_answer(
     rules: &policy::Policy,
     answer: &tasks::Answer,
     on_chain: bool,
-    send: impl FnOnce(&policy::Policy, &Prepared, policy::Counted) -> Result<Value, String>,
+    send: impl FnOnce(&policy::Policy, &Prepared, policy::Counted) -> Result<Value, gmail::Unsent>,
     report: impl FnOnce(&str, &[u8]) -> Result<(), String>,
+    fail: impl FnOnce(&str, &str) -> Result<(), String>,
 ) -> Result<Value, String> {
-    let message = held(&answer.state, &answer.files).map_err(closed)?;
-    message.check(rules).map_err(closed)?;
+    // Nothing was sent: the agent reads why as the failed task's result. A
+    // report that does not land leaves the task failed without it, which the
+    // refusal still answers.
+    let refused = |why: String| {
+        let refusal = closed(why);
+        let _ = fail(&answer.id, &refusal);
+        Err(refusal)
+    };
+    let message = match held(&answer.state, &answer.files).and_then(|message| message.check(rules).map(|_| message)) {
+        Ok(message) => message,
+        Err(why) => return refused(why),
+    };
     // Counted in this run's own cell, beside the agent's direct sends: the
     // cap is the owner's bound on this agent, confirmed or not.
-    let mut sent = send(rules, &message, policy::Counted::Confirmed).map_err(closed)?;
+    let mut sent = match send(rules, &message, policy::Counted::Confirmed) {
+        Ok(sent) => sent,
+        Err(gmail::Unsent::Refused(why)) => return refused(why),
+        Err(gmail::Unsent::Unknown(why)) => return Err(outcome_unknown(why)),
+    };
     // What the owner wrote beside their yes goes to the agent with the result,
     // cut to what the report holds: a message that left is reported whole
     // before a note is.
@@ -436,12 +472,16 @@ mod tests {
         }
     }
 
-    fn never_sends(_: &policy::Policy, _: &Prepared, _: policy::Counted) -> Result<Value, String> {
+    fn never_sends(_: &policy::Policy, _: &Prepared, _: policy::Counted) -> Result<Value, gmail::Unsent> {
         panic!("nothing is sent")
     }
 
     fn never_reports(_: &str, _: &[u8]) -> Result<(), String> {
-        panic!("nothing is reported")
+        panic!("a refusal is never reported as carried out")
+    }
+
+    fn never_fails(_: &str, _: &str) -> Result<(), String> {
+        panic!("nothing is reported as not carried out")
     }
 
     /// A refusal from before the answer says nothing of a closed task: the
@@ -471,20 +511,29 @@ mod tests {
 
     #[test]
     fn after_the_answer_every_refusal_keeps_its_code_and_says_the_task_is_closed() {
-        let ends = |said: &str, code: &str| {
+        // Every refusal after the answer is also left for the agent, as the
+        // failed task's result: `{"error": <the same sentence>}`.
+        let ends = |said: &str, code: &str, failed: &RefCell<Option<(String, String)>>| {
             assert!(said.starts_with(code), "{said}");
             assert!(said.ends_with(CLOSED), "{said}");
             assert!(!said.contains(".."), "{said}");
+            let (id, why) = failed.borrow_mut().take().expect("the refusal is reported as not carried out");
+            assert_eq!((id.as_str(), why.as_str()), ("run-0", said));
+        };
+        let failed = RefCell::new(None);
+        let fails = |id: &str, why: &str| {
+            *failed.borrow_mut() = Some((id.to_string(), why.to_string()));
+            Ok(())
         };
 
         // A state that is not a message: refused before anything is sent.
         let broken = tasks::Answer { state: b"not a message".to_vec(), ..answer_holding(&message("Hello")) };
-        let said = after_answer(&rules("{}"), &broken, false, never_sends, never_reports).unwrap_err();
-        ends(&said, "task_unreadable: ");
+        let said = after_answer(&rules("{}"), &broken, false, never_sends, never_reports, fails).unwrap_err();
+        ends(&said, "task_unreadable: ", &failed);
 
         // A message its rules refuse: an attachment, under rules that allow none.
-        let said = after_answer(&rules("{}"), &answer_holding(&message("Hello")), false, never_sends, never_reports).unwrap_err();
-        ends(&said, "policy_denied: ");
+        let said = after_answer(&rules("{}"), &answer_holding(&message("Hello")), false, never_sends, never_reports, fails).unwrap_err();
+        ends(&said, "policy_denied: ", &failed);
         assert!(said.contains("max_attachment_kb"), "{said}");
 
         // The day's count, the credential, Google: whatever the send refuses.
@@ -493,14 +542,18 @@ mod tests {
             "policy_denied: 3 of the owner's 3 messages a day are used; this one would pass it",
             "credential_expired: Google refused the refresh token (revoked); retrying will not help.",
             "rate_limited: Gmail is refusing more requests for now (quota). Wait and retry; nothing was changed.",
-            "Gmail refused /messages/send: HTTP 500 oops",
+            "Gmail refused /messages/send: HTTP 400 bad recipient",
         ] {
-            let send = |_: &policy::Policy, _: &Prepared, _: policy::Counted| Err(refusal.to_string());
-            let said = after_answer(&allows, &answer_holding(&message("Hello")), false, send, never_reports).unwrap_err();
+            let send = |_: &policy::Policy, _: &Prepared, _: policy::Counted| Err(gmail::Unsent::Refused(refusal.to_string()));
+            let said = after_answer(&allows, &answer_holding(&message("Hello")), false, send, never_reports, fails).unwrap_err();
             let code = refusal.split(' ').next().unwrap();
-            ends(&said, code);
+            ends(&said, code, &failed);
             assert!(said.starts_with(refusal.trim_end_matches('.')), "{said}");
         }
+
+        // A report of the refusal that does not land changes nothing of the answer.
+        let said = after_answer(&rules("{}"), &broken, false, never_sends, never_reports, |_, _| Err("task_store_unavailable: no".into())).unwrap_err();
+        assert!(said.starts_with("task_unreadable: ") && said.ends_with(CLOSED), "{said}");
     }
 
     #[test]
@@ -519,7 +572,7 @@ mod tests {
             *reported.borrow_mut() = Some((id.to_string(), serde_json::from_slice::<Value>(result).unwrap()));
             Ok(())
         };
-        let out = after_answer(&allows, &answer_holding(&shown(&message("Hello,\r\nBob"))), true, send, report).unwrap();
+        let out = after_answer(&allows, &answer_holding(&shown(&message("Hello,\r\nBob"))), true, send, report, never_fails).unwrap();
 
         let message = seen.into_inner().expect("a message was sent");
         assert_eq!(message.body, "Hello,\nBob");
@@ -551,7 +604,7 @@ mod tests {
         };
         let mut answer = answer_holding(&shown(&message("Hello,\r\nBob")));
         answer.note = Some("go ahead, but today only".as_bytes().to_vec());
-        let out = after_answer(&allows, &answer, true, send, report).unwrap();
+        let out = after_answer(&allows, &answer, true, send, report, never_fails).unwrap();
         assert_eq!(seen.into_inner().unwrap().body, "Hello,\nBob", "the note changes nothing of the message");
         let result = reported.into_inner().unwrap();
         assert_eq!(result["note"], "go ahead, but today only");
@@ -571,12 +624,26 @@ mod tests {
         assert_eq!(big["to"], sent()["to"]);
     }
 
+    /// A send whose outcome Google did not give is reported neither way: the
+    /// task ends `run_unreported`, and the agent is told to look at the
+    /// mailbox before it prepares the message again.
+    #[test]
+    fn a_send_whose_outcome_is_lost_is_never_reported_as_not_sent() {
+        let allows = rules(r#"{"max_attachment_kb":10}"#);
+        for lost in ["Gmail could not be reached for /messages/send: connection reset", "Gmail refused /messages/send: HTTP 503 backend"] {
+            let send = |_: &policy::Policy, _: &Prepared, _: policy::Counted| Err(gmail::Unsent::Unknown(lost.to_string()));
+            let said = after_answer(&allows, &answer_holding(&message("Hello")), false, send, never_reports, never_fails).unwrap_err();
+            assert!(said.contains("MAY") && said.contains("Sent folder"), "{said}");
+            assert!(!said.contains(CLOSED), "{said}");
+        }
+    }
+
     #[test]
     fn a_message_that_left_and_was_not_reported_is_said_to_have_left() {
         let allows = rules(r#"{"max_attachment_kb":10}"#);
         let send = |_: &policy::Policy, _: &Prepared, _: policy::Counted| Ok(sent());
         let report = |_: &str, _: &[u8]| Err("task_store_unavailable: the task store did not answer".to_string());
-        let said = after_answer(&allows, &answer_holding(&message("Hello")), true, send, report).unwrap_err();
+        let said = after_answer(&allows, &answer_holding(&message("Hello")), true, send, report, never_fails).unwrap_err();
         assert!(said.starts_with("task_store_unavailable: the task store did not answer. "), "{said}");
         assert!(said.contains("WAS sent") && said.contains("19a0c0ffee") && said.contains("do not prepare it again"), "{said}");
         assert!(!said.contains(CLOSED) && !said.contains("bob@example.com"), "{said}");

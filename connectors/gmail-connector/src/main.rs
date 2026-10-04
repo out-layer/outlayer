@@ -304,7 +304,7 @@ pub(crate) fn sent_as_answered(sent: &Value, on_chain: bool) -> Value {
 }
 
 /// Send a message that passed the owner's rules, counted as `counted` says.
-pub(crate) fn deliver(rules: &policy::Policy, message: &Prepared, counted: policy::Counted) -> Result<Value, String> {
+pub(crate) fn deliver(rules: &policy::Policy, message: &Prepared, counted: policy::Counted) -> Result<Value, gmail::Unsent> {
     let Prepared { to, cc, subject, body, attachments } = message;
 
     // The owner's own cap, if they set one — their guard against a runaway
@@ -318,13 +318,24 @@ pub(crate) fn deliver(rules: &policy::Policy, message: &Prepared, counted: polic
     // last message. Any return from here without `keep` gives it back.
     let day = policy::day_key(policy::now_ms());
     let reservation = match rules.max_per_day {
-        Some(cap) => Some(policy::reserve(&day, counted, cap)?),
+        Some(cap) => Some(policy::reserve(&day, counted, cap).map_err(gmail::Unsent::Refused)?),
         None => None,
     };
 
-    let token = token()?;
-    let raw = mime::build(&mime::Outgoing { from: None, to, cc, subject, body, attachments })?;
-    let result = gmail::send(&token, &raw)?;
+    let token = token().map_err(gmail::Unsent::Refused)?;
+    let raw = mime::build(&mime::Outgoing { from: None, to, cc, subject, body, attachments }).map_err(gmail::Unsent::Refused)?;
+    let result = match gmail::send(&token, &raw) {
+        Ok(result) => result,
+        // A message that may have left keeps its place in today's count: a
+        // count one too high refuses a message, one too low allows one.
+        Err(unknown @ gmail::Unsent::Unknown(_)) => {
+            if let Some((reservation, _)) = reservation {
+                reservation.keep();
+            }
+            return Err(unknown);
+        }
+        Err(refused) => return Err(refused),
+    };
     let sent_today = reservation.map(|(reservation, used)| {
         reservation.keep();
         used

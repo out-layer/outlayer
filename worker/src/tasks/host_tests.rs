@@ -2300,6 +2300,45 @@ fn a_notice_names_no_operation_and_a_task_that_takes_an_answer_names_one() {
     assert!(world.store.rows.lock().unwrap().is_empty());
 }
 
+/// A confirm takes only a yes and an input asks for something: the other
+/// pairings open a task no answer could carry out, and are refused before the
+/// owner is shown anything.
+#[test]
+fn a_task_asks_for_what_its_kind_takes() {
+    let world = World::new();
+    let mut confirm_asking = email();
+    confirm_asking.answer_by = Some(wit::AnswerBy { operation: "confirm".to_string(), supplies: wit::Supplies::Text });
+    let mut input_asking_nothing = photo();
+    input_asking_nothing.answer_by = Some(wit::AnswerBy { operation: "upload_photo".to_string(), supplies: wit::Supplies::Nothing });
+    for (why, request) in [("a confirm that asks for text", confirm_asking), ("an input that asks for nothing", input_asking_nothing)] {
+        let refused = world.agent("run-a").open(request).expect_err(why);
+        assert_eq!(refused.reason, wit::Reason::DisplayInvalid, "{why}: {}", refused.message);
+    }
+    assert!(world.store.rows.lock().unwrap().is_empty());
+    // The pairings that work still open.
+    assert!(world.agent("run-a").open(email()).is_ok());
+    assert!(world.agent("run-b").open(photo()).is_ok());
+}
+
+/// A task that takes an answer lives long enough for its owner to answer
+/// before the approval margin closes; a notice takes no answer and has no
+/// floor.
+#[test]
+fn a_task_that_takes_an_answer_lives_fifteen_minutes_at_least() {
+    let world = World::new();
+    let mut short = email();
+    short.life_seconds = crate::tasks::MIN_ANSWER_LIFE_SECS - 1;
+    let refused = world.agent("run-a").open(short).expect_err("a confirm one second short");
+    assert_eq!(refused.reason, wit::Reason::DisplayInvalid, "{}", refused.message);
+    assert!(world.store.rows.lock().unwrap().is_empty());
+    let mut enough = email();
+    enough.life_seconds = crate::tasks::MIN_ANSWER_LIFE_SECS;
+    assert!(world.agent("run-b").open(enough).is_ok());
+    let mut brief = guessed();
+    brief.life_seconds = 20;
+    assert!(world.agent("run-c").open(brief).is_ok(), "a notice has no floor");
+}
+
 /// `answered` on a notice is `answer-invalid` for every operation, nothing
 /// is recorded, and the notice stays open; `report` on it is `not-found`.
 #[test]

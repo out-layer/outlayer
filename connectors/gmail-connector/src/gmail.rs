@@ -14,9 +14,29 @@ use wasi_http_client::Client as HttpClient;
 const BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-fn post(token: &str, path: &str, body: &Value) -> Result<Value, String> {
+/// Why a send has no answer to show.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unsent {
+    /// Nothing left: the request did not encode, or Google refused it (4xx).
+    Refused(String),
+    /// The request went out, or may have, and its outcome is not known: the
+    /// answer was lost, Google failed (5xx), or it said yes in a shape that
+    /// does not read. The message MAY have been sent.
+    Unknown(String),
+}
+
+impl From<Unsent> for String {
+    fn from(unsent: Unsent) -> String {
+        match unsent {
+            Unsent::Refused(why) | Unsent::Unknown(why) => why,
+        }
+    }
+}
+
+fn post(token: &str, path: &str, body: &Value) -> Result<Value, Unsent> {
     let url = format!("{BASE}{path}");
-    let payload = serde_json::to_vec(body).map_err(|e| format!("request encoding: {e}"))?;
+    let payload = serde_json::to_vec(body).map_err(|e| Unsent::Refused(format!("request encoding: {e}")))?;
+    // A transport error may come after the request went out.
     let response = HttpClient::new()
         .post(&url)
         .header("Authorization", format!("Bearer {token}").as_str())
@@ -24,13 +44,15 @@ fn post(token: &str, path: &str, body: &Value) -> Result<Value, String> {
         .body(&payload)
         .connect_timeout(TIMEOUT)
         .send()
-        .map_err(|e| format!("Gmail could not be reached for {path}: {e}"))?;
+        .map_err(|e| Unsent::Unknown(format!("Gmail could not be reached for {path}: {e}")))?;
     let status = response.status();
-    let bytes = response.body().map_err(|e| format!("Gmail answer for {path}: {e}"))?;
+    let refused = (400..500).contains(&status);
+    let unread = |why: String| if refused { Unsent::Refused(why) } else { Unsent::Unknown(why) };
+    let bytes = response.body().map_err(|e| unread(format!("Gmail answer for {path}: {e}")))?;
     if status != 200 && status != 201 {
-        return Err(describe(status, &bytes, path));
+        return Err(unread(describe(status, &bytes, path)));
     }
-    serde_json::from_slice(&bytes).map_err(|e| format!("Gmail's answer for {path} is not JSON: {e}"))
+    serde_json::from_slice(&bytes).map_err(|e| Unsent::Unknown(format!("Gmail's answer for {path} is not JSON: {e}")))
 }
 
 /// Google's refusal, in its own words, with the one reading an agent cannot work
@@ -78,7 +100,7 @@ fn describe(status: u16, bytes: &[u8], path: &str) -> String {
 
 /// Send a message that is already built. `gmail.send` authorises this and
 /// nothing else — not even reading back which address the token belongs to.
-pub fn send(token: &str, raw: &str) -> Result<Value, String> {
+pub fn send(token: &str, raw: &str) -> Result<Value, Unsent> {
     post(token, "/messages/send", &json!({"raw": raw}))
 }
 

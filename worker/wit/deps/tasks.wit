@@ -177,7 +177,8 @@ interface api {
         /// and a task made under another is `void`.
         policy: list<u8>,
         /// How long the task waits, in seconds. 0 is the longest a task may
-        /// wait; more than that is refused `life-too-long`.
+        /// wait; more than that is refused `life-too-long`. A task that takes
+        /// an answer waits 900 at least; less is refused `display-invalid`.
         life-seconds: u32,
     }
 
@@ -222,19 +223,27 @@ interface api {
         /// `approved`, `answering`, `done` and `failed`. Its status is the
         /// platform's ordinary status of a call.
         run: option<string>,
-        /// What the project reported: present on `done`.
+        /// What the project reported: on `done`, the result; on `failed` as
+        /// `run_trapped`, the result it reported before the run failed; as
+        /// `run_failed`, why it was not carried out.
         %result: option<list<u8>>,
         /// The owner's reason, as they wrote it: on `rejected`, when they
         /// gave one.
         rejection: option<string>,
-        /// Why a task is `failed` before its run acted: `preparer_key_unavailable`
+        /// Why a task is `failed`. Before its run acted: `preparer_key_unavailable`
         /// (the payment key that prepared could not pay for the run),
         /// `operation_priced`, `operation_unknown`, `operation_limit_reached`,
         /// `wallet_unresolved`, `queue_unavailable`, `run_not_started`, or
         /// `run_refused:<reason>` with the reason the host refused the run
         /// `answered` with — `run_refused:unreported` when the run ended
-        /// without ever asking for the task. Absent when the run acted and
-        /// ended any way, or in every other state.
+        /// without ever asking for the task. After its run took the answer:
+        /// `run_failed` (the project said, with `report-failure`, that it did
+        /// not carry the task out; why is in `result`), `run_trapped` (it
+        /// reported the task carried out, and then the run failed; what it
+        /// reported is in `result`), `run_unreported` (the run ended without a
+        /// word on the task — it may have acted),
+        /// `run_unfinished` (no word of the run's end in time — it may have
+        /// acted). Absent in every other state.
         failure-reason: option<string>,
     }
 
@@ -297,8 +306,9 @@ interface api {
         /// This run opened as many tasks, or made as many calls of this
         /// interface, as one run may. Another run starts from nothing.
         run-limit,
-        /// A kind outside the list, too many fields, a value too long: the
-        /// message names which.
+        /// A kind outside the list, too many fields, a value too long, or a
+        /// life too short for a task that takes an answer: the message names
+        /// which.
         display-invalid,
         /// `state`, `policy`, the files, the envelope or a result over its
         /// bound.
@@ -382,14 +392,29 @@ interface api {
     answered: func(id: string, hash: string, operation: string, policy: list<u8>, approval: approval, supplied: option<list<u8>>, note: option<list<u8>>) -> result<answer, task-error>;
 
     /// Leave `result` (at most 16384 bytes) for the preparer of a task this
-    /// run answered. A task reported on is `done` when the run ends as a
-    /// success; a task this run answered and did not report on is `failed`.
+    /// run answered, and with it the word that the task was carried out: it
+    /// is `done` when the run ends as a success, and `failed` as
+    /// `run_trapped`, `result` kept, when the run fails after. A task this run
+    /// answered and reported nothing of is `failed` as `run_unreported`.
     report: func(id: string, %result: list<u8>) -> result<_, task-error>;
+
+    /// Leave `result` (at most 16384 bytes) for the preparer of a task this
+    /// run answered, with the word that it was NOT carried out: the task is
+    /// `failed` as `run_failed` when the run ends, and `result` — the
+    /// project's refusal — is what the preparer reads. A later `report` or
+    /// `report-failure` of the same task replaces it.
+    report-failure: func(id: string, %result: list<u8>) -> result<_, task-error>;
 
     /// Withdraw an open task whose preparer is this caller.
     cancel: func(id: string) -> result<_, task-error>;
 
-    /// Delete a task whose preparer is this caller, in any state.
+    /// Delete a task whose preparer is this caller and that nothing was
+    /// carried out on: open (withdrawn with it), cancelled, rejected,
+    /// expired, void, or failed with a reason that says nothing was done —
+    /// `run_failed`, `run_not_started`, `run_refused:*`, or a run that was
+    /// never started. One the owner's yes acted on, or may have — approved,
+    /// answering, done, failed for any other reason — is the owner's record
+    /// too, and is refused `closed`.
     delete: func(id: string) -> result<_, task-error>;
 
     /// Write the copies of this project's open tasks for every device the

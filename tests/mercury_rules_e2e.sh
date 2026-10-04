@@ -31,6 +31,11 @@
 #        withdraws the task (task_cancel → cancelled)
 #   MR7  the prices on chain: `confirm` and the five task operations cost 0,
 #        `pay_invoice` its price; SKIP when the project has no price rows
+#   MR8  a payment the owner approves and the bank then refuses — by ACH to a
+#        saved payee Mercury cannot pay by ACH: the agent's task_status says
+#        failed as `run_failed`, and `result.error` is the connector's own
+#        refusal, saying the task is closed. Needs the coordinator and the
+#        worker that keep a failed run's report
 #
 # Money: sandbox money only (`sandbox: true`, a sandbox token). Two payments
 # of under $2 each to a payee saved in the sandbox, amounts unique to the run
@@ -71,7 +76,7 @@ want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 APPLY=false; [[ "${1:-}" == "--apply" ]] && APPLY=true
 
 if [[ "$APPLY" != true ]]; then
-  sed -n '3,57p' "$0" >&2; echo "  Pass --apply to run." >&2; exit 0
+  sed -n '3,62p' "$0" >&2; echo "  Pass --apply to run." >&2; exit 0
 fi
 for v in PARENT AGENT_PAYMENT_KEY AGENT_ACCOUNT; do
   [[ -n "${!v}" ]] || { echo "✗ $v is required" >&2; exit 1; }
@@ -180,6 +185,9 @@ mercury '{"operation":"recipients"}'
 # A payee Mercury pays by ACH: one that names it as its default rail.
 PAYEE=$(field '[.output.recipients[]? | select(.status != "deleted" and .default_payment_method == "ach")][0].id')
 PAYEES_BEFORE=$(field '[.output.recipients[]? | select(.status != "deleted")] | length')
+# One Mercury does not pay by ACH: the payment passes every check of ours and
+# the bank refuses it after the owner's yes (MR8).
+NOT_ACH=$(field '[.output.recipients[]? | select(.status != "deleted" and .default_payment_method != "ach")][0].id')
 [[ -n "$PAYEE" ]] || { echo "✗ the sandbox has no saved payee paid by ACH: $(why)" >&2; exit 1; }
 BASE=$(jq -c --arg a "$ACCOUNT" '. + {account_id: $a}' <<<"$BASE")
 note "account $ACCOUNT, saved payee $PAYEE ($PAYEES_BEFORE saved)"
@@ -331,6 +339,36 @@ if want MR7; then
     [[ -z "$bad" && "$(price pay_invoice)" == "$MERCURY_PAY_PRICE" ]] \
       && pass "MR7 confirm and the task operations cost 0, pay_invoice $MERCURY_PAY_PRICE" \
       || fail "MR7 prices:$bad pay_invoice=$(price pay_invoice)"
+  fi
+fi
+
+# ── MR8 approved, then refused by the bank ───────────────────────────────────
+if want MR8; then
+  if [[ -z "$NOT_ACH" ]]; then
+    skip "MR8 the sandbox has no saved payee that is not paid by ACH"
+  elif owner_ready MR8; then
+    log "MR8 an approved payment the bank refuses"
+    put_policy "$(jq -c --argjson r "$ASK_FROM_1" '. + {rules: $r}' <<<"$BASE")"
+    mercury "$(jq -nc --argjson a "1.$CENTS" --arg r "$NOT_ACH" '{operation:"pay_invoice", amount_usd:$a, recipient_id:$r, payment_method:"ach"}')"
+    T8=$(field .output.task_id)
+    if ok && [[ "$(field .output.status)" == "awaiting_owner" && -n "$T8" ]]; then
+      MADE_TASKS+=("$T8")
+      approves "$T8" - - a
+      if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" ]]; then
+        await_run "$T8"
+        ERR8=$(field .output.result.error)
+        [[ "$ENDED" == "failed" && "$(field .output.failure_reason)" == "run_failed" ]] \
+          && pass "MR8 the agent reads failed as run_failed" \
+          || fail "MR8 task_status: state '$ENDED' failure_reason '$(field .output.failure_reason)'"
+        [[ "$ERR8" == *"Mercury refused"* && "$ERR8" == *"The task is closed: to make this payment, prepare it again"* ]] \
+          && pass "MR8 result.error is the connector's refusal: $(head -c 140 <<<"$ERR8")" \
+          || fail "MR8 result.error: '$(head -c 200 <<<"$ERR8")'"
+      else
+        fail "MR8 approve answered $(own .status) state '$(own .state)' reason '$(own .reason)'"
+      fi
+    else
+      fail "MR8 the payment answered status '$(field .output.status)': $(why)"
+    fi
   fi
 fi
 

@@ -466,10 +466,12 @@ pub struct Finished {
     pub failed: u64,
 }
 
-/// Tell the store the run that acted has ended: a task it reported on, in a
-/// run that succeeded, is `done`; every other task it answered is `failed`;
-/// an approved task it was refused is `failed` with the reason. Called by
-/// the job path after the guest exits, however it exited.
+/// Tell the store the run that acted has ended: a task it reported carried
+/// out is `done` (or `failed` as `run_trapped` when the run failed after);
+/// one it reported NOT carried out is `failed` as `run_failed`; one it
+/// answered and reported nothing of is `failed` as `run_unreported`; an
+/// approved task it was refused is `failed` with the reason. Called by the
+/// job path after the guest exits, however it exited.
 pub async fn finish(
     config: &StoreConfig,
     scope: &Scope,
@@ -480,7 +482,17 @@ pub async fn finish(
 ) -> Result<Finished, StoreError> {
     let reported: Vec<_> = answered
         .iter()
-        .filter_map(|task| task.outcome.as_ref().map(|outcome| serde_json::json!({ "id": task.id, "outcome": b64(outcome) })))
+        .filter_map(|task| {
+            task.outcome.as_ref().map(|outcome| {
+                // `failed` only when it is true: a report that carried the
+                // task out is the shape every coordinator reads.
+                let mut entry = serde_json::json!({ "id": task.id, "outcome": b64(outcome) });
+                if task.failed {
+                    entry["failed"] = serde_json::Value::Bool(true);
+                }
+                entry
+            })
+        })
         .collect();
     let refused: Vec<_> =
         refused.iter().map(|task| serde_json::json!({ "id": task.id, "reason": task.reason })).collect();
@@ -502,25 +514,15 @@ async fn finish_within(
     most_answer: usize,
 ) -> Result<Finished, StoreError> {
     let client = reqwest::Client::new();
-    // The report is what makes an action that happened read as `done`: a
-    // store that did not answer is asked again, at once, before the call is
-    // said to be over. The report is the same each time, and a second one
-    // after a first that arrived changes nothing.
-    let mut last = StoreError::Unavailable("the task store was not asked".to_string());
-    for attempt in 1..=FINISH_ATTEMPTS {
-        match finish_once(&client, config, &body, most_answer).await {
-            Err(StoreError::Unavailable(why)) => {
-                tracing::warn!(run = %run, attempt, "the run's report did not reach the task store: {why}");
-                last = StoreError::Unavailable(why);
-            }
-            answered => return answered,
-        }
+    // Sent once. A report the store did not take leaves the run's tasks
+    // `answering`, and the store's sweep ends them as `run_unfinished`: "it
+    // may have acted", which is the truth when nobody heard the report.
+    let answered = finish_once(&client, config, &body, most_answer).await;
+    if let Err(StoreError::Unavailable(why)) = &answered {
+        tracing::warn!(run = %run, "the run's report did not reach the task store: {why}");
     }
-    Err(last)
+    answered
 }
-
-/// How many times a run's report is sent before it is given up.
-pub const FINISH_ATTEMPTS: u32 = 3;
 
 async fn finish_once(
     client: &reqwest::Client,
@@ -671,8 +673,9 @@ mod tests {
 
     fn answered() -> Vec<crate::tasks::Answered> {
         vec![
-            crate::tasks::Answered { id: "run-a-0".to_string(), outcome: Some(b"sealed".to_vec()) },
-            crate::tasks::Answered { id: "run-b-0".to_string(), outcome: None },
+            crate::tasks::Answered { id: "run-a-0".to_string(), outcome: Some(b"sealed".to_vec()), failed: false },
+            crate::tasks::Answered { id: "run-b-0".to_string(), outcome: None, failed: false },
+            crate::tasks::Answered { id: "run-d-0".to_string(), outcome: Some(b"refusal".to_vec()), failed: true },
         ]
     }
 
@@ -683,18 +686,18 @@ mod tests {
     const DOWN: (u16, &str) = (503, "the database is temporarily unavailable; try again shortly");
 
     #[tokio::test]
-    async fn a_report_the_store_took_at_the_third_asking_is_a_report_made() {
-        let (config, seen) = store_answering(vec![DOWN, DOWN, (200, r#"{"done":1,"failed":1}"#)]);
+    async fn a_report_the_store_took_is_a_report_made() {
+        let (config, seen) = store_answering(vec![(200, r#"{"done":1,"failed":1}"#)]);
         let finished = finish(&config, &scope(), "run-o", true, &answered(), &refused()).await;
         assert_eq!(finished, Ok(Finished { done: 1, failed: 1 }));
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 1);
         for (path, authorization, body) in seen.iter() {
             assert_eq!(path, "/owner-tasks/finish");
             assert_eq!(authorization, "Bearer the-workers-token");
-            // The same report each time: what the run reported on, and
-            // nothing of a task it answered and left without a result.
+            // What the run reported on — `failed` only where it is true —
+            // and nothing of a task it answered and left without a result.
             assert_eq!(
                 body,
                 &serde_json::json!({
@@ -702,7 +705,10 @@ mod tests {
                     "owner": "owner.testnet",
                     "run": "run-o",
                     "success": true,
-                    "reported": [{ "id": "run-a-0", "outcome": "c2VhbGVk" }],
+                    "reported": [
+                        { "id": "run-a-0", "outcome": "c2VhbGVk" },
+                        { "id": "run-d-0", "outcome": "cmVmdXNhbA==", "failed": true },
+                    ],
                     "refused": [{ "id": "run-c-0", "reason": "hash-mismatch" }],
                 })
             );
@@ -710,12 +716,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_report_the_store_did_not_take_in_three_askings_is_given_up() {
-        let (config, seen) = store_answering(vec![DOWN, DOWN, DOWN, (200, r#"{"done":1,"failed":0}"#)]);
+    async fn a_report_the_store_did_not_take_is_not_sent_again() {
+        let (config, seen) = store_answering(vec![DOWN, (200, r#"{"done":1,"failed":0}"#)]);
         let finished = finish(&config, &scope(), "run-o", true, &answered(), &refused()).await;
         assert_eq!(finished, Err(StoreError::Unavailable("the task store answered 503".to_string())));
-        assert_eq!(seen.lock().unwrap().len(), FINISH_ATTEMPTS as usize);
-        assert_eq!(FINISH_ATTEMPTS, 3);
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -819,12 +824,12 @@ mod tests {
         let (config, _) = store_answering(vec![(200, r#"{"done":1,"failed":0}"#)]);
         assert_eq!(finish_within(&config, body.clone(), "run-o", 21).await, Ok(Finished { done: 1, failed: 0 }));
 
-        let (config, seen) = store_answering(vec![(200, r#"{"done":1,"failed":0}"#); 4]);
+        let (config, seen) = store_answering(vec![(200, r#"{"done":1,"failed":0}"#); 2]);
         let Err(StoreError::Unavailable(why)) = finish_within(&config, body, "run-o", 20).await else {
             panic!("an answer over the bound was read");
         };
         assert!(why.contains("is over"), "{why}");
-        assert_eq!(seen.lock().unwrap().len(), FINISH_ATTEMPTS as usize, "no answer, so asked again");
+        assert_eq!(seen.lock().unwrap().len(), 1, "asked once");
     }
 
     #[test]

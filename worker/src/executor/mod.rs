@@ -41,6 +41,7 @@ use crate::compiled_cache::CompiledCache;
 use crate::outlayer_rpc::RpcProxy;
 use crate::outlayer_storage::client::StorageConfig;
 
+pub mod sandbox;
 mod wasi_p1;
 mod wasi_p2;
 
@@ -394,21 +395,17 @@ impl Executor {
             }
             Err(e) => {
                 let error_str = e.to_string();
-                info!("WASM execution failed: {}", error_str);
+                info!("WASM execution failed ({} bytes of error)", error_str.len());
 
-                let is_penalty = error_str.contains("(penalty)");
-
-                // Penalty (timeout/HTTP abuse): charge max_instructions so full compute_limit is spent.
-                // Normal errors: parse actual instructions from error message.
-                let instructions = if is_penalty {
-                    limits.max_instructions
-                } else {
-                    error_str
-                        .split("consumed ")
-                        .nth(1)
-                        .and_then(|s| s.split(' ').next())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0)
+                // What the run consumed, as the executor counted it — never a
+                // number read out of the message, which carries the guest's
+                // stderr. A penalty (timeout, HTTP abuse) spends the whole
+                // compute limit. A failure before the guest ran (it did not
+                // load or link) consumed nothing.
+                let instructions = match e.downcast_ref::<sandbox::RunFailed>() {
+                    Some(run) if run.penalty => limits.max_instructions,
+                    Some(run) => run.instructions,
+                    None => 0,
                 };
 
                 Ok(ExecutionResult {
@@ -529,8 +526,12 @@ impl Executor {
         }
 
         // Fallback: auto-detect format (for unknown targets or if specific executor failed)
-        // Try WASI P2 component first (with RPC proxy, storage, and compiled cache support)
-        if let Ok(result) = wasi_p2::execute(
+        // Try WASI P2 component first (with RPC proxy, storage, and compiled cache support).
+        // A binary that loaded and RAN is that format whatever became of the
+        // run: its failure (`sandbox::RunFailed`, with what it consumed) is the
+        // answer, not a reason to try the next format and lose it. Only a
+        // binary that is not this format falls through.
+        match wasi_p2::execute(
             wasm_bytes,
             wasm_content_sha256,
             compiled_cache.as_ref(),
@@ -542,13 +543,16 @@ impl Executor {
             keys,
         ).await
         {
-            return Ok(result);
+            Ok(result) => return Ok(result),
+            Err(e) if e.downcast_ref::<sandbox::RunFailed>().is_some() => return Err(e),
+            Err(_) => {}
         }
 
         // Try WASI P1 module (no RPC proxy, storage, or compiled cache)
-        if let Ok(result) = wasi_p1::execute(wasm_bytes, input_data, limits, env_vars.clone(), self.print_wasm_stderr).await
-        {
-            return Ok(result);
+        match wasi_p1::execute(wasm_bytes, input_data, limits, env_vars.clone(), self.print_wasm_stderr).await {
+            Ok(result) => return Ok(result),
+            Err(e) if e.downcast_ref::<sandbox::RunFailed>().is_some() => return Err(e),
+            Err(_) => {}
         }
 
         // If nothing worked, return error
@@ -568,6 +572,37 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(module (func (export "_start") unreachable))`: a P1 module whose
+    /// run traps at once.
+    const TRAPPING_P1: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic, version
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+        0x03, 0x02, 0x01, 0x00, // one function of that type
+        0x07, 0x0a, 0x01, 0x06, b'_', b's', b't', b'a', b'r', b't', 0x00, 0x00, // export "_start"
+        0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b, // body: unreachable, end
+    ];
+
+    /// With no build target, a module that loaded and ran is answered with
+    /// its own failure — not with "not a valid binary", which would charge
+    /// nothing and name the wrong cause.
+    #[tokio::test]
+    async fn an_auto_detected_run_that_fails_keeps_its_failure() {
+        let executor = Executor::new(10_000_000, false);
+        let limits = ResourceLimits { max_instructions: 10_000_000, max_memory_mb: 16, max_execution_seconds: 5 };
+        let result = executor
+            .execute(TRAPPING_P1, None, b"{}", &limits, None, None, &ResponseFormat::Json, None, None, None, None)
+            .await;
+        let failure = match result {
+            Ok(r) => {
+                assert!(!r.success, "a trap is a failure");
+                r.error.unwrap_or_default()
+            }
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(!failure.contains("Failed to load WASM binary"), "{failure}");
+        assert!(failure.contains("unreachable") || failure.contains("WASM execution failed"), "{failure}");
+    }
 
     #[tokio::test]
     async fn test_executor_creation() {

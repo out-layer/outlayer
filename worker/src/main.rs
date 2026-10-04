@@ -75,6 +75,13 @@ async fn main() -> Result<()> {
 
     info!("OffchainVM Worker starting...");
 
+    // Scratch directories of runs a stopped worker never finished: their
+    // drop did not run, and what a guest wrote there is nobody's now.
+    let cleared = executor::sandbox::clear_leftovers();
+    if cleared > 0 {
+        info!("🧹 Removed {} scratch directories left by an earlier run of this worker", cleared);
+    }
+
     // Load configuration
     let mut config = Config::from_env().context("Failed to load configuration")?;
     config.validate().context("Invalid configuration")?;
@@ -2640,6 +2647,13 @@ async fn handle_execute_job(
             }
         };
 
+        // A connector run whose call NAMED a row that does not exist is
+        // refused, not run with no policy — see `missing_row_refusal`.
+        let missing_row = missing_row_refusal(
+            declared_manifest.as_ref().and_then(|m| m.connector_id.as_deref()),
+            &secrets_ref.profile,
+            &secrets_ref.account_id,
+        );
         match secrets_result {
             Ok(run) => {
                 run_keys = run.keys;
@@ -2652,6 +2666,11 @@ async fn handle_execute_job(
                     // The row does not exist, reported beside the declared keys:
                     // the same outcome as the typed "not found" below.
                     None => {
+                        if let Some(why) = missing_row {
+                            error!("❌ {why}");
+                            report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), why, Some(api_client::JobStatus::AccessDenied)).await?;
+                            return Ok(());
+                        }
                         info!("ℹ️  No secrets configured for this project/source, continuing without secrets");
                         Some(std::collections::HashMap::new())
                     }
@@ -2666,6 +2685,11 @@ async fn handle_execute_job(
                 // a REFUSAL whose wording happened to contain "not found" would
                 // otherwise start the job with no credential at all.
                 if keystore_client::SecretsNotFound::is_missing(&e) {
+                    if let Some(why) = missing_row {
+                        error!("❌ {why}");
+                        report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), why, Some(api_client::JobStatus::AccessDenied)).await?;
+                        return Ok(());
+                    }
                     info!("ℹ️  No secrets configured for this project/source, continuing without secrets");
                     Some(std::collections::HashMap::new())
                 } else if keystore_client::SigningKeysRefused::is_refusal(&e) {
@@ -2984,8 +3008,10 @@ async fn handle_execute_job(
 
     // The tasks this run answered, and the approved tasks it was refused,
     // told to the store now that the guest has exited — however it exited: a
-    // task it reported on, in a run that succeeded, is `done`; every other it
-    // answered is `failed`; one it was refused is `failed` with the reason. A
+    // task it reported carried out is `done`, or `failed` as `run_trapped`
+    // when the run failed after; one reported NOT carried out is `failed` as
+    // `run_failed`; one it said nothing of is `failed` as `run_unreported`;
+    // one it was refused is `failed` with the reason. A
     // store that cannot be told leaves them where they stand, and closes
     // them `failed` by itself.
     {
@@ -3942,6 +3968,35 @@ fn proven_sender<'a>(sender: Option<&'a str>, secrets_owner: &str) -> Result<&'a
              access condition against, so nothing was decrypted."
         )
     })
+}
+
+/// The connectors whose policy is the wallet owner's and which run open — no
+/// caps — when no policy row is found: the coordinator's
+/// `owner_policy_profile`, which names each by its connector id.
+const OWNER_CAPPED_CONNECTORS: [&str; 2] = ["hyperliquid", "polymarket"];
+
+/// Why a run of an owner-capped connector whose row is not found is refused
+/// rather than run with no policy — or `None` when a missing row is no
+/// policy.
+///
+/// Such a connector with no policy runs its built-in default: every market,
+/// no caps. That is the owner's choice when they stored no row under the
+/// connector's own profile — the row the coordinator attaches when the call
+/// names none. It is NOT the caller's to make by naming a row that does not
+/// exist: `{owner, "zzz"}` would otherwise run the connector open, past every
+/// cap the owner's real rows hold. Every other connector keeps its
+/// credential in the same row as its rules, so a missing row means nothing
+/// can act and the connector's own answer says so; an ordinary project keeps
+/// "no row, no secrets".
+fn missing_row_refusal(connector_id: Option<&str>, profile: &str, account_id: &str) -> Option<String> {
+    let connector = connector_id.filter(|c| OWNER_CAPPED_CONNECTORS.contains(c))?;
+    if profile == connector {
+        return None;
+    }
+    Some(format!(
+        "policy_row_missing: the policy row {{account_id: {account_id:?}, profile: {profile:?}}} is not stored. \
+         Name a row that exists, or none to run the owner's row under the {connector:?} profile."
+    ))
 }
 
 /// Which job status a failed secrets decryption maps to.
@@ -5337,6 +5392,39 @@ mod signing_keys_in_the_job_path {
     }
 }
 
+#[cfg(test)]
+mod missing_policy_row {
+    use super::missing_row_refusal;
+
+    /// An owner-capped connector refuses a row that is not found unless it is
+    /// the owner's under the connector's own profile; every other connector,
+    /// and an ordinary project, runs without one.
+    #[test]
+    fn only_an_owner_capped_connector_refuses_a_row_that_is_not_found() {
+        let refused = missing_row_refusal(Some("hyperliquid"), "zzz", "owner.near").expect("refused");
+        assert!(refused.starts_with("policy_row_missing:") && refused.contains("\"zzz\"") && refused.contains("owner.near"), "{refused}");
+        assert!(missing_row_refusal(Some("polymarket"), "pm-strategy-a", "owner.near").is_some());
+        assert!(missing_row_refusal(Some("hyperliquid"), "hyperliquid", "owner.near").is_none(), "the owner's own row may be absent");
+        assert!(missing_row_refusal(Some("polymarket"), "polymarket", "owner.near").is_none());
+        // `X-Use-Owner-Secret` names the wallet's own row under the wallet's
+        // account: a credential connector answers "not connected" itself.
+        for credential in ["mercury", "gmail", "github", "connector-probe", "subkey-probe"] {
+            assert!(missing_row_refusal(Some(credential), "ab12", "ab12").is_none(), "{credential}");
+        }
+        assert!(missing_row_refusal(None, "zzz", "agent.near").is_none(), "an ordinary project: no row, no secrets");
+    }
+
+    /// Both ways the keystore says "no such row" — beside the declared keys,
+    /// and as the typed error — go through the refusal.
+    #[test]
+    fn both_not_found_paths_refuse_a_missing_owner_capped_row() {
+        let src = include_str!("main.rs");
+        let at = src.find("let missing_row = missing_row_refusal(").expect("the decision");
+        let to = at + src[at..].find("// The declared signing and encryption keys").expect("the end of the secrets step");
+        assert_eq!(src[at..to].matches("if let Some(why) = missing_row {").count(), 2, "both not-found paths");
+    }
+}
+
 /// What a run holds for tasks comes from the job and the keystore, and what it
 /// answered is told to the store after the guest exits, however it exited.
 /// Source-shape tests, as for the keys.
@@ -5366,7 +5454,10 @@ mod tasks_in_the_job_path {
     fn the_runs_facts_are_the_jobs() {
         let src = src();
         let at = src.find("declared_run_keys.tasks = tasks::declared_in(declared_manifest.as_ref()).then(|| tasks::TasksRun {").expect("the context");
-        let context = &src[at..at + 1000];
+        // The whole struct literal, to its closing line: a fixed window cut
+        // off the last facts as the literal grew.
+        let end = at + src[at..].find("\n    });").expect("the end of the context");
+        let context = &src[at..end];
         for fact in [
             "grant: task_grant.take(),",
             "run: task_run_id.clone(),",
