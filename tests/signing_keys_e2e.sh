@@ -445,6 +445,11 @@ if ran_ok "S1 what_i_can_see"; then
   names=$(jq -r '.env | keys[]' <<<"$RUN_OUT" 2>/dev/null | grep -iE 'seed|signing|key' | tr '\n' ' ')
   [[ -z "$names" ]] && pass "S1 what_i_can_see — no environment variable is named for a key" \
     || finding "S1 what_i_can_see — environment variables named like keys: $names (S11 checks their values)"
+  # No directory is preopened for a guest (the worker's GUEST_FILES_ALLOWED):
+  # listing `/` or `.` is an error, never a list — not even an empty one.
+  [[ -n "$(out_field '.dirs["/"].Err')" && -n "$(out_field '.dirs["."].Err')" ]] \
+    && pass "S1 what_i_can_see — the guest has no directory: / and . cannot be listed" \
+    || fail "S1 what_i_can_see — the guest lists a directory: $(jq -c .dirs <<<"$RUN_OUT" 2>/dev/null | head -c 200)"
 fi
 
 # ── S2 alpha ≠ beta ──────────────────────────────────────────────────────────

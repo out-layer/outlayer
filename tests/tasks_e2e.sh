@@ -188,6 +188,9 @@
 #                        under "requests"
 #   HOOK_REDIRECT_URL, HOOK_REDIRECT_LOG_URL   a second receiver, which
 #                        answers 307 to HOOK_URL, and its log (W3)
+#                        All four come from `tests/hook_receiver.sh start`
+#                        (a receiver on this machine behind a Cloudflare quick
+#                        tunnel): `set -a; source ~/.local/state/outlayer-hook/hook.env; set +a`
 #   AGENT_SPARE_NONCE    the nonce of a second FUNDED payment key of AGENT_ACCOUNT (N4)
 #   CUSTODY_WALLET_KEY   the `wk_` key of a custody wallet whose implicit
 #                        account was never sent NEAR (S3); read where it is used
