@@ -757,7 +757,7 @@
       },
       "task_delete": {
         "class": "write",
-        "doc": "Delete a task this caller made, in any state.",
+        "doc": "Delete a task this caller made that nothing was carried out on: open, cancelled, rejected, expired, void, or failed with a reason that says nothing was done. One the owner's yes acted on, or may have, is refused task_closed — it is the owner's record too.",
         "params": [
           {
             "name": "task_id",

@@ -325,8 +325,8 @@ A connector whose writes the wallet's OWNER caps declares it in the registry
   one, and with none stored, the built-in default — no caps. An owner who caps
   per wallet stores it as well, strict or whitelisting no wallet (then a call
   that names nothing is `Access denied`); any other account's row —
-  the agent's own included — is refused `403 policy_row_not_owner`, and doing
-  that again blocks the wallet on these connectors for a while
+  the agent's own included — is refused `403 policy_row_not_owner`, and naming
+  such rows can block the wallet on both these connectors for a while
   (`403 calls_suspended`, `terminal: false`);
 * without an owner, the call's own reference is used as it is;
 * a named row that does not exist is refused by the worker
