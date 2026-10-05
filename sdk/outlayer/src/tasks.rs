@@ -341,6 +341,72 @@ pub fn failed(id: &str, refusal: &str) -> Result<()> {
     raw::report_failure(id, &failure(refusal)).map_err(TaskError::from)
 }
 
+/// The title of the notice [`failed_and_told`] leaves the owner.
+pub const NOT_CARRIED_OUT: &str = "Not carried out";
+
+/// What [`failed_and_told`] did.
+#[derive(Debug)]
+pub struct Told {
+    /// The notice, as [`notified`] spells it; `None` when it could not be
+    /// opened. The run's answer names it — see [`Refused`].
+    pub notice: Option<serde_json::Value>,
+    /// The failure report, as [`failed`] answers it.
+    pub reported: Result<()>,
+}
+
+/// [`failed`], and the owner told why at once: a notice in the answered
+/// task's conversation, under it in the inbox, showing the refusal. `policy`
+/// is the policy as the project reads it, as for [`answered`]. A notice that
+/// cannot be opened does not keep the task from failing: the refusal the
+/// agent reads then says the owner was not told, and why.
+///
+/// The run's answer must name the notice ([`Refused::output`]): the owner's
+/// page holds what a notice shows to the attested answer of the run that
+/// opened it, and a notice no answer names does not hold.
+pub fn failed_and_told(id: &str, refusal: &str, policy: &[u8]) -> Told {
+    let display = Display::new(NOT_CARRIED_OUT).field("Why", FieldKind::LongText, shown(refusal), WrittenBy::Project);
+    match notice(display, policy).open() {
+        Ok(opened) => Told { notice: Some(notified(&opened)), reported: failed(id, refusal) },
+        Err(e) => Told {
+            notice: None,
+            reported: failed(id, &format!("{refusal} (the owner was not told: {})", e.refusal())),
+        },
+    }
+}
+
+/// The refusal of a run that answered a task, with the notice that told the
+/// owner why, when one was opened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refused {
+    pub refusal: String,
+    pub notice: Option<serde_json::Value>,
+}
+
+impl From<String> for Refused {
+    fn from(refusal: String) -> Self {
+        Self { refusal, notice: None }
+    }
+}
+
+impl Refused {
+    /// The `output` the run answers beside its `error`: `{"notice": …}`, so
+    /// the attested answer names the notice by its id and hash. `None` when
+    /// no notice was opened.
+    pub fn output(&self) -> Option<serde_json::Value> {
+        self.notice.as_ref().map(|notice| serde_json::json!({ "notice": notice }))
+    }
+}
+
+/// The refusal as a notice shows it: at most [`MOST_FAILURE_BYTES`], cut at a
+/// character.
+fn shown(refusal: &str) -> &str {
+    let mut keep = refusal.len().min(MOST_FAILURE_BYTES);
+    while !refusal.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    &refusal[..keep]
+}
+
 /// Withdraw an open task whose preparer is this caller. An approved task is
 /// the owner's yes, and is not withdrawn.
 pub fn cancel(id: &str) -> Result<()> {
@@ -583,6 +649,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_owner_is_shown_the_refusal_whole_or_cut_at_a_character() {
+        assert_eq!(shown("bank_refused: no approver"), "bank_refused: no approver");
+        let long = "é".repeat(20_000);
+        let cut = shown(&long);
+        assert!(cut.len() <= MOST_FAILURE_BYTES && cut.len() > MOST_FAILURE_BYTES - 2, "{} bytes", cut.len());
+        assert!(cut.chars().all(|c| c == 'é'), "cut at a character, never inside one");
+    }
+
+    #[test]
+    fn a_refused_run_names_its_notice_beside_the_error() {
+        let notice = serde_json::json!({"status": "notified", "task_id": "run-1", "task_hash": "ab"});
+        let told = Refused { refusal: "bank_refused".into(), notice: Some(notice.clone()) };
+        assert_eq!(told.output(), Some(serde_json::json!({"notice": notice})));
+        assert_eq!(Refused::from("policy_denied".to_string()).output(), None);
+    }
 
     #[test]
     fn base64_reads_what_it_writes_and_refuses_what_is_not() {

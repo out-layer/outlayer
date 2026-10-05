@@ -58,7 +58,9 @@ m = json.load(open(sys.argv[1]))
 src = open(sys.argv[2]).read()
 declared = set(m["operations"])
 advertised = set(re.findall(r'"([a-z_]+)"', re.search(r'const OPERATIONS.*?\];', src, re.S).group(0)))
-dispatched = set(re.findall(r'^\s*"([a-z_]+)" => ', re.search(r'fn run\(.*?\n\}\n', src, re.S).group(0), re.M))
+# `answer` takes `confirm`, whose refusal names a notice; `run` takes the rest.
+dispatched = set(n for f in ("answer", "run")
+                 for n in re.findall(r'^\s*"([a-z_]+)" => ', re.search(r'fn ' + f + r'\(.*?\n\}\n', src, re.S).group(0), re.M))
 WINDOWS = {"day", "week", "month"}; APPLIES = {"everyone", "unpaid", "covered"}
 bad = []
 if declared != advertised:

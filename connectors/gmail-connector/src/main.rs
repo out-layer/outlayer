@@ -103,20 +103,35 @@ fn main() {
         },
         Ok(input) => {
             let op = input.operation.trim().to_string();
-            match run(&op, &input) {
-                Ok(output) => Envelope { success: true, operation: op, error: None, output: Some(output), logs: Vec::new() },
-                Err(e) => Envelope { success: false, operation: op, error: Some(e), output: None, logs: Vec::new() },
-            }
+            let answered = answer(&op, &input);
+            envelope(op, answered)
         }
     };
     let _ = env::output_json(&envelope);
+}
+
+/// The envelope of a run that read its input: the output, or the refusal and
+/// what the refusal names beside it.
+fn envelope(operation: String, answered: Result<Value, outlayer::tasks::Refused>) -> Envelope {
+    match answered {
+        Ok(output) => Envelope { success: true, operation, error: None, output: Some(output), logs: Vec::new() },
+        Err(r) => Envelope { success: false, operation, output: r.output(), error: Some(r.refusal), logs: Vec::new() },
+    }
+}
+
+/// The run's answer: `confirm` names the notice its refusal opened, beside
+/// the refusal; every other operation's refusal is its sentence.
+fn answer(op: &str, input: &Input) -> Result<Value, outlayer::tasks::Refused> {
+    match op {
+        "confirm" => confirm::confirm(input),
+        _ => run(op, input).map_err(outlayer::tasks::Refused::from),
+    }
 }
 
 fn run(op: &str, input: &Input) -> Result<Value, String> {
     match op {
         "status" => status(input),
         "send" => send(input),
-        "confirm" => confirm::confirm(input),
         "task_status" => confirm::task(op, input),
         "task_cancel" => confirm::task(op, input),
         "task_delete" => confirm::task(op, input),
@@ -356,6 +371,19 @@ pub(crate) fn deliver(rules: &policy::Policy, message: &Prepared, counted: polic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_confirm_names_the_notice_that_told_the_owner() {
+        let notice = json!({"status": "notified", "task_id": "run-7", "task_hash": "c0ffee"});
+        let refused = outlayer::tasks::Refused { refusal: "bank refused".into(), notice: Some(notice) };
+        let answer = serde_json::to_value(envelope("confirm".into(), Err(refused))).unwrap();
+        assert_eq!(answer["success"], false);
+        assert_eq!(answer["error"], "bank refused");
+        assert_eq!(answer["output"]["notice"]["task_id"], "run-7");
+        assert_eq!(answer["output"]["notice"]["task_hash"], "c0ffee");
+        let plain = serde_json::to_value(envelope("send".into(), Err("policy_denied".to_string().into()))).unwrap();
+        assert!(plain.get("output").is_none(), "a refusal that told nobody answers no output");
+    }
 
     #[test]
     fn the_operations_this_code_runs_are_the_ones_it_advertises() {

@@ -191,17 +191,26 @@ fn held(state: &[u8], files: &[tasks::File]) -> Result<Prepared, String> {
 /// of the send. What differs between preparing and confirming is the day's
 /// count and Google's answer. Last, a result the host would not keep: the
 /// message left, and the refusal says that instead.
-pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
+///
+/// A refusal after the answer that is certain nothing left comes with the
+/// notice that told the owner why, which the run's answer names.
+pub(crate) fn confirm(input: &Input) -> Result<Value, tasks::Refused> {
     let (call, rules) = before_answer(input, policy::load())?;
     let answer = tasks::answered_for(ANSWERED_BY, &call, &policy::stored()).map_err(|e| e.refusal())?;
+    let notice = std::cell::RefCell::new(None);
     after_answer(
         &rules,
         &answer,
         crate::on_chain(),
         crate::deliver,
         |id, result| tasks::report(id, result).map_err(|e| e.refusal()),
-        |id, refusal| tasks::failed(id, refusal).map_err(|e| e.refusal()),
+        |id, refusal| {
+            let told = tasks::failed_and_told(id, refusal, &policy::stored());
+            *notice.borrow_mut() = told.notice;
+            told.reported.map_err(|e| e.refusal())
+        },
     )
+    .map_err(|refusal| tasks::Refused { refusal, notice: notice.take() })
 }
 
 /// Everything that follows the answer: the task is `answering`, and any
@@ -209,7 +218,7 @@ pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
 /// for the agent — the host's doing in a run. A refusal that says nothing
 /// left goes to the agent through `fail` (`report-failure`): the task ends
 /// `failed` as `run_failed` with `{"error": <the refusal>}` as the result it
-/// reads. A send whose outcome is not known is NOT reported as not carried
+/// reads, and the owner is shown the same refusal in a notice under the task. A send whose outcome is not known is NOT reported as not carried
 /// out: the run ends with the refusal, and the task as `run_unreported` —
 /// "it may have acted".
 fn after_answer(
@@ -428,9 +437,11 @@ mod tests {
     #[test]
     fn a_call_that_names_no_task_is_refused_before_anything_is_asked() {
         let said = confirm(&Input::default()).unwrap_err();
+        assert!(said.notice.is_none(), "nothing was answered, so no owner is told");
+        let said = said.refusal;
         assert!(said.starts_with("task_answer_invalid: ") && said.contains("task_id"), "{said}");
         let no_hash = Input { task_id: Some("run-0".into()), ..Input::default() };
-        assert!(confirm(&no_hash).unwrap_err().contains("task_hash"));
+        assert!(confirm(&no_hash).unwrap_err().refusal.contains("task_hash"));
     }
 
     // ===== the order: what refuses before the answer is taken, and after =====

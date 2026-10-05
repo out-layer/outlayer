@@ -381,10 +381,23 @@ is sealed.
 action happened — to the run's caller and to the agent.** Once the answer is
 taken the task is closed whatever follows. A refusal from then on keeps its
 own code and adds what is true of the task, and the same sentence goes to the
-preparer as the task's verdict: `tasks::failed(id, &refusal)` — the host's
-`report-failure` — so the task ends `failed` as `run_failed` with
+preparer as the task's verdict, and to the owner:
+`tasks::failed_and_told(id, &refusal, &policy)` opens a notice titled "Not
+carried out" in the task's conversation, showing the refusal, then calls the
+host's `report-failure` (`tasks::failed`) — so the owner reads why under the
+task they approved, and the task ends `failed` as `run_failed` with
 `{"error": <the refusal>}` as the result the agent reads in `task_status`,
-never a bare `failed`. Each answered task ends by its own word and by how
+never a bare `failed`. The result is sealed for the preparer and the owner's
+page cannot open it; the notice is how the owner learns the reason. A notice
+that cannot be opened does not keep the task from failing: the agent's
+refusal then says the owner was not told.
+
+The run's answer names the notice: `confirm` returns `tasks::Refused`, and
+the connector answers `{"success": false, "error": <the refusal>, "output":
+{"notice": <as tasks::notified spells it>}}` (`Refused::output`). The owner's
+page holds what a task shows to the attested answer of the run that made it —
+that answer names the task by its id and hash — so a notice no answer names
+reads "the proof does not hold". Each answered task ends by its own word and by how
 the run ended: `report` is "carried out" — `done`, or `failed` as
 `run_trapped` with the report kept when the run fails after;
 `report-failure` is "not carried out" — `run_failed`; no word at all is
@@ -554,8 +567,8 @@ Suites run through a keyed RPC (`tests/lib/rpc.sh`).
    note, answers.
 8. Refusals after the answer say the task is closed, and say so when the
    action happened; each one certain that nothing reached the service goes
-   to the preparer through `tasks::failed` (`report-failure`) before the run
-   answers it. One whose outcome is not known reports nothing and says the
+   to the preparer and, in a notice under the task, to the owner through
+   `tasks::failed_and_told` (`report-failure`) before the run answers it. One whose outcome is not known reports nothing and says the
    action may have happened.
 9. On chain, `confirm` answers a fixed list of members that names nobody.
 10. `tasks::dispatch` serves the five task operations.

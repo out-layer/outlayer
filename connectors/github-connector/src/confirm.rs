@@ -701,10 +701,14 @@ fn held(state: &[u8], files: &[tasks::File]) -> Result<Action, String> {
 /// GitHub's refusal of the write — a branch that moved, a pull request whose
 /// head is not the one shown. Last, a result the host would not keep: the
 /// write was made, and the refusal says that instead.
-pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
+///
+/// A refusal after the answer that is certain nothing was written comes with
+/// the notice that told the owner why, which the run's answer names.
+pub(crate) fn confirm(input: &Input) -> Result<Value, tasks::Refused> {
     let on_chain = crate::on_chain();
     let (call, rules) = before_answer(input, policy::load()).map_err(|e| as_answered(e, on_chain))?;
     let answer = tasks::answered_for(ANSWERED_BY, &call, &policy::stored()).map_err(|e| e.refusal())?;
+    let notice = std::cell::RefCell::new(None);
     after_answer(
         &rules,
         &answer,
@@ -715,8 +719,13 @@ pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
             action.execute(rules, counted).map_err(|e| if gh::may_have_written() { Unmade::Unknown(e) } else { Unmade::Refused(e) })
         },
         |id, result| tasks::report(id, result).map_err(|e| e.refusal()),
-        |id, refusal| tasks::failed(id, refusal).map_err(|e| e.refusal()),
+        |id, refusal| {
+            let told = tasks::failed_and_told(id, refusal, &policy::stored());
+            *notice.borrow_mut() = told.notice;
+            told.reported.map_err(|e| e.refusal())
+        },
     )
+    .map_err(|refusal| tasks::Refused { refusal, notice: notice.take() })
 }
 
 /// Why a write the task held was not answered with a result.
@@ -747,7 +756,8 @@ fn outcome_unknown(refusal: String) -> String {
 /// result for the agent — the host's doing in a run. A refusal that says
 /// nothing was written goes to the agent through `fail` (`report-failure`):
 /// the task ends `failed` as `run_failed` with `{"error": <the refusal>}` as
-/// the result it reads. A write whose outcome is not known is NOT reported
+/// the result it reads, and the owner is shown the same refusal in a notice
+/// under the task. A write whose outcome is not known is NOT reported
 /// as not carried out: the run ends with the refusal, and the task as
 /// `run_unreported` — "it may have acted".
 fn after_answer(
@@ -1212,9 +1222,11 @@ mod tests {
     #[test]
     fn a_call_that_names_no_task_is_refused_before_anything_is_asked() {
         let said = confirm(&Input::default()).unwrap_err();
+        assert!(said.notice.is_none(), "nothing was answered, so no owner is told");
+        let said = said.refusal;
         assert!(said.starts_with("task_answer_invalid: ") && said.contains("task_id"), "{said}");
         let no_hash = Input { task_id: Some("run-0".into()), ..Input::default() };
-        assert!(confirm(&no_hash).unwrap_err().contains("task_hash"));
+        assert!(confirm(&no_hash).unwrap_err().refusal.contains("task_hash"));
     }
 
     /// A refusal from before the answer says nothing of a closed task: the
