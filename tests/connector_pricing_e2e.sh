@@ -2011,7 +2011,7 @@ if want C19 && agent_secret_mode C19; then
   fi
 fi
 
-# ── C7: a trial is ten calls, and paying has no call limit ──────────────────
+# ── C7: a trial is counted in calls, and paying has no call limit ──────────
 # The whole of the count-based metering on a connector. A fresh wallet claims
 # its trial, makes every call the answer promised, and is refused on the next
 # one — for good (`terminal: true`), in calls and never in dollars. A funded key
@@ -2024,7 +2024,7 @@ if want C7; then
   if [[ "$APPLY" != true ]]; then
     printf '\033[90m  (dry-run) mint a wallet, claim its trial, call ping to the limit and once more; then pass the limit on a funded key\033[0m\n' >&2
   else
-    log "C7 a trial is ten calls; a funded key has no call limit"
+    log "C7 a trial is counted in calls; a funded key has no call limit"
     REG=$(curl -sS --max-time 60 -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d '{}')
     T_WK=$(jq -r '.api_key // empty' <<<"$REG")
     OFFER=$(jq -c '.trial // {}' <<<"$REG")

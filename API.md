@@ -44,7 +44,7 @@ base URL that matches the network your project / wallet is deployed on.
 |--------|----------|------|-------------|
 | POST | `/call/{owner}/{project}` | `X-Payment-Key` | Execute a WASI module (sync response) |
 | GET | `/calls/{call_id}` | — | Poll an async execution by id |
-| POST | `/trial-key` | `Bearer wk_...` / `near:...` | Claim the wallet's trial: ten connector calls in its first week; the key is derived and read again below |
+| POST | `/trial-key` | `Bearer wk_...` / `near:...` | Claim the wallet's trial: fifty connector calls in its first week; the key is derived and read again below |
 | GET | `/wallet/v1/payment-key` | `Bearer wk_...` / `near:...` | The wallet's nonce-0 key (trial or sponsored), derived again; only the credential that claimed it reads it |
 | POST | `/wallet/v1/sponsorship` | `Bearer wk_...` / `near:...` | Redeem a sponsor code (`spn_…`): a subscription, paid by the sponsor, on the nonce-0 key |
 | GET | `/subscription/status` | `X-Payment-Key` | What a key has left — for a trial key, `trial.calls_left` |

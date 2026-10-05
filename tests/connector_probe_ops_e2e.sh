@@ -53,8 +53,8 @@
 #
 # Needs: PAYMENT_KEY — a funded payment key; CALLER (O8 only) — an account with
 # a stablecoin balance INSIDE the contract and NEAR for the compute deposit.
-# Nine connector calls over HTTPS. A funded key has no call limit; a TRIAL key is
-# ten calls in all and would barely finish, so use a funded one.
+# Nine connector calls over HTTPS. A funded key has no call limit; a TRIAL key
+# spends one of its calls on each, so use a funded one.
 #
 # Run:
 #   PAYMENT_KEY=… ./tests/connector_probe_ops_e2e.sh --apply

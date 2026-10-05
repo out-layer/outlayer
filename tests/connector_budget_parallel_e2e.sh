@@ -30,8 +30,8 @@
 #                      receive up to `max_per_day` real messages
 #
 # About `N + CAP + 6` connector calls at the defaults, roughly nineteen. A funded
-# key has no call limit; a TRIAL key is ten calls in all and cannot finish — B2
-# says so rather than blaming the counter.
+# key has no call limit; a TRIAL key counts every call and can run out mid-run —
+# B2 says so rather than blaming the counter.
 #
 # Run (dry-run prints the plan; --apply spends a little compute):
 #   PAYMENT_KEY=… ./tests/connector_budget_parallel_e2e.sh --apply
