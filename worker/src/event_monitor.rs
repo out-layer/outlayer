@@ -27,7 +27,30 @@ impl std::fmt::Display for BlockNotIndexedError {
 
 impl std::error::Error for BlockNotIndexedError {}
 
-/// Enum for different event types from contract
+/// An event of the contract, as the monitor read it from a block.
+///
+/// Every variant is classified in [`relay_decision`], and the match there is
+/// exhaustive on purpose. A block can reach the monitor LATE — older than the
+/// contract's 200-block yield window: a slow head, a restart's catch-up — and
+/// OUT OF ORDER — a deferred block read after newer ones. What is safe then
+/// differs per event. Before adding a variant, answer:
+///
+/// 1. Does the contract hold a **yield** for it? A late resume finds the yield
+///    gone and the timeout callback already settled (refunded, kept). The
+///    contract's `resume_*` must refuse a missing yield, and the worker must
+///    check that the chain TOOK the resume (`NearClient::require_taken`)
+///    before telling the coordinator anything. If the worker acts on the
+///    coordinator BEFORE the resume, a late event must be dropped.
+/// 2. Does the coordinator apply the event's **value**, or create or revive a
+///    row from it? Then an older event delivered after a newer one rewinds
+///    state: out of order, relay the chain's CURRENT state, or check the chain
+///    first — never the event's value as is.
+/// 3. Is the relay idempotent and order-free — keyed by receipt, request_id or
+///    data_id, or a re-read of the chain? Only then is it relayed as is from
+///    every delivery.
+///
+/// A top-up resumed after its yield was refunded, and credited anyway, is what
+/// skipping (1) costs.
 #[derive(Debug, Clone)]
 pub enum ContractEvent {
     ExecutionRequested(ExecutionRequestedEvent),
@@ -513,6 +536,314 @@ impl DelegatedCalls {
     }
 }
 
+/// The longest the head spends on one block, every attempt included, before
+/// the block is deferred and the head moves on.
+const HEAD_BLOCK_BUDGET: Duration = Duration::from_secs(15);
+
+/// One read of a block: the HTTP client's own timeout.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The pause between two reads of the same block inside its budget.
+const READ_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
+/// How far past an unreadable head block the monitor looks to tell one bad
+/// block from neardata being down: any of these read means the head block is
+/// the problem, none means neardata is.
+const PROBE_AHEAD_BLOCKS: u64 = 3;
+
+/// How long the head waits on neardata being down before it defers its block
+/// anyway. A range neardata has lost must not hold the head for ever; a short
+/// outage is waited out, so the blocks keep their order.
+const HEAD_OUTAGE_MAX: Duration = Duration::from_secs(300);
+
+/// The pauses between two tries of the head block while neardata is down.
+const OUTAGE_PAUSES: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+];
+
+/// The pauses between two tries of one deferred block.
+const DEFERRED_PAUSES: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
+
+/// How many blocks behind the head a deferred block is kept before it is
+/// given up — about an hour.
+const DEFERRED_MAX_AGE_BLOCKS: u64 = 3_000;
+
+/// The most blocks the queue holds; past it the oldest is given up.
+const DEFERRED_MAX_LEN: usize = 500;
+
+/// How many due deferred blocks one turn of the loop tries, and for how long
+/// at most, so the head keeps moving while the queue drains.
+const DEFERRED_PER_TURN: usize = 3;
+const DEFERRED_TURN_BUDGET: Duration = Duration::from_secs(5);
+
+/// One read of a deferred block: once, and shorter than the head's.
+const DEFERRED_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How far past an unreadable head the monitor looks for a block that reads,
+/// once neardata has not served the head for [`HEAD_OUTAGE_MAX`].
+const FAR_PROBE_STEPS: [u64; 6] = [8, 16, 32, 64, 128, 256];
+
+/// A delegated receipt normally runs one block after its `Delegate`. While a
+/// block this close before a block is unread, a call in it that may be a
+/// meta-transaction cannot be told from a contract call, and the block waits.
+const DELEGATE_LOOKBACK_BLOCKS: u64 = 10;
+
+/// An event older than this many blocks behind the chain tip is LATE: the
+/// contract's yield window is 200 blocks, and the work that answers a yield
+/// needs the rest of it.
+const LATE_AFTER_BLOCKS: u64 = 100;
+
+/// How long a read of the chain tip is reused.
+const TIP_REUSE: Duration = Duration::from_secs(10);
+
+/// How a block reached the monitor. The head reads blocks in order — a
+/// restart's catch-up too. A deferred block is read after newer ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    InOrder,
+    OutOfOrder,
+}
+
+/// How far a block is behind the chain tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Age {
+    Blocks(u64),
+    /// The tip could not be read.
+    Unknown,
+}
+
+impl Age {
+    fn is_late(self) -> Option<bool> {
+        match self {
+            Age::Blocks(blocks) => Some(blocks > LATE_AFTER_BLOCKS),
+            Age::Unknown => None,
+        }
+    }
+}
+
+/// What the monitor does with one event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Relay {
+    /// Relayed as the event says.
+    AsIs,
+    /// Relayed only while the contract still holds the request at the final
+    /// block: a request that timed out has been refunded.
+    IfPendingAtFinal,
+    /// Relayed only while the payment key exists at the final block: a key
+    /// created and then deleted must not be created again.
+    IfKeyExistsAtFinal,
+    /// The wallet's policy and freeze AT THE FINAL BLOCK are relayed instead
+    /// of the event's, which a newer event may have replaced.
+    WalletStateAtFinal,
+    /// Not decided now: delivered again later, for the reason given.
+    Later(&'static str),
+    /// Not relayed, for the reason given.
+    Drop(&'static str),
+}
+
+/// The one place each event's late and out-of-order handling is decided. No
+/// wildcard arm: a new [`ContractEvent`] does not compile until it is
+/// classified here (see the questions on [`ContractEvent`]).
+fn relay_decision(event: &ContractEvent, delivery: Delivery, age: Age) -> Relay {
+    match event {
+        // A yield. The contract refuses a late resolve and the worker reports
+        // nothing for it, so a late request is safe — but a request already
+        // refunded is not run.
+        ContractEvent::ExecutionRequested(_) => match (delivery, age.is_late()) {
+            (Delivery::InOrder, Some(false)) => Relay::AsIs,
+            _ => Relay::IfPendingAtFinal,
+        },
+        // A yield. A late resume is refused and not credited
+        // (`NearClient::require_taken`), so the chain decides; additive by
+        // `data_id`, so order is free.
+        ContractEvent::TopUpPaymentKey(e) if e.amount != "0" => Relay::AsIs,
+        // A key's creation, no yield. The coordinator creates the row, and
+        // revives a deleted one.
+        ContractEvent::TopUpPaymentKey(_) => match delivery {
+            Delivery::InOrder => Relay::AsIs,
+            Delivery::OutOfOrder => Relay::IfKeyExistsAtFinal,
+        },
+        // A yield, and the coordinator deletes the key BEFORE the resume: a
+        // delete whose yield is gone would leave the key deleted here and kept
+        // on chain. Kept on both sides instead; the owner deletes again.
+        ContractEvent::DeletePaymentKey(_) => match age.is_late() {
+            Some(false) => Relay::AsIs,
+            Some(true) => Relay::Drop("older than the yield window allows; the contract keeps the key — delete it again"),
+            None => Relay::Later("the chain tip could not be read to tell whether its yield is still open"),
+        },
+        // Values the coordinator applies as they come.
+        ContractEvent::WalletPolicyUpdated(_)
+        | ContractEvent::WalletPolicyDeleted(_)
+        | ContractEvent::WalletFrozenChanged(_) => match delivery {
+            Delivery::InOrder => Relay::AsIs,
+            Delivery::OutOfOrder => Relay::WalletStateAtFinal,
+        },
+        // Keyed by receipt; the allowance adds and the expiry extends.
+        ContractEvent::SubscriptionPurchased(_) => Relay::AsIs,
+        // The coordinator confirms the deletion on the contract; a uuid is
+        // never reused.
+        ContractEvent::ProjectStorageCleanup(_) => Relay::AsIs,
+        // Drops a cache.
+        ContractEvent::ProjectTransferred(_) => Relay::AsIs,
+    }
+}
+
+/// An execution request whose receipt has the shape of a meta-transaction —
+/// signed by one account on another's behalf — with no `Delegate` found for
+/// it: a contract call, or a meta-transaction whose delegate is unread.
+fn may_be_unattributed_meta_tx(event: &ContractEvent) -> bool {
+    match event {
+        ContractEvent::ExecutionRequested(e) => {
+            e.relayer_id.is_none()
+                && matches!((&e.signer_id, &e.predecessor_id), (Some(s), Some(p)) if s != p)
+        }
+        _ => false,
+    }
+}
+
+/// One block in the queue: unread, or read with events still to deliver.
+#[derive(Debug, Clone)]
+struct Deferred {
+    tries: usize,
+    next_try: tokio::time::Instant,
+    /// `None`: the block is unread. `Some`: it was read, and these of its
+    /// events are still to be delivered — the rest were.
+    events: Option<Vec<ContractEvent>>,
+}
+
+/// The blocks the head moved past with something undone: unread, or read
+/// with events still to deliver. Each is tried again on its own backoff and
+/// delivered OUT OF ORDER. A block is here or behind the head, never both,
+/// and an event is delivered from one place only.
+#[derive(Debug, Default)]
+struct DeferredBlocks {
+    blocks: std::collections::BTreeMap<u64, Deferred>,
+}
+
+/// A block the queue gave up, and its events still undelivered if it was read.
+type GivenUp = (u64, Option<Vec<ContractEvent>>);
+
+impl DeferredBlocks {
+    /// Add `height` unread, due after the first pause. Returns the block given
+    /// up to make room, if the queue was full.
+    fn defer(&mut self, height: u64, now: tokio::time::Instant) -> Option<GivenUp> {
+        self.insert(height, None, now)
+    }
+
+    /// Add `height` read, with `events` still to deliver.
+    fn keep(&mut self, height: u64, events: Vec<ContractEvent>, now: tokio::time::Instant) -> Option<GivenUp> {
+        self.insert(height, Some(events), now)
+    }
+
+    fn insert(&mut self, height: u64, events: Option<Vec<ContractEvent>>, now: tokio::time::Instant) -> Option<GivenUp> {
+        self.blocks.insert(height, Deferred { tries: 0, next_try: now + DEFERRED_PAUSES[0], events });
+        if self.blocks.len() > DEFERRED_MAX_LEN {
+            return self.blocks.pop_first().map(|(h, d)| (h, d.events));
+        }
+        None
+    }
+
+    /// The oldest blocks due by `now`, at most `limit`.
+    fn due(&self, now: tokio::time::Instant, limit: usize) -> Vec<u64> {
+        self.blocks.iter().filter(|(_, d)| d.next_try <= now).map(|(h, _)| *h).take(limit).collect()
+    }
+
+    /// The events still to deliver from `height`, `None` while it is unread.
+    fn events(&self, height: u64) -> Option<Vec<ContractEvent>> {
+        self.blocks.get(&height).and_then(|d| d.events.clone())
+    }
+
+    /// `height` is not done: due after the next pause, with `events` still to
+    /// deliver if it has been read.
+    fn retry_later(&mut self, height: u64, events: Option<Vec<ContractEvent>>, now: tokio::time::Instant) {
+        if let Some(d) = self.blocks.get_mut(&height) {
+            d.tries += 1;
+            d.next_try = now + DEFERRED_PAUSES[d.tries.min(DEFERRED_PAUSES.len() - 1)];
+            if events.is_some() {
+                d.events = events;
+            }
+        }
+    }
+
+    fn remove(&mut self, height: u64) {
+        self.blocks.remove(&height);
+    }
+
+    /// Give up the unread blocks more than [`DEFERRED_MAX_AGE_BLOCKS`] behind
+    /// `head`, and the read ones twice as far. The blocks that waited for an
+    /// unread one given up are tried at once.
+    fn expire(&mut self, head: u64, now: tokio::time::Instant) -> Vec<GivenUp> {
+        let unread_cutoff = head.saturating_sub(DEFERRED_MAX_AGE_BLOCKS);
+        let read_cutoff = head.saturating_sub(2 * DEFERRED_MAX_AGE_BLOCKS);
+        let gone: Vec<u64> = self
+            .blocks
+            .iter()
+            .filter(|(h, d)| match d.events {
+                None => **h < unread_cutoff,
+                Some(_) => **h < read_cutoff,
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        let mut given_up = Vec::new();
+        for height in gone {
+            if let Some(d) = self.blocks.remove(&height) {
+                if d.events.is_none() {
+                    for (_, waiting) in self.blocks.range_mut(height + 1..=height + DELEGATE_LOOKBACK_BLOCKS) {
+                        waiting.next_try = now;
+                    }
+                }
+                given_up.push((height, d.events));
+            }
+        }
+        given_up
+    }
+
+    /// Whether an UNREAD block lies in `[height − DELEGATE_LOOKBACK_BLOCKS, height)`.
+    fn unread_just_before(&self, height: u64) -> bool {
+        self.blocks
+            .range(height.saturating_sub(DELEGATE_LOOKBACK_BLOCKS)..height)
+            .any(|(_, d)| d.events.is_none())
+    }
+
+    fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn heights(&self) -> Vec<u64> {
+        self.blocks.keys().copied().collect()
+    }
+}
+
+/// What one read of a block found.
+enum Scan {
+    Events(Vec<ContractEvent>),
+    /// neardata has not indexed it yet (404): wait for it.
+    NotIndexed,
+    /// It could not be read now. The text names what failed and never quotes
+    /// the URL, which can carry an API key.
+    Unreadable(String),
+}
+
+/// What is left of a block after delivering it.
+struct Leftover {
+    /// The events not delivered yet. Every other event of the block was
+    /// relayed, refused or dropped for good, and is not delivered again.
+    events: Vec<ContractEvent>,
+    why: String,
+    /// Some of them wait for an older block still unread: holding the block
+    /// in place cannot help.
+    waits: bool,
+}
+
 /// NEAR RPC block response (simplified, only what we need)
 #[derive(Debug, Deserialize)]
 struct NearRpcBlockResponse {
@@ -571,6 +902,10 @@ pub struct EventMonitor {
     shared_block_height: Arc<AtomicU64>,
     /// Receipts to this contract made by a `Delegate` action.
     delegated: std::sync::Mutex<DelegatedCalls>,
+    /// Blocks the head moved past unread.
+    deferred: DeferredBlocks,
+    /// The last chain tip read, and when.
+    tip: std::sync::Mutex<Option<(u64, tokio::time::Instant)>>,
 }
 
 impl EventMonitor {
@@ -693,6 +1028,8 @@ impl EventMonitor {
             event_filter_min_version: parsed_min_version,
             shared_block_height,
             delegated: std::sync::Mutex::new(DelegatedCalls::default()),
+            deferred: DeferredBlocks::default(),
+            tip: std::sync::Mutex::new(None),
         })
     }
 
@@ -735,7 +1072,14 @@ impl EventMonitor {
         Ok(height)
     }
 
-    /// Start continuous monitoring of new blocks
+    /// Start continuous monitoring of new blocks.
+    ///
+    /// The head reads blocks in order and never waits on one block for more
+    /// than [`HEAD_BLOCK_BUDGET`]: a block it cannot read is deferred and read
+    /// again on its own backoff, delivered out of order (see
+    /// [`relay_decision`]). When the blocks after it cannot be read either,
+    /// neardata is down rather than the block: the head waits, so the blocks
+    /// keep their order, for up to [`HEAD_OUTAGE_MAX`].
     pub async fn start_monitoring(&mut self) -> Result<()> {
         info!(
             "Starting event monitoring from block {} for contract {}",
@@ -744,208 +1088,538 @@ impl EventMonitor {
 
         let start_block = self.current_block;
         self.backfill_delegated(start_block).await;
-        let mut retry_count = 0;
         let mut wait_for_block_count = 0u32; // Counter for "waiting for block" logging
-        const MAX_RETRIES: u32 = 3;
-        // How many times a block has been held because a MONEY event could not
-        // be relayed. Bounded so one event the coordinator will never accept
-        // cannot stop the monitor from ever scanning again.
-        let mut relay_retry_count = 0u32;
+        // How many times the head holds a block whose events could not all be
+        // relayed for a reason that may pass, before it defers what is left.
         const MAX_RELAY_RETRIES: u32 = 12;
+        // Since when neardata has been down, and how many pauses the head has
+        // taken in it.
+        let mut outage: Option<(tokio::time::Instant, usize)> = None;
 
         loop {
-            // Set when an event that MOVES MONEY could not be relayed for a
-            // reason that may pass. See the hold below.
-            let mut hold_for_relay = false;
+            self.serve_deferred().await;
 
-            match self.scan_single_block(self.current_block).await {
-                Ok(events) => {
+            let head = self.current_block;
+            match self.scan_within(head, HEAD_BLOCK_BUDGET).await {
+                Scan::NotIndexed => {
+                    wait_for_block_count += 1;
+                    if wait_for_block_count == 1 || wait_for_block_count % 50 == 0 {
+                        info!("⏳ Waiting for block {} (not indexed by neardata yet)", head);
+                    }
+                    sleep(Duration::from_millis(200)).await;
+                }
+                Scan::Events(events) => {
+                    wait_for_block_count = 0;
+                    outage = None;
                     self.blocks_scanned += 1;
-                    retry_count = 0; // Reset retry counter on success
-                    wait_for_block_count = 0; // Reset wait counter on success
+                    self.count_events(head, &events);
 
-                    if !events.is_empty() {
-                        self.events_found += events.len() as u64;
-                        let system_count = events.iter().filter(|e| !matches!(e, ContractEvent::ExecutionRequested(_))).count();
-                        if system_count > 0 {
-                            self.system_events_found += system_count as u64;
+                    // Hold the block while what is left of it may still go
+                    // through in order — only the events not relayed yet are
+                    // delivered again. Bounded: after that they are deferred
+                    // and delivered out of order.
+                    let mut left = self.deliver(head, events, Delivery::InOrder).await;
+                    let mut holds = 0;
+                    while let Some(l) = left.take() {
+                        if l.waits || holds + 1 >= MAX_RELAY_RETRIES {
+                            warn!("Block {}: {} event(s) deferred: {}", head, l.events.len(), l.why);
+                            self.keep(head, l.events);
+                            break;
                         }
-                        info!(
-                            "📦 Block {}: Found {} events ({} execution, {} system) — total: {} events in {} blocks",
-                            self.current_block,
-                            events.len(),
-                            events.len() - system_count,
-                            system_count,
-                            self.events_found,
-                            self.blocks_scanned
-                        );
+                        holds += 1;
+                        warn!("Holding block {} ({}); delivering what is left again", head, l.why);
+                        sleep(Duration::from_secs(5)).await;
+                        left = self.deliver(head, l.events, Delivery::InOrder).await;
                     }
-
-                    // Process found events
-                    for event in events {
-                        match event {
-                            ContractEvent::ExecutionRequested(exec_event) => {
-                                if let Err(e) = self.handle_execution_requested(exec_event).await {
-                                    error!("Failed to handle execution_requested event: {}", e);
-                                }
-                            }
-                            ContractEvent::ProjectStorageCleanup(cleanup_event) => {
-                                if let Err(e) = self.handle_project_storage_cleanup(cleanup_event).await {
-                                    error!("Failed to handle project_storage_cleanup event: {}", e);
-                                }
-                            }
-                            ContractEvent::ProjectTransferred(transfer_event) => {
-                                if let Err(e) = self.handle_project_transferred(transfer_event).await {
-                                    error!("Failed to handle project_transferred event: {}", e);
-                                }
-                            }
-                            ContractEvent::TopUpPaymentKey(topup_event) => {
-                                if let Err(e) = self.handle_topup_payment_key(topup_event).await {
-                                    error!("Failed to handle topup_payment_key event: {}", e);
-                                }
-                            }
-                            ContractEvent::DeletePaymentKey(delete_event) => {
-                                if let Err(e) = self.handle_delete_payment_key(delete_event).await {
-                                    error!("Failed to handle delete_payment_key event: {}", e);
-                                }
-                            }
-                            ContractEvent::WalletPolicyUpdated(event) => {
-                                if let Err(e) = self.handle_wallet_policy_updated(event).await {
-                                    error!("Failed to handle wallet_policy_updated event: {}", e);
-                                }
-                            }
-                            ContractEvent::WalletPolicyDeleted(event) => {
-                                if let Err(e) = self.handle_wallet_policy_deleted(event).await {
-                                    error!("Failed to handle wallet_policy_deleted event: {}", e);
-                                }
-                            }
-                            ContractEvent::WalletFrozenChanged(event) => {
-                                if let Err(e) = self.handle_wallet_frozen_changed(event).await {
-                                    error!("Failed to handle wallet_frozen_changed event: {}", e);
-                                }
-                            }
-                            ContractEvent::SubscriptionPurchased(event) => {
-                                // The one event where dropping the relay costs a
-                                // customer money. Their transaction has already
-                                // succeeded and the contract has already kept the
-                                // payment: there is no yield left to time out, so
-                                // if this does not reach the coordinator the
-                                // allowance is simply never granted, and nobody
-                                // finds out but the customer.
-                                if let Err(e) = self.handle_subscription_purchased(event).await {
-                                    if crate::api_client::TerminalRelay::is_terminal(&e) {
-                                        error!(
-                                            "Subscription purchase REFUSED by the coordinator, \
-                                             giving up on it: {:#}",
-                                            e
-                                        );
-                                    } else {
-                                        error!(
-                                            "Subscription purchase could not be relayed, \
-                                             holding block {}: {:#}",
-                                            self.current_block, e
-                                        );
-                                        hold_for_relay = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Hold the block when a money event could not be relayed.
-                    //
-                    // Re-processing a block is safe: a task is keyed by
-                    // `request_id`, a top-up by `data_id`, a purchase by its
-                    // receipt — every relay in here is idempotent, which is why
-                    // the runbook already prescribes a re-scan as the recovery.
-                    // So the cheap move is to stay put until the coordinator is
-                    // back, rather than walk past a payment that has already
-                    // been taken.
-                    //
-                    // Bounded, because a transient failure that is not transient
-                    // must not stop the monitor forever: after enough attempts
-                    // the block moves on and the loss is at least a loud line
-                    // with the receipt in it.
-                    if hold_for_relay {
-                        relay_retry_count += 1;
-                        if relay_retry_count < MAX_RELAY_RETRIES {
-                            // The same pause the loop already takes for a block
-                            // it could not scan — this is the same situation:
-                            // something downstream is briefly unavailable.
-                            sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
-                        error!(
-                            "Giving up on block {} after {} failed relay attempts. A \
-                             subscription purchase in it has NOT been granted — replay its \
-                             receipt to /internal/subscription-purchased.",
-                            self.current_block, relay_retry_count
-                        );
-                    }
-                    relay_retry_count = 0;
-
-                    // Move to next block
-                    self.current_block += 1;
-                    self.shared_block_height.store(self.current_block, Ordering::Relaxed);
-
-                    // Log progress every 100 blocks
-                    if self.blocks_scanned % 100 == 0 {
-                        info!(
-                            "📊 Progress: Scanned blocks {}-{} ({} blocks, {} events: {} execution, {} system)",
-                            start_block,
-                            self.current_block - 1,
-                            self.blocks_scanned,
-                            self.events_found,
-                            self.events_found - self.system_events_found,
-                            self.system_events_found
-                        );
-                    }
+                    self.advance();
 
                     // Brief pause between blocks (if configured)
                     if self.scan_interval_ms > 0 {
                         sleep(Duration::from_millis(self.scan_interval_ms)).await;
                     }
                 }
-                Err(e) => {
-                    // Check if this is a "block not indexed" error - should wait, not skip
-                    if e.downcast_ref::<BlockNotIndexedError>().is_some() {
-                        // Block not indexed by neardata yet - wait and retry
-                        // DO NOT increment current_block here - that was the bug!
-                        wait_for_block_count += 1;
-                        if wait_for_block_count == 1 || wait_for_block_count % 50 == 0 {
-                            info!(
-                                "⏳ Waiting for block {} (not indexed by neardata yet)",
-                                self.current_block
-                            );
+                Scan::Unreadable(why) => {
+                    wait_for_block_count = 0;
+                    warn!("❌ Block {} not read within {:?}: {}", head, HEAD_BLOCK_BUDGET, why);
+                    if let Some(readable) = self.probe_ahead(head).await {
+                        // The blocks after it read: the problem is this block.
+                        outage = None;
+                        for height in head..readable {
+                            self.defer(height);
                         }
-                        // Wait 200ms before retry
-                        sleep(Duration::from_millis(200)).await;
+                        self.set_head(readable);
                         continue;
                     }
-
-                    // Regular error - use retry logic
-                    retry_count += 1;
-                    error!(
-                        "❌ Error scanning block {} (attempt {}/{}): {}",
-                        self.current_block, retry_count, MAX_RETRIES, e
+                    let now = tokio::time::Instant::now();
+                    let since = outage.get_or_insert((now, 0)).0;
+                    if now.duration_since(since) >= HEAD_OUTAGE_MAX {
+                        if let Some(tip) = self.chain_tip().await.filter(|tip| head < *tip) {
+                            // A range neardata has lost, or a long outage: look
+                            // further for a block that reads, below the tip.
+                            let next = self.probe_far(head, tip).await.unwrap_or(head + 1);
+                            error!(
+                                "Blocks {}..{} unreadable for {:?}; deferring them and moving the head to {}",
+                                head, next, HEAD_OUTAGE_MAX, next
+                            );
+                            for height in head..next {
+                                self.defer(height);
+                            }
+                            self.set_head(next);
+                            outage = Some((now, 0));
+                            continue;
+                        }
+                    }
+                    let (since, pauses) = outage.get_or_insert((now, 0));
+                    let pause = OUTAGE_PAUSES[(*pauses).min(OUTAGE_PAUSES.len() - 1)];
+                    *pauses += 1;
+                    warn!(
+                        "neardata does not serve block {} or the {} after it; waiting {:?} (down for {:?})",
+                        head, PROBE_AHEAD_BLOCKS, pause, now.duration_since(*since)
                     );
+                    sleep(pause).await;
+                }
+            }
+        }
+    }
 
-                    if retry_count >= MAX_RETRIES {
-                        warn!(
-                            "⚠️  Skipping block {} after {} failed attempts",
-                            self.current_block, MAX_RETRIES
+    fn count_events(&mut self, height: u64, events: &[ContractEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        self.events_found += events.len() as u64;
+        let system_count = events.iter().filter(|e| !matches!(e, ContractEvent::ExecutionRequested(_))).count();
+        self.system_events_found += system_count as u64;
+        info!(
+            "📦 Block {}: Found {} events ({} execution, {} system) — total: {} events in {} blocks",
+            height,
+            events.len(),
+            events.len() - system_count,
+            system_count,
+            self.events_found,
+            self.blocks_scanned
+        );
+    }
+
+    /// Move the head to the next block.
+    fn advance(&mut self) {
+        self.set_head(self.current_block + 1);
+
+        // Log progress every 100 blocks
+        if self.blocks_scanned % 100 == 0 {
+            info!(
+                "📊 Progress: head {} ({} blocks scanned, {} events: {} execution, {} system)",
+                self.current_block,
+                self.blocks_scanned,
+                self.events_found,
+                self.events_found - self.system_events_found,
+                self.system_events_found
+            );
+            if self.deferred.len() > 0 {
+                warn!("📊 Deferred blocks not done yet: {:?}", self.deferred.heights());
+            }
+        }
+    }
+
+    fn set_head(&mut self, height: u64) {
+        self.current_block = height;
+        self.shared_block_height.store(height, Ordering::Relaxed);
+    }
+
+    /// Queue `height` unread.
+    fn defer(&mut self, height: u64) {
+        warn!("⏸️  Deferring block {} unread (queue: {})", height, self.deferred.len() + 1);
+        let given_up = self.deferred.defer(height, tokio::time::Instant::now());
+        Self::log_given_up(given_up, "the queue is full");
+    }
+
+    /// Queue `height`, read, with `events` still to deliver.
+    fn keep(&mut self, height: u64, events: Vec<ContractEvent>) {
+        let given_up = self.deferred.keep(height, events, tokio::time::Instant::now());
+        Self::log_given_up(given_up, "the queue is full");
+    }
+
+    fn log_given_up(given_up: Option<GivenUp>, why: &str) {
+        match given_up {
+            None => {}
+            Some((height, None)) => error!(
+                "⚠️  Giving up deferred block {} ({}): never read — its events are NOT delivered",
+                height, why
+            ),
+            Some((height, Some(events))) => error!(
+                "⚠️  Giving up deferred block {} ({}): these events are NOT delivered: {:?}",
+                height, why, events
+            ),
+        }
+    }
+
+    /// Try the due deferred blocks, oldest first, for at most
+    /// [`DEFERRED_TURN_BUDGET`], and deliver them out of order.
+    async fn serve_deferred(&mut self) {
+        let started = tokio::time::Instant::now();
+        for given_up in self.deferred.expire(self.current_block, started) {
+            Self::log_given_up(Some(given_up), "too far behind the head");
+        }
+        for height in self.deferred.due(started, DEFERRED_PER_TURN) {
+            if started.elapsed() >= DEFERRED_TURN_BUDGET {
+                break;
+            }
+            let events = match self.deferred.events(height) {
+                Some(events) => Ok(events),
+                None => match self.scan_once(height, DEFERRED_READ_TIMEOUT).await {
+                    Scan::Events(events) => {
+                        self.blocks_scanned += 1;
+                        self.count_events(height, &events);
+                        Ok(events)
+                    }
+                    Scan::NotIndexed => Err("not indexed by neardata".to_string()),
+                    Scan::Unreadable(why) => Err(why),
+                },
+            };
+            let now = tokio::time::Instant::now();
+            match events {
+                Err(why) => {
+                    self.deferred.retry_later(height, None, now);
+                    warn!("Deferred block {} still unread: {}", height, why);
+                }
+                Ok(events) => match self.deliver(height, events, Delivery::OutOfOrder).await {
+                    None => {
+                        self.deferred.remove(height);
+                        info!("✅ Deferred block {} delivered (queue: {})", height, self.deferred.len());
+                    }
+                    Some(left) => {
+                        warn!("Deferred block {}: {} event(s) not delivered yet: {}", height, left.events.len(), left.why);
+                        self.deferred.retry_later(height, Some(left.events), now);
+                    }
+                },
+            }
+        }
+    }
+
+    /// The first of the blocks after `head` that reads, if one does before a
+    /// block not indexed yet.
+    async fn probe_ahead(&self, head: u64) -> Option<u64> {
+        for height in head + 1..=head + PROBE_AHEAD_BLOCKS {
+            match self.read_once(height, READ_TIMEOUT).await {
+                Ok(_) => return Some(height),
+                Err(e) if e.downcast_ref::<BlockNotIndexedError>().is_some() => return None,
+                Err(_) => {}
+            }
+        }
+        None
+    }
+
+    /// A block below `tip`, further than [`probe_ahead`](Self::probe_ahead)
+    /// looks, that reads.
+    async fn probe_far(&self, head: u64, tip: u64) -> Option<u64> {
+        for step in FAR_PROBE_STEPS {
+            let height = head + step;
+            if height >= tip {
+                return None;
+            }
+            if self.read_once(height, READ_TIMEOUT).await.is_ok() {
+                return Some(height);
+            }
+        }
+        None
+    }
+
+    /// The final block's height, read at most every [`TIP_REUSE`].
+    async fn chain_tip(&self) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        if let Some((tip, at)) = *self.tip.lock().unwrap_or_else(|e| e.into_inner()) {
+            if now.duration_since(at) < TIP_REUSE {
+                return Some(tip);
+            }
+        }
+        let request = methods::block::RpcBlockRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+        };
+        match tokio::time::timeout(READ_TIMEOUT, self.rpc_client.call(request)).await {
+            Ok(Ok(block)) => {
+                let tip = block.header.height;
+                *self.tip.lock().unwrap_or_else(|e| e.into_inner()) = Some((tip, now));
+                Some(tip)
+            }
+            _ => {
+                warn!("The chain tip could not be read from the RPC");
+                None
+            }
+        }
+    }
+
+    async fn age_of(&self, height: u64) -> Age {
+        match self.chain_tip().await {
+            Some(tip) => Age::Blocks(tip.saturating_sub(height)),
+            None => Age::Unknown,
+        }
+    }
+
+    /// Read and scan `height` once, within `timeout`.
+    async fn scan_once(&self, height: u64, timeout: Duration) -> Scan {
+        match self.read_once(height, timeout).await {
+            Ok(block) => match block.shards {
+                None => Scan::Events(vec![]),
+                Some(shards) => match self.process_shards(&shards, height) {
+                    Ok(events) => Scan::Events(events),
+                    Err(e) => Scan::Unreadable(e.to_string()),
+                },
+            },
+            Err(e) if e.downcast_ref::<BlockNotIndexedError>().is_some() => Scan::NotIndexed,
+            // `{}`, not `{:#}`: the cause of a transport error quotes the
+            // URL, which can carry an API key.
+            Err(e) => Scan::Unreadable(e.to_string()),
+        }
+    }
+
+    /// Read and scan `height`, trying again within `budget` wall-clock.
+    async fn scan_within(&self, height: u64, budget: Duration) -> Scan {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let scan = self.scan_once(height, READ_TIMEOUT.min(left)).await;
+            let Scan::Unreadable(why) = scan else { return scan };
+            if deadline.saturating_duration_since(tokio::time::Instant::now()) <= READ_RETRY_PAUSE {
+                return Scan::Unreadable(why);
+            }
+            sleep(READ_RETRY_PAUSE).await;
+        }
+    }
+
+    /// Relay the events of block `height` as [`relay_decision`] says, and
+    /// return what is left: the events a later delivery may still get
+    /// through. Everything else is done and is never delivered again.
+    async fn deliver(&self, height: u64, events: Vec<ContractEvent>, delivery: Delivery) -> Option<Leftover> {
+        if events.is_empty() {
+            return None;
+        }
+        // A meta-transaction is told from a contract call by the `Delegate`
+        // in an earlier block. With such a block unread, a call of that shape
+        // would be judged by the wrong door and run as the relayer: it waits.
+        let (waiting, events): (Vec<ContractEvent>, Vec<ContractEvent>) = if self.deferred.unread_just_before(height) {
+            events.into_iter().partition(may_be_unattributed_meta_tx)
+        } else {
+            (Vec::new(), events)
+        };
+        let mut again = Vec::new();
+        let mut why = None;
+        if !events.is_empty() {
+            let age = self.age_of(height).await;
+            for event in events {
+                let decision = relay_decision(&event, delivery, age);
+                if let Err(e) = self.relay(event.clone(), decision, height, age).await {
+                    why = Some(e);
+                    again.push(event);
+                }
+            }
+        }
+        if waiting.is_empty() && again.is_empty() {
+            return None;
+        }
+        let waits = !waiting.is_empty();
+        let why = match (waits, why) {
+            (true, None) => format!(
+                "{} call(s) that may be meta-transactions wait for an unread block of the {} before it",
+                waiting.len(),
+                DELEGATE_LOOKBACK_BLOCKS
+            ),
+            (true, Some(why)) => format!(
+                "{} call(s) wait for an unread block before it; {}",
+                waiting.len(),
+                why
+            ),
+            (false, why) => why.unwrap_or_default(),
+        };
+        again.extend(waiting);
+        Some(Leftover { events: again, why, waits })
+    }
+
+    /// Carry out one decision. `Err` is a failure a later delivery of the
+    /// event can get past.
+    async fn relay(&self, event: ContractEvent, decision: Relay, height: u64, age: Age) -> std::result::Result<(), String> {
+        match decision {
+            Relay::AsIs => self.relay_as_is(event, height).await,
+            Relay::Later(why) => Err(why.to_string()),
+            Relay::Drop(why) => {
+                error!("⛔ Block {} ({:?} behind the tip): not relaying {:?}: {}", height, age, event, why);
+                Ok(())
+            }
+            Relay::IfPendingAtFinal => {
+                let ContractEvent::ExecutionRequested(exec_event) = event else {
+                    return Err(format!("IfPendingAtFinal is not a decision for {:?}", event));
+                };
+                let request_id = serde_json::from_str::<RequestData>(&exec_event.request_data)
+                    .map_err(|e| format!("execution_requested at block {}: request_data does not parse: {}", height, e))?
+                    .request_id;
+                let (request, final_height) = self
+                    .view_final("get_request", &serde_json::json!({ "request_id": request_id }))
+                    .await
+                    .map_err(|e| format!("request {} not read at the final block: {}", request_id, e))?;
+                if final_height < height {
+                    return Err(format!("the RPC's final block {} is behind block {}", final_height, height));
+                }
+                if request.is_null() {
+                    warn!(
+                        "Dropping execution_requested for request_id={}: block {} is late or read out of order, and at final block {} the request is no longer pending — it was resolved or timed out and refunded",
+                        request_id, height, final_height
+                    );
+                    return Ok(());
+                }
+                if let Err(e) = self.handle_execution_requested(exec_event).await {
+                    error!("Failed to handle execution_requested event: {}", e);
+                }
+                Ok(())
+            }
+            Relay::IfKeyExistsAtFinal => {
+                let ContractEvent::TopUpPaymentKey(topup) = event else {
+                    return Err(format!("IfKeyExistsAtFinal is not a decision for {:?}", event));
+                };
+                let (exists, final_height) = self
+                    .payment_key_exists_at_final(&topup.owner, topup.nonce)
+                    .await
+                    .map_err(|e| format!("payment key {}:{} not read at the final block: {}", topup.owner, topup.nonce, e))?;
+                if final_height < height {
+                    return Err(format!("the RPC's final block {} is behind block {}", final_height, height));
+                }
+                if !exists {
+                    warn!(
+                        "Block {}: payment key {}:{} was created and is gone at final block {}; its creation is not relayed",
+                        height, topup.owner, topup.nonce, final_height
+                    );
+                    return Ok(());
+                }
+                if let Err(e) = self.handle_topup_payment_key(topup).await {
+                    error!("Failed to handle topup_payment_key event: {}", e);
+                }
+                Ok(())
+            }
+            Relay::WalletStateAtFinal => {
+                let (wallet_pubkey, owner) = match &event {
+                    ContractEvent::WalletPolicyUpdated(e) => (e.wallet_pubkey.clone(), e.owner.clone()),
+                    ContractEvent::WalletPolicyDeleted(e) => (e.wallet_pubkey.clone(), e.owner.clone()),
+                    ContractEvent::WalletFrozenChanged(e) => (e.wallet_pubkey.clone(), e.owner.clone()),
+                    other => return Err(format!("WalletStateAtFinal is not a decision for {:?}", other)),
+                };
+                // The head has relayed every block below it in order; the
+                // state relayed now must be no older than those.
+                let not_before = height.max(self.current_block.saturating_sub(1));
+                self.relay_wallet_state_at_final(&wallet_pubkey, &owner, not_before)
+                    .await
+                    .map_err(|e| format!("wallet {} not synced from the final block: {}", wallet_pubkey, e))
+            }
+        }
+    }
+
+    /// Relay an event as it says. `Err` only for a failure the event is
+    /// delivered again for; every other failure is logged, as delivering it
+    /// again cannot help.
+    async fn relay_as_is(&self, event: ContractEvent, height: u64) -> std::result::Result<(), String> {
+        match event {
+            ContractEvent::ExecutionRequested(exec_event) => {
+                if let Err(e) = self.handle_execution_requested(exec_event).await {
+                    error!("Failed to handle execution_requested event: {}", e);
+                }
+            }
+            ContractEvent::ProjectStorageCleanup(cleanup_event) => {
+                if let Err(e) = self.handle_project_storage_cleanup(cleanup_event).await {
+                    error!("Failed to handle project_storage_cleanup event: {}", e);
+                }
+            }
+            ContractEvent::ProjectTransferred(transfer_event) => {
+                if let Err(e) = self.handle_project_transferred(transfer_event).await {
+                    error!("Failed to handle project_transferred event: {}", e);
+                }
+            }
+            ContractEvent::TopUpPaymentKey(topup_event) => {
+                if let Err(e) = self.handle_topup_payment_key(topup_event).await {
+                    error!("Failed to handle topup_payment_key event: {}", e);
+                }
+            }
+            ContractEvent::DeletePaymentKey(delete_event) => {
+                if let Err(e) = self.handle_delete_payment_key(delete_event).await {
+                    error!("Failed to handle delete_payment_key event: {}", e);
+                }
+            }
+            ContractEvent::WalletPolicyUpdated(event) => {
+                if let Err(e) = self.handle_wallet_policy_updated(event).await {
+                    error!("Failed to handle wallet_policy_updated event: {}", e);
+                }
+            }
+            ContractEvent::WalletPolicyDeleted(event) => {
+                if let Err(e) = self.handle_wallet_policy_deleted(event).await {
+                    error!("Failed to handle wallet_policy_deleted event: {}", e);
+                }
+            }
+            ContractEvent::WalletFrozenChanged(event) => {
+                if let Err(e) = self.handle_wallet_frozen_changed(event).await {
+                    error!("Failed to handle wallet_frozen_changed event: {}", e);
+                }
+            }
+            ContractEvent::SubscriptionPurchased(event) => {
+                // The one event where dropping the relay costs a
+                // customer money. Their transaction has already
+                // succeeded and the contract has already kept the
+                // payment: there is no yield left to time out, so
+                // if this does not reach the coordinator the
+                // allowance is simply never granted, and nobody
+                // finds out but the customer.
+                if let Err(e) = self.handle_subscription_purchased(event).await {
+                    if crate::api_client::TerminalRelay::is_terminal(&e) {
+                        error!(
+                            "Subscription purchase REFUSED by the coordinator, \
+                             giving up on it: {:#}",
+                            e
                         );
-                        // Skip to next block
-                        self.current_block += 1;
-                        retry_count = 0;
-                        sleep(Duration::from_secs(1)).await;
                     } else {
-                        // Wait before retrying same block
-                        sleep(Duration::from_secs(5)).await;
+                        error!(
+                            "Subscription purchase in block {} could not be relayed: {:#}",
+                            height, e
+                        );
+                        return Err("a subscription purchase could not be relayed".to_string());
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Relay the wallet's policy and freeze as the final block holds them,
+    /// instead of an event a newer one may have replaced: the coordinator
+    /// applies what it is sent. No policy on chain is a deletion. A final
+    /// block below `not_before` may predate what was already relayed, and is
+    /// no answer.
+    async fn relay_wallet_state_at_final(&self, wallet_pubkey: &str, event_owner: &str, not_before: u64) -> Result<()> {
+        let (policy, at) = self
+            .view_final("get_wallet_policy", &serde_json::json!({ "wallet_pubkey": wallet_pubkey }))
+            .await?;
+        if at < not_before {
+            anyhow::bail!("the RPC's final block {} is behind block {}", at, not_before);
+        }
+        if policy.is_null() {
+            info!("🔁 Wallet {}: no policy at final block {}; relaying the deletion", wallet_pubkey, at);
+            return self.api_client.notify_wallet_policy_deleted(wallet_pubkey, event_owner).await;
+        }
+        let owner = policy.get("owner").and_then(Value::as_str).context("get_wallet_policy: no owner")?;
+        let encrypted_data = policy
+            .get("encrypted_data")
+            .and_then(Value::as_str)
+            .context("get_wallet_policy: no encrypted_data")?;
+        let frozen = policy.get("frozen").and_then(Value::as_bool).context("get_wallet_policy: no frozen")?;
+        info!("🔁 Wallet {}: relaying the policy at final block {} (frozen={})", wallet_pubkey, at, frozen);
+        self.api_client
+            .notify_wallet_policy_updated(wallet_pubkey, owner, encrypted_data, frozen)
+            .await
+    }
+
+    /// Whether the payment key `owner`:`nonce` exists at the final block, and
+    /// that block's height.
+    async fn payment_key_exists_at_final(&self, owner: &str, nonce: u32) -> Result<(bool, u64)> {
+        let args = serde_json::json!({
+            "accessor": { "System": "PaymentKey" },
+            "profile": nonce.to_string(),
+            "owner": owner,
+        });
+        let (exists, at) = self.view_final("secrets_exist", &args).await?;
+        Ok((exists.as_bool().context("secrets_exist answered something other than a bool")?, at))
     }
 
     /// Read the blocks just before `start_block` for `Delegate` actions only.
@@ -953,7 +1627,7 @@ impl EventMonitor {
     /// whose delegate ran in it is read as a contract call.
     async fn backfill_delegated(&self, start_block: u64) {
         for block_id in start_block.saturating_sub(DELEGATED_BACKFILL_BLOCKS)..start_block {
-            match self.load_block(block_id).await {
+            match self.read_once(block_id, READ_TIMEOUT).await {
                 Ok(block) => {
                     let mut delegated = self.delegated.lock().unwrap_or_else(|e| e.into_inner());
                     for shard in block.shards.iter().flatten() {
@@ -967,34 +1641,15 @@ impl EventMonitor {
         }
     }
 
-    /// Scan a single block for contract events
-    async fn scan_single_block(&self, block_id: u64) -> Result<Vec<ContractEvent>> {
-        let block_data = self.load_block(block_id).await?;
-
-        if block_data.shards.is_none() {
-            return Ok(vec![]);
-        }
-
-        let events = self.process_shards(&block_data.shards.unwrap(), block_id)?;
-
-        if !events.is_empty() {
-            info!(
-                "Block {}: found {} contract events",
-                block_id,
-                events.len()
-            );
-        }
-
-        Ok(events)
-    }
-
-    /// Load block data from neardata.xyz API
-    async fn load_block(&self, block_id: u64) -> Result<BlockData> {
+    /// Load block data from neardata.xyz API, the whole read — body
+    /// included — within `timeout`.
+    async fn read_once(&self, block_id: u64, timeout: Duration) -> Result<BlockData> {
         let url = self.neardata_api_url.replace("{block_id}", &block_id.to_string());
 
         let response = self
             .http_client
             .get(&url)
+            .timeout(timeout)
             .send()
             .await
             .context("Failed to fetch block")?;
@@ -2615,7 +3270,7 @@ mod tests {
     }
 
     /// A monitor that is only asked to parse logs: nothing in it is contacted.
-    fn parsing_monitor() -> EventMonitor {
+    pub(super) fn parsing_monitor() -> EventMonitor {
         EventMonitor {
             api_client: ApiClient::new("http://127.0.0.1:9".to_string(), "t".to_string()).unwrap(),
             neardata_api_url: "http://127.0.0.1:9".to_string(),
@@ -2632,6 +3287,8 @@ mod tests {
             event_filter_min_version: EventMonitor::parse_semver("1.0.0"),
             shared_block_height: Arc::new(AtomicU64::new(0)),
             delegated: std::sync::Mutex::new(DelegatedCalls::default()),
+            deferred: DeferredBlocks::default(),
+            tip: std::sync::Mutex::new(None),
         }
     }
 
@@ -2886,5 +3543,407 @@ mod tests {
         let total: Duration = VIEW_RETRY_DELAYS.iter().sum();
         assert_eq!(VIEW_RETRY_DELAYS.len() + 1, 5);
         assert_eq!(total, Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod late_and_out_of_order {
+    //! A block can reach the monitor late (older than the yield window) or
+    //! out of order (a deferred block read after newer ones). What each event
+    //! may do then is decided in one place, and the queue that holds the
+    //! unread blocks keeps each block once and gives up only what it says.
+    use super::*;
+    use tokio::time::Instant;
+
+    const OWNER: &str = "alice.testnet";
+    const ON_TIME: Age = Age::Blocks(LATE_AFTER_BLOCKS);
+    const LATE: Age = Age::Blocks(LATE_AFTER_BLOCKS + 1);
+
+    fn execution(signer: Option<&str>, predecessor: Option<&str>, relayer: Option<&str>) -> ContractEvent {
+        ContractEvent::ExecutionRequested(ExecutionRequestedEvent {
+            request_data: "{}".to_string(),
+            data_id: vec![0; 32],
+            timestamp: 1,
+            block_height: 9,
+            transaction_hash: None,
+            receipt_id: None,
+            predecessor_id: predecessor.map(str::to_string),
+            signer_id: signer.map(str::to_string),
+            signer_public_key: None,
+            gas_burnt: None,
+            relayer_id: relayer.map(str::to_string),
+        })
+    }
+
+    fn topup(amount: &str) -> ContractEvent {
+        ContractEvent::TopUpPaymentKey(TopUpPaymentKeyEvent {
+            data_id: vec![1; 32],
+            owner: OWNER.to_string(),
+            nonce: 3,
+            amount: amount.to_string(),
+            encrypted_data: "blob".to_string(),
+        })
+    }
+
+    fn delete() -> ContractEvent {
+        ContractEvent::DeletePaymentKey(DeletePaymentKeyEvent { data_id: vec![2; 32], owner: OWNER.to_string(), nonce: 3 })
+    }
+
+    fn wallet_events() -> Vec<ContractEvent> {
+        vec![
+            ContractEvent::WalletPolicyUpdated(WalletPolicyUpdatedEvent {
+                wallet_pubkey: "ed25519:ab".to_string(),
+                owner: OWNER.to_string(),
+                encrypted_data: "blob".to_string(),
+                frozen: false,
+            }),
+            ContractEvent::WalletPolicyDeleted(WalletPolicyDeletedEvent {
+                wallet_pubkey: "ed25519:ab".to_string(),
+                owner: OWNER.to_string(),
+            }),
+            ContractEvent::WalletFrozenChanged(WalletFrozenChangedEvent {
+                wallet_pubkey: "ed25519:ab".to_string(),
+                owner: OWNER.to_string(),
+                frozen: false,
+            }),
+        ]
+    }
+
+    fn order_free() -> Vec<ContractEvent> {
+        vec![
+            ContractEvent::SubscriptionPurchased(SubscriptionPurchasedEvent {
+                owner: OWNER.to_string(),
+                nonce: 3,
+                plan: 1,
+                paid_usd: "1".to_string(),
+                payer: OWNER.to_string(),
+                receipt_id: Some("r".to_string()),
+            }),
+            ContractEvent::ProjectStorageCleanup(ProjectStorageCleanupEvent {
+                project_id: "alice/p".to_string(),
+                project_uuid: "u".to_string(),
+                timestamp: 1,
+                block_height: 9,
+            }),
+            ContractEvent::ProjectTransferred(ProjectTransferredEvent {
+                old_project_id: "alice/p".to_string(),
+                new_project_id: "bob/p".to_string(),
+                project_uuid: "u".to_string(),
+                old_owner: OWNER.to_string(),
+                new_owner: "bob.testnet".to_string(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn an_execution_in_order_and_on_time_is_relayed_and_any_other_is_checked_at_final() {
+        let e = execution(Some(OWNER), Some(OWNER), None);
+        assert_eq!(relay_decision(&e, Delivery::InOrder, ON_TIME), Relay::AsIs);
+        assert_eq!(relay_decision(&e, Delivery::InOrder, LATE), Relay::IfPendingAtFinal);
+        assert_eq!(relay_decision(&e, Delivery::InOrder, Age::Unknown), Relay::IfPendingAtFinal);
+        assert_eq!(relay_decision(&e, Delivery::OutOfOrder, ON_TIME), Relay::IfPendingAtFinal);
+    }
+
+    /// The chain decides a late top-up: a refused resume is not credited.
+    #[test]
+    fn a_top_up_is_relayed_late_and_out_of_order() {
+        for delivery in [Delivery::InOrder, Delivery::OutOfOrder] {
+            for age in [ON_TIME, LATE, Age::Unknown] {
+                assert_eq!(relay_decision(&topup("5"), delivery, age), Relay::AsIs);
+            }
+        }
+    }
+
+    /// A creation read after the key's deletion must not bring the key back.
+    #[test]
+    fn a_key_creation_out_of_order_is_relayed_only_if_the_key_still_exists() {
+        assert_eq!(relay_decision(&topup("0"), Delivery::InOrder, LATE), Relay::AsIs);
+        assert_eq!(relay_decision(&topup("0"), Delivery::OutOfOrder, ON_TIME), Relay::IfKeyExistsAtFinal);
+    }
+
+    /// The coordinator deletes before the resume: a late delete would leave
+    /// the key deleted here and kept on chain. An unknown age is asked again.
+    #[test]
+    fn a_delete_is_relayed_only_while_its_yield_is_surely_open() {
+        for delivery in [Delivery::InOrder, Delivery::OutOfOrder] {
+            assert_eq!(relay_decision(&delete(), delivery, ON_TIME), Relay::AsIs);
+            assert!(matches!(relay_decision(&delete(), delivery, LATE), Relay::Drop(_)));
+            assert!(matches!(relay_decision(&delete(), delivery, Age::Unknown), Relay::Later(_)));
+        }
+    }
+
+    /// An older policy or freeze applied after a newer one would restore a
+    /// revoked key or unfreeze a wallet.
+    #[test]
+    fn a_wallet_event_out_of_order_relays_the_state_at_final() {
+        for e in wallet_events() {
+            assert_eq!(relay_decision(&e, Delivery::InOrder, LATE), Relay::AsIs);
+            assert_eq!(relay_decision(&e, Delivery::OutOfOrder, ON_TIME), Relay::WalletStateAtFinal);
+        }
+    }
+
+    #[test]
+    fn order_free_events_are_relayed_from_every_delivery() {
+        for e in order_free() {
+            for delivery in [Delivery::InOrder, Delivery::OutOfOrder] {
+                for age in [ON_TIME, LATE, Age::Unknown] {
+                    assert_eq!(relay_decision(&e, delivery, age), Relay::AsIs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_signed_for_another_account_with_no_delegate_found_may_be_a_meta_transaction() {
+        assert!(may_be_unattributed_meta_tx(&execution(Some("relayer.testnet"), Some(OWNER), None)));
+        assert!(!may_be_unattributed_meta_tx(&execution(Some("relayer.testnet"), Some(OWNER), Some("relayer.testnet"))));
+        assert!(!may_be_unattributed_meta_tx(&execution(Some(OWNER), Some(OWNER), None)));
+        assert!(!may_be_unattributed_meta_tx(&topup("5")));
+    }
+
+    #[test]
+    fn a_deferred_block_is_due_after_its_pause_and_backs_off() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        assert!(q.defer(100, now).is_none());
+        assert!(q.due(now, 3).is_empty());
+        assert_eq!(q.due(now + DEFERRED_PAUSES[0], 3), vec![100]);
+        q.retry_later(100, None, now);
+        assert!(q.due(now + DEFERRED_PAUSES[0], 3).is_empty());
+        assert_eq!(q.due(now + DEFERRED_PAUSES[1], 3), vec![100]);
+        for _ in 0..20 {
+            q.retry_later(100, None, now);
+        }
+        assert_eq!(q.due(now + *DEFERRED_PAUSES.last().unwrap(), 3), vec![100]);
+        q.remove(100);
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn the_oldest_due_blocks_come_first_and_at_most_the_limit() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        for h in [105, 101, 103, 102] {
+            q.defer(h, now);
+        }
+        assert_eq!(q.due(now + DEFERRED_PAUSES[0], 3), vec![101, 102, 103]);
+    }
+
+    #[test]
+    fn a_block_too_far_behind_the_head_is_given_up() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        q.defer(1_000, now);
+        q.defer(1_001, now);
+        assert!(q.expire(1_000 + DEFERRED_MAX_AGE_BLOCKS, now).is_empty());
+        let given_up: Vec<u64> = q.expire(1_001 + DEFERRED_MAX_AGE_BLOCKS, now).into_iter().map(|(h, _)| h).collect();
+        assert_eq!(given_up, vec![1_000]);
+        assert_eq!(q.heights(), vec![1_001]);
+    }
+
+    #[test]
+    fn a_full_queue_gives_up_its_oldest_block() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        for h in 0..DEFERRED_MAX_LEN as u64 {
+            assert!(q.defer(10_000 + h, now).is_none());
+        }
+        assert_eq!(q.defer(20_000, now).map(|(h, _)| h), Some(10_000));
+        assert_eq!(q.len(), DEFERRED_MAX_LEN);
+    }
+
+    /// A call that may be a meta-transaction, with its delegate's block
+    /// unread, is not relayed under a guessed door: the block waits, before
+    /// anything in it is relayed.
+    #[tokio::test]
+    async fn a_block_with_a_possible_meta_transaction_waits_for_an_unread_block_before_it() {
+        let mut monitor = super::tests::parsing_monitor();
+        monitor.deferred.defer(100, Instant::now());
+        let call = execution(Some("relayer.testnet"), Some(OWNER), None);
+        for delivery in [Delivery::InOrder, Delivery::OutOfOrder] {
+            let left = monitor.deliver(101, vec![call.clone()], delivery).await.expect("the call waits");
+            assert!(left.waits);
+            assert_eq!(left.events.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_without_events_is_delivered_at_once() {
+        let monitor = super::tests::parsing_monitor();
+        assert!(monitor.deliver(101, vec![], Delivery::OutOfOrder).await.is_none());
+    }
+
+    /// A block read and kept only for events still to deliver has had its
+    /// delegates recorded: it makes nothing wait, so waits do not chain.
+    #[test]
+    fn a_read_block_in_the_queue_makes_nothing_wait() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        q.keep(100, vec![topup("5")], now);
+        assert!(!q.unread_just_before(101));
+        assert_eq!(q.events(100).map(|e| e.len()), Some(1));
+        assert!(q.events(99).is_none());
+    }
+
+    /// When an unread block is given up, the blocks that waited for it are
+    /// tried at once rather than aging out behind it.
+    #[test]
+    fn giving_up_an_unread_block_releases_the_blocks_that_waited_for_it() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        q.defer(1_000, now);
+        q.keep(1_001, vec![execution(Some("relayer.testnet"), Some(OWNER), None)], now);
+        q.retry_later(1_001, None, now);
+        let later = now + Duration::from_secs(1);
+        let given_up = q.expire(1_001 + DEFERRED_MAX_AGE_BLOCKS, later);
+        assert_eq!(given_up.len(), 1);
+        assert_eq!(q.due(later, 3), vec![1_001]);
+        assert!(!q.unread_just_before(1_001));
+    }
+
+    /// A read block is kept twice as long as an unread one before it is
+    /// given up.
+    #[test]
+    fn a_read_block_outlives_an_unread_one() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        q.keep(1_000, vec![topup("5")], now);
+        assert!(q.expire(1_001 + DEFERRED_MAX_AGE_BLOCKS, now).is_empty());
+        assert_eq!(q.expire(1_001 + 2 * DEFERRED_MAX_AGE_BLOCKS, now).len(), 1);
+    }
+
+    #[test]
+    fn an_unread_block_just_before_is_seen_and_one_further_back_is_not() {
+        let now = Instant::now();
+        let mut q = DeferredBlocks::default();
+        q.defer(100, now);
+        assert!(q.unread_just_before(101));
+        assert!(q.unread_just_before(100 + DELEGATE_LOOKBACK_BLOCKS));
+        assert!(!q.unread_just_before(101 + DELEGATE_LOOKBACK_BLOCKS));
+        assert!(!q.unread_just_before(100));
+    }
+}
+
+#[cfg(test)]
+mod head_never_waits_on_one_block {
+    //! The monitor's loop against a fake neardata: one block that will not
+    //! read is deferred and read later while the head moves on; neardata down
+    //! as a whole holds the head, so nothing is read out of order.
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    type Script = Arc<dyn Fn(u64, usize) -> u16 + Send + Sync>;
+
+    /// A neardata answering `GET /block/{n}` with the status `script(n, nth
+    /// request for n)` gives — 200 an empty block, 404 not indexed, anything
+    /// else an error — and the order the blocks were asked for.
+    async fn fake_neardata(script: Script) -> (String, Arc<Mutex<Vec<u64>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/block/{{block_id}}", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let counts = Arc::new(Mutex::new(HashMap::<u64, usize>::new()));
+        let log = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let (script, log, counts) = (script.clone(), log.clone(), counts.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let height: u64 = request
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|path| path.rsplit('/').next())
+                        .and_then(|h| h.parse().ok())
+                        .unwrap_or(0);
+                    log.lock().unwrap().push(height);
+                    let nth = {
+                        let mut counts = counts.lock().unwrap();
+                        let c = counts.entry(height).or_insert(0);
+                        *c += 1;
+                        *c
+                    };
+                    let status = script(height, nth);
+                    let body = if status == 200 { r#"{"shards":[]}"# } else { "" };
+                    let response = format!(
+                        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (url, asked)
+    }
+
+    fn monitor_at(url: String, head: u64) -> (EventMonitor, Arc<AtomicU64>) {
+        let mut monitor = super::tests::parsing_monitor();
+        monitor.neardata_api_url = url;
+        monitor.current_block = head;
+        let shared = Arc::new(AtomicU64::new(head));
+        monitor.shared_block_height = shared.clone();
+        (monitor, shared)
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_block_is_deferred_and_read_after_the_head_moved_on() {
+        // Block 1001 fails until the head has gone past it; 1010 is the tip.
+        let script: Script = Arc::new(|h, nth| match h {
+            1001 if nth <= 8 => 500,
+            1010.. => 404,
+            _ => 200,
+        });
+        let (url, asked) = fake_neardata(script).await;
+        let (mut monitor, head) = monitor_at(url, 1000);
+        let run = tokio::spawn(async move { monitor.start_monitoring().await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let asked = asked.lock().unwrap().clone();
+            let read_after_moving_on = asked
+                .iter()
+                .position(|h| *h == 1002)
+                .is_some_and(|first_1002| asked[first_1002..].contains(&1001));
+            if head.load(Ordering::Relaxed) == 1010 && read_after_moving_on {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "head {:?}, asked {:?}", head, asked);
+            sleep(Duration::from_millis(200)).await;
+        }
+        run.abort();
+    }
+
+    #[tokio::test]
+    async fn neardata_down_holds_the_head_and_nothing_is_read_out_of_order() {
+        // Everything from 1001 on fails for the first 25 s, then reads.
+        let down_until = std::time::Instant::now() + Duration::from_secs(25);
+        let script: Script = Arc::new(move |h, _| match h {
+            1010.. => 404,
+            1001.. if std::time::Instant::now() < down_until => 503,
+            _ => 200,
+        });
+        let (url, asked) = fake_neardata(script).await;
+        let (mut monitor, head) = monitor_at(url, 1000);
+        let run = tokio::spawn(async move { monitor.start_monitoring().await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while head.load(Ordering::Relaxed) < 1010 {
+            assert!(tokio::time::Instant::now() < deadline, "head stuck at {:?}", head);
+            sleep(Duration::from_millis(200)).await;
+        }
+        run.abort();
+        // Once the head first READ past 1001, no block below the head was
+        // asked for again: nothing was deferred.
+        let asked = asked.lock().unwrap().clone();
+        let mut highest_read = 0;
+        for h in asked.iter().copied().filter(|h| *h >= 1001 && *h < 1010) {
+            assert!(h + PROBE_AHEAD_BLOCKS >= highest_read, "block {} asked for after {}: {:?}", h, highest_read, asked);
+            highest_read = highest_read.max(h);
+        }
     }
 }

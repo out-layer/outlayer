@@ -92,10 +92,36 @@ Interacts with NEAR blockchain:
 
 ### 6. Event Monitor (`src/event_monitor.rs`) (Optional)
 Monitors blockchain for events:
-- Polls NEAR RPC for new blocks
-- Parses `EVENT_JSON` logs for `execution_requested` events
-- Creates tasks in Coordinator API
-- Alternative to relying solely on contract-side task creation
+- Reads every block from neardata, in order, from the coordinator's saved cursor
+- Parses `EVENT_JSON` logs of committed receipts of the contract
+- Relays them to the Coordinator API (tasks, top-ups, wallet policies, …)
+
+A block neardata will not serve within 15 s is **deferred**: the head moves
+on, and the block is read again on its own backoff (2 → 30 s, for up to 3000
+blocks) and delivered **out of order**. When the blocks after it do not read
+either, neardata is down rather than the block, and the head waits — up to
+5 minutes, then it looks further ahead for a block that reads and defers the
+range before it — so the blocks keep their order. An event that could not be
+relayed for a reason that may pass is kept with its block and delivered again;
+an event relayed once is never delivered again. The queue is logged every 100
+blocks; a restart starts from the head and does not read it.
+
+A block can also be **late** — more than 100 blocks behind the chain tip,
+after a slow head or a restart's catch-up — against the contract's 200-block
+yield window. What each event may do late or out of order is decided in
+`relay_decision`:
+
+| event | late | out of order |
+|---|---|---|
+| `execution_requested` | run only if still pending at the final block | same |
+| top-up (amount > 0) | relayed; the chain refuses a late resume and nothing is credited | relayed |
+| payment key creation (amount 0) | relayed | relayed only if the key still exists at the final block |
+| `delete_payment_key` | not relayed: the contract keeps the key, the owner deletes again (an unknown tip: tried again) | same rule |
+| wallet policy / freeze | relayed | the wallet's state at the final block is relayed, not the event's |
+| subscription purchase, project cleanup, project transfer | relayed | relayed |
+
+A block within 10 blocks after an unread one that holds a call which may be a
+meta-transaction waits for it, so the call is not judged by the wrong door.
 
 ### 7. Main Loop (`src/main.rs`)
 Orchestrates all components:
