@@ -4,6 +4,8 @@
 # https://*.trycloudflare.com address, no account).
 #
 #   tests/hook_receiver.sh start    # starts both, writes the env file
+#   tests/hook_receiver.sh ensure   # leaves one that answers at its public
+#                                   # address: the running one, or a new one
 #   tests/hook_receiver.sh status   # running or not, and whether the public
 #                                   # address answers
 #   tests/hook_receiver.sh stop     # stops both, removes the env file
@@ -15,13 +17,20 @@
 #   HOOK_REDIRECT_LOG_URL   its log
 # Every URL carries a random token in its path: whoever holds it can send to
 # the receiver and read its log, so the file is not printed and the URLs are
-# not put on a command line. A suite reads them where it runs:
+# not put on a command line. `tests/tasks_e2e.sh` starts one itself with
+# `ensure` when a row needs it and stops it on exit; another suite reads them
+# where it runs:
 #
+#   tests/hook_receiver.sh ensure
 #   set -a; source ~/.local/state/outlayer-hook/hook.env; set +a
-#   ONLY=W1,W3,NT7 .idea/testnet-runners/run_tasks_alice.sh
 #
 # The tunnel's address changes on every start; the env file follows it. The
 # log lives in the receiver's memory only, and goes with `stop`.
+#
+# A quick tunnel is Cloudflare's to drop: once its connection is lost — the
+# machine slept, the network moved — the name is gone and cloudflared cannot
+# take it back ("Tunnel not found"). `ensure` sees that the public address no
+# longer answers and starts a new one, at a new address.
 #
 # Requires: node, cloudflared (brew install cloudflared), curl, openssl.
 
@@ -114,12 +123,24 @@ EOF
     echo "the tunnel's name was not published in 120 s (see $STATE/tunnel.log)" >&2
     exit 1
   fi
-  for i in $(seq 1 30); do
+  for i in $(seq 1 60); do
     [[ "$(public_ok)" == 200 ]] && { echo "hook receiver up at a public trycloudflare.com address; env: $ENV_FILE"; return 0; }
     sleep 2
   done
-  echo "the receiver runs, but its public address did not answer in 60 s (see $STATE/tunnel.log)" >&2
+  echo "the receiver runs, but its public address did not answer in 120 s (see $STATE/tunnel.log)" >&2
   exit 1
+}
+
+# A receiver that answers at its public address: the running one, or a new
+# one in its place — at a new address, so whoever named the old one names
+# the new one.
+ensure() {
+  if alive receiver && alive tunnel && [[ -f "$ENV_FILE" && "$(public_ok)" == 200 ]]; then
+    echo "hook receiver up; env: $ENV_FILE"
+    return 0
+  fi
+  stop >/dev/null
+  start
 }
 
 status() {
@@ -127,12 +148,13 @@ status() {
   r=$(alive receiver && echo running || echo stopped)
   t=$(alive tunnel && echo running || echo stopped)
   echo "receiver: $r, tunnel: $t, env file: $([[ -f "$ENV_FILE" ]] && echo present || echo absent)"
-  [[ -f "$ENV_FILE" ]] && echo "public address answers: $(public_ok)"
+  if [[ -f "$ENV_FILE" ]]; then echo "public address answers: $(public_ok)"; fi
 }
 
 case "${1:-}" in
   start) start ;;
+  ensure) ensure ;;
   stop) stop ;;
   status) status ;;
-  *) echo "usage: $0 start|status|stop" >&2; exit 2 ;;
+  *) echo "usage: $0 start|ensure|status|stop" >&2; exit 2 ;;
 esac

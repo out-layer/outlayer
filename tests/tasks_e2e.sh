@@ -188,9 +188,12 @@
 #                        under "requests"
 #   HOOK_REDIRECT_URL, HOOK_REDIRECT_LOG_URL   a second receiver, which
 #                        answers 307 to HOOK_URL, and its log (W3)
-#                        All four come from `tests/hook_receiver.sh start`
-#                        (a receiver on this machine behind a Cloudflare quick
-#                        tunnel): `set -a; source ~/.local/state/outlayer-hook/hook.env; set +a`
+#                        Without them the suite starts its own receiver
+#                        (`tests/hook_receiver.sh ensure`: one on this machine
+#                        behind a Cloudflare quick tunnel) when W1, W3 or NT7
+#                        first needs it, checks before each of them that it
+#                        still answers, starting a new one if not, and stops
+#                        it on exit. Supplied, they are used as they are
 #   AGENT_SPARE_NONCE    the nonce of a second FUNDED payment key of AGENT_ACCOUNT (N4)
 #   CUSTODY_WALLET_KEY   the `wk_` key of a custody wallet whose implicit
 #                        account was never sent NEAR (S3); read where it is used
@@ -291,6 +294,31 @@ lacks() {
     return 0
   done
   return 1
+}
+
+# The receiver W1, W3 and NT7 send to. A quick tunnel is gone once the
+# machine sleeps or its network moves, and a row that sent to a dead one would
+# read as a webhook the platform never sent.
+HOOK_SUPPLIED=${HOOK_URL:+true}
+HOOK_STARTED=false
+HOOK_ENV_FILE="${HOOK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/outlayer-hook}/hook.env"
+# receiver_ready <row> — true when the receiver answers; otherwise a SKIP that
+# says why. The suite's own receiver is made sure of (`ensure`) and its URLs
+# read again: a new one is at a new address.
+receiver_ready() {
+  local row=$1 out
+  if [[ "$HOOK_SUPPLIED" == true ]]; then
+    [[ "$HOOK_URL" != *.trycloudflare.com/* ]] && return 0
+    [[ "$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "${HOOK_URL%/hook}/health")" == 200 ]] && return 0
+    skip "$row: the receiver HOOK_URL names does not answer (a quick tunnel is gone once the machine sleeps): run tests/hook_receiver.sh ensure and source its env file again, or leave HOOK_URL unset and the suite starts its own"
+    return 1
+  fi
+  if ! out=$("$SCRIPT_DIR/hook_receiver.sh" ensure 2>&1); then
+    skip "$row: no webhook receiver came up: $(tail -1 <<<"$out")"
+    return 1
+  fi
+  HOOK_STARTED=true
+  set -a; source "$HOOK_ENV_FILE"; set +a
 }
 
 # https_as <VARIABLE holding a payment key> <owner/profile|""> <input-json> —
@@ -563,6 +591,7 @@ cleanup() {
     sign_in_on swept >/dev/null 2>&1 && owner raw DELETE /inbox/tasks "" swept >/dev/null 2>&1
   fi
   [[ "$HOOK_NAMED" == true ]] && owner webhook delete "$NOW_ON" >/dev/null 2>&1
+  [[ "$HOOK_STARTED" == true ]] && "$SCRIPT_DIR/hook_receiver.sh" stop >/dev/null 2>&1
   # A row that stopped between a mute and its unmute leaves no mute behind.
   owner unmute agent "$AGENT_ACCOUNT" "$NOW_ON" >/dev/null 2>&1
   [[ -n "$PROJECT_UUID" ]] && owner unmute project "$PROJECT_UUID" "$NOW_ON" >/dev/null 2>&1
@@ -1900,7 +1929,7 @@ fi
 
 if want W1; then
   log "W1 the owner is told at a URL"
-  if lacks W1 HOOK_URL HOOK_LOG_URL; then :
+  if ! receiver_ready W1 || lacks W1 HOOK_URL HOOK_LOG_URL; then :
   else
     export HOOK_URL
     owner webhook set HOOK_URL a
@@ -1953,7 +1982,7 @@ fi
 
 if want W3; then
   log "W3 a receiver that redirects"
-  if lacks W3 HOOK_REDIRECT_URL HOOK_REDIRECT_LOG_URL HOOK_LOG_URL; then :
+  if ! receiver_ready W3 || lacks W3 HOOK_REDIRECT_URL HOOK_REDIRECT_LOG_URL HOOK_LOG_URL; then :
   else
     export HOOK_REDIRECT_URL
     owner webhook set HOOK_REDIRECT_URL a
@@ -2415,7 +2444,7 @@ fi
 
 if want NT7; then
   log "NT7 a notice at the owner's URL"
-  if lacks NT7 HOOK_URL HOOK_LOG_URL; then :
+  if ! receiver_ready NT7 || lacks NT7 HOOK_URL HOOK_LOG_URL; then :
   else
     export HOOK_URL
     owner webhook set HOOK_URL "$NOW_ON"

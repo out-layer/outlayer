@@ -3342,13 +3342,11 @@ async fn handle_execute_job(
             // Report to coordinator (can wait, non-critical)
             match near_result {
                 Ok((tx_hash, outcome)) => {
-                    // Check if contract panicked (shouldn't happen for success=true!)
-                    if matches!(outcome.status, near_primitives::views::FinalExecutionStatus::Failure(_)) {
-                        error!("⚠️  WARNING: Contract panicked unexpectedly on successful execution! tx_hash={}", tx_hash);
-                        error!("    This should NOT happen - contract should only panic on failures!");
-                    } else {
-                        info!("✅ Result submitted to NEAR successfully: tx_hash={}", tx_hash);
-                    }
+                    // `submit_execution_result` is Ok only when the contract
+                    // took the result (`NearClient::require_taken`); a refused
+                    // one — the request already timed out and refunded — is the
+                    // Err arm below and earns the author nothing.
+                    info!("✅ Result submitted to NEAR successfully: tx_hash={}", tx_hash);
 
                     // Extract actual cost from contract logs
                     let actual_cost = NearClient::extract_payment_from_logs(&outcome);
@@ -3580,7 +3578,7 @@ async fn handle_execute_job(
             // Submit error to NEAR contract (critical path) and extract actual cost
             let actual_cost = match near_client.submit_execution_result(request_id, &result).await {
                 Ok((tx_hash, outcome)) => {
-                    info!("✅ Failure reported to NEAR contract (contract panicked as expected): tx_hash={}", tx_hash);
+                    info!("✅ Failure reported to NEAR contract: tx_hash={}", tx_hash);
                     let cost = NearClient::extract_payment_from_logs(&outcome);
                     if cost > 0 {
                         info!("💰 Extracted cost from contract: {} yoctoNEAR ({:.6} NEAR)",
@@ -3736,7 +3734,13 @@ async fn run_contract_system_callbacks_handler(
                                         payload.owner, payload.nonce, result.tx_hash, result.new_balance
                                     );
 
-                                    // Notify coordinator of payment key metadata (non-critical)
+                                    // The credit: the coordinator ADDS `amount` to the
+                                    // key's balance. For a top-up (amount > 0) it is
+                                    // reached only when the contract did not refuse the
+                                    // resume (`process_topup_task` fails on a refused one),
+                                    // so a top-up whose yield timed out and was refunded
+                                    // is not credited. The callback itself runs in the
+                                    // payer's transaction and is not seen here.
                                     if let Err(e) = api_client
                                         .complete_topup(
                                             &payload.owner,
@@ -3749,22 +3753,33 @@ async fn run_contract_system_callbacks_handler(
                                         )
                                         .await
                                     {
-                                        warn!(
-                                            "Failed to notify coordinator of payment key update (non-critical): {}",
-                                            e
+                                        error!(
+                                            "❌ TopUp taken on chain but NOT credited in the coordinator: owner={} nonce={} amount={} error={}",
+                                            payload.owner, payload.nonce, payload.amount, e
                                         );
                                     }
                                 }
                                 Err(e) => {
                                     error!(
-                                        "❌ TopUp failed: owner={} nonce={} error={}",
+                                        "❌ TopUp failed: owner={} nonce={} error={:#}",
                                         payload.owner, payload.nonce, e
                                     );
 
                                     // Only resume with error if there's a real yield (amount > 0).
                                     // For amount=0 (PaymentKey creation), there's no yield to resume —
                                     // the data_id is a generated hash, not a real yield promise.
-                                    if payload.amount != "0" {
+                                    // Nor when the contract already said the yield is gone: its
+                                    // timeout callback has refunded the payer.
+                                    let yield_gone = matches!(
+                                        e.downcast_ref::<near_client::ChainRefused>().map(|r| &r.reason),
+                                        Some(near_client::Refusal::NoYield(_))
+                                    );
+                                    if yield_gone {
+                                        warn!(
+                                            "TopUp yield already settled by the contract (payer refunded); nothing credited: owner={} nonce={}",
+                                            payload.owner, payload.nonce
+                                        );
+                                    } else if payload.amount != "0" {
                                         if let Err(resume_err) = near_client
                                             .resume_topup_error(&payload.data_id, &format!("TopUp failed: {}", e))
                                             .await
@@ -3847,7 +3862,7 @@ async fn run_contract_system_callbacks_handler(
                             }
                             Err(e) => {
                                 error!(
-                                    "❌ Failed to resume DeletePaymentKey on contract: owner={} nonce={} error={}",
+                                    "❌ DeletePaymentKey: the coordinator deleted the key but the chain did not confirm the resume — unless that transaction still executes, the key stays on chain: owner={} nonce={} error={:#}",
                                     payload.owner, payload.nonce, e
                                 );
                             }
@@ -4090,7 +4105,7 @@ async fn settle_refusal(
     };
     match near_client.submit_execution_result(request_id, &error_result).await {
         Ok((tx_hash, outcome)) => {
-            info!("✅ Failure reported to NEAR contract (contract panicked as expected): tx_hash={}", tx_hash);
+            info!("✅ Failure reported to NEAR contract: tx_hash={}", tx_hash);
             let cost = NearClient::extract_payment_from_logs(&outcome);
             if cost > 0 {
                 info!("💰 Extracted cost from contract: {} yoctoNEAR ({:.6} NEAR)", cost, cost as f64 / 1e24);

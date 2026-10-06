@@ -9,6 +9,45 @@ use tracing::{debug, info, warn};
 
 use crate::api_client::{ExecutionOutput, ExecutionResult};
 
+/// The logs `resume_topup` and `resume_delete_payment_key` write when the
+/// yield they were to resume is gone (`contract/src/payment.rs`).
+const NO_YIELD_LOGS: [&str; 2] = ["TopUp yield resume failed", "DeletePaymentKey yield resume failed"];
+
+/// A transaction of the worker's that executed and that the contract did not
+/// take. Nothing it was to settle is settled, so nothing may be reported as
+/// done.
+#[derive(Debug)]
+pub struct ChainRefused {
+    pub method: String,
+    pub tx_hash: String,
+    pub reason: Refusal,
+}
+
+/// Why the contract did not take a transaction.
+#[derive(Debug)]
+pub enum Refusal {
+    /// The transaction failed; the contract's panic or the runtime's error.
+    Failed(String),
+    /// The contract found no yield to resume: its timeout callback has already
+    /// settled the request, and no resume — success or error — can reach it.
+    NoYield(String),
+    /// The outcome says the transaction has not finished executing.
+    Unfinished,
+}
+
+impl std::fmt::Display for ChainRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the chain did not take {} (tx {}): ", self.method, self.tx_hash)?;
+        match &self.reason {
+            Refusal::Failed(why) => write!(f, "the transaction failed: {}", why),
+            Refusal::NoYield(log) => write!(f, "the contract found no yield to resume: {}", log),
+            Refusal::Unfinished => write!(f, "the transaction has not finished executing"),
+        }
+    }
+}
+
+impl std::error::Error for ChainRefused {}
+
 /// NEAR blockchain client for worker operations
 #[derive(Clone)]
 pub struct NearClient {
@@ -88,6 +127,10 @@ impl NearClient {
     ///
     /// Errors name what happened, never the RPC's own text: a transport error
     /// quotes the endpoint URL, and this text reaches the job's error details.
+    ///
+    /// `Ok` means EXECUTED, not succeeded: the outcome may be a failure, or a
+    /// resume the contract could not deliver. A caller that reports the call
+    /// as done anywhere else checks [`Self::require_taken`] first.
     async fn send_and_follow(
         &self,
         signed_transaction: near_primitives::transaction::SignedTransaction,
@@ -141,12 +184,23 @@ impl NearClient {
                 wait_until: TxExecutionStatus::ExecutedOptimistic,
             };
             let unknown = match tokio::time::timeout(wait(), self.client.call(status)).await {
-                Ok(Ok(response)) => match response.final_execution_outcome {
+                Ok(Ok(response)) => match response.final_execution_outcome.map(|o| o.into_outcome()) {
+                    // An outcome whose receipts have not all run yet is not an
+                    // answer: reading it as one would refuse a transaction
+                    // the chain is still executing.
+                    Some(outcome) if matches!(
+                        outcome.status,
+                        near_primitives::views::FinalExecutionStatus::NotStarted
+                            | near_primitives::views::FinalExecutionStatus::Started
+                    ) => {
+                        last = "executing, not finished yet".to_string();
+                        false
+                    }
                     Some(outcome) => {
                         if sends > 1 {
                             info!("Transaction {} executed after {} sends", hash, sends);
                         }
-                        return Ok(outcome.into_outcome());
+                        return Ok(outcome);
                     }
                     None => {
                         last = "sent, not executed yet".to_string();
@@ -192,6 +246,52 @@ impl NearClient {
             warn!("Transaction {} not executed yet ({}); looking again", hash, last);
             tokio::time::sleep(pause).await;
         }
+    }
+
+    /// Ok only when the contract TOOK this transaction of the worker's.
+    ///
+    /// A mined transaction is not a successful one: [`Self::send_and_follow`]
+    /// returns once the transaction executed, whatever its status. Every call
+    /// whose success is reported anywhere else — to the coordinator, to a
+    /// ledger, to a user — is checked here first. A resume that reached the
+    /// contract after the yield's 200 blocks is the case this exists for: the
+    /// timeout callback has already settled the request (refunded the top-up,
+    /// refunded the execution, kept the key), and reporting the late resume as
+    /// done credits what the chain gave back.
+    pub(crate) fn require_taken(method: &str, outcome: &FinalExecutionOutcomeView) -> std::result::Result<(), ChainRefused> {
+        use near_primitives::views::FinalExecutionStatus;
+
+        let refused = |reason: Refusal| ChainRefused {
+            method: method.to_string(),
+            tx_hash: outcome.transaction_outcome.id.to_string(),
+            reason,
+        };
+        match &outcome.status {
+            FinalExecutionStatus::SuccessValue(_) => {}
+            FinalExecutionStatus::Failure(err) => return Err(refused(Refusal::Failed(err.to_string()))),
+            FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started => {
+                return Err(refused(Refusal::Unfinished))
+            }
+        }
+        // `resume_topup` and `resume_delete_payment_key` return normally when
+        // the yield is gone and say so only in a log; the status alone does not
+        // show it. Only the contract's own receipts are read, and the marker
+        // must start the log.
+        let contract_id = &outcome.transaction.receiver_id;
+        for receipt in &outcome.receipts_outcome {
+            if &receipt.outcome.executor_id != contract_id {
+                continue;
+            }
+            if let Some(log) = receipt
+                .outcome
+                .logs
+                .iter()
+                .find(|log| NO_YIELD_LOGS.iter().any(|marker| log.starts_with(marker)))
+            {
+                return Err(refused(Refusal::NoYield(log.clone())));
+            }
+        }
+        Ok(())
     }
 
     /// Extract cost from transaction logs (parses [[yNEAR charged: "..."]] or estimated_cost)
@@ -394,6 +494,8 @@ impl NearClient {
         // No need to fetch nested receipts - submit_execution_output_and_resolve
         // is synchronous (no Promise), all logs are in the initial outcome
 
+        Self::require_taken("submit_execution_output_and_resolve", &outcome)?;
+
         // Return transaction hash and outcome
         let tx_hash = format!("{}", outcome.transaction_outcome.id);
         Ok((tx_hash, outcome))
@@ -595,6 +697,8 @@ impl NearClient {
             }
         }
 
+        Self::require_taken("resolve_execution", &outcome)?;
+
         // Return transaction hash and outcome with receipt logs
         // Note: The estimated_cost is in the resolve_execution receipt logs
         let tx_hash = format!("{}", outcome.transaction_outcome.id);
@@ -788,6 +892,7 @@ impl NearClient {
             )
             .await
             .context("Failed to call resume_topup")?;
+        Self::require_taken("resume_topup", &outcome)?;
 
         let tx_hash = format!("{}", outcome.transaction_outcome.id);
         info!("✅ TopUp resumed: data_id={} tx={}", data_id, tx_hash);
@@ -832,6 +937,7 @@ impl NearClient {
             )
             .await
             .context("Failed to call resume_topup")?;
+        Self::require_taken("resume_topup", &outcome)?;
 
         let tx_hash = format!("{}", outcome.transaction_outcome.id);
         info!("✅ TopUp error resumed: data_id={} tx={}", data_id, tx_hash);
@@ -869,6 +975,7 @@ impl NearClient {
             )
             .await
             .context("Failed to call resume_delete_payment_key")?;
+        Self::require_taken("resume_delete_payment_key", &outcome)?;
 
         let tx_hash = format!("{}", outcome.transaction_outcome.id);
         info!("✅ DeletePaymentKey resumed: data_id={} tx={}", data_id, tx_hash);
@@ -916,6 +1023,7 @@ impl NearClient {
             )
             .await
             .context("Failed to call resume_delete_payment_key")?;
+        Self::require_taken("resume_delete_payment_key", &outcome)?;
 
         let tx_hash = format!("{}", outcome.transaction_outcome.id);
         info!(
@@ -1350,6 +1458,134 @@ mod only_a_committed_receipt_says_what_was_charged {
     fn a_charge_only_in_a_failed_receipt_reads_as_nothing_charged() {
         let o = outcome(vec![receipt(CONTRACT, panicked(), &["[[yNEAR charged: \"999000\"]]"])]);
         assert_eq!(NearClient::extract_payment_from_logs(&o), 0);
+    }
+}
+
+#[cfg(test)]
+mod only_a_taken_transaction_is_reported_as_done {
+    //! A late resume executes and settles nothing: the yield timed out and the
+    //! chain already refunded. Reported as done, it would credit a refunded
+    //! top-up (refund + balance) and write earnings for a refunded execution.
+    use super::NearClient;
+    use near_primitives::views::FinalExecutionOutcomeView;
+    use serde_json::{json, Value};
+
+    const CONTRACT: &str = "outlayer.testnet";
+    /// 32 zero bytes, base58.
+    const ZERO_HASH: &str = "11111111111111111111111111111111";
+    const DATA_ID: &str = "ab12";
+
+    fn receipt(executor: &str, logs: &[&str]) -> Value {
+        json!({
+            "proof": [], "block_hash": ZERO_HASH, "id": ZERO_HASH,
+            "outcome": {
+                "logs": logs, "receipt_ids": [], "gas_burnt": 0, "tokens_burnt": "0",
+                "executor_id": executor, "status": { "SuccessValue": "" },
+                "metadata": { "version": 1, "gas_profile": null }
+            }
+        })
+    }
+
+    fn outcome(status: Value, receipts: Vec<Value>) -> FinalExecutionOutcomeView {
+        serde_json::from_value(json!({
+            "status": status,
+            "transaction": {
+                "signer_id": "worker.testnet",
+                "public_key": format!("ed25519:{ZERO_HASH}"),
+                "nonce": 1,
+                "receiver_id": CONTRACT,
+                "actions": [],
+                "signature": format!("ed25519:{}", "1".repeat(64)),
+                "hash": ZERO_HASH
+            },
+            "transaction_outcome": receipt("worker.testnet", &[]),
+            "receipts_outcome": receipts
+        }))
+        .expect("the outcome must parse as the RPC serves it")
+    }
+
+    fn succeeded(logs: &[&str]) -> FinalExecutionOutcomeView {
+        outcome(json!({ "SuccessValue": "" }), vec![receipt(CONTRACT, logs)])
+    }
+
+    fn refusal(o: &FinalExecutionOutcomeView) -> String {
+        NearClient::require_taken("resume_topup", o)
+            .expect_err("the chain did not take this transaction")
+            .to_string()
+    }
+
+    #[test]
+    fn a_resume_the_contract_delivered_is_taken() {
+        let log = format!("TopUp yield resumed: data_id={DATA_ID}");
+        assert!(NearClient::require_taken("resume_topup", &succeeded(&[&log])).is_ok());
+    }
+
+    #[test]
+    fn a_top_up_resume_that_found_no_yield_is_refused() {
+        let log = format!("TopUp yield resume failed (timeout?): data_id={DATA_ID}");
+        assert!(refusal(&succeeded(&[&log])).contains("no yield to resume"));
+    }
+
+    #[test]
+    fn a_delete_resume_that_found_no_yield_is_refused() {
+        let log = format!("DeletePaymentKey yield resume failed (timeout?): data_id={DATA_ID}");
+        assert!(refusal(&succeeded(&[&log])).contains("no yield to resume"));
+    }
+
+    #[test]
+    fn a_failed_transaction_is_refused_with_the_contracts_reason() {
+        let o = outcome(
+            json!({ "Failure": { "ActionError": { "index": 0, "kind": {
+                "FunctionCallError": { "ExecutionError": "Smart contract panicked: Execution request not found" } } } } }),
+            vec![receipt(CONTRACT, &[])],
+        );
+        assert!(refusal(&o).contains("Execution request not found"));
+    }
+
+    #[test]
+    fn an_unfinished_transaction_is_refused() {
+        assert!(refusal(&outcome(json!("Started"), vec![])).contains("not finished"));
+    }
+
+    /// The marker is read only from the contract's own receipts and only at
+    /// the start of a log: anything else may carry text a caller wrote.
+    #[test]
+    fn a_marker_outside_the_contracts_own_log_start_is_not_a_refusal() {
+        let quoted = format!("note: TopUp yield resume failed (timeout?): data_id={DATA_ID}");
+        let elsewhere = format!("TopUp yield resume failed (timeout?): data_id={DATA_ID}");
+        let o = outcome(
+            json!({ "SuccessValue": "" }),
+            vec![receipt(CONTRACT, &[&quoted]), receipt("someone.testnet", &[&elsewhere])],
+        );
+        assert!(NearClient::require_taken("resume_topup", &o).is_ok());
+    }
+
+    /// The TopUp handler tells a gone yield from any other failure through the
+    /// context `process_topup_task` wraps around it.
+    #[test]
+    fn a_refusal_is_still_told_apart_under_its_context() {
+        let log = format!("TopUp yield resume failed (timeout?): data_id={DATA_ID}");
+        let refused = NearClient::require_taken("resume_topup", &succeeded(&[&log])).unwrap_err();
+        let e = anyhow::Error::from(refused).context("Failed to resume TopUp on contract");
+        assert!(matches!(
+            e.downcast_ref::<super::ChainRefused>().map(|r| &r.reason),
+            Some(super::Refusal::NoYield(_))
+        ));
+    }
+
+    /// Every send of a method that settles a yield is followed by the check
+    /// naming it. A new send of one of these, or a new settling method, is
+    /// added here with its check.
+    #[test]
+    fn every_settling_send_is_checked() {
+        let src = include_str!("near_client.rs");
+        let (src, _) = src.split_once("#[cfg(test)]").expect("tests sit last");
+        for method in ["resume_topup", "resume_delete_payment_key", "resolve_execution", "submit_execution_output_and_resolve"] {
+            let sends = src.lines().filter(|l| l.trim() == format!("\"{method}\",")).count();
+            let checks = src.matches(&format!("require_taken(\"{method}\"")).count();
+            assert!(sends > 0, "{method} is no longer sent from here; update this list");
+            assert_eq!(sends, checks, "every send of {method} must be followed by require_taken");
+        }
     }
 }
 

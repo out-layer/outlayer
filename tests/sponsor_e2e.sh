@@ -37,17 +37,39 @@
 #   SP15 owner policy on hyperliquid: a wallet WITH an owner (policy stored on
 #        chain by PARENT): no HL row of the owner's → the built-in default (or,
 #        when PARENT's HL row does not name this wallet, `Access denied`);
-#        naming the agent's own row → 403 policy_row_not_owner; the next HL call
-#        → 403 calls_suspended; connector-probe still answers (the block is the
-#        trading connectors' only)
+#        naming a row of the owner's under a profile nobody stored → the run is
+#        refused policy_row_missing, never run open; naming the agent's own row
+#        → 403 policy_row_not_owner, and the next HL call still runs (the first
+#        offence is counted, not blocked); naming it again → 403, and the next
+#        HL call → 403 calls_suspended; connector-probe still answers (the
+#        block is the trading connectors' only)
+#   SP17 the owner's row reaches the call unnamed: PARENT stores a
+#        HYPERLIQUID_POLICY row naming one wallet → its `status` reports those
+#        caps; another wallet of PARENT's the row does not name → `Access
+#        denied`; the row deleted → the default again. Needs `outlayer` logged in
+#        as PARENT on testnet, and PARENT with no hyperliquid row of its own
+#        (SP15 saw the default) — the row is PARENT's one row for the connector
+#   SP21 a wallet with no owner names a row of PARENT's (`secrets_ref`, its
+#        own profile) → that row's caps apply; the same wallet naming none →
+#        the default; another wallet naming the row, outside its whitelist →
+#        `Access denied`. The row is deleted again
+#   SP18 redeem_until moved into the past → a new wallet's redeem is 404, no
+#        use taken
+#   SP19 a key carrying a live operator's gift takes no code → 200 "already
+#        carries a subscription", no sponsor on it, no use taken
+#   SP20 a policy that names its own keys revokes the bootstrap wk_ the
+#        nonce-0 key was claimed with (the worker syncs it from the chain):
+#        the key's /call → 401 invalid_key; the policy's key reads GET → 409
+#        payment_key_revoked, and a redeem → 409 payment_key_revoked
 #   SP16 (VAULT_ID=<vault whose parent is PARENT>) a `near:` wallet under a
 #        vault: redeem → key owned by the vault-derived account
 #        (= /wallet/v1/address); hyperliquid `status` reports the trading
 #        sub-key the public address route derives under the same vault — the
 #        worker's host functions read the vault the near: request wrote
-#   SP13 (CEILING=1, spends NEAR) custody ceiling: a sponsored wallet makes
-#        more transfers than `custody:*` allows and none is refused; a
-#        bare-trial wallet is refused operation_limit_reached past it
+#   SP13 (CEILING=1, spends NEAR) custody ceiling: a wallet sponsored by a
+#        code with `lifts_custody_ceiling` makes more transfers than
+#        `custody:*` allows and none is refused; one sponsored by a code
+#        without it, and a bare-trial wallet, are refused past it
 #
 # Secrets: the admin bearer, `wk_`s and payment keys reach curl through stdin
 # (`-H @-`), bodies that carry a code through a 0600 file, never argv; none is
@@ -101,11 +123,14 @@ RUN="sp$(date +%s)"
 RUN_TMP="$(mktemp -d -t sponsor_e2e.XXXXXX)"
 chmod 700 "$RUN_TMP"
 CODE_IDS=()
+HL_ROWS=()   # profiles of PARENT's hyperliquid rows this run stored
+PARENT_HL_ROW=unknown
 cleanup() {
   local id
   for id in ${CODE_IDS[@]+"${CODE_IDS[@]}"}; do
     req admin - PATCH "/admin/sponsor-codes/$id" '{"active":false}' >/dev/null 2>&1
   done
+  for id in ${HL_ROWS[@]+"${HL_ROWS[@]}"}; do hl_row_delete "$id" >/dev/null 2>&1; done
   rm -rf "$RUN_TMP"
 }
 trap cleanup EXIT
@@ -154,7 +179,12 @@ nreq() {
   BODY="$(tr -d '\n' < "$out" 2>/dev/null)"
 }
 j() { jq -r "$1" <<<"$BODY" 2>/dev/null; }
-short() { head -c "${2:-220}" <<<"${1:-$BODY}"; }
+# An answer, cut short — any payment_key in it removed first.
+short() {
+  local b=${1:-$BODY}
+  b=$(jq -c 'del(.payment_key?)' <<<"$b" 2>/dev/null) || b=${1:-$BODY}
+  head -c "${2:-220}" <<<"$b"
+}
 seed() { printf '%s-%s' "$RUN" "$1"; }
 q() { sql "$1" 2>/dev/null; }
 HAVE_SQL=false
@@ -190,6 +220,16 @@ hl_status() { # hl_status <pk> <wallet_id> — sets HTTP, BODY, OUT, NETWORK_SEE
   NETWORK_SEEN=$(jq -r '.network // empty' <<<"$OUT" 2>/dev/null)
   EFFECT=$(jq -r '.policy.effect // empty' <<<"$OUT" 2>/dev/null)
 }
+# The CLI signs as the account it is logged in as, through the keyed RPC.
+cli() { OUTLAYER_NETWORK=$NETWORK OUTLAYER_RPC_URL="$RPC_URL" outlayer "$@"; }
+hl_row_delete() { cli secrets delete --project "$HL_PROJECT" --profile "$1"; } # hl_row_delete <profile>
+# hl_row_store <profile> <policy-json> <whitelist> — PARENT's row for the connector.
+hl_row_store() {
+  local row; row=$(jq -nc --arg p "$2" '{HYPERLIQUID_POLICY:$p, HYPERLIQUID_TESTNET:"1"}')
+  cli secrets set "$row" --project "$HL_PROJECT" --profile "$1" --access "whitelist:$3" && HL_ROWS+=("$1")
+}
+# wk_pair — a fresh wk_ in WK and its hash in WK_HASH (WK is a secret).
+wk_pair() { WK="wk_$(openssl rand -hex 32)"; WK_HASH=$(printf '%s' "$WK" | shasum -a 256 | cut -d' ' -f1); }
 
 # ── preflight ────────────────────────────────────────────────────────────────
 
@@ -205,7 +245,7 @@ if [[ "$APPLY" != true ]]; then
   (dry-run) with --apply this suite will mint sponsor codes on testnet (allowance
   $0.10 each, 1–2 days), derive ~12 `near:` wallets from PARENT with run-unique
   seeds, redeem, call connector-probe / hyperliquid `status`, extend and end the
-  codes. CEILING=1 also funds two wallets with NEAR and makes ~2×(limit+1)
+  codes. CEILING=1 also funds three wallets with NEAR and makes ~3×(limit+1)
   transfers.
 EOF
   exit 0
@@ -404,18 +444,31 @@ if [[ -n "${O_WID:-}" ]] && store_policy "$O" "$O_WID" '{"rules":{"transaction_t
   redeem "$O" "$CODE"; O_PK=$PK
   hl_status "$O_PK" "$O_WID"
   if [[ "$HTTP" == 200 && "$EFFECT" == default:* ]]; then
+    PARENT_HL_ROW=absent
     pass "SP15 owner with no HL row → the built-in default"
   elif grep -qi "access denied" <<<"$BODY"; then
     pass "SP15 PARENT's HL row does not name this wallet → Access denied (the owner adds the wallet)"
   else
     fail "SP15 status → HTTP $HTTP effect '$EFFECT': $(short)"
   fi
-  hl_call "$O_PK" "$O_WID" '{"operation":"status"}' "$(jq -nc --arg a "$O_ADDR" '{account_id:$a, profile:"hyperliquid"}')"
+  hl_call "$O_PK" "$O_WID" '{"operation":"status"}' "$(jq -nc --arg a "$PARENT" --arg p "$RUN-nobody" '{account_id:$a, profile:$p}')"
+  grep -q "policy_row_missing" <<<"$BODY" \
+    && pass "SP15 a profile of the owner's nobody stored → policy_row_missing, not run open" \
+    || fail "SP15 a missing named row → HTTP $HTTP: $(short)"
+  own_row() { hl_call "$O_PK" "$O_WID" '{"operation":"status"}' "$(jq -nc --arg a "$O_ADDR" '{account_id:$a, profile:"hyperliquid"}')"; }
+  own_row
   [[ "$HTTP" == 403 && "$(j .reason)" == policy_row_not_owner ]] && pass "SP15 own row → 403 policy_row_not_owner" \
     || fail "SP15 own row → HTTP $HTTP: $(short)"
   hl_status "$O_PK" "$O_WID"
-  [[ "$HTTP" == 403 && "$(j .reason)" == calls_suspended ]] && pass "SP15 the next HL call → 403 calls_suspended" \
-    || fail "SP15 after the offence → HTTP $HTTP: $(short)"
+  [[ "$HTTP" == 200 ]] && pass "SP15 after the first offence the next HL call still runs" \
+    || fail "SP15 after the first offence → HTTP $HTTP $(j .reason): $(short)"
+  own_row
+  [[ "$HTTP" == 403 && "$(j .reason)" == policy_row_not_owner ]] && pass "SP15 own row again → 403 policy_row_not_owner" \
+    || fail "SP15 own row again → HTTP $HTTP: $(short)"
+  hl_status "$O_PK" "$O_WID"
+  [[ "$HTTP" == 403 && "$(j .reason)" == calls_suspended && "$(j .terminal)" == false ]] \
+    && pass "SP15 the next HL call → 403 calls_suspended, terminal false" \
+    || fail "SP15 after the second offence → HTTP $HTTP $(j .reason) terminal=$(j .terminal): $(short)"
   for hint in minute minutes hour day limit 10 600; do
     grep -qiw "$hint" <<<"$(j .error)" && fail "SP15 the block names '$hint': $(j .error)"
   done
@@ -424,6 +477,168 @@ if [[ -n "${O_WID:-}" ]] && store_policy "$O" "$O_WID" '{"rules":{"transaction_t
     || fail "SP15 connector-probe while blocked → HTTP $HTTP: $(short)"
 else
   fail "SP15 could not give the wallet an owner"
+fi
+
+# ── SP17 ─────────────────────────────────────────────────────────────────────
+log "SP17 the owner's hyperliquid row reaches the call unnamed"
+CLI_WHO=$(cli whoami 2>/dev/null | awk '/^Account:/{print $2}')
+if [[ "$CLI_WHO" != "$PARENT" ]]; then
+  skip "SP17 outlayer is logged in as '${CLI_WHO:-nobody}' on $NETWORK, not $PARENT"
+elif [[ "$PARENT_HL_ROW" != absent ]]; then
+  skip "SP17 $PARENT may already hold a hyperliquid row (SP15 did not see the default) — not overwritten"
+else
+  NS=$(seed hl-named); US=$(seed hl-unnamed)
+  read -r N_WID N_ADDR < <(wallet_address "$NS") || true
+  read -r U_WID U_ADDR < <(wallet_address "$US") || true
+  if [[ -n "${N_WID:-}" && -n "${U_WID:-}" ]] \
+     && store_policy "$NS" "$N_WID" '{"rules":{"transaction_types":["call"]}}' \
+     && store_policy "$US" "$U_WID" '{"rules":{"transaction_types":["call"]}}'; then
+    create_code "{\"name\":\"$RUN-hl\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1}"
+    redeem "$NS" "$CODE"; N_PK=$PK
+    redeem "$US" "$CODE"; U_PK=$PK
+    if hl_row_store hyperliquid '{"max_order_usd":7,"max_leverage":2,"max_daily_volume_usd":50}' "$PARENT,$N_ADDR" >"$RUN_TMP/cli" 2>&1; then
+      # The row is read from the chain at call time; give finality a moment.
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        hl_status "$N_PK" "$N_WID"
+        [[ "$(jq -r '.policy.present // false' <<<"$OUT" 2>/dev/null)" == true ]] && break
+        sleep 3
+      done
+      [[ "$HTTP" == 200 && "$(jq '.policy.max_order_usd == 7' <<<"$OUT" 2>/dev/null)" == true ]] \
+        && pass "SP17 the named wallet runs on the owner's row (max_order_usd 7), not naming it" \
+        || fail "SP17 named wallet → HTTP $HTTP policy $(jq -c '.policy // empty' <<<"$OUT" | head -c 200) $(short)"
+      hl_status "$U_PK" "$U_WID"
+      grep -qi "access denied" <<<"$BODY" \
+        && pass "SP17 a wallet of the owner's the row does not name → Access denied" \
+        || fail "SP17 unnamed wallet → HTTP $HTTP: $(short)"
+      if out=$(hl_row_delete hyperliquid 2>&1); then
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          hl_status "$N_PK" "$N_WID"
+          [[ "$EFFECT" == default:* ]] && break
+          sleep 3
+        done
+        [[ "$HTTP" == 200 && "$EFFECT" == default:* ]] && pass "SP17 the row deleted → the built-in default again" \
+          || fail "SP17 after delete → HTTP $HTTP effect '$EFFECT': $(short)"
+      else
+        fail "SP17 could not delete the row: $(near_why "$out")"
+      fi
+    else
+      fail "SP17 could not store the row: $(near_why < "$RUN_TMP/cli")"
+    fi
+  else
+    fail "SP17 could not give two wallets an owner"
+  fi
+fi
+
+# ── SP21 ─────────────────────────────────────────────────────────────────────
+log "SP21 a wallet with no owner names a row of its operator's"
+if [[ "$CLI_WHO" != "$PARENT" ]]; then
+  skip "SP21 outlayer is logged in as '${CLI_WHO:-nobody}' on $NETWORK, not $PARENT"
+else
+  FS=$(seed free-named); GS=$(seed free-other)
+  read -r F_WID F_ADDR < <(wallet_address "$FS") || true
+  read -r G_WID G_ADDR < <(wallet_address "$GS") || true
+  create_code "{\"name\":\"$RUN-free\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1}"
+  redeem "$FS" "$CODE"; F_PK=$PK
+  redeem "$GS" "$CODE"; G_PK=$PK
+  F_PROFILE="$RUN-hl"
+  F_REF=$(jq -nc --arg a "$PARENT" --arg p "$F_PROFILE" '{account_id:$a, profile:$p}')
+  if [[ -n "${F_WID:-}" && -n "${G_WID:-}" && -n "$F_PK" && -n "$G_PK" ]] \
+     && hl_row_store "$F_PROFILE" '{"max_order_usd":9,"max_leverage":3,"max_daily_volume_usd":90}' "$PARENT,$F_ADDR" >"$RUN_TMP/cli" 2>&1; then
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      hl_call "$F_PK" "$F_WID" '{"operation":"status"}' "$F_REF"
+      [[ "$(jq -r '.policy.present // false' <<<"$OUT" 2>/dev/null)" == true ]] && break
+      sleep 3
+    done
+    [[ "$HTTP" == 200 && "$(jq '.policy.max_order_usd == 9' <<<"$OUT" 2>/dev/null)" == true ]] \
+      && pass "SP21 the named row applies (max_order_usd 9)" \
+      || fail "SP21 named row → HTTP $HTTP policy $(jq -c '.policy // empty' <<<"$OUT" | head -c 200) $(short)"
+    hl_status "$F_PK" "$F_WID"
+    [[ "$HTTP" == 200 && "$EFFECT" == default:* ]] && pass "SP21 the same wallet naming no row → the built-in default" \
+      || fail "SP21 no row named → HTTP $HTTP effect '$EFFECT': $(short)"
+    hl_call "$G_PK" "$G_WID" '{"operation":"status"}' "$F_REF"
+    grep -qi "access denied" <<<"$BODY" \
+      && pass "SP21 another wallet naming that row (not in its whitelist) → Access denied" \
+      || fail "SP21 a wallet outside the whitelist → HTTP $HTTP: $(short)"
+    hl_row_delete "$F_PROFILE" >/dev/null 2>&1 || fail "SP21 could not delete $F_PROFILE"
+  else
+    fail "SP21 fixture: wallets, keys or the row ($(near_why < "$RUN_TMP/cli"))"
+  fi
+fi
+
+# ── SP18 ─────────────────────────────────────────────────────────────────────
+log "SP18 a code past its redeem_until"
+create_code "{\"name\":\"$RUN-until\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1,\"redeem_until\":\"$(jq -nr 'now + 3600 | todate')\"}"
+U_ID=$CODE_ID
+req admin - PATCH "/admin/sponsor-codes/$U_ID" "{\"redeem_until\":\"$(jq -nr 'now - 60 | todate')\"}"
+if [[ "$HTTP" =~ ^2 ]]; then
+  redeem "$(seed until)" "$CODE"
+  [[ "$HTTP" == 404 && "$(j .reason)" == sponsor_code_invalid && "$(code_uses "$U_ID")" == 0\|* ]] \
+    && pass "SP18 past redeem_until → 404 sponsor_code_invalid, no use taken" \
+    || fail "SP18 past redeem_until → HTTP $HTTP $(j .reason), uses|live $(code_uses "$U_ID")"
+else
+  fail "SP18 PATCH redeem_until → HTTP $HTTP: $(short)"
+fi
+
+# ── SP19 ─────────────────────────────────────────────────────────────────────
+log "SP19 a key carrying a live operator's gift takes no code"
+TS=$(seed topup)
+create_code "{\"name\":\"$RUN-t1\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1}"
+redeem "$TS" "$CODE"; T_PK=$PK
+if [[ "$HTTP" == 200 && -n "$T_PK" ]]; then
+  req admin - POST /admin/grant-subscription "$(jq -nc --arg o "${T_PK%%:*}" '{owner:$o, nonce:0}')"
+  if [[ "$HTTP" == 200 ]] && (( $(j '.allowance_available_usd | tonumber') > ALLOW )); then
+    create_code "{\"name\":\"$RUN-t2\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1,\"max_uses\":1,\"one_per_ip\":false}"
+    T2_ID=$CODE_ID
+    redeem "$TS" "$CODE"
+    [[ "$HTTP" == 200 && "$(j .note)" == *"already carries a subscription"* && -z "$(j '.sponsor // empty')" \
+       && "$(code_uses "$T2_ID")" == 0\|* ]] \
+      && pass "SP19 gifted key, another code → 200 already carries a subscription, no use taken" \
+      || fail "SP19 → HTTP $HTTP note='$(j .note | head -c 80)' sponsor='$(j .sponsor)', uses|live $(code_uses "$T2_ID")"
+  else
+    fail "SP19 grant-subscription → HTTP $HTTP: $(short)"
+  fi
+else
+  fail "SP19 first redeem → HTTP $HTTP: $(short)"
+fi
+
+# ── SP20 ─────────────────────────────────────────────────────────────────────
+log "SP20 a policy naming its own keys revokes the bootstrap wk_ and the key with it"
+BS=$(seed boot)
+wk_pair; KB=$WK; KB_HASH=$WK_HASH
+wk_pair; KP=$WK; KP_HASH=$WK_HASH
+# A wk_ registered under a near: bearer belongs to a sub-wallet of that
+# bearer's wallet: everything below acts on the wk_'s own wallet.
+nreq "$BS" PUT /wallet/v1/api-key "$(jq -nc --arg s "$(seed boot-sub)" --arg h "$KB_HASH" '{seed:$s, key_hash:$h}')"
+reg=$HTTP
+req wk "$KB" GET "/wallet/v1/address?chain=near"; B_WID=$(j '.wallet_id // empty')
+if [[ "$reg" =~ ^2 && -n "$B_WID" ]]; then
+  create_code "{\"name\":\"$RUN-boot\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1}"
+  req wk "$KB" POST /wallet/v1/sponsorship "$(jq -nc --arg c "$CODE" '{code:$c}')"
+  B_PK=$(j '.payment_key // empty'); BODY=""
+  if [[ "$HTTP" == 200 && -n "$B_PK" ]] \
+     && store_policy "$BS" "$B_WID" "$(jq -nc --arg h "$KP_HASH" '{rules:{transaction_types:["call"]}, authorized_key_hashes:[$h]}')" "$KB"; then
+    # The worker syncs the policy from the chain event; wait for it, bounded.
+    for _ in $(seq 1 24); do
+      req pk "$B_PK" POST "/call/$PROBE_PROJECT" '{"input":{"operation":"ping"}}'
+      [[ "$HTTP" == 401 ]] && break
+      sleep 5
+    done
+    [[ "$HTTP" == 401 && "$(j .reason)" == invalid_key ]] \
+      && pass "SP20 the policy's sync revoked the bootstrap wk_ → the key's /call 401 invalid_key" \
+      || fail "SP20 the key after the policy → HTTP $HTTP: $(short)"
+    req wk "$KP" GET /wallet/v1/payment-key
+    [[ "$HTTP" == 409 && "$(j .reason)" == payment_key_revoked ]] \
+      && pass "SP20 the policy's own key reads GET → 409 payment_key_revoked" \
+      || fail "SP20 GET by the policy key → HTTP $HTTP: $(short)"
+    req wk "$KP" POST /wallet/v1/sponsorship "$(jq -nc --arg c "$CODE" '{code:$c}')"
+    [[ "$HTTP" == 409 && "$(j .reason)" == payment_key_revoked ]] \
+      && pass "SP20 a redeem onto the dead key → 409 payment_key_revoked" \
+      || fail "SP20 redeem by the policy key → HTTP $HTTP: $(short)"
+  else
+    fail "SP20 redeem with the bootstrap wk_ → HTTP $HTTP, or the policy was not stored"
+  fi
+else
+  fail "SP20 could not register the bootstrap wk_ (HTTP $reg) or read its wallet (HTTP $HTTP)"
 fi
 
 # ── SP16 ─────────────────────────────────────────────────────────────────────
@@ -459,32 +674,35 @@ fi
 
 # ── SP13 ─────────────────────────────────────────────────────────────────────
 if [[ "$CEILING" == 1 ]]; then
-  log "SP13 the custody ceiling: sponsored lifts it, a bare trial does not"
+  log "SP13 the custody ceiling: a lifting code lifts it, a plain code and a bare trial do not"
   LIMIT=$($HAVE_SQL && q "SELECT max_count FROM operation_limits WHERE operation = 'custody:*' AND applies = 'unpaid'" | tr -d ' ')
   if [[ ! "$LIMIT" =~ ^[0-9]+$ ]]; then
     skip "SP13 no custody:* unpaid rule on testnet (or no PSQL_CMD)"
   else
-    for who in sponsored trial; do
+    for who in lifting sponsored trial; do
       S=$(seed "ce-$who")
       nreq "$S" GET "/wallet/v1/address?chain=near"; addr=$(j .address)
       fund_account "$addr" 0.2 || { fail "SP13 could not fund $who"; continue; }
       # The other wallet holds nothing or a bare trial — pay-as-you-go either way.
-      if [[ $who == sponsored ]]; then create_code "{\"name\":\"$RUN-ce\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1}"; redeem "$S" "$CODE"
-      else nreq "$S" POST /trial-key; fi
+      case $who in
+        lifting) create_code "{\"name\":\"$RUN-ce-lift\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1,\"lifts_custody_ceiling\":true}"; redeem "$S" "$CODE" ;;
+        sponsored) create_code "{\"name\":\"$RUN-ce\",\"allowance_usd\":\"$ALLOW\",\"grant_days\":1}"; redeem "$S" "$CODE" ;;
+        trial) nreq "$S" POST /trial-key ;;
+      esac
       refused_at=""
       for n in $(seq 1 $((LIMIT + 1))); do
         nreq "$S" POST /wallet/v1/transfer "{\"to\":\"$PARENT\",\"amount\":\"1000000000000000000\"}"
         [[ "$BODY" == *"limit reached:"*"for custody:"* ]] && { refused_at=$n; break; }
       done
-      if [[ $who == sponsored ]]; then
-        [[ -z "$refused_at" ]] && pass "SP13 sponsored: $((LIMIT + 1)) transfers, none refused" || fail "SP13 sponsored refused at $refused_at"
+      if [[ $who == lifting ]]; then
+        [[ -z "$refused_at" ]] && pass "SP13 lifting code: $((LIMIT + 1)) transfers, none refused" || fail "SP13 lifting code refused at $refused_at"
       else
-        [[ "$refused_at" == $((LIMIT + 1)) ]] && pass "SP13 bare trial refused at $((LIMIT + 1))" || fail "SP13 bare trial refused at '${refused_at:-never}'"
+        [[ "$refused_at" == $((LIMIT + 1)) ]] && pass "SP13 $who refused at $((LIMIT + 1))" || fail "SP13 $who refused at '${refused_at:-never}'"
       fi
     done
   fi
 else
-  skip "SP13 custody ceiling — CEILING=1 (spends NEAR, ~$((2 * 101)) transfers)"
+  skip "SP13 custody ceiling — CEILING=1 (spends NEAR, ~$((3 * 101)) transfers)"
 fi
 
 verdict

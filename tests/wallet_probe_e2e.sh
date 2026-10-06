@@ -13,10 +13,11 @@
 # these probes prove an agent can ROUTE on a refusal, not merely read one.
 #
 # WHY A SEPARATE MODULE FROM connector-probe. The worker gives the wallet
-# imports only to a component that imports them (`has_wallet_import`), and
-# REFUSES to instantiate such a component when the request names no wallet —
-# before `main`. Most connector-probe calls name no wallet, so one import would
-# have taken all of them down. W1 is the live proof of that contract.
+# imports only to a component that imports them (`has_wallet_import`). On a
+# request that names no wallet the component still starts, and every wallet
+# host function answers `no_wallet`; connector-probe keeps the wallet out so
+# its answers stay about the connector path. W1 is the live proof of that
+# contract.
 #
 # HOW IT IS CALLED — two things, both required:
 #   * a payment key the WALLET owns (`X-Payment-Key`). The key names its wallet
@@ -27,8 +28,9 @@
 #     refusal at startup rather than a quieter run.
 #
 # What each probe pins:
-#   W1  no `X-Wallet-Id` → the job is REFUSED because the module imports wallet
-#       and no wallet is available. The negative that defines the contract
+#   W1  no `X-Wallet-Id` → the module starts, and the wallet host function
+#       answers `no_wallet`: no wallet reaches a call that did not name one.
+#       The negative that defines the contract
 #   W2  `whoami` → the host function's `wallet_id` equals `WALLET_ID` from the
 #       environment. A mismatch would mean something other than the worker put
 #       that variable there
@@ -341,21 +343,20 @@ else
   exit 1
 fi
 
-# ── W1: no wallet named → the module must not start ──────────────────────────
+# ── W1: no wallet named → the host function has no wallet ────────────────────
 #
 # The refusal is the product's answer, so it is read from the body rather than
-# from the status alone: a 4xx for a different reason (an unknown project, a
-# rejected key) would pass a status-only check while proving nothing.
-log "W1 calling WITHOUT X-Wallet-Id — the module imports wallet and must be refused"
+# from the status alone: a refusal for a different reason (an unknown project,
+# a rejected key) would pass a status-only check while proving nothing.
+log "W1 calling WITHOUT X-Wallet-Id — the wallet host function must answer no_wallet"
 R=$(probe '{"input":{"operation":"whoami"}}')
 HTTP=${R%% *}; BODY=${R#* }
-MSG=$(jq -r '(.error // "") + " " + (.message // "") + " " + ((.output.error // "")|tostring)' <<<"$BODY" 2>/dev/null)
 if [[ "$HTTP" == 2?? ]] && [[ "$(jq -r '.output.ok // false' <<<"$BODY" 2>/dev/null)" == "true" ]]; then
-  fail "W1 the module RAN without a wallet — every probe below would then be testing emptiness"
-elif grep -qi "wallet is not available\|outlayer:wallet/api\|wallet.*not available" <<<"$MSG$BODY"; then
-  pass "W1 refused, and the reason names the missing wallet"
+  fail "W1 the host function answered a wallet the call never named"
+elif [[ "$HTTP" == 2?? ]] && grep -q "this run has no wallet" <<<"$(jq -r '.output | tostring' <<<"$BODY" 2>/dev/null)"; then
+  pass "W1 no wallet named → the host function answers no_wallet"
 else
-  fail "W1 refused ($HTTP) but not for the wallet: $(head -c 200 <<<"$BODY")"
+  fail "W1 not refused for the wallet ($HTTP): $(head -c 200 <<<"$BODY")"
 fi
 
 WID_HDR="X-Wallet-Id: $WALLET_ID"

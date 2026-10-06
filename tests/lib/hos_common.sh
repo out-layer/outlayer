@@ -399,16 +399,19 @@ extension_op() {
 
 # store_policy <seed> <wallet_id> <rules-json> — encrypt, sign, put on chain.
 store_policy() {
-  local seed=$1 wid=$2 pol=$3 body enc encb64 sg sig_hex pub_hex store_args
+  local seed=$1 wid=$2 pol=$3 wk=${4:-} body enc encb64 sg sig_hex pub_hex store_args hdr
+  # The wallet's own credential, through stdin: its near: bearer for `seed`,
+  # or — a 4th argument — a wk_ of that wallet.
+  if [[ -n "$wk" ]]; then hdr="Authorization: Bearer $wk"; else hdr=$(AUTH_FOR "$seed"); fi
   body=$(jq -nc --arg wid "$wid" --argjson p "$pol" '$p + {wallet_id:$wid}')
   throttle
-  enc=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" --max-time 60 \
-    -H "$(AUTH_FOR "$seed")" -H 'Content-Type: application/json' -d "$body")
+  enc=$(printf '%s\n' "$hdr" | curl -sS -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" --max-time 60 \
+    -H @- -H 'Content-Type: application/json' -d "$body")
   encb64=$(jq -r '.encrypted_base64 // empty' <<<"$enc")
   [[ -n "$encb64" ]] || { warn "encrypt-policy failed: $(head -c 200 <<<"$enc")"; return 1; }
   throttle
-  sg=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" --max-time 60 \
-    -H "$(AUTH_FOR "$seed")" -H 'Content-Type: application/json' \
+  sg=$(printf '%s\n' "$hdr" | curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" --max-time 60 \
+    -H @- -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg ed "$encb64" --arg c "$PARENT" '{encrypted_data:$ed, caller:$c}')")
   sig_hex=$(jq -r '.signature_hex // empty' <<<"$sg")
   pub_hex=$(jq -r '.public_key_hex // empty' <<<"$sg")
