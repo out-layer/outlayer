@@ -68,6 +68,8 @@ enum StorageKey {
     // The highest payment-key nonce the contract has seen each owner create or
     // delete (owner -> nonce)
     PaymentKeyNonceFloor,
+    // Who a refundable storage deposit goes back to (StorageItem -> AccountId)
+    StorageRefundTo,
 }
 
 /// Execution source - GitHub repo, pre-compiled WASM URL, or project reference
@@ -556,6 +558,14 @@ pub struct Contract {
     // deleted key's row under `(owner, nonce)`, and a key at that nonce would
     // bring the row back. See `payment::Contract::payment_key_nonce_floor`.
     payment_key_nonce_floors: LookupMap<AccountId, u32>,
+
+    // Who a refundable storage deposit goes back to, by what it is held for.
+    // Absent: the caller of the refunding call, as it always was. A side map
+    // rather than a field on the stored entry, so existing borsh entries keep
+    // reading unchanged; keyed by `wallet::StorageItem`, so a new kind of
+    // sponsored storage is a new variant and an argument on its creating call,
+    // never a new map. See `wallet::Contract::store_wallet_policy`.
+    storage_refund_to: LookupMap<wallet::StorageItem, AccountId>,
 }
 
 #[near_bindgen]
@@ -607,6 +617,7 @@ impl Contract {
             subscription_plans: Vec::new(),
             project_pricing: UnorderedMap::new(StorageKey::ProjectPricing),
             payment_key_nonce_floors: LookupMap::new(StorageKey::PaymentKeyNonceFloor),
+            storage_refund_to: LookupMap::new(StorageKey::StorageRefundTo),
         }
     }
 

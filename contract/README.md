@@ -178,6 +178,66 @@ Get contract configuration.
 near view outlayer.testnet get_config '{}'
 ```
 
+### Wallet Policy Functions
+
+A custody wallet's policy is stored here encrypted; only the keystore decrypts
+it. The account that sends `store_wallet_policy` becomes its controller.
+
+#### `store_wallet_policy`
+Create or update a policy. Needs a signature by the wallet's own key over
+`store_wallet_policy:v1:{wallet_pubkey}:{len}:{encrypted_data}:{caller}` (the
+keystore makes it) and a storage deposit (`estimate_wallet_policy_cost`).
+
+`storage_refund_to` (optional) names who the storage deposit goes back to —
+for a sponsor that pays it while the owner signs. It is set only when the
+policy is CREATED: an update that names it fails. From then on every refund
+goes to it — the excess of the creating call, the difference when an update
+shrinks the policy, and the whole deposit on `delete_wallet_policy`. The owner
+keeps every power over the policy itself (update, freeze, delete); it cannot
+change where the deposit goes. That includes the excess of the owner's own
+attachment on an update: attach exactly `estimate_wallet_policy_cost`, or the
+rest goes to the beneficiary. Without the argument, refunds go to the caller,
+as before. The argument is covered by the owner's transaction signature, so a
+NEP-366 relayer cannot change it.
+
+```bash
+near contract call-function as-transaction outlayer.testnet store_wallet_policy json-args '{
+  "wallet_pubkey": "ed25519:<hex>", "encrypted_data": "<base64>",
+  "wallet_signature": "<hex>", "storage_refund_to": "sponsor.testnet"
+}' prepaid-gas '100.0 Tgas' attached-deposit '0.05 NEAR' sign-as owner.testnet network-config testnet sign-with-keychain send
+```
+
+#### `set_storage_refund_to`
+Hand the refunds on: `{"item": {"WalletPolicy": {"wallet_pubkey": "ed25519:<hex>"}}, "storage_refund_to": "other.testnet"}`.
+Only the current beneficiary can call it — to pass the deposit to another
+sponsor, or to the owner to give it back. The owner cannot take it, and a
+policy created without a beneficiary never gets one. No deposit is attached and
+nothing is refunded: the record keeps its size. Emits `StorageRefundToChanged`.
+
+**The beneficiary answers for its account existing.** A refund to an account
+that no longer exists fails on chain and the NEAR stays with the contract; the
+contract cannot check this in advance.
+
+`StorageItem` is what a refundable deposit is held for. Today it has one
+variant, `WalletPolicy { wallet_pubkey }`; a new kind of sponsored storage is a
+new variant and an argument on its creating call.
+
+#### `delete_wallet_policy`
+Controller only. Returns the whole deposit to the beneficiary when one is set,
+otherwise to the caller, and drops the beneficiary: a policy created again
+under the key starts without one. The `WalletPolicyDeleted` event carries
+`refunded_to`.
+
+#### `freeze_wallet` / `unfreeze_wallet`
+Controller only, no wallet signature: the emergency stop for a compromised
+agent key.
+
+#### Views
+- `get_wallet_policy(wallet_pubkey)` → `{owner, encrypted_data, frozen, updated_at, storage_refund_to, storage_deposit}` or `null`. A sponsor checks `storage_refund_to` before it pays.
+- `get_wallet_policies_by_owner(owner)` → `[{wallet_pubkey, owner, frozen, updated_at, storage_refund_to}]`.
+- `has_wallet_policy(wallet_pubkey)` → `bool`.
+- `estimate_wallet_policy_cost(wallet_pubkey, encrypted_data, storage_refund_to?)` → yoctoNEAR as a string; with `storage_refund_to` it includes the beneficiary's record, as the store will charge it.
+
 ### Secrets Management Functions
 
 #### `store_secrets`
@@ -436,6 +496,10 @@ near contract call-function as-transaction dev.outlayer.testnet set_payment_toke
 near contract call-function as-transaction usdc.fakes.testnet storage_deposit json-args '{"account_id": "dev.outlayer.testnet"}' prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' sign-as dev.outlayer.testnet network-config testnet sign-with-keychain send
 
 ### Deploy without init
+
+A deploy that changes the state shape runs `migrate` in the same transaction
+(or straight after). `get_storage_version` answers the shape the code expects:
+`"10"` adds `storage_refund_to` (from `"9"`).
 
 ```bash
 near contract deploy dev.outlayer.testnet use-file res/local/outlayer_contract.wasm without-init-call network-config testnet sign-with-keychain send

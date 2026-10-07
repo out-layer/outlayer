@@ -22,6 +22,28 @@ pub struct WalletPolicyEntry {
     pub storage_deposit: Balance,
 }
 
+/// What a refundable storage deposit is held for. Grows by variant: a new
+/// kind of sponsored storage is a new variant and an argument on its creating
+/// call, never a new map.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageItem {
+    /// A wallet policy, by its wallet key (canonical — see
+    /// [`canonical_wallet_pubkey`]).
+    WalletPolicy { wallet_pubkey: String },
+}
+
+impl StorageItem {
+    /// The same item under the one key it may be stored under.
+    fn canonical(self) -> StorageItem {
+        match self {
+            StorageItem::WalletPolicy { wallet_pubkey } => StorageItem::WalletPolicy {
+                wallet_pubkey: canonical_wallet_pubkey(&wallet_pubkey),
+            },
+        }
+    }
+}
+
 /// Wallet policy view for JSON responses
 #[derive(Clone, Debug)]
 #[near(serializers = [json])]
@@ -30,6 +52,11 @@ pub struct WalletPolicyView {
     pub encrypted_data: String,
     pub frozen: bool,
     pub updated_at: u64,
+    /// Who the storage deposit goes back to on a shrink or a delete; `None`:
+    /// the owner, who calls them.
+    pub storage_refund_to: Option<AccountId>,
+    /// The storage deposit held for this policy now.
+    pub storage_deposit: near_sdk::json_types::U128,
 }
 
 /// Lightweight view for listing wallets by owner
@@ -40,6 +67,7 @@ pub struct WalletPolicyListItem {
     pub owner: AccountId,
     pub frozen: bool,
     pub updated_at: u64,
+    pub storage_refund_to: Option<AccountId>,
 }
 
 /// Parse wallet pubkey string into (key_type, raw_bytes)
@@ -262,12 +290,18 @@ impl Contract {
     /// * `wallet_pubkey` - "ed25519:<hex32>" or "secp256k1:<hex33>"
     /// * `encrypted_data` - Policy encrypted by keystore
     /// * `wallet_signature` - Hex-encoded signature proving API key ownership
+    /// * `storage_refund_to` - Who the storage deposit goes back to on a shrink
+    ///   or a delete, for a sponsor that pays it. Set only when the policy is
+    ///   CREATED; on an update it must be absent (the beneficiary changes it
+    ///   with `set_storage_refund_to`). Absent: the owner, as always. Covered by
+    ///   the owner's transaction signature — a NEP-366 relayer cannot change it.
     #[payable]
     pub fn store_wallet_policy(
         &mut self,
         wallet_pubkey: String,
         encrypted_data: String,
         wallet_signature: String,
+        storage_refund_to: Option<AccountId>,
     ) {
         self.assert_not_paused();
 
@@ -311,14 +345,40 @@ impl Contract {
 
         verify_wallet_signature(&wallet_pubkey, &message_hash, &wallet_signature);
 
-        // Calculate storage cost
-        let storage_size = self.calculate_wallet_policy_storage_size(&wallet_pubkey, &encrypted_data);
+        let item = StorageItem::WalletPolicy { wallet_pubkey: wallet_pubkey.clone() };
+        let existing = self.wallet_policies.get(&wallet_pubkey);
+
+        // The beneficiary is named when the policy is created and changed only
+        // by itself. An update that names one is refused rather than ignored:
+        // ignored, the owner would believe they had changed it.
+        let beneficiary = if existing.is_some() {
+            assert!(
+                storage_refund_to.is_none(),
+                "storage_refund_to is set when the policy is created; the beneficiary changes it with set_storage_refund_to"
+            );
+            self.storage_refund_to.get(&item)
+        } else {
+            if let Some(b) = &storage_refund_to {
+                self.storage_refund_to.insert(&item, b);
+            }
+            storage_refund_to
+        };
+
+        // Calculate storage cost — the beneficiary's own record included.
+        let storage_size = self.calculate_wallet_policy_storage_size(
+            &wallet_pubkey,
+            &encrypted_data,
+            beneficiary.is_some(),
+        );
         let required_deposit = storage_size as u128 * STORAGE_PRICE_PER_BYTE;
+        // Every refund of this deposit — the excess now, a shrink or a delete
+        // later — goes to the beneficiary when there is one.
+        let refund_to = beneficiary.unwrap_or_else(|| caller.clone());
 
         // Check ownership and handle deposit. `was_frozen` travels with the
         // entry: a freeze must survive a policy edit — see below.
         let mut was_frozen = false;
-        let is_new = if let Some(existing) = self.wallet_policies.get(&wallet_pubkey) {
+        let is_new = if let Some(existing) = existing {
             // Update: caller must be the same controller
             assert!(
                 existing.owner == caller,
@@ -340,7 +400,7 @@ impl Contract {
             // Refund excess
             let refund = total_available - required_deposit;
             if refund > 0 {
-                near_sdk::Promise::new(caller.clone())
+                near_sdk::Promise::new(refund_to.clone())
                     .transfer(NearToken::from_yoctonear(refund));
             }
             false
@@ -356,7 +416,7 @@ impl Contract {
             // Refund excess
             if attached_deposit > required_deposit {
                 let refund = attached_deposit - required_deposit;
-                near_sdk::Promise::new(caller.clone())
+                near_sdk::Promise::new(refund_to.clone())
                     .transfer(NearToken::from_yoctonear(refund));
             }
             true
@@ -515,15 +575,56 @@ impl Contract {
             }
         }
 
-        // Refund storage deposit
+        // Refund storage deposit — to the beneficiary when there is one — and
+        // drop the beneficiary with the policy: a policy created again under
+        // this key starts without one.
+        let refunded_to = self
+            .storage_refund_to
+            .remove(&StorageItem::WalletPolicy { wallet_pubkey: wallet_pubkey.clone() })
+            .unwrap_or_else(|| caller.clone());
         if entry.storage_deposit > 0 {
-            near_sdk::Promise::new(caller.clone())
+            near_sdk::Promise::new(refunded_to.clone())
                 .transfer(NearToken::from_yoctonear(entry.storage_deposit));
         }
 
         self.emit_system_event(crate::payment::SystemEvent::WalletPolicyDeleted {
             wallet_pubkey,
             owner: caller,
+            refunded_to,
+        });
+    }
+
+    /// Hand the storage refunds of `item` to another account.
+    ///
+    /// A beneficiary is named only when the item is created. From then on only
+    /// the beneficiary itself can hand it on — to another sponsor, or to the
+    /// owner to give the deposit back. The owner cannot take it, and an item
+    /// created without one never gets one. The record's size does not change,
+    /// so nothing is attached and nothing is refunded. Emits
+    /// `StorageRefundToChanged`.
+    pub fn set_storage_refund_to(&mut self, item: StorageItem, storage_refund_to: AccountId) {
+        self.assert_not_paused();
+        let caller = env::predecessor_account_id();
+        let item = item.canonical();
+
+        // A beneficiary record lives exactly as long as its item: written when
+        // the item is created, removed when it is deleted. So no record means
+        // either no such item or one created without a beneficiary.
+        let current = self.storage_refund_to.get(&item).unwrap_or_else(|| {
+            env::panic_str(
+                "No storage beneficiary is set for this item; one is named only when the item is created",
+            )
+        });
+        assert!(
+            caller == current,
+            "Only the storage beneficiary ({}) can change where this deposit is refunded",
+            current
+        );
+
+        self.storage_refund_to.insert(&item, &storage_refund_to);
+        self.emit_system_event(crate::payment::SystemEvent::StorageRefundToChanged {
+            item,
+            storage_refund_to,
         });
     }
 }
@@ -543,13 +644,16 @@ impl Contract {
     /// Returns owner, encrypted_data, frozen flag, updated_at
     /// Keystore decrypts encrypted_data for policy rules
     pub fn get_wallet_policy(&self, wallet_pubkey: String) -> Option<WalletPolicyView> {
-        self.wallet_policies.get(&lookup_wallet_pubkey(&wallet_pubkey)).map(|entry| {
-            WalletPolicyView {
-                owner: entry.owner,
-                encrypted_data: entry.encrypted_data,
-                frozen: entry.frozen,
-                updated_at: entry.updated_at,
-            }
+        let wallet_pubkey = lookup_wallet_pubkey(&wallet_pubkey);
+        self.wallet_policies.get(&wallet_pubkey).map(|entry| WalletPolicyView {
+            owner: entry.owner,
+            encrypted_data: entry.encrypted_data,
+            frozen: entry.frozen,
+            updated_at: entry.updated_at,
+            storage_refund_to: self
+                .storage_refund_to
+                .get(&StorageItem::WalletPolicy { wallet_pubkey: wallet_pubkey.clone() }),
+            storage_deposit: near_sdk::json_types::U128(entry.storage_deposit),
         })
     }
 
@@ -562,35 +666,47 @@ impl Contract {
             .iter()
             .filter_map(|wallet_pubkey| {
                 self.wallet_policies.get(&wallet_pubkey).map(|entry| {
+                    let storage_refund_to = self
+                        .storage_refund_to
+                        .get(&StorageItem::WalletPolicy { wallet_pubkey: wallet_pubkey.clone() });
                     WalletPolicyListItem {
                         wallet_pubkey,
                         owner: entry.owner,
                         frozen: entry.frozen,
                         updated_at: entry.updated_at,
+                        storage_refund_to,
                     }
                 })
             })
             .collect()
     }
 
-    /// Estimate storage cost for wallet policy (before storing)
+    /// Estimate storage cost for wallet policy (before storing). With
+    /// `storage_refund_to`, the beneficiary's record is included, as
+    /// `store_wallet_policy` will charge it.
     pub fn estimate_wallet_policy_cost(
         &self,
         wallet_pubkey: String,
         encrypted_data: String,
+        storage_refund_to: Option<AccountId>,
     ) -> near_sdk::json_types::U128 {
-        let storage_bytes =
-            self.calculate_wallet_policy_storage_size(&wallet_pubkey, &encrypted_data);
+        let storage_bytes = self.calculate_wallet_policy_storage_size(
+            &wallet_pubkey,
+            &encrypted_data,
+            storage_refund_to.is_some(),
+        );
         near_sdk::json_types::U128((storage_bytes as u128) * STORAGE_PRICE_PER_BYTE)
     }
 }
 
 impl Contract {
-    /// Calculate storage size for wallet policy entry
+    /// Calculate storage size for wallet policy entry, and the beneficiary's
+    /// record when there is one.
     fn calculate_wallet_policy_storage_size(
         &self,
         wallet_pubkey: &str,
         encrypted_data: &str,
+        with_beneficiary: bool,
     ) -> u64 {
         const BASE_OVERHEAD: u64 = 40; // LookupMap entry overhead
 
@@ -611,7 +727,15 @@ impl Contract {
             + 16 // storage_deposit
         ) as u64;
 
-        BASE_OVERHEAD + key_size + value_size
+        // The beneficiary's record: its map entry, its key (the borsh variant
+        // tag and the wallet key) and an account id at its maximum.
+        let beneficiary = if with_beneficiary {
+            BASE_OVERHEAD + (1 + 4 + wallet_pubkey.len() as u64) + (4 + 64)
+        } else {
+            0
+        };
+
+        BASE_OVERHEAD + key_size + value_size + beneficiary
     }
 }
 

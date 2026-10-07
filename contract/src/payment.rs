@@ -435,6 +435,14 @@ pub enum SystemEvent {
     WalletPolicyDeleted {
         wallet_pubkey: String,
         owner: AccountId,
+        /// Who the storage deposit went back to: the beneficiary when one was
+        /// set, otherwise the owner.
+        refunded_to: AccountId,
+    },
+    /// The beneficiary of a storage deposit handed it to another account.
+    StorageRefundToChanged {
+        item: crate::wallet::StorageItem,
+        storage_refund_to: AccountId,
     },
     /// Wallet frozen/unfrozen — worker should update freeze status
     WalletFrozenChanged {

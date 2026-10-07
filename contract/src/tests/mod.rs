@@ -2234,7 +2234,7 @@ mod store_wallet_policy_tests {
         signature: String,
     ) {
         testing_env!(get_context(caller, NearToken::from_near(1)).build());
-        contract.store_wallet_policy(pubkey.to_string(), data.to_string(), signature);
+        contract.store_wallet_policy(pubkey.to_string(), data.to_string(), signature, None);
     }
 
     /// Byte for byte, so the keystore's copy has something to be compared
@@ -2837,5 +2837,250 @@ mod project_uuid_tests {
             }),
         );
         assert_eq!(announced_uuid(), Some(uuid));
+    }
+}
+
+/// Who a wallet policy's storage deposit goes back to.
+///
+/// A sponsor pays the deposit of a policy its owner signs. Every refund — the
+/// excess at creation, the difference on a shrink, the whole deposit on a
+/// delete — went to the caller, the owner, who could grow a policy on the
+/// sponsor's money and shrink or delete it to keep the NEAR. A beneficiary
+/// named at creation now receives them, and only it can hand them on.
+mod storage_refund_to_tests {
+    use super::*;
+    use crate::wallet::StorageItem;
+    use ed25519_dalek::{Signer, SigningKey};
+    use near_sdk::mock::MockAction;
+    use sha2::{Digest, Sha256};
+
+    const PRICE: u128 = 10_000_000_000_000_000_000; // per byte, as in wallet.rs
+
+    fn owner() -> AccountId { accounts(1) }
+    fn sponsor() -> AccountId { accounts(2) }
+    fn stranger() -> AccountId { accounts(3) }
+
+    fn wallet() -> (SigningKey, String) {
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        (signing.clone(), format!("ed25519:{}", hex::encode(signing.verifying_key().to_bytes())))
+    }
+
+    fn sign(signing: &SigningKey, pubkey: &str, data: &str, caller: &AccountId) -> String {
+        let message = crate::wallet::policy_store_message(pubkey, data, caller);
+        let hash: [u8; 32] = Sha256::digest(message.as_bytes()).into();
+        hex::encode(signing.sign(&hash).to_bytes())
+    }
+
+    /// Store as `owner()` with `deposit` attached; returns the transfers made.
+    fn store(
+        c: &mut Contract,
+        data: &str,
+        deposit: u128,
+        refund_to: Option<AccountId>,
+    ) -> Vec<(AccountId, u128)> {
+        let (signing, pubkey) = wallet();
+        testing_env!(get_context(owner(), NearToken::from_yoctonear(deposit)).build());
+        c.store_wallet_policy(pubkey.clone(), data.to_string(), sign(&signing, &pubkey, data, &owner()), refund_to);
+        transfers()
+    }
+
+    fn transfers() -> Vec<(AccountId, u128)> {
+        near_sdk::test_utils::get_created_receipts()
+            .into_iter()
+            .flat_map(|r| {
+                let to = r.receiver_id.clone();
+                r.actions.into_iter().filter_map(move |a| match a {
+                    MockAction::Transfer { deposit, .. } => Some((to.clone(), deposit.as_yoctonear())),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    fn item() -> StorageItem {
+        StorageItem::WalletPolicy { wallet_pubkey: wallet().1 }
+    }
+
+    fn cost(c: &Contract, data: &str, beneficiary: Option<AccountId>) -> u128 {
+        c.estimate_wallet_policy_cost(wallet().1, data.to_string(), beneficiary).0
+    }
+
+    fn held(c: &Contract) -> u128 {
+        c.get_wallet_policy(wallet().1).unwrap().storage_deposit.0
+    }
+
+    fn system_events() -> Vec<serde_json::Value> {
+        near_sdk::test_utils::get_logs()
+            .iter()
+            .filter_map(|l| l.strip_prefix("EVENT_JSON:"))
+            .filter_map(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .filter(|e| e["event"] == "system_event")
+            .flat_map(|e| e["data"].as_array().cloned().unwrap_or_default())
+            .collect()
+    }
+
+    const BIG: &str = "A";
+    fn big() -> String { BIG.repeat(400) }
+    fn small() -> String { BIG.repeat(50) }
+    const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+
+    /// Without a beneficiary nothing changes: every refund goes to the caller.
+    #[test]
+    fn without_a_beneficiary_every_refund_goes_to_the_caller() {
+        let mut c = setup_contract();
+        let need = cost(&c, &big(), None);
+        assert_eq!(store(&mut c, &big(), ONE_NEAR, None), vec![(owner(), ONE_NEAR - need)]);
+        let view = c.get_wallet_policy(wallet().1).unwrap();
+        assert_eq!(view.storage_refund_to, None);
+        assert_eq!(view.storage_deposit.0, need);
+
+        let shrunk = cost(&c, &small(), None);
+        assert_eq!(store(&mut c, &small(), 0, None), vec![(owner(), need - shrunk)]);
+
+        testing_env!(get_context(owner(), NearToken::from_yoctonear(0)).build());
+        c.delete_wallet_policy(wallet().1);
+        assert_eq!(transfers(), vec![(owner(), shrunk)]);
+        let deleted = system_events().into_iter().find(|e| e.get("WalletPolicyDeleted").is_some()).unwrap();
+        assert_eq!(deleted["WalletPolicyDeleted"]["refunded_to"], owner().to_string());
+    }
+
+    /// A beneficiary named at creation gets the excess of that same call, and
+    /// the view says who it is and what is held.
+    #[test]
+    fn a_beneficiary_named_at_creation_receives_the_excess() {
+        let mut c = setup_contract();
+        let need = cost(&c, &big(), Some(sponsor()));
+        assert_eq!(store(&mut c, &big(), ONE_NEAR, Some(sponsor())), vec![(sponsor(), ONE_NEAR - need)]);
+        let view = c.get_wallet_policy(wallet().1).unwrap();
+        assert_eq!(view.storage_refund_to, Some(sponsor()));
+        assert_eq!(view.storage_deposit.0, need);
+        let listed = c.get_wallet_policies_by_owner(owner());
+        assert_eq!(listed[0].storage_refund_to, Some(sponsor()));
+    }
+
+    /// The owner shrinks the policy: the difference goes to the beneficiary.
+    #[test]
+    fn a_shrink_refunds_the_beneficiary_not_the_owner() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, Some(sponsor()));
+        let before = held(&c);
+        let after = cost(&c, &small(), Some(sponsor()));
+        assert_eq!(store(&mut c, &small(), 0, None), vec![(sponsor(), before - after)]);
+        assert_eq!(held(&c), after);
+    }
+
+    /// Naming a beneficiary on an update is refused, not ignored.
+    #[test]
+    #[should_panic(expected = "storage_refund_to is set when the policy is created")]
+    fn an_update_cannot_name_a_beneficiary() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, Some(sponsor()));
+        store(&mut c, &small(), 0, Some(owner()));
+    }
+
+    /// The same, for a policy created without one: the owner may not slip one
+    /// in through an update either.
+    #[test]
+    #[should_panic(expected = "storage_refund_to is set when the policy is created")]
+    fn an_update_of_a_policy_without_one_cannot_name_one_either() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, None);
+        store(&mut c, &small(), ONE_NEAR, Some(sponsor()));
+    }
+
+    /// The owner deletes: the whole deposit goes to the beneficiary, and a
+    /// policy created again under the key starts without one.
+    #[test]
+    fn a_delete_refunds_the_beneficiary_and_forgets_it() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, Some(sponsor()));
+        let deposit = held(&c);
+        testing_env!(get_context(owner(), NearToken::from_yoctonear(0)).build());
+        c.delete_wallet_policy(wallet().1);
+        assert_eq!(transfers(), vec![(sponsor(), deposit)]);
+        let deleted = system_events().into_iter().find(|e| e.get("WalletPolicyDeleted").is_some()).unwrap();
+        assert_eq!(deleted["WalletPolicyDeleted"]["refunded_to"], sponsor().to_string());
+        assert!(c.get_wallet_policy(wallet().1).is_none());
+
+        store(&mut c, &big(), ONE_NEAR, None);
+        assert_eq!(c.get_wallet_policy(wallet().1).unwrap().storage_refund_to, None);
+    }
+
+    fn set(c: &mut Contract, caller: AccountId, to: AccountId) -> Vec<(AccountId, u128)> {
+        testing_env!(get_context(caller, NearToken::from_yoctonear(0)).build());
+        c.set_storage_refund_to(item(), to);
+        transfers()
+    }
+
+    /// The beneficiary hands the refunds on — here to the owner, which is how
+    /// a sponsor gives the deposit back. Nothing moves and nothing is charged:
+    /// the record keeps its size. From then on refunds go to the new one.
+    #[test]
+    fn the_beneficiary_hands_the_refunds_on() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, Some(sponsor()));
+        let held_before = held(&c);
+
+        assert_eq!(set(&mut c, sponsor(), owner()), vec![]);
+        assert_eq!(c.get_wallet_policy(wallet().1).unwrap().storage_refund_to, Some(owner()));
+        assert_eq!(held(&c), held_before, "the record keeps its size");
+        let changed = system_events().into_iter().find(|e| e.get("StorageRefundToChanged").is_some()).unwrap();
+        assert_eq!(changed["StorageRefundToChanged"]["storage_refund_to"], owner().to_string());
+
+        let shrunk = cost(&c, &small(), Some(owner()));
+        assert_eq!(store(&mut c, &small(), 0, None), vec![(owner(), held_before - shrunk)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the storage beneficiary")]
+    fn the_owner_cannot_change_a_beneficiary() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, Some(sponsor()));
+        set(&mut c, owner(), owner());
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the storage beneficiary")]
+    fn a_stranger_cannot_change_a_beneficiary() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, Some(sponsor()));
+        set(&mut c, stranger(), stranger());
+    }
+
+    /// A policy created without one never gets one — not even from its owner.
+    #[test]
+    #[should_panic(expected = "named only when the item is created")]
+    fn a_policy_created_without_a_beneficiary_never_gets_one() {
+        let mut c = setup_contract();
+        store(&mut c, &big(), ONE_NEAR, None);
+        set(&mut c, owner(), sponsor());
+    }
+
+    #[test]
+    #[should_panic(expected = "No storage beneficiary is set for this item")]
+    fn there_is_no_beneficiary_for_a_policy_that_does_not_exist() {
+        let mut c = setup_contract();
+        set(&mut c, sponsor(), sponsor());
+    }
+
+    /// The estimate counts the record exactly as the store charges it.
+    #[test]
+    fn the_estimate_with_a_beneficiary_is_the_charge() {
+        let mut c = setup_contract();
+        let with = cost(&c, &big(), Some(sponsor()));
+        let without = cost(&c, &big(), None);
+        let key = wallet().1;
+        let expected_record = (40 + 1 + 4 + key.len() as u128 + 4 + 64) * PRICE;
+        assert_eq!(with - without, expected_record);
+        store(&mut c, &big(), with, Some(sponsor()));
+        assert_eq!(held(&c), with);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient storage deposit")]
+    fn a_deposit_without_the_record_is_not_enough_with_a_beneficiary() {
+        let mut c = setup_contract();
+        let without = cost(&c, &big(), None);
+        store(&mut c, &big(), without, Some(sponsor()));
     }
 }
