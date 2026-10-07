@@ -9,8 +9,9 @@ use tracing::{debug, info, warn};
 
 use crate::api_client::{ExecutionOutput, ExecutionResult};
 
-/// The logs `resume_topup` and `resume_delete_payment_key` write when the
-/// yield they were to resume is gone (`contract/src/payment.rs`).
+/// What `resume_topup` and `resume_delete_payment_key` say when the yield
+/// they were to resume is gone (`contract/src/payment.rs`): the start of their
+/// panic message, and of the log a contract that does not panic writes.
 const NO_YIELD_LOGS: [&str; 2] = ["TopUp yield resume failed", "DeletePaymentKey yield resume failed"];
 
 /// A transaction of the worker's that executed and that the contract did not
@@ -268,7 +269,16 @@ impl NearClient {
         };
         match &outcome.status {
             FinalExecutionStatus::SuccessValue(_) => {}
-            FinalExecutionStatus::Failure(err) => return Err(refused(Refusal::Failed(err.to_string()))),
+            // The contract refuses a resume whose yield is gone by panicking
+            // with the same words it logs where it does not panic.
+            FinalExecutionStatus::Failure(err) => {
+                let why = err.to_string();
+                return Err(refused(if NO_YIELD_LOGS.iter().any(|marker| why.contains(marker)) {
+                    Refusal::NoYield(why)
+                } else {
+                    Refusal::Failed(why)
+                }));
+            }
             FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started => {
                 return Err(refused(Refusal::Unfinished))
             }
@@ -1540,6 +1550,20 @@ mod only_a_taken_transaction_is_reported_as_done {
             vec![receipt(CONTRACT, &[])],
         );
         assert!(refusal(&o).contains("Execution request not found"));
+    }
+
+    /// The contract that panics on a gone yield is told apart the same way.
+    #[test]
+    fn a_resume_the_contract_panicked_on_for_no_yield_is_a_gone_yield() {
+        let o = outcome(
+            json!({ "Failure": { "ActionError": { "index": 0, "kind": {
+                "FunctionCallError": { "ExecutionError": format!(
+                    "Smart contract panicked: TopUp yield resume failed: no yield for data_id={DATA_ID} (timed out and refunded, or already resumed)"
+                ) } } } } }),
+            vec![receipt(CONTRACT, &[])],
+        );
+        let refused = NearClient::require_taken("resume_topup", &o).unwrap_err();
+        assert!(matches!(refused.reason, super::Refusal::NoYield(_)), "{refused}");
     }
 
     #[test]

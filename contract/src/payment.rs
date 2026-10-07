@@ -645,14 +645,17 @@ impl Contract {
         let result_bytes = serde_json::to_vec(&result)
             .expect("Failed to serialize TopUpResult");
 
-        // Resume the yield promise
-        let success = env::promise_yield_resume(&data_id_hash, &result_bytes);
-
-        if success {
-            log!("TopUp yield resumed: data_id={}", data_id);
-        } else {
-            log!("TopUp yield resume failed (timeout?): data_id={}", data_id);
+        // A resume that finds no yield MUST panic: the timeout callback has
+        // already settled this top-up (refunded the tokens), and a successful
+        // transaction here would let the worker report a credit the chain did
+        // not take. Every `resume_*` follows the same rule.
+        if !env::promise_yield_resume(&data_id_hash, &result_bytes) {
+            env::panic_str(&format!(
+                "TopUp yield resume failed: no yield for data_id={} (timed out and refunded, or already resumed)",
+                data_id
+            ));
         }
+        log!("TopUp yield resumed: data_id={}", data_id);
     }
 
     // =========================================================================
@@ -819,14 +822,17 @@ impl Contract {
         let result_bytes = serde_json::to_vec(&result)
             .expect("Failed to serialize DeletePaymentKeyResult");
 
-        // Resume the yield promise
-        let success = env::promise_yield_resume(&data_id_hash, &result_bytes);
-
-        if success {
-            log!("DeletePaymentKey yield resumed: data_id={}", data_id);
-        } else {
-            log!("DeletePaymentKey yield resume failed (timeout?): data_id={}", data_id);
+        // A resume that finds no yield MUST panic: the timeout callback has
+        // already settled this delete (kept the key), and a successful
+        // transaction here would let the worker report a deletion the chain
+        // did not make. Every `resume_*` follows the same rule.
+        if !env::promise_yield_resume(&data_id_hash, &result_bytes) {
+            env::panic_str(&format!(
+                "DeletePaymentKey yield resume failed: no yield for data_id={} (timed out, the key is kept, or already resumed)",
+                data_id
+            ));
         }
+        log!("DeletePaymentKey yield resumed: data_id={}", data_id);
     }
 
     // =========================================================================
@@ -1285,5 +1291,56 @@ impl Contract {
             Gas::from_tgas(0), // minimum gas (will get all remaining)
             GasWeight(1),      // weight = 1, gets all remaining gas
         )
+    }
+}
+
+#[cfg(test)]
+mod a_resume_with_no_yield_is_refused {
+    //! A resume that reaches the contract after its yield timed out must fail
+    //! the transaction: the timeout callback has already refunded the top-up or
+    //! kept the key, and the worker reports the resume as done only when the
+    //! chain took it.
+    use super::*;
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::testing_env;
+
+    /// 32 bytes no yield was ever created for, hex.
+    const NO_YIELD: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+    fn contract_as_operator() -> Contract {
+        let owner = accounts(0);
+        let operator = accounts(1);
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(owner.clone());
+        testing_env!(b.build());
+        let contract = Contract::new(owner, Some(operator.clone()), None, None);
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(operator);
+        testing_env!(b.build());
+        contract
+    }
+
+    #[test]
+    #[should_panic(expected = "TopUp yield resume failed: no yield for data_id=")]
+    fn a_top_up_resume_with_no_yield_panics() {
+        contract_as_operator().resume_topup(
+            NO_YIELD.to_string(),
+            TopUpResult::Success { new_encrypted_data: "blob".to_string() },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "TopUp yield resume failed: no yield for data_id=")]
+    fn a_top_up_error_resume_with_no_yield_panics() {
+        contract_as_operator().resume_topup(
+            NO_YIELD.to_string(),
+            TopUpResult::Error { message: "keystore down".to_string() },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "DeletePaymentKey yield resume failed: no yield for data_id=")]
+    fn a_delete_resume_with_no_yield_panics() {
+        contract_as_operator().resume_delete_payment_key(NO_YIELD.to_string(), DeletePaymentKeyResult::Success);
     }
 }
