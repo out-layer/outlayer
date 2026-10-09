@@ -27,6 +27,14 @@
 #                       https://<keystore-app-id>-8081.<domain>. Unset -> loopback-only keystore.
 #   --dry-run           show what would happen; no deploy, no tx
 #
+# The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
+# compose file, the env-file layout and the node-side deploy_tdx.sh are read there. This script
+# does not copy that tree. After any change under deploy/self-hosted-tdx, ship it first:
+#   ./deploy/self-hosted-tdx/sync-node.sh <host>
+# then run this. A change that is only here deploys the node's old files, and nothing fails:
+# a variable this script writes to the node's env file (EXECUTE_EXCLUDES) never reaches a
+# container whose compose does not pass it on.
+#
 # Measurements are approved ONCE per (network, version): the measured compose-name is stable
 # (outlayer-<component>-<net>-<ver>), so re-runs / extra instances of the same version hit the
 # idempotent is_measurements_approved check and skip.
