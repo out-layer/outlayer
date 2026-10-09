@@ -2513,6 +2513,9 @@ mod project_transfer_event_tests {
         );
         let uuid = c.get_project(format!("{}/app", accounts(1))).unwrap().uuid;
 
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+
         testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
         c.transfer_project("app".to_string(), accounts(2));
 
@@ -2569,6 +2572,355 @@ mod project_transfer_event_tests {
             .expect("a delete announces the cleanup");
         assert_eq!(cleanup["project_id"], format!("{}/app", accounts(1)));
         assert_eq!(cleanup["project_uuid"], uuid.as_str());
+    }
+}
+
+/// A project moves only onto an acceptance the receiving account gave for
+/// exactly that project and that owner; names are ASCII; a priced project
+/// stays where its price is.
+mod project_transfer_acceptance_tests {
+    use crate::*;
+    use near_sdk::mock::MockAction;
+    use near_sdk::test_utils::{accounts, get_created_receipts, get_logs, VMContextBuilder};
+    use near_sdk::{testing_env, NearToken};
+
+    const PRICE: u128 = crate::projects::STORAGE_PRICE_PER_BYTE;
+
+    fn ctx(predecessor: AccountId, deposit: NearToken) -> VMContextBuilder {
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(predecessor).attached_deposit(deposit);
+        b
+    }
+
+    fn source() -> CodeSource {
+        CodeSource::WasmUrl {
+            url: "https://example.invalid/app.wasm".to_string(),
+            hash: "ab".repeat(32),
+            build_target: None,
+        }
+    }
+
+    /// A contract with `accounts(1)/app` on it.
+    fn with_app() -> Contract {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        testing_env!(ctx(accounts(1), NearToken::from_near(10)).build());
+        c.create_project("app".to_string(), source());
+        c
+    }
+
+    fn transfers() -> Vec<(AccountId, u128)> {
+        get_created_receipts()
+            .into_iter()
+            .flat_map(|r| {
+                let to = r.receiver_id.clone();
+                r.actions.into_iter().filter_map(move |a| match a {
+                    MockAction::Transfer { deposit, .. } => Some((to.clone(), deposit.as_yoctonear())),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    fn system_event(name: &str) -> Option<serde_json::Value> {
+        get_logs()
+            .iter()
+            .filter_map(|l| l.strip_prefix("EVENT_JSON:"))
+            .map(|j| serde_json::from_str::<serde_json::Value>(j).expect("event is JSON"))
+            .filter(|e| e["event"] == "system_event")
+            .find_map(|e| e["data"][0].get(name).cloned())
+    }
+
+    #[test]
+    #[should_panic(expected = "has not accepted project")]
+    fn a_transfer_without_an_acceptance_is_refused() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+    }
+
+    /// Accept, transfer: the project moves, the acceptance is consumed and
+    /// its deposit goes back to the acceptor in the transfer's receipts.
+    #[test]
+    fn an_accepted_project_moves_and_the_acceptance_is_consumed() {
+        let mut c = with_app();
+        let uuid = c.get_project(format!("{}/app", accounts(1))).unwrap().uuid;
+
+        let quoted = c.estimate_transfer_acceptance_cost(accounts(2), accounts(1), "app".to_string()).0;
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        let refunds = transfers();
+        assert_eq!(refunds.len(), 1, "the excess over the record comes back: {refunds:?}");
+        let (to, excess) = &refunds[0];
+        assert_eq!(*to, accounts(2));
+        let charged = NearToken::from_near(1).as_yoctonear() - excess;
+        assert!(charged > 0, "the record costs something");
+        assert!(
+            quoted >= charged && quoted - charged <= 8 * PRICE,
+            "the estimate is at least the charge and within a few bytes of it: quoted {quoted}, charged {charged}"
+        );
+        let accepted = system_event("ProjectTransferAccepted").expect("the acceptance is announced");
+        assert_eq!(accepted["new_owner"], accounts(2).as_str());
+        assert_eq!(accepted["from"], accounts(1).as_str());
+        assert_eq!(accepted["name"], "app");
+
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+        assert_eq!(c.get_project(format!("{}/app", accounts(2))).unwrap().uuid, uuid);
+        assert!(c.get_project(format!("{}/app", accounts(1))).is_none());
+        assert_eq!(
+            transfers(),
+            vec![(accounts(2), charged)],
+            "the record's deposit returns to the acceptor when the record is consumed"
+        );
+        assert_eq!(
+            c.list_user_projects(accounts(2)).len(), 1);
+        assert!(c.list_user_projects(accounts(1)).is_empty());
+
+        // Consumed: the same owner re-creating the name cannot move it again
+        // on the old acceptance.
+        testing_env!(ctx(accounts(1), NearToken::from_near(10)).build());
+        c.create_project("app".to_string(), source());
+        testing_env!(ctx(accounts(2), NearToken::from_near(0)).build());
+        // accounts(2) still owns its `app`, so it could not even accept again —
+        // and the transfer finds no record.
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.transfer_project("app".to_string(), accounts(2));
+        }));
+        assert!(again.is_err(), "an acceptance is used once");
+    }
+
+    /// An acceptance is for one owner: a project of the same name from
+    /// somebody else does not move onto it.
+    #[test]
+    #[should_panic(expected = "has not accepted project")]
+    fn an_acceptance_names_the_owner_it_is_from() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(3), "app".to_string());
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+    }
+
+    #[test]
+    fn a_revoked_acceptance_refunds_and_no_longer_admits() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        let excess = transfers()[0].1;
+        let charged = NearToken::from_near(1).as_yoctonear() - excess;
+
+        testing_env!(ctx(accounts(2), NearToken::from_near(0)).build());
+        c.revoke_project_transfer(accounts(1), "app".to_string());
+        assert_eq!(transfers(), vec![(accounts(2), charged)]);
+        let revoked = system_event("ProjectTransferRevoked").expect("the revocation is announced");
+        assert_eq!(revoked["new_owner"], accounts(2).as_str());
+
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.transfer_project("app".to_string(), accounts(2));
+        }));
+        assert!(moved.is_err(), "a revoked acceptance admits nothing");
+    }
+
+    #[test]
+    #[should_panic(expected = "has no acceptance for project")]
+    fn only_an_existing_acceptance_can_be_revoked() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_near(0)).build());
+        c.revoke_project_transfer(accounts(1), "app".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient storage deposit for the acceptance record")]
+    fn an_acceptance_needs_its_deposit() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_yoctonear(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "has already accepted project")]
+    fn an_acceptance_is_given_once() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+    }
+
+    /// The acceptor already has a project of that name: the transfer would
+    /// be refused, so the acceptance is refused first.
+    #[test]
+    #[should_panic(expected = "already exists; a transfer onto that name would be refused")]
+    fn an_acceptance_for_a_name_the_acceptor_holds_is_refused() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_near(10)).build());
+        c.create_project("app".to_string(), source());
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+    }
+
+    /// The acceptance may precede the project: a standing agreement.
+    #[test]
+    fn an_acceptance_may_be_given_before_the_project_exists() {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(1), NearToken::from_near(10)).build());
+        c.create_project("app".to_string(), source());
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+        assert!(c.get_project(format!("{}/app", accounts(2))).is_some());
+    }
+
+    /// Moving a project to oneself still needs the acceptance: one rule, no
+    /// special case to reason about.
+    #[test]
+    #[should_panic(expected = "has not accepted project")]
+    fn a_transfer_to_oneself_needs_an_acceptance_too() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(1));
+    }
+
+    /// The estimate is the chain's own figure, so it equals the charge at
+    /// every length — checked at the longest key there is: two 64-character
+    /// accounts and a 64-byte name.
+    #[test]
+    fn the_estimate_equals_the_charge_at_the_longest_key() {
+        let long_owner: AccountId = format!("{}.near", "o".repeat(59)).parse().unwrap();
+        let long_taker: AccountId = format!("{}.near", "t".repeat(59)).parse().unwrap();
+        let long_name = "n".repeat(64);
+        assert_eq!(long_owner.as_str().len(), 64);
+
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        let quoted = c
+            .estimate_transfer_acceptance_cost(long_taker.clone(), long_owner.clone(), long_name.clone())
+            .0;
+
+        testing_env!(ctx(long_taker.clone(), NearToken::from_near(1)).build());
+        c.accept_project_transfer(long_owner.clone(), long_name.clone());
+        let excess = transfers()[0].1;
+        let charged = NearToken::from_near(1).as_yoctonear() - excess;
+        assert_eq!(quoted, charged, "quoted {quoted}, charged {charged}");
+        assert_eq!(
+            c.get_project_transfer_acceptance(long_taker, long_owner, long_name),
+            Some(U128(charged)),
+            "the view answers the deposit held"
+        );
+    }
+
+    /// The acceptor takes the name themselves after accepting: the transfer
+    /// is refused. On chain the panic reverts the receipt, so nothing moves
+    /// and the acceptance stays (revocable); the mock VM does not roll back,
+    /// so that half is the chain's to keep and `project_transfer_e2e.sh`'s to
+    /// check.
+    #[test]
+    #[should_panic(expected = "already exists")]
+    fn a_name_the_acceptor_took_meanwhile_refuses_the_transfer() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(2), NearToken::from_near(10)).build());
+        c.create_project("app".to_string(), source());
+
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "Project not found")]
+    fn an_acceptance_for_a_project_that_does_not_exist_moves_nothing() {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+    }
+
+    /// An owner may accept their own not-yet-created name and transfer the
+    /// project to themselves: one rule, and the round trip is a no-op.
+    #[test]
+    fn a_self_transfer_on_a_self_acceptance_round_trips() {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        testing_env!(ctx(accounts(1), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(1), NearToken::from_near(10)).build());
+        c.create_project("app".to_string(), source());
+        let uuid = c.get_project(format!("{}/app", accounts(1))).unwrap().uuid;
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(1));
+        assert_eq!(c.get_project(format!("{}/app", accounts(1))).unwrap().uuid, uuid);
+        assert_eq!(c.list_user_projects(accounts(1)).len(), 1);
+        assert!(c.get_project_transfer_acceptance(accounts(1), accounts(1), "app".to_string()).is_none());
+    }
+
+    /// A pause stops new acceptances, not the way out of one: the deposit
+    /// comes back while paused, as a project can be deleted while paused.
+    #[test]
+    fn a_pause_does_not_hold_an_acceptor_s_deposit() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        c.set_paused(true);
+
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.accept_project_transfer(accounts(1), "other".to_string());
+        }));
+        assert!(accepted.is_err(), "no new acceptance while paused");
+
+        testing_env!(ctx(accounts(2), NearToken::from_near(0)).build());
+        c.revoke_project_transfer(accounts(1), "app".to_string());
+        assert_eq!(transfers().len(), 1, "the deposit comes back while paused");
+    }
+
+    #[test]
+    #[should_panic(expected = "a priced project does not move")]
+    fn a_priced_project_does_not_move() {
+        let mut c = with_app();
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        c.set_project_pricing(
+            format!("{}/app", accounts(1)),
+            crate::payment::ProjectPricing {
+                author_account_id: accounts(3),
+                operations: vec![crate::payment::OperationPrice {
+                    operation: "send".to_string(),
+                    price_usd: U128(10_000),
+                    developer_share_bp: 5_000,
+                }],
+            },
+        );
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(1), NearToken::from_near(0)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+    }
+
+    /// `polymаrket` with a Cyrillic а is not a project name.
+    #[test]
+    #[should_panic(expected = "ASCII letters, digits, dash, or underscore")]
+    fn a_project_name_is_ascii() {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        testing_env!(ctx(accounts(1), NearToken::from_near(10)).build());
+        c.create_project("polym\u{430}rket".to_string(), source());
+    }
+
+    #[test]
+    #[should_panic(expected = "ASCII letters, digits, dash, or underscore")]
+    fn an_acceptance_holds_names_to_the_same_rule() {
+        testing_env!(ctx(accounts(0), NearToken::from_near(0)).build());
+        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
+        testing_env!(ctx(accounts(2), NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "polym\u{430}rket".to_string());
     }
 }
 

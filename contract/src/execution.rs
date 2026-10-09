@@ -148,10 +148,19 @@ impl Contract {
         // Not applied to compile-only requests: they compile and stop, so there
         // is no operation to charge for and no output to obtain.
         //
-        // This is the ONLY gate. Connectors are reachable exclusively as
-        // ordinary projects under `connectors.outlayer.near`, so there is no
-        // second route to guard — the check follows the project, not the entry
-        // point it was called through.
+        // The gate follows the PROJECT, not the bytes. The same code is
+        // reachable unpriced as a `WasmUrl` or `GitHub` source — the version's
+        // source is public — and that is fine: what makes a connector worth
+        // paying for is its project-scoped secrets and its storage namespace,
+        // and the keystore releases `Project` secrets only to a run of the
+        // project itself, while `project_uuid` is set only for a Project
+        // source. The bytes alone do nothing the caller could not build.
+        //
+        // EVERY version of a priced project is sellable, by `version_key`,
+        // at the price of the operation named in `input_data`. Which builds
+        // stay callable is the project owner's decision, made with
+        // `remove_version`: a build that should no longer be sold is removed,
+        // not kept behind a flag.
         if !compile_only {
             if let Some(pricing) = project_id.as_ref().and_then(|id| self.project_pricing.get(id)) {
                 let id = project_id.as_deref().unwrap_or_default();
@@ -233,6 +242,16 @@ impl Contract {
 
         // predecessor_id = contract that called OutLayer (e.g. token.near)
         // signer_id = real user who signed the transaction (e.g. alice.near)
+        //
+        // The identity a secret's access condition is judged against is the
+        // SIGNER, deliberately: this is what makes OutLayer composable from
+        // other contracts. A DeFi contract the user transacts with can request
+        // an execution on the user's behalf, the user's own secrets admit it,
+        // and the result comes back to that contract as the return value of
+        // this call. The predecessor is carried alongside, so a secret's owner
+        // who wants to limit which contracts may stand in between writes a
+        // `Predecessor{…}` leaf (see `types::AccessCondition::Predecessor`);
+        // without one, any contract the owner calls may relay.
         let predecessor_id = env::predecessor_account_id();
         let signer_id = env::signer_account_id();
 

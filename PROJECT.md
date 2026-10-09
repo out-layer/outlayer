@@ -318,7 +318,11 @@ pub struct VersionInfo {
 | `set_active_version(project_name, version_key)` | Switch active version |
 | `remove_version(project_name, version_key)` | Remove version (cannot remove active) |
 | `delete_project(project_name)` | Delete project and all versions |
-| `transfer_project(project_name, new_owner)` | Transfer ownership; emits `system_event` `ProjectTransferred` |
+| `accept_project_transfer(from, name)` | Payable. The future owner agrees to take `from/name`; required before `transfer_project`. Emits `ProjectTransferAccepted` |
+| `revoke_project_transfer(from, name)` | Withdraw that acceptance, deposit returned. Emits `ProjectTransferRevoked` |
+| `transfer_project(project_name, new_owner)` | Transfer ownership onto `new_owner`'s acceptance (consumed); refused for a priced project. Emits `system_event` `ProjectTransferred` |
+| `estimate_transfer_acceptance_cost(new_owner, from, name)` | View: the deposit `accept_project_transfer` charges |
+| `get_project_transfer_acceptance(new_owner, from, name)` | View: `Option<U128>`, the deposit held for a pending acceptance |
 
 ### View Methods
 

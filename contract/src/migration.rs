@@ -9,16 +9,17 @@
 //!   plan). (Run.)
 //! * v7 → v8: add `subscription_plans` and `project_pricing`. (Run.)
 //! * v8 → v9: add `payment_key_nonce_floors`. (Run.)
-//! * **v9 → v10 (current): add `storage_refund_to` — who a refundable
-//!   storage deposit goes back to, by what it is held for.**
+//! * v9 → v10: add `storage_refund_to`. (Run.)
+//! * **v10 → v11 (current): add `project_transfer_acceptances` — who agreed
+//!   to take which project from whom.**
 //!
-//! **`ContractV9` mirrors what is DEPLOYED, not this working tree minus
+//! **`ContractV10` mirrors what is DEPLOYED, not this working tree minus
 //! the new field.** Check it against `git show HEAD:` before touching
 //! it. The two are the same only when the previous migration is already
 //! committed, and it is the DEPLOYED shape that `state_read` will be
 //! handed.
 //!
-//! Versions ≤ v9 are historical. Production deployments must be on v9
+//! Versions ≤ v10 are historical. Production deployments must be on v10
 //! before calling this migration; an earlier-version deployment must
 //! first run the prior migrations from an earlier code revision.
 //!
@@ -30,10 +31,10 @@ use crate::*;
 use near_sdk::borsh::BorshDeserialize;
 use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
 
-/// Contract state as DEPLOYED at v9 — the last shape any chain has held.
+/// Contract state as DEPLOYED at v10 — the last shape any chain has held.
 ///
-/// Mirrors `Contract` as it was before `storage_refund_to` existed; every
-/// field carries over verbatim. Check it against
+/// Mirrors `Contract` as it was before `project_transfer_acceptances`
+/// existed; every field carries over verbatim. Check it against
 /// `git show HEAD:contract/src/lib.rs`, not against the struct in this working
 /// tree: the two differ by exactly the field this migration adds.
 ///
@@ -44,7 +45,7 @@ use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
 #[cfg_attr(test, derive(near_sdk::borsh::BorshSerialize))]
 #[borsh(crate = "near_sdk::borsh")]
 #[allow(dead_code)] // fields needed for borsh deserialisation only
-pub struct ContractV9 {
+pub struct ContractV10 {
     owner_id: AccountId,
     operator_id: AccountId,
     paused: bool,
@@ -91,60 +92,63 @@ pub struct ContractV9 {
     project_pricing: UnorderedMap<String, payment::ProjectPricing>,
 
     payment_key_nonce_floors: LookupMap<AccountId, u32>,
+
+    storage_refund_to: LookupMap<wallet::StorageItem, AccountId>,
 }
 
 #[near_bindgen]
 impl Contract {
-    /// Migrate from v9 to v10: add the storage refund beneficiaries.
+    /// Migrate from v10 to v11: add the project transfer acceptances.
     ///
-    /// The map starts EMPTY: every existing policy refunds its caller, as
-    /// before, until a beneficiary is set on it with `set_storage_refund_to`.
+    /// The map starts EMPTY: from this deploy on, every `transfer_project`
+    /// needs an acceptance from the receiving account first.
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let v9: ContractV9 = env::state_read().expect("failed to read v9 state");
+        let v10: ContractV10 = env::state_read().expect("failed to read v10 state");
 
         log!(
-            "Migrating contract v9 -> v10 (storage_refund_to): owner={}, total_executions={}",
-            v9.owner_id,
-            v9.total_executions
+            "Migrating contract v10 -> v11 (project_transfer_acceptances): owner={}, total_executions={}",
+            v10.owner_id,
+            v10.total_executions
         );
 
         Self {
-            owner_id: v9.owner_id,
-            operator_id: v9.operator_id,
-            paused: v9.paused,
-            event_standard: v9.event_standard,
-            event_version: v9.event_version,
-            base_fee: v9.base_fee,
-            per_million_instructions_fee: v9.per_million_instructions_fee,
-            per_ms_fee: v9.per_ms_fee,
-            per_compile_ms_fee: v9.per_compile_ms_fee,
-            base_fee_usd: v9.base_fee_usd,
-            per_million_instructions_fee_usd: v9.per_million_instructions_fee_usd,
-            per_sec_fee_usd: v9.per_sec_fee_usd,
-            per_compile_ms_fee_usd: v9.per_compile_ms_fee_usd,
-            payment_token_contract: v9.payment_token_contract,
-            next_request_id: v9.next_request_id,
-            pending_requests: v9.pending_requests,
-            total_executions: v9.total_executions,
-            total_fees_collected: v9.total_fees_collected,
-            secrets_storage: v9.secrets_storage,
-            user_secrets_index: v9.user_secrets_index,
-            projects: v9.projects,
-            project_versions: v9.project_versions,
-            user_projects_index: v9.user_projects_index,
-            next_project_id: v9.next_project_id,
-            developer_earnings: v9.developer_earnings,
-            user_stablecoin_balances: v9.user_stablecoin_balances,
-            wallet_policies: v9.wallet_policies,
-            wallet_owner_index: v9.wallet_owner_index,
-            secret_vault_bindings: v9.secret_vault_bindings,
-            subscription_plans: v9.subscription_plans,
-            project_pricing: v9.project_pricing,
-            payment_key_nonce_floors: v9.payment_key_nonce_floors,
-            // ----- v10 -----
-            storage_refund_to: LookupMap::new(StorageKey::StorageRefundTo),
+            owner_id: v10.owner_id,
+            operator_id: v10.operator_id,
+            paused: v10.paused,
+            event_standard: v10.event_standard,
+            event_version: v10.event_version,
+            base_fee: v10.base_fee,
+            per_million_instructions_fee: v10.per_million_instructions_fee,
+            per_ms_fee: v10.per_ms_fee,
+            per_compile_ms_fee: v10.per_compile_ms_fee,
+            base_fee_usd: v10.base_fee_usd,
+            per_million_instructions_fee_usd: v10.per_million_instructions_fee_usd,
+            per_sec_fee_usd: v10.per_sec_fee_usd,
+            per_compile_ms_fee_usd: v10.per_compile_ms_fee_usd,
+            payment_token_contract: v10.payment_token_contract,
+            next_request_id: v10.next_request_id,
+            pending_requests: v10.pending_requests,
+            total_executions: v10.total_executions,
+            total_fees_collected: v10.total_fees_collected,
+            secrets_storage: v10.secrets_storage,
+            user_secrets_index: v10.user_secrets_index,
+            projects: v10.projects,
+            project_versions: v10.project_versions,
+            user_projects_index: v10.user_projects_index,
+            next_project_id: v10.next_project_id,
+            developer_earnings: v10.developer_earnings,
+            user_stablecoin_balances: v10.user_stablecoin_balances,
+            wallet_policies: v10.wallet_policies,
+            wallet_owner_index: v10.wallet_owner_index,
+            secret_vault_bindings: v10.secret_vault_bindings,
+            subscription_plans: v10.subscription_plans,
+            project_pricing: v10.project_pricing,
+            payment_key_nonce_floors: v10.payment_key_nonce_floors,
+            storage_refund_to: v10.storage_refund_to,
+            // ----- v11 -----
+            project_transfer_acceptances: LookupMap::new(StorageKey::ProjectTransferAcceptances),
         }
     }
 
@@ -152,7 +156,7 @@ impl Contract {
     /// `migrate()` advances the layout. Off-chain tooling reads this to
     /// decide whether a deploy needs a migration call.
     pub fn get_storage_version(&self) -> String {
-        "10".to_string()
+        "11".to_string()
     }
 }
 
@@ -183,9 +187,9 @@ mod tests {
         );
     }
 
-    /// A v9 chain: the contract as it stands, a wallet policy and payment keys
-    /// in storage, no beneficiary map.
-    fn v9_state(nonces: &[u32], policy_key: &str) -> VMContextBuilder {
+    /// A v10 chain: the contract as it stands, payment keys, a wallet policy
+    /// with a beneficiary and a project in storage, no acceptance map.
+    fn v10_state(nonces: &[u32], policy_key: &str) -> VMContextBuilder {
         let mut b = ctx(accounts(1));
         testing_env!(b.build());
         let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
@@ -202,7 +206,20 @@ mod tests {
                 storage_deposit: 7,
             },
         );
-        let v9 = ContractV9 {
+        c.storage_refund_to.insert(
+            &wallet::StorageItem::WalletPolicy { wallet_pubkey: policy_key.to_string() },
+            &accounts(2),
+        );
+        testing_env!(b.attached_deposit(NearToken::from_near(1)).build());
+        c.create_project(
+            "app".to_string(),
+            CodeSource::WasmUrl {
+                url: "https://example.invalid/app.wasm".to_string(),
+                hash: "ab".repeat(32),
+                build_target: None,
+            },
+        );
+        let v10 = ContractV10 {
             owner_id: c.owner_id,
             operator_id: c.operator_id,
             paused: c.paused,
@@ -235,21 +252,22 @@ mod tests {
             subscription_plans: c.subscription_plans,
             project_pricing: c.project_pricing,
             payment_key_nonce_floors: c.payment_key_nonce_floors,
+            storage_refund_to: c.storage_refund_to,
         };
-        env::state_write(&v9);
+        env::state_write(&v10);
         b
     }
 
-    /// Everything a v9 chain held reads on as before, and no policy has a
-    /// beneficiary until one is set.
+    /// Everything a v10 chain held reads on as before, and a project moves
+    /// only once somebody has accepted it.
     #[test]
-    fn a_v9_state_migrates_with_no_beneficiaries() {
+    fn a_v10_state_migrates_with_no_acceptances() {
         let key = format!("ed25519:{}", "ab".repeat(32));
-        let _b = v9_state(&[1, 2, 3], &key);
+        let _b = v10_state(&[1, 2, 3], &key);
         testing_env!(ctx(accounts(0)).build());
-        let c = Contract::migrate();
+        let mut c = Contract::migrate();
 
-        assert_eq!(c.get_storage_version(), "10");
+        assert_eq!(c.get_storage_version(), "11");
         assert_eq!(c.owner_id, accounts(0));
         for n in 1..=3 {
             assert!(
@@ -258,31 +276,49 @@ mod tests {
                 "key {n} survives the migration"
             );
         }
-        assert_eq!(c.get_payment_key_nonce_floor(accounts(1)), 3, "the v9 floors carry over");
+        assert_eq!(c.get_payment_key_nonce_floor(accounts(1)), 3, "the v10 floors carry over");
         let view = c.get_wallet_policy(key).expect("the policy survives");
         assert_eq!(view.owner, accounts(1));
         assert_eq!(view.storage_deposit.0, 7);
-        assert_eq!(view.storage_refund_to, None);
+        assert_eq!(view.storage_refund_to, Some(accounts(2)), "the v10 beneficiaries carry over");
+        let project_id = format!("{}/app", accounts(1));
+        assert!(c.get_project(project_id.clone()).is_some(), "the project survives");
+
+        // Nothing has been accepted yet, so nothing moves.
+        testing_env!(ctx(accounts(1)).build());
+        let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.transfer_project("app".to_string(), accounts(2));
+        }));
+        assert!(moved.is_err(), "a transfer with no acceptance is refused after the migration");
+
+        // The new map works on the migrated state: accept, then the v10
+        // project moves.
+        testing_env!(ctx(accounts(2)).attached_deposit(NearToken::from_near(1)).build());
+        c.accept_project_transfer(accounts(1), "app".to_string());
+        testing_env!(ctx(accounts(1)).build());
+        c.transfer_project("app".to_string(), accounts(2));
+        assert!(c.get_project(format!("{}/app", accounts(2))).is_some(), "the v10 project moved onto the acceptance");
+        assert!(c.get_project(project_id).is_none());
     }
 
-    /// The deployed state itself, read through `ContractV9`. Runs when
-    /// `V9_STATE_FILE` names a file holding the raw `STATE` value of a live
+    /// The deployed state itself, read through `ContractV10`. Runs when
+    /// `V10_STATE_FILE` names a file holding the raw `STATE` value of a live
     /// contract (a `view_state` with prefix `STATE`); skipped otherwise.
     #[test]
-    fn a_deployed_state_reads_as_v9_and_migrates() {
-        let Ok(path) = std::env::var("V9_STATE_FILE") else { return };
-        let bytes = std::fs::read(&path).expect("read V9_STATE_FILE");
+    fn a_deployed_state_reads_as_v10_and_migrates() {
+        let Ok(path) = std::env::var("V10_STATE_FILE") else { return };
+        let bytes = std::fs::read(&path).expect("read V10_STATE_FILE");
         testing_env!(ctx(accounts(0)).build());
         assert!(
             Contract::try_from_slice(&bytes).is_err(),
-            "the deployed STATE already reads as the v10 shape — this migration is not for it"
+            "the deployed STATE already reads as the v11 shape — this migration is not for it"
         );
-        let v9 = ContractV9::try_from_slice(&bytes).expect("the deployed STATE is not the v9 shape");
-        let owner = v9.owner_id.clone();
-        env::state_write(&v9);
+        let v10 = ContractV10::try_from_slice(&bytes).expect("the deployed STATE is not the v10 shape");
+        let owner = v10.owner_id.clone();
+        env::state_write(&v10);
         let c = Contract::migrate();
         assert_eq!(c.owner_id, owner);
-        assert_eq!(c.get_storage_version(), "10");
-        println!("v9 state of {} bytes, owner {owner}, migrated", bytes.len());
+        assert_eq!(c.get_storage_version(), "11");
+        println!("v10 state of {} bytes, owner {owner}, migrated", bytes.len());
     }
 }

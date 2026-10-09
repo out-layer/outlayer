@@ -60,13 +60,7 @@ impl Contract {
         let caller = env::predecessor_account_id();
         let project_id = format!("{}/{}", caller, name);
 
-        // Validate name
-        assert!(!name.is_empty(), "Project name cannot be empty");
-        assert!(name.len() <= 64, "Project name too long (max 64 chars)");
-        assert!(
-            name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
-            "Project name must contain only alphanumeric, dash, or underscore"
-        );
+        assert_project_name(&name);
 
         // Check project doesn't exist
         assert!(
@@ -374,10 +368,149 @@ impl Contract {
         );
     }
 
+    /// Agree to take project `from/name`: the step that has to precede
+    /// `transfer_project`, taken by the account that will own it.
+    ///
+    /// A project carries code, and a project id is what secrets, prices and
+    /// callers trust. So nothing lands under `caller/name` unless the caller
+    /// has named exactly that project and that previous owner first. Without
+    /// this, anyone could put their own build under any account's namespace —
+    /// `connectors.outlayer.near/<name>` before the real one exists — and
+    /// everything that trusts the name would run it.
+    ///
+    /// The project need not exist yet: an acceptance is a standing agreement
+    /// and waits until `from` transfers. It is for ONE name from ONE owner, is
+    /// consumed by the transfer, and is withdrawn with
+    /// `revoke_project_transfer`. Refused when the caller already has a
+    /// project of that name, since the transfer would be refused too.
+    ///
+    /// What it pins is the NAME and the OWNER, not the code: `from` keeps
+    /// every right over the project until the transfer lands, including
+    /// changing its active version, and whoever holds the `from` account
+    /// holds that right — an acceptance naming an account nobody has
+    /// registered is a standing offer to whoever registers it. The acceptor
+    /// controls the versions from the moment the project is theirs; what
+    /// arrives is checked then, with `get_version`, not promised here.
+    ///
+    /// Payable: the record is stored bytes, measured when it is written and
+    /// charged at `STORAGE_PRICE_PER_BYTE`; the excess comes back now and the
+    /// deposit when the record goes. `estimate_transfer_acceptance_cost` says
+    /// how much. Emits `ProjectTransferAccepted`.
+    #[payable]
+    pub fn accept_project_transfer(&mut self, from: AccountId, name: String) {
+        self.assert_not_paused();
+        let caller = env::predecessor_account_id();
+        assert_project_name(&name);
+
+        let project_id = format!("{}/{}", caller, name);
+        assert!(
+            self.projects.get(&project_id).is_none(),
+            "Project '{}' already exists; a transfer onto that name would be refused",
+            project_id
+        );
+
+        let acceptance = TransferAcceptance { new_owner: caller.clone(), from: from.clone(), name: name.clone() };
+        assert!(
+            self.project_transfer_acceptances.get(&acceptance).is_none(),
+            "'{}' has already accepted project {}/{}",
+            caller, from, name
+        );
+
+        // Measured, not estimated: the record is written with a placeholder of
+        // the value's own width (a u128), so the bytes it takes are known
+        // before the deposit is settled, and the real figure overwrites it at
+        // the same size.
+        let before = env::storage_usage();
+        self.project_transfer_acceptances.insert(&acceptance, &0u128);
+        let bytes = env::storage_usage().saturating_sub(before);
+        let required_deposit = bytes as u128 * STORAGE_PRICE_PER_BYTE;
+        let attached_deposit = env::attached_deposit().as_yoctonear();
+        assert!(
+            attached_deposit >= required_deposit,
+            "Insufficient storage deposit for the acceptance record. Required: {} yoctoNEAR, attached: {} yoctoNEAR",
+            required_deposit,
+            attached_deposit
+        );
+        self.project_transfer_acceptances.insert(&acceptance, &required_deposit);
+
+        let excess = attached_deposit - required_deposit;
+        if excess > 0 {
+            Promise::new(caller.clone()).transfer(NearToken::from_yoctonear(excess));
+        }
+
+        log!(
+            "Project transfer accepted: {}/{} may be transferred to {} (deposit {})",
+            from, name, caller, required_deposit
+        );
+        self.emit_system_event(crate::payment::SystemEvent::ProjectTransferAccepted {
+            new_owner: caller,
+            from,
+            name,
+        });
+    }
+
+    /// Withdraw an acceptance that has not been used. Only the account that
+    /// gave it can take it back; the record's deposit returns to it. Not
+    /// gated by the pause, like `delete_project`: getting one's own deposit
+    /// back is never what a pause is for. Emits `ProjectTransferRevoked`.
+    pub fn revoke_project_transfer(&mut self, from: AccountId, name: String) {
+        let caller = env::predecessor_account_id();
+        let acceptance = TransferAcceptance { new_owner: caller.clone(), from: from.clone(), name: name.clone() };
+        let deposit = self
+            .project_transfer_acceptances
+            .remove(&acceptance)
+            .unwrap_or_else(|| {
+                env::panic_str(&format!(
+                    "'{}' has no acceptance for project {}/{}",
+                    caller, from, name
+                ))
+            });
+        if deposit > 0 {
+            Promise::new(caller.clone()).transfer(NearToken::from_yoctonear(deposit));
+        }
+
+        log!("Project transfer acceptance revoked: {}/{} to {} (refund {})", from, name, caller, deposit);
+        self.emit_system_event(crate::payment::SystemEvent::ProjectTransferRevoked {
+            new_owner: caller,
+            from,
+            name,
+        });
+    }
+
+    /// The acceptance `new_owner` holds for project `from/name`, as the deposit
+    /// held for its record, or `None` when there is none. What a dashboard or
+    /// a CLI shows as "pending transfer".
+    pub fn get_project_transfer_acceptance(&self, new_owner: AccountId, from: AccountId, name: String) -> Option<U128> {
+        self.project_transfer_acceptances
+            .get(&TransferAcceptance { new_owner, from, name })
+            .map(U128)
+    }
+
+    /// What `accept_project_transfer` will charge for its record, in
+    /// yoctoNEAR: the bytes of the key (the three account-sized fields) and
+    /// the value, with the record overhead, at `STORAGE_PRICE_PER_BYTE`.
+    /// Counted the way the chain counts — the same figure for any length of
+    /// name or account — so the call refunds exactly the excess.
+    pub fn estimate_transfer_acceptance_cost(&self, new_owner: AccountId, from: AccountId, name: String) -> U128 {
+        let key = near_sdk::borsh::to_vec(&TransferAcceptance { new_owner, from, name })
+            .unwrap_or_else(|_| env::panic_str("acceptance could not be serialised"));
+        // Record overhead (40), the map prefix (one `StorageKey` byte), the
+        // borsh key, the u128 value.
+        let bytes = 40 + 1 + key.len() as u64 + 16;
+        U128(bytes as u128 * STORAGE_PRICE_PER_BYTE)
+    }
+
     /// Transfer project ownership to another account
     ///
     /// The project will be renamed to `new_owner/name`.
     /// All data is preserved (UUID stays the same).
+    ///
+    /// Requires that `new_owner` has called `accept_project_transfer(caller,
+    /// project_name)`; the acceptance is consumed and its deposit returned to
+    /// `new_owner`. A priced project does not move: the price is keyed by the
+    /// project's id and would stay on a name that no longer exists. Pricing is
+    /// the contract owner's (a priced project is a curated one), so it is the
+    /// contract owner who unprices it (`remove_project_pricing`) first.
     ///
     /// # Arguments
     /// * `project_name` - Current name of the project
@@ -389,6 +522,27 @@ impl Contract {
     ) {
         let caller = env::predecessor_account_id();
         let old_project_id = format!("{}/{}", caller, project_name);
+
+        assert!(
+            self.project_pricing.get(&old_project_id).is_none(),
+            "Project '{}' is priced, and a priced project does not move: ask the OutLayer operator to unprice it (remove_project_pricing) first",
+            old_project_id
+        );
+
+        let acceptance = TransferAcceptance {
+            new_owner: new_owner.clone(),
+            from: caller.clone(),
+            name: project_name.clone(),
+        };
+        let acceptance_deposit = self
+            .project_transfer_acceptances
+            .remove(&acceptance)
+            .unwrap_or_else(|| {
+                env::panic_str(&format!(
+                    "'{}' has not accepted project {}: it calls accept_project_transfer(from: \"{}\", name: \"{}\") first",
+                    new_owner, old_project_id, caller, project_name
+                ))
+            });
 
         let mut project = self.projects.remove(&old_project_id)
             .expect("Project not found");
@@ -432,6 +586,11 @@ impl Contract {
             .unwrap_or_else(|| UnorderedSet::new(StorageKey::UserProjectsList { account_id: new_owner.clone() }));
         new_user_projects.insert(&new_project_id);
         self.user_projects_index.insert(&new_owner, &new_user_projects);
+
+        // The acceptance record is gone; its deposit goes back to who paid it.
+        if acceptance_deposit > 0 {
+            Promise::new(new_owner.clone()).transfer(NearToken::from_yoctonear(acceptance_deposit));
+        }
 
         log!(
             "Project transferred: {} -> {}, uuid={}",
@@ -696,4 +855,19 @@ pub(crate) fn assert_code_source(source: &CodeSource) {
     if let Some(why) = code_source_error(source) {
         env::panic_str(&why);
     }
+}
+
+/// A project name is 1–64 bytes of ASCII letters, digits, `-` or `_`.
+///
+/// ASCII, not Unicode alphanumerics: a name is what people read when they
+/// decide to trust a project id, and a Cyrillic `а` in `polymаrket` is a
+/// different, valid name that reads as the real one. Applied wherever a name
+/// is chosen — `create_project` and `accept_project_transfer`.
+pub(crate) fn assert_project_name(name: &str) {
+    assert!(!name.is_empty(), "Project name cannot be empty");
+    assert!(name.len() <= 64, "Project name too long (max 64 chars)");
+    assert!(
+        name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "Project name must contain only ASCII letters, digits, dash, or underscore"
+    );
 }

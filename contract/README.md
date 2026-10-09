@@ -178,6 +178,69 @@ Get contract configuration.
 near view outlayer.testnet get_config '{}'
 ```
 
+### Project Functions
+
+A project is `{owner}/{name}`: the name is 1–64 bytes of ASCII letters,
+digits, `-` or `_` (a Cyrillic `а` in `polymаrket` is not a name — it would
+read as the real one). `create_project`, `add_version`, `set_active_version`,
+`remove_version` and `delete_project` are the owner's; see
+[PROJECT.md](../PROJECT.md) for their arguments.
+
+#### `accept_project_transfer`
+
+A project moves only onto an acceptance given by the account that will own
+it, for exactly that project and that owner. Without one, `transfer_project`
+is refused — so nobody can put their code under a name in another account's
+namespace (`connectors.outlayer.near/<name>` before the real one exists)
+without that account asking for it.
+
+```bash
+# bob agrees to take alice.testnet/my-app. The deposit pays for the record and
+# comes back when it is consumed or revoked; estimate_transfer_acceptance_cost
+# quotes it (about 0.002 NEAR).
+near call outlayer.testnet accept_project_transfer '{"from": "alice.testnet", "name": "my-app"}' --accountId bob.testnet --deposit 0.01
+```
+
+The project need not exist yet. Refused when `bob.testnet/my-app` already
+exists, or when bob has already accepted that project. An acceptance pins the
+name and the owner, not the code: alice keeps every right over the project
+until the transfer lands, and bob checks what arrived with `get_version`
+afterwards. Emits `system_event` `ProjectTransferAccepted { new_owner, from, name }`.
+
+```bash
+# The acceptance bob holds, as the deposit held for it; null when there is none.
+near view outlayer.testnet get_project_transfer_acceptance '{"new_owner": "bob.testnet", "from": "alice.testnet", "name": "my-app"}'
+```
+
+#### `revoke_project_transfer`
+
+```bash
+near call outlayer.testnet revoke_project_transfer '{"from": "alice.testnet", "name": "my-app"}' --accountId bob.testnet
+```
+
+Only the account that gave the acceptance can take it back; the record's
+deposit returns to it. Emits `ProjectTransferRevoked { new_owner, from, name }`.
+
+#### `transfer_project`
+
+```bash
+near call outlayer.testnet transfer_project '{"project_name": "my-app", "new_owner": "bob.testnet"}' --accountId alice.testnet
+```
+
+Renames `alice.testnet/my-app` to `bob.testnet/my-app`; the uuid, the versions
+and the storage stay. Requires bob's acceptance, consumes it and returns its
+deposit to bob. A priced project does not move: pricing is the contract
+owner's, so the OutLayer operator unprices it (`remove_project_pricing`)
+first. Emits `ProjectTransferred`.
+
+#### `estimate_transfer_acceptance_cost`
+
+```bash
+near view outlayer.testnet estimate_transfer_acceptance_cost '{"new_owner": "bob.testnet", "from": "alice.testnet", "name": "my-app"}'
+```
+
+The deposit `accept_project_transfer` will charge, in yoctoNEAR.
+
 ### Wallet Policy Functions
 
 A custody wallet's policy is stored here encrypted; only the keystore decrypts
@@ -499,7 +562,7 @@ near contract call-function as-transaction usdc.fakes.testnet storage_deposit js
 
 A deploy that changes the state shape runs `migrate` in the same transaction
 (or straight after). `get_storage_version` answers the shape the code expects:
-`"10"` adds `storage_refund_to` (from `"9"`).
+`"11"` adds `project_transfer_acceptances` (from `"10"`).
 
 ```bash
 near contract deploy dev.outlayer.testnet use-file res/local/outlayer_contract.wasm without-init-call network-config testnet sign-with-keychain send

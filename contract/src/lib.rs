@@ -70,6 +70,8 @@ enum StorageKey {
     PaymentKeyNonceFloor,
     // Who a refundable storage deposit goes back to (StorageItem -> AccountId)
     StorageRefundTo,
+    // Who agreed to take which project from whom (TransferAcceptance -> deposit)
+    ProjectTransferAcceptances,
 }
 
 /// Execution source - GitHub repo, pre-compiled WASM URL, or project reference
@@ -404,6 +406,26 @@ pub struct VersionInfo {
     // about a version belongs in a side map, never here.
 }
 
+/// An account's standing agreement to take one project from one owner.
+///
+/// The key of `project_transfer_acceptances`. A project moves only onto an
+/// acceptance: `transfer_project` finds the record for `(new_owner, caller,
+/// name)` and consumes it, so nobody can put a project — and its code — under
+/// a name in somebody else's namespace without that account having asked for
+/// exactly it. The value is the deposit the acceptor paid for the record,
+/// returned to them when it is consumed or revoked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[near(serializers = [borsh, json])]
+pub struct TransferAcceptance {
+    /// The account that will own the project: the caller of
+    /// `accept_project_transfer`.
+    pub new_owner: AccountId,
+    /// The account that owns it now.
+    pub from: AccountId,
+    /// The project's name, the part after `from/`.
+    pub name: String,
+}
+
 /// Pending version request (for yield/resume flow)
 #[derive(Clone, Debug)]
 #[near(serializers = [borsh])]
@@ -566,6 +588,12 @@ pub struct Contract {
     // sponsored storage is a new variant and an argument on its creating call,
     // never a new map. See `wallet::Contract::store_wallet_policy`.
     storage_refund_to: LookupMap<wallet::StorageItem, AccountId>,
+
+    // Who agreed to take which project from whom, and the deposit held for
+    // the record. Written by `accept_project_transfer`, consumed by
+    // `transfer_project`, dropped by `revoke_project_transfer`. See
+    // `TransferAcceptance`.
+    project_transfer_acceptances: LookupMap<TransferAcceptance, Balance>,
 }
 
 #[near_bindgen]
@@ -618,6 +646,7 @@ impl Contract {
             project_pricing: UnorderedMap::new(StorageKey::ProjectPricing),
             payment_key_nonce_floors: LookupMap::new(StorageKey::PaymentKeyNonceFloor),
             storage_refund_to: LookupMap::new(StorageKey::StorageRefundTo),
+            project_transfer_acceptances: LookupMap::new(StorageKey::ProjectTransferAcceptances),
         }
     }
 

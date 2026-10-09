@@ -461,6 +461,19 @@ pub enum SystemEvent {
         old_owner: AccountId,
         new_owner: AccountId,
     },
+    /// `new_owner` agreed to take project `from/name`; `transfer_project` by
+    /// `from` may now move it. Informational: nothing off chain has to act.
+    ProjectTransferAccepted {
+        new_owner: AccountId,
+        from: AccountId,
+        name: String,
+    },
+    /// `new_owner` withdrew that agreement before the project moved.
+    ProjectTransferRevoked {
+        new_owner: AccountId,
+        from: AccountId,
+        name: String,
+    },
 }
 
 /// Which plan a payment buys, or `None` if it buys nothing.
