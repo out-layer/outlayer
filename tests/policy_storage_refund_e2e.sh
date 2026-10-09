@@ -90,7 +90,10 @@ set_to() { # set_to <caller> <account>
 }
 view() { near_view "$CONTRACT_ID" get_wallet_policy "$(jq -nc --arg k "$WPK" '{wallet_pubkey:$k}')"; }
 held() { jq -r '.storage_deposit // "null"' <<<"$(view)"; }
-beneficiary() { jq -r '.storage_refund_to // "none"' <<<"$(view)"; }
+# "none" only for a policy that EXISTS without a beneficiary; "absent" when there is
+# no policy at all — the two must never read alike, or a deleted policy passes as
+# one without a beneficiary.
+beneficiary() { jq -r 'if . == null then "absent" else (.storage_refund_to // "none") end' <<<"$(view)"; }
 estimate() { # estimate [refund_to] — for the current ENC
   near_view "$CONTRACT_ID" estimate_wallet_policy_cost \
     "$(jq -nc --arg k "$WPK" --arg e "$ENC" --arg r "${1:-}" '{wallet_pubkey:$k, encrypted_data:$e} + (if $r == "" then {} else {storage_refund_to:$r} end)')" | jq -r .
@@ -203,12 +206,16 @@ ok_tx "R8 delete" && expect_refunds "R8 delete" "$PARENT $DEPOSIT"
 if [[ -n "${R9_SEED:-}" ]]; then
   log "R9 a policy created before v10 ($R9_SEED)"
   prep "$R9_SEED" 5 || exit 1
+  if [[ "$(beneficiary)" == absent ]]; then
+    skip "R9 the policy of $R9_SEED no longer exists (deleted by an earlier run?) — a pre-v10 policy can only be prepared before the deploy"
+  else
   [[ "$(beneficiary)" == none ]] && pass "R9 the old policy has no beneficiary" || fail "R9 beneficiary $(beneficiary)"
   set_to "$PARENT" "$SPONSOR"
   refused "R9 cannot get one" "named only when the item is created"
   DEPOSIT=$(held)
   tx "$PARENT" delete_wallet_policy "$(jq -nc --arg k "$WPK" '{wallet_pubkey:$k}')" "0 NEAR"
   ok_tx "R9 delete" && expect_refunds "R9 delete" "$PARENT $DEPOSIT"
+  fi
 else
   skip "R9 needs R9_SEED: run --prepare-r9 BEFORE the v10 deploy"
 fi
