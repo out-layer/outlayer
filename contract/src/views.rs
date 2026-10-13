@@ -107,10 +107,13 @@ impl Contract {
         self.payment_token_contract.clone()
     }
 
-    /// Estimate cost for given resource limits
-    pub fn estimate_execution_cost(&self, resource_limits: Option<ResourceLimits>) -> U128 {
+    /// What `request_execution` requires attached: the compute estimate for
+    /// the limits, plus the deposit held for `input_len` bytes of `input_data`
+    /// beyond `INPUT_DATA_FREE_BYTES` (returned at settlement). `input_len`
+    /// may be omitted; absent, the input is taken as small.
+    pub fn estimate_execution_cost(&self, resource_limits: Option<ResourceLimits>, input_len: Option<u64>) -> U128 {
         let limits = resource_limits.unwrap_or_default();
-        U128(self.estimate_cost(&limits))
+        U128(self.estimate_cost(&limits) + input_storage_deposit(input_len.unwrap_or(0) as usize))
     }
 
     /// Get maximum resource limits (hard caps)

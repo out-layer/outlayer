@@ -27,6 +27,60 @@ pub type CryptoHash = [u8; 32];
 pub const MIN_RESPONSE_GAS: Gas = Gas::from_tgas(50);
 pub const DATA_ID_REGISTER: u64 = 37;
 
+/// What the settlement callback needs on top of `MIN_RESPONSE_GAS` for every
+/// byte of `input_data` the request holds in state: `on_execution_response`
+/// removes the whole `ExecutionRequest`, and the chain charges the evicted
+/// value by the byte (`storage_remove` with its return value, the register
+/// read, the borsh decode), about 20 Mgas per byte in all — 25 Mgas here, so
+/// a 2 MiB input adds ~52 TGas. Reserved at admission, out of the caller's
+/// prepaid gas, so a large INPUT cannot starve its own callback by attaching
+/// little gas: a callback that ran out of gas would leave the request pending
+/// with its yield already spent.
+///
+/// The OUTPUT is not known at admission and is not reserved for. It is
+/// covered by the weight share of whatever the caller left unused — a call
+/// made with 300 TGas, or a proxy forwarding its remaining gas, leaves the
+/// callback a couple of hundred TGas, enough to evict the largest output the
+/// operator can submit. A caller who attaches just enough for admission and
+/// whose guest then emits megabytes starves only themselves: a request whose
+/// output was delivered but never settled is cancelled at the compute
+/// estimate (`cancel_stale_execution`), so there is nothing to gain by it.
+pub const CALLBACK_GAS_PER_INPUT_BYTE: u64 = 25_000_000;
+
+/// The gas the settlement callback is created with for a request holding
+/// `input_len` bytes of `input_data`: `MIN_RESPONSE_GAS` up to
+/// `INPUT_DATA_FREE_BYTES`, so a request within the free allowance reserves
+/// exactly what it always has, and the per-byte part only above it — the
+/// 50 TGas minimum removes 32 KB with room to spare.
+pub fn response_gas(input_len: usize) -> Gas {
+    MIN_RESPONSE_GAS.saturating_add(Gas::from_gas(
+        (input_len.saturating_sub(INPUT_DATA_FREE_BYTES) as u64)
+            .saturating_mul(CALLBACK_GAS_PER_INPUT_BYTE),
+    ))
+}
+
+/// What one byte of state costs to hold, in yoctoNEAR: 0.00001 NEAR, the
+/// chain's own storage staking rate. The one figure every storage deposit in
+/// this contract is computed from.
+pub const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000;
+
+/// Bytes of `input_data` a request may hold in state for nothing. Beyond it
+/// every byte is held at `STORAGE_PRICE_PER_BYTE` for the life of the request
+/// and returned at settlement, whichever way the request ends.
+///
+/// Without a price the stored input was the contract's to stake: a few
+/// multi-megabyte requests in flight held tens of NEAR of the contract's
+/// balance and stopped every other write on it (`LackBalanceForState`).
+pub const INPUT_DATA_FREE_BYTES: usize = 32 * 1024;
+
+/// The deposit held for `len` bytes of `input_data` while the request is
+/// pending: nothing up to `INPUT_DATA_FREE_BYTES`, the storage price per byte
+/// above it. A pure function of the stored length, so settlement recomputes
+/// it from the request and nothing new is stored.
+pub fn input_storage_deposit(len: usize) -> Balance {
+    len.saturating_sub(INPUT_DATA_FREE_BYTES) as u128 * STORAGE_PRICE_PER_BYTE
+}
+
 // Timeout for stale execution cancellation (10 minutes)
 pub const EXECUTION_TIMEOUT: u64 = 600 * 1_000_000_000;
 

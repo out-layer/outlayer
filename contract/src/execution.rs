@@ -227,13 +227,26 @@ impl Contract {
             );
         }
 
-        // NEAR payment is only for compute costs now
+        // The NEAR attached covers the compute estimate and, for a large
+        // `input_data`, the bytes it will hold in state while pending. The
+        // storage part is inside `payment` and comes back with the rest at
+        // settlement: on success the refund is everything above the cost, on
+        // failure and timeout everything above the base fee, on a cancel
+        // everything above the base fee or everything — none of those paths
+        // keeps it, so none has to know about it.
         let payment = env::attached_deposit().as_yoctonear();
+        let input_len = input_data.as_ref().map_or(0, |d| d.len());
+        let input_storage = input_storage_deposit(input_len);
+        let required_payment = estimated_cost + input_storage;
 
         assert!(
-            payment >= estimated_cost,
-            "Insufficient payment: required {} yoctoNEAR for compute, got {} yoctoNEAR",
+            payment >= required_payment,
+            "Insufficient payment: required {} yoctoNEAR ({} for compute, {} held for {} bytes of input_data beyond the free {}), got {} yoctoNEAR",
+            required_payment,
             estimated_cost,
+            input_storage,
+            input_len,
+            INPUT_DATA_FREE_BYTES,
             payment
         );
 
@@ -295,11 +308,14 @@ impl Contract {
             "project_id": project_id
         });
 
-        // Create yield promise to pause execution
+        // Create yield promise to pause execution. The callback's gas grows
+        // with the input it will have to remove from state (`response_gas`),
+        // and is reserved here out of the caller's prepaid gas; the weight
+        // adds whatever this call leaves unused.
         let promise_idx = env::promise_yield_create(
             "on_execution_response",
             &request_data.to_string().into_bytes(),
-            MIN_RESPONSE_GAS,
+            response_gas(input_len),
             GasWeight::default(),
             DATA_ID_REGISTER,
         );
@@ -414,9 +430,20 @@ impl Contract {
         self.resolve_execution_internal(request_id, response);
     }
 
+    /// Callback function to handle execution completion.
+    ///
+    /// Its return value is what the calling contract receives: the output as
+    /// a JSON value — the guest's JSON for `Json`, a string for `Text`, base64
+    /// for `Bytes` — or `null` when the run failed or produced nothing.
+    /// Written with `env::value_return` rather than returned as a
+    /// `serde_json::Value`: the output is already serialised bytes (the
+    /// worker's JSON, stored as such), and building a value tree from it only
+    /// to serialise it again made the callback's gas grow with the output —
+    /// the output being the guest's, that was a cost a caller could set and a
+    /// callback a caller could make fail. `output_return_bytes` is the whole
+    /// conversion and is pinned by tests against the value-tree form.
     #[allow(unused_variables)]
     #[private]
-    /// Callback function to handle execution completion
     pub fn on_execution_response(
         &mut self,
         request_id: u64,
@@ -425,25 +452,36 @@ impl Contract {
         resource_limits: ResourceLimits,
         payment: U128,
         #[callback_result] response: Result<ExecutionResponse, PromiseError>,
-    ) -> Option<serde_json::Value> {
+    ) {
         // Remove the pending request and check if output was submitted separately
         if let Some(request) = self.pending_requests.remove(&request_id) {
             self.total_executions += 1;
 
             match response {
                 Ok(mut exec_response) => {
-                    // If output was submitted separately, retrieve it from storage
-                    if request.output_submitted && exec_response.success {
-                        log!("Retrieving large output from storage for request_id: {}", request_id);
-                        if let Some(stored_output) = request.pending_output.clone() {
-                            let output: crate::ExecutionOutput = stored_output.into();
-                            exec_response.output = Some(output);
-                        }
-                    }
+                    // The output, as stored bytes: from state when it came by
+                    // the 2-call flow, from the response otherwise. Never
+                    // parsed here.
+                    let stored_output: Option<StoredOutput> =
+                        if request.output_submitted && exec_response.success {
+                            log!("Retrieving large output from storage for request_id: {}", request_id);
+                            request.pending_output.clone()
+                        } else {
+                            exec_response.output.take().map(StoredOutput::from)
+                        };
 
                     if exec_response.success {
-                        // Calculate actual cost (NEAR only)
-                        let cost = self.calculate_cost(&exec_response.resources_used);
+                        // What the run cost, capped at what was attached FOR
+                        // COMPUTE: the storage part of `payment` is held, not
+                        // offered, and comes back whatever the run burned.
+                        // The cap also keeps `total_fees_collected` honest when
+                        // compile time — which `estimate_cost` does not
+                        // include — takes the cost past the compute deposit.
+                        let storage_part = input_storage_deposit(
+                            request.input_data.as_ref().map_or(0, |d| d.len()),
+                        );
+                        let chargeable = payment.0.saturating_sub(storage_part);
+                        let cost = self.calculate_cost(&exec_response.resources_used).min(chargeable);
 
                         // Handle stablecoin payment with refund support
                         if request.attached_usd > 0 {
@@ -630,82 +668,30 @@ impl Contract {
                             exec_response.compilation_note.as_deref(),
                         );
 
-                        // Log the execution result with resources used
-                        if let Some(output) = exec_response.output {
-                            // Convert ExecutionOutput to plain JSON value (without enum wrapper)
-                            let json_value = match &output {
-                                ExecutionOutput::Bytes(bytes) => {
-                                    // For bytes, encode as base64 string
-                                    use near_sdk::base64::{engine::general_purpose::STANDARD, Engine};
-                                    serde_json::Value::String(STANDARD.encode(bytes))
-                                }
-                                ExecutionOutput::Text(text) => {
-                                    // For text, return as JSON string
-                                    serde_json::Value::String(text.clone())
-                                }
-                                ExecutionOutput::Json(value) => {
-                                    // For JSON, return the value directly
-                                    value.clone()
-                                }
-                            };
+                        // Log the result by kind and size only: a preview
+                        // would mean walking the output, and this callback's
+                        // cost must not grow with it.
+                        let compilation_info = exec_response.compilation_note
+                            .as_ref()
+                            .map(|note| format!(", {}", note))
+                            .unwrap_or_default();
+                        let output_info = match &stored_output {
+                            Some(StoredOutput::Bytes(b)) => format!("Bytes({} bytes)", b.len()),
+                            Some(StoredOutput::Text(b)) => format!("Text({} bytes)", b.len()),
+                            Some(StoredOutput::Json(b)) => format!("Json({} bytes)", b.len()),
+                            None => "none".to_string(),
+                        };
+                        log!(
+                            "Execution completed successfully. Output: {}, Resources: {{ instructions: {}, time_ms: {} }}, Cost: {} yoctoNEAR, Refund: {} yoctoNEAR{}",
+                            output_info,
+                            exec_response.resources_used.instructions,
+                            exec_response.resources_used.time_ms,
+                            cost,
+                            refund,
+                            compilation_info
+                        );
 
-                            // Log for debugging (with type info, truncated to avoid log limit).
-                            // The text is the WASM's own and is quoted, so a line break in it
-                            // stays inside this one log line.
-                            let log_preview = match &output {
-                                ExecutionOutput::Bytes(bytes) => format!("Bytes({} bytes)", bytes.len()),
-                                ExecutionOutput::Text(text) => {
-                                    let preview: String = text.chars().take(100).collect();
-                                    if text.len() > 100 {
-                                        format!("Text({} bytes): {:?}...", text.len(), preview)
-                                    } else {
-                                        format!("Text: {:?}", text)
-                                    }
-                                }
-                                ExecutionOutput::Json(value) => {
-                                    let json_str = serde_json::to_string(value).unwrap_or_default();
-                                    let preview: String = json_str.chars().take(100).collect();
-                                    if json_str.len() > 100 {
-                                        format!("Json({} bytes): {}...", json_str.len(), preview)
-                                    } else {
-                                        format!("Json: {}", json_str)
-                                    }
-                                }
-                            };
-
-                            let compilation_info = exec_response.compilation_note
-                                .as_ref()
-                                .map(|note| format!(", {}", note))
-                                .unwrap_or_default();
-
-                            log!(
-                                "Execution completed successfully. Output: {}, Resources: {{ instructions: {}, time_ms: {} }}, Cost: {} yoctoNEAR, Refund: {} yoctoNEAR{}",
-                                log_preview,
-                                exec_response.resources_used.instructions,
-                                exec_response.resources_used.time_ms,
-                                cost,
-                                refund,
-                                compilation_info
-                            );
-
-                            Some(json_value)
-                        } else {
-                            let compilation_info = exec_response.compilation_note
-                                .as_ref()
-                                .map(|note| format!(", {}", note))
-                                .unwrap_or_default();
-
-                            log!(
-                                "Execution has no output value. Resources: {{ instructions: {}, time_ms: {} }}, Cost: {} yoctoNEAR, Refund: {} yoctoNEAR{}",
-                                exec_response.resources_used.instructions,
-                                exec_response.resources_used.time_ms,
-                                cost,
-                                refund,
-                                compilation_info
-                            );
-
-                            None
-                        }
+                        env::value_return(&output_return_bytes(stored_output.as_ref()));
                     } else {
                         // Execution failed - refund NEAR (except base fee) and stablecoin
                         // Developer gets nothing on failure
@@ -754,8 +740,8 @@ impl Contract {
                             refund
                         );
 
-                        // Return None to indicate failure to calling contract
-                        None
+                        // `null` tells the calling contract the run failed.
+                        env::value_return(&output_return_bytes(None));
                     }
                 }
                 Err(promise_error) => {
@@ -786,8 +772,7 @@ impl Contract {
                         promise_error, refund
                     );
 
-                    // Return None to indicate failure to calling contract
-                    None
+                    env::value_return(&output_return_bytes(None));
                 }
             }
         } else {
@@ -796,11 +781,29 @@ impl Contract {
                 request_id
             );
 
-            None
+            env::value_return(&output_return_bytes(None));
         }
     }
 
-    /// Cancel stale execution request if timeout has passed
+    /// Cancel a request that is still pending after `EXECUTION_TIMEOUT`.
+    ///
+    /// The sender gets back the NEAR above what the request is charged — the
+    /// storage part of a large input always included — and the whole of the
+    /// stablecoin. What is charged depends on whether the work was done:
+    ///
+    /// * output not delivered: the base fee, as on every other way a request
+    ///   ends without a result — admitted and announced, and a cancel that
+    ///   cost nothing would make a request that outlived its callback cheaper
+    ///   than one that failed;
+    /// * output delivered through the 2-call flow (`output_submitted`) but the
+    ///   callback never settled it: the compute estimate for the limits — the
+    ///   budget the caller reserved — since the run happened and its output
+    ///   sits in state where a view can read it. Charging the estimate rather
+    ///   than refusing keeps the sender's own way out open (the deposit for a
+    ///   large input can be tens of NEAR), and leaves nothing to gain from
+    ///   starving the callback on purpose.
+    ///
+    /// The owner's `emergency_cancel_execution` remains, and refunds in full.
     pub fn cancel_stale_execution(&mut self, request_id: u64) {
         let request = self
             .pending_requests
@@ -819,17 +822,27 @@ impl Contract {
         assert!(is_stale, "Execution is not yet stale, please wait");
 
         // Remove the request and return BOTH sides of what it took: the NEAR
-        // held for compute, and the stablecoin admission debited for the
-        // developers. A cancelled request earns nobody anything, so leaving the
-        // stablecoin behind would take a caller's money for work that never
-        // happened.
+        // above the charge, and the stablecoin admission debited for the
+        // developers. A cancelled request earns the developers nothing, so
+        // leaving the stablecoin behind would take a caller's money for work
+        // they were never paid for.
         //
         // Removal is what makes this safe to pay out. It is the same single
         // token `on_execution_response` claims, so a request is settled here or
         // there, never in both.
         if let Some(stale_request) = self.pending_requests.remove(&request_id) {
-            near_sdk::Promise::new(stale_request.payer_account_id.clone())
-                .transfer(NearToken::from_yoctonear(stale_request.payment));
+            let charge = if stale_request.output_submitted {
+                self.estimate_cost(&stale_request.resource_limits)
+            } else {
+                self.base_fee
+            };
+            let kept = stale_request.payment.min(charge);
+            let refund = stale_request.payment - kept;
+            if refund > 0 {
+                near_sdk::Promise::new(stale_request.payer_account_id.clone())
+                    .transfer(NearToken::from_yoctonear(refund));
+            }
+            self.total_fees_collected += kept;
 
             self.return_attached_usd(
                 &stale_request.sender_id,
@@ -837,12 +850,51 @@ impl Contract {
                 "the execution was cancelled as stale",
             );
 
-
+            log!("[[yNEAR charged: \"{}\"]]", kept);
             log!(
-                "Cancelled stale execution {} and refunded payer {}",
+                "Cancelled stale execution {}: refunded {} yoctoNEAR to payer {}, kept {} ({})",
                 request_id,
-                stale_request.payer_account_id
+                refund,
+                stale_request.payer_account_id,
+                kept,
+                if stale_request.output_submitted { "the compute estimate: the output was delivered" } else { "the base fee" }
             );
+        }
+    }
+}
+
+/// The bytes `on_execution_response` returns to the calling contract for an
+/// output, or for none.
+///
+/// Byte for byte what serialising the equivalent `serde_json::Value` produced:
+/// `Json` is the guest's JSON as the worker serialised it, returned as is;
+/// `Text` is that text as one JSON string; `Bytes` is their base64 as one JSON
+/// string; no output, a failed run and a run with no request are `null`. Text
+/// that is not UTF-8 is reported as such rather than refused, as the view
+/// `get_pending_output` reports it. Empty `Json` bytes — a value that could not
+/// be serialised when stored — are `null`, never an empty answer a caller
+/// cannot parse.
+pub(crate) fn output_return_bytes(output: Option<&StoredOutput>) -> Vec<u8> {
+    const NULL: &[u8] = b"null";
+    match output {
+        None => NULL.to_vec(),
+        Some(StoredOutput::Json(bytes)) => {
+            if bytes.is_empty() {
+                NULL.to_vec()
+            } else {
+                bytes.clone()
+            }
+        }
+        Some(StoredOutput::Text(bytes)) => {
+            let text = match std::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => "[invalid UTF-8]",
+            };
+            serde_json::to_vec(text).unwrap_or_else(|_| NULL.to_vec())
+        }
+        Some(StoredOutput::Bytes(bytes)) => {
+            use near_sdk::base64::{engine::general_purpose::STANDARD, Engine};
+            serde_json::to_vec(&STANDARD.encode(bytes)).unwrap_or_else(|_| NULL.to_vec())
         }
     }
 }

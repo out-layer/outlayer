@@ -7,11 +7,11 @@ mod tests {
     use near_sdk::{testing_env, NearToken};
 
     /// Helper to create test ExecutionRequest
-    fn test_execution_request(request_id: u64, sender: AccountId, timestamp: u64) -> ExecutionRequest {
+    pub(super) fn test_execution_request(request_id: u64, sender: AccountId, timestamp: u64) -> ExecutionRequest {
         test_execution_request_with_data_id(request_id, sender, timestamp, [0; 32])
     }
 
-    fn test_execution_request_with_data_id(request_id: u64, sender: AccountId, timestamp: u64, data_id: [u8; 32]) -> ExecutionRequest {
+    pub(super) fn test_execution_request_with_data_id(request_id: u64, sender: AccountId, timestamp: u64, data_id: [u8; 32]) -> ExecutionRequest {
         let code_source = CodeSource::GitHub {
             repo: "https://github.com/test/repo".to_string(),
             commit: "abc123".to_string(),
@@ -582,6 +582,234 @@ mod tests {
                 compile_time_ms: None,
             },
             None, // compilation_note
+        );
+    }
+}
+
+/// A large `input_data` is paid for while it is held, the settlement callback
+/// is given gas for it, a stale cancel keeps the base fee and stops once the
+/// output has been delivered, and the callback's answer to the calling
+/// contract is built from the stored bytes without a value tree.
+#[cfg(test)]
+mod input_storage_and_callback_tests {
+    use super::tests::*;
+    use crate::tests::{get_context, setup_contract};
+    use crate::*;
+    use near_sdk::mock::MockAction;
+    use near_sdk::test_utils::{accounts, get_created_receipts};
+    use near_sdk::{testing_env, NearToken};
+
+    fn transfers() -> Vec<(AccountId, u128)> {
+        get_created_receipts()
+            .into_iter()
+            .flat_map(|r| {
+                let to = r.receiver_id.clone();
+                r.actions.into_iter().filter_map(move |a| match a {
+                    MockAction::Transfer { deposit, .. } => Some((to.clone(), deposit.as_yoctonear())),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    fn source() -> ExecutionSource {
+        ExecutionSource::GitHub {
+            repo: "github.com/test/repo".to_string(),
+            commit: "main".to_string(),
+            build_target: None,
+        }
+    }
+
+    fn request_with(c: &mut Contract, deposit: u128, input: Option<String>) {
+        testing_env!(get_context(accounts(1), NearToken::from_yoctonear(deposit)).build());
+        c.request_execution(source(), Some(ResourceLimits::default()), input, None, None, None, None);
+    }
+
+    /// Up to the free allowance the deposit is the compute estimate, as it
+    /// always was; the view says the same.
+    #[test]
+    fn a_small_input_costs_the_compute_estimate_only() {
+        let mut c = setup_contract();
+        let estimate = c.estimate_execution_cost(None, None).0;
+        assert_eq!(c.estimate_execution_cost(None, Some(INPUT_DATA_FREE_BYTES as u64)).0, estimate);
+        request_with(&mut c, estimate, Some("x".repeat(INPUT_DATA_FREE_BYTES)));
+        assert!(c.get_request(0).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient payment")]
+    fn a_large_input_is_refused_at_the_compute_estimate() {
+        let mut c = setup_contract();
+        let estimate = c.estimate_execution_cost(None, None).0;
+        request_with(&mut c, estimate, Some("x".repeat(INPUT_DATA_FREE_BYTES + 1)));
+    }
+
+    /// Beyond the allowance every byte is held at the storage price, the view
+    /// quotes exactly that, and the cancel gives it back less the base fee.
+    #[test]
+    fn a_large_input_is_held_at_the_storage_price_and_returned() {
+        let mut c = setup_contract();
+        let len = INPUT_DATA_FREE_BYTES + 8_000;
+        let estimate = c.estimate_execution_cost(None, None).0;
+        let quoted = c.estimate_execution_cost(None, Some(len as u64)).0;
+        assert_eq!(quoted, estimate + 8_000 * STORAGE_PRICE_PER_BYTE);
+        assert_eq!(quoted, estimate + input_storage_deposit(len));
+
+        request_with(&mut c, quoted, Some("x".repeat(len)));
+        let request = c.get_request(0).expect("admitted at the quote");
+        assert_eq!(request.payment, quoted);
+
+        let mut ctx = get_context(accounts(1), NearToken::from_yoctonear(0));
+        ctx.block_timestamp(request.timestamp + EXECUTION_TIMEOUT + 1);
+        testing_env!(ctx.build());
+        c.cancel_stale_execution(0);
+        assert_eq!(
+            transfers(),
+            vec![(accounts(1), quoted - c.base_fee)],
+            "everything above the base fee, the storage part included, comes back"
+        );
+        assert_eq!(c.total_fees_collected, c.base_fee);
+    }
+
+    /// The callback is created with gas for the bytes it will remove — above
+    /// the free allowance. Within it, a request reserves exactly the minimum,
+    /// so no existing caller's gas arithmetic moves.
+    #[test]
+    fn the_callback_gas_grows_with_the_input_above_the_free_allowance() {
+        assert_eq!(response_gas(0), MIN_RESPONSE_GAS);
+        assert_eq!(response_gas(INPUT_DATA_FREE_BYTES), MIN_RESPONSE_GAS);
+        assert_eq!(
+            response_gas(INPUT_DATA_FREE_BYTES + 1),
+            MIN_RESPONSE_GAS.saturating_add(Gas::from_gas(CALLBACK_GAS_PER_INPUT_BYTE))
+        );
+        assert_eq!(
+            response_gas(INPUT_DATA_FREE_BYTES + (1 << 20)),
+            MIN_RESPONSE_GAS.saturating_add(Gas::from_gas((1u64 << 20) * CALLBACK_GAS_PER_INPUT_BYTE))
+        );
+        // Two megabytes still leave room for the admission call itself inside
+        // one transaction's 300 TGas.
+        assert!(response_gas(2 << 20).as_tgas() < 110);
+    }
+
+    /// A stale cancel keeps the base fee, like every other end without a
+    /// result, and returns the whole of the stablecoin.
+    #[test]
+    fn a_stale_cancel_keeps_the_base_fee() {
+        let mut c = setup_contract();
+        let sender = accounts(3);
+        let t0 = env::block_timestamp();
+        let mut request = test_execution_request(0, sender.clone(), t0);
+        request.attached_usd = 12_000;
+        c.pending_requests.insert(&0, &request);
+        c.user_stablecoin_balances.insert(&sender, &988_000);
+
+        let mut ctx = get_context(sender.clone(), NearToken::from_near(0));
+        ctx.block_timestamp(t0 + EXECUTION_TIMEOUT + 1);
+        testing_env!(ctx.build());
+        c.cancel_stale_execution(0);
+
+        assert_eq!(transfers(), vec![(sender.clone(), request.payment - c.base_fee)]);
+        assert_eq!(c.total_fees_collected, c.base_fee);
+        assert_eq!(c.user_stablecoin_balances.get(&sender).unwrap(), 1_000_000);
+    }
+
+    /// Once the worker has put the output in state the run happened: a
+    /// cancel still works — the sender's own way out — but keeps the compute
+    /// estimate, so the output is paid for and the rest comes back.
+    #[test]
+    fn a_delivered_request_is_cancelled_at_the_compute_estimate() {
+        let mut c = setup_contract();
+        let sender = accounts(3);
+        let t0 = env::block_timestamp();
+        let mut request = test_execution_request(0, sender.clone(), t0);
+        request.output_submitted = true;
+        request.pending_output = Some(StoredOutput::Text(b"done".to_vec()));
+        request.attached_usd = 5_000;
+        c.pending_requests.insert(&0, &request);
+        c.user_stablecoin_balances.insert(&sender, &0);
+        let estimate = c.estimate_cost(&request.resource_limits);
+        assert!(estimate > c.base_fee && estimate < request.payment, "a meaningful middle");
+
+        let mut ctx = get_context(sender.clone(), NearToken::from_near(0));
+        ctx.block_timestamp(t0 + EXECUTION_TIMEOUT + 1);
+        testing_env!(ctx.build());
+        c.cancel_stale_execution(0);
+
+        assert_eq!(transfers(), vec![(sender.clone(), request.payment - estimate)]);
+        assert_eq!(c.total_fees_collected, estimate);
+        assert_eq!(c.user_stablecoin_balances.get(&sender).unwrap(), 5_000, "the stablecoin comes back whole");
+        assert!(c.get_request(0).is_none());
+    }
+
+    /// Compile time is not in the estimate, so a run's cost can exceed the
+    /// compute deposit; it must never reach into the storage part, which is
+    /// held, not offered.
+    #[test]
+    fn compile_time_cannot_eat_the_storage_deposit() {
+        let mut c = setup_contract();
+        let len = INPUT_DATA_FREE_BYTES + 8_000;
+        let storage_part = input_storage_deposit(len);
+        let quoted = c.estimate_execution_cost(None, Some(len as u64)).0;
+        request_with(&mut c, quoted, Some("x".repeat(len)));
+        let request = c.get_request(0).expect("admitted");
+
+        testing_env!(get_context(accounts(0), NearToken::from_near(0)).build());
+        c.on_execution_response(
+            0,
+            request.sender_id.clone(),
+            request.resolved_source.clone(),
+            request.resource_limits.clone(),
+            U128(request.payment),
+            Ok(ExecutionResponse {
+                success: true,
+                output: Some(ExecutionOutput::Text("ok".to_string())),
+                error: None,
+                // A compile that alone would cost far more than the deposit.
+                resources_used: ResourceMetrics { instructions: 0, time_ms: 0, compile_time_ms: Some(10_000_000) },
+                compilation_note: None,
+                refund_usd: None,
+            }),
+        );
+
+        assert_eq!(
+            transfers(),
+            vec![(accounts(1), storage_part)],
+            "the storage part comes back whole; the compute deposit is what the run could burn"
+        );
+        assert_eq!(c.total_fees_collected, quoted - storage_part);
+    }
+
+    /// The bytes handed to the calling contract are what serialising the value
+    /// tree gave, for every kind of output — pinned here because the callback
+    /// no longer builds that tree.
+    #[test]
+    fn the_returned_bytes_equal_the_value_tree_form() {
+        let tree = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+
+        let json = serde_json::json!({"ok": true, "items": [1, 2.5, "x"], "nested": {"a": null}});
+        let stored: StoredOutput = ExecutionOutput::Json(json.clone()).into();
+        assert_eq!(crate::execution::output_return_bytes(Some(&stored)), tree(json));
+
+        let text = "line one\nline \"two\" — ünïcödé";
+        let stored: StoredOutput = ExecutionOutput::Text(text.to_string()).into();
+        assert_eq!(
+            crate::execution::output_return_bytes(Some(&stored)),
+            tree(serde_json::Value::String(text.to_string()))
+        );
+
+        let bytes = vec![0u8, 1, 2, 255, 254];
+        let stored: StoredOutput = ExecutionOutput::Bytes(bytes.clone()).into();
+        use near_sdk::base64::{engine::general_purpose::STANDARD, Engine};
+        assert_eq!(
+            crate::execution::output_return_bytes(Some(&stored)),
+            tree(serde_json::Value::String(STANDARD.encode(&bytes)))
+        );
+
+        assert_eq!(crate::execution::output_return_bytes(None), b"null");
+        assert_eq!(crate::execution::output_return_bytes(Some(&StoredOutput::Json(vec![]))), b"null");
+        assert_eq!(
+            crate::execution::output_return_bytes(Some(&StoredOutput::Text(vec![0xff, 0xfe]))),
+            tree(serde_json::Value::String("[invalid UTF-8]".to_string()))
         );
     }
 }

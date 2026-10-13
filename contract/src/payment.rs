@@ -49,7 +49,7 @@ impl Contract {
         if self.payment_key_nonce_floors.contains_key(owner) {
             0
         } else {
-            nonce_floor_entry_bytes(owner) as u128 * crate::secrets::STORAGE_PRICE_PER_BYTE
+            nonce_floor_entry_bytes(owner) as u128 * STORAGE_PRICE_PER_BYTE
         }
     }
 }

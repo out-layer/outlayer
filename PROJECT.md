@@ -208,7 +208,7 @@ Two-call flow for large outputs: first submit output data, then resolve. Used wh
 
 ### cancel_stale_execution
 
-Anyone can cancel requests older than 10 minutes (`EXECUTION_TIMEOUT = 600 * 1_000_000_000` nanoseconds). Refunds payment to payer.
+The sender can cancel a request still pending after 10 minutes (`EXECUTION_TIMEOUT = 600 * 1_000_000_000` nanoseconds). Refunds the whole `attached_usd` to the sender and the payment above the charge to the payer: the base fee when no output was delivered, the compute estimate for the limits when the output was delivered through the 2-call flow (`output_submitted`) and the callback never settled it.
 
 ---
 
@@ -660,7 +660,7 @@ cargo build --target wasm32-wasip2 --release
 | `get_pricing()` | `(U128, U128, U128, U128)` | NEAR pricing tuple |
 | `get_pricing_full()` | `PricingView` | Full NEAR + USD pricing |
 | `get_payment_token_contract()` | `Option<AccountId>` | Stablecoin contract |
-| `estimate_execution_cost(resource_limits)` | `U128` | Cost estimate |
+| `estimate_execution_cost(resource_limits, input_len)` | `U128` | What to attach: the compute estimate plus the deposit held for `input_data` beyond the free 32 KB |
 | `get_max_limits()` | `(u64, u64, u64)` | Hard caps: instructions, exec_sec, compile_sec |
 | `is_paused()` | `bool` | Contract pause status |
 | `get_config()` | `(AccountId, AccountId)` | Owner, operator |

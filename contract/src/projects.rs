@@ -18,9 +18,6 @@ use crate::*;
 use near_sdk::collections::UnorderedMap;
 use near_sdk::{env, log, near_bindgen, Promise};
 
-/// Storage cost per byte in NEAR (same as secrets)
-pub const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000; // 0.00001 NEAR per byte
-
 /// Base storage overhead for a project entry
 const PROJECT_BASE_STORAGE: u64 = 200;
 

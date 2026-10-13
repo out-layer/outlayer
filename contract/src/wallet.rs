@@ -2,9 +2,6 @@ use crate::*;
 use near_sdk::env;
 use sha2::{Digest, Sha256};
 
-/// Storage cost per byte in NEAR
-const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000; // 0.00001 NEAR per byte
-
 /// Wallet policy entry stored on-chain
 /// Encrypted by keystore (TEE), only keystore can decrypt
 #[derive(Clone, Debug)]

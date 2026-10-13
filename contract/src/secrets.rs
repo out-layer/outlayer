@@ -243,9 +243,6 @@ fn system_binding(kind: &SystemSecretType) -> &'static str {
     }
 }
 
-/// Storage cost per byte in NEAR
-pub const STORAGE_PRICE_PER_BYTE: Balance = 10_000_000_000_000_000_000; // 0.00001 NEAR per byte
-
 #[near_bindgen]
 impl Contract {
     /// Store secrets with access control.

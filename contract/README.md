@@ -64,8 +64,27 @@ applies to a profile name — 1–64 bytes of letters, digits, `-` or `_` — an
 reference no row could match is refused before the request yields, naming
 that rule.
 
+**Deposit.** `estimate_execution_cost(resource_limits, input_len)` is what to
+attach: the compute estimate for the limits, plus — for an `input_data` longer
+than 32 KB — 0.00001 NEAR per byte above that, held while the request is
+pending and returned at settlement with the rest of the refund. Up to 32 KB
+the deposit is the compute estimate alone. The settlement callback is given
+gas in proportion to the input it will remove from state, out of the gas
+attached to the call, so a call carrying megabytes needs more gas as well
+(25 MGas per byte above 32 KB, about 52 TGas for 2 MiB; within 32 KB nothing changes).
+
+**Return value.** The calling contract receives the output as a JSON value:
+the guest's JSON for `Json`, a string for `Text`, base64 for `Bytes`, and
+`null` when the run failed or produced nothing.
+
 #### `cancel_stale_execution`
-Cancel execution request after timeout (10 minutes).
+Cancel a request still pending after the timeout (10 minutes). Returns the
+whole of the stablecoin and the NEAR above the charge, the storage part of a
+large input always included. The charge is the base fee when no output was
+delivered — as on every other end without a result — and the compute estimate
+for the limits when the worker has delivered the output through the 2-call
+flow and the callback never settled it: the run happened and its output is
+readable with `get_pending_output`.
 
 ```bash
 near call outlayer.testnet cancel_stale_execution '{

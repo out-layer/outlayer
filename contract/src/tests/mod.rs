@@ -2584,7 +2584,7 @@ mod project_transfer_acceptance_tests {
     use near_sdk::test_utils::{accounts, get_created_receipts, get_logs, VMContextBuilder};
     use near_sdk::{testing_env, NearToken};
 
-    const PRICE: u128 = crate::projects::STORAGE_PRICE_PER_BYTE;
+    const PRICE: u128 = crate::STORAGE_PRICE_PER_BYTE;
 
     fn ctx(predecessor: AccountId, deposit: NearToken) -> VMContextBuilder {
         let mut b = VMContextBuilder::new();

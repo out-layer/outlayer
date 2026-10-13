@@ -1,5 +1,5 @@
 use crate::*;
-use crate::secrets::STORAGE_PRICE_PER_BYTE;
+use crate::STORAGE_PRICE_PER_BYTE;
 use near_sdk::test_utils::{accounts, VMContextBuilder};
 use near_sdk::testing_env;
 use near_sdk::NearToken;
