@@ -779,6 +779,112 @@ mod input_storage_and_callback_tests {
         assert_eq!(c.total_fees_collected, quoted - storage_part);
     }
 
+    fn settle_with(c: &mut Contract, request_id: u64, response: Result<ExecutionResponse, PromiseError>) {
+        let request = c.get_request(request_id).expect("pending");
+        testing_env!(get_context(accounts(0), NearToken::from_near(0)).build());
+        c.on_execution_response(
+            request_id,
+            request.sender_id.clone(),
+            request.resolved_source.clone(),
+            request.resource_limits.clone(),
+            U128(request.payment),
+            response,
+        );
+    }
+
+    fn failed(resources: ResourceMetrics) -> Result<ExecutionResponse, PromiseError> {
+        Ok(ExecutionResponse {
+            success: false,
+            output: None,
+            error: Some("trap".to_string()),
+            resources_used: resources,
+            compilation_note: None,
+            refund_usd: None,
+        })
+    }
+
+    /// A failed run pays for what it burned, by the same formula as a success.
+    #[test]
+    fn a_failed_run_is_charged_what_it_burned() {
+        let mut c = setup_contract();
+        let quoted = c.estimate_execution_cost(None, None).0;
+        request_with(&mut c, quoted, Some("{}".to_string()));
+        let burned = ResourceMetrics { instructions: 500_000_000, time_ms: 20_000, compile_time_ms: None };
+        let expected = c.calculate_cost(&burned);
+        assert!(expected > c.base_fee && expected < quoted, "a meaningful middle: {expected}");
+
+        settle_with(&mut c, 0, failed(burned));
+        assert_eq!(transfers(), vec![(accounts(1), quoted - expected)]);
+        assert_eq!(c.total_fees_collected, expected);
+    }
+
+    /// A failure before the guest ran arrives with nothing burned and costs
+    /// the base fee, as it always did.
+    #[test]
+    fn a_platform_failure_costs_the_base_fee() {
+        let mut c = setup_contract();
+        let quoted = c.estimate_execution_cost(None, None).0;
+        request_with(&mut c, quoted, Some("{}".to_string()));
+        settle_with(&mut c, 0, failed(ResourceMetrics { instructions: 0, time_ms: 0, compile_time_ms: None }));
+        assert_eq!(transfers(), vec![(accounts(1), quoted - c.base_fee)]);
+        assert_eq!(c.total_fees_collected, c.base_fee);
+    }
+
+    /// A failed run that burned past its budget — the penalty case, the
+    /// whole limit reported — pays the compute deposit and no more; the
+    /// storage part comes back.
+    #[test]
+    fn a_failed_run_never_pays_past_the_compute_deposit() {
+        let mut c = setup_contract();
+        let len = INPUT_DATA_FREE_BYTES + 8_000;
+        let storage_part = input_storage_deposit(len);
+        let quoted = c.estimate_execution_cost(None, Some(len as u64)).0;
+        request_with(&mut c, quoted, Some("x".repeat(len)));
+        settle_with(&mut c, 0, failed(ResourceMetrics { instructions: u64::MAX / 4, time_ms: u64::MAX / 4, compile_time_ms: Some(u64::MAX / 4) }));
+        assert_eq!(transfers(), vec![(accounts(1), storage_part)]);
+        assert_eq!(c.total_fees_collected, quoted - storage_part);
+    }
+
+    /// A run the yield window outlived costs the base fee: the window runs
+    /// out on our side as often as on the caller's, and the two cannot be
+    /// told apart here. The storage part and the stablecoin come back whole.
+    #[test]
+    fn a_timed_out_run_costs_the_base_fee() {
+        let mut c = setup_contract();
+        let len = INPUT_DATA_FREE_BYTES + 8_000;
+        let quoted = c.estimate_execution_cost(None, Some(len as u64)).0;
+        request_with(&mut c, quoted, Some("x".repeat(len)));
+        c.user_stablecoin_balances.insert(&accounts(1), &0);
+        let mut request = c.get_request(0).unwrap();
+        request.attached_usd = 7_000;
+        c.pending_requests.insert(&0, &request);
+
+        settle_with(&mut c, 0, Err(PromiseError::Failed));
+        assert_eq!(transfers(), vec![(accounts(1), quoted - c.base_fee)]);
+        assert_eq!(c.total_fees_collected, c.base_fee);
+        assert_eq!(c.user_stablecoin_balances.get(&accounts(1)).unwrap(), 7_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds hard limit of 4096 MB")]
+    fn memory_above_the_cap_is_refused() {
+        let mut c = setup_contract();
+        let quoted = c.estimate_execution_cost(None, None).0;
+        testing_env!(get_context(accounts(1), NearToken::from_yoctonear(quoted)).build());
+        let limits = ResourceLimits { max_memory_mb: Some(MAX_MEMORY_MB + 1), ..Default::default() };
+        c.request_execution(source(), Some(limits), None, None, None, None, None);
+    }
+
+    #[test]
+    fn memory_at_the_cap_is_admitted() {
+        let mut c = setup_contract();
+        let quoted = c.estimate_execution_cost(None, None).0;
+        testing_env!(get_context(accounts(1), NearToken::from_yoctonear(quoted)).build());
+        let limits = ResourceLimits { max_memory_mb: Some(MAX_MEMORY_MB), ..Default::default() };
+        c.request_execution(source(), Some(limits), None, None, None, None, None);
+        assert!(c.get_request(0).is_some());
+    }
+
     /// The bytes handed to the calling contract are what serialising the value
     /// tree gave, for every kind of output — pinned here because the callback
     /// no longer builds that tree.

@@ -111,6 +111,14 @@ impl Contract {
                 max_execution_seconds,
                 MAX_EXECUTION_SECONDS
             );
+
+            let max_memory_mb = limits.max_memory_mb.unwrap_or_default();
+            assert!(
+                max_memory_mb <= MAX_MEMORY_MB,
+                "Requested max_memory_mb {} exceeds hard limit of {} MB",
+                max_memory_mb,
+                MAX_MEMORY_MB
+            );
         }
 
         // Calculate cost: base fee for compile-only, full estimate for execute
@@ -693,11 +701,20 @@ impl Contract {
 
                         env::value_return(&output_return_bytes(stored_output.as_ref()));
                     } else {
-                        // Execution failed - refund NEAR (except base fee) and stablecoin
-                        // Developer gets nothing on failure
+                        // Execution failed: the developers earn nothing, the
+                        // stablecoin goes back whole, and the NEAR charge is
+                        // what the worker reports the run used — the same
+                        // formula as a success, capped at the compute deposit,
+                        // so the storage part of a large input always comes
+                        // back. A failure before the guest ran reports little
+                        // or nothing and costs about the base fee.
+                        let storage_part = input_storage_deposit(
+                            request.input_data.as_ref().map_or(0, |d| d.len()),
+                        );
+                        let chargeable = payment.0.saturating_sub(storage_part);
+                        let cost = self.calculate_cost(&exec_response.resources_used).min(chargeable);
 
-                        // Refund NEAR (minus base fee)
-                        let refund = payment.0.saturating_sub(self.base_fee);
+                        let refund = payment.0.saturating_sub(cost);
                         if refund > 0 {
                             near_sdk::Promise::new(request.payer_account_id.clone())
                                 .transfer(NearToken::from_yoctonear(refund));
@@ -709,10 +726,10 @@ impl Contract {
                             "execution failed",
                         );
 
-                        self.total_fees_collected += self.base_fee;
+                        self.total_fees_collected += cost;
 
-                        // Log payment charged in easy-to-parse format for worker (only base fee charged on failure)
-                        log!("[[yNEAR charged: \"{}\"]]", self.base_fee);
+                        // Log payment charged in easy-to-parse format for worker
+                        log!("[[yNEAR charged: \"{}\"]]", cost);
 
                         // Get error message for event
                         let error_msg = exec_response.error.unwrap_or("Unknown error".to_string());
@@ -726,8 +743,8 @@ impl Contract {
                             &exec_response.resources_used,
                             false,
                             Some(&error_msg),
-                            U128(self.base_fee),  // payment_charged (only base fee)
-                            U128(refund),         // payment_refunded
+                            U128(cost),    // payment_charged
+                            U128(refund),  // payment_refunded
                             exec_response.compilation_note.as_deref(),
                         );
 
@@ -791,10 +808,9 @@ impl Contract {
     /// storage part of a large input always included — and the whole of the
     /// stablecoin. What is charged depends on whether the work was done:
     ///
-    /// * output not delivered: the base fee, as on every other way a request
-    ///   ends without a result — admitted and announced, and a cancel that
-    ///   cost nothing would make a request that outlived its callback cheaper
-    ///   than one that failed;
+    /// * output not delivered: the base fee, as a timed-out request pays —
+    ///   admitted and announced, and a cancel that cost nothing would make a
+    ///   request that outlived its callback cheaper than one that failed;
     /// * output delivered through the 2-call flow (`output_submitted`) but the
     ///   callback never settled it: the compute estimate for the limits — the
     ///   budget the caller reserved — since the run happened and its output

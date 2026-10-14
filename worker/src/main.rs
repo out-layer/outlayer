@@ -468,6 +468,7 @@ async fn main() -> Result<()> {
         }
 
         Executor::new(config.default_max_instructions, config.print_wasm_stderr)
+            .with_run_limits(config.wasm_memory_floor_mb, config.wasm_memory_ceiling_mb, config.max_output_bytes)
             .with_context(exec_context)
     };
 

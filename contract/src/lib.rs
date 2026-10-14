@@ -88,6 +88,9 @@ pub const EXECUTION_TIMEOUT: u64 = 600 * 1_000_000_000;
 pub const MAX_INSTRUCTIONS: u64 = 500_000_000_000; // 500 billion instructions
 pub const MAX_EXECUTION_SECONDS: u64 = 180; // 180 seconds
 pub const MAX_COMPILATION_SECONDS: u64 = 300; // 5 minutes max compilation time
+/// The most linear memory a run may ask for: wasm32's own bound. A request
+/// above it names a memory no module can address.
+pub const MAX_MEMORY_MB: u32 = 4096;
 
 // Large payload handling: threshold for including input_data in event log
 // Payloads >= this size are stored in state only, worker fetches via get_request()

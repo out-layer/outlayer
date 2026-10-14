@@ -7,11 +7,11 @@
 #       for none (otherwise the deploy is pending: every probe SKIPs)
 #   E1  a 40 KB request at the compute estimate alone → "Insufficient payment",
 #       naming the free allowance
-#   E2  the same request at the quote is admitted, and get_request shows the
-#       quote as its payment
-#   E3  it settles on its own within the yield window (the source cannot be
-#       fetched, so the run fails and the deposit above the base fee comes back
-#       — the arithmetic is the unit tests'; here only that the request is gone)
+#   E2  the same request at the quote is admitted, and the admission event
+#       shows the quote as its payment
+#   E3  it settles on its own within the yield window: the source cannot be
+#       fetched, the run fails having used nothing, and the admission tx's
+#       receipts refund exactly quote − base fee (the storage part included)
 #
 # Run (spends a base fee and gas on testnet):
 #   ./tests/input_storage_e2e.sh --apply
@@ -52,7 +52,19 @@ tx() {
     prepaid-gas '150.0 Tgas' attached-deposit "$4 yoctoNEAR" sign-as "$1" network-config "$NETWORK" \
     sign-with-keychain send 2>&1); RC=$?
   grep -q "succeeded" <<<"$OUT" || RC=1
+  TXH=$(grep -aoE 'Transaction ID: [1-9A-HJ-NP-Za-km-z]{43,44}' <<<"$OUT" | head -1 | awk '{print $3}')
   WHY=$(near_why "$OUT")
+}
+
+# refunds <tx-hash> <sender> — "receiver amount" for every transfer the
+# contract made inside that transaction's receipt tree. The settlement
+# callback of a yield is a receipt of the ADMISSION transaction, so once the
+# request has settled, its refund shows up here.
+refunds() {
+  curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' --max-time 60 \
+    -d "$(jq -nc --arg h "$1" --arg s "$2" '{jsonrpc:"2.0",id:1,method:"EXPERIMENTAL_tx_status",params:{tx_hash:$h,sender_account_id:$s,wait_until:"FINAL"}}')" \
+  | jq -r --arg c "$CONTRACT_ID" '.result.receipts[]? | select(.predecessor_id == $c)
+      | .receiver_id as $r | .receipt.Action.actions[]? | select(.Transfer) | "\($r) \(.Transfer.deposit)"'
 }
 refused() { if [[ $RC -ne 0 ]] && grep -qi "$2" <<<"$WHY"; then pass "$1 refused: $(head -c 160 <<<"$WHY")"; else fail "$1 expected a refusal naming /$2/, got rc=$RC: $WHY"; fi; }
 succeeded() { if [[ $RC -eq 0 ]]; then pass "$1"; else fail "$1: $WHY"; fi; }
@@ -102,21 +114,37 @@ succeeded "E2 admitted at the quote"
 # The id is in the execution_requested event, inside the JSON-escaped
 # request_data string: `\"request_id\":12`.
 RID=$(grep -aoE 'request_id\\?"?:[0-9]+' <<<"$OUT" | head -1 | grep -oE '[0-9]+$')
-if [[ -n "$RID" ]]; then
-  HELD=$(view get_request "$(jq -nc --argjson r "$RID" '{request_id:$r}')" | jq -r '.payment // empty')
-  [[ "$HELD" == "$QUOTE" ]] && pass "request $RID holds the quote as its payment" || fail "request $RID payment '$HELD', expected $QUOTE"
-else
-  fail "no request_id in the admission output"; RID=""
-fi
+# The payment the request holds, from the same event (the worker can settle a
+# request that fails to fetch within seconds, before a view would see it).
+HELD=$(grep -aoE 'payment\\?"?:\\?"?[0-9]+' <<<"$OUT" | head -1 | grep -oE '[0-9]+$')
+[[ -n "$RID" ]] && pass "request $RID admitted" || fail "no request_id in the admission output"
+[[ "$HELD" == "$QUOTE" ]] && pass "the request holds the quote as its payment" || fail "payment '$HELD' in the event, expected $QUOTE"
+ADMIT_TX="$TXH"
 
-log "E3 it settles on its own"
+log "E3 it settles on its own and the deposit above the base fee comes back"
 if [[ -n "$RID" ]]; then
   for _ in $(seq 1 60); do
     [[ "$(view get_request "$(jq -nc --argjson r "$RID" '{request_id:$r}')")" == "null" ]] && break
     sleep 5
   done
-  [[ "$(view get_request "$(jq -nc --argjson r "$RID" '{request_id:$r}')")" == "null" ]] \
-    && pass "request $RID settled within five minutes" || fail "request $RID is still pending after five minutes"
+  if [[ "$(view get_request "$(jq -nc --argjson r "$RID" '{request_id:$r}')")" == "null" ]]; then
+    pass "request $RID settled within five minutes"
+    # The source cannot be fetched, so the run FAILS: the refund is everything
+    # above the base fee — the storage part included.
+    BASE_FEE=$(view get_pricing '{}' | jq -r '.[0]')
+    EXPECTED_BACK=$(python3 -c 'import sys; print(int(sys.argv[1]) - int(sys.argv[2]))' "$QUOTE" "$BASE_FEE")
+    BACK=""
+    for _ in $(seq 1 12); do
+      BACK=$(refunds "$ADMIT_TX" "$OWNER" | awk -v o="$OWNER" '$1==o {print $2}' | head -1)
+      [[ -n "$BACK" ]] && break
+      sleep 5
+    done
+    if [[ "$BACK" == "$EXPECTED_BACK" ]]; then pass "refunded $BACK = quote − base fee ($BASE_FEE): the storage part came back"
+    elif [[ -z "$BACK" ]]; then fail "no refund to $OWNER in the receipts of $ADMIT_TX"
+    else fail "refunded $BACK, expected $EXPECTED_BACK (quote $QUOTE − base fee $BASE_FEE)"; fi
+  else
+    fail "request $RID is still pending after five minutes"
+  fi
 else
   skip "no request to watch"
 fi

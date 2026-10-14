@@ -1,5 +1,6 @@
 //! What a guest run is given of the host, and what it leaves behind: a
-//! private scratch directory, and the epoch ticker that times it.
+//! private scratch directory, the bounds of its store, and the epoch ticker
+//! that times it.
 //!
 //! A WASI guest has no file access but the directories the host preopens.
 //! While [`GUEST_FILES_ALLOWED`] is false it gets none: every file call
@@ -9,6 +10,9 @@
 //! over — success, trap, timeout or an early return. Nothing a guest writes
 //! reaches the next job, and no guest sees the worker's own files: the wasm
 //! cache and anything else under `/tmp` stay outside it.
+//!
+//! [`store_limits`] is what a run's store holds it to: its linear memory and
+//! its tables.
 //!
 //! The epoch ticker advances the engine's epoch once a second for the run's
 //! deadline. The engine is shared by every run, so a ticker left behind
@@ -110,6 +114,25 @@ impl Drop for Ticker {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// The bounds a run's store holds it to: each linear memory at `memory_mb`,
+/// each table at a million elements (Rust guests declare their tables fixed
+/// and never grow them; a hand-built module could otherwise grow a table into
+/// host memory past the linear-memory bound). A growth past either is REFUSED the way
+/// the wasm spec has it — `memory.grow` answers -1 — and the guest's allocator
+/// fails in its own words; a module whose declared minimum is past the bound
+/// does not instantiate.
+///
+/// Refused, not trapped: wasmtime's `trap_on_grow_failure` raises the trap
+/// inside the `memory.grow` libcall, before the run's fuel is written back,
+/// and the run would report no instructions at all — a guest could end every
+/// costly run on one oversized growth and be charged nothing for the work.
+pub fn store_limits(memory_mb: u32) -> wasmtime::StoreLimits {
+    wasmtime::StoreLimitsBuilder::new()
+        .memory_size(memory_mb as usize * 1024 * 1024)
+        .table_elements(1_000_000)
+        .build()
 }
 
 /// A run that executed and did not succeed, with what it consumed — typed,

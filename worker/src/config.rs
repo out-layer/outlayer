@@ -50,6 +50,14 @@ pub struct Config {
     pub default_max_execution_seconds: u64,
     /// Hard cap on WASM execution time regardless of request (seconds)
     pub max_execution_seconds_cap: u64,
+    /// The least linear memory a run is given, whatever `max_memory_mb` it
+    /// asked (MB). A guest that declared less and used more kept running
+    /// while the limit was not enforced, and keeps running under the floor.
+    pub wasm_memory_floor_mb: u32,
+    /// The most linear memory a run can be given (MB); wasm32's own bound.
+    pub wasm_memory_ceiling_mb: u32,
+    /// The stdout capacity (bytes); a write past it fails.
+    pub max_output_bytes: usize,
     /// Extra time budget for RPC calls, WASM download, result upload etc. (seconds)
     pub iteration_overhead_seconds: u64,
 
@@ -334,6 +342,25 @@ impl Config {
             .parse::<u64>()
             .context("MAX_EXECUTION_SECONDS_CAP must be a valid number")?;
 
+        let wasm_memory_floor_mb = env::var("WASM_MEMORY_FLOOR_MB")
+            .unwrap_or_else(|_| crate::executor::DEFAULT_MEMORY_FLOOR_MB.to_string())
+            .parse::<u32>()
+            .context("WASM_MEMORY_FLOOR_MB must be a valid number")?;
+
+        let wasm_memory_ceiling_mb = env::var("WASM_MEMORY_CEILING_MB")
+            .unwrap_or_else(|_| crate::executor::DEFAULT_MEMORY_CEILING_MB.to_string())
+            .parse::<u32>()
+            .context("WASM_MEMORY_CEILING_MB must be a valid number")?;
+        anyhow::ensure!(
+            wasm_memory_ceiling_mb >= wasm_memory_floor_mb,
+            "WASM_MEMORY_CEILING_MB ({wasm_memory_ceiling_mb}) must be at least WASM_MEMORY_FLOOR_MB ({wasm_memory_floor_mb})"
+        );
+
+        let max_output_bytes = env::var("MAX_OUTPUT_BYTES")
+            .unwrap_or_else(|_| crate::executor::DEFAULT_MAX_OUTPUT_BYTES.to_string())
+            .parse::<usize>()
+            .context("MAX_OUTPUT_BYTES must be a valid number")?;
+
         let iteration_overhead_seconds = env::var("ITERATION_OVERHEAD_SECONDS")
             .unwrap_or_else(|_| "60".to_string())
             .parse::<u64>()
@@ -526,6 +553,9 @@ impl Config {
             default_max_memory_mb,
             default_max_execution_seconds,
             max_execution_seconds_cap,
+            wasm_memory_floor_mb,
+            wasm_memory_ceiling_mb,
+            max_output_bytes,
             iteration_overhead_seconds,
             keystore_base_urls,
             keystore_auth_token,
@@ -767,6 +797,9 @@ mod tests {
             default_max_memory_mb: 128,
             default_max_execution_seconds: 60,
             max_execution_seconds_cap: 180,
+            wasm_memory_floor_mb: crate::executor::DEFAULT_MEMORY_FLOOR_MB,
+            wasm_memory_ceiling_mb: crate::executor::DEFAULT_MEMORY_CEILING_MB,
+            max_output_bytes: crate::executor::DEFAULT_MAX_OUTPUT_BYTES,
             iteration_overhead_seconds: 60,
             keystore_base_urls: None,
             keystore_auth_token: None,

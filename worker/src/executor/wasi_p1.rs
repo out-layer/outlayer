@@ -58,6 +58,7 @@ fn get_p1_engine() -> &'static Engine {
 /// * `limits` - Resource limits (memory, instructions, time)
 /// * `env_vars` - Environment variables (from encrypted secrets)
 /// * `print_stderr` - Print WASM stderr to worker logs
+/// * `max_output_bytes` - The stdout pipe's capacity; a write past it fails
 ///
 /// # Returns
 /// * `Ok((output, fuel_consumed, refund_usd))` - Execution succeeded
@@ -69,6 +70,7 @@ pub async fn execute(
     limits: &ResourceLimits,
     env_vars: Option<HashMap<String, String>>,
     print_stderr: bool,
+    max_output_bytes: usize,
 ) -> Result<(Vec<u8>, u64, Option<u64>)> {
     // Use global P1 engine (avoids ~50-100ms overhead per execution)
     let engine = get_p1_engine();
@@ -81,12 +83,12 @@ pub async fn execute(
 
     // Create linker for WASI P1
     let mut linker = wasmtime::Linker::new(&engine);
-    preview1::add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
+    preview1::add_to_linker_async(&mut linker, |t: &mut P1Data| &mut t.wasi)?;
 
-    // Prepare stdin/stdout pipes
+    // Prepare stdin/stdout pipes. stdout has a fixed capacity and a write past
+    // it fails; memory is bounded separately, by the store's limits below.
     let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
-    let stdout_pipe =
-        wasmtime_wasi::pipe::MemoryOutputPipe::new((limits.max_memory_mb as usize) * 1024 * 1024);
+    let stdout_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(max_output_bytes);
     let stderr_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024);
 
     // Build WASI P1 context
@@ -110,10 +112,14 @@ pub async fn execute(
         }
     }
 
-    let wasi_p1_ctx = wasi_builder.build_p1();
+    let data = P1Data {
+        wasi: wasi_builder.build_p1(),
+        limits: super::sandbox::store_limits(limits.max_memory_mb),
+    };
 
-    // Create store with fuel limit
-    let mut store = Store::new(&engine, wasi_p1_ctx);
+    // Create store with the fuel limit and the run's bounds
+    let mut store = Store::new(&engine, data);
+    store.limiter(|d| &mut d.limits);
     store.set_fuel(limits.max_instructions)?;
     let timeout_secs = limits.max_execution_seconds.max(5);
     store.set_epoch_deadline(timeout_secs);
@@ -240,6 +246,12 @@ pub async fn execute(
 
     // P1 does not support payment host functions, so refund_usd is always None
     Ok((output, fuel_consumed, None))
+}
+
+/// What a P1 store carries: the WASI context and the run's bounds.
+struct P1Data {
+    wasi: WasiP1Ctx,
+    limits: wasmtime::StoreLimits,
 }
 
 /// The first 200 characters of the input, for an error that quotes it — cut

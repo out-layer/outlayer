@@ -215,6 +215,16 @@ impl RunWithKeys<'_> {
     }
 }
 
+/// The least memory a run is given, whatever it asked for: a guest that
+/// declared the contract's default of 128 MB and used more kept running while
+/// the limit was not enforced, and keeps running under it.
+pub const DEFAULT_MEMORY_FLOOR_MB: u32 = 1024;
+/// The most memory a run can be given: wasm32's own bound.
+pub const DEFAULT_MEMORY_CEILING_MB: u32 = 4096;
+/// The stdout capacity: a write past it fails. Set at what the coordinator
+/// accepts of a worker's answer (10 MiB).
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+
 /// WASM executor supporting multiple WASI versions
 pub struct Executor {
     /// Maximum instructions allowed per execution (default)
@@ -223,6 +233,11 @@ pub struct Executor {
     print_wasm_stderr: bool,
     /// Execution context with optional RPC proxy and other services
     context: Option<ExecutionContext>,
+    /// The bounds every run's `max_memory_mb` is held between, and the stdout
+    /// capacity (`with_run_limits`).
+    memory_floor_mb: u32,
+    memory_ceiling_mb: u32,
+    max_output_bytes: usize,
 }
 
 impl Executor {
@@ -232,7 +247,20 @@ impl Executor {
             _default_max_instructions: default_max_instructions,
             print_wasm_stderr,
             context: None,
+            memory_floor_mb: DEFAULT_MEMORY_FLOOR_MB,
+            memory_ceiling_mb: DEFAULT_MEMORY_CEILING_MB,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
+    }
+
+    /// The bounds a run's memory is held between and its stdout capacity
+    /// (`WASM_MEMORY_FLOOR_MB`, `WASM_MEMORY_CEILING_MB`, `MAX_OUTPUT_BYTES` in
+    /// the worker's config, which refuses a ceiling below the floor).
+    pub fn with_run_limits(mut self, memory_floor_mb: u32, memory_ceiling_mb: u32, max_output_bytes: usize) -> Self {
+        self.memory_floor_mb = memory_floor_mb;
+        self.memory_ceiling_mb = memory_ceiling_mb;
+        self.max_output_bytes = max_output_bytes;
+        self
     }
 
     /// Create executor with execution context
@@ -318,6 +346,17 @@ impl Executor {
         network_config: Option<NetworkConfig>,
         keys: RunKeys,
     ) -> Result<ExecutionResult> {
+        // The memory the run is actually given: what it asked, held between
+        // the worker's floor and ceiling. The floor exists because the limit
+        // was not enforced before: a guest that declared the contract's
+        // default of 128 MB and used more kept running, and keeps running.
+        // The ceiling is wasm32's own bound.
+        let effective = ResourceLimits {
+            max_memory_mb: limits.max_memory_mb.clamp(self.memory_floor_mb, self.memory_ceiling_mb),
+            ..limits.clone()
+        };
+        let limits = &effective;
+
         info!(
             "Starting WASM execution: {} instructions, {} MB memory, {} seconds, target: {:?}, format: {:?}",
             limits.max_instructions, limits.max_memory_mb, limits.max_execution_seconds, build_target, response_format
@@ -507,6 +546,7 @@ impl Executor {
                         self.print_wasm_stderr,
                         effective_ctx.as_ref(),
                         keys,
+                        self.max_output_bytes,
                     ).await;
                 }
                 "wasm32-wasip1" | "wasm32-wasi" => {
@@ -514,7 +554,7 @@ impl Executor {
                     // When target is known, return error directly (don't fallback to other formats)
                     // P1 does not support RPC proxy, storage, declared keys, or compiled cache
                     // (no component model); a P1 run that declares keys is refused before here.
-                    return wasi_p1::execute(wasm_bytes, input_data, limits, env_vars, self.print_wasm_stderr).await;
+                    return wasi_p1::execute(wasm_bytes, input_data, limits, env_vars, self.print_wasm_stderr, self.max_output_bytes).await;
                 }
                 _ => {
                     tracing::debug!("⚠️ Unknown target '{}', fallback to auto-detection", target);
@@ -541,6 +581,7 @@ impl Executor {
             self.print_wasm_stderr,
             effective_ctx.as_ref(),
             keys,
+            self.max_output_bytes,
         ).await
         {
             Ok(result) => return Ok(result),
@@ -549,7 +590,7 @@ impl Executor {
         }
 
         // Try WASI P1 module (no RPC proxy, storage, or compiled cache)
-        match wasi_p1::execute(wasm_bytes, input_data, limits, env_vars.clone(), self.print_wasm_stderr).await {
+        match wasi_p1::execute(wasm_bytes, input_data, limits, env_vars.clone(), self.print_wasm_stderr, self.max_output_bytes).await {
             Ok(result) => return Ok(result),
             Err(e) if e.downcast_ref::<sandbox::RunFailed>().is_some() => return Err(e),
             Err(_) => {}
@@ -610,4 +651,97 @@ mod tests {
         assert_eq!(executor._default_max_instructions, 10_000_000_000);
         assert_eq!(executor.print_wasm_stderr, false);
     }
+
+    /// A P1 guest that burns about sixteen million instructions, grows its
+    /// memory from nothing 1 MiB at a time until the host refuses, then writes
+    /// its memory size in MiB as one byte to stdout and returns — so the bound
+    /// it met is read off its output, not inferred from words.
+    const GROWS_UNTIL_REFUSED: &str = r#"(module
+        (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 0)
+        (func (export "_start")
+            (local $i i32)
+            (loop $burn
+                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                (br_if $burn (i32.lt_u (local.get $i) (i32.const 2000000))))
+            (loop $again
+                (br_if $again (i32.ne (memory.grow (i32.const 16)) (i32.const -1))))
+            ;; iovec at 0: buf = 8, len = 1; the byte at 8 is the size in MiB
+            (i32.store (i32.const 0) (i32.const 8))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store8 (i32.const 8) (i32.shr_u (memory.size) (i32.const 4)))
+            (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 12)))))"#;
+
+    /// A P1 guest that writes 64 KiB to stdout over and over, stops at the
+    /// first write that fails, and returns — so what it managed to write is
+    /// its output.
+    const WRITES_UNTIL_REFUSED: &str = r#"(module
+        (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 2)
+        (func (export "_start")
+            ;; iovec at 0: buf = 16, len = 65536
+            (i32.store (i32.const 0) (i32.const 16))
+            (i32.store (i32.const 4) (i32.const 65536))
+            (block $done
+                (loop $again
+                    (br_if $done (i32.ne (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)) (i32.const 0)))
+                    (br $again)))))"#;
+
+    async fn run_p1(wat: &str, executor: &Executor, memory_mb: u32) -> ExecutionResult {
+        let bytes = wat::parse_str(wat).expect("the test module assembles");
+        let limits = ResourceLimits { max_instructions: 1_000_000_000, max_memory_mb: memory_mb, max_execution_seconds: 10 };
+        executor
+            .execute(&bytes, None, b"", &limits, None, Some("wasm32-wasip1"), &ResponseFormat::Bytes, None, None, None, None)
+            .await
+            .expect("the run answers with a result, not a transport error")
+    }
+
+    /// `max_memory_mb` bounds the guest's linear memory: growth stops at
+    /// exactly the bound, the refusal is the guest's to handle, and the run
+    /// reports every instruction it burned on the way.
+    #[tokio::test]
+    async fn a_guest_is_refused_memory_at_its_limit_and_billed_for_its_work() {
+        let executor = Executor::new(1_000_000_000, false).with_run_limits(16, 64, 1024 * 1024);
+        let result = run_p1(GROWS_UNTIL_REFUSED, &executor, 16).await;
+        assert!(result.success, "{:?}", result.error);
+        match result.output {
+            Some(ExecutionOutput::Bytes(bytes)) => assert_eq!(bytes, vec![16], "growth stopped at 16 MiB"),
+            other => panic!("expected one byte of output, got {other:?}"),
+        }
+        assert!(result.instructions > 8_000_000, "the burn is billed: {}", result.instructions);
+    }
+
+    /// Below the floor the request's figure is not what is enforced: a guest
+    /// that asked for 16 MB and grows to about 40 MiB (one page, then forty 1 MiB
+    /// grows) keeps running under a 64 MB floor.
+    #[tokio::test]
+    async fn the_floor_is_the_least_a_run_is_given() {
+        let grows_40 = r#"(module
+            (memory (export "memory") 1)
+            (func (export "_start")
+                (local $i i32)
+                (loop $again
+                    (if (i32.eq (memory.grow (i32.const 16)) (i32.const -1)) (then unreachable))
+                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                    (br_if $again (i32.lt_u (local.get $i) (i32.const 40))))))"#;
+        let executor = Executor::new(1_000_000_000, false).with_run_limits(64, 4096, 1024 * 1024);
+        let result = run_p1(grows_40, &executor, 16).await;
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    /// stdout holds exactly `max_output_bytes`, whatever memory the run has:
+    /// the guest gets four 64 KiB writes into 256 KiB and the fifth fails.
+    /// Under a capacity tied to `max_memory_mb` (16 MiB here) it would write
+    /// far past 256 KiB.
+    #[tokio::test]
+    async fn stdout_holds_exactly_the_output_capacity() {
+        let executor = Executor::new(1_000_000_000, false).with_run_limits(16, 64, 256 * 1024);
+        let result = run_p1(WRITES_UNTIL_REFUSED, &executor, 16).await;
+        assert!(result.success, "{:?}", result.error);
+        match result.output {
+            Some(ExecutionOutput::Bytes(bytes)) => assert_eq!(bytes.len(), 256 * 1024),
+            other => panic!("expected the bytes written, got {other:?}"),
+        }
+    }
 }
+

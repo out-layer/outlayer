@@ -192,6 +192,11 @@ COMPILE_CPU_LIMIT=2.0                 # default: 2.0
 DEFAULT_MAX_INSTRUCTIONS=10000000000  # default: 10 billion
 DEFAULT_MAX_MEMORY_MB=128             # default: 128 MB
 DEFAULT_MAX_EXECUTION_SECONDS=60      # default: 60 seconds
+
+# WASM Run Bounds
+WASM_MEMORY_FLOOR_MB=1024             # default: 1024 — the least linear memory a run is given, whatever max_memory_mb it asked; a growth past the bound is refused (memory.grow answers -1)
+WASM_MEMORY_CEILING_MB=4096           # default: 4096 — the most (wasm32's own bound)
+MAX_OUTPUT_BYTES=10485760             # default: 10 MiB — the stdout capacity; a write past it fails
 ```
 
 ## Usage

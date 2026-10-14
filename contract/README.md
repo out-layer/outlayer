@@ -77,11 +77,24 @@ attached to the call, so a call carrying megabytes needs more gas as well
 the guest's JSON for `Json`, a string for `Text`, base64 for `Bytes`, and
 `null` when the run failed or produced nothing.
 
+**Limits.** `get_max_limits` answers `max_instructions` (500 billion),
+`max_execution_seconds` (180) and the compile cap; `max_memory_mb` is capped
+at 4096 (wasm32's bound). A request above a cap is refused at the door.
+
+**What a run is charged.** A success pays `base_fee + instructions + time +
+compile`, capped at the compute deposit. A failed run pays the same formula on
+what the worker reports it used, capped the same way; a failure before the
+guest ran reports little or nothing and costs about the base fee. A run the
+chain's yield window (200 blocks) outlived pays the base fee. The storage part
+of a large input always comes back; the stablecoin comes back whole when the
+run fails or times out, and on a success goes to the developer less any change
+and the guest's own refund.
+
 #### `cancel_stale_execution`
 Cancel a request still pending after the timeout (10 minutes). Returns the
 whole of the stablecoin and the NEAR above the charge, the storage part of a
 large input always included. The charge is the base fee when no output was
-delivered — as on every other end without a result — and the compute estimate
+delivered — as a timed-out request pays — and the compute estimate
 for the limits when the worker has delivered the output through the 2-call
 flow and the callback never settled it: the run happened and its output is
 readable with `get_pending_output`.

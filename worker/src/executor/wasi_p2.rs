@@ -115,6 +115,9 @@ struct HostState {
     /// with the spawned per-request tasks; read back by the caller after the
     /// guest finishes and submitted to the audit.
     egress_log: Arc<Mutex<Vec<EgressRecord>>>,
+    /// The run's bounds (`sandbox::store_limits`), consulted by wasmtime on
+    /// every growth of a memory or a table.
+    limits: wasmtime::StoreLimits,
 }
 
 impl WasiView for HostState {
@@ -389,6 +392,7 @@ pub async fn execute(
     print_stderr: bool,
     exec_ctx: Option<&ExecutionContext>,
     keys: super::RunKeys,
+    max_output_bytes: usize,
 ) -> Result<(Vec<u8>, u64, Option<u64>)> {
     let super::RunKeys { signing: signing_keys, encryption: encryption_keys, tasks: tasks_run } = keys;
     // Use global P2 engine (avoids ~50-100ms overhead per execution)
@@ -653,10 +657,10 @@ pub async fn execute(
         None
     };
 
-    // Prepare stdin/stdout/stderr pipes
+    // Prepare stdin/stdout/stderr pipes. stdout has a fixed capacity and a
+    // write past it fails; memory is bounded separately, by the store's limits.
     let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
-    let stdout_pipe =
-        wasmtime_wasi::pipe::MemoryOutputPipe::new((limits.max_memory_mb as usize) * 1024 * 1024);
+    let stdout_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(max_output_bytes);
     let stderr_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024);
 
     // Build WASI context
@@ -730,10 +734,12 @@ pub async fn execute(
         engine_handle: engine,
         network_policy,
         egress_log,
+        limits: super::sandbox::store_limits(limits.max_memory_mb),
     };
 
-    // Create store with fuel limit + epoch deadline
+    // Create store with the run's bounds, the fuel limit and the epoch deadline
     let mut store = Store::new(&engine, host_state);
+    store.limiter(|s| &mut s.limits);
     store.set_fuel(limits.max_instructions)?;
     let timeout_secs = limits.max_execution_seconds.max(5);
     // Epoch interruption: engine ticks every second, deadline = timeout_secs ticks.

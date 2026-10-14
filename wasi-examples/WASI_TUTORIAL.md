@@ -83,7 +83,7 @@ NEAR OutLayer executes WASM modules off-chain using wasmtime runtime. Your code 
 - **Target**: `wasm32-wasip2`
 - **Format**: Component model with typed interfaces
 - **Use case**: HTTP requests, complex I/O, modern features
-- **Features**: HTTP client and the OutLayer host interfaces. No files and no raw sockets: keep a run's data in memory, which `max_memory_mb` bounds
+- **Features**: HTTP client and the OutLayer host interfaces. No files and no raw sockets: keep a run's data in memory, which `max_memory_mb` bounds (a run is given at least 1 GB whatever it asks and at most 4 GB; stdout holds up to 10 MiB)
 - **Size**: Larger binaries (~500KB-1MB)
 - **Example**: [ai-example](./ai-example/)
 

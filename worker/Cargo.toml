@@ -97,4 +97,5 @@ log = "0.4.28"
 tempfile = "3.10"  # secure temp dir for native compilation (0700 perms + random name)
 
 [dev-dependencies]
+wat = "1"  # the executor tests assemble their guest modules from text
 hmac = "0.12"  # reference HMAC-SHA256 the encryption keys' own is checked against
