@@ -130,6 +130,8 @@ projects we do not own cannot be rebuilt.
 * Before a worker deploy that touches `worker/wit/`, list the imports of the
   active versions (`wasm-tools component wit <file>`) and check every one
   still links.
+* The procedure (freeze, bump, bind both, test, SDK, rollout order):
+  [worker/wit/README.md](worker/wit/README.md).
 
 ## Live tests: a keyed RPC, always
 Every e2e/live run — the suites' own `curl`, near-cli, and the keystore under

@@ -70,7 +70,10 @@ compile_error!(
     "OutLayer SDK requires wasm32-wasip2 target (WASI Preview 2). You are compiling with wasm32-wasip1 which does not support OutLayer host functions."
 );
 
-// Generate bindings from WIT
+// Generate bindings from WIT. `wit/deps/*.wit` are copies of the worker's
+// `worker/wit/deps/`: copy, never hand-edit. A changed signature is a new
+// package version that the worker serves next to the old one, and the crate's
+// own version does not reach the binary. See worker/wit/README.md.
 wit_bindgen::generate!({
     world: "outlayer-host",
     path: "wit",

@@ -4,7 +4,8 @@
 //! A component carries the exact types of the interface it imports, so every
 //! version a deployed binary may import stays registered, each in its own
 //! shape: `@0.2.0` (`wit/deps/storage.wit`, the SDK's current one) and `@0.1.0`
-//! (`wit/storage-v0_1/storage.wit`, binaries built on SDK 0.1).
+//! (`wit/storage-v0_1/storage.wit`, binaries built on SDK 0.1). How to add a
+//! version: `wit/README.md`.
 
 use anyhow::Result;
 use tracing::debug;

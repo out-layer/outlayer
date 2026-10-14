@@ -297,9 +297,9 @@ if want D; then
   run "$OWNER" "$PD" "$W_B" "$(jq -nc --arg k "$TAG/enc" '{operation:"enc_set",key:$k,value_hex:"e0"}')";        ran_ok "D $OWNER enc_set" >/dev/null
   run "$CALLER2" "$PD" "$W_B" "$(jq -nc --arg k "$TAG/raw" '{operation:"raw_set",key:$k,value_hex:"c2"}')";     ran_ok "D $CALLER2 raw_set" >/dev/null
   run "$CALLER2" "$PD" "$W_B" "$(jq -nc --arg k "$TAG/enc" '{operation:"enc_set",key:$k,value_hex:"c2"}')";     ran_ok "D $CALLER2 enc_set" >/dev/null
-  before=$(sql "SELECT string_agg(account_id||':'||is_encrypted::text||'='||n, ',' ORDER BY account_id, is_encrypted) FROM (SELECT account_id, is_encrypted, count(*) n FROM storage_data WHERE project_uuid='$UD' GROUP BY 1,2) t")
+  before=$(sql "SELECT string_agg(account_id||':'||is_encrypted::text||'='||n, ',' ORDER BY account_id <> '$OWNER', is_encrypted) FROM (SELECT account_id, is_encrypted, count(*) n FROM storage_data WHERE project_uuid='$UD' GROUP BY 1,2) t")
   # $OWNER: raw + sealed + SDK sealed (3 raw rows), enc (1); $CALLER2: raw (1), enc (1).
-  [[ "$before" == "$CALLER2:false=1,$CALLER2:true=1,$OWNER:false=3,$OWNER:true=1" ]] \
+  [[ "$before" == "$OWNER:false=3,$OWNER:true=1,$CALLER2:false=1,$CALLER2:true=1" ]] \
     && pass "D storage_data before the delete: $before" || fail "D storage_data before the delete: '$before'"
   out=$(call "$OWNER" delete_project "$(jq -nc --arg n "$NAME_D" '{project_name:$n}')" '0 NEAR')
   if succeeded "$out"; then
