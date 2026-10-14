@@ -202,19 +202,21 @@ msg_of()   { jq -r '.message // .error // ""' <<<"${1:-$BODY}" 2>/dev/null | hea
 # ── assertions ───────────────────────────────────────────────────────────────
 
 # Has the wallet under test run out of allowance rather than been refused by a
-# rule? The monthly custody cap and a spent trial are LIMITS, and a suite that
+# rule? The daily custody cap and a spent trial are LIMITS, and a suite that
 # reports one as a policy failure sends the reader to fix the wrong thing — the
 # mistake the admin runbook calls out by name.
 exhausted() {
   # A spent trial is spelled once, in `trial_spent`; the rest are the
-  # allowances this helper knows about.
+  # allowances this helper knows about. The custody cap is a typed refusal
+  # (429 `operation_limit_reached`); its sentence is matched too, for the
+  # places that quote it inside another body.
   trial_spent "$BODY" && return 0
-  grep -qiE "limit reached: [0-9]+ per (month|day) for custody|already has its trial key" <<<"$BODY"
+  grep -qiE '"error":"operation_limit_reached"|limit reached: [0-9]+ per day for custody|already has its trial key' <<<"$BODY"
 }
 
 # assert_status <desc> <expected-http>
 assert_status() {
-  if exhausted; then skip "$1 — the wallet has spent its monthly custody allowance; the rule was never reached"; return 0; fi
+  if exhausted; then skip "$1 — the wallet has spent its daily custody allowance; the rule was never reached"; return 0; fi
   local desc=$1 want=$2
   if [[ "$HTTP" == "$want" ]]; then pass "$desc (HTTP $HTTP)"; return 0; fi
   fail "$desc — expected HTTP $want, got $HTTP: $(msg_of)"; return 1
@@ -223,7 +225,7 @@ assert_status() {
 # assert_denied <desc> [error-code] — any 4xx refusal, optionally with the
 # coordinator's own error code.
 assert_denied() {
-  if exhausted; then skip "$1 — the wallet has spent its monthly custody allowance; the rule was never reached"; return 0; fi
+  if exhausted; then skip "$1 — the wallet has spent its daily custody allowance; the rule was never reached"; return 0; fi
   local desc=$1 want_err=${2:-}
   if [[ ! "$HTTP" =~ ^4 ]]; then
     fail "$desc — expected a refusal, got HTTP $HTTP: $(msg_of)"; return 1
@@ -237,7 +239,7 @@ assert_denied() {
 # assert_class <desc> <class> — an agent_connect_denied carrying exactly this
 # class (`rule` or `rule:subcode`).
 assert_class() {
-  if exhausted; then skip "$1 — the wallet has spent its monthly custody allowance; the rule was never reached"; return 0; fi
+  if exhausted; then skip "$1 — the wallet has spent its daily custody allowance; the rule was never reached"; return 0; fi
   local desc=$1 want=$2 got
   got=$(class_of)
   if [[ "$HTTP" == "403" && "$got" == "$want" ]]; then
@@ -253,17 +255,17 @@ assert_class() {
 # The quota guard is needed HERE too, and not only in the status assertions
 # above: these two are chained after them — `assert_denied … && assert_msg …` —
 # and a skip returns 0, so the chain runs on. Without this, an exhausted wallet
-# skipped the status and then FAILED on the sentence, reporting a monthly cap as
+# skipped the status and then FAILED on the sentence, reporting a daily cap as
 # a missing diagnostic.
 assert_msg() {
-  if exhausted; then skip "$1 — the wallet has spent its monthly custody allowance; the rule was never reached"; return 0; fi
+  if exhausted; then skip "$1 — the wallet has spent its daily custody allowance; the rule was never reached"; return 0; fi
   local desc=$1 pat=$2
   if grep -qiE "$pat" <<<"$BODY"; then pass "$desc — message names /$pat/"; return 0; fi
   fail "$desc — message does not name /$pat/: $(msg_of | head -c 200)"; return 1
 }
 
 assert_json() {
-  if exhausted; then skip "$1 — the wallet has spent its monthly custody allowance; the rule was never reached"; return 0; fi
+  if exhausted; then skip "$1 — the wallet has spent its daily custody allowance; the rule was never reached"; return 0; fi
   local desc=$1 expr=$2 want=$3 got
   got=$(jq -r "$expr // \"\"" <<<"$BODY" 2>/dev/null)
   if [[ "$got" == "$want" ]]; then pass "$desc ($expr = $got)"; return 0; fi
@@ -464,7 +466,7 @@ wallet_address() {
 # pinned no-sign contract with this wallet's executor in its extension set, and
 # wait for the binding to go ACTIVE. Sets SEED / WALLET_ID / EXECUTOR / ASSET.
 #
-# Exists because the monthly custody cap is per WALLET (100 operations) and the
+# Exists because the daily custody cap is per WALLET (100 operations) and the
 # heavier suites spend most of one on their own. Sharing a fixture across all of
 # them made whichever ran last fail on the cap — which reads exactly like a
 # policy defect and is not one.
@@ -488,7 +490,7 @@ new_bound_wallet() {
     sleep 3
   done
   [[ "$status" == "active" ]] || { warn "$tag: the binding never went active ('$status')"; return 1; }
-  pass "$tag: a fresh bound wallet, with its full monthly custody allowance"
+  pass "$tag: a fresh bound wallet, with its full daily custody allowance"
 }
 
 # buy_payment_key <wk_key> <wallet-near-address> — a payment key for a wallet

@@ -124,7 +124,16 @@ expect_would_fail() {
     dry_run "$body"
     assert_status "200" "$RESP_CODE" "$name — dry-run answers"
     assert_equals "false" "$WOULD_SUCCEED" "$name — would_succeed"
-    assert_equals "$expected_reason" "$REASON" "$name — reason"
+    # `expected_reason` may name alternatives (`a|b`): 1Click words a refusal
+    # as it sees fit, and each wording has its own code.
+    TOTAL=$((TOTAL + 1))
+    if [[ "$REASON" =~ ^($expected_reason)$ ]]; then
+        echo -e "  ${GREEN}PASS${NC} $name — reason ($REASON)"
+        PASSED=$((PASSED + 1))
+    else
+        echo -e "  ${RED}FAIL${NC} $name — reason (expected '$expected_reason', got '$REASON')"
+        FAILED=$((FAILED + 1))
+    fi
     [ -n "$MESSAGE" ] && echo "       ↳ $MESSAGE"
 
     if [ "$SKIP_PARITY" = "1" ]; then
@@ -221,7 +230,10 @@ echo ""
 # ============================================================================
 
 echo "5. Cross-chain USDC → ethereum, amount the bridge refuses"
-expect_would_fail "bridge rejected" "bridge_rejected" \
+# 1Click answers a zero amount in its own words — "Amount is too low for
+# bridge" (upstream_rejected) or "No liquidity available" (no_liquidity) —
+# and the dry-run's reason is the code the real withdraw answers with.
+expect_would_fail "bridge refused" "upstream_rejected|no_liquidity" \
     "$(printf '{"chain":"ethereum","token":"%s","amount":"0","to":"%s"}' "$USDC_NEAR" "$ETH_RECIPIENT")"
 echo ""
 

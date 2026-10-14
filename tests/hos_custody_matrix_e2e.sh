@@ -28,7 +28,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 [[ "${1:-}" == "--apply" ]] || { sed -n '3,25p' "$0" >&2; echo "  Pass --apply to run." >&2; exit 0; }
 hos_require
 # Its OWN bound wallet, not the shared fixture. This suite spends most of a
-# wallet's monthly custody allowance (100 operations) on its own, so sharing one
+# wallet's daily custody allowance (100 operations) on its own, so sharing one
 # made whichever suite ran after it fail on the cap — a limit that reads exactly
 # like a policy defect.
 new_bound_wallet custody || { echo "✗ could not build this suite's bound wallet" >&2; exit 1; }

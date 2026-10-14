@@ -45,7 +45,7 @@ SUITES=(
 )
 ONLY="${ONLY:-}"
 
-# A FRESH shared fixture every full run. A wallet carries a monthly custody
+# A FRESH shared fixture every full run. A wallet carries a daily custody
 # allowance of 100 operations, and a re-used fixture arrives with an unknown
 # share of it already spent — after which suites fail on the cap and the failure
 # reads as a policy defect. The suites that spend most of an allowance on their

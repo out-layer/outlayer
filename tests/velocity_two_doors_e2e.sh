@@ -32,7 +32,7 @@
 # Money: three transfers of 0.001 NEAR to $RECIPIENT, plus gas, plus 0.1 NEAR
 # per policy store (three stores) and ~1 NEAR + 1.5 USDC funding a wallet of
 # this run's own. A disposable wallet is deliberate: velocity probes eat the
-# monthly custody allowance, and a shared wallet's is somebody else's.
+# daily custody allowance, and a shared wallet's is somebody else's.
 #
 # Requires $PSQL_CMD. The counters are exposed by no endpoint, and a probe that
 # judged them by whether a later call was refused would pass on a coordinator

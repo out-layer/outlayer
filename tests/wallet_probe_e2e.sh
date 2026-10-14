@@ -135,7 +135,7 @@ log "Building customer-recovery (sign-bearer-near)"
 #
 # W6 holds the wallet busy by firing transfers at it continuously, and a run
 # does dozens. Spent against a wallet somebody else uses, that eats their
-# limits: a shared wallet's MONTHLY custody allowance (100 operations) goes in
+# limits: a shared wallet's DAILY custody allowance (100 operations) goes in
 # one evening of this suite, which then blocks
 # unrelated work. A disposable wallet costs a little testnet NEAR and keeps the
 # damage inside the run.

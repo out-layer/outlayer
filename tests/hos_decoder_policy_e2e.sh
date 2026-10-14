@@ -29,7 +29,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 hos_require
 # Its OWN bound wallet. This suite fires forty-odd envelopes at the door, and
 # although almost all of them are refused before anything is signed, enough
-# reach the chain to eat a visible share of a wallet's monthly custody
+# reach the chain to eat a visible share of a wallet's daily custody
 # allowance — which then failed the next suite on a LIMIT, not a rule.
 new_bound_wallet decoder || { echo "✗ could not build this suite's bound wallet" >&2; exit 1; }
 CLEAN_ASSET="$ASSET"
