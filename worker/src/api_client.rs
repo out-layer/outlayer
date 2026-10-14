@@ -1114,20 +1114,34 @@ impl ApiClient {
             call_id, success, instructions, time_ms
         );
 
-        let response = self.add_auth_headers(self.client.post(&url))
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send complete HTTPS call request")?;
-
-        if !response.status().is_success() {
+        // A connection that failed or a 5xx is repeated with the event relays'
+        // pauses, as for a job: without it the output is lost and the stale
+        // sweeper later bills the call as a timeout. A repeat is safe: the
+        // coordinator settles a call only while it is still open and answers a
+        // second completion with `finalized: false`. A 4xx is not repeated.
+        let body = serde_json::to_value(&request).context("Failed to serialize complete HTTPS call request")?;
+        retry_relay("complete HTTPS call", &RELAY_RETRY_DELAYS, || async {
+            let response = self.add_auth_headers(self.client.post(&url))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to send complete HTTPS call request")?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
+            }
             let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!("❌ Complete HTTPS call failed: {}", error_text);
-            anyhow::bail!("Complete HTTPS call failed: {}", error_text)
-        }
+            tracing::error!("❌ Complete HTTPS call failed: HTTP {} {}", status, error_text);
+            let message = format!("Complete HTTPS call failed: {}", error_text);
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(TerminalRelay).context(message));
+            }
+            Err(anyhow::anyhow!(message))
+        })
+        .await?;
 
         tracing::info!("✅ HTTPS call {} completed successfully", call_id);
         Ok(())
@@ -1804,14 +1818,14 @@ impl ApiClient {
             .await
             .context("Failed to notify coordinator of topup completion")?;
 
-        if !response.status().is_success() {
+        // The coordinator ADDS `amount` to the key's balance here, so a refusal
+        // means the customer paid on chain and was not credited. It is an
+        // error, not repeated: the credit is additive, and a repeat of one that
+        // did land would credit twice.
+        let status = response.status();
+        if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            tracing::warn!(
-                "Failed to update balance cache (non-critical): {}",
-                error_text
-            );
-            // Non-critical error - TopUp still succeeded on contract
-            return Ok(());
+            anyhow::bail!("Coordinator refused the top-up credit: HTTP {} {}", status, error_text);
         }
 
         tracing::info!("Balance cache updated successfully");

@@ -18,6 +18,7 @@ mod outlayer_vrf;
 mod outlayer_wallet;
 mod signing_keys;
 mod encryption_keys;
+mod shutdown;
 mod tasks;
 mod tdx_attestation;
 mod wasm_cache;
@@ -74,6 +75,10 @@ async fn main() -> Result<()> {
         .init();
 
     info!("OffchainVM Worker starting...");
+
+    // A stop asked for during startup is honoured by the loops below: they
+    // see the flag before their first poll and exit with nothing to finish.
+    let shutdown = shutdown::install()?;
 
     // Scratch directories of runs a stopped worker never finished: their
     // drop did not run, and what a guest wrote there is nobody's now.
@@ -575,25 +580,31 @@ async fn main() -> Result<()> {
     // This handles contract business logic that requires yield/resume (TopUp, Delete, etc.)
     // Separated from main worker loop to avoid blocking WASM execution tasks
     // Only workers with "execution" capability should poll system callbacks
-    if config.capabilities.to_array().contains(&"execution".to_string()) {
+    let callbacks_handler = if config.capabilities.to_array().contains(&"execution".to_string()) {
         let callbacks_api_client = api_client.clone();
         let callbacks_keystore_client = keystore_client.clone();
         let callbacks_near_client = near_client.clone();
         let callbacks_capabilities = config.capabilities.to_array();
+        let callbacks_poll_timeout = config.poll_timeout_seconds;
+        let callbacks_shutdown = shutdown.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             run_contract_system_callbacks_handler(
                 callbacks_api_client,
                 callbacks_keystore_client,
                 callbacks_near_client,
                 callbacks_capabilities,
+                callbacks_poll_timeout,
+                callbacks_shutdown,
             )
             .await;
         });
         info!("📋 Contract System Callbacks Handler started");
+        Some(handle)
     } else {
         info!("📋 Contract System Callbacks Handler skipped (no 'execution' capability)");
-    }
+        None
+    };
 
     // Main worker loop
     info!("Starting worker loop...");
@@ -602,6 +613,11 @@ async fn main() -> Result<()> {
         iteration_timeout.as_secs(), config.poll_timeout_seconds, config.max_execution_seconds_cap,
         NearClient::CALL_BUDGET.as_secs(), config.iteration_overhead_seconds);
     loop {
+        // Checked before the poll, never during it: an iteration that started
+        // runs to its end, and the task its poll returns is finished.
+        if shutdown.requested() {
+            break;
+        }
         match tokio::time::timeout(
             iteration_timeout,
             worker_iteration(
@@ -643,6 +659,15 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // The system callbacks loop finishes its own task, if it holds one.
+    if let Some(handle) = callbacks_handler {
+        if let Err(e) = handle.await {
+            error!("Contract System Callbacks Handler ended abnormally: {}", e);
+        }
+    }
+    info!("🛑 Drained: no task in hand, exiting");
+    Ok(())
 }
 
 /// The hard timeout of one worker iteration: the long poll, the execution
@@ -3698,14 +3723,25 @@ async fn run_contract_system_callbacks_handler(
     keystore_client: Option<KeystoreClient>,
     near_client: NearClient,
     capabilities: Vec<String>,
+    poll_timeout_seconds: u64,
+    shutdown: shutdown::Shutdown,
 ) {
     use api_client::SystemCallbackTask;
 
-    info!("📋 Contract System Callbacks Handler loop started (unified queue, 60s timeout)");
+    info!(
+        "📋 Contract System Callbacks Handler loop started (unified queue, {}s timeout)",
+        poll_timeout_seconds
+    );
 
     loop {
-        // Poll unified queue for any system callback task (blocking, 60s timeout like execution queue)
-        match api_client.poll_system_callback_task(60, &capabilities).await {
+        // Checked before the poll only, as in the main loop.
+        if shutdown.requested() {
+            info!("📋 Contract System Callbacks Handler stopped: no task in hand");
+            return;
+        }
+        // Poll unified queue for any system callback task, blocking as long as the
+        // execution queue's poll: a soft stop waits at most one of these.
+        match api_client.poll_system_callback_task(poll_timeout_seconds, &capabilities).await {
             Ok(Some(task)) => {
                 match task {
                     // =================================================================
@@ -3897,7 +3933,7 @@ async fn run_contract_system_callbacks_handler(
                 }
             }
             Ok(None) => {
-                // Timeout - blocking BRPOP already waited 60s, continue immediately
+                // Timeout - the blocking BRPOP already waited, continue immediately
             }
             Err(e) => {
                 error!("❌ Failed to poll system callback task: {}", e);

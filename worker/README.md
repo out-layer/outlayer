@@ -130,6 +130,13 @@ Orchestrates all components:
 3. If execute task: download WASM, execute, submit result to NEAR
 4. Repeat
 
+### Stopping
+SIGTERM or SIGINT (Ctrl-C) is a soft stop: the main loop and the system-callbacks loop poll
+for nothing more, the task in hand runs to its end, and the worker exits 0. A poll already in
+flight is not cancelled — the task it returns is finished too. In a dstack CVM the signal comes
+from a non-forced `vmm stop` (`worker-ctl.sh stop`); the compose gives the worker 85 s before
+the guest kills it.
+
 ## Setup
 
 ### Prerequisites
