@@ -75,7 +75,7 @@ wit_bindgen::generate!({
     world: "outlayer-host",
     path: "wit",
     with: {
-        "near:storage/api@0.1.0": generate,
+        "near:storage/api@0.2.0": generate,
         "near:vrf/api@0.1.0": generate,
     },
 });

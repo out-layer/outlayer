@@ -110,6 +110,27 @@ anyhow::bail!("Feature X is not supported. Please use Y instead.");
   `/wallet/v1/*` anyway, so a closed default protects nothing (decided by
   Vadim, 2026-10-04).
 
+## WIT interfaces are an ABI: a published version never changes
+A deployed component carries the name, version and exact types of every host
+interface it imports (`near:storage/api@0.1.0`), never the SDK crate's version.
+The worker's linker matches the name and version, then compares the types: a
+function whose signature changed under the same version fails EVERY binary
+built against the old one with `Failed to instantiate component`, and
+projects we do not own cannot be rebuilt.
+
+* Under a published `package near:<name>@X.Y.Z`, nothing is removed and no
+  signature or record changes. Adding a new function is the only edit.
+* A changed signature is a new package version (`@0.2.0`); the worker keeps
+  registering every version a deployed binary may import, each with its own
+  shape.
+* Bumping the SDK crate is not versioning: the crate version never reaches the
+  binary.
+* The worker carrying a new interface version deploys on both networks before
+  any guest built against it is published.
+* Before a worker deploy that touches `worker/wit/`, list the imports of the
+  active versions (`wasm-tools component wit <file>`) and check every one
+  still links.
+
 ## Live tests: a keyed RPC, always
 Every e2e/live run — the suites' own `curl`, near-cli, and the keystore under
 test — goes through a FastNEAR RPC **with an API key**. The unkeyed testnet

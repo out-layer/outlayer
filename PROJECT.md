@@ -549,7 +549,7 @@ The `outlayer` crate on crates.io provides high-level APIs for WASM components. 
 |--------|-------------|
 | `outlayer::storage` | Persistent encrypted storage across executions |
 | `outlayer::env` | Execution context — input, output, signer |
-| `outlayer::raw` | Low-level WIT bindings (`near:storage/api@0.1.0`, `near:rpc/api`) |
+| `outlayer::raw` | Low-level WIT bindings (`near:storage/api@0.2.0`, `near:rpc/api`) |
 
 ### Example
 

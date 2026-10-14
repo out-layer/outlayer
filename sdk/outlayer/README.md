@@ -12,6 +12,8 @@ Rust SDK for building WASM applications on [OutLayer](https://app.outlayer.ai) -
 outlayer = "0.2"
 ```
 
+Use 0.2.1 or later: a build on 0.2.0 imports a storage interface no worker serves.
+
 Signing keys, encryption keys (with sealed storage) and tasks are opt-in features:
 
 ```toml

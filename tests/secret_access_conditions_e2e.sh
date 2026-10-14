@@ -113,13 +113,18 @@ account_is_on_chain() {
 
 make_account() { # make_account <name> <parent> <amount>
   if account_is_on_chain "$1"; then note "$1 is already there"; return 0; fi
-  local signer=with-keychain
+  local signer=with-keychain attempt
   [[ "$2" != "$PARENT" ]] && signer=with-legacy-keychain
-  near --quiet account create-account fund-myself "$1" "$3" \
-    autogenerate-new-keypair save-to-legacy-keychain \
-    sign-as "$2" network-config "$NETWORK" "sign-$signer" send >/dev/null 2>&1
-  account_is_on_chain "$1" || { echo "✗ could not create $1" >&2; exit 1; }
-  note "created $1 with $3"
+  # Two attempts: a parent made a moment ago by the line above may not yet
+  # sign (its key and nonce are read from a node that has not caught up).
+  for attempt in 1 2; do
+    near --quiet account create-account fund-myself "$1" "$3" \
+      autogenerate-new-keypair save-to-legacy-keychain \
+      sign-as "$2" network-config "$NETWORK" "sign-$signer" send >/dev/null 2>&1
+    account_is_on_chain "$1" && { note "created $1 with $3"; return 0; }
+    [[ $attempt -eq 1 ]] && sleep 6
+  done
+  echo "✗ could not create $1 (signed by $2)" >&2; exit 1
 }
 
 log "Fixture: the project, the callers, the secret"
@@ -197,7 +202,16 @@ run_as() { # run_as <signer> <profile>
     prepaid-gas '300.0 Tgas' attached-deposit "$DEPOSIT" \
     sign-as "$signer" network-config "$NETWORK" "sign-$signer_flag" send 2>&1)
   # The completion event, which is the only place the chain states an outcome.
+  # No event means the transaction never ran — near-cli refused to send it (a
+  # balance short of the deposit, a key it could not find) — and that is a
+  # fixture fault, never a verdict on the gate: RUN_OK says `unsent`, and the
+  # caller's "was refused" and "ran" checks both fail on it, honestly.
   ev=$(grep -o 'EVENT_JSON:.*execution_completed.*' <<<"$out" | sed 's/^EVENT_JSON://' | head -1)
+  if [[ -z "$ev" ]]; then
+    RUN_OK=unsent; RUN_ERR=""; RUN_SECRET=""
+    fail "run_as $signer: the transaction was not sent — $(grep -oE '[Ee]rror:.*|does not have enough balance.*|not found.*' <<<"$out" | head -1 | head -c 160)"
+    return 0
+  fi
   # NOT `.success // empty`: jq's `//` treats FALSE exactly like null, so every
   # refusal — the outcome this suite is about — would read as "the event said
   # nothing" and each assertion below would fail with the wrong sentence.
@@ -230,7 +244,7 @@ log "A2 a character BEFORE the pattern"
 run_as "$PREFIX_TRAP" patternprobe
 [[ "$RUN_OK" == "false" ]] \
   && pass "A2 $PREFIX_TRAP was refused — the pattern is anchored at the start" \
-  || fail "A2 $PREFIX_TRAP RAN: an unanchored pattern is handing this account another's secrets"
+  || fail "A2 $PREFIX_TRAP was not refused (outcome: $RUN_OK) — an unanchored pattern would hand this account another's secrets"
 [[ -z "$RUN_SECRET" ]] \
   && pass "A2 and it saw no secret at all" \
   || fail "A2 the refused caller still read '$RUN_SECRET'"
@@ -239,7 +253,7 @@ log "A3 a label BEFORE the pattern"
 run_as "$SUFFIX_TRAP" patternprobe
 [[ "$RUN_OK" == "false" ]] \
   && pass "A3 $SUFFIX_TRAP was refused — a sub-account does not inherit its parent's gate" \
-  || fail "A3 $SUFFIX_TRAP RAN: the pattern matched a substring of a longer account"
+  || fail "A3 $SUFFIX_TRAP was not refused (outcome: $RUN_OK) — a pattern must not match a substring of a longer account"
 [[ -z "$RUN_SECRET" ]] \
   && pass "A3 and it saw no secret at all" \
   || fail "A3 the refused caller still read '$RUN_SECRET'"

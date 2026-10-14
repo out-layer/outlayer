@@ -2,7 +2,7 @@
 
 Test WASM for OutLayer persistent storage host functions.
 
-This WASI Preview 2 component demonstrates and tests the `near:storage@0.1.0` host functions provided by the OutLayer worker for encrypted persistent storage.
+This WASI Preview 2 component demonstrates and tests the `near:storage@0.2.0` host functions provided by the OutLayer worker for encrypted persistent storage.
 
 `relay-contract/` beside it is a testnet NEAR contract that makes a call reach OutLayer through a contract — see [Relay contract](#relay-contract-relay-contract).
 
@@ -204,7 +204,7 @@ Response:
 
 ## Storage API (WIT)
 
-The functions of `near:storage@0.1.0` (`worker/wit/deps/storage.wit`) this example calls:
+The functions of `near:storage@0.2.0` (`worker/wit/deps/storage.wit`) this example calls:
 
 ```wit
 interface api {

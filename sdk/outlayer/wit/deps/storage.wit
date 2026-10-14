@@ -1,4 +1,4 @@
-package near:storage@0.1.0;
+package near:storage@0.2.0;
 
 /// Persistent storage API for OutLayer projects
 ///
