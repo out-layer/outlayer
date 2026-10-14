@@ -206,6 +206,21 @@ else
   fail "no approval_id: $T_RESP"
 fi
 
+# ─── 4.1 The wallet's own key lists what waits on it ─────────────
+# The same wk_ that was told "pending_approval" asks for the list; the approval
+# it was just given must be in it, with the counts the detail page shows.
+log "4.1 GET /wallet/v1/pending_approvals with the same wk_ lists it"
+LIST_RESP=$(curl -sS -w '\nHTTP:%{http_code}' "$COORDINATOR_URL/wallet/v1/pending_approvals" \
+  -H "Authorization: Bearer $WK_API_KEY")
+LIST_CODE=$(echo "$LIST_RESP" | tail -n1 | sed 's/HTTP://')
+LIST_BODY=$(echo "$LIST_RESP" | sed '$d')
+LISTED=$(echo "$LIST_BODY" | jq -r --arg id "$APPROVAL_ID" '[.approvals[]? | select(.approval_id == $id)] | length' 2>/dev/null || echo 0)
+if [[ "$LIST_CODE" == "200" && "$LISTED" == "1" ]]; then
+  pass "the wallet key lists its pending approval ($(echo "$LIST_BODY" | jq -c --arg id "$APPROVAL_ID" '.approvals[] | select(.approval_id == $id) | {required, approved, type}'))"
+else
+  fail "GET /pending_approvals HTTP $LIST_CODE did not list $APPROVAL_ID: $(echo "$LIST_BODY" | head -c 400)"
+fi
+
 # ─── 5. Approver signs NEP-413 → /approve ────────────────────────
 
 DETAILS=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$APPROVAL_ID")

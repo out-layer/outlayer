@@ -466,10 +466,11 @@ and no list, and the session of a device that a later sign-in retired is 401
 `session_replaced`; a store or a chain that did not answer is 503
 `upstream_unavailable` with `Retry-After`. A refusal is never an empty list.
 
-What waits for approval on a wallet is listed inside the same session, to the
-owner of the wallet's policy only
-(`GET /wallet/v1/pending_approvals_by_pubkey`). One approval is told by its id
-to whoever holds it (`GET /wallet/v1/approval/{id}`).
+What waits for approval on a wallet is listed two ways: to the wallet's own
+key (`GET /wallet/v1/pending_approvals`, `Authorization: Bearer wk_…`, its own
+wallet only), and inside an owner's session to the owner of the wallet's
+policy (`GET /wallet/v1/pending_approvals_by_pubkey`). One approval is told by
+its id to whoever holds it (`GET /wallet/v1/approval/{id}`).
 
 ### Events
 
