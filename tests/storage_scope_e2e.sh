@@ -30,7 +30,7 @@
 # command taking one SELECT on the coordinator DB) — V and D read storage_data;
 # the `outlayer` CLI logged in on testnet (pays the FastFS uploads); near,
 # outlayer, jq, curl, shasum, cargo + wasm-tools (the build). The RPC is keyed
-# through tests/lib/rpc.sh. COORD_SSH (default root@138.201.58.122) and
+# through tests/lib/rpc.sh. COORD_SSH (from .env.nodes) and
 # COORD_CONTAINER (default offchainvm-coordinator-testnet): the coordinator log
 # V reads; unreadable → that half SKIPS, loudly.
 #
@@ -57,7 +57,7 @@ CALLER2="${CALLER2:-}"
 DEPOSIT="${DEPOSIT:-0.1 NEAR}"
 NAME_A="${NAME_A:-storage-scope-a}"
 NAME_B="${NAME_B:-storage-scope-b}"
-COORD_SSH="${COORD_SSH:-root@138.201.58.122}"
+COORD_SSH="${COORD_SSH:-}"
 COORD_CONTAINER="${COORD_CONTAINER:-offchainvm-coordinator-testnet}"
 PROBE_DIR="$REPO_ROOT/wasi-examples/signing-key-probe"
 VARIANTS="$PROBE_DIR/target/variants"

@@ -39,8 +39,8 @@
 # curl on stdin (`-H @-`). Never printed.
 #
 # Needs: OWNER (default outlayer-bob.testnet) with its key in the legacy
-# keychain; REDIS_CMD (redis-cli args, testnet) for CV2/CV8; COORD_SSH for the
-# coordinator log (read-only). The RPC is keyed through tests/lib/rpc.sh.
+# keychain; REDIS_CMD (redis-cli args, testnet) for CV2/CV8; COORD_SSH (from
+# .env.nodes) for the coordinator log (read-only). The RPC is keyed through tests/lib/rpc.sh.
 #
 # Run:
 #   REDIS_CMD=… ./tests/cleanup_verification_e2e.sh            # dry run
@@ -57,7 +57,7 @@ APPLY=false
 OWNER="${OWNER:-outlayer-bob.testnet}"
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/scripts/.env}"
 REDIS_CMD="${REDIS_CMD:-}"
-COORD_SSH="${COORD_SSH:-root@138.201.58.122}"
+COORD_SSH="${COORD_SSH:-}"
 COORD_CONTAINER="${COORD_CONTAINER:-offchainvm-coordinator-testnet}"
 RUN_START=$(date +%s)
 TAG="$RUN_START"

@@ -20,6 +20,10 @@ CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 COORDINATOR_URL="${COORDINATOR_URL:-https://testnet-api.outlayer.ai}"
 # The RPC every probe here reads through — keyed, or a warning (lib/rpc.sh).
 source "$HOS_LIB_DIR/rpc.sh"
+# Where an operator's suite reaches our hosts over ssh — COORD_SSH (root@<coordinator>),
+# DAL_HOST and AMS_HOST (the TDX nodes) — lives in the gitignored .env.nodes at the
+# repo root, never in a tracked file. A suite that needs one it lacks says so.
+[[ -f "$REPO_ROOT/.env.nodes" ]] && { set -a; source "$REPO_ROOT/.env.nodes"; set +a; }
 PARENT="${PARENT:-}"
 export OUTLAYER_NETWORK="$NETWORK"
 

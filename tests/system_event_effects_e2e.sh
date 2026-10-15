@@ -46,7 +46,8 @@
 #
 # Needs: both owners' keys in the legacy keychain; PSQL_CMD (the testnet
 # coordinator DB, one statement); COORD_SSH for the coordinator log and
-# WORKER_SSH + WORKER_CVM for the TEE worker's log (both read-only).
+# WORKER_SSH (default root@$DAL_HOST) + WORKER_CVM for the TEE worker's log (both
+# read-only); the hosts come from .env.nodes.
 #
 # Run:
 #   PSQL_CMD=… ./tests/system_event_effects_e2e.sh            # dry run
@@ -67,9 +68,10 @@ TOPUP="${TOPUP:-50000}"                   # $0.05 in the token's 6 decimals
 FUND="${FUND:-0.05}"
 SEND_YOCTO="1000000000000000000000"       # 0.001 NEAR
 ONLY="${ONLY:-}"
-COORD_SSH="${COORD_SSH:-root@138.201.58.122}"
+COORD_SSH="${COORD_SSH:?COORD_SSH unset — put it in .env.nodes at the repo root}"
 COORD_CONTAINER="${COORD_CONTAINER:-offchainvm-coordinator-testnet}"
-WORKER_SSH="${WORKER_SSH:-root@173.237.9.76}"
+WORKER_SSH="${WORKER_SSH:-${DAL_HOST:+root@$DAL_HOST}}"
+: "${WORKER_SSH:?WORKER_SSH unset — put DAL_HOST in .env.nodes at the repo root}"
 WORKER_CVM="${WORKER_CVM:-testnet-worker-0178-1}"
 RUN_START=$(date +%s)
 TAG="$RUN_START"

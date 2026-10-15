@@ -7,6 +7,8 @@
 !.env.keystore-phala.example
 
 **/.env.*
+*.env
+!*.env.template
 
 # Rust
 target/
