@@ -93,7 +93,9 @@ The base64url payload is a JSON object:
 ## Auth middleware flow
 
 ```
-1. Try X-Internal-Wallet-Auth (trusted worker, no DB query)
+1. Try X-Internal-Wallet-Auth + X-Wallet-Id: an active worker token, from a
+   worker address (WORKER_ALLOWED_IPS), with the worker's active TEE session
+   (X-TEE-Session) when REQUIRE_TEE_SESSION=true
 2. Try Bearer near:... → NEAR signature auth:
    a. base64url-decode → parse JSON
    b. Verify timestamp ±30 sec (MAX_TIMESTAMP_SKEW = 30)

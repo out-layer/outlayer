@@ -162,16 +162,20 @@ else
   else fail "vault-scoped /secrets/pubkey" "got $code after ${elapsed}s: $(body | head -c 200)"; fi
 fi
 
-# 6. The branch-count guard. Only reachable with a worker token (the route is worker-protected),
-#    and it is the one check that needs a repository with more than 5 branches.
+# 6. The branch-count guard. Only reachable with a worker token from a worker host (the route
+#    is worker-protected and answers WORKER_ALLOWED_IPS only), and it is the one check that
+#    needs a repository with more than 5 branches. Part of the build path, which is off unless
+#    the coordinator has BUILDS_ENABLED.
 if [ -z "$API_URL" ] || [ -z "$COORDINATOR_TOKEN" ] || [ -z "$BIG_REPO" ] || [ -z "$BIG_REPO_COMMIT" ]; then
   skip "branch-count guard returns 422" "needs SMOKE_COORDINATOR_TOKEN_$UP + SMOKE_BIG_REPO_$UP + SMOKE_BIG_REPO_COMMIT_$UP (repo with >5 branches)"
 else
-  code="$(req -H "Authorization: Bearer $COORDINATOR_TOKEN" \
+  code="$(printf 'Authorization: Bearer %s\n' "$COORDINATOR_TOKEN" | req -H @- \
         --get --data-urlencode "repo=$BIG_REPO" --data-urlencode "commit=$BIG_REPO_COMMIT" \
         "$API_URL/github/resolve-branch")"
   if [ "$code" = "422" ] && body | grep -q "branches (limit"; then
     pass "branch-count guard returns 422 with an actionable message"
+  elif [ "$code" = "403" ]; then
+    skip "branch-count guard" "the coordinator answers worker routes only from worker hosts (WORKER_ALLOWED_IPS); run this from one"
   elif [ "$code" = "200" ]; then
     # NOT a failure: the fast path (`branches-where-head`, a single GitHub call) resolved it, so
     # the per-branch scan the guard protects was never entered. Only a commit that is not the head

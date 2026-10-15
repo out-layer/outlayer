@@ -269,6 +269,20 @@ async fn body_within_async(mut response: reqwest::Response, most: usize) -> Resu
 }
 
 /// Read a status and a body as the store's answer.
+/// The worker's token and its TEE session: the coordinator answers the task
+/// routes only with both. A value that is not a valid header is left out, and
+/// the coordinator refuses the call.
+fn auth_headers(config: &StoreConfig) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(v) = format!("Bearer {}", config.coordinator_token).parse() {
+        headers.insert(reqwest::header::AUTHORIZATION, v);
+    }
+    if let Some(v) = config.coordinator_tee_session_id.as_deref().and_then(|s| s.parse().ok()) {
+        headers.insert("X-TEE-Session", v);
+    }
+    headers
+}
+
 fn read<T: serde::de::DeserializeOwned>(status: u16, body: &[u8]) -> Result<T, StoreError> {
     match status {
         200 => serde_json::from_slice(body)
@@ -306,7 +320,7 @@ impl HttpStore {
         let response = self
             .client
             .post(format!("{}{path}", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
+            .headers(auth_headers(&self.config))
             .json(&body)
             .send()
             .map_err(|_| StoreError::Unavailable("the task store did not answer".to_string()))?;
@@ -532,7 +546,7 @@ async fn finish_once(
 ) -> Result<Finished, StoreError> {
     let response = client
         .post(format!("{}/owner-tasks/finish", config.coordinator_url))
-        .header("Authorization", format!("Bearer {}", config.coordinator_token))
+        .headers(auth_headers(config))
         .timeout(std::time::Duration::from_secs(10))
         .json(body)
         .send()
@@ -619,6 +633,7 @@ mod tests {
         let config = StoreConfig {
             coordinator_url: format!("http://{}", listener.local_addr().expect("addr")),
             coordinator_token: "the-workers-token".to_string(),
+            coordinator_tee_session_id: Some("the-workers-session".to_string()),
         };
         let seen = Seen::default();
         let kept = seen.clone();
@@ -653,7 +668,13 @@ mod tests {
                 }
                 let path = head.split_whitespace().nth(1).unwrap_or_default().to_string();
                 let body = serde_json::from_slice(&data[head_end..]).unwrap_or(serde_json::Value::Null);
-                kept.lock().unwrap().push((path, header("authorization").unwrap_or_default(), body));
+                // The credentials it came with: the token, then the session.
+                let credentials = format!(
+                    "{} / {}",
+                    header("authorization").unwrap_or_default(),
+                    header("x-tee-session").unwrap_or_default()
+                );
+                kept.lock().unwrap().push((path, credentials, body));
                 // A request past the last answer written for it is answered
                 // as one the test did not expect.
                 let (status, reply) = answers.next().unwrap_or((500, "one request too many"));
@@ -693,9 +714,9 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        for (path, authorization, body) in seen.iter() {
+        for (path, credentials, body) in seen.iter() {
             assert_eq!(path, "/owner-tasks/finish");
-            assert_eq!(authorization, "Bearer the-workers-token");
+            assert_eq!(credentials, "Bearer the-workers-token / the-workers-session");
             // What the run reported on — `failed` only where it is true —
             // and nothing of a task it answered and left without a result.
             assert_eq!(
@@ -744,7 +765,11 @@ mod tests {
         // An address nothing listens at: bound, read, and let go.
         let gone = std::net::TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
         let config =
-            StoreConfig { coordinator_url: format!("http://{gone}"), coordinator_token: "the-workers-token".to_string() };
+            StoreConfig {
+                coordinator_url: format!("http://{gone}"),
+                coordinator_token: "the-workers-token".to_string(),
+                coordinator_tee_session_id: None,
+            };
         let Err(StoreError::Unavailable(why)) = finish(&config, &scope(), "run-o", true, &answered(), &refused()).await else {
             panic!("a store that is not there took a report");
         };
@@ -786,6 +811,7 @@ mod tests {
         let config = StoreConfig {
             coordinator_url: format!("http://{}", listener.local_addr().expect("addr")),
             coordinator_token: "the-workers-token".to_string(),
+            coordinator_tee_session_id: None,
         };
         let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = sent.clone();

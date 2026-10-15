@@ -27,6 +27,12 @@ phala deploy --name outlayer-testnet-worker --compose docker-compose.phala.yml -
 # Compilation does not run in the enclave: the TEE workers execute only
 # (COMPILATION_ENABLED=false). A separate worker compiles, and pins the image it
 # compiles in by digest — see worker/.env.testnet.worker1.
+#
+# A worker with DOWNLOAD_ENABLED=true (and COMPILATION_ENABLED=false) only
+# fetches prebuilt wasm_url files into the cache: no docker, no build. Builds
+# from GitHub run only where the coordinator has BUILDS_ENABLED=true; anywhere
+# else a request that needs one is refused with a message telling the caller to
+# build the .wasm locally.
 
 # whitelist measurements after code updates
 # use scripts/deploy_phala.sh which extracts all 5 TDX measurements (MRTD + RTMR0-3) automatically

@@ -141,8 +141,11 @@ pub struct RpcProxyConfig {
 /// Worker capabilities - what jobs this worker can handle
 #[derive(Debug, Clone)]
 pub struct WorkerCapabilities {
-    pub compilation: bool, // Can compile GitHub repos to WASM
+    pub compilation: bool, // Can compile GitHub repos to WASM (and fetch a wasm_url)
     pub execution: bool,   // Can execute WASM code
+    /// Can fetch a prebuilt `wasm_url` into the cache. Builds nothing and runs
+    /// nothing it fetches; needs no docker.
+    pub download: bool,
 }
 
 impl WorkerCapabilities {
@@ -155,7 +158,15 @@ impl WorkerCapabilities {
         if self.execution {
             result.push("execution".to_string());
         }
+        if self.download {
+            result.push("download".to_string());
+        }
         result
+    }
+
+    /// Check if worker can fetch a prebuilt `wasm_url` (a compiler can too)
+    pub fn can_download(&self) -> bool {
+        self.compilation || self.download
     }
 
     /// Check if worker can handle compilation
@@ -420,14 +431,20 @@ impl Config {
             .parse::<bool>()
             .context("EXECUTION_ENABLED must be 'true' or 'false'")?;
 
+        let download_enabled = env::var("DOWNLOAD_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .context("DOWNLOAD_ENABLED must be 'true' or 'false'")?;
+
         // At least one capability must be enabled
-        if !compilation_enabled && !execution_enabled {
-            anyhow::bail!("At least one capability must be enabled (COMPILATION_ENABLED or EXECUTION_ENABLED)");
+        if !compilation_enabled && !execution_enabled && !download_enabled {
+            anyhow::bail!("At least one capability must be enabled (COMPILATION_ENABLED, EXECUTION_ENABLED or DOWNLOAD_ENABLED)");
         }
 
         let capabilities = WorkerCapabilities {
             compilation: compilation_enabled,
             execution: execution_enabled,
+            download: download_enabled,
         };
 
         // FastFS receiver contract (optional)
@@ -600,14 +617,18 @@ impl Config {
         }
     }
 
-    /// Get worker type string based on capabilities
-    /// Returns "executor", "compiler", or "executor-compiler"
+    /// Get worker type string based on capabilities: "executor", "compiler",
+    /// "downloader", or a combination. A compiler fetches wasm_url too, so
+    /// `download` adds nothing to its name.
     pub fn worker_type_string(&self) -> &'static str {
-        match (self.capabilities.execution, self.capabilities.compilation) {
-            (true, true) => "executor-compiler",
-            (true, false) => "executor",
-            (false, true) => "compiler",
-            (false, false) => "unknown", // Should never happen due to validation
+        let c = &self.capabilities;
+        match (c.execution, c.compilation, c.download) {
+            (true, true, _) => "executor-compiler",
+            (true, false, true) => "executor-downloader",
+            (true, false, false) => "executor",
+            (false, true, _) => "compiler",
+            (false, false, true) => "downloader",
+            (false, false, false) => "unknown", // Should never happen due to validation
         }
     }
 
@@ -717,6 +738,50 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn with_roles(execution: bool, compilation: bool, download: bool) -> Config {
+        let mut c = create_test_config();
+        c.capabilities = WorkerCapabilities { compilation, execution, download };
+        c
+    }
+
+    #[test]
+    fn the_worker_name_says_what_it_can_do() {
+        assert_eq!(with_roles(true, false, false).worker_type_string(), "executor");
+        assert_eq!(with_roles(false, true, false).worker_type_string(), "compiler");
+        assert_eq!(with_roles(false, false, true).worker_type_string(), "downloader");
+        assert_eq!(with_roles(true, false, true).worker_type_string(), "executor-downloader");
+        assert_eq!(with_roles(true, true, false).worker_type_string(), "executor-compiler");
+        // A compiler fetches too; download adds nothing to its name.
+        assert_eq!(with_roles(false, true, true).worker_type_string(), "compiler");
+    }
+
+    #[test]
+    fn a_downloader_fetches_and_does_not_build() {
+        let c = with_roles(false, false, true);
+        assert!(c.capabilities.can_download());
+        assert!(!c.capabilities.can_compile());
+        assert_eq!(c.capabilities.to_array(), vec!["download".to_string()]);
+        // A compiler can fetch as well.
+        assert!(with_roles(false, true, false).capabilities.can_download());
+        assert!(!with_roles(true, false, false).capabilities.can_download());
+    }
+
+    #[tokio::test]
+    async fn a_downloader_refuses_to_build_whatever_the_compilation_mode() {
+        let mut c = with_roles(false, false, true);
+        c.compilation_mode = "native".to_string();
+        let api = crate::api_client::ApiClient::new(c.api_base_url.clone(), c.api_auth_token.clone())
+            .expect("client");
+        let compiler = crate::compiler::Compiler::new(api, c).expect("no docker needed");
+        let source = crate::api_client::CodeSource::GitHub {
+            repo: "https://github.com/out-layer/outlayer".to_string(),
+            commit: "main".to_string(),
+            build_target: "wasm32-wasip2".to_string(),
+        };
+        let err = compiler.compile_local_with_options(&source, None, false).await.unwrap_err();
+        assert!(err.to_string().contains("not available on this worker"), "{err}");
+    }
+
     #[test]
     fn test_config_validation() {
         let mut config = create_test_config();
@@ -812,6 +877,7 @@ mod tests {
             capabilities: WorkerCapabilities {
                 compilation: true,
                 execution: true,
+                download: false,
             },
             fastfs_receiver: None,
             fastfs_sender_signer: None,

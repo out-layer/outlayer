@@ -11,7 +11,7 @@
 //! The rest follows `wasmtime_wasi_http::types::default_send_request_handler`
 //! (28.0.1): same TLS roots, same HTTP/1 handshake, same timeouts and errors.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use http_body_util::BodyExt;
 use tokio::net::TcpStream;
@@ -20,21 +20,6 @@ use wasmtime_wasi_http::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::types::{IncomingResponse, OutgoingRequestConfig};
-
-/// The addresses to connect to, or `None` when the name must not be reached:
-/// it resolved to nothing, or ANY of its addresses is one a guest may not
-/// reach. Refusing the whole name, rather than skipping its blocked
-/// addresses, keeps a name that points inside our infrastructure refused even
-/// when it also lists a public address.
-pub(crate) fn checked_addresses(
-    addrs: Vec<SocketAddr>,
-    is_blocked: impl Fn(IpAddr) -> bool,
-) -> Option<Vec<SocketAddr>> {
-    if addrs.is_empty() || addrs.iter().any(|a| is_blocked(a.ip())) {
-        return None;
-    }
-    Some(addrs)
-}
 
 /// Send `request` over a connection to the first of `addrs` that answers —
 /// all of them already checked, none resolved again — verifying TLS against
@@ -144,37 +129,7 @@ pub(crate) async fn send_to(
 
 #[cfg(test)]
 mod tests {
-    use super::checked_addresses;
-    use std::net::{IpAddr, SocketAddr};
-
-    fn private(ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
-            IpAddr::V6(v6) => v6.is_loopback(),
-        }
-    }
-
-    fn a(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn every_address_of_a_public_name_is_kept_in_order() {
-        let both = vec![a("[2606:2800:220:1::1]:443"), a("93.184.216.34:443")];
-        assert_eq!(checked_addresses(both.clone(), private), Some(both));
-    }
-
-    #[test]
-    fn a_name_with_any_blocked_address_is_refused_whole() {
-        assert_eq!(checked_addresses(vec![a("93.184.216.34:443"), a("10.0.2.2:443")], private), None);
-        assert_eq!(checked_addresses(vec![a("10.0.2.2:11000")], private), None);
-        assert_eq!(checked_addresses(vec![a("127.0.0.1:80")], private), None);
-    }
-
-    #[test]
-    fn a_name_that_resolves_to_nothing_is_refused() {
-        assert_eq!(checked_addresses(vec![], private), None);
-    }
+    use std::net::SocketAddr;
 
     /// Live: a real HTTPS request over a connection to the checked address,
     /// with TLS verified against the host name. Needs the internet.
@@ -188,7 +143,7 @@ mod tests {
 
         let host = "example.com";
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 443)).await.unwrap().collect();
-        let addrs = checked_addresses(addrs, private).expect("example.com is public");
+        let addrs = crate::net_guard::checked_addresses(addrs).expect("example.com is public");
         let body = http_body_util::Empty::<hyper::body::Bytes>::new().map_err(|e| match e {}).boxed();
         let request = hyper::Request::builder()
             .uri(format!("https://{host}/"))

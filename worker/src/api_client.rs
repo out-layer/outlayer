@@ -530,9 +530,21 @@ impl ApiClient {
     }
 
     /// Add wallet internal auth header (X-Internal-Wallet-Auth) for /internal/wallet-* endpoints.
-    /// These endpoints use a different auth scheme than the standard Bearer token.
+    /// These endpoints use a different auth scheme than the standard Bearer token,
+    /// and also need the TEE session.
     fn add_wallet_internal_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder.header("X-Internal-Wallet-Auth", &self.auth_token)
+        let builder = builder.header("X-Internal-Wallet-Auth", &self.auth_token);
+        match self.tee_session_id() {
+            Some(session_id) => builder.header("X-TEE-Session", session_id),
+            None => builder,
+        }
+    }
+
+    /// The worker's TEE session with the coordinator, once registered. Every
+    /// coordinator call made for a run carries it: the coordinator refuses
+    /// a bare worker token on everything past preparation work.
+    pub fn tee_session_id(&self) -> Option<String> {
+        self.tee_session_id.lock().unwrap().clone()
     }
 
     /// Perform a challenge-response TEE registration against the given endpoint path prefix.

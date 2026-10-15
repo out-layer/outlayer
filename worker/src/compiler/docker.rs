@@ -60,6 +60,10 @@ pub async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
 }
 
 /// Create and start a Docker container for compilation
+///
+/// Not a sandbox for untrusted code: root, the `bridge` network (the host's
+/// docker0 listeners and the internet reachable), ten minutes alive. What
+/// must change before builds are enabled: `Compiler::compile_from_github`.
 pub async fn create_container(
     docker: &Docker,
     name: &str,

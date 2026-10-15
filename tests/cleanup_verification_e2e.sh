@@ -38,6 +38,14 @@
 # (SMOKE_COORDINATOR_TOKEN_TESTNET), is held in this process only and reaches
 # curl on stdin (`-H @-`). Never printed.
 #
+# The route is a worker route: the deployed coordinators answer it only from a
+# worker host (WORKER_ALLOWED_IPS) with a TEE session (REQUIRE_TEE_SESSION), so
+# a bearer alone gets 403/401 there. Run it against a coordinator on testnet
+# config with neither set — a local one, COORDINATOR_URL=http://localhost:8080 —
+# whose worker_auth_tokens holds the bearer's hash. The verdict rules are also
+# unit-tested in the coordinator (storage_cleanup_verdict); this suite adds the
+# real chain reads.
+#
 # Needs: OWNER (default outlayer-bob.testnet) with its key in the legacy
 # keychain; REDIS_CMD (redis-cli args, testnet) for CV2/CV8; COORD_SSH (from
 # .env.nodes) for the coordinator log (read-only). The RPC is keyed through tests/lib/rpc.sh.
@@ -156,6 +164,10 @@ out=$(mktemp -t cv_body.XXXXXX)
 HTTP=$(printf 'Authorization: Bearer %s\n' "$WORKER_TOKEN" | command curl -sS -o "$out" -w '%{http_code}' --max-time 30 \
   -X POST -H @- -H 'Content-Type: application/json' --data-binary '{}' "$COORDINATOR_URL/projects/cleanup-task/create" 2>/dev/null)
 rm -f "$out"
+if [[ "$HTTP" == 401 || "$HTTP" == 403 ]]; then
+  echo "✗ $COORDINATOR_URL refused the bearer (HTTP $HTTP): it admits workers only from their hosts with a TEE session. Run against a local coordinator (see the header)." >&2
+  exit 1
+fi
 [[ "$HTTP" == 422 ]] || { echo "✗ the worker route answered HTTP $HTTP to {} (expected 422: bearer accepted, body refused)" >&2; exit 1; }
 
 if [[ "$APPLY" != true ]]; then

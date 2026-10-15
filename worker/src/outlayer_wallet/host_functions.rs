@@ -149,6 +149,9 @@ pub struct WalletHostState {
     /// Wallet signature for authenticating requests
     /// Pre-computed by the worker using the keystore
     wallet_auth_token: String,
+    /// The worker's TEE session with the coordinator, which wallet calls
+    /// need next to the token
+    tee_session_id: Option<String>,
     /// Call counter for rate limiting
     call_count: u32,
     /// Max wallet calls per execution
@@ -164,12 +167,14 @@ impl WalletHostState {
     /// `wallet_id` is the wallet pubkey identifier from X-Wallet-Id header.
     /// `coordinator_url` is the coordinator base URL.
     /// `wallet_auth_token` is the internal auth token for coordinator wallet API.
+    /// `tee_session_id` is the worker's TEE session with the coordinator.
     /// `connector_id` is the running artefact's connector identity from its
     /// verified manifest, or `None` for a project that has none.
     pub fn new(
         wallet_id: &str,
         coordinator_url: &str,
         wallet_auth_token: &str,
+        tee_session_id: Option<String>,
         connector_id: Option<&str>,
     ) -> Self {
         let http_client = reqwest::blocking::Client::builder()
@@ -184,6 +189,7 @@ impl WalletHostState {
             http_client: Some(http_client),
             coordinator_url: coordinator_url.to_string(),
             wallet_auth_token: wallet_auth_token.to_string(),
+            tee_session_id,
             call_count: 0,
             max_calls: MAX_CALLS,
             connector_id: connector_id.map(str::to_string),
@@ -200,6 +206,7 @@ impl WalletHostState {
             http_client: None,
             coordinator_url: String::new(),
             wallet_auth_token: String::new(),
+            tee_session_id: None,
             call_count: 0,
             max_calls: MAX_CALLS,
             connector_id: None,
@@ -342,6 +349,9 @@ impl WalletHostState {
         request_builder = request_builder
             .header("X-Wallet-Id", &self.wallet_id)
             .header("X-Internal-Wallet-Auth", &self.wallet_auth_token);
+        if let Some(session_id) = &self.tee_session_id {
+            request_builder = request_builder.header("X-TEE-Session", session_id);
+        }
 
         if let Some(json_body) = body {
             request_builder = request_builder.json(json_body);
@@ -738,6 +748,7 @@ mod tests {
             http_client: Some(reqwest::blocking::Client::new()),
             coordinator_url: "http://localhost:9999".to_string(),
             wallet_auth_token: "test-token".to_string(),
+            tee_session_id: None,
             call_count: 0,
             max_calls: MAX_CALLS,
             connector_id: connector_id.map(str::to_string),

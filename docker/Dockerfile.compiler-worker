@@ -129,7 +129,11 @@ RUN mkdir -p /tmp/compile && chmod 1777 /tmp/compile
 #    - Process isolation (Linux kernel prevents memory access)
 #    - Resource limits via ulimit (memory, CPU time, processes)
 #    - Intel TDX hardware isolation (TEE protects from host)
-#    - Build.rs validation (rejects projects with build scripts)
+#    - A manifest check (refuses `build =` and git dependencies); it does NOT
+#      stop build-time code (an unnamed root build.rs, dependencies' build
+#      scripts, proc-macros run all the same). Not safe for untrusted
+#      repositories as it stands: see Compiler::compile_from_github in
+#      worker/src/compiler/mod.rs before enabling builds.
 # 4. Temporary directories cleaned after each compilation
 
 # ==============================================================================

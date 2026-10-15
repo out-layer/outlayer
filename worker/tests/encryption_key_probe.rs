@@ -506,6 +506,7 @@ impl FakeStorage {
             wasm_hash: "wasm-test".to_string(),
             account_id: "bob.near".to_string(),
             keystore_tee_session_id: None,
+            coordinator_tee_session_id: None,
         }
     }
 

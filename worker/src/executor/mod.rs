@@ -83,6 +83,8 @@ pub struct WalletConfig {
     pub coordinator_url: String,
     /// Internal auth token for coordinator wallet API
     pub wallet_auth_token: String,
+    /// The worker's TEE session with the coordinator, required next to the token
+    pub tee_session_id: Option<String>,
     /// `connector_id` from the running artefact's verified manifest; `None`
     /// for an ordinary project. Decides whether the guest may name sub-keys,
     /// and of which connector.

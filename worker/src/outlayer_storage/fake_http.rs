@@ -14,6 +14,8 @@ pub struct Seen {
     pub path: String,
     /// JSON body, `Null` when the request had none.
     pub body: serde_json::Value,
+    /// The `X-TEE-Session` header, if the request carried one.
+    pub tee_session: Option<String>,
 }
 
 /// A running fake server.
@@ -42,8 +44,8 @@ where
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let Some((path, body)) = read_request(&mut stream) else { continue };
-            recorded.lock().expect("seen lock").push(Seen { path: path.clone(), body: body.clone() });
+            let Some((path, body, tee_session)) = read_request(&mut stream) else { continue };
+            recorded.lock().expect("seen lock").push(Seen { path: path.clone(), body: body.clone(), tee_session });
             let (code, reply) = respond(&path, &body);
             let response = format!(
                 "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
@@ -55,9 +57,9 @@ where
     FakeServer { url, seen }
 }
 
-/// Read one request: the request line's path and the JSON body sized by
-/// `Content-Length`.
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, serde_json::Value)> {
+/// Read one request: the request line's path, the JSON body sized by
+/// `Content-Length`, and the `X-TEE-Session` header.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, serde_json::Value, Option<String>)> {
     let mut data = Vec::new();
     let mut buf = [0u8; 8192];
     let header_end = loop {
@@ -72,13 +74,14 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, serde_json:
     };
     let head = String::from_utf8_lossy(&data[..header_end]).into_owned();
     let path = head.split_whitespace().nth(1)?.to_string();
-    let content_length = head
-        .lines()
-        .find_map(|line| {
+    let header = |wanted: &str| {
+        head.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok())?
+            name.trim().eq_ignore_ascii_case(wanted).then(|| value.trim().to_string())
         })
-        .unwrap_or(0);
+    };
+    let content_length = header("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let tee_session = header("x-tee-session");
     while data.len() < header_end + content_length {
         let n = stream.read(&mut buf).ok()?;
         if n == 0 {
@@ -92,7 +95,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, serde_json:
     } else {
         serde_json::from_slice(body_bytes).ok()?
     };
-    Some((path, body))
+    Some((path, body, tee_session))
 }
 
 /// A storage config for account `agent.near` in project `p-test`, talking to
@@ -107,6 +110,7 @@ pub fn config(coordinator: &FakeServer, keystore: &FakeServer) -> StorageConfig 
         wasm_hash: "wasm-test".to_string(),
         account_id: "agent.near".to_string(),
         keystore_tee_session_id: None,
+        coordinator_tee_session_id: Some("coordinator-test-session".to_string()),
     }
 }
 

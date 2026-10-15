@@ -4,14 +4,18 @@
 //! - env -i for environment variable isolation
 //! - ulimit for resource limits (memory, CPU time, processes)
 //! - Temporary isolated directories for each compilation
-//! - build.rs validation to prevent malicious build scripts
+//! - a manifest check refusing `build =` and git dependencies
 //!
 //! Security model:
 //! 1. Environment isolation (env -i clears all worker secrets)
 //! 2. Process isolation (Linux kernel isolates process memory)
 //! 3. Intel TDX hardware isolation (TEE protects from host)
 //! 4. Resource limits prevent DoS (memory, CPU, time)
-//! 5. Build.rs validation prevents code execution attacks
+//! 5. The manifest check does NOT prevent build-time code: cargo runs a
+//!    root `build.rs` the manifest does not name, every dependency's build
+//!    script and every proc-macro. The build has the network and the worker's
+//!    host. Not safe for untrusted repositories as it stands; what must change
+//!    before builds are enabled: `Compiler::compile_from_github` (mod.rs).
 //! 6. Temporary directories prevent filesystem conflicts
 //!
 //! This is designed for TEE environments (Phala, Intel TDX) where
@@ -72,7 +76,8 @@ const MAX_PROCESSES: u32 = 1024;
 /// - Process isolation: Linux kernel prevents reading worker memory
 /// - Hardware isolation: Intel TDX protects from host and other processes
 /// - Resource limits: 2GB RAM, 5min CPU time, 1024 processes (ulimit)
-/// - Build.rs validation: rejects projects with build scripts
+/// - Manifest check: refuses `build =` and git dependencies (does not stop
+///   build-time code, see the module documentation)
 /// - Temporary directories: compilation isolated in /tmp/compile-{uuid}
 ///
 /// # Determinism
@@ -317,6 +322,11 @@ fn classify_clone_error(stderr: &str, repo: &str) -> Result<()> {
 }
 
 /// Validate that project doesn't use build.rs or git dependencies (security requirement)
+///
+/// Not a barrier to build-time code: it reads the root `Cargo.toml` only, and
+/// cargo runs a root `build.rs` without any `build =` line, plus every
+/// dependency's build script and every proc-macro. Containment has to come
+/// from the build environment (see the module documentation).
 ///
 /// Build scripts can execute arbitrary code during compilation, which is a security risk.
 /// We reject projects with build.rs to prevent:

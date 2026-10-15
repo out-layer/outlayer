@@ -34,6 +34,8 @@ pub struct StorageConfig {
     pub account_id: String,
     /// Keystore TEE session ID (set after challenge-response registration)
     pub keystore_tee_session_id: Option<String>,
+    /// The worker's TEE session with the coordinator
+    pub coordinator_tee_session_id: Option<String>,
 }
 
 /// The mode a record is stored in.
@@ -138,14 +140,24 @@ impl StorageClient {
         req
     }
 
+    /// Build a coordinator request with auth headers: the worker token and the
+    /// worker's TEE session, without which the coordinator refuses storage
+    /// routes.
+    fn coordinator_request(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
+        let mut req = self
+            .client
+            .request(method, format!("{}{}", self.config.coordinator_url, path))
+            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
+            .header("Content-Type", "application/json");
+        if let Some(ref session_id) = self.config.coordinator_tee_session_id {
+            req = req.header("X-TEE-Session", session_id.as_str());
+        }
+        req
+    }
+
     /// POST a JSON body to a coordinator storage endpoint
     fn coordinator_post(&self, path: &str, body: &serde_json::Value) -> reqwest::Result<reqwest::blocking::Response> {
-        self.client
-            .post(format!("{}{}", self.config.coordinator_url, path))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
+        self.coordinator_request(reqwest::Method::POST, path).json(body).send()
     }
 
     /// Hash a key for storage lookup
@@ -259,10 +271,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/set", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/set")
             .json(&body)
             .send()
             .context("Failed to send storage set request")?;
@@ -301,10 +310,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/get", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/get")
             .json(&body)
             .send()
             .context("Failed to send storage get request")?;
@@ -346,10 +352,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/has", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/has")
             .json(&body)
             .send()
             .context("Failed to send storage has request")?;
@@ -381,10 +384,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/delete", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/delete")
             .json(&body)
             .send()
             .context("Failed to send storage delete request")?;
@@ -403,17 +403,9 @@ impl StorageClient {
     /// Raw records carry their key name as stored; encrypted ones are decrypted
     /// by the keystore. The prefix filter applies to the key names.
     pub fn list_keys(&self, prefix: &str) -> Result<String> {
-        let url = format!(
-            "{}/storage/list?account_id={}&project_uuid={}",
-            self.config.coordinator_url,
-            self.config.account_id,
-            self.config.project_uuid
-        );
-
         let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
+            .coordinator_request(reqwest::Method::GET, "/storage/list")
+            .query(&[("account_id", &self.config.account_id), ("project_uuid", &self.config.project_uuid)])
             .send()
             .context("Failed to send storage list request")?;
 
@@ -495,10 +487,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/get-by-version", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/get-by-version")
             .json(&body)
             .send()
             .context("Failed to send storage get-by-version request")?;
@@ -560,10 +549,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/clear-all", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/clear-all")
             .json(&body)
             .send()
             .context("Failed to send storage clear-all request")?;
@@ -587,10 +573,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/clear-version", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/clear-version")
             .json(&body)
             .send()
             .context("Failed to send storage clear-version request")?;
@@ -639,10 +622,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/set", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/set")
             .json(&body)
             .send()
             .context("Failed to send storage set request")?;
@@ -688,10 +668,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/get", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/get")
             .json(&body)
             .send()
             .context("Failed to send storage get request")?;
@@ -745,10 +722,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/get-public", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/get-public")
             .json(&body)
             .send()
             .context("Failed to send storage get-public request")?;
@@ -811,10 +785,7 @@ impl StorageClient {
         });
 
         let response = self
-            .client
-            .post(format!("{}/storage/set-if-absent", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/set-if-absent")
             .json(&body)
             .send()
             .context("Failed to send storage set-if-absent request")?;
@@ -847,10 +818,7 @@ impl StorageClient {
         });
 
         let get_response = self
-            .client
-            .post(format!("{}/storage/get", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/get")
             .json(&get_body)
             .send()
             .context("Failed to send storage get request for set_if_equals")?;
@@ -896,10 +864,7 @@ impl StorageClient {
         });
 
         let update_response = self
-            .client
-            .post(format!("{}/storage/set-if-equals", self.config.coordinator_url))
-            .header("Authorization", format!("Bearer {}", self.config.coordinator_token))
-            .header("Content-Type", "application/json")
+            .coordinator_request(reqwest::Method::POST, "/storage/set-if-equals")
             .json(&update_body)
             .send()
             .context("Failed to send storage set-if-equals request")?;
@@ -1300,6 +1265,32 @@ mod tests {
             })
         );
         assert!(keystore.seen().is_empty(), "no keystore call on a raw write");
+    }
+
+    /// Every coordinator call carries the worker's TEE session: the coordinator
+    /// refuses storage routes to a token alone. The listing's account and
+    /// project go as query parameters.
+    #[test]
+    fn every_coordinator_call_carries_the_tee_session() {
+        let coordinator = serve(|path, _| {
+            if path.starts_with("/storage/list") {
+                (200, json!({ "keys": [], "total": 0 }).to_string())
+            } else {
+                (200, String::new())
+            }
+        });
+        let keystore = untouched_keystore();
+        let client = StorageClient::new(config(&coordinator, &keystore)).unwrap();
+
+        client.set_raw("sealed/1", b"x").unwrap();
+        client.list_keys("").unwrap();
+
+        let seen = coordinator.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].path, "/storage/list?account_id=agent.near&project_uuid=p-test");
+        for s in &seen {
+            assert_eq!(s.tee_session.as_deref(), Some("coordinator-test-session"), "{}", s.path);
+        }
     }
 
     /// set-raw over an encrypted record comes back as a mode error naming the

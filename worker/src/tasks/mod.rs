@@ -114,6 +114,8 @@ impl std::fmt::Debug for TaskGrant {
 pub struct StoreConfig {
     pub coordinator_url: String,
     pub coordinator_token: String,
+    /// The worker's TEE session with the coordinator, required next to the token
+    pub coordinator_tee_session_id: Option<String>,
 }
 
 /// Prints where the store is and nothing of the token that opens it.
@@ -327,6 +329,7 @@ mod tests {
         let store = StoreConfig {
             coordinator_url: "http://coordinator.internal:8080".to_string(),
             coordinator_token: "MARKER-BEARER-0123456789".to_string(),
+            coordinator_tee_session_id: Some("MARKER-SESSION-0123456789".to_string()),
         };
         let chain = ChainConfig {
             rpc_url: "https://rpc.example/?apiKey=MARKER-RPC-KEY".to_string(),

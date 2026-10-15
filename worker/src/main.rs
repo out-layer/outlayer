@@ -5,6 +5,7 @@ mod compiler;
 mod config;
 mod event_monitor;
 mod executor;
+mod net_guard;
 mod fastfs;
 mod keystore_client;
 mod near_client;
@@ -188,13 +189,18 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Initialize compiler (only if compilation capability enabled)
-    let compiler = if config.capabilities.can_compile() {
-        info!("✅ Compilation capability enabled - initializing compiler");
+    // Initialize compiler: builds (compilation) and wasm_url fetches
+    // (compilation or download)
+    let compiler = if config.capabilities.can_download() {
+        if config.capabilities.can_compile() {
+            info!("✅ Compilation capability enabled - initializing compiler");
+        } else {
+            info!("✅ Download capability enabled - wasm_url fetches only, no builds");
+        }
         Some(Compiler::new(api_client.clone(), config.clone())
             .context("Failed to create compiler")?)
     } else {
-        info!("⚠️  Compilation capability disabled - will only handle Execute jobs");
+        info!("⚠️  Compilation and download disabled - will only handle Execute jobs");
         None
     };
 
@@ -953,12 +959,21 @@ come from the coordinator's own flow. contract={:?} task={:?}",
     //              the implicit-account assert must NOT be applied here. It
     //              exists to catch a credential path attaching a wallet to a
     //              named owner, which is an HTTPS-only concern.
-    let claim = identity_claim(
-        is_https_call,
-        context.sender_id.as_deref(),
-        payment_key_owner.as_deref(),
-        user_account_id.as_deref(),
-    );
+    //
+    // Only a claim that runs something is checked: a build or a wasm_url fetch
+    // runs nothing under any name, and its worker, outside the TEE, could not
+    // read the coordinator's wallet list to check with.
+    let runs = claim_response.jobs.iter().any(|j| matches!(j.job_type, JobType::Execute));
+    let claim = if runs {
+        identity_claim(
+            is_https_call,
+            context.sender_id.as_deref(),
+            payment_key_owner.as_deref(),
+            user_account_id.as_deref(),
+        )
+    } else {
+        None
+    };
 
     let bound_sender: Option<String> = match claim {
         // The coordinator was asked for a bound identity and had none to give.
@@ -2330,6 +2345,19 @@ async fn handle_execute_job(
         hex::encode(Sha256::digest(&wasm_bytes))
     };
 
+    // A `wasm_url` project names the sha256 of its file on chain, and that is
+    // the key the cache serves it under. Bytes that hash otherwise are not the
+    // project's, whoever put them in the cache: refused before any secret is
+    // read and before anything runs.
+    if let CodeSource::WasmUrl { hash, .. } = code_source {
+        if !executed_wasm_sha256.eq_ignore_ascii_case(hash) {
+            error!("❌ wasm_url bytes hash to {} but the project names {}", executed_wasm_sha256, hash);
+            let error_msg = "The WASM file does not match the hash the project names.".to_string();
+            report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), error_msg, Some(api_client::JobStatus::Failed)).await?;
+            return Ok(());
+        }
+    }
+
     // The account that called the contract, for a `Predecessor` access
     // condition: on chain the receipt's predecessor as the contract's event
     // named it, carried in the job's context; over HTTPS no contract relays
@@ -2790,6 +2818,7 @@ async fn handle_execute_job(
     let task_store = tasks::StoreConfig {
         coordinator_url: config.api_base_url.clone(),
         coordinator_token: config.api_auth_token.clone(),
+        coordinator_tee_session_id: api_client.tee_session_id(),
     };
     let task_run_id = tasks::run_id(call_id.map(|s| s.as_str()), request_id);
     declared_run_keys.tasks = tasks::declared_in(declared_manifest.as_ref()).then(|| tasks::TasksRun {
@@ -2898,6 +2927,7 @@ async fn handle_execute_job(
                 wasm_hash: wasm_checksum.clone(),
                 account_id: storage_account_id,
                 keystore_tee_session_id,
+                coordinator_tee_session_id: api_client.tee_session_id(),
             })
         }
         (None, _, _) | (_, None, _) => {
@@ -3000,6 +3030,7 @@ async fn handle_execute_job(
             wallet_id: wid.to_string(),
             coordinator_url: config.api_base_url.clone(),
             wallet_auth_token: config.api_auth_token.clone(),
+            tee_session_id: api_client.tee_session_id(),
             connector_id: sub_key_connector.clone(),
         }
     });
@@ -4637,6 +4668,22 @@ mod payment_key_name_tests {
 
 #[cfg(test)]
 mod verified_sender_tests {
+
+    /// Only a claim holding an execute job is checked for a bound identity: a
+    /// preparation runs nothing, and its worker has no TEE session to read the
+    /// coordinator's wallet list with.
+    #[test]
+    fn only_a_claim_that_runs_is_checked_for_a_bound_identity() {
+        let src = include_str!("main.rs");
+        let at = src.find("let claim = if runs {").expect("the check is gated");
+        let gate = src[..at].rfind("let runs = ").expect("the gate");
+        assert!(
+            src[gate..at].contains("claim_response.jobs.iter().any(|j| matches!(j.job_type, JobType::Execute))"),
+            "the gate is: the claim holds an execute job"
+        );
+        let body = &src[at..at + 400];
+        assert!(body.contains("identity_claim(") && body.contains("} else {\n        None\n    };"), "{body}");
+    }
     use super::*;
     use crate::api_client::{ExecutionContext, ResourceLimits};
 
@@ -5282,6 +5329,23 @@ mod the_compiled_cache_is_keyed_by_content {
             body.contains("Sha256::digest(&wasm_bytes)"),
             "executed_wasm_sha256 must be the hash of the loaded buffer, not a value from the task: {body}"
         );
+    }
+
+    /// A `wasm_url` run whose bytes do not hash to the project's hash is
+    /// refused between the measurement and the first secret.
+    #[test]
+    fn wasm_url_bytes_must_hash_to_the_projects_hash() {
+        let measured = SOURCE.find("let executed_wasm_sha256 = {").expect("the measurement");
+        let first_decrypt = SOURCE.find("decrypt_secrets_by_project(proj_id").expect("a decrypt follows");
+        let check = SOURCE[measured..]
+            .find("if let CodeSource::WasmUrl { hash, .. } = code_source {")
+            .map(|n| measured + n)
+            .expect("the wasm_url check follows the measurement");
+        assert!(check < first_decrypt, "the check comes before any secret is read");
+        let body = &SOURCE[check..check + 700];
+        assert!(body.contains("!executed_wasm_sha256.eq_ignore_ascii_case(hash)"), "{body}");
+        let refused = body.find("report_refusal(").expect("refused through the refusal path");
+        assert!(body[refused..].contains("return Ok(());"), "and nothing runs after the refusal");
     }
 }
 

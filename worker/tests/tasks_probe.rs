@@ -435,7 +435,11 @@ impl World {
             wallet_id: None,
             bound_identity: false,
             compute_limit_usd: (!keyless).then(|| "10000".to_string()),
-            store: Some(StoreConfig { coordinator_url: self.store_url.clone(), coordinator_token: "t".to_string() }),
+            store: Some(StoreConfig {
+                coordinator_url: self.store_url.clone(),
+                coordinator_token: "t".to_string(),
+                coordinator_tee_session_id: None,
+            }),
             chain: Some(ChainConfig { rpc_url: self.rpc_url.clone(), recipient: RECIPIENT.to_string() }),
             report: report.clone(),
         };
