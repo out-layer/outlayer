@@ -483,10 +483,23 @@ async fn main() -> Result<()> {
             .with_context(exec_context)
     };
 
-    // Create NearClient with operator signer from registration
+    // Create NearClient with operator signer from registration. A worker that
+    // runs nothing holds no operator key; its client gets one generated here,
+    // which is on no account, so nothing it could sign is accepted.
+    let near_signer = match (&config.operator_signer, config.capabilities.can_execute()) {
+        (None, false) => {
+            let secret_key = near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519);
+            near_crypto::InMemorySigner {
+                account_id: config.operator_account_id.clone(),
+                public_key: secret_key.public_key(),
+                secret_key,
+            }
+        }
+        _ => config.get_operator_signer().clone(),
+    };
     let near_client = NearClient::new(
         config.near_rpc_url.clone(),
-        config.get_operator_signer().clone(),
+        near_signer,
         config.offchainvm_contract_id.clone(),
     )
     .context("Failed to create NEAR client")?;
@@ -1768,7 +1781,11 @@ async fn handle_compile_job(
 
             if store_on_fastfs {
                 if let Some(ref fastfs_receiver) = config.fastfs_receiver {
-                    // Use dedicated FastFS sender if configured, otherwise use operator
+                    // Use dedicated FastFS sender if configured, otherwise use operator.
+                    // Before builds are enabled (BUILDS_ENABLED): require the
+                    // dedicated sender here. A compiler runs nothing and holds no
+                    // operator key, so the fallback panics; and the operator key
+                    // has no place on a host that builds untrusted code.
                     let signer = config.fastfs_sender_signer.clone()
                         .unwrap_or_else(|| config.get_operator_signer().clone());
 

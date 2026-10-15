@@ -252,18 +252,29 @@ impl Config {
             })?
         };
 
+        let execution_enabled = env::var("EXECUTION_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .context("EXECUTION_ENABLED must be 'true' or 'false'")?;
+
         // Load operator_signer based on registration mode
-        // CRITICAL: operator_signer is ONLY used for calling resolve_execution() on OutLayer contract
+        // CRITICAL: operator_signer is used for calling resolve_execution() on OutLayer contract
+        // (and, on a compiler with no FASTFS_SENDER_PRIVATE_KEY, to publish a build to FastFS).
         // This key is NEVER passed to WASM and NEVER used for user transactions!
         // User transactions are signed with keys from WASM (provided via secrets mechanism).
         let operator_signer = if use_tee_registration {
             // TEE mode: operator_signer will be set after registration in main.rs
             None
+        } else if !execution_enabled && env::var("OPERATOR_PRIVATE_KEY").is_err() {
+            // A worker that runs nothing never calls resolve_execution(): it
+            // needs no operator key, and one that fetches or builds untrusted
+            // input should not hold it.
+            None
         } else {
             // Legacy mode: load OPERATOR_PRIVATE_KEY from env
             // CRITICAL: This key is ONLY for resolve_execution(), NOT for user transactions!
             let operator_private_key = env::var("OPERATOR_PRIVATE_KEY")
-                .context("OPERATOR_PRIVATE_KEY is required when USE_TEE_REGISTRATION=false")?;
+                .context("OPERATOR_PRIVATE_KEY is required when USE_TEE_REGISTRATION=false and EXECUTION_ENABLED=true")?;
 
             let secret_key: SecretKey = operator_private_key
                 .parse()
@@ -425,11 +436,6 @@ impl Config {
             .unwrap_or_else(|_| "true".to_string())
             .parse::<bool>()
             .context("COMPILATION_ENABLED must be 'true' or 'false'")?;
-
-        let execution_enabled = env::var("EXECUTION_ENABLED")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse::<bool>()
-            .context("EXECUTION_ENABLED must be 'true' or 'false'")?;
 
         let download_enabled = env::var("DOWNLOAD_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
