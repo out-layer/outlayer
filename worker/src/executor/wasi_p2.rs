@@ -55,9 +55,7 @@ use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder,
 use wasmtime_wasi::bindings::Command;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use wasmtime_wasi_http::body::HyperOutgoingBody;
-use wasmtime_wasi_http::types::{
-    default_send_request_handler, HostFutureIncomingResponse, OutgoingRequestConfig,
-};
+use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
 
 use crate::api_client::ResourceLimits;
 use crate::compiled_cache::CompiledCache;
@@ -253,22 +251,23 @@ impl WasiHttpView for HostState {
         let handle = wasmtime_wasi::runtime::spawn(async move {
             // SSRF guard: a guest component must not reach internal / private /
             // link-local / cloud-metadata addresses from inside the keys-bearing
-            // TEE. Resolve the destination and reject blocked ranges before
-            // connecting. Public destinations are unaffected (guest HTTP to the
-            // internet still works). NOTE: this resolves then hands off to the
-            // default handler which resolves again — a DNS-rebinding window
-            // remains; pin the resolved IP into the connection to fully close it.
-            match host.as_deref() {
+            // TEE. The name is resolved once, every address is checked, and the
+            // connection goes to the checked address (`pinned_http`), never to
+            // a fresh resolution of the name. Public destinations are
+            // unaffected (guest HTTP to the internet still works).
+            let (h, addrs) = match host.as_deref() {
                 Some(h) => match tokio::net::lookup_host((h, port)).await {
                     Ok(addrs) => {
-                        let addrs: Vec<std::net::SocketAddr> = addrs.collect();
-                        if addrs.is_empty() || addrs.iter().any(|a| is_blocked_ip(a.ip())) {
-                            tracing::warn!("WASI HTTP blocked (internal/private destination): {:?}", url);
-                            return Ok(Err(
-                                wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(
-                                    Some("destination blocked: internal/private/link-local address".to_string()),
-                                ),
-                            ));
+                        match super::pinned_http::checked_addresses(addrs.collect(), is_blocked_ip) {
+                            Some(addrs) => (h.to_string(), addrs),
+                            None => {
+                                tracing::warn!("WASI HTTP blocked (internal/private destination): {:?}", url);
+                                return Ok(Err(
+                                    wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(
+                                        Some("destination blocked: internal/private/link-local address".to_string()),
+                                    ),
+                                ));
+                            }
                         }
                     }
                     Err(e) => {
@@ -286,11 +285,11 @@ impl WasiHttpView for HostState {
                         ),
                     ));
                 }
-            }
+            };
 
             match tokio::time::timeout(
                 timeout_duration,
-                default_send_request_handler(request, config),
+                super::pinned_http::send_to(request, config, &h, &addrs),
             )
             .await
             {

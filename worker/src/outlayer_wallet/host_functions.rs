@@ -258,6 +258,22 @@ impl WalletHostState {
         body
     }
 
+    /// `/wallet/v1/balance` for `chain` (`near` when empty). `chain` and
+    /// `token` come from the guest; both are encoded, so neither can add a
+    /// parameter of its own to the query.
+    fn balance_path(chain: &str, token: &str) -> String {
+        let chain = if chain.is_empty() { "near" } else { chain };
+        if token.is_empty() {
+            format!("/wallet/v1/balance?chain={}", urlencoding::encode(chain))
+        } else {
+            format!(
+                "/wallet/v1/balance?chain={}&token={}",
+                urlencoding::encode(chain),
+                urlencoding::encode(token)
+            )
+        }
+    }
+
     /// `/wallet/v1/balance` for the wallet's intents balance of `token`.
     fn intents_balance_path(token: &str) -> String {
         format!(
@@ -563,17 +579,7 @@ impl outlayer::wallet::api::Host for WalletHostState {
             return (String::new(), err);
         }
 
-        let chain_param = if chain.is_empty() { "near" } else { &chain };
-        let path = if token.is_empty() {
-            format!("/wallet/v1/balance?chain={}", chain_param)
-        } else {
-            format!(
-                "/wallet/v1/balance?chain={}&token={}",
-                chain_param,
-                urlencoding::encode(&token)
-            )
-        };
-
+        let path = Self::balance_path(&chain, &token);
         self.call_coordinator("GET", &path, None)
     }
 
@@ -806,6 +812,20 @@ mod tests {
         assert_eq!(
             WalletHostState::address_path("a b", "x/y"),
             "/wallet/v1/address?chain=a%20b&sub_path=x%2Fy"
+        );
+    }
+
+    #[test]
+    fn the_balance_path_encodes_the_chain_too() {
+        assert_eq!(WalletHostState::balance_path("", ""), "/wallet/v1/balance?chain=near");
+        assert_eq!(
+            WalletHostState::balance_path("base", "usdc"),
+            "/wallet/v1/balance?chain=base&token=usdc"
+        );
+        // A chain cannot smuggle a parameter of its own into the query.
+        assert_eq!(
+            WalletHostState::balance_path("near&source=intents", ""),
+            "/wallet/v1/balance?chain=near%26source%3Dintents"
         );
     }
 

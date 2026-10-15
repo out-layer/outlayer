@@ -1181,8 +1181,7 @@ impl ApiClient {
         });
 
         let response = self
-            .client
-            .post(&url)
+            .add_auth_headers(self.client.post(&url))
             .json(&payload)
             .send()
             .await

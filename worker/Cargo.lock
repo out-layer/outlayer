@@ -3938,6 +3938,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "http-body-util",
  "hyper 1.8.1",
  "k256",
  "log",
@@ -3950,6 +3951,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "reqwest 0.11.27",
+ "rustls 0.22.4",
  "serde",
  "serde_json",
  "sha2",
@@ -3958,6 +3960,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls 0.25.0",
  "tracing",
  "tracing-subscriber",
  "urlencoding",
@@ -3968,6 +3971,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wat",
+ "webpki-roots 0.26.11",
  "zeroize",
 ]
 

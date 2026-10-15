@@ -44,6 +44,7 @@ use crate::outlayer_storage::client::StorageConfig;
 pub mod sandbox;
 mod wasi_p1;
 mod wasi_p2;
+mod pinned_http;
 
 /// VRF configuration for host functions
 #[derive(Clone)]

@@ -41,6 +41,12 @@ wasmtime = { version = "28", features = ["component-model", "async"] }
 wasmtime-wasi = "28"
 wasmtime-wasi-http = "28"
 hyper = "1.8"
+# Guest HTTP to a checked address (executor/pinned_http.rs): the versions
+# wasmtime-wasi-http 28 itself builds with, so TLS behaves exactly as before.
+http-body-util = "0.1"
+rustls = "0.22"
+tokio-rustls = "0.25"
+webpki-roots = "0.26"
 wasmparser = "0.220"
 
 # WASM execution (wasmi for WASI Preview 1 support)
