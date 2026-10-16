@@ -2,7 +2,7 @@
 #
 # A build hash computed BEFORE anything is published, live.
 #
-# The claim under test: you can compile a GitHub project yourself, get the
+# The claim under test: you can build a project yourself, reproducibly, get the
 # sha256 the enclave will measure, store a secret locked to that number, and
 # have the very first run read it — without ever having run the project to
 # discover the number first.
@@ -15,11 +15,12 @@
 # number. Every row below is arranged around that.
 #
 # What each row pins:
-#   P0  the hash is computed locally, twice, in the compiler image the deployed
-#       worker uses. Two builds that disagree stop the suite: a number that is
-#       not reproducible cannot be locked to, and a suite that carried on would
-#       be testing a coincidence
-#   P1  the project is published from that repo and commit, and NOT run
+#   P0  the hash is computed locally, twice, in the pinned compiler image
+#       (scripts/build_github_wasm.sh). Two builds that disagree stop the suite:
+#       a number that is not reproducible cannot be locked to, and a suite that
+#       carried on would be testing a coincidence
+#   P1  that file is uploaded to FastFS and published as the project's
+#       version, and NOT run
 #   P2  the secret is stored locked to the hash while the project has never
 #       run. The order is the point — a row written after a first run proves
 #       nothing about knowing the hash in advance.
@@ -35,8 +36,8 @@
 #       it P3 would also pass against a keystore that never consults the lock
 #
 # Needs: PARENT (signs and owns the row), PAYMENT_KEY (the run goes over HTTPS
-# so it yields a call id and therefore an attestation), docker (the hash is
-# computed in the platform's compiler image).
+# so it yields a call id and therefore an attestation), docker (the build runs
+# in the pinned compiler image), and the outlayer CLI on PATH (the upload).
 #
 # Run:
 #   PARENT=you.testnet PAYMENT_KEY=… ./tests/secret_prepublish_hash_e2e.sh --apply
@@ -53,7 +54,7 @@ CANARY="prepublish-canary-$$"
 # The fixture: a project that returns the environment variables it is asked
 # for, which is how a secret becomes observable from outside the guest. Pinned
 # to a commit, not a branch — the hash is a property of a commit, and a moving
-# branch would let the platform build something else.
+# branch would build something else on the next run of this suite.
 SRC_REPO="${SRC_REPO:-https://github.com/out-layer/env-test-example}"
 SRC_COMMIT="${SRC_COMMIT:-74fb4db65ae5bcd7feb819b7cbb9dc969b6fcd65}"
 SRC_TARGET="${SRC_TARGET:-wasm32-wasip1}"
@@ -97,15 +98,18 @@ gate() {
 gate
 
 docker info >/dev/null 2>&1 || {
-  skip "docker is not available (no CLI or no reachable daemon), and the whole point of this suite is computing the hash in the platform's compiler image"
+  skip "docker is not available (no CLI or no reachable daemon), and the whole point of this suite is computing the hash in the pinned compiler image"
   verdict "pre-published build hash"; exit $?
 }
 
 # ── P0 the hash, computed locally, before anything exists ────────────────────
-log "P0 computing the build hash locally, in the platform's compiler image"
+log "P0 computing the build hash locally, in the pinned compiler image"
 BUILD_OUT=$("$SCRIPT_DIR/../scripts/build_github_wasm.sh" \
-  --repo "$SRC_REPO" --commit "$SRC_COMMIT" --target "$SRC_TARGET" --twice 2>&1)
+  --repo "$SRC_REPO" --commit "$SRC_COMMIT" --target "$SRC_TARGET" --twice --keep 2>&1)
 LOCAL_HASH=$(tail -1 <<<"$BUILD_OUT" | tr -d '[:space:]')
+WASM_FILE=$(sed -n 's/^wasm kept at: //p' <<<"$BUILD_OUT" | tail -1)
+KEPT_DIR=$(dirname "$(dirname "$WASM_FILE")")
+trap '[[ "$KEPT_DIR" == */tmp.* ]] && rm -rf "$KEPT_DIR"' EXIT
 if [[ ! "$LOCAL_HASH" =~ ^[0-9a-f]{64}$ ]]; then
   fail "P0 the local build did not yield a hash. A build that does not reproduce cannot be locked to: $(tail -6 <<<"$BUILD_OUT" | head -c 600)"
   verdict "pre-published build hash"; exit $?
@@ -116,20 +120,19 @@ pass "P0 two local builds agree on $LOCAL_HASH"
 # first hex digit rotated, so it is well formed and cannot collide.
 OTHER="$(printf '%x%s' "$(( (16#${LOCAL_HASH:0:1} + 1) % 16 ))" "${LOCAL_HASH:1}")"
 
-# ── P1 publish the commit, without running it ────────────────────────────────
-log "P1 publishing the project from the same repo and commit — no run yet"
-CLONE=$(mktemp -d)
-trap 'rm -rf "$CLONE"' EXIT
-if ! git clone -q "$SRC_REPO" "$CLONE" 2>/dev/null || ! git -C "$CLONE" checkout -q "$SRC_COMMIT" 2>/dev/null; then
-  skip "P1 could not clone $SRC_REPO at $SRC_COMMIT"
+# ── P1 publish that file, without running it ─────────────────────────────────
+log "P1 uploading the built file and publishing it as the project's version — no run yet"
+if ! WASM_URL=$(fastfs_upload "$WASM_FILE" "$LOCAL_HASH"); then
+  fail "P1 the built file could not be uploaded to FastFS"
   verdict "pre-published build hash"; exit $?
 fi
-DEPLOY_OUT=$(cd "$CLONE" && OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" deploy "$PROJECT_NAME" --github --target "$SRC_TARGET" 2>&1)
+DEPLOY_OUT=$(OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" deploy "$PROJECT_NAME" "$WASM_URL" \
+  --hash "$LOCAL_HASH" --target "$SRC_TARGET" 2>&1)
 if grep -qiE "error|failed" <<<"$DEPLOY_OUT" && ! grep -qiE "deployed|activated|version" <<<"$DEPLOY_OUT"; then
   fail "P1 deploy failed: $(near_why "$DEPLOY_OUT")"
   verdict "pre-published build hash"; exit $?
 fi
-pass "P1 published $PROJECT at $SRC_COMMIT"
+pass "P1 published $PROJECT from $WASM_URL"
 
 # ── P2 the secret, locked to the precomputed hash, before any run ────────────
 log "P2 storing the secret locked to that hash — before the project has ever run"
@@ -146,16 +149,16 @@ fi
 # ── the run ──────────────────────────────────────────────────────────────────
 #
 # The module returns the environment variables it is asked for, so the secret is
-# observable from outside the guest. The first call may also compile, which is
-# slower than one HTTP timeout; a timeout is retried once rather than reported
-# as a refusal.
+# observable from outside the guest. The first call also downloads the file,
+# which may be slower than one HTTP timeout; a timeout is retried once rather
+# than reported as a refusal.
 run() {
   local body
   body=$(jq -nc --arg pr "$PROFILE" --arg o "$PARENT" \
     '{input:{env_vars:["USER_SECRET"]}, secrets_ref:{profile:$pr, account_id:$o}}')
   https_post "$PAYMENT_KEY" "$PROJECT" "$body"
   if [[ "$RUN_OK" == absent ]]; then
-    note "no answer within the timeout — the first call compiles; retrying once"
+    note "no answer within the timeout — the first call downloads the file; retrying once"
     https_post "$PAYMENT_KEY" "$PROJECT" "$body"
   fi
 }
@@ -167,7 +170,7 @@ run
 if secret_arrived; then
   pass "P3 a secret locked to a hash computed before publishing was read on the first run"
 else
-  fail "P3 the secret did not arrive. The platform's build of $SRC_COMMIT is not the one computed locally, or the lock refused it: $(jq -r '.error // .message // .status // empty' <<<"$ANS" | head -c 400)"
+  fail "P3 the secret did not arrive. The worker ran other bytes than the published file, or the lock refused it: $(jq -r '.error // .message // .status // empty' <<<"$ANS" | head -c 400)"
 fi
 
 # ── P4 the attestation names the same hash ───────────────────────────────────
@@ -190,7 +193,7 @@ if [[ "$MEASURED" == "$LOCAL_HASH" ]]; then
 elif [[ -z "$MEASURED" ]]; then
   fail "P4 the run left no executed_wasm_sha256, so the measurement cannot be read back"
 else
-  fail "P4 the enclave measured $MEASURED but the local build gave $LOCAL_HASH — the platform does not compile this commit the way scripts/build_github_wasm.sh does"
+  fail "P4 the enclave measured $MEASURED but the published file is $LOCAL_HASH — the worker ran other bytes than the version names"
 fi
 
 # ── P5 the control ───────────────────────────────────────────────────────────

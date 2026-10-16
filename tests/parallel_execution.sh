@@ -10,8 +10,9 @@ set -e
 NUM_TASKS=${1:-5}  # Default: 5 parallel tasks
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 USER_ACCOUNT="${USER_ACCOUNT:-zavodil.testnet}"
-GITHUB_REPO="https://github.com/out-layer/echo-example"
-GITHUB_COMMIT="main"
+# echo-example, published on FastFS
+WASM_URL="https://wasmhub.testnet.fastfs.io/fastfs.testnet/a42ad9cac53669204ab431a52ba1d7314ca8909301106f7cbe64f91e4bf8da1e.wasm"
+WASM_HASH="a42ad9cac53669204ab431a52ba1d7314ca8909301106f7cbe64f91e4bf8da1e"
 
 # Colors
 RED='\033[0;31m'
@@ -38,9 +39,9 @@ submit_task() {
     # Call contract
     local output=$(near contract call-function as-transaction "$CONTRACT_ID" request_execution json-args "{
         \"source\": {
-            \"GitHub\": {
-                \"repo\": \"$GITHUB_REPO\",
-                \"commit\": \"$GITHUB_COMMIT\",
+            \"WasmUrl\": {
+                \"url\": \"$WASM_URL\",
+                \"hash\": \"$WASM_HASH\",
                 \"build_target\": \"wasm32-wasip1\"
             }
         },

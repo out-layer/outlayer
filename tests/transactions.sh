@@ -64,7 +64,7 @@ echo -e "${BLUE}═════════════════════�
 echo ""
 
 echo "📦 Sending execution request..."
-echo "  Repo: https://github.com/out-layer/random-example"
+echo "  WASM: https://wasmhub.testnet.fastfs.io/fastfs.testnet/0bb0668611f0fa9abeabbfaabf48436a46c94aa65ae1a0d106db7212f2d5f88a.wasm"
 echo "  Target: wasm32-wasip1"
 echo "  Input: {\"min\": 100, \"max\": 5000}"
 echo ""
@@ -74,9 +74,9 @@ TX1_OUTPUT=$(near contract call-function as-transaction \
   request_execution \
   json-args '{
     "source": {
-      "GitHub": {
-        "repo": "https://github.com/out-layer/random-example",
-        "commit": "main",
+      "WasmUrl": {
+        "url": "https://wasmhub.testnet.fastfs.io/fastfs.testnet/0bb0668611f0fa9abeabbfaabf48436a46c94aa65ae1a0d106db7212f2d5f88a.wasm",
+        "hash": "0bb0668611f0fa9abeabbfaabf48436a46c94aa65ae1a0d106db7212f2d5f88a",
         "build_target": "wasm32-wasip1"
       }
     },
@@ -120,7 +120,7 @@ if echo "$TX1_OUTPUT" | grep -q -E "(Transaction ID:|succeeded)"; then
     echo ""
 
     echo "📍 Next steps:"
-    echo "  • Worker: Watch for compilation and execution logs"
+    echo "  • Worker: Watch for download and execution logs"
     echo "  • Contract: https://testnet.nearblocks.io/address/$CONTRACT_ID"
     echo ""
 else
@@ -138,7 +138,7 @@ echo -e "${BLUE}═════════════════════�
 echo ""
 
 echo "📦 Sending execution request..."
-echo "  Repo: https://github.com/out-layer/echo-example"
+echo "  WASM: https://wasmhub.testnet.fastfs.io/fastfs.testnet/a42ad9cac53669204ab431a52ba1d7314ca8909301106f7cbe64f91e4bf8da1e.wasm"
 echo "  Target: wasm32-wasip1"
 echo "  Input: Hello, world"
 echo ""
@@ -148,9 +148,9 @@ TX2_OUTPUT=$(near contract call-function as-transaction \
   request_execution \
   json-args '{
     "source": {
-      "GitHub": {
-        "repo": "https://github.com/out-layer/echo-example",
-        "commit": "main",
+      "WasmUrl": {
+        "url": "https://wasmhub.testnet.fastfs.io/fastfs.testnet/a42ad9cac53669204ab431a52ba1d7314ca8909301106f7cbe64f91e4bf8da1e.wasm",
+        "hash": "a42ad9cac53669204ab431a52ba1d7314ca8909301106f7cbe64f91e4bf8da1e",
         "build_target": "wasm32-wasip1"
       }
     },
@@ -194,7 +194,7 @@ if echo "$TX2_OUTPUT" | grep -q -E "(Transaction ID:|succeeded)"; then
     echo ""
 
     echo "📍 Next steps:"
-    echo "  • Worker: Watch for compilation and execution logs"
+    echo "  • Worker: Watch for download and execution logs"
     echo "  • Contract: https://testnet.nearblocks.io/address/$CONTRACT_ID"
     echo ""
 else
@@ -212,7 +212,7 @@ echo -e "${BLUE}═════════════════════�
 echo ""
 
 echo "📦 Sending execution request..."
-echo "  Repo: https://github.com/out-layer/ai-example"
+echo "  WASM: https://wasmhub.testnet.fastfs.io/fastfs.testnet/cbf80ed0080dd62f2041745cdc958ec0fbd192f33aeaa756f7873d742204b2f8.wasm"
 echo "  Target: wasm32-wasip2"
 echo "  Input: AI prompt with encrypted secrets"
 echo ""
@@ -227,9 +227,9 @@ TX2_OUTPUT=$(near contract call-function as-transaction \
   request_execution \
   json-args '{
     "source": {
-      "GitHub": {
-        "repo": "https://github.com/out-layer/ai-example",
-        "commit": "main",
+      "WasmUrl": {
+        "url": "https://wasmhub.testnet.fastfs.io/fastfs.testnet/cbf80ed0080dd62f2041745cdc958ec0fbd192f33aeaa756f7873d742204b2f8.wasm",
+        "hash": "41c1c7b3528565f3fd139943f439d61c0768e9abdb9b579bd0921ecbfcabeded",
         "build_target": "wasm32-wasip2"
       }
     },
@@ -287,7 +287,7 @@ elif echo "$TX2_OUTPUT" | grep -q -E "(Transaction ID:|succeeded)"; then
     echo ""
 
     echo "📍 Next steps:"
-    echo "  • Worker: Watch for compilation and execution logs"
+    echo "  • Worker: Watch for download and execution logs"
     echo "  • Contract: https://testnet.nearblocks.io/address/$CONTRACT_ID"
     echo ""
 else

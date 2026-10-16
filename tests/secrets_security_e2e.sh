@@ -942,8 +942,8 @@ fi
 
 # ── C6 the first call after a version switch ──────────────────────────────────
 #
-# Activating a version means the next call finds no compiled wasm cached, so the
-# coordinator compiles and RE-QUEUES the execute task. A reference dropped on
+# Activating a version means the next call finds its wasm not cached yet, so the
+# coordinator queues the download and RE-QUEUES the execute task. A reference dropped on
 # that path would strand exactly the first caller after every publish.
 if ! want C6; then
   :

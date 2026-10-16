@@ -16,12 +16,6 @@
 #   S7  bind must match how the code is run: the `wasm` build published as a
 #       project version and run through the project → refused; the project
 #       build run directly from its wasm URL → refused. No key in either answer
-#   S8  a GitHub run whose manifest declares signing_keys → refused before it
-#       runs, no key material in the answer; with GITHUB_PROJECT_VERSION=1, a
-#       project version published from that repository too. Needs
-#       GITHUB_PROBE_REPO + GITHUB_PROBE_COMMIT (a repository whose ROOT is this
-#       probe, the commit pushed): the platform builds a repository at its root
-#       and has no subdirectory field, so out-layer/outlayer cannot be used
 #   S9  every attack answers with a status and a message, in a run that succeeds
 #   S10 naming a vault for a key declared without one → err
 #   S11 no seed in any answer: every 32-byte value in every answer of the run
@@ -65,7 +59,7 @@
 # wasi-examples/test-storage-ark/relay-contract (its `outlayer()` must be
 # $CONTRACT_ID).
 #
-# Env: OFFLINE=1 (dry run only: no chain or GitHub reads; ignored with --apply).
+# Env: OFFLINE=1 (dry run only: no chain reads; ignored with --apply).
 #
 # Money: seven FastFS uploads (~230 KB each), project storage, and one on-chain
 # run per probe at $DEPOSIT (~27 runs; a relayed run's unused deposit comes
@@ -74,7 +68,6 @@
 # Run:
 #   PARENT=you.testnet CALLER2=friend.testnet ./tests/signing_keys_e2e.sh            # dry run: checks, no writes
 #   PARENT=you.testnet CALLER2=friend.testnet ./tests/signing_keys_e2e.sh --apply    # build, upload, publish, run
-#   … GITHUB_PROBE_REPO=https://github.com/you/signing-key-probe GITHUB_PROBE_COMMIT=<sha> … --apply
 #   … RELAY_CONTRACT=relay.you.testnet … --apply                                     # with S22's relayed half
 
 set -uo pipefail
@@ -90,9 +83,6 @@ CALLER2="${CALLER2:-}"
 PROJECT_NAME="${PROJECT_NAME:-signing-key-probe}"
 PROJECT="$PARENT/$PROJECT_NAME"
 DEPOSIT="${DEPOSIT:-0.1 NEAR}"
-GITHUB_PROBE_REPO="${GITHUB_PROBE_REPO:-}"
-GITHUB_PROBE_COMMIT="${GITHUB_PROBE_COMMIT:-}"
-GITHUB_PROJECT_VERSION="${GITHUB_PROJECT_VERSION:-0}"
 RELAY_CONTRACT="${RELAY_CONTRACT:-}"
 OFFLINE="${OFFLINE:-0}"
 [[ "$APPLY" == true ]] && OFFLINE=0
@@ -153,7 +143,7 @@ call() { call_on "$1" "$CONTRACT_ID" "$2" "$3" "$4"; } # call <signer> <method> 
 # absent), RUN_ERR (the refusal) and RUN_OUT (the probe's own answer), and
 # appends everything that came back to $ANSWERS. The completion event is read
 # from the send's own transcript, or polled from the transaction when the run
-# outlives it (a GitHub source compiles first). `run_relayed` is the same run
+# outlives it. `run_relayed` is the same run
 # reached through $RELAY_CONTRACT: its predecessor is the relay, its signer
 # `<signer>`, and the relay returns the run's answer as its own.
 RUN_OK=""; RUN_ERR=""; RUN_OUT=""
@@ -206,7 +196,6 @@ project_src() { # project_src [version_key]
   else jq -nc --arg p "$PROJECT" '{Project:{project_id:$p}}'; fi
 }
 wasm_src() { jq -nc --arg u "$1" --arg h "$2" '{WasmUrl:{url:$u, hash:$h, build_target:"wasm32-wasip2"}}'; }
-github_src() { jq -nc --arg r "$GITHUB_PROBE_REPO" --arg c "$GITHUB_PROBE_COMMIT" '{GitHub:{repo:$r, commit:$c, build_target:"wasm32-wasip2"}}'; }
 
 out_field() { jq -r "$1 | if . == null then \"\" else tostring end" <<<"$RUN_OUT" 2>/dev/null; }
 
@@ -300,21 +289,6 @@ if [[ -n "$CREDS_MISSING" ]]; then
   warn "no key in $CREDS_DIR for: ${CREDS_MISSING}— --apply will stop here"
 fi
 
-# The GitHub row's commit must be one the platform can fetch.
-GITHUB_READY=false
-GITHUB_WHY="GITHUB_PROBE_REPO and GITHUB_PROBE_COMMIT are unset"
-if [[ -n "$GITHUB_PROBE_REPO" && -n "$GITHUB_PROBE_COMMIT" && "$OFFLINE" == 1 ]]; then
-  GITHUB_WHY="OFFLINE=1: $GITHUB_PROBE_REPO@${GITHUB_PROBE_COMMIT:0:12} not checked"
-elif [[ -n "$GITHUB_PROBE_REPO" && -n "$GITHUB_PROBE_COMMIT" ]]; then
-  slug=$(sed -E 's#^https://github.com/##; s#\.git$##; s#/$##' <<<"$GITHUB_PROBE_REPO")
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://api.github.com/repos/$slug/commits/$GITHUB_PROBE_COMMIT")
-  if [[ "$code" == "200" ]]; then
-    GITHUB_READY=true
-  else
-    GITHUB_WHY="$GITHUB_PROBE_REPO@${GITHUB_PROBE_COMMIT:0:12} is not a pushed public commit (GitHub answered $code)"
-  fi
-fi
-
 # S22's relayed half needs the relay deployed, relaying to this contract. A
 # relay named but unusable stops --apply: the rows it was named for would not run.
 RELAY_READY=false
@@ -350,7 +324,6 @@ if [[ "$APPLY" != true ]]; then
       note "$v: not built yet (--apply runs $PROBE_DIR/build.sh)"
     fi
   done
-  if [[ "$GITHUB_READY" == true ]]; then note "S8: $GITHUB_PROBE_REPO@${GITHUB_PROBE_COMMIT:0:12} is pushed"; else warn "S8 will SKIP: $GITHUB_WHY"; fi
   if [[ "$RELAY_READY" == true ]]; then note "S22 relayed: $RELAY_CONTRACT relays to $CONTRACT_ID"; else warn "S22 relayed half will SKIP: $RELAY_WHY"; fi
   echo "  Pass --apply to run." >&2
   exit 0
@@ -526,46 +499,6 @@ run_src "$PARENT" "$(project_src "$H_W")" '{"operation":"all_public_keys"}'
 refused_without_keys "S7 the wasm build as a project version" 'bound to the build|only to a direct run'
 run_src "$PARENT" "$(wasm_src "$U_P" "$H_P")" '{"operation":"all_public_keys"}'
 refused_without_keys "S7 the project build run directly" 'bound to the project|direct run with no project'
-
-# ── S8 GitHub ────────────────────────────────────────────────────────────────
-
-log "S8 code built from GitHub gets no keys"
-github_verdict() { # github_verdict <row>
-  if [[ "$RUN_OK" == "true" ]]; then
-    # The platform strips a wasm32-wasip2 build with `wasm-tools strip`, which
-    # drops custom sections — the manifest with them. A run then declares
-    # nothing: no keys are asked for, and none may be served.
-    if [[ "$(out_field .status)" == "err" ]] && grep -q "declares none" <<<"$(out_field .message)"; then
-      finding "$1 — the run happened with NO keys: the platform's GitHub build dropped the outlayer.manifest section, so nothing was declared (build.sh reports this). No key was served"
-    else
-      fail "$1 — a GitHub-built run was served keys: $(head -c 300 <<<"$RUN_OUT")"
-    fi
-    return
-  fi
-  refused_without_keys "$1" 'GitHub|repository|not a WasmUrl version'
-}
-if [[ "$GITHUB_READY" != true ]]; then
-  skip "S8 $GITHUB_WHY — set GITHUB_PROBE_REPO (a repository whose ROOT is wasi-examples/signing-key-probe) and a pushed GITHUB_PROBE_COMMIT"
-else
-  note "S8 the first run compiles $GITHUB_PROBE_REPO@${GITHUB_PROBE_COMMIT:0:12} — minutes"
-  run_src "$PARENT" "$(github_src)" '{"operation":"all_public_keys"}'
-  github_verdict "S8 a direct GitHub run"
-  if [[ "$GITHUB_PROJECT_VERSION" == 1 ]]; then
-    gkey="${GITHUB_PROBE_REPO}@${GITHUB_PROBE_COMMIT}"
-    if [[ -z "$(version_on_chain "$gkey")" ]]; then
-      call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(github_src)" '{project_name:$n, source:$s, set_active:false}')" '0.1 NEAR' >/dev/null
-      sleep 4
-    fi
-    if [[ "$(version_on_chain "$gkey")" == "GitHub" ]]; then
-      run_src "$PARENT" "$(project_src "$gkey")" '{"operation":"all_public_keys"}'
-      github_verdict "S8 a project version published from GitHub"
-    else
-      fail "S8 the GitHub version could not be published under $PROJECT"
-    fi
-  else
-    skip "S8 a project version from GitHub — pass GITHUB_PROJECT_VERSION=1 to publish one under $PROJECT"
-  fi
-fi
 
 # ── S9 attacks ───────────────────────────────────────────────────────────────
 

@@ -22,8 +22,7 @@ echo "📝 Configuration:"
 echo "  Contract: $CONTRACT_ID"
 echo "  Caller: $CALLER_ACCOUNT"
 echo "  Payment: $PAYMENT NEAR"
-echo "  Repo: https://github.com/out-layer/random-example"
-echo "  Commit: main"
+echo "  WASM: https://wasmhub.testnet.fastfs.io/fastfs.testnet/0bb0668611f0fa9abeabbfaabf48436a46c94aa65ae1a0d106db7212f2d5f88a.wasm"
 echo ""
 
 # Check prerequisites
@@ -55,9 +54,9 @@ echo ""
 near contract call-function as-transaction "$CONTRACT_ID" request_execution json-args \
 '{
   "source": {
-    "GitHub": {
-      "repo": "https://github.com/out-layer/random-example",
-      "commit": "main",
+    "WasmUrl": {
+      "url": "https://wasmhub.testnet.fastfs.io/fastfs.testnet/0bb0668611f0fa9abeabbfaabf48436a46c94aa65ae1a0d106db7212f2d5f88a.wasm",
+      "hash": "0bb0668611f0fa9abeabbfaabf48436a46c94aa65ae1a0d106db7212f2d5f88a",
       "build_target": "wasm32-wasip1"
     }
   },

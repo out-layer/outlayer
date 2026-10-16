@@ -11,9 +11,9 @@ NUM_TASKS=${1:-3}  # Default: 3 parallel tasks (AI is expensive)
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 USER_ACCOUNT="${USER_ACCOUNT:-zavodil.testnet}"
 
-# GitHub repo that uses NEAR.ai API (free, no API key needed)
-GITHUB_REPO="https://github.com/out-layer/ai-example"
-GITHUB_COMMIT="main"
+# ai-example (NEAR.ai API, free, no API key needed), published on FastFS
+WASM_URL="https://wasmhub.testnet.fastfs.io/fastfs.testnet/cbf80ed0080dd62f2041745cdc958ec0fbd192f33aeaa756f7873d742204b2f8.wasm"
+WASM_HASH="41c1c7b3528565f3fd139943f439d61c0768e9abdb9b579bd0921ecbfcabeded"
 BUILD_TARGET="wasm32-wasip2"
 
 # AI prompts for variety
@@ -73,10 +73,10 @@ submit_ai_task() {
     # Build JSON payload with escaped prompt
     local json_payload="{
     \"source\": {
-      \"GitHub\": {
-        \"repo\": \"https://github.com/out-layer/ai-example\",
-        \"commit\": \"main\",
-        \"build_target\": \"wasm32-wasip2\"
+      \"WasmUrl\": {
+        \"url\": \"$WASM_URL\",
+        \"hash\": \"$WASM_HASH\",
+        \"build_target\": \"$BUILD_TARGET\"
       }
     },
     \"resource_limits\": {

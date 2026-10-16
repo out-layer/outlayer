@@ -31,9 +31,7 @@
 #   E5  bind must match how the code is run: the wasm build run through the
 #       project, and the predecessor build (bind project) run directly →
 #       refused, naming the encryption key, no key material in the answer. A
-#       GitHub run declaring encryption keys → refused (needs
-#       GITHUB_ENC_PROBE_REPO + GITHUB_ENC_PROBE_COMMIT; see Needs). A vault
-#       key is SKIPPED: it needs a vault the project's owner holds
+#       vault key is SKIPPED: it needs a vault the project's owner holds
 #   E6  caller predecessor: on a direct call the predecessor is the signer,
 #       and the predecessor key at alpha is NOT the signer key at alpha (the
 #       caller kind is a derivation segment); $CALLER2 gets another one.
@@ -108,14 +106,6 @@
 # the deployed wasi-examples/test-storage-ark/relay-contract (its `outlayer()`
 # must be $CONTRACT_ID). PSQL_CMD (tests/lib/hos_common.sh) adds the SC rows'
 # storage_data reads.
-# For E5's GitHub row: GITHUB_ENC_PROBE_REPO + GITHUB_ENC_PROBE_COMMIT — a
-# public repository whose ROOT is this probe with `default = ["encryption-wasm"]`
-# in Cargo.toml (the platform builds the default features; `encryption-wasm`
-# declares encryption keys only, so the refusal is the encryption family's),
-# the commit pushed. GITHUB_PROJECT_VERSION=1 also publishes it as a version of
-# $PROJECT. Not the signing suite's GITHUB_PROBE_REPO: its default build
-# declares signing keys, and its refusal names those.
-#
 # For H: HTTPS_PAYMENT_KEY, a funded payment key (owner:nonce:secret) whose
 # owner is $PARENT, in the environment only; HTTPS_OTHER_PAYMENT_KEY (another
 # owner) adds the "another owner, other keys" rows. Without HTTPS_PAYMENT_KEY, H
@@ -123,7 +113,7 @@
 #
 # Env: PROJECT_NAME (default encryption-key-probe), DEPOSIT (default 0.1 NEAR),
 # ONLY=E1,E8,SC,E11,H (a subset; fixtures a row needs are made on demand), OFFLINE=1
-# (dry run only: no chain or GitHub reads).
+# (dry run only: no chain reads).
 #
 # Money: eight FastFS uploads (~300 KB each), a project and five versions
 # (0.3 + 5 × 0.1 NEAR, once), a few storage rows, and ~85 on-chain runs at
@@ -133,7 +123,6 @@
 # Run:
 #   PARENT=you.testnet CALLER2=friend.testnet ./tests/encryption_keys_e2e.sh            # dry run: checks, no writes
 #   PARENT=you.testnet CALLER2=friend.testnet ./tests/encryption_keys_e2e.sh --apply    # build, upload, publish, run
-#   … GITHUB_ENC_PROBE_REPO=https://github.com/you/enc-key-probe GITHUB_ENC_PROBE_COMMIT=<sha> … --apply
 #   … RELAY_CONTRACT=relay.you.testnet … --apply                                     # with the relayed rows
 
 set -uo pipefail
@@ -150,9 +139,6 @@ PROJECT_NAME="${PROJECT_NAME:-encryption-key-probe}"
 PROJECT="$PARENT/$PROJECT_NAME"
 DEPOSIT="${DEPOSIT:-0.1 NEAR}"
 OFFLINE="${OFFLINE:-0}"
-GITHUB_ENC_PROBE_REPO="${GITHUB_ENC_PROBE_REPO:-}"
-GITHUB_ENC_PROBE_COMMIT="${GITHUB_ENC_PROBE_COMMIT:-}"
-GITHUB_PROJECT_VERSION="${GITHUB_PROJECT_VERSION:-0}"
 RELAY_CONTRACT="${RELAY_CONTRACT:-}"
 PROBE_DIR="$REPO_ROOT/wasi-examples/signing-key-probe"
 VARIANTS="$PROBE_DIR/target/variants"
@@ -221,7 +207,7 @@ call() { call_on "$1" "$CONTRACT_ID" "$2" "$3" "$4"; } # call <signer> <method> 
 # absent), RUN_ERR (the refusal) and RUN_OUT (the probe's own answer), and
 # appends everything that came back to $ANSWERS. The completion event is read
 # from the send's own transcript, or polled from the transaction when the run
-# outlives it (a GitHub source compiles first). `run_relayed` is the same run
+# outlives it. `run_relayed` is the same run
 # reached through $RELAY_CONTRACT: its predecessor is the relay, its signer
 # `<signer>`, and the relay returns the run's answer as its own.
 RUN_OK=""; RUN_ERR=""; RUN_OUT=""
@@ -274,7 +260,6 @@ project_src() { # project_src [version_key]
   else jq -nc --arg p "$PROJECT" '{Project:{project_id:$p}}'; fi
 }
 wasm_src() { jq -nc --arg u "$1" --arg h "$2" '{WasmUrl:{url:$u, hash:$h, build_target:"wasm32-wasip2"}}'; }
-github_src() { jq -nc --arg r "$GITHUB_ENC_PROBE_REPO" --arg c "$GITHUB_ENC_PROBE_COMMIT" '{GitHub:{repo:$r, commit:$c, build_target:"wasm32-wasip2"}}'; }
 
 # Shorthands: a run of one build through the project, or directly.
 via_project() { run_src "$1" "$(project_src "$(get_for hash "$2")")" "$3"; }   # via_project <signer> <build> <input>
@@ -404,23 +389,6 @@ if [[ -n "$CREDS_MISSING" ]]; then
   warn "no key in $CREDS_DIR for: ${CREDS_MISSING}— --apply will stop here"
 fi
 
-# The GitHub row's commit must be one the platform can fetch.
-GITHUB_READY=false
-GITHUB_WHY="GITHUB_ENC_PROBE_REPO and GITHUB_ENC_PROBE_COMMIT are unset"
-if [[ -n "$GITHUB_ENC_PROBE_REPO" && -n "$GITHUB_ENC_PROBE_COMMIT" ]]; then
-  if [[ "$OFFLINE" == 1 ]]; then
-    GITHUB_WHY="OFFLINE=1: $GITHUB_ENC_PROBE_REPO@${GITHUB_ENC_PROBE_COMMIT:0:12} not checked"
-  else
-    slug=$(sed -E 's#^https://github.com/##; s#\.git$##; s#/$##' <<<"$GITHUB_ENC_PROBE_REPO")
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://api.github.com/repos/$slug/commits/$GITHUB_ENC_PROBE_COMMIT")
-    if [[ "$code" == "200" ]]; then
-      GITHUB_READY=true
-    else
-      GITHUB_WHY="$GITHUB_ENC_PROBE_REPO@${GITHUB_ENC_PROBE_COMMIT:0:12} is not a pushed public commit (GitHub answered $code)"
-    fi
-  fi
-fi
-
 # E6's relayed half, SC1 and SC2 need the relay deployed, relaying to this
 # contract. A relay named but unusable stops --apply: the rows it was named for
 # would not run.
@@ -475,7 +443,6 @@ if [[ "$APPLY" != true ]]; then
       note "$v: not built yet (--apply runs $PROBE_DIR/build.sh)"
     fi
   done
-  if [[ "$GITHUB_READY" == true ]]; then note "E5 GitHub: $GITHUB_ENC_PROBE_REPO@${GITHUB_ENC_PROBE_COMMIT:0:12} is pushed"; else warn "E5 GitHub will SKIP: $GITHUB_WHY"; fi
   if [[ "$RELAY_READY" == true ]]; then note "E6 relayed, SC1, SC2: $RELAY_CONTRACT relays to $CONTRACT_ID"; else warn "E6 relayed half, SC1 and SC2 will SKIP: $RELAY_WHY"; fi
   [[ -n "${ONLY:-}" ]] && note "ONLY=$ONLY"
   echo "  Pass --apply to run." >&2
@@ -687,40 +654,6 @@ if want E5; then
   direct "$PARENT" encryption-pred '{"operation":"all_encryption_keys"}'
   refused_without_keys "E5 a project-bound build run directly" 'encryption key .*bound to the project'
   skip "E5 a vault key — the encryption-vault build names vault.alice.near; a live run needs a vault owned by the project's owner ($PARENT), and the vault rules are pinned by worker/tests/encryption_key_probe.rs and the keystore's unit tests"
-
-  github_verdict() { # github_verdict <row>
-    if [[ "$RUN_OK" == "true" ]]; then
-      if [[ "$(out_field .status)" == "err" ]] && grep -qiE "no encryption key|declares none" <<<"$(out_field .message)"; then
-        finding "$1 — the run happened with NO keys: the GitHub build dropped the outlayer.manifest section, so nothing was declared. No key was served"
-      else
-        fail "$1 — a GitHub-built run was served encryption keys: $(head -c 300 <<<"$RUN_OUT")"
-      fi
-      return
-    fi
-    refused_without_keys "$1" 'gets no encryption keys'
-  }
-  if [[ "$GITHUB_READY" != true ]]; then
-    skip "E5 GitHub — $GITHUB_WHY; set GITHUB_ENC_PROBE_REPO (a repository whose ROOT is this probe, default feature encryption-wasm) and a pushed GITHUB_ENC_PROBE_COMMIT"
-  else
-    note "E5 the first GitHub run compiles $GITHUB_ENC_PROBE_REPO@${GITHUB_ENC_PROBE_COMMIT:0:12} — minutes"
-    run_src "$PARENT" "$(github_src)" '{"operation":"all_encryption_keys"}'
-    github_verdict "E5 a direct GitHub run"
-    if [[ "$GITHUB_PROJECT_VERSION" == 1 ]]; then
-      gkey="${GITHUB_ENC_PROBE_REPO}@${GITHUB_ENC_PROBE_COMMIT}"
-      if [[ -z "$(version_on_chain "$gkey")" ]]; then
-        call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(github_src)" '{project_name:$n, source:$s, set_active:false}')" '0.1 NEAR' >/dev/null
-        sleep 4
-      fi
-      if [[ "$(version_on_chain "$gkey")" == "GitHub" ]]; then
-        run_src "$PARENT" "$(project_src "$gkey")" '{"operation":"all_encryption_keys"}'
-        github_verdict "E5 a project version published from GitHub"
-      else
-        fail "E5 the GitHub version could not be published under $PROJECT"
-      fi
-    else
-      skip "E5 a project version from GitHub — pass GITHUB_PROJECT_VERSION=1 to publish one under $PROJECT"
-    fi
-  fi
 fi
 
 # ── E6 caller predecessor ────────────────────────────────────────────────────
