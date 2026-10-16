@@ -248,7 +248,7 @@ onchain() {  # onchain <input-json> <attached_usd> → the guest's answer on std
         resource_limits:{max_instructions:1000000000,max_memory_mb:128,max_execution_seconds:30},
         params:{attached_usd:$u}}')" \
     prepaid-gas '300.0 Tgas' attached-deposit '0.1 NEAR' \
-    sign-as "$CALLER" network-config "$NETWORK" sign-with-keychain send 2>&1)
+    sign-as "$CALLER" network-config "$NETWORK" sign-with-legacy-keychain send 2>&1)
   local value
   value=$(grep -E '^".*"$' <<<"$out" | tail -1)
   if [[ -z "$value" ]]; then

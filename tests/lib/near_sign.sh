@@ -51,7 +51,9 @@ curl() {
 # output can hold the RPC URL — a transport error echoes the endpoint, key and
 # all — so a suite never prints it, not even its tail. This picks the contract's
 # panic, else the error class, else the CLI's own `Error:` line; anything picked
-# that is URL-shaped is withheld whole rather than filtered. Byte-wise (`LC_ALL=C
+# that is URL-shaped (a scheme followed by a host, or the RPC's own names) is
+# withheld whole rather than filtered. A panic that only names a scheme —
+# "must be an https:// URL" — is the contract's words and is shown. Byte-wise (`LC_ALL=C
 # grep -a`): a panic with non-ASCII text makes BSD grep call the output binary.
 #   near_why "$OUT"          near_why < file
 near_why() {
@@ -67,7 +69,7 @@ near_why() {
   fi
   if [[ -z "$m" ]]; then
     echo "no contract or CLI error in the output (withheld: it can carry the RPC URL)"
-  elif LC_ALL=C grep -aqiE 'https?:|apikey|rpc\.|fastnear' <<<"$m"; then
+  elif LC_ALL=C grep -aqiE 'https?://[a-z0-9]|apikey|rpc\.|fastnear' <<<"$m"; then
     echo "a transport error (withheld: it names the RPC endpoint)"
   else
     LC_ALL=C tr '\n' ' ' <<<"$m"

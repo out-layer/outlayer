@@ -43,6 +43,7 @@ log()  { printf '\n\033[36m▶ %s\033[0m\n' "$*" >&2; }
 # (with the last served sha256 on stderr) when the bytes never arrive.
 fastfs_upload() { # fastfs_upload <file> <sha256>
   local up url="" got="" attempt i
+  command -v outlayer >/dev/null || { echo "fastfs_upload: the outlayer CLI is not on PATH" >&2; return 1; }
   for attempt in 1 2 3; do
     up=$(OUTLAYER_RPC_URL="$RPC_URL" outlayer upload "$1" 2>&1)
     url=$(grep -oE 'https://[A-Za-z0-9._-]+\.fastfs\.io/[^[:space:]"]+\.wasm' <<<"$up" | head -1)
