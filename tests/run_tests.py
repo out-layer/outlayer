@@ -10,7 +10,7 @@ task or piped shell) that `script` invocation dies with
 allocates a tty for the whole test subprocess so the inner `script` works.
 
 Reads env vars from tests/.env.tests (gitignored). Required:
-    API_AUTH_TOKEN  MPC_PUBLIC_KEY  PARENT  APPROVER  NETWORK
+    MPC_PUBLIC_KEY  PARENT  APPROVER  NETWORK
 
 Usage:
     ./tests/run_tests.py                          # default battery
@@ -29,7 +29,7 @@ from pathlib import Path
 TESTS_DIR = Path(__file__).resolve().parent
 ENV_FILE = TESTS_DIR / ".env.tests"
 
-REQUIRED_ENV = ["API_AUTH_TOKEN", "MPC_PUBLIC_KEY", "PARENT", "APPROVER", "NETWORK"]
+REQUIRED_ENV = ["MPC_PUBLIC_KEY", "PARENT", "APPROVER", "NETWORK"]
 
 # Tests that MUST pass before any PR touching the wallet-id derivation
 # layer (coordinator/auth.rs, customer-recovery, keystore-worker mpc_ckd).

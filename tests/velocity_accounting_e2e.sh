@@ -547,9 +547,11 @@ fi
 # The caller picks both the deposit and the receiver, so this is not a corner:
 # it is the shape an agent would use to move money past its own ceiling.
 #
-# EMPTY request on purpose — no decoded effects at all, so the only thing that
-# can move the counter is the deposit itself. Minus the marker, which proves a
-# key rather than paying anyone.
+# The smallest request the door takes — one transfer of 1 yocto (a request
+# with no operation is refused) — so the deposit is nearly all that can move
+# the counter: the expected growth is the deposit, less the 1-yocto marker
+# that proves a key rather than paying anyone, plus the 1 yocto transferred.
+# A deposit that is not counted shows as a growth of 1.
 log "U12 a door call with an outer deposit above the marker"
 OUTER=1000001
 U12_POLICY="missing"
@@ -561,12 +563,14 @@ if ! store_policy "$BINDING_SEED" "$BOUND_WID" \
 else
   U12_POLICY="stored"
   B=$(usage_of "$BOUND_WID" "$(today_daily)")
-  door_call '{"request":{}}' "$OUTER"
+  door_call "$(jq -nc --arg to "$PARENT" \
+      '{request:{external:[{receiver_id:$to, actions:[{action:"transfer", payload:{amount:"1"}}]}]}}')" \
+    "$OUTER"
   note "U12 answer: HTTP $OUT_HTTP $(jq -r '.status // .error // "?"' <<<"$OUT" 2>/dev/null)"
   if [[ "$OUT_HTTP" != "200" ]]; then
     fail "U12 the call did not reach the chain (HTTP $OUT_HTTP: $(head -c 160 <<<"$OUT")) — a refusal costs nothing by design and proves nothing about this rule"
   else
-    judge "U12" "$BOUND_WID" "$B" "$((OUTER - 1))" "the deposit the caller attached, less the 1-yocto marker — the door is not a free way past the ceiling"
+    judge "U12" "$BOUND_WID" "$B" "$OUTER" "the deposit the caller attached, less the 1-yocto marker, plus the 1 yocto transferred — the door is not a free way past the ceiling"
   fi
 fi
 

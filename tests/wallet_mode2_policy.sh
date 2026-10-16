@@ -10,7 +10,11 @@
 #   5. Approver signs, threshold met, auto-execute
 #
 # Prerequisites:
-#   - Coordinator running on localhost:8080
+#   - Coordinator running on localhost:8080. Steps 2, 14 and 15 call /internal/*
+#     with a worker token (WORKER_AUTH_TOKEN); a deployed coordinator answers
+#     those only from a worker host with a TEE session, so against one they are
+#     skipped with that reason, and the policy-enforcement steps that need step
+#     2's policy are skipped with them.
 #   - Keystore running on localhost:8081
 #   - PostgreSQL + Redis running
 # ============================================================================
@@ -222,8 +226,13 @@ if [ "$HAS_POLICY" = true ] && [ -n "$WORKER_TOKEN" ]; then
         -d "$ACTIVATE_BODY" \
         "${COORDINATOR_URL}/internal/activate-policy")
     parse_response "$RESP"
-    assert_status "200" "$RESP_CODE" "POST /internal/activate-policy"
-    POLICY_ACTIVE=true
+    if [ "$RESP_CODE" = "401" ] || [ "$RESP_CODE" = "403" ]; then
+        skip_test "activate policy" "HTTP $RESP_CODE: this coordinator answers /internal/* only from a TEE worker — run against a local coordinator"
+        POLICY_ACTIVE=false
+    else
+        assert_status "200" "$RESP_CODE" "POST /internal/activate-policy"
+        POLICY_ACTIVE=true
+    fi
 elif [ "$HAS_POLICY" = true ]; then
     skip_test "activate policy" "set WORKER_AUTH_TOKEN to test"
     POLICY_ACTIVE=false
@@ -370,8 +379,12 @@ if [ -n "$WORKER_TOKEN" ]; then
         -H "X-Wallet-Id: $WALLET_ID" \
         "${COORDINATOR_URL}/internal/wallet-check?wallet_id=$ENCODED_WID")
     parse_response "$RESP"
-    assert_status "200" "$RESP_CODE" "GET /internal/wallet-check?wallet_id=..."
-    echo "  Response: $(echo "$RESP_BODY" | jq -c '.' 2>/dev/null || echo "${RESP_BODY:0:80}")"
+    if [ "$RESP_CODE" = "401" ] || [ "$RESP_CODE" = "403" ]; then
+        skip_test "internal wallet-check" "HTTP $RESP_CODE: this coordinator answers /internal/* only from a TEE worker"
+    else
+        assert_status "200" "$RESP_CODE" "GET /internal/wallet-check?wallet_id=..."
+        echo "  Response: $(echo "$RESP_BODY" | jq -c '.' 2>/dev/null || echo "${RESP_BODY:0:80}")"
+    fi
 else
     skip_test "internal wallet-check" "set WORKER_AUTH_TOKEN to test"
 fi
@@ -388,7 +401,11 @@ if [ -n "$WORKER_TOKEN" ]; then
         -d "$AUDIT_BODY" \
         "${COORDINATOR_URL}/internal/wallet-audit")
     parse_response "$RESP"
-    assert_status "200" "$RESP_CODE" "POST /internal/wallet-audit"
+    if [ "$RESP_CODE" = "401" ] || [ "$RESP_CODE" = "403" ]; then
+        skip_test "internal wallet-audit" "HTTP $RESP_CODE: this coordinator answers /internal/* only from a TEE worker"
+    else
+        assert_status "200" "$RESP_CODE" "POST /internal/wallet-audit"
+    fi
 else
     skip_test "internal wallet-audit" "set WORKER_AUTH_TOKEN to test"
 fi

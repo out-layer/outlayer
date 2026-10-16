@@ -1,28 +1,29 @@
 #!/bin/bash
-# /internal/wallet-policy-sync e2e — exercises the indexer-triggered
-# decrypt path for two wallet creation flows:
+# The indexer-triggered policy sync, live: a policy stored on chain reaches the
+# coordinator through the TEE worker, which reads the chain event and calls
+# /internal/wallet-policy-sync with its TEE session. The route answers only a
+# TEE worker, so this suite never calls it; it stores the policy and judges what
+# the worker's call left behind, for two wallet creation flows:
 #
-#   A. Bearer near: + vault_id (the stateless flow that doesn't write
-#      `wallet_accounts.vault_id` or `wallet_api_keys.customer_account_id`)
-#   B. POST /register {vault_id} (legacy wk_ path — writes both)
+#   A. Bearer near: + vault_id (the stateless flow, whose vault the coordinator
+#      learns from encrypt-policy)
+#   B. POST /register {vault_id} (the wk_ flow)
 #
-# Pre-fix expectation:
-#   A → 500 (AEAD failure: policy encrypted under per-vault master,
-#         decrypt path resolves scope=None via lookup_wallet_vault_id)
-#   B → 200 ok (lookup_wallet_vault_id returns the vault)
-#
-# Post-fix expectation (encrypt-policy persists wallet_accounts.vault_id):
-#   A → 200 ok
-#   B → 200 ok (unchanged)
+# For each: the coordinator's copy of the policy (wallet_accounts.policy_json)
+# appears with the stored rules, and the coordinator log shows
+# "Policy sync complete: wallet=<id>" and no "Lazy-synced policy" for it —
+# the copy came from the worker, not from a lazy decrypt on first use.
 #
 # Required env:
-#   PARENT              NEAR account that owns the vault (must have outlayer login)
-#   API_AUTH_TOKEN      plaintext worker token (hash is in worker_auth_tokens)
+#   PARENT              NEAR account that owns the vault (its key in the legacy keychain;
+#                       `outlayer` logged in as it)
+#   APPROVER            the policy's approver (default outlayer-bob.testnet)
+#   PSQL_CMD            the coordinator's testnet DB, one statement
+#   COORD_SSH           the coordinator host, for its log (from .env.nodes)
 #   COORDINATOR_URL     default https://testnet-api.outlayer.ai
 #
 # Run:
-#   API_AUTH_TOKEN=... PARENT=zavodil2.testnet \
-#       ./tests/internal_policy_sync_e2e.sh --apply
+#   PARENT=outlayer-alice.testnet PSQL_CMD=… ./tests/internal_policy_sync_e2e.sh --apply
 
 set -euo pipefail
 
@@ -33,12 +34,17 @@ APPLY=false
 NETWORK="${NETWORK:-testnet}"
 PARENT="${PARENT:-}"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_URL, or a warning
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/near_sign.sh"   # near_why
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -f "$REPO_ROOT/.env.nodes" ]] && { set -a; source "$REPO_ROOT/.env.nodes"; set +a; }
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 COORDINATOR_URL="${COORDINATOR_URL:-https://testnet-api.outlayer.ai}"
-APPROVER="${APPROVER:-zavodil.testnet}"
+APPROVER="${APPROVER:-outlayer-bob.testnet}"
 
-[[ -n "$PARENT" ]] || { echo "USAGE: PARENT=... API_AUTH_TOKEN=... $0 --apply" >&2; exit 1; }
-[[ -n "${API_AUTH_TOKEN:-}" ]] || { echo "✗ API_AUTH_TOKEN env required (worker plaintext token)" >&2; exit 1; }
+[[ -n "$PARENT" ]] || { echo "USAGE: PARENT=... PSQL_CMD=... $0 --apply" >&2; exit 1; }
+[[ -n "${PSQL_CMD:-}" ]] || { echo "✗ PSQL_CMD required: the coordinator's copy of the policy is what is judged" >&2; exit 1; }
+[[ -n "${COORD_SSH:-}" ]] || { echo "✗ COORD_SSH required (.env.nodes): the coordinator log tells the worker's sync from a lazy one" >&2; exit 1; }
+RUN_START=$(date +%s)
 
 CREDS_FILE="${CREDS_FILE:-$HOME/.near-credentials/$NETWORK/$PARENT.json}"
 APPROVER_CREDS="${APPROVER_CREDS:-$HOME/.near-credentials/$NETWORK/$APPROVER.json}"
@@ -165,21 +171,28 @@ prepare_and_store_policy() {
   echo "$enc_b64"
 }
 
-# ─── Helper: invoke /internal/wallet-policy-sync ─────────────────────────
-sync_call() {
-  local wallet_pub=$1 enc_b64=$2 owner=$3 out_file=$4
-  # verify_internal_auth reads `x-internal-wallet-auth` header (the
-  # plaintext token; coordinator SHA256s and compares against the
-  # `worker_auth_tokens.token_hash` allowlist).
-  curl -sS -o "$out_file" -w '%{http_code}' \
-    -X POST "$COORDINATOR_URL/internal/wallet-policy-sync" \
-    -H "x-internal-wallet-auth: $API_AUTH_TOKEN" \
-    -H 'Content-Type: application/json' \
-    -d "$(jq -nc \
-      --arg wp "$wallet_pub" \
-      --arg ed "$enc_b64" \
-      --arg ow "$owner" \
-      '{wallet_pubkey: $wp, encrypted_data: $ed, owner: $ow}')"
+# ─── Helper: the worker's sync, judged by what it left behind ─────────────
+#
+# Waits up to ~3 min for the coordinator's copy of the stored policy, then reads
+# the log of this run: the worker's call writes "Policy sync complete" and no
+# lazy decrypt may have stood in for it. Echoes "ok" or the reason it is not.
+coord_count() { # coord_count <fixed-string> — this run's coordinator log lines holding it
+  local since=$(( $(date +%s) - RUN_START + 120 ))
+  ssh -o ConnectTimeout=15 -o BatchMode=yes -o ControlMaster=no -o ControlPath=none "$COORD_SSH" \
+    "docker logs offchainvm-coordinator-testnet --since ${since}s 2>&1 | grep -F -- $(printf '%q' "$1") | wc -l" 2>/dev/null | tr -d ' \n'
+}
+synced_by_worker() { # synced_by_worker <wallet_id>
+  local wid=$1 got="" i synced lazy
+  for i in $(seq 1 30); do
+    got=$($PSQL_CMD "SELECT COALESCE((policy_json->'rules'->'transaction_types')::text, 'NULL') FROM wallet_accounts WHERE wallet_id = '$wid'" | tr -d ' ')
+    [[ "$got" == '["transfer"]' ]] && break
+    sleep 6
+  done
+  [[ "$got" == '["transfer"]' ]] || { echo "the coordinator's copy reads '${got:-no row}', expected [\"transfer\"]"; return; }
+  synced=$(coord_count "Policy sync complete: wallet=$wid")
+  lazy=$(coord_count "Lazy-synced policy for wallet=$wid")
+  if [[ "${synced:-0}" -ge 1 && "${lazy:-0}" == 0 ]]; then echo ok
+  else echo "log: 'Policy sync complete' ${synced:-?} line(s), 'Lazy-synced' ${lazy:-?}"; fi
 }
 
 # ─── 2. Scenario A: Bearer near: + vault (the bug-prone path) ─────
@@ -205,19 +218,10 @@ ENC_A=$(prepare_and_store_policy "near:$TOKEN_A" "$SUB_PUB_A" "$WALLET_ID_A") ||
   fail "Scenario A policy storage failed"
 pass "Scenario A policy stored on chain (len=${#ENC_A} base64 chars)"
 
-log "2.2 POST /internal/wallet-policy-sync as the worker (simulates indexer event)"
-RESP_A_FILE=$(mktemp)
-HTTP_A=$(sync_call "$SUB_PUB_A" "$ENC_A" "$PARENT" "$RESP_A_FILE")
-BODY_A=$(cat "$RESP_A_FILE"); rm -f "$RESP_A_FILE"
-echo "  HTTP $HTTP_A body=$BODY_A" >&2
-
-# Expected before fix: 500 with AEAD/decrypt error. After fix: 200.
-if [[ "$HTTP_A" == "200" ]]; then
-  pass "Scenario A: /internal/wallet-policy-sync succeeded (HTTP 200 — fix is live)"
-else
-  warn "Scenario A: HTTP $HTTP_A — confirms the indexer-path bug before the fix"
-  warn "  body: $BODY_A"
-fi
+log "2.2 the worker syncs Scenario A's policy from the chain event"
+SYNC_A=$(synced_by_worker "$WALLET_ID_A")
+[[ "$SYNC_A" == ok ]] && pass "Scenario A: the worker's sync decrypted and stored the policy (Bearer near: + vault)" \
+  || fail "Scenario A: $SYNC_A"
 
 # ─── 3. Scenario B: /register {vault_id} (control, wk_ flow) ───────
 
@@ -239,42 +243,11 @@ ENC_B=$(prepare_and_store_policy "$WK_B" "$SUB_PUB_B" "$WALLET_ID_B") || \
   fail "Scenario B policy storage failed"
 pass "Scenario B policy stored on chain"
 
-log "3.2 POST /internal/wallet-policy-sync for Scenario B"
-RESP_B_FILE=$(mktemp)
-HTTP_B=$(sync_call "$SUB_PUB_B" "$ENC_B" "$PARENT" "$RESP_B_FILE")
-BODY_B=$(cat "$RESP_B_FILE"); rm -f "$RESP_B_FILE"
-echo "  HTTP $HTTP_B body=$BODY_B" >&2
-
-if [[ "$HTTP_B" == "200" ]]; then
-  pass "Scenario B: /internal/wallet-policy-sync succeeded (HTTP 200) — control path intact"
-elif [[ "$HTTP_B" == "401" ]] && grep -q 'internal wallet auth token' <<<"$BODY_B"; then
-  # The control path refusing the CREDENTIAL says nothing about the decrypt
-  # path this file exists to test. `/internal/*` accepts a worker token whose
-  # sha256 is registered in the coordinator's `worker_auth_tokens`, which the
-  # running worker holds and a checkout does not — so the token in a local
-  # `worker/.env*` is usually some other deployment's. Reported as a skip and
-  # not a failure: called red, it sends whoever reads the run looking for a
-  # regression in code that was never reached.
-  warn "SKIPPED — API_AUTH_TOKEN is not one of the tokens this coordinator has registered"
-  warn "Supply the token the LIVE testnet worker runs with (its sha256 must be in worker_auth_tokens); a local worker/.env* copy is usually a different deployment's."
-  exit 3
-else
-  fail "Scenario B (control) UNEXPECTEDLY failed: HTTP $HTTP_B body=$BODY_B"
-fi
-
-# ─── 4. Summary ───────────────────────────────────────────────────
+log "3.2 the worker syncs Scenario B's policy from the chain event"
+SYNC_B=$(synced_by_worker "$WALLET_ID_B")
+[[ "$SYNC_B" == ok ]] && pass "Scenario B: the worker's sync decrypted and stored the policy (wk_ + vault)" \
+  || fail "Scenario B: $SYNC_B"
 
 echo
-if [[ "$HTTP_A" == "200" && "$HTTP_B" == "200" ]]; then
-  pass "BOTH scenarios PASSED — internal policy sync works for Bearer near: AND wk_ flows"
-  pass "  (this means the encrypt-policy → wallet_accounts.vault_id persistence fix is live)"
-elif [[ "$HTTP_A" != "200" && "$HTTP_B" == "200" ]]; then
-  warn "EXPECTED PRE-FIX RESULT: Scenario A fails (indexer-path bug), B succeeds"
-  warn "  Bearer near: wallets' policies aren't synced by indexer until the fix lands"
-  warn "  Run again after the encrypt-policy persistence patch."
-  # Exit non-zero so CI catches the missing fix
-  exit 2
-else
-  fail "Unexpected combination: A=HTTP $HTTP_A, B=HTTP $HTTP_B"
-fi
+pass "BOTH scenarios: the indexer path syncs policies for Bearer near: and wk_ wallets"
 warn "Cleanup (optional): $VAULT_ID has 0.1 NEAR locked + on-chain policy storage stake."

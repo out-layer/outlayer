@@ -195,6 +195,13 @@ async fn run_git_with_timeout(
 /// by git as an option (`--upload-pack=…`); and an arbitrary `https://<host>`
 /// would let a guest clone from internal/attacker hosts. We require a plain
 /// https URL pinned to github.com.
+///
+/// TODO(before builds are enabled, not urgent while BUILDS_ENABLED=false):
+/// parse with `url::Url` and require `host_str() == "github.com"`, no userinfo,
+/// no query, no fragment, the path exactly `/owner/repo(.git)`, and apply the
+/// same check where the coordinator takes a source in. Taking the authority as
+/// the text before the first `/` passes `https://<host>#@github.com/o/r`, which
+/// git clones from `<host>`.
 pub(crate) fn validate_repo_url(repo: &str) -> Result<()> {
     let rest = repo
         .strip_prefix("https://")

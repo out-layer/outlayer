@@ -306,7 +306,9 @@ impl Compiler {
     ///   the build then run with no network at all. Today the docker build runs
     ///   on the `bridge` network: the host's listeners on docker0 (172.17.0.1)
     ///   and the internet are reachable, which is how a build opened a tunnel
-    ///   out and scanned the host's networks.
+    ///   out and scanned the host's networks. On a host whose firewall admits
+    ///   the docker networks (ufw `ALLOW 172.17.0.0/16`), every service of the
+    ///   host answers a build container.
     /// - Privilege: the build as an unprivileged user in a read-only image, not
     ///   root (today the container runs as root and lives `sleep 600`).
     /// - Output: the coordinator takes a build only for the compile job this
@@ -474,9 +476,11 @@ impl Compiler {
 
         let mut response = fetch_checked(url).await?;
 
-        // Check status
+        // The caller is told that the fetch failed, not what the server
+        // answered: the status stays in the worker's log.
         if !response.status().is_success() {
-            anyhow::bail!("HTTP error: {} - {}", response.status(), url);
+            warn!("wasm_url fetch answered {} for {}", response.status(), url);
+            anyhow::bail!("wasm_url could not be fetched");
         }
 
         // Check Content-Length header before downloading
@@ -510,13 +514,10 @@ impl Compiler {
         hasher.update(&downloaded_bytes);
         let actual_hash = hex::encode(hasher.finalize());
 
+        // Nor the hash of what it served.
         if actual_hash != expected_hash {
-            anyhow::bail!(
-                "Hash mismatch!\n  Expected: {}\n  Actual:   {}\n  URL: {}",
-                expected_hash,
-                actual_hash,
-                url
-            );
+            warn!("wasm_url content hashes to {}, expected {} ({})", actual_hash, expected_hash, url);
+            anyhow::bail!("wasm_url content does not match its hash");
         }
 
         info!("✅ WASM downloaded and verified: {} bytes, hash matches", downloaded_bytes.len());

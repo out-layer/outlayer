@@ -902,6 +902,12 @@ come from the coordinator's own flow. contract={:?} task={:?}",
         }
     };
 
+    // TODO(second line of defence, not urgent): before claiming an on-chain
+    // task, ask the contract for it (`get_request(request_id)`: it exists, its
+    // data_id and sender match the task) so a task the contract never created
+    // is refused even if a worker token leaks. Today the queue is fed only by
+    // workers with a TEE session (`/executions/create`), which closes that
+    // path; the check would add an RPC call to every on-chain task.
     // Claim jobs for this task with worker capabilities
     let has_compile_result = compile_result.is_some();
 

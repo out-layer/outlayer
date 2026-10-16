@@ -40,7 +40,7 @@
 #   FUNDER EXECUTOR RECIPIENT   three accounts, for the contract-level probes
 #   MPC_PUBLIC_KEY   enables the dedicated-vault probes; without it the vault
 #                    suite runs in default-vault mode
-#   API_KEY APPROVER API_AUTH_TOKEN ADMIN_TOKEN BOUND_TO   per-suite extras
+#   API_KEY APPROVER ADMIN_TOKEN BOUND_TO   per-suite extras
 
 set -uo pipefail
 
@@ -88,7 +88,7 @@ SUITES=(
   "stuck-repair|stuck_request_repair_e2e.sh|PARENT PSQL_CMD|the lazy repair of rows left in processing, including the door's per-promise detail"
   "approvals|approval_flow_wk_e2e.sh|PARENT APPROVER|multisig approval over a wk_ credential"
   "refusals|refusals_e2e.sh|PARENT|the endpoints that exist to say no: /reject's signature binding, the internal endpoints' auth gate, and delete toward an address the policy does not list"
-  "policy-sync|internal_policy_sync_e2e.sh|PARENT API_AUTH_TOKEN|the internal policy-sync decrypt path"
+  "policy-sync|internal_policy_sync_e2e.sh|PARENT PSQL_CMD|the indexer policy sync through the TEE worker, for Bearer near: and wk_ vault wallets"
   "unified-op|unified_op_e2e.sh|PARENT|the canonical-op surface: auth-sign, approve/reject, sign_message, delete, negatives"
   "unified-intents|unified_op_e2e_intents.sh|PARENT|the intents half of the same surface"
   "unified-vault|unified_vault_e2e.sh|PARENT|vault isolation and the sovereign exit — V1 is the real multi-customer isolation test"
