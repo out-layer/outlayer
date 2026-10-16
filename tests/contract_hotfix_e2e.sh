@@ -30,8 +30,9 @@
 #   C5   cleanup refusals need the worker bearer: SKIP here, always, loudly —
 #        tests/cleanup_verification_e2e.sh runs them
 #   C10  a project run logs `Resolved project: …, version: "<key>"` (quoted); a
-#        Text answer with a line break logs `Text: "…\n…"` in one log;
-#        `set_active_version` logs `version="…"`
+#        Text answer with a line break logs its size, `Output: Text(N bytes)`,
+#        and comes back whole as the return value; `set_active_version` logs
+#        `version="…"`
 #   R7-cache-ttl     a by-name public read caches `project_uuid_by_name:<owner>/<name>`
 #                    with a TTL in 1..86400
 #   R7-cache-delete  after `delete_project` the coordinator logs
@@ -40,7 +41,7 @@
 #                    that window caches nothing; the project created again under
 #                    the name is read by name (its value, not the deleted one's);
 #                    after the window the name caches the NEW uuid
-#   R7-cache-transfer `transfer_project` → the `ProjectTransferred` event, the
+#   R7-cache-transfer $OWNER_B accepts, `transfer_project` → the `ProjectTransferred` event, the
 #                    coordinator invalidates both names; the new name reads the
 #                    transferred value; a project created again under the old name
 #                    reads its own, and the transferred uuid still reads the old
@@ -199,7 +200,7 @@ run() { # run <signer> <args-json>
   done
   RUN_REQ=$(events_of "$RUN_LOGS" execution_requested | head -1 | jq -c '.request_data | fromjson' 2>/dev/null)
   RUN_OUT=$(jq -r '.result.status.SuccessValue // empty | @base64d' <<<"$res" 2>/dev/null \
-    | jq -c 'select(. != null) | if type=="string" then (try fromjson catch .) else . end' 2>/dev/null)
+    | jq -c 'select(. != null) | if type=="string" then (. as $s | try fromjson catch $s) else . end' 2>/dev/null)
   ev=$(events_of "$RUN_LOGS" execution_completed | head -1)
   if [[ -z "$ev" ]]; then
     RUN_OK=absent
@@ -471,16 +472,17 @@ else
     || fail "C2 an inline run READ $UUID1's record k=old"
 fi
 
-log "C10 a Text answer with a line break is logged on one line, quoted"
+log "C10 a Text answer with a line break: its size in the log, the text in the return value"
 if [[ -n "$U_E" ]]; then
   run "$OWNER_A" "$(exec_args "$(wasm_src "$U_E" "$H_E" wasm32-wasip1)" $'a\nb' null Text)"
-  # The log, as the chain holds it: `Text: "… said \"a\nb\" …"` — the break
-  # escaped (a backslash and an n), no raw line break in it.
-  textlog=$(jq -c '[.[] | select(contains("Text: "))][0] // empty' <<<"$RUN_LOGS")
-  if [[ -z "$textlog" ]]; then fail "C10 Text — no 'Text: ' log in the run (run $RUN_OK: $RUN_ERR)"
-  elif jq -e 'contains("\n")' <<<"$textlog" >/dev/null 2>&1; then fail "C10 Text — the log holds a raw line break: $textlog"
-  elif jq -e 'contains("said \\\"a\\nb\\\"")' <<<"$textlog" >/dev/null 2>&1; then pass "C10 Text logged quoted on one line: $(head -c 120 <<<"$textlog")"
-  else fail "C10 Text — the log is not the quoted answer: $textlog"; fi
+  # The success log names the output's kind and size, never its content; the
+  # text itself, line break and all, is the transaction's return value.
+  answer_len=$(jq -j 'strings' <<<"${RUN_OUT:-null}" 2>/dev/null | wc -c | tr -d ' ')
+  if ! jq -e 'type == "string" and contains("said \"a\nb\"")' <<<"${RUN_OUT:-null}" >/dev/null 2>&1; then
+    fail "C10 Text — the return value is not the answer with its line break: ${RUN_OUT:0:160} (run $RUN_OK: $RUN_ERR)"
+  elif jq -e --arg l "Output: Text($answer_len bytes)" 'any(.[]; contains($l))' <<<"$RUN_LOGS" >/dev/null 2>&1; then
+    pass "C10 Text logged as Output: Text($answer_len bytes), the answer returned with its line break"
+  else fail "C10 Text — no 'Output: Text($answer_len bytes)' log: $(jq -r '.[] | select(contains("Output: "))' <<<"$RUN_LOGS" | head -c 200)"; fi
 else
   skip "C10 Text half — the echo module is not built or never reached FastFS"
 fi
@@ -627,6 +629,10 @@ if [[ "$LOGS_OK" == true ]]; then
   before_a=$(coord_lines "Invalidated project uuid cache: project_id=$OWNER_A/$NAME " | grep -c .)
   before_b=$(coord_lines "Invalidated project uuid cache: project_id=$OWNER_B/$NAME " | grep -c .)
 fi
+# A project moves only onto the receiver's acceptance, paid at the quote.
+quote=$(view "$CONTRACT_ID" estimate_transfer_acceptance_cost "$(jq -nc --arg t "$OWNER_B" --arg f "$OWNER_A" --arg n "$NAME" '{new_owner:$t, from:$f, name:$n}')" | tr -d '"')
+out=$(call "$OWNER_B" accept_project_transfer "$(jq -nc --arg f "$OWNER_A" --arg n "$NAME" '{from:$f, name:$n}')" "${quote:-0} yoctoNEAR")
+succeeded "$out" || { fail "R7 accept_project_transfer failed: $(why_of "$out")"; verdict "contract hotfix"; exit $?; }
 out=$(call "$OWNER_A" transfer_project "$(jq -nc --arg n "$NAME" --arg o "$OWNER_B" '{project_name:$n, new_owner:$o}')" '0 NEAR')
 succeeded "$out" || { fail "R7 transfer_project failed: $(why_of "$out")"; verdict "contract hotfix"; exit $?; }
 logs=$(tx_logs "$(tx_of "$out")" "$OWNER_A")

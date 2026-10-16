@@ -12,6 +12,8 @@ use wasmtime::component::Linker;
 
 use super::SigningKeys;
 
+// A published interface version never changes a type: a changed signature is
+// a new package version, registered next to the old one (wit/README.md).
 wasmtime::component::bindgen!({
     path: "wit",
     world: "outlayer:signing-keys/signing-keys-host",

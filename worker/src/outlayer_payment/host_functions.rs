@@ -9,6 +9,8 @@ use tracing::debug;
 use wasmtime::component::Linker;
 
 // Generate bindings from WIT (payment is separate package near:payment)
+// A published interface version never changes a type: a changed signature is
+// a new package version, registered next to the old one (wit/README.md).
 wasmtime::component::bindgen!({
     path: "wit",
     world: "near:payment/payment-host",

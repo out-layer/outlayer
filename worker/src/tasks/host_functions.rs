@@ -40,6 +40,8 @@ use super::envelope::{self, Consent, Envelope, SealedTask};
 use super::statement::{self, Approval, ApprovalRefused, Chain, Device, RpcChain};
 use super::{RunReport, TaskGrant, TasksRun};
 
+// A published interface version never changes a type: a changed signature is
+// a new package version, registered next to the old one (wit/README.md).
 wasmtime::component::bindgen!({
     path: "wit",
     world: "outlayer:tasks/tasks-host",

@@ -14,6 +14,8 @@ use wasmtime::component::Linker;
 use super::client::{StorageClient, StorageConfig};
 
 // `near:storage/api@0.2.0`.
+// A published interface version never changes a type: a changed signature is
+// a new package version, registered next to the old one (wit/README.md).
 wasmtime::component::bindgen!({
     path: "wit",
     world: "near:storage/storage-host",

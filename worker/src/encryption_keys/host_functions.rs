@@ -13,6 +13,8 @@ use wasmtime::component::Linker;
 use super::EncryptionKeys;
 use crate::signing_keys::shown;
 
+// A published interface version never changes a type: a changed signature is
+// a new package version, registered next to the old one (wit/README.md).
 wasmtime::component::bindgen!({
     path: "wit",
     world: "outlayer:encryption-keys/encryption-keys-host",

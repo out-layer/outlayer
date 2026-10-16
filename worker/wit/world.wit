@@ -1,3 +1,6 @@
+// Every package here is a published ABI: under a version, nothing is removed
+// and no type changes. A changed signature is a new package version that the
+// worker serves next to the old one. See README.md.
 package near:rpc@0.1.0;
 
 interface api {

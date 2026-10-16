@@ -26,6 +26,8 @@ use std::time::Duration;
 use wasmtime::component::Linker;
 
 // Generate bindings from WIT - sync mode for simpler implementation
+// A published interface version never changes a type: a changed signature is
+// a new package version, registered next to the old one (wit/README.md).
 wasmtime::component::bindgen!({
     path: "wit",
     world: "rpc-host",
