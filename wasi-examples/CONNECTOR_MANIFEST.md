@@ -19,7 +19,7 @@ The alternatives are weaker:
 
 | Source | Anchored by | Problem |
 |---|---|---|
-| **custom section** | the on-chain wasm hash | none; works for `WasmUrl` sources too |
+| **custom section** | the on-chain wasm hash | none; it travels inside the published wasm |
 | `manifest.json` at a git ref | nothing | a force-push moves what the ref points at while the ref stays the same |
 | a row in the coordinator's database | nothing | an operator can widen the allowlist with one `UPDATE`, silently |
 
@@ -30,9 +30,9 @@ network policy moving whenever somebody pushed. A wasm without the section
 declares nothing, and a CONNECTOR without the section reaches nothing.
 
 Nothing is lost by that. `connector-probe/build.sh` fails the build when the
-section is missing, so the omission is caught at the author's desk; and anything
-published as a `WasmUrl` — an IPFS CID, say — has no repository to read anyway,
-so the embedded section is the only option there.
+section is missing, so the omission is caught at the author's desk; and what
+runs is a published `.wasm` named by its hash, so the section is covered by the
+same hash as the code.
 
 ## What goes in it
 
@@ -57,7 +57,7 @@ and exactly the ones priced on chain — see the next section.
 | `capabilities.network` | **yes** | The outbound allowlist. Exact hostnames, case-insensitive, **no implicit subdomain wildcard**: `example.com` does not permit `evil.example.com`. List every host you need. Absent on a project without `connector_id`: egress stays unrestricted, as for a wasm with no manifest at all. |
 | `operations` | no | Documentation, and a cross-check against the price list. |
 | `limits` | **yes** | Caps this connector declares about itself. Unioned with the coordinator's own rules — every applicable one must pass — so a declaration can only ever tighten. |
-| `author_secrets` | **yes** | The author's own credential, for any project: the row `owner` stored under the accessor `Project(<this project id>)` and `profile`, decrypted into the environment on every run next to the caller's. `owner` defaults to the publishing account. The row's access condition is judged against the real caller, so it is who may run the project — `AllowAll` for everyone, a whitelist or DAO role for a circle. A name on both sides, or a profile nobody stored, refuses the run; a name the caller's row carries and the author never stored is added to the environment as the caller's — store every name your code reads, so no caller can supply it. A run with no project (a `Repo` source executed directly) cannot hold one. See `WASI_TUTORIAL.md` §3c and `docs/CONNECTORS.md` §4.1. |
+| `author_secrets` | **yes** | The author's own credential, for any project: the row `owner` stored under the accessor `Project(<this project id>)` and `profile`, decrypted into the environment on every run next to the caller's. `owner` defaults to the publishing account. The row's access condition is judged against the real caller, so it is who may run the project — `AllowAll` for everyone, a whitelist or DAO role for a circle. A name on both sides, or a profile nobody stored, refuses the run; a name the caller's row carries and the author never stored is added to the environment as the caller's — store every name your code reads, so no caller can supply it. A run with no project (a `WasmUrl` source executed directly) cannot hold one. See `WASI_TUTORIAL.md` §3c and `docs/CONNECTORS.md` §4.1. |
 | `signing_keys` | **yes** | ed25519 or secp256k1 keys the module signs with, by `path`. The keystore derives each for the run, bound to the caller and to the project or the exact code; the module reaches them only through the `outlayer:signing-keys` host functions. Any project may declare them. See `signing_keys` below. |
 | `encryption_keys` | **yes** | Symmetric keys the module seals data with, by `path`. Derived like signing keys — the same `bind`, `caller` and `vault` rules — but a separate namespace with its own limit; the module reaches them only through the `outlayer:encryption-keys` host functions. Any project may declare them. See `encryption_keys` below. |
 | `storage_account` | **yes** | Whose cell of the project's per-account storage the run reads and writes: `signer` (default) or `predecessor`. Any project may declare it. See `storage_account` below. |
@@ -258,16 +258,6 @@ to that owner. The worker checks every declared `bind` and `caller` against the
 run before any secret is decrypted; the keystore checks them again. One key
 that does not match refuses the whole run before it starts.
 
-A GitHub-sourced run is never issued signing keys — neither a project version
-built from a repository nor a repository run directly. Through a project, the
-keystore sees it: the contract's version for the build's hash has a GitHub
-source, or there is none. Directly, only the worker sees it — it holds the
-resolved code source, while the keystore holds nothing but the hash of the
-bytes — so the worker refuses a direct GitHub build before any request is made.
-A manifest that reaches the worker declaring keys on such a run refuses it; a
-module that reaches the worker with no declaration runs, and every signing call
-answers `err`.
-
 So one run never holds both kinds. The manifest is part of the wasm, so a
 binary that declares `project` keys runs only through a project, and one that
 declares `wasm` keys runs only directly: declare the one `bind` that matches how
@@ -346,7 +336,6 @@ are dropped with it. The master never leaves the keystore.
 * more than 3 signing keys or 5 encryption keys, a `path` of the wrong shape
   or declared twice (under any type), an unknown field, a `type`, `bind` or `caller` outside the lists
   above;
-* keys declared on a GitHub-sourced run, when the manifest reaches the worker;
 * a `project` key on a run with no project; a `wasm` key on a run through a
   project;
 * a `predecessor` key on a run that carries no predecessor;
@@ -430,8 +419,8 @@ not read with the field dropped; a `bind` or `caller` value outside its list is
 refused the same way.
 
 **The rules are the signing keys', key for key.** `bind`, `caller`, `vault`,
-what is issued to which run, who checks what, and the refusal of every
-GitHub-sourced run are exactly as in `signing_keys` above; one encryption key
+what is issued to which run and who checks what are exactly as in
+`signing_keys` above; one encryption key
 that breaks a rule refuses the whole run before it starts, as a signing key
 does. The keystore derives
 
@@ -620,9 +609,7 @@ admits it. **Every published version stays callable**: a caller names any of
 them with `version_key`, and a version without the block admits every door.
 Gating a project means removing (`remove_version`) each version that does not
 carry the rule you want. The same bytes run outside the project — directly
-from their wasm URL — keep the rule, since it travels in the wasm. A run built
-from a GitHub repository is judged after its build, so a refused first run
-still costs one compilation.
+from their wasm URL — keep the rule, since it travels in the wasm.
 
 ## How a request names its operation
 

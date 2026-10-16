@@ -26,7 +26,7 @@ Two integration modes:
 |-----------|-------------|
 | `contract/` | Main NEAR contract (`outlayer.near`) — execution requests, secrets, projects, payments |
 | `coordinator/` | HTTP API server — task queue (PostgreSQL + Redis), WASM cache, HTTPS API gateway |
-| `worker/` | Polls tasks, compiles GitHub repos, executes WASM in TEE (Intel TDX via Phala Cloud) |
+| `worker/` | Polls tasks, fetches a published WASM and checks its sha256, executes it in TEE (Intel TDX via Phala Cloud); its compiler exists but is off by default (see [Code sources and builds](#code-sources-and-builds)) |
 | `keystore-worker/` | Secrets decryption service running in TEE, accessed directly by worker (not via coordinator) |
 | `register-contract/` | NEAR contract for TEE worker key registration with TDX quote verification (deployed to `worker.outlayer.near`) |
 | `keystore-dao-contract/` | DAO governance contract for keystore worker registration |
@@ -43,7 +43,7 @@ User Contract → request_execution(source, limits, input, secrets_ref)
     ↓
 OutLayer Contract → yield (data_id) + emit event
     ↓
-Worker Network → poll event, compile/cache WASM, execute in TEE
+Worker Network → poll event, fetch/cache WASM (sha256 checked), execute in TEE
     ↓
 Worker → resolve_execution(request_id, response) → resume
     ↓
@@ -66,13 +66,36 @@ Coordinator → return JSON response (or poll via GET /calls/{call_id})
 
 ## Contract Types
 
+### Code sources and builds
+
+A user names one of two sources: `Project` (the normal case) or `WasmUrl` (a
+direct run of a published file). A project version's source is a `WasmUrl`. A
+version is a file named by its hash, so what a caller runs and pays for cannot
+change under that version afterwards — a repository can change under the same
+name and commit history can be rewritten. The worker fetches a `wasm_url` only
+over `https://` on the default port (443), to a public address, and refuses a
+file whose bytes do not match `hash`.
+
+The contract's enums carry a `GitHub` variant, and the worker has a
+compiler (`worker/src/compiler/`, Docker-sandboxed). Builds are off by default:
+
+| Switch | Where | Default | Effect |
+|--------|-------|---------|--------|
+| `BUILDS_ENABLED` | coordinator | `false` | Off: a `GitHub` task whose wasm is not cached, or that asks for `force_rebuild`, is refused (`worker_roles::BUILD_REFUSED`) |
+| `COMPILATION_ENABLED` | worker | `false` | The builder role: builds a GitHub repository and fetches `wasm_url`; builds run only where the coordinator has `BUILDS_ENABLED=true` |
+| `DOWNLOAD_ENABLED` | worker | `false` | The downloader role: fetches a `WasmUrl`, checks its sha256 and caches it; no Docker, no build, runs nothing |
+| `EXECUTION_ENABLED` | worker | `true` | Runs a cached wasm (TEE workers) |
+
+A worker needs at least one of the three roles. Nothing user-facing (CLI,
+dashboard, docs) names a `GitHub` source.
+
 ### ExecutionSource
 
 How users specify code to execute. Passed to `request_execution()`.
 
 ```rust
 pub enum ExecutionSource {
-    /// Compile from GitHub repository
+    /// Build from a GitHub repository (builds off by default, see above)
     GitHub {
         repo: String,              // e.g., "https://github.com/user/repo"
         commit: String,            // Git commit hash
@@ -80,7 +103,7 @@ pub enum ExecutionSource {
     },
     /// Pre-compiled WASM from URL
     WasmUrl {
-        url: String,               // https://, ipfs://, ar://
+        url: String,               // https:// on port 443
         hash: String,              // SHA256 hex (64 chars)
         build_target: Option<String>,
     },
@@ -94,7 +117,7 @@ pub enum ExecutionSource {
 
 ### CodeSource
 
-Resolved source sent to workers (no `Project` variant — resolved to `GitHub` or `WasmUrl`).
+Resolved source sent to workers (no `Project` variant — resolved to `WasmUrl`, or `GitHub` for a build).
 
 ```rust
 pub enum CodeSource {
@@ -119,15 +142,15 @@ pub struct ResourceLimits {
 |-------|-------|
 | `MAX_INSTRUCTIONS` | 500,000,000,000 (500 billion) |
 | `MAX_EXECUTION_SECONDS` | 180 (3 minutes) |
-| `MAX_COMPILATION_SECONDS` | 300 (5 minutes) |
+| `MAX_COMPILATION_SECONDS` | 300 (5 minutes; builds only) |
 
 ### RequestParams
 
 ```rust
 pub struct RequestParams {
-    pub force_rebuild: bool,           // Force recompilation even if cached
-    pub store_on_fastfs: bool,         // Store compiled WASM to FastFS
-    pub compile_only: bool,            // Compile only, no execution
+    pub force_rebuild: bool,           // Build parameter: force recompilation even if cached
+    pub store_on_fastfs: bool,         // Build parameter: store compiled WASM to FastFS
+    pub compile_only: bool,            // Build parameter: compile only, no execution
     pub project_uuid: Option<String>,  // Set automatically for Project source
     pub attached_usd: Option<U128>,    // Payment to project developer (stablecoin micro-units)
 }
@@ -194,7 +217,7 @@ pub fn request_execution(
 );
 ```
 
-**Compile-only mode**: When `resource_limits` is `None` or `params.compile_only` is `true`, only compilation occurs (no execution). Useful for pre-warming cache.
+**Compile-only mode**: When `resource_limits` is `None` or `params.compile_only` is `true`, only compilation occurs (no execution), charged the base fee. It is a build path: with builds off it is not offered to users.
 
 **Large payloads**: Input data >= 10KB is stored in contract state only (not in event log). Workers fetch via `get_request()`.
 
@@ -218,7 +241,7 @@ The sender can cancel a request still pending after 10 minutes (`EXECUTION_TIMEO
 
 ```rust
 pub enum SecretAccessor {
-    Repo { repo: String, branch: Option<String> },   // GitHub repo secrets
+    Repo { repo: String, branch: Option<String> },   // rows stored earlier: listed and deleted; CLI and dashboard store nothing new under it
     WasmHash { hash: String },                         // WASM hash secrets
     Project { project_id: String },                    // Project secrets (all versions)
     System(SystemSecretType),                           // Payment Keys
@@ -307,13 +330,13 @@ pub struct VersionInfo {
 ```
 
 **Project ID format**: `{owner}/{name}` (e.g., `alice.near/my-app`)
-**Version key**: WASM hash for `WasmUrl`, `{repo}@{commit}` for `GitHub`
+**Version key**: the WASM hash of the version's `WasmUrl` (the contract keys a `GitHub` source as `{repo}@{commit}`; nothing user-facing creates one)
 
 ### Methods
 
 | Method | Description |
 |--------|-------------|
-| `create_project(name, source)` | Create project, assigns UUID, compiles first version via yield/resume |
+| `create_project(name, source)` | Create project, assigns UUID, stores the first version |
 | `add_version(project_name, source, set_active)` | Add version, optionally set as active |
 | `set_active_version(project_name, version_key)` | Switch active version |
 | `remove_version(project_name, version_key)` | Remove version (cannot remove active) |
@@ -466,6 +489,8 @@ cost = base_fee_usd + (instructions / 1M) × per_million_instructions_fee_usd
      + execution_seconds × per_sec_fee_usd + compile_time_ms × per_compile_ms_fee_usd
 ```
 
+`compile_time_ms` is reported only by a build; a run of a published wasm reports none.
+
 View current pricing: `get_pricing()` (NEAR tuple) or `get_pricing_full()` (PricingView with both).
 
 ---
@@ -583,7 +608,7 @@ cargo build --target wasm32-wasip2 --release
 | GET | `/executions/poll` | Poll for new tasks |
 | POST | `/executions/create` | Create execution task |
 | GET | `/wasm/:checksum` | Download cached WASM |
-| POST | `/wasm/upload` | Upload compiled WASM |
+| POST | `/wasm/upload` | Upload a built WASM (builder role) |
 | GET | `/wasm/exists/:checksum` | Check WASM cache |
 | POST | `/locks/acquire` | Acquire distributed lock |
 | DELETE | `/locks/release/:lock_key` | Release lock |
@@ -592,7 +617,7 @@ cargo build --target wasm32-wasip2 --release
 | POST | `/workers/tee-challenge` | TEE challenge request |
 | POST | `/workers/register-tee` | TEE session registration |
 | POST | `/attestations` | Store attestation |
-| GET | `/github/resolve-branch` | Resolve branch to commit |
+| GET | `/github/resolve-branch` | Resolve branch to commit (builds only) |
 | POST | `/storage/set`, `set-if-absent`, `set-if-equals` | Worker storage operations |
 | POST | `/storage/get`, `get-by-version`, `has`, `delete` | Worker storage queries |
 | GET | `/storage/list`, `usage` | Storage metadata |
@@ -661,7 +686,7 @@ cargo build --target wasm32-wasip2 --release
 | `get_pricing_full()` | `PricingView` | Full NEAR + USD pricing |
 | `get_payment_token_contract()` | `Option<AccountId>` | Stablecoin contract |
 | `estimate_execution_cost(resource_limits, input_len)` | `U128` | What to attach: the compute estimate plus the deposit held for `input_data` beyond the free 32 KB |
-| `get_max_limits()` | `(u64, u64, u64)` | Hard caps: instructions, exec_sec, compile_sec |
+| `get_max_limits()` | `(u64, u64, u64)` | Hard caps: instructions, exec_sec, compile_sec (builds only) |
 | `is_paused()` | `bool` | Contract pause status |
 | `get_config()` | `(AccountId, AccountId)` | Owner, operator |
 | `get_event_metadata()` | `(String, String)` | Event standard + version |
@@ -685,8 +710,8 @@ cargo build --target wasm32-wasip2 --release
     "request_id": 12345,
     "data_id": "0x...",
     "sender_id": "client.near",
-    "execution_source": { "GitHub": { "repo": "...", "commit": "...", "build_target": "wasm32-wasip2" } },
-    "resolved_source": { "GitHub": { "repo": "...", "commit": "...", "build_target": "wasm32-wasip2" } },
+    "execution_source": { "Project": { "project_id": "alice.near/my-app", "version_key": null } },
+    "resolved_source": { "WasmUrl": { "url": "https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm", "hash": "<sha256>", "build_target": "wasm32-wasip2" } },
     "secrets_ref": { "profile": "default", "account_id": "alice.near" },
     "input_data": "{}",
     "resource_limits": { "max_instructions": 1000000000, "max_memory_mb": 128, "max_execution_seconds": 60 },
@@ -742,7 +767,7 @@ Blockchain-native email for NEAR accounts. Every NEAR account has an email: `ali
 |-----------|--------|
 | Smart Contract | Production — yield/resume, secrets (4 accessor types, 9 access conditions), projects, pricing (NEAR + USD), developer earnings |
 | Coordinator | Production — PostgreSQL + Redis, task queue, WASM cache (LRU eviction), HTTPS API, earnings tracking |
-| Worker | Production — wasmi with fuel metering, WASI env vars, Docker sandboxed compilation, TEE attestation (Intel TDX) |
+| Worker | Production — wasmi with fuel metering, WASI env vars, sha256-checked WASM download, TEE attestation (Intel TDX); Docker-sandboxed compiler present, off by default |
 | Keystore | Production — TEE-based decryption, CKD/MPC key derivation, access condition validation, TEE session auth |
 | Register Contract | Production — 5-measurement TDX verification, scoped access keys |
 | Dashboard | Production — project management, secrets UI, executions view, earnings page, documentation |
@@ -897,7 +922,7 @@ CREATE TABLE system_hidden_logs (
 
 ### Error Classification System
 
-The worker classifies errors into safe, user-facing descriptions:
+The worker classifies errors into safe, user-facing descriptions (the repository, git and build classes come from the compiler, which runs only where builds are enabled):
 
 | Classification | User Message |
 |---------------|-------------|

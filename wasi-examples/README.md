@@ -113,12 +113,21 @@ cd wasi-test-runner
 
 ### 4. Deploy to NEAR OutLayer
 
+OutLayer runs a published `.wasm`, named by its sha256. Publish the file you
+built and register it as a project version:
+
+```bash
+outlayer upload your-app.wasm
+# prints SHA256 and: FastFS URL: https://test.fastfs.io/your.testnet/outlayer.testnet/<sha256>.wasm
+outlayer deploy your-app <FastFS URL> --target wasm32-wasip1
+```
+
+Then call it:
+
 ```bash
 near call outlayer.testnet request_execution '{
-  "code_source": {
-    "repo": "https://github.com/user/repo",
-    "commit": "main",
-    "build_target": "wasm32-wasip1"
+  "source": {
+    "Project": {"project_id": "your.testnet/your-app", "version_key": null}
   },
   "resource_limits": {
     "max_instructions": 10000000,

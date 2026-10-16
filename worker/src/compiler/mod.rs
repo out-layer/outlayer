@@ -449,7 +449,7 @@ impl Compiler {
 
     /// Download WASM from URL and verify hash
     ///
-    /// Downloads pre-compiled WASM from URL (https://, ipfs://, ar://)
+    /// Downloads pre-compiled WASM from an https:// URL on port 443
     /// with security protections:
     /// - 10 MB size limit
     /// - 30 second timeout

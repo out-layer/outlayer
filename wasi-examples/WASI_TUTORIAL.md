@@ -839,7 +839,7 @@ same address either way.
 
 Three kinds of secret can reach a run, and every project — not only a
 connector — may use all three. All of them are rows stored on chain with
-`store_secrets` under an **accessor** (`Project`, `Repo` or `WasmHash`), a
+`store_secrets` under an **accessor** (`Project` or `WasmHash`), a
 **profile** and an **owner**, encrypted to the keystore; the keystore decrypts
 them inside the TEE and the worker hands them to your module as environment
 variables.
@@ -861,7 +861,7 @@ that called the contract — which makes it the project's admission gate: `Allow
 refused run before anything executes. A declared profile nobody stored refuses
 the run too, with a message saying what to store. Two cautions: a manifest that
 carries `connector_id` turns the outbound allowlist mandatory (a connector's
-rule), so leave it out; and a run that has no project — a `Repo` source
+rule), so leave it out; and a run that has no project — a `WasmUrl` source
 executed directly — has nowhere to hold an author secret, so build the
 manifest into the artefact you publish as a project only
 (`test-secrets-example` does this with a cargo feature).
@@ -1232,17 +1232,30 @@ echo '{"value":21}' | wasmtime target/wasm32-wasip1/release/example.wasm
 
 ## Deployment to NEAR OutLayer
 
+OutLayer runs a published `.wasm`, named by its sha256: build it, publish it,
+and register it as a project version. The worker refuses a file whose bytes do
+not match the hash.
+
+```bash
+cargo build --target wasm32-wasip1 --release
+outlayer upload target/wasm32-wasip1/release/example.wasm
+# prints SHA256 and: FastFS URL: https://test.fastfs.io/your.testnet/outlayer.testnet/<sha256>.wasm
+outlayer deploy example <FastFS URL> --target wasm32-wasip1   # creates the project or adds a version, activates it
+```
+
+Any https URL works for `outlayer deploy`; FastFS is the default. On the
+dashboard, Projects → Create Project / Add Version take the WASM URL and its
+SHA256.
+
 ### Option 1: Blockchain Mode (via NEAR transaction)
 
-1. **Push code to GitHub**
+1. **Deploy the project** (above)
 2. **Call contract**:
 
 ```bash
 near call outlayer.testnet request_execution '{
-  "code_source": {
-    "repo": "https://github.com/username/repo",
-    "commit": "main",
-    "build_target": "wasm32-wasip1"
+  "source": {
+    "Project": {"project_id": "your.testnet/example", "version_key": null}
   },
   "resource_limits": {
     "max_instructions": 10000000,

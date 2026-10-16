@@ -25,10 +25,8 @@ Request off-chain execution of WASM code.
 **Basic execution (no secrets):**
 ```bash
 near call outlayer.testnet request_execution '{
-  "code_source": {
-    "repo": "https://github.com/user/project",
-    "commit": "abc123",
-    "build_target": "wasm32-wasi"
+  "source": {
+    "Project": {"project_id": "alice.testnet/my-app", "version_key": null}
   },
   "resource_limits": {
     "max_instructions": 1000000000,
@@ -38,6 +36,14 @@ near call outlayer.testnet request_execution '{
   "input_data": "{\"key\": \"value\"}"  
 }' --accountId user.testnet --deposit 0.01
 ```
+
+`source` names a published `.wasm` by its sha256; the worker refuses a file
+whose bytes do not match the hash. `Project` is the normal case
+(`version_key: null` = the active version, otherwise the version's wasm hash);
+a published file runs directly as
+`{"WasmUrl": {"url": "https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm", "hash": "<sha256>", "build_target": "wasm32-wasip2"}}`.
+The URL must be `https://` on the default port. A project version's source is
+always a `WasmUrl`.
 
 **With encrypted secrets (e.g., API keys):**
 ```bash
@@ -49,7 +55,7 @@ near contract call-function as-read-only outlayer.testnet get_keystore_pubkey js
 
 # 3. Call with encrypted secrets
 near call outlayer.testnet request_execution '{
-  "code_source": {...},
+  "source": {...},
   "resource_limits": {...},
   "input_data": "{...}",
   "secrets_ref": {
@@ -78,11 +84,11 @@ the guest's JSON for `Json`, a string for `Text`, base64 for `Bytes`, and
 `null` when the run failed or produced nothing.
 
 **Limits.** `get_max_limits` answers `max_instructions` (500 billion),
-`max_execution_seconds` (180) and the compile cap; `max_memory_mb` is capped
+`max_execution_seconds` (180) as its first two values; `max_memory_mb` is capped
 at 4096 (wasm32's bound). A request above a cap is refused at the door.
 
-**What a run is charged.** A success pays `base_fee + instructions + time +
-compile`, capped at the compute deposit. A failed run pays the same formula on
+**What a run is charged.** A success pays `base_fee + instructions + time`,
+capped at the compute deposit. A failed run pays the same formula on
 what the worker reports it used, capped the same way; a failure before the
 guest ran reports little or nothing and costs about the base fee. A run the
 chain's yield window (200 blocks) outlived pays the base fee. The storage part
@@ -336,18 +342,22 @@ agent key.
 ### Secrets Management Functions
 
 #### `store_secrets`
-Store encrypted secrets for a repository. `profile` names the row: 1–64 bytes
-of letters, digits, `-` or `_`. The same rule refuses, at `request_execution`,
-a `secrets_ref` no row could match.
+Store encrypted secrets under an accessor: `{"Project": {"project_id"}}` (every
+version of a project) or `{"WasmHash": {"hash"}}` (one build). A `Repo` accessor
+names a row stored earlier for a repository: such a row is read and deleted
+like any other, and nothing new is stored, updated or re-scoped for a
+repository. `profile` names the row: 1–64 bytes of letters, digits, `-` or `_`.
+The same rule refuses, at `request_execution`, a `secrets_ref` no row could
+match.
 
 **Important:** Always estimate storage cost first using `estimate_storage_cost` to attach the correct deposit.
 
 ```bash
 # 1. Estimate storage cost. The arguments are the slot the store will use:
-# an ACCESSOR (not repo/branch), the profile, the owner, the ciphertext and the
+# the ACCESSOR, the profile, the owner, the ciphertext and the
 # condition — the condition is priced too, so a large whitelist costs more.
 near view outlayer.testnet estimate_storage_cost '{
-  "accessor": {"Repo": {"repo": "github.com/alice/project", "branch": "main"}},
+  "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
   "profile": "default",
   "owner": "alice.testnet",
   "encrypted_secrets_base64": "YWJjZGVm...",
@@ -358,11 +368,11 @@ near view outlayer.testnet estimate_storage_cost '{
 
 # 2. Store secrets with exact deposit
 near call outlayer.testnet store_secrets '{
-  "repo": "github.com/alice/project",
-  "branch": "main",
+  "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
   "profile": "default",
   "encrypted_secrets_base64": "YWJjZGVm...",
-  "access": "AllowAll"
+  "access": "AllowAll",
+  "vault_id": null
 }' --accountId alice.testnet --deposit 0.0015
 ```
 
@@ -371,18 +381,18 @@ Estimate the storage cost before storing secrets. Returns exact cost in yoctoNEA
 
 ```bash
 near view outlayer.testnet estimate_storage_cost '{
-  "repo": "github.com/alice/project",
-  "branch": null,
+  "accessor": {"WasmHash": {"hash": "<sha256>"}},
   "profile": "production",
   "owner": "alice.testnet",
   "encrypted_secrets_base64": "YWJjZGVm...",
-  "access": {"Whitelist": {"accounts": ["alice.testnet", "bob.testnet"]}}
+  "access": {"Whitelist": {"accounts": ["alice.testnet", "bob.testnet"]}},
+  "vault_id": null
 }'
 ```
 
 **Pricing factors:**
 - Base overhead: 40 bytes (LookupMap entry)
-- Key size: repo + branch + profile + owner (with Borsh length prefixes)
+- Key size: accessor + profile + owner (with Borsh length prefixes)
 - Value size: encrypted_secrets + access condition + timestamps
 - Index overhead: 64 bytes (for new secrets)
 - Storage price: 0.00001 NEAR per byte
@@ -390,12 +400,11 @@ near view outlayer.testnet estimate_storage_cost '{
 **Note:** Complex access conditions (e.g., Whitelist with many accounts) cost more than simple ones (e.g., AllowAll).
 
 #### `get_secrets`
-Retrieve secrets for a repository (called by keystore worker).
+Retrieve a stored secret row (called by keystore worker).
 
 ```bash
 near view outlayer.testnet get_secrets '{
-  "repo": "github.com/alice/project",
-  "branch": "main",
+  "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
   "profile": "default",
   "owner": "alice.testnet"
 }'
@@ -406,8 +415,7 @@ Delete secrets and get storage deposit refund.
 
 ```bash
 near call outlayer.testnet delete_secrets '{
-  "repo": "github.com/alice/project",
-  "branch": "main",
+  "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
   "profile": "default"
 }' --accountId alice.testnet
 ```

@@ -73,7 +73,7 @@ See [OutLayer SDK](./WASI_TUTORIAL.md#outlayer-sdk) for details.
 | `OUTLAYER_PROJECT_NAME` | Project name: `my-app` | Only via Project |
 | `OUTLAYER_PROJECT_UUID` | Internal UUID for storage | Only via Project |
 
-**NOT SET** when running directly with GitHub URL or WASM hash (without project).
+**NOT SET** when a `WasmUrl` source runs directly (without a project).
 
 ```rust
 // Safe pattern for project vars

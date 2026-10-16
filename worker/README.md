@@ -5,11 +5,28 @@ Worker implementation for executing off-chain computations triggered by NEAR sma
 ## Features
 
 - **Task Polling**: Long-polling from Coordinator API for new tasks
-- **GitHub Compilation**: Clones and compiles GitHub repositories to WASM (Docker-sandboxed)
+- **WASM Download**: Fetches a published `WasmUrl` (`https://` on port 443), checks its sha256 and caches it
+- **Compiler (off by default)**: Clones and compiles GitHub repositories to WASM (Docker-sandboxed); runs only on a builder worker where the coordinator enables builds
 - **WASM Execution**: Executes WASM with resource limits using wasmi
 - **NEAR Integration**: Submits execution results back to blockchain via `resolve_execution`
 - **Event Monitoring** (optional): Monitors NEAR blockchain for `execution_requested` events
 - **Distributed Locking**: Prevents duplicate compilation across multiple workers
+
+## Roles
+
+What a worker does is set by three switches (`src/config.rs`); at least one must be on.
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `EXECUTION_ENABLED` | `true` | Runs a cached wasm (TEE workers) |
+| `DOWNLOAD_ENABLED` | `false` | Downloader: fetches a `WasmUrl`, checks its sha256 and caches it; no Docker, no build, runs nothing |
+| `COMPILATION_ENABLED` | `false` | Builder: builds a GitHub repository and fetches a `WasmUrl`; builds run only where the coordinator has `BUILDS_ENABLED=true` (default `false`) |
+
+Builds are off by default on both sides. The code sources a user can name are
+`Project` and `WasmUrl`, and a project version's source is a `WasmUrl`: a
+published `.wasm` named by its sha256, which the worker refuses when the bytes
+do not match. With builds off the coordinator refuses a `GitHub` task whose
+wasm is not cached. A downloader configuration is in `.env.example` (ROLES).
 
 ## Architecture
 
@@ -52,18 +69,22 @@ Worker implementation for executing off-chain computations triggered by NEAR sma
 Loads configuration from environment variables:
 - Coordinator API credentials
 - NEAR RPC endpoint and operator keys
-- Docker compilation settings
+- Worker roles (`EXECUTION_ENABLED`, `DOWNLOAD_ENABLED`, `COMPILATION_ENABLED`)
+- Docker compilation settings (builder role)
 - Default resource limits
 
 ### 2. API Client (`src/api_client.rs`)
 HTTP client for Coordinator API:
-- `poll_task()` - Long-poll for new tasks (compile or execute)
+- `poll_task()` - Long-poll for new tasks (download, compile or execute; the queues follow the worker's roles)
 - `complete_task()` / `fail_task()` - Report task status
 - `upload_wasm()` / `download_wasm()` - WASM cache management
 - `acquire_lock()` / `release_lock()` - Distributed locking for compilation
 
 ### 3. Compiler (`src/compiler.rs`)
-Compiles GitHub repositories to WASM using Docker:
+Downloads a `WasmUrl` (`https://` on port 443, public address only, 10 MB cap),
+checks its sha256 and uploads it to the coordinator's cache. On a builder
+worker with builds enabled (both off by default, see [Roles](#roles)) it also
+compiles GitHub repositories to WASM using Docker:
 - Checks WASM cache before compiling
 - Acquires distributed lock to prevent duplicate work
 - **Runs real Docker-based compilation** from public GitHub repositories
@@ -126,7 +147,7 @@ meta-transaction waits for it, so the call is not judged by the wrong door.
 ### 7. Main Loop (`src/main.rs`)
 Orchestrates all components:
 1. Poll for task from Coordinator API
-2. If compile task: compile and upload WASM
+2. If preparation task: download the `WasmUrl` and check its sha256 (or, on a builder with builds enabled, compile), then upload the WASM to the cache
 3. If execute task: download WASM, execute, submit result to NEAR
 4. Repeat
 
@@ -142,7 +163,7 @@ the guest kills it.
 ### Prerequisites
 
 - Rust 1.75+ with `wasm32-unknown-unknown` target
-- Docker (for compilation sandbox)
+- Docker (builder role only: the compilation sandbox)
 - NEAR account with operator role on OffchainVM contract
 - Access to Coordinator API
 
@@ -189,7 +210,12 @@ WORKER_ID=worker-1                    # default: random UUID
 ENABLE_EVENT_MONITOR=false            # default: false
 POLL_TIMEOUT_SECONDS=60               # default: 60
 
-# Docker Compilation
+# Roles (see Roles above)
+EXECUTION_ENABLED=true                # default: true
+DOWNLOAD_ENABLED=false                # default: false
+COMPILATION_ENABLED=false             # default: false — builds also need BUILDS_ENABLED=true on the coordinator
+
+# Docker Compilation (builder role only)
 DOCKER_IMAGE=rust:1.75                # default: rust:1.75
 COMPILE_TIMEOUT_SECONDS=300           # default: 300 (5 minutes)
 COMPILE_MEMORY_LIMIT_MB=2048          # default: 2048
@@ -233,7 +259,16 @@ RUST_LOG=offchainvm_worker=trace cargo run
 
 ## Task Flow
 
-### Compile Task
+### Download Task
+
+1. Receive the task for a `WasmUrl` source (downloader or builder role)
+2. Check if WASM with that sha256 exists in cache → return if yes
+3. Fetch the URL (`https://`, port 443, public address, 10 MB cap)
+4. Refuse the file if its sha256 does not match `hash`
+5. Upload to coordinator with the checksum
+6. Complete task
+
+### Compile Task (builder role, builds enabled only)
 
 1. Receive `Task::Compile` from coordinator
 2. Compute checksum for (repo, commit, build_target)
@@ -442,7 +477,7 @@ cargo run
 - Ensure contract ID is correct for your network (testnet/mainnet)
 - Check RPC endpoint is responsive
 
-### Compilation errors
+### Compilation errors (builder role)
 
 - Verify Docker is running: `docker ps`
 - Check Docker image is available: `docker pull rust:1.75`

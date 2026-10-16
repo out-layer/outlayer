@@ -19,7 +19,7 @@ The same compute layer is callable directly: a NEAR smart contract can request a
 ## How It Works
 
 1. A NEAR smart contract (or HTTP client) submits a computation request
-2. A TEE worker picks up the task, compiles/executes the WASI binary with resource limits
+2. A TEE worker picks up the task, fetches the published WASI binary, checks its sha256 and executes it with resource limits
 3. The verified result is returned on-chain (via yield/resume) or via HTTP response
 
 ## Project Structure
@@ -75,8 +75,7 @@ curl -X POST https://api.outlayer.ai/call/alice.near/my-project \
 - **Intel TDX**: Hardware-level memory encryption and isolation — the host operator cannot read TEE memory
 - **5-Measurement Verification**: Workers are verified using all 5 TDX measurements (MRTD + RTMR0-3), preventing dev/debug images from passing attestation
 - **Sigstore Certification**: Release binaries are cryptographically linked to source code via [Sigstore](https://www.sigstore.dev/)
-- **Phala Trust Center**: Independently verify the exact image hash running in each TEE worker
-- **No Compilation in TEE**: TEE workers with access to secrets only execute pre-compiled WASM, preventing supply chain attacks via malicious build scripts
+- **Only Published WASM Runs**: TEE workers with access to secrets execute a published `.wasm` named by its sha256 and run no build scripts, preventing supply chain attacks via malicious build scripts
 
 ## Development
 

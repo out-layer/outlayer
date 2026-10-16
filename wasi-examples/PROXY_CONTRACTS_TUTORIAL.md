@@ -55,7 +55,7 @@ const OUTLAYER_CONTRACT_ID: &str = "outlayer.near"; // or "outlayer.testnet"
 trait OutLayer {
     fn request_execution(
         &mut self,
-        code_source: serde_json::Value,
+        source: serde_json::Value,
         resource_limits: serde_json::Value,
         input_data: String,
         secrets_ref: Option<serde_json::Value>,
@@ -69,11 +69,11 @@ trait OutLayer {
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `code_source` | JSON | GitHub URL or WASM hash |
-| `resource_limits` | JSON | Memory, instructions, time limits |
+| `source` | JSON | The code to run: a `Project` or a `WasmUrl` (see [Code Source Formats](#code-source-formats)) |
+| `resource_limits` | JSON | Memory, instructions, time limits. Always pass it (`{}` takes the defaults): a request without it runs nothing |
 | `input_data` | String | JSON input for your WASM |
-| `secrets_ref` | Option<JSON> | Reference to encrypted secrets |
-| `response_format` | String | `"String"` or `"Json"` |
+| `secrets_ref` | Option<JSON> | `{"profile": "...", "account_id": "..."}` — the stored secrets to decrypt for the run |
+| `response_format` | String | `"Text"` (default), `"Json"` or `"Bytes"` |
 | `payer_account_id` | Option<AccountId> | Who gets refund on failure |
 
 ## Simple Example: Coin Flip
@@ -92,7 +92,7 @@ const CALLBACK_GAS: Gas = Gas::from_tgas(5);
 trait OutLayer {
     fn request_execution(
         &mut self,
-        code_source: serde_json::Value,
+        source: serde_json::Value,
         resource_limits: serde_json::Value,
         input_data: String,
         secrets_ref: Option<serde_json::Value>,
@@ -122,11 +122,11 @@ impl CoinFlip {
 
         let player = env::predecessor_account_id();
 
-        // Code source - GitHub URL
-        let code_source = serde_json::json!({
-            "GitHub": {
-                "url": "https://github.com/example/random-wasm",
-                "hash": null
+        // Code source - the active version of a project
+        let source = serde_json::json!({
+            "Project": {
+                "project_id": "alice.near/random-wasm",
+                "version_key": null
             }
         });
 
@@ -150,11 +150,11 @@ impl CoinFlip {
             .with_static_gas(remaining_gas)
             .with_unused_gas_weight(1)
             .request_execution(
-                code_source,
+                source,
                 resource_limits,
                 input_data,
                 None,           // no secrets
-                "String".into(),
+                "Text".into(),
                 Some(player.clone()), // refund to player on failure
             )
             .then(
@@ -199,36 +199,34 @@ impl CoinFlip {
 
 ## Code Source Formats
 
-### GitHub URL
+OutLayer runs a published `.wasm`, named by its sha256; the worker refuses a
+file whose bytes do not match the hash. A project version's source is always a
+`WasmUrl`.
+
+### Project (normal case)
 
 ```rust
-let code_source = serde_json::json!({
-    "GitHub": {
-        "url": "https://github.com/owner/repo",
-        "hash": null  // or specific commit hash
-    }
-});
-```
-
-### Project ID
-
-```rust
-let code_source = serde_json::json!({
+let source = serde_json::json!({
     "Project": {
-        "project_id": "alice.near/my-app"
+        "project_id": "alice.near/my-app",
+        "version_key": null  // null = active version; otherwise the version's wasm hash
     }
 });
 ```
 
-### WASM Hash (pre-uploaded)
+### WasmUrl (direct run of a published file)
 
 ```rust
-let code_source = serde_json::json!({
-    "WasmHash": {
-        "hash": "abc123..."
+let source = serde_json::json!({
+    "WasmUrl": {
+        "url": "https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm",
+        "hash": "<sha256>",
+        "build_target": "wasm32-wasip2"
     }
 });
 ```
+
+The URL must be `https://` on the default port.
 
 ## Advanced: OutLayerResponse Wrapper
 
@@ -300,10 +298,10 @@ For WASM that needs encrypted secrets (API keys, private keys):
 pub fn execute_with_secrets(&mut self) -> Promise {
     let player = env::predecessor_account_id();
 
-    // Reference secrets owned by current contract
+    // The secrets this contract stored under profile "default"
     let secrets_ref = serde_json::json!({
-        "owner_id": env::current_account_id(),
-        "names": ["API_KEY", "PRIVATE_KEY"]
+        "profile": "default",
+        "account_id": env::current_account_id()
     });
 
     ext_outlayer::ext(OUTLAYER_CONTRACT_ID.parse().unwrap())
@@ -311,7 +309,7 @@ pub fn execute_with_secrets(&mut self) -> Promise {
         .with_static_gas(env::prepaid_gas().saturating_sub(CALLBACK_GAS))
         .with_unused_gas_weight(1)
         .request_execution(
-            code_source,
+            source,
             resource_limits,
             input_data,
             Some(secrets_ref),  // <- secrets reference

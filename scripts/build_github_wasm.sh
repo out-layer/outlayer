@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 #
-# Compile a project the way the platform compiles it, and print the sha256 of
-# the wasm.
+# Build a project reproducibly, and print the sha256 of the wasm.
 #
 # That number is what an OutLayer enclave measures before it runs your code, and
-# what a secret locked to a build is judged against. Running this before you
-# publish lets you store the secret against the build first, so the very first
-# run is already allowed to read it — instead of publishing, running once to
-# discover the number, and storing the secret afterwards.
+# what a secret locked to a build is judged against. With --keep the wasm stays
+# on disk to publish (`outlayer upload <file>`, then `outlayer deploy <name>
+# <url>`); knowing the hash first lets you store the secret against the build
+# before the very first run.
 #
-# The build runs inside the same image the platform's compiler runs in, pinned
-# by digest, and follows the same recipe as
-# worker/src/compiler/wasm32_wasip{1,2}.rs: cargo build --release, then wasm-opt
-# for P1 or wasm-tools strip (keeping outlayer.manifest) for P2. Building with your own toolchain gives a
-# different, equally valid binary — and a different hash.
+# The build runs inside the platform's compiler image, pinned by digest, and
+# follows the recipe of worker/src/compiler/wasm32_wasip{1,2}.rs: cargo build
+# --release, then wasm-opt for P1 or wasm-tools strip (keeping
+# outlayer.manifest) for P2. Anyone who runs it on the same source gets the same
+# bytes, so a published hash can be checked against its source. Building with
+# your own toolchain gives a different, equally valid binary — and a different
+# hash.
 #
 # Usage:
 #   scripts/build_github_wasm.sh --repo https://github.com/you/proj --commit main
@@ -21,31 +22,28 @@
 #   scripts/build_github_wasm.sh --repo … --commit … --twice   # check it reproduces
 #
 # Options:
-#   --repo URL        GitHub repository to clone (with --commit)
+#   --repo URL        git repository to clone (with --commit)
 #   --commit REF      branch, tag or commit to build
 #   --dir PATH        build a local directory instead of cloning
 #   --target TRIPLE   wasm32-wasip1 (default) or wasm32-wasip2
-#   --image REF       compiler image; defaults to the digest below, which is
-#                     what the deployed compiling worker uses
-#                     (worker/.env.testnet.worker1). Override to match a
-#                     different worker, and pin by digest — a floating tag lets
-#                     a registry push change the toolchain under you.
+#   --image REF       compiler image; defaults to the digest below. Pin an
+#                     override by digest too — a floating tag lets a registry
+#                     push change the toolchain under you.
 #   --twice           build twice from scratch and report whether the bytes match
-#   --keep            leave the build output on disk and say where
+#   --keep            leave the wasm on disk and say where (the file to upload)
 #
 set -euo pipefail
 
-# The compiler the deployed worker runs, on linux/amd64 — the architecture the
-# compiling worker runs on, and not a detail.
+# The compiler image, on linux/amd64 — the architecture is not a detail.
 #
 # Measured, because the opposite seemed obvious: out-layer/env-test-example at
 # 74fb4db6 compiles to f4712d4f… on amd64 and to c11e2a1b… on arm64, same image
 # digest, same recipe. (out-layer/echo-example happens to agree across both,
 # which is how the assumption survived a first test.) A hash computed on an
-# Apple laptop against the arm64 variant is therefore a number the platform will
-# never produce, and a secret locked to it would never open.
-# outlayer/wasmedge-compiler:rust1.97-wasi25-b120, amd64 — the same image the
-# compiling worker is pinned to (worker/.env.testnet.worker1). Every input that
+# Apple laptop against the arm64 variant is therefore a number no amd64 rebuild
+# reproduces.
+# outlayer/wasmedge-compiler:rust1.97-wasi25-b120, amd64
+# (docker/Dockerfile.wasmedge-compiler). Every input that
 # decides the bytes is fixed in it: the rust base by digest, wasm-tools and
 # cargo-component by version, and binaryen — whose wasm-opt rewrites every
 # wasip1 module — by exact package.
@@ -53,8 +51,7 @@ set -euo pipefail
 # amd64 is named, not merely preferred: the architecture changes the bytes.
 # out-layer/env-test-example at 74fb4db6 compiled to f4712d4f… on amd64 and to
 # c11e2a1b… on arm64 under the previous image, same digest and same recipe. A
-# hash worked out against an arm64 variant is one the platform will never
-# produce, and a secret locked to it would never open.
+# hash worked out against an arm64 variant is one no amd64 rebuild reproduces.
 DEFAULT_IMAGE="outlayer/wasmedge-compiler@sha256:d9eb7bd9bab6c46b77f309ec33e94ca112883268a848dd1929289fade799cd27"
 
 REPO=""; COMMIT=""; DIR=""; TARGET="wasm32-wasip1"
@@ -102,8 +99,8 @@ docker pull -q "$IMAGE" >/dev/null 2>&1 || docker pull -q --platform linux/amd64
 ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}' 2>/dev/null || echo unknown)
 if [ "$ARCH" != "amd64" ]; then
   echo "the compiler image resolved to '$ARCH', not amd64." >&2
-  echo "The platform compiles on amd64 and the bytes differ, so a hash from any" >&2
-  echo "other architecture is one the platform will never produce. Name the amd64" >&2
+  echo "The bytes differ by architecture, so a hash from any other architecture" >&2
+  echo "is one no amd64 rebuild reproduces. Name the amd64" >&2
   echo "image rather than a multi-arch one: a reference already pulled for this" >&2
   echo "host keeps that architecture, and --platform will not move it." >&2
   exit 1
@@ -136,18 +133,6 @@ else
   rm -rf target
 fi
 
-# The platform refuses build scripts and git dependencies. Warn here rather than
-# letting the build run and the publish fail later. Comments are stripped first:
-# repositories leave the rejected forms in a comment as a note to the reader,
-# and one of OutLayer's own examples does.
-CODE=$(sed 's/#.*//' Cargo.toml)
-if printf '%s' "$CODE" | grep -Eq '^[[:space:]]*build[[:space:]]*='; then
-  echo "warning: Cargo.toml declares a build script; the platform refuses those" >&2
-fi
-if printf '%s' "$CODE" | grep -Eq 'git[[:space:]]*=[[:space:]]*["'"'"']https?://'; then
-  echo "warning: Cargo.toml has a git dependency; the platform refuses those" >&2
-fi
-
 LOCKED=""
 if [ -f Cargo.lock ]; then
   LOCKED="--locked"
@@ -160,7 +145,7 @@ cargo build --release --target "$TARGET_TO_ADD" $LOCKED >&2
 WASM=$(find "target/$TARGET_TO_ADD/release" -maxdepth 1 -name '*.wasm' -type f | sort | head -1)
 [ -n "$WASM" ] || { echo "the build produced no wasm in target/$TARGET_TO_ADD/release" >&2; exit 1; }
 COUNT=$(find "target/$TARGET_TO_ADD/release" -maxdepth 1 -name '*.wasm' -type f | wc -l | tr -d ' ')
-[ "$COUNT" = 1 ] || echo "note: $COUNT wasm binaries built; the platform runs the first by name, $(basename "$WASM")" >&2
+[ "$COUNT" = 1 ] || echo "note: $COUNT wasm binaries built; this is the first by name, $(basename "$WASM")" >&2
 
 mkdir -p /workspace/output
 cp "$WASM" /workspace/output/output.wasm
@@ -226,11 +211,14 @@ if [ "$TWICE" = 1 ]; then
   fi
 fi
 
-[ "$KEEP" = 1 ] && echo "wasm kept at: $OUT_DIR/a/module.wasm" >&2
+if [ "$KEEP" = 1 ]; then
+  echo "wasm kept at: $OUT_DIR/a/module.wasm" >&2
+  echo "Publish it with: outlayer upload $OUT_DIR/a/module.wasm, then outlayer deploy <name> <url>" >&2
+fi
 
 echo >&2
 echo "Lock a secret to this build with:" >&2
-echo "  outlayer secrets set <KEY> <value> --build $FIRST" >&2
+echo "  outlayer secrets set '{\"KEY\":\"value\"}' --project <owner/name> --build $FIRST" >&2
 echo >&2
 
 echo "$FIRST"

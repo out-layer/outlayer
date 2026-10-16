@@ -5,14 +5,15 @@ Command-line tool for deploying, running, and managing OutLayer agents.
 ```bash
 outlayer login                                              # Import NEAR full access key
 outlayer create my-agent                                    # Create project from template
-outlayer deploy my-agent                                    # Deploy agent to OutLayer
+outlayer upload my-agent.wasm                               # Publish the built .wasm to FastFS
+outlayer deploy my-agent <FastFS URL>                       # Deploy it to OutLayer
 outlayer run alice.near/my-agent '{"command": "hello"}'     # Execute agent
 ```
 
 ## Install
 
 ```bash
-# From GitHub (requires Rust)
+# From source (requires Rust)
 cargo install --git https://github.com/out-layer/outlayer-cli
 
 # From local checkout
@@ -31,10 +32,10 @@ outlayer create my-agent                    # basic template (stdin/stdout)
 outlayer create my-agent --template contract # with OutLayer SDK (VRF, storage, RPC)
 cd my-agent
 
-# 3. Edit src/main.rs, push to GitHub, then deploy
-git init && git remote add origin <your-repo-url>
-git push
-outlayer deploy my-agent
+# 3. Edit src/main.rs, build, publish the .wasm and deploy it
+./build.sh
+outlayer upload out/my-agent.wasm
+outlayer deploy my-agent <FastFS URL printed by upload>
 
 # 4. Create a payment key for HTTPS calls
 outlayer keys create
@@ -70,12 +71,19 @@ The active network is saved to `~/.outlayer/default-network`. If not set, the CL
 | `outlayer create <name>` | Create project from template (basic) in `./<name>/` |
 | `outlayer create <name> --template contract` | Create with OutLayer SDK (VRF, storage, RPC) |
 | `outlayer create <name> --dir /path` | Create in a custom directory |
-| `outlayer deploy <name>` | Deploy from current git repo (origin + HEAD) |
-| `outlayer deploy <name> <wasm-url>` | Deploy from WASM URL (FastFS, etc.) |
-| `outlayer deploy <name> --no-activate` | Deploy without activating |
+| `outlayer deploy <name> <wasm-url>` | Deploy a published .wasm (the FastFS URL `outlayer upload` prints, or any https URL): creates the project or adds a version, and activates it |
+| `outlayer deploy <name> <wasm-url> --no-activate` | Deploy without activating |
 | `outlayer run <project> [input]` | Execute agent (HTTPS or on-chain fallback) |
 | `outlayer projects [account]` | List projects for a user |
 | `outlayer status [call_id]` | Project info or poll async call |
+
+A version is a published `.wasm`, named by its sha256, so what a caller runs and
+pays for cannot change under that version afterwards — a repository can change
+under the same name and commit history can be rewritten. `deploy` computes the
+hash from the URL (or takes `--hash`); the worker refuses a file whose bytes do
+not match it. For a reproducible build — the same pinned Docker image, the same
+hash every time — use `scripts/build_github_wasm.sh --dir ./my-project --target
+wasm32-wasip2` from the [OutLayer repository](https://github.com/out-layer/outlayer).
 
 ### Run
 
@@ -91,12 +99,8 @@ outlayer run alice.near/my-agent '{}' --version abc123            # specific ver
 # Attach secrets to execution
 outlayer run alice.near/my-agent '{}' --secrets-profile default --secrets-account alice.near
 
-# Run from GitHub repo (on-chain)
-outlayer run --github github.com/user/repo '{"command": "hello"}'
-outlayer run --github github.com/user/repo --commit abc123 '{"input": 1}'
-
-# Run from WASM URL (on-chain)
-outlayer run --wasm https://alice.near.fastfs.io/outlayer.near/abc.wasm '{"cmd": "hi"}'
+# Run a published WASM URL directly (on-chain)
+outlayer run --wasm https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm '{"cmd": "hi"}'
 outlayer run --wasm https://example.com/file.wasm --hash abc123... '{}'
 ```
 
@@ -127,7 +131,6 @@ Encrypted client-side, decrypted only inside TEE.
 # Set secrets (JSON object, overwrites existing)
 outlayer secrets set '{"API_KEY":"sk-...","DB_URL":"postgres://..."}'
 outlayer secrets set '{"API_KEY":"sk-..."}' --project alice.near/my-agent
-outlayer secrets set '{"API_KEY":"sk-..."}' --repo github.com/user/repo --branch main
 outlayer secrets set '{"API_KEY":"sk-..."}' --wasm-hash abc123...   # the row a raw WASM URL run reads under
 outlayer secrets set '{"SIGNING_KEY":"..."}' --project alice.near/oracle --build <sha256>   # locked to one build
 outlayer secrets access --project alice.near/oracle --access whitelist:alice.near --build <new sha256>   # move to the next release
@@ -140,8 +143,10 @@ outlayer secrets set --generate PROTECTED_MASTER_KEY:hex32
 outlayer secrets set '{"API_KEY":"sk-..."}' --generate PROTECTED_DB:hex64   # mixed
 
 # Access control
-outlayer secrets set '{"KEY":"val"}' --access allow-all                      # default
+outlayer secrets set '{"KEY":"val"}' --access allow-all                      # everyone who names it
 outlayer secrets set '{"KEY":"val"}' --access whitelist:alice.near,bob.near
+# Without --access: a row that exists keeps its condition; a new project row admits only you;
+# a new hash row admits everyone.
 
 # Update (merge with existing, preserves all PROTECTED_* variables)
 outlayer secrets update '{"NEW_KEY":"val"}' --project alice.near/my-agent
@@ -157,7 +162,12 @@ outlayer secrets delete --profile production
 
 Default accessor: `--project` auto-resolved from `outlayer.toml` if present.
 
-`--build <sha256>` locks a project's or repository's row to one build: the
+A row is bound to a project (`--project`) or to a build (`--wasm-hash`). A row
+bound to a repository, stored earlier, is listed by `secrets list` and can be
+deleted (`secrets delete --repo <repo> --branch <branch>`); nothing new is
+stored, updated or re-scoped for a repository.
+
+`--build <sha256>` locks a project's row to one build: the
 condition becomes `And[<access>, WasmHash(hash)]` (or the `WasmHash` leaf alone
 under `allow-all`), and the keystore admits only a run whose bytes hash to it.
 A rebuild is refused with the build named. The value stays; `secrets access
@@ -215,10 +225,11 @@ Upload files to on-chain storage via NEAR transactions.
 
 ```bash
 outlayer upload ./target/wasm32-wasip2/release/my-agent.wasm
-# → FastFS URL: https://alice.near.fastfs.io/outlayer.near/abcdef.wasm
+# → SHA256: <sha256>
+#   FastFS URL: https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm
 ```
 
-Files >1MB are automatically chunked.
+The host is `main.fastfs.io` on mainnet and `test.fastfs.io` on testnet. Files >1MB are automatically chunked.
 
 > **Note:** FastFS upload transactions are **expected to fail** with "Exceeded the prepaid gas" — this is by design. Gas is intentionally set to 1 to minimize costs. No contract execution is needed — the NEAR indexer picks up the file data from the transaction arguments regardless of execution status. The file will be available at its FastFS URL after indexing, which takes 1–2 minutes. Chunked uploads (files >1MB) may take longer since all chunks must be indexed before the file is assembled.
 
@@ -265,7 +276,7 @@ owner = "alice.near"
 
 [build]
 target = "wasm32-wasip2"
-source = "github"
+source = "wasm_url"
 
 [run]
 payment_key_nonce = 1

@@ -81,8 +81,7 @@ exactly `encryption-typed` names a `type` on an encryption key, exactly
 `encryption-pred` declares a predecessor encryption key, exactly `project-pred`
 a predecessor signing key, and exactly
 `encryption-storage-pred` declares `storage_account: "predecessor"`. It also reports whether the manifest
-survives `wasm-tools strip`, the step the platform applies to a GitHub build of
-a `wasm32-wasip2` component.
+survives `wasm-tools strip`.
 
 ## Not a connector
 
@@ -104,8 +103,7 @@ curl -s -X POST "https://testnet-api.outlayer.ai/call/you.testnet/signing-key-pr
 
 A `bind: "wasm"` build runs directly from its wasm URL, on chain
 (`request_execution` with a `WasmUrl` source, or `outlayer run --wasm <url>`).
-Run the other way round, either build is refused before it starts; so is any
-build of this code from a GitHub repository.
+Run the other way round, either build is refused before it starts.
 
 Every key these builds declare is a `caller: "signer"` key (the default): bound
 to the transaction's signer on chain, the payment key's owner over HTTPS —
