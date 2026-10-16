@@ -432,8 +432,11 @@ impl Config {
             .unwrap_or(false);
 
         // Worker capabilities - what this worker can do
+        // Off unless asked for: a build runs the repository's own code (see
+        // `Compiler::compile_from_github`), so no worker becomes a builder by
+        // leaving the variable out.
         let compilation_enabled = env::var("COMPILATION_ENABLED")
-            .unwrap_or_else(|_| "true".to_string())
+            .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
             .context("COMPILATION_ENABLED must be 'true' or 'false'")?;
 
