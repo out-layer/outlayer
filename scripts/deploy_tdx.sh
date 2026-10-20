@@ -431,20 +431,36 @@ fi
 # against the now-approved list, then grep for the Proposal ID.
 echo "[5/6] Restart keystore so it submits against the approved measurements..."
 # The keystore mints a new registration key on EVERY boot and submits a proposal for it, and
-# the container log survives the restart. So the proposal to vote on is the one submitted AFTER
-# this restart: anything already in the log is for a key the keystore no longer holds, and a
-# vote on it executes, changes nothing, and leaves the live key waiting until its 30-min
-# registration timeout. Remember the highest id seen before the restart; accept only a higher one.
-PREV_ID=$(ks_logs 2000 2>/dev/null | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)
-[ -n "$PREV_ID" ] && echo "  proposals already in the log (stale after the restart): up to #$PREV_ID"
+# the container log survives the restart. So only what the keystore logs AFTER this restart
+# counts: a proposal or a "ready" line from before it belongs to a key the keystore no longer
+# holds, and a vote on such a proposal executes, changes nothing, and leaves the live key waiting
+# until its 30-min registration timeout. A boot that is still registering when the restart is
+# issued can submit after any "highest id so far" was read, so the cut is the node's clock taken
+# once the restart has returned (the old VM is down by then); the proposal is then checked on
+# chain against the key the new boot announced.
 node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
+SINCE=$(node_run "date -u +%Y-%m-%dT%H:%M:%S" 2>/dev/null | tail -1 | tr -d '\r')
+[[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}$ ]] || { echo "  could not read the node's clock (got '$SINCE')" >&2; exit 1; }
+echo "  counting only what the keystore logs from $SINCE UTC on"
+# The keystore's log lines from $SINCE on (they start with an ISO timestamp).
+ks_logs_since() { ks_logs "${1:-600}" 2>/dev/null | awk -v t="$SINCE" '/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && substr($0, 1, 19) >= t'; }
 echo "  waiting for the keystore to submit its DAO proposal (Proposal ID: N)..."
-PROPOSAL_ID=""
+PROPOSAL_ID=""; LIVE_KEY=""
 for i in $(seq 1 25); do
-  L=$(ks_logs 300 2>/dev/null || true)
+  L=$(ks_logs_since 600 || true)
+  LIVE_KEY=$(printf '%s' "$L" | grep -oE 'Using keystore public key: [a-z0-9-]+:[A-Za-z0-9]+' | tail -1 | sed 's/.*: //' || true)
   # main.rs logs "Proposal ID: {}" on a successful submit; tee_registration.rs logs the same.
   PROPOSAL_ID=$(printf '%s' "$L" | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)
-  if [ -n "$PROPOSAL_ID" ] && [ -n "$PREV_ID" ] && [ "$PROPOSAL_ID" -le "$PREV_ID" ]; then PROPOSAL_ID=""; fi
+  if [ -n "$PROPOSAL_ID" ]; then
+    P=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
+      network-config "$NETWORK" now 2>/dev/null || true)
+    P_KEY=$(printf '%s' "$P" | grep -oE '"public_key": "[^"]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
+    P_STATUS=$(printf '%s' "$P" | grep -oE '"status": "[A-Za-z]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
+    if [ -z "$LIVE_KEY" ] || [ "$P_KEY" != "$LIVE_KEY" ] || [ "$P_STATUS" != Pending ]; then
+      echo "  #$PROPOSAL_ID is not the live key's pending proposal yet (key ${P_KEY:-?}, live ${LIVE_KEY:-not logged yet}, status ${P_STATUS:-?}); waiting"
+      PROPOSAL_ID=""
+    fi
+  fi
   [ -n "$PROPOSAL_ID" ] && break
   # Do NOT early-exit on "measurements not approved" / "Registration rejected": that line is EXPECTED
   # from the keystore's FIRST boot (before [4/6] approved) and persists in the log buffer, so bailing
@@ -453,7 +469,7 @@ for i in $(seq 1 25); do
   sleep 12
 done
 [ -n "$PROPOSAL_ID" ] || { echo "  No 'Proposal ID' in logs after ~5min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
-echo "  proposal id: $PROPOSAL_ID"
+echo "  proposal id: $PROPOSAL_ID (live key $LIVE_KEY, pending on $DAO)"
 
 # Vote: auto on testnet, manual on mainnet (mirror deploy_phala.sh step 7 — a human turns the
 # mainnet key). Threshold with the single member zavodil is 1, so one approve passes it.
@@ -495,7 +511,8 @@ for i in $(seq 1 25); do
     p=\$(for pid in \$(pgrep -f qemu-system-x86_64); do c=\$(tr '\\0' ' ' < /proc/\$pid/cmdline 2>/dev/null) || continue; \
       [[ \"\$c\" == *\"\$u\"* ]] || continue; echo \"\$c\" | grep -oE '127\\.0\\.0\\.1:[0-9]+-:8081' | sed -E 's/.*:([0-9]+)-:8081/\\1/' | head -1; break; done); \
     [ -n \"\$p\" ] && curl -fs --max-time 5 \"http://127.0.0.1:\$p/health\" || true" 2>/dev/null || true)
-  L=$(ks_logs 300 2>/dev/null || true)
+  # Only a "ready" line of THIS boot counts (see [5/6]): an earlier boot's line survives in the log.
+  L=$(ks_logs_since 600 || true)
   if printf '%s' "$L" | grep -q "Keystore is now ready to serve requests"; then
     echo "  READY: keystore completed TEE registration + pulled its MPC-CKD master."
     [ -n "$HEALTH" ] && echo "  /health (loopback): $HEALTH"
