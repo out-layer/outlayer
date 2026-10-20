@@ -32,6 +32,9 @@
 #                       disk and env; its measurements change. The container digest step is
 #                       skipped (the container does not change); --version only names the
 #                       instance when [instance-name] is omitted.
+#   --kms-url <url>     deploy against this KMS instead of the node's default (KMS v1):
+#                       https://kms-v2.<site>.dstack.outlayer.ai:11102 for KMS v2. Changes the
+#                       measurements (RTMR3 carries the KMS), approved like any other.
 #   --dry-run           show what would happen; no deploy, no tx
 #
 # The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
@@ -60,7 +63,7 @@
 #   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@173.237.9.76
 set -euo pipefail
 
-DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""
+DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""; KMS_URL=""
 EXECUTE_EXCLUDES=""; EXCLUDES_SET=false
 REMOTE_USER="outlayer"; REMOTE_DIR="/home/outlayer/self-hosted-tdx"
 POS=()
@@ -75,6 +78,9 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --gateway-url) GATEWAY_URL="${2:?}"; shift 2;;
   # upgrade the existing CVM's guest OS image in place instead of deploying (see the header)
   --os-image)    OS_IMAGE="${2:?}"; shift 2;;
+  # the KMS the CVM gets its keys from (default: the node script's, KMS v1); KMS v2 is
+  # https://kms-v2.<site>.dstack.outlayer.ai:11102 (deploy/self-hosted-tdx/30-deploy-kms-v2.sh)
+  --kms-url)     KMS_URL="${2:?}"; shift 2;;
   # worker only: routes this node must NOT run, `<project>:<operation>` or
   # `<project>:*`, comma-separated. Given here it overrides the per-node table
   # below; an empty string forces "no exclusions" on a node the table covers.
@@ -209,7 +215,7 @@ if $DRY_RUN; then
     exit 0
   fi
   if [ "$COMPONENT" = worker ]; then
-    echo "(dry-run) would: deploy CVM '$NAME' on $NODE -> read measurements -> approve on $REGISTER (signer $OWNER) -> wait for it to register"
+    echo "(dry-run) would: deploy CVM '$NAME' on $NODE${KMS_URL:+ (kms-url=$KMS_URL)} -> read measurements -> approve on $REGISTER (signer $OWNER) -> wait for it to register"
     if [ "$EXCLUDES_SET" = true ]; then
       echo "(dry-run) would set in $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx: EXECUTE_EXCLUDES=${EXECUTE_EXCLUDES:-<empty>} (from --execute-excludes)"
     else
@@ -281,7 +287,7 @@ if [ "$WRITE_EXCLUDES" = true ]; then
     [ -n "$WAS" ] && [ "$WAS" != "$WANT_EXCLUDES" ] && echo "    previous value on the node: $WAS"
   fi
 fi
-node_run "WORKER_DIGEST=$DIGEST ./deploy_tdx.sh worker $NETWORK $NAME --version $VER"
+node_run "${KMS_URL:+KMS_URL=$KMS_URL }WORKER_DIGEST=$DIGEST ./deploy_tdx.sh worker $NETWORK $NAME --version $VER"
 fi  # deploy vs --os-image
 
 # [3/5] read the 5 TEE measurements. Source of truth: the CVM's guest agent (tcb_info on its
@@ -390,7 +396,7 @@ fi
 # Capture the node deploy output (tee'd so the operator still sees it) to recover the gateway-mode
 # KEYSTORE_URL=... line that 40-deploy-keystore.sh prints (app-id is computed node-side from
 # the final app-compose). Empty in plain mode.
-DEPLOY_LOG=$(node_run "GATEWAY_URL='$GATEWAY_URL' WORKER_DIGEST=$DIGEST ./deploy_tdx.sh keystore $NETWORK $NAME --version $VER" 2>&1 | tee /dev/stderr) || true
+DEPLOY_LOG=$(node_run "${KMS_URL:+KMS_URL=$KMS_URL }GATEWAY_URL='$GATEWAY_URL' WORKER_DIGEST=$DIGEST ./deploy_tdx.sh keystore $NETWORK $NAME --version $VER" 2>&1 | tee /dev/stderr) || true
 KEYSTORE_URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'KEYSTORE_URL=https://[^[:space:]]+' | tail -1 | sed 's/^KEYSTORE_URL=//' || true)
 fi  # deploy vs --os-image
 
