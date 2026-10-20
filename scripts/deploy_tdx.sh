@@ -25,6 +25,13 @@
 #                       https://gateway.dstack.outlayer.ai:9202). Set -> keystore deploys
 #                       gateway-enabled and gets a public HTTPS endpoint
 #                       https://<keystore-app-id>-8081.<domain>. Unset -> loopback-only keystore.
+#   --os-image <img>    UPGRADE instead of deploy: move the EXISTING CVM [instance-name] to this
+#                       dstack guest OS image (e.g. dstack-0.5.12, added to the node by
+#                       deploy/self-hosted-tdx/15-add-os-image.sh), then approve its new
+#                       measurements exactly as a deploy would. The CVM keeps its app-id, URL,
+#                       disk and env; its measurements change. The container digest step is
+#                       skipped (the container does not change); --version only names the
+#                       instance when [instance-name] is omitted.
 #   --dry-run           show what would happen; no deploy, no tx
 #
 # The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
@@ -52,7 +59,7 @@
 #   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@173.237.9.76
 set -euo pipefail
 
-DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""
+DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""
 EXECUTE_EXCLUDES=""; EXCLUDES_SET=false
 REMOTE_USER="outlayer"; REMOTE_DIR="/home/outlayer/self-hosted-tdx"
 POS=()
@@ -65,6 +72,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
   # keystore only: per-VM dstack-gateway URL. Set -> keystore deploys gateway-enabled (public HTTPS
   # https://<keystore-app-id>-8081.<domain>). Forwarded to the node as GATEWAY_URL=...
   --gateway-url) GATEWAY_URL="${2:?}"; shift 2;;
+  # upgrade the existing CVM's guest OS image in place instead of deploying (see the header)
+  --os-image)    OS_IMAGE="${2:?}"; shift 2;;
   # worker only: routes this node must NOT run, `<project>:<operation>` or
   # `<project>:*`, comma-separated. Given here it overrides the per-node table
   # below; an empty string forces "no exclusions" on a node the table covers.
@@ -142,6 +151,19 @@ case "$COMPONENT" in
     ;;
 esac
 
+# The five measurements of the CVM named $NAME, as the contract-argument JSON, read from its
+# guest agent's tcb_info over the node loopback (worker-ctl.sh finds the port). Empty while the
+# CVM is not up yet. Any booted CVM answers, registered or not, worker or keystore.
+agent_measurements() {
+  node_run "p=\$(NAME=$NAME ./worker-ctl.sh port 2>/dev/null); case \"\$p\" in ''|'<'*) exit 0;; esac; \
+    curl -s --max-time 5 \"http://127.0.0.1:\$p/prpc/Info?json\" | python3 -c '
+import sys, json
+t = json.loads(json.load(sys.stdin)[\"tcb_info\"])
+m = {k: t[k] for k in (\"mrtd\", \"rtmr0\", \"rtmr1\", \"rtmr2\", \"rtmr3\")}
+assert all(len(v) == 96 for v in m.values())
+print(json.dumps(m, separators=(\",\", \":\")))' 2>/dev/null" 2>/dev/null | grep -oE '^\{"mrtd":"[a-f0-9]{96}".*\}$' | tail -1
+}
+
 # Run a command on the node as REMOTE_USER inside REMOTE_DIR. base64 avoids all quoting hell.
 node_run() {
   local cmd b64
@@ -158,14 +180,16 @@ echo "== deploy_tdx: $COMPONENT $NETWORK  vm-label=$NAME  version=v$VER  node=$N
 
 # [1/N] resolve + attest the image digest locally (the node has no gh). The GitHub release
 # body lists one row per component: `| worker | sha256:... |`, `| keystore | sha256:... |`.
-if [ -z "$DIGEST" ]; then
+if [ -n "$OS_IMAGE" ]; then
+  echo "[1] OS image upgrade of the existing CVM '$NAME' to $OS_IMAGE: the container is not redeployed, no digest to resolve"
+elif [ -z "$DIGEST" ]; then
   echo "[1] Resolve $COMPONENT digest for v$VER (gh, local)..."
   DIGEST=$(gh release view "v$VER" --repo out-layer/outlayer --json body -q '.body' 2>/dev/null \
     | grep -iE "\\| *$COMPONENT *\\|" | grep -oE 'sha256:[a-f0-9]{64}' | head -1) || true
   [ -n "$DIGEST" ] || { echo "  Could not resolve digest via gh — pass --digest sha256:..." >&2; exit 1; }
 fi
-echo "  digest: $DIGEST"
-if command -v gh >/dev/null 2>&1; then
+[ -n "$OS_IMAGE" ] || echo "  digest: $DIGEST"
+if [ -z "$OS_IMAGE" ] && command -v gh >/dev/null 2>&1; then
   # Releases up to v0.1.58 are attested under the fastnear GitHub organization (the
   # repository former home), so fall back to --owner fastnear when the repo lookup fails.
   if gh attestation verify "oci://docker.io/$IMAGE@$DIGEST" -R out-layer/outlayer >/dev/null 2>&1; then
@@ -178,6 +202,11 @@ if command -v gh >/dev/null 2>&1; then
 fi
 
 if $DRY_RUN; then
+  if [ -n "$OS_IMAGE" ]; then
+    gate=$([ "$COMPONENT" = worker ] && echo "approve on $REGISTER (signer $OWNER) -> restart -> verify" || echo "approve on $DAO (signer $OWNER) -> wait for proposal -> vote (signer $VOTER) -> poll /health")
+    echo "(dry-run) would: on $NODE, worker-ctl.sh set-image $NAME $OS_IMAGE (soft stop, resize --image, start) -> read measurements -> $gate"
+    exit 0
+  fi
   if [ "$COMPONENT" = worker ]; then
     echo "(dry-run) would: deploy CVM '$NAME' on $NODE -> read measurements -> approve on $REGISTER (signer $OWNER) -> restart -> verify"
     if [ "$EXCLUDES_SET" = true ]; then
@@ -196,6 +225,11 @@ if $DRY_RUN; then
 fi
 
 if [ "$COMPONENT" = worker ]; then
+if [ -n "$OS_IMAGE" ]; then
+# [2/5] upgrade: the existing CVM boots the new guest OS; env, disk and app-id are untouched
+echo "[2/5] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image, start)..."
+node_run "./worker-ctl.sh set-image $NAME $OS_IMAGE"
+else
 # [2/5] deploy the CVM on the node (node-side deploy_tdx.sh derives the stable COMPOSE_NAME)
 echo "[2/5] Deploy CVM on node (reads node env: $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx — NOT your local copy)..."
 
@@ -244,20 +278,29 @@ if [ "$WRITE_EXCLUDES" = true ]; then
   fi
 fi
 node_run "WORKER_DIGEST=$DIGEST ./deploy_tdx.sh worker $NETWORK $NAME --version $VER"
+fi  # deploy vs --os-image
 
-# [3/5] read the 5 TEE measurements from the worker's logs
-echo "[3/5] Read TEE measurements from worker logs (waiting for boot)..."
-LOGS=""; MRTD=""
+# [3/5] read the 5 TEE measurements. Source of truth: the CVM's guest agent (tcb_info on its
+# loopback port), which answers for any booted CVM. The worker's own log carries them only on a
+# boot that registers a key, so a CVM whose key is already registered (an OS image upgrade)
+# logs nothing — the log is the fallback, not the source.
+echo "[3/5] Read TEE measurements from the CVM's guest agent (waiting for boot)..."
+MEAS=""
 for i in $(seq 1 20); do
+  MEAS=$(agent_measurements || true)
+  [ -n "$MEAS" ] && break
   LOGS=$(node_run "NAME=$NAME TAIL=600 ./worker-ctl.sh logs" 2>/dev/null || true)
   MRTD=$(printf '%s' "$LOGS" | grep -oE 'MRTD:[[:space:]]+[a-f0-9]{96}' | tail -1 | grep -oE '[a-f0-9]{96}' || true)
-  [ -n "$MRTD" ] && break
+  if [ -n "$MRTD" ]; then
+    rd(){ printf '%s' "$LOGS" | grep -oE "$1:[[:space:]]+[a-f0-9]{96}" | tail -1 | grep -oE '[a-f0-9]{96}'; }
+    MEAS=$(printf '{"mrtd":"%s","rtmr0":"%s","rtmr1":"%s","rtmr2":"%s","rtmr3":"%s"}' "$MRTD" "$(rd RTMR0)" "$(rd RTMR1)" "$(rd RTMR2)" "$(rd RTMR3)")
+    break
+  fi
   sleep 12
 done
-[ -n "$MRTD" ] || { echo "  Could not read measurements after ~4min. Check: NAME=$NAME worker-ctl.sh follow" >&2; exit 1; }
-rd(){ printf '%s' "$LOGS" | grep -oE "$1:[[:space:]]+[a-f0-9]{96}" | tail -1 | grep -oE '[a-f0-9]{96}'; }
-RTMR0=$(rd RTMR0); RTMR1=$(rd RTMR1); RTMR2=$(rd RTMR2); RTMR3=$(rd RTMR3)
-MEAS=$(printf '{"mrtd":"%s","rtmr0":"%s","rtmr1":"%s","rtmr2":"%s","rtmr3":"%s"}' "$MRTD" "$RTMR0" "$RTMR1" "$RTMR2" "$RTMR3")
+[ -n "$MEAS" ] || { echo "  Could not read measurements after ~4min. Check: NAME=$NAME worker-ctl.sh follow" >&2; exit 1; }
+MRTD=$(printf '%s' "$MEAS" | grep -oE '"mrtd":"[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}')
+RTMR3=$(printf '%s' "$MEAS" | grep -oE '"rtmr3":"[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}')
 echo "  mrtd=$MRTD"
 echo "  rtmr3=$RTMR3"
 
@@ -281,8 +324,10 @@ node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
 echo "  watching for registration..."
 for i in $(seq 1 20); do
   L=$(node_run "NAME=$NAME TAIL=200 ./worker-ctl.sh logs" 2>/dev/null || true)
-  if printf '%s' "$L" | grep -q "Worker key registered successfully"; then
-    echo "  REGISTERED:"; printf '%s' "$L" | grep -E "registered successfully|Transaction:" | tail -2
+  # A worker whose key is already on the contract (an OS image upgrade keeps the disk, and the
+  # key on it) does not register again: it logs "Key registered and ready for signing".
+  if printf '%s' "$L" | grep -qE "Worker key registered successfully|Key registered and ready for signing"; then
+    echo "  REGISTERED:"; printf '%s' "$L" | grep -E "registered successfully|Key registered and ready|Transaction:" | tail -2
     echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME ./worker-ctl.sh follow"
     exit 0
   fi
@@ -306,6 +351,13 @@ ks_logs() { node_run "NAME=$NAME CONTAINER=$KS_CONTAINER TAIL=${1:-600} ./worker
 # [2/6] deploy the CVM on the node (node-side deploy_tdx.sh derives the stable COMPOSE_NAME).
 # GATEWAY_URL (optional) flows Mac --gateway-url -> node env -> 40-deploy-keystore.sh: when set, the
 # keystore deploys gateway-enabled and gets a public HTTPS endpoint.
+if [ -n "$OS_IMAGE" ]; then
+# [2/6] upgrade: the existing keystore boots the new guest OS; app-id, URL, disk, env and the
+# gateway registration are untouched. It is not ready from the stop until the vote lands.
+echo "[2/6] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image, start)..."
+node_run "./worker-ctl.sh set-image $NAME $OS_IMAGE"
+KEYSTORE_URL=""   # unchanged by an image upgrade; nothing new to announce
+else
 echo "[2/6] Deploy CVM on node (reads node env: $REMOTE_DIR/keystore/.env.${NETWORK}-keystore-tdx — NOT your local copy)..."
 if [ -n "$GATEWAY_URL" ]; then
   echo "  gateway mode: GATEWAY_URL=$GATEWAY_URL"
@@ -320,6 +372,7 @@ fi
 # the final app-compose). Empty in plain mode.
 DEPLOY_LOG=$(node_run "GATEWAY_URL='$GATEWAY_URL' WORKER_DIGEST=$DIGEST ./deploy_tdx.sh keystore $NETWORK $NAME --version $VER" 2>&1 | tee /dev/stderr) || true
 KEYSTORE_URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'KEYSTORE_URL=https://[^[:space:]]+' | tail -1 | sed 's/^KEYSTORE_URL=//' || true)
+fi  # deploy vs --os-image
 
 # [3/6] read the 5 TEE measurements from the keystore's logs.
 # The keystore logs them as a single DEBUG line: "TDX Measurements: MRTD=<hex>, RTMR0=<hex>, ..."
@@ -332,21 +385,25 @@ KEYSTORE_URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'KEYSTORE_URL=https://[^[:sp
 # a clean restart FIRST so the once-per-boot line is freshly near the tail of the captured window
 # (it's the same kind of restart the flow already does before grepping the Proposal ID). Robust under
 # set -euo pipefail: worker-ctl.sh restart is best-effort (|| true), then we poll.
+# The guest agent is the source (see agent_measurements); the log line is the fallback.
 KS_MEAS_TAIL="${KS_MEAS_TAIL:-8000}"
-echo "[3/6] Restart keystore so it re-emits the once-per-boot 'TDX Measurements:' line, then read it..."
-node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null 2>&1 || true
-echo "  reading TEE measurements from keystore logs (window=$KS_MEAS_TAIL lines; waiting for boot)..."
-LOGS=""; MRTD=""
+echo "[3/6] Read TEE measurements from the CVM's guest agent (waiting for boot)..."
+MEAS=""
 for i in $(seq 1 20); do
+  MEAS=$(agent_measurements || true)
+  [ -n "$MEAS" ] && break
   LOGS=$(ks_logs "$KS_MEAS_TAIL" 2>/dev/null || true)
   MRTD=$(printf '%s' "$LOGS" | grep -oE 'MRTD=[a-f0-9]{96}' | tail -1 | grep -oE '[a-f0-9]{96}' || true)
-  [ -n "$MRTD" ] && break
+  if [ -n "$MRTD" ]; then
+    rd(){ printf '%s' "$LOGS" | grep -oE "$1=[a-f0-9]{96}" | tail -1 | grep -oE '[a-f0-9]{96}'; }
+    MEAS=$(printf '{"mrtd":"%s","rtmr0":"%s","rtmr1":"%s","rtmr2":"%s","rtmr3":"%s"}' "$MRTD" "$(rd RTMR0)" "$(rd RTMR1)" "$(rd RTMR2)" "$(rd RTMR3)")
+    break
+  fi
   sleep 12
 done
-[ -n "$MRTD" ] || { echo "  Could not read measurements after ~4min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
-rd(){ printf '%s' "$LOGS" | grep -oE "$1=[a-f0-9]{96}" | tail -1 | grep -oE '[a-f0-9]{96}'; }
-RTMR0=$(rd RTMR0); RTMR1=$(rd RTMR1); RTMR2=$(rd RTMR2); RTMR3=$(rd RTMR3)
-MEAS=$(printf '{"mrtd":"%s","rtmr0":"%s","rtmr1":"%s","rtmr2":"%s","rtmr3":"%s"}' "$MRTD" "$RTMR0" "$RTMR1" "$RTMR2" "$RTMR3")
+[ -n "$MEAS" ] || { echo "  Could not read measurements after ~4min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
+MRTD=$(printf '%s' "$MEAS" | grep -oE '"mrtd":"[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}')
+RTMR3=$(printf '%s' "$MEAS" | grep -oE '"rtmr3":"[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}')
 echo "  mrtd=$MRTD"
 echo "  rtmr3=$RTMR3"
 
@@ -373,13 +430,21 @@ fi
 # for not-approved) it will resubmit on the next boot. Restart once to force a clean submit
 # against the now-approved list, then grep for the Proposal ID.
 echo "[5/6] Restart keystore so it submits against the approved measurements..."
+# The keystore mints a new registration key on EVERY boot and submits a proposal for it, and
+# the container log survives the restart. So the proposal to vote on is the one submitted AFTER
+# this restart: anything already in the log is for a key the keystore no longer holds, and a
+# vote on it executes, changes nothing, and leaves the live key waiting until its 30-min
+# registration timeout. Remember the highest id seen before the restart; accept only a higher one.
+PREV_ID=$(ks_logs 2000 2>/dev/null | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+[ -n "$PREV_ID" ] && echo "  proposals already in the log (stale after the restart): up to #$PREV_ID"
 node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
 echo "  waiting for the keystore to submit its DAO proposal (Proposal ID: N)..."
 PROPOSAL_ID=""
 for i in $(seq 1 25); do
   L=$(ks_logs 300 2>/dev/null || true)
   # main.rs logs "Proposal ID: {}" on a successful submit; tee_registration.rs logs the same.
-  PROPOSAL_ID=$(printf '%s' "$L" | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | tail -1 || true)
+  PROPOSAL_ID=$(printf '%s' "$L" | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+  if [ -n "$PROPOSAL_ID" ] && [ -n "$PREV_ID" ] && [ "$PROPOSAL_ID" -le "$PREV_ID" ]; then PROPOSAL_ID=""; fi
   [ -n "$PROPOSAL_ID" ] && break
   # Do NOT early-exit on "measurements not approved" / "Registration rejected": that line is EXPECTED
   # from the keystore's FIRST boot (before [4/6] approved) and persists in the log buffer, so bailing
@@ -440,6 +505,8 @@ for i in $(seq 1 25); do
       echo "  PUBLIC ENDPOINT (via dstack-gateway, TLS terminates in the TEE):"
       echo "    $KEYSTORE_URL"
       echo "  Add it to the comma-separated KEYSTORE_BASE_URLS in the worker env and the coordinator env."
+    elif [ -n "$OS_IMAGE" ]; then
+      echo "  Endpoint unchanged: an OS image upgrade keeps the app-id, the URL and the gateway registration."
     else
       echo "NOTE: this exposes only a LOOPBACK port on the node. Public ingress (TLS-in-TEE gateway)"
       echo "needs gateway mode — re-run with --gateway-url <https://gateway.<domain>:9202> to get a"
