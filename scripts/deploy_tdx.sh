@@ -46,8 +46,9 @@
 # (outlayer-<component>-<net>-<ver>), so re-runs / extra instances of the same version hit the
 # idempotent is_measurements_approved check and skip.
 #
-# worker:   deploy -> read measurements -> owner-approve on the register-contract -> restart
-#           -> verify registration. Owner key stays on the Mac.
+# worker:   deploy -> read measurements -> owner-approve on the register-contract -> wait for the
+#           worker to register by itself (restarted only if it gave up waiting). Owner key stays
+#           on the Mac.
 # keystore: deploy (self-submits its DAO registration) -> read measurements -> owner-approve on
 #           the DAO contract -> wait for the keystore's "Proposal ID: N" -> vote as zavodil
 #           (auto on testnet, printed for manual run on mainnet) -> poll /health until ready.
@@ -203,12 +204,12 @@ fi
 
 if $DRY_RUN; then
   if [ -n "$OS_IMAGE" ]; then
-    gate=$([ "$COMPONENT" = worker ] && echo "approve on $REGISTER (signer $OWNER) -> restart -> verify" || echo "approve on $DAO (signer $OWNER) -> wait for proposal -> vote (signer $VOTER) -> poll /health")
+    gate=$([ "$COMPONENT" = worker ] && echo "approve on $REGISTER (signer $OWNER) -> wait for it to register" || echo "approve on $DAO (signer $OWNER) -> wait for proposal -> vote (signer $VOTER) -> poll /health")
     echo "(dry-run) would: on $NODE, worker-ctl.sh set-image $NAME $OS_IMAGE (soft stop, resize --image, start) -> read measurements -> $gate"
     exit 0
   fi
   if [ "$COMPONENT" = worker ]; then
-    echo "(dry-run) would: deploy CVM '$NAME' on $NODE -> read measurements -> approve on $REGISTER (signer $OWNER) -> restart -> verify"
+    echo "(dry-run) would: deploy CVM '$NAME' on $NODE -> read measurements -> approve on $REGISTER (signer $OWNER) -> wait for it to register"
     if [ "$EXCLUDES_SET" = true ]; then
       echo "(dry-run) would set in $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx: EXECUTE_EXCLUDES=${EXECUTE_EXCLUDES:-<empty>} (from --execute-excludes)"
     else
@@ -225,6 +226,9 @@ if $DRY_RUN; then
 fi
 
 if [ "$COMPONENT" = worker ]; then
+# The node's clock before this deploy boots anything: [5/5] counts only log lines from here on.
+W_SINCE=$(node_run "date -u +%Y-%m-%dT%H:%M:%S" 2>/dev/null | tail -1 | tr -d '\r')
+[[ "$W_SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}$ ]] || { echo "  could not read the node's clock (got '$W_SINCE')" >&2; exit 1; }
 if [ -n "$OS_IMAGE" ]; then
 # [2/5] upgrade: the existing CVM boots the new guest OS; env, disk and app-id are untouched
 echo "[2/5] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image, start)..."
@@ -318,30 +322,46 @@ else
   echo "  measurements approved"
 fi
 
-# [5/5] restart the worker -> it re-attempts registration
-echo "[5/5] Restart worker to trigger registration..."
+# [5/5] wait for the worker to register. It polls is_measurements_approved every 5 s for ~8 min
+# (registration.rs wait_for_measurements_approval) and registers by itself once [4/5] approved,
+# so no restart is needed. Only a worker that gave up (approval later than its window: the
+# process exits) is restarted, once. A worker whose key is already on the contract (an OS image
+# upgrade keeps the disk, and the key on it) does not register again: it logs "Key registered and
+# ready for signing". Only lines of this deploy's boots count ($W_SINCE): the container log
+# survives a restart, and an earlier boot's success line says nothing about this one.
+worker_watch() { # rounds of 12 s → 0 registered, 1 error (exits), 2 undecided
+  local i L
+  for i in $(seq 1 "$1"); do
+    L=$(node_run "NAME=$NAME TAIL=400 ./worker-ctl.sh logs" 2>/dev/null \
+      | awk -v t="$W_SINCE" '/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && substr($0, 1, 19) >= t' || true)
+    if printf '%s' "$L" | grep -qE "Worker key registered successfully|Key registered and ready for signing"; then
+      echo "  REGISTERED:"; printf '%s' "$L" | grep -E "registered successfully|Key registered and ready|Transaction:" | tail -2
+      return 0
+    fi
+    if printf '%s' "$L" | grep -qiE "Exceeded the prepaid gas|did not verify|No cached collateral"; then
+      echo "  registration error:"; printf '%s' "$L" | grep -iE "exceeded|verif|collateral" | tail -3 >&2; exit 1
+    fi
+    sleep 12
+  done
+  return 2
+}
+echo "[5/5] Wait for the worker to register (it does so by itself once the measurements are approved)..."
+if worker_watch 45; then
+  echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME ./worker-ctl.sh follow"
+  exit 0
+fi
+echo "  not registered within ~9 min (its approval window has passed): restarting it once..."
 node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
-echo "  watching for registration..."
-for i in $(seq 1 20); do
-  L=$(node_run "NAME=$NAME TAIL=200 ./worker-ctl.sh logs" 2>/dev/null || true)
-  # A worker whose key is already on the contract (an OS image upgrade keeps the disk, and the
-  # key on it) does not register again: it logs "Key registered and ready for signing".
-  if printf '%s' "$L" | grep -qE "Worker key registered successfully|Key registered and ready for signing"; then
-    echo "  REGISTERED:"; printf '%s' "$L" | grep -E "registered successfully|Key registered and ready|Transaction:" | tail -2
-    echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME ./worker-ctl.sh follow"
-    exit 0
-  fi
-  if printf '%s' "$L" | grep -qiE "Exceeded the prepaid gas|did not verify|No cached collateral"; then
-    echo "  registration error:"; printf '%s' "$L" | grep -iE "exceeded|verif|collateral" | tail -3 >&2; exit 1
-  fi
-  sleep 12
-done
+if worker_watch 20; then
+  echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME ./worker-ctl.sh follow"
+  exit 0
+fi
 echo "  No decisive result yet — check: NAME=$NAME worker-ctl.sh follow (on the node)"
 exit 0
 fi  # end worker
 
 # ============================== keystore flow ==============================
-# Unlike the worker (owner-approve -> restart -> register), the keystore self-submits its DAO
+# Unlike the worker (owner-approve -> it registers by itself), the keystore self-submits its DAO
 # registration on boot (logs "Proposal ID: N"). Governance = owner-approve measurements on the
 # DAO + a DAO member (zavodil) vote. Both signed LOCALLY (keys stay on the Mac).
 
