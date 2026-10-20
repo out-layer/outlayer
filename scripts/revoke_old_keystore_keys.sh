@@ -40,10 +40,11 @@
 # Which keys are live is taken from the nodes, not guessed. On every TDX node
 #   outlayer keystore-keys <testnet|mainnet>
 # prints `export KEEP_<SITE>="<key> <key>"` (KEEP_DAL on dal, KEEP_AMS on ams) with the registration
-# key of each running keystore CVM there (read from its log). Paste both lines into the shell here
-# and run the script: every key in them is kept, everything else is retired — one command per
-# network after a release. BOTH variables must be set (empty is fine for a node without keystores);
-# a missing one means a node was skipped, and its live instance would be revoked.
+# key of each running keystore CVM there (read from its log). The script asks both nodes itself,
+# over ssh as root, for any KEEP_* not already in the environment, and stops if a node does not
+# answer with its line: every key in them is kept, everything else is retired — one command per
+# network after a release. Exporting a KEEP_* by hand (empty is fine for a node without
+# keystores) overrides what its node would say.
 #
 # Usage:
 #   ./scripts/revoke_old_keystore_keys.sh <testnet|mainnet> [--keep ed25519:KEY]... [--send]
@@ -72,6 +73,26 @@ KEEP=()
 # Keys from the nodes, one variable per TDX node as printed by `outlayer keystore-keys`. All of
 # them must be set (empty allowed): an unset one is a node that was not asked.
 KEEP_VARS="KEEP_DAL KEEP_AMS"
+# A variable not set in the environment is asked of its node here, over ssh, with the same
+# command (`worker-ctl.sh keystore-keys`, what `outlayer keystore-keys` runs). It fails closed:
+# the node prints no export line when a running keystore's key cannot be read, and an
+# unreachable node, a refusal or a line for another site stops the run — a node that did not
+# answer would otherwise have its live keystore revoked. A variable already set wins (a node
+# asked by hand, or a deliberate value). `ssh -n`: the confirmation prompt below reads stdin.
+node_of() { case "$1" in KEEP_DAL) echo 173.237.9.76 ;; KEEP_AMS) echo 23.109.254.164 ;; esac; }
+for var in $KEEP_VARS; do
+  [ -z "${!var+x}" ] || continue
+  host="$(node_of "$var")"
+  out=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "root@$host" \
+    "su - outlayer -c 'cd /home/outlayer/self-hosted-tdx && ./worker-ctl.sh keystore-keys $NETWORK'" 2>&1) \
+    || { echo "$var: root@$host did not give its live keys (keystore-keys failed or the node is unreachable):" >&2
+         printf '%s\n' "$out" | sed 's/^/    /' >&2; exit 1; }
+  line=$(printf '%s\n' "$out" | grep -E "^export $var=\"[^\"]*\"$" | tail -1)
+  [ -n "$line" ] || { echo "$var: root@$host answered without an 'export $var=...' line:" >&2
+                      printf '%s\n' "$out" | sed 's/^/    /' >&2; exit 1; }
+  printf '%s\n' "$out" | sed "s/^/  [$var from root@$host] /" >&2
+  eval "$line"
+done
 missing=""
 for var in $KEEP_VARS; do
   if [ -z "${!var+x}" ]; then missing="$missing $var"; continue; fi

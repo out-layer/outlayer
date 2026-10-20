@@ -27,30 +27,60 @@
 #                     out of the KEEP set and land in the revoke list. Without the flag the
 #                     report states how many workers it keeps — compare it with your fleet.
 #
-# Defaults (override in scripts/.env):
-#   WORKER_CLEANUP_SSH=root@138.201.58.122      # host running the coordinator + its postgres
-#   WORKER_CLEANUP_SSH_KEY=~/.ssh/id_ed25519
-#   NEARBLOCKS_API_KEY=                          # optional; raises the indexer rate limit
+# Where each network's coordinator database is, in scripts/.env (scripts/.env.example) — one set
+# per network, because each network's API runs on its own node:
+#   WORKER_CLEANUP_SSH_<NET>    ssh target of the node running that network's API (root@…)
+#   WORKER_CLEANUP_PG_<NET>     its postgres container
+#   WORKER_CLEANUP_DB_<NET>     its database
+#   WORKER_CLEANUP_NODES        every TDX node (ssh targets), for the fleet cross-check below
+#   WORKER_CLEANUP_SSH_KEY      ssh key (default ~/.ssh/id_ed25519)
+#   NEARBLOCKS_API_KEY          optional; raises the indexer rate limit
+# <NET> is TESTNET or MAINNET. The chain is read through the keyed RPC of the repo .env
+# (TESTNET_NEAR_RPC_URL / MAINNET_NEAR_RPC_URL).
+#
+# Two checks stand between a wrong database and a revoked live worker, and both stop the run:
+#   * the freshest heartbeat in worker_status must be under WORKER_CLEANUP_MAX_HEARTBEAT_MIN
+#     minutes (default 10) — a copy of the database that no coordinator writes to any more
+#     (the pre-2026-10-17 one on the old API host is such a copy) fails it;
+#   * the workers with a fresh heartbeat must be exactly the worker CVMs running on the nodes
+#     (`<net>-worker-*` / `outlayer-worker-<net>-*` in lsvm), counted — unless --expect-live N
+#     states the fleet size by hand.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 [ -f "$SCRIPT_DIR/.env" ] && set -a && . "$SCRIPT_DIR/.env" && set +a || true
 
-SSH_TARGET="${WORKER_CLEANUP_SSH:-root@138.201.58.122}"
+[ -z "${WORKER_CLEANUP_SSH:-}" ] || echo "note: WORKER_CLEANUP_SSH is not read any more (one host cannot serve both networks); set WORKER_CLEANUP_SSH_TESTNET / _MAINNET" >&2
 SSH_KEY="${WORKER_CLEANUP_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+MAX_HB_MIN="${WORKER_CLEANUP_MAX_HEARTBEAT_MIN:-10}"
 
 NETWORK="${1:-}"
 shift || true
 case "$NETWORK" in
   testnet) REGISTER="worker.outlayer.testnet"; OWNER="owner.outlayer.testnet"; INIT="init-worker.outlayer.testnet"
-           RPC="https://rpc.testnet.fastnear.com"; IDX="https://api-testnet.nearblocks.io"
-           PG="offchainvm-postgres-testnet"; DB="offchainvm" ;;
+           RPC="https://rpc.testnet.fastnear.com"; IDX="https://api-testnet.nearblocks.io" ;;
   mainnet) REGISTER="worker.outlayer.near"; OWNER="owner.outlayer.near"; INIT="init-worker.outlayer.near"
-           RPC="https://rpc.mainnet.fastnear.com"; IDX="https://api.nearblocks.io"
-           PG="offchainvm-postgres-mainnet"; DB="outlayer" ;;
+           RPC="https://rpc.mainnet.fastnear.com"; IDX="https://api.nearblocks.io" ;;
   *) echo "Usage: $0 <testnet|mainnet> [--send]" >&2; exit 1 ;;
 esac
+NET_UC=$(printf '%s' "$NETWORK" | tr '[:lower:]' '[:upper:]')
+v="WORKER_CLEANUP_SSH_$NET_UC"; SSH_TARGET="${!v:-}"
+v="WORKER_CLEANUP_PG_$NET_UC";  PG="${!v:-}"
+v="WORKER_CLEANUP_DB_$NET_UC";  DB="${!v:-}"
+NODES="${WORKER_CLEANUP_NODES:-}"
+missing=""
+for v in "WORKER_CLEANUP_SSH_$NET_UC:$SSH_TARGET" "WORKER_CLEANUP_PG_$NET_UC:$PG" "WORKER_CLEANUP_DB_$NET_UC:$DB" "WORKER_CLEANUP_NODES:$NODES"; do
+  [ -n "${v#*:}" ] || missing="$missing ${v%%:*}"
+done
+[ -z "$missing" ] || { echo "not set in scripts/.env:$missing (see scripts/.env.example)" >&2; exit 1; }
+# The keyed RPC: the public host rate-limits the many view calls a run makes.
+v="${NET_UC}_NEAR_RPC_URL"
+if [ -f .env ] && keyed=$(grep -E "^$v=" .env | tail -1 | cut -d= -f2- | tr -d "\"'") && [ -n "$keyed" ]; then
+  RPC="$keyed"
+else
+  echo "⚠ no keyed RPC ($v in the repo .env): reading the chain through the public host" >&2
+fi
 
 SEND=false
 EXPECT_LIVE=""
@@ -68,7 +98,7 @@ done
 # age. A worker that is merely quiet (coordinator restart, network blip) is still running with
 # its key file on disk; revoking it would break it until someone notices and restarts it. The
 # heartbeat age is reported per key instead, so a genuinely dead row is visible before you sign.
-LIVE=$(ssh -o BatchMode=yes "$SSH_TARGET" -i "$SSH_KEY" \
+LIVE=$(ssh -n -o BatchMode=yes "$SSH_TARGET" -i "$SSH_KEY" \
   "docker exec $PG psql -U postgres -d $DB -t -A -F'|' -c \
    \"SELECT worker_public_key, worker_id, round(extract(epoch from now()-last_heartbeat_at)/60) FROM worker_status WHERE worker_public_key IS NOT NULL AND worker_public_key <> '';\"") \
   || { echo "Could not read workers from $PG on $SSH_TARGET" >&2; exit 1; }
@@ -78,6 +108,40 @@ if [ -z "$(printf '%s' "$LIVE" | tr -d '[:space:]')" ]; then
   echo "The coordinator reports NO workers with a public key — refusing to build a plan." >&2
   echo "(Every installed key would look retired. Check $PG on $SSH_TARGET.)" >&2
   exit 1
+fi
+
+# Is this the database a coordinator writes to right now? A copy left behind (the old API host)
+# answers with rows too — only none of them is fresh.
+FRESHEST=$(printf '%s\n' "$LIVE" | awk -F'|' 'NF>=3 && $3 ~ /^[0-9]+$/ {print $3}' | sort -n | head -1)
+if [ -z "$FRESHEST" ] || [ "$FRESHEST" -gt "$MAX_HB_MIN" ]; then
+  echo "The freshest worker heartbeat in $PG on $SSH_TARGET is ${FRESHEST:-?} min old (limit $MAX_HB_MIN):" >&2
+  echo "no coordinator is writing to this database now. Refusing to build a plan — point" >&2
+  echo "WORKER_CLEANUP_SSH_$NET_UC / _PG_ / _DB_ at the $NETWORK API that is running." >&2
+  exit 1
+fi
+FRESH_COUNT=$(printf '%s\n' "$LIVE" | awk -F'|' -v m="$MAX_HB_MIN" 'NF>=3 && $3 ~ /^[0-9]+$/ && $3 <= m' | wc -l | tr -d ' ')
+
+# The fleet as the nodes see it: the worker CVMs running there. Counted against the workers with
+# a fresh heartbeat; --expect-live N replaces this count with one stated by hand.
+if [ -z "$EXPECT_LIVE" ]; then
+  RUNNING=0
+  for node in $NODES; do
+    out=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$node" -i "$SSH_KEY" \
+      "su - outlayer -c 'python3 /home/outlayer/meta-dstack/dstack/vmm/src/vmm-cli.py --url http://127.0.0.1:11000 lsvm'" 2>/dev/null) \
+      || { echo "$node: no answer from its vmm — refusing to build a plan (pass --expect-live N to state the fleet by hand)" >&2; exit 1; }
+    n=$(printf '%s\n' "$out" | sed 's/│/|/g' | awk -F'|' -v net="$NETWORK" '
+      { name=$4; status=$5; gsub(/[[:space:]]/,"",name); gsub(/[[:space:]]/,"",status)
+        if (status == "running" && (index(name, net "-worker-") == 1 || index(name, "outlayer-worker-" net "-") == 1)) c++ }
+      END { print c+0 }')
+    echo "  $node: $n running $NETWORK worker CVM(s)" >&2
+    RUNNING=$((RUNNING + n))
+  done
+  if [ "$RUNNING" -ne "$FRESH_COUNT" ]; then
+    echo "The nodes run $RUNNING $NETWORK worker CVM(s), the coordinator has $FRESH_COUNT with a heartbeat in the last $MAX_HB_MIN min." >&2
+    echo "Refusing to build a plan: a running worker would land in the revoke list. Wait for a heartbeat, or pass --expect-live N." >&2
+    exit 1
+  fi
+  echo "  fleet: $RUNNING running worker CVM(s) = $FRESH_COUNT fresh coordinator row(s)" >&2
 fi
 
 PLAN="$(mktemp -t worker_revoke.XXXXXX)"
@@ -108,7 +172,23 @@ if EXPECT_LIVE:
         raise SystemExit(f"--expect-live {EXPECT_LIVE} but the coordinator reports "
                          f"{len(live_keys)} worker key(s). Refusing to build a plan.")
 w = sys.stderr.write
-BATCH = 16  # keys per remove_worker_keys call — the contract has no cap, this bounds gas
+# remove_worker_keys spends gas per key, and an ml-dsa-65 key (~2.6 KB as a string) is expensive
+# to parse: one measured at 65 Tgas on worker.outlayer.testnet (2026-10-20), an ed25519 key a few.
+# Calls are filled up to a budget below the 300 Tgas a transaction may carry.
+GAS_PER_KEY = {'ml-dsa-65': 70, 'ed25519': 6}  # Tgas, with headroom
+GAS_BUDGET = 250
+
+
+def batches(keys):
+    out, cur, used = [], [], 0
+    for pk in keys:
+        g = GAS_PER_KEY.get(pk.split(':', 1)[0], 70)
+        if cur and used + g > GAS_BUDGET:
+            out.append(cur); cur, used = [], 0
+        cur.append(pk); used += g
+    if cur:
+        out.append(cur)
+    return out
 
 
 def rpc(params):
@@ -127,7 +207,15 @@ def access_key(pk):
         r = rpc({"request_type": "view_access_key", "finality": "final",
                  "account_id": REGISTER, "public_key": pk})
         res = r.get('result', {})
-        _ak_cache[pk] = res if 'nonce' in res else None
+        if 'nonce' in res:
+            _ak_cache[pk] = res
+        elif (r.get('error') or {}).get('cause', {}).get('name') == 'UNKNOWN_ACCESS_KEY' \
+                or 'does not exist' in str(res.get('error', '')):
+            _ak_cache[pk] = None
+        else:
+            # A failed call is not an absent key: an answer like "the key is gone" from a
+            # rate-limited RPC would take a live worker out of the picture.
+            raise SystemExit(f"RPC error on view_access_key {pk[:24]}…: {json.dumps(r)[:300]}")
     return _ak_cache[pk]
 
 
@@ -233,12 +321,21 @@ for pk in registered:
         continue
     stale.append((pk, ak['nonce'] % 1_000_000, registered[pk]))
 
-onchain_total = len([k for k in rpc({"request_type": "view_access_key_list", "finality": "final",
-                                     "account_id": REGISTER})['result']['keys']
-                     if isinstance(k['access_key']['permission'], dict)])
-
-w(f"on {REGISTER}: {onchain_total} FunctionCall key(s); recovered from history: {len(installed)}\n")
-if onchain_total > len(installed):
+# The account's own key count, as a cross-check of the history. An account with very many keys
+# is refused by the RPC (TOO_MANY_ACCESS_KEYS); the plan does not depend on the count — every key
+# above was checked one by one — so only the cross-check is skipped then.
+_akl = rpc({"request_type": "view_access_key_list", "finality": "final", "account_id": REGISTER})
+if 'result' in _akl:
+    onchain_total = len([k for k in _akl['result']['keys']
+                         if isinstance(k['access_key']['permission'], dict)])
+    w(f"on {REGISTER}: {onchain_total} FunctionCall key(s); recovered from history: {len(installed)}\n")
+elif 'TOO_MANY_ACCESS_KEYS' in json.dumps(_akl):
+    onchain_total = None
+    w(f"on {REGISTER}: too many keys for the RPC to list them; recovered from history: "
+      f"{len(installed)} (each checked on chain one by one)\n")
+else:
+    raise SystemExit(f"RPC error on view_access_key_list {REGISTER}: {json.dumps(_akl)[:300]}")
+if onchain_total is not None and onchain_total > len(installed):
     w(f"!! {onchain_total - len(installed)} key(s) on the account are NOT in the registration "
       f"history — they were not installed by register_worker_key. Inspect them manually; this "
       f"script will not touch them.\n")
@@ -274,7 +371,8 @@ w(f"\nSTALE — revoke ({len(stale)}):\n")
 for pk, used, when in sorted(stale, key=lambda s: -s[1]):
     w(f"    {pk[:34]}…  tx={used:<4} registered={ts(when)}\n")
 
-w(f"\n=> remove {len(stale)} key(s) in {-(-len(stale) // BATCH)} call(s), signed by {OWNER}\n")
+calls = batches([pk for pk, _, _ in stale])
+w(f"\n=> remove {len(stale)} key(s) in {len(calls)} call(s), signed by {OWNER}\n")
 if stale:
     w(f"\n   CHECK BEFORE SIGNING: this keeps {len(live_keys)} worker(s). If MORE than "
       f"{len(live_keys)} workers are running right now, some are missing from the coordinator's\n"
@@ -282,8 +380,8 @@ if stale:
       f"--expect-live <real count>.\n")
 if not stale:
     print("echo 'Nothing to retire — every installed key belongs to a live worker.'")
-for n in range(0, len(stale), BATCH):
-    args = json.dumps({"public_keys": [pk for pk, _, _ in stale[n:n + BATCH]]})
+for keys in calls:
+    args = json.dumps({"public_keys": keys})
     print(f"near contract call-function as-transaction {REGISTER} remove_worker_keys "
           f"json-args '{args}' prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' "
           f"sign-as {OWNER} network-config {NETWORK} sign-with-legacy-keychain send")
