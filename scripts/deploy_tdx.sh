@@ -35,6 +35,14 @@
 #   --kms-url <url>     deploy against this KMS instead of the node's default (KMS v1):
 #                       https://kms-v2.<site>.dstack.outlayer.ai:11102 for KMS v2. Changes the
 #                       measurements (RTMR3 carries the KMS), approved like any other.
+#   --stack <name>      a deployment on this network's contracts with its own API and secrets
+#                       (e.g. beta: beta-testnet-api.outlayer.ai). The node reads
+#                       .env.<stack>-<component>-tdx and worker/docker-compose.<stack>.yaml, and the
+#                       measured name is outlayer-<component>-<stack>-<ver>. Default: the network.
+#   --env <name>        the node env file .env.<name>-<component>-tdx (default: the stack), for
+#                       two CVMs of one stack that differ only in their env (same measurements)
+#   --memory <size>     worker only: the CVM's memory (default 1G; a compose with the
+#                       outlayer-core sidecar needs 4G). Changes the measurements.
 #   --dry-run           show what would happen; no deploy, no tx
 #
 # The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
@@ -63,7 +71,7 @@
 #   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@173.237.9.76
 set -euo pipefail
 
-DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""; KMS_URL=""
+DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; STACK=""; ENV_NAME=""; CVM_MEMORY=""; GATEWAY_URL=""; OS_IMAGE=""; KMS_URL=""
 EXECUTE_EXCLUDES=""; EXCLUDES_SET=false
 REMOTE_USER="outlayer"; REMOTE_DIR="/home/outlayer/self-hosted-tdx"
 POS=()
@@ -85,6 +93,9 @@ while [[ $# -gt 0 ]]; do case "$1" in
   # `<project>:*`, comma-separated. Given here it overrides the per-node table
   # below; an empty string forces "no exclusions" on a node the table covers.
   --execute-excludes) EXECUTE_EXCLUDES="${2-}"; EXCLUDES_SET=true; shift 2;;
+  --stack)       STACK="${2:?}"; shift 2;;
+  --env)         ENV_NAME="${2:?}"; shift 2;;
+  --memory)      CVM_MEMORY="${2:?}"; shift 2;;
   --dry-run|--info) DRY_RUN=true; shift;;
   *) POS+=("$1"); shift;;
 esac; done
@@ -92,6 +103,11 @@ COMPONENT="${POS[0]:-}"; NETWORK="${POS[1]:-testnet}"; INSTANCE_NAME="${POS[2]:-
 
 case "$COMPONENT" in worker|keystore) ;; *) echo "component must be worker|keystore (got '$COMPONENT')" >&2; exit 1;; esac
 case "$NETWORK" in testnet|mainnet) ;; *) echo "network must be testnet|mainnet (got '$NETWORK')" >&2; exit 1;; esac
+STACK="${STACK:-$NETWORK}"
+[[ "$STACK" =~ ^[a-z]+$ ]] || { echo "--stack must be lowercase letters (got '$STACK')" >&2; exit 1; }
+ENV_NAME="${ENV_NAME:-$STACK}"
+[[ "$ENV_NAME" =~ ^[a-z]+$ ]] || { echo "--env must be lowercase letters (got '$ENV_NAME')" >&2; exit 1; }
+[[ -z "${CVM_MEMORY:-}" || "$CVM_MEMORY" =~ ^[0-9]+[MG]$ ]] || { echo "--memory must look like 4G (got '$CVM_MEMORY')" >&2; exit 1; }
 [ -n "$DEPLOY_VERSION" ] || { echo "--version <ver> required (e.g. --version 0.1.35)" >&2; exit 1; }
 [ -n "$NODE" ] || { echo "--node <ssh-target> required (e.g. --node root@173.237.9.76)" >&2; exit 1; }
 
@@ -147,14 +163,14 @@ case "$COMPONENT" in
   worker)
     IMAGE="outlayer/near-outlayer-worker"
     REGISTER="worker.outlayer.$SUFFIX"
-    NAME="${INSTANCE_NAME:-outlayer-worker-${NETWORK}-${VER}-1}"
+    NAME="${INSTANCE_NAME:-outlayer-worker-${STACK}-${VER}-1}"
     ;;
   keystore)
     IMAGE="outlayer/near-outlayer-keystore"
     DAO="dao.outlayer.$SUFFIX"
     VOTER="zavodil.$SUFFIX"
     KS_CONTAINER="dstack-keystore-1"
-    NAME="${INSTANCE_NAME:-outlayer-keystore-${NETWORK}-${VER}-1}"
+    NAME="${INSTANCE_NAME:-outlayer-keystore-${STACK}-${VER}-1}"
     ;;
 esac
 
@@ -183,7 +199,7 @@ node_run() {
   fi
 }
 
-echo "== deploy_tdx: $COMPONENT $NETWORK  vm-label=$NAME  version=v$VER  node=$NODE =="
+echo "== deploy_tdx: $COMPONENT $NETWORK  stack=$STACK  vm-label=$NAME  version=v$VER  node=$NODE =="
 
 # [1/N] resolve + attest the image digest locally (the node has no gh). The GitHub release
 # body lists one row per component: `| worker | sha256:... |`, `| keystore | sha256:... |`.
@@ -217,12 +233,12 @@ if $DRY_RUN; then
   if [ "$COMPONENT" = worker ]; then
     echo "(dry-run) would: deploy CVM '$NAME' on $NODE${KMS_URL:+ (kms-url=$KMS_URL)} -> read measurements -> approve on $REGISTER (signer $OWNER) -> wait for it to register"
     if [ "$EXCLUDES_SET" = true ]; then
-      echo "(dry-run) would set in $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx: EXECUTE_EXCLUDES=${EXECUTE_EXCLUDES:-<empty>} (from --execute-excludes)"
+      echo "(dry-run) would set in $REMOTE_DIR/worker/.env.${ENV_NAME}-worker-tdx: EXECUTE_EXCLUDES=${EXECUTE_EXCLUDES:-<empty>} (from --execute-excludes)"
     else
       case "$(node_excludes "$NODE")" in
         "")   echo "(dry-run) $NODE is not in the per-node table: EXECUTE_EXCLUDES left exactly as it is on the node" ;;
-        none) echo "(dry-run) would CLEAR EXECUTE_EXCLUDES in $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx (the table knows this node refuses nothing)" ;;
-        *)    echo "(dry-run) would set in $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx: EXECUTE_EXCLUDES=$(node_excludes "$NODE")" ;;
+        none) echo "(dry-run) would CLEAR EXECUTE_EXCLUDES in $REMOTE_DIR/worker/.env.${ENV_NAME}-worker-tdx (the table knows this node refuses nothing)" ;;
+        *)    echo "(dry-run) would set in $REMOTE_DIR/worker/.env.${ENV_NAME}-worker-tdx: EXECUTE_EXCLUDES=$(node_excludes "$NODE")" ;;
       esac
     fi
   else
@@ -241,7 +257,7 @@ echo "[2/5] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image
 node_run "./worker-ctl.sh set-image $NAME $OS_IMAGE"
 else
 # [2/5] deploy the CVM on the node (node-side deploy_tdx.sh derives the stable COMPOSE_NAME)
-echo "[2/5] Deploy CVM on node (reads node env: $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx — NOT your local copy)..."
+echo "[2/5] Deploy CVM on node (reads node env: $REMOTE_DIR/worker/.env.${ENV_NAME}-worker-tdx — NOT your local copy)..."
 
 # EXECUTE_EXCLUDES lands in the NODE's env file, which is what the CVM reads.
 # `--execute-excludes` wins; otherwise the table above decides, and a node the
@@ -260,7 +276,7 @@ else
   esac
 fi
 if [ "$WRITE_EXCLUDES" = true ]; then
-  ENV_FILE="$REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx"
+  ENV_FILE="$REMOTE_DIR/worker/.env.${ENV_NAME}-worker-tdx"
   WAS=$(node_run "grep -m1 '^EXECUTE_EXCLUDES=' '$ENV_FILE' 2>/dev/null | cut -d= -f2- || true" 2>/dev/null | tr -d '\r')
   # Sent as base64, so operator text never becomes part of a sed replacement
   # (where `&` means the whole match) or of a shell word on the node.
@@ -287,7 +303,7 @@ if [ "$WRITE_EXCLUDES" = true ]; then
     [ -n "$WAS" ] && [ "$WAS" != "$WANT_EXCLUDES" ] && echo "    previous value on the node: $WAS"
   fi
 fi
-node_run "${KMS_URL:+KMS_URL=$KMS_URL }WORKER_DIGEST=$DIGEST ./deploy_tdx.sh worker $NETWORK $NAME --version $VER"
+node_run "STACK=$STACK ENV_NAME=$ENV_NAME ${CVM_MEMORY:+CVM_MEMORY=$CVM_MEMORY }${KMS_URL:+KMS_URL=$KMS_URL }WORKER_DIGEST=$DIGEST ./deploy_tdx.sh worker $NETWORK $NAME --version $VER"
 fi  # deploy vs --os-image
 
 # [3/5] read the 5 TEE measurements. Source of truth: the CVM's guest agent (tcb_info on its
@@ -384,7 +400,7 @@ echo "[2/6] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image
 node_run "./worker-ctl.sh set-image $NAME $OS_IMAGE"
 KEYSTORE_URL=""   # unchanged by an image upgrade; nothing new to announce
 else
-echo "[2/6] Deploy CVM on node (reads node env: $REMOTE_DIR/keystore/.env.${NETWORK}-keystore-tdx — NOT your local copy)..."
+echo "[2/6] Deploy CVM on node (reads node env: $REMOTE_DIR/keystore/.env.${ENV_NAME}-keystore-tdx — NOT your local copy)..."
 if [ -n "$GATEWAY_URL" ]; then
   echo "  gateway mode: GATEWAY_URL=$GATEWAY_URL"
 else
@@ -396,7 +412,7 @@ fi
 # Capture the node deploy output (tee'd so the operator still sees it) to recover the gateway-mode
 # KEYSTORE_URL=... line that 40-deploy-keystore.sh prints (app-id is computed node-side from
 # the final app-compose). Empty in plain mode.
-DEPLOY_LOG=$(node_run "${KMS_URL:+KMS_URL=$KMS_URL }GATEWAY_URL='$GATEWAY_URL' WORKER_DIGEST=$DIGEST ./deploy_tdx.sh keystore $NETWORK $NAME --version $VER" 2>&1 | tee /dev/stderr) || true
+DEPLOY_LOG=$(node_run "STACK=$STACK ENV_NAME=$ENV_NAME ${KMS_URL:+KMS_URL=$KMS_URL }GATEWAY_URL='$GATEWAY_URL' WORKER_DIGEST=$DIGEST ./deploy_tdx.sh keystore $NETWORK $NAME --version $VER" 2>&1 | tee /dev/stderr) || true
 KEYSTORE_URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'KEYSTORE_URL=https://[^[:space:]]+' | tail -1 | sed 's/^KEYSTORE_URL=//' || true)
 fi  # deploy vs --os-image
 
