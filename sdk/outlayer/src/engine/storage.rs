@@ -456,7 +456,7 @@ pub fn increment(key: &str, delta: i64) -> (i64, String) {
                 return Ok(next);
             }
         }
-        Err(format!("increment: too many concurrent modifications after {MAX_RETRIES} attempts"))
+        Err(format!("increment: max retries ({MAX_RETRIES}) exceeded for key={key}"))
     };
     ok_or(run(), 0)
 }
@@ -515,7 +515,7 @@ pub fn get_by_version(key: &str, wasm_hash: &str) -> (Vec<u8>, String) {
         let r: GetResponse = reply.json("storage get-by-version")?;
         match (r.exists, r.encrypted_key, r.encrypted_value, r.is_encrypted) {
             (true, Some(k), Some(v), true) => Ok(open(&c, &k, &v)?.1),
-            (true, Some(_), Some(v), false) => Ok(v),
+            (true, Some(_), Some(_), false) => Err("the record at this key was written raw; read it with get-raw".to_string()),
             _ => Ok(Vec::new()),
         }
     };

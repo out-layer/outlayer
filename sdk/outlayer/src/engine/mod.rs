@@ -11,6 +11,15 @@
 pub mod storage;
 mod http;
 
+/// The mark the worker reads before it builds the envelope: a component without it
+/// gets the caller's input as it is, and never secrets it would not know to keep
+/// out of its output. `#[used]` keeps the linker from dropping a static nothing
+/// references; the section name is the worker's `outlayer.engine`.
+#[cfg(target_arch = "wasm32")]
+#[used]
+#[link_section = "outlayer.engine"]
+static ENGINE_MARK: [u8; 13] = *b"defuse-worker";
+
 use std::{
     collections::HashMap,
     io::Read,
