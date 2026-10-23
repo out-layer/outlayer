@@ -1,0 +1,27 @@
+[package]
+name = "defuse-core-probe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A WASI P2 component for running guests on the Defuse Outlayer core"
+
+[[bin]]
+name = "defuse-core-probe"
+path = "src/main.rs"
+
+[[bin]]
+name = "defuse-plain-probe"
+path = "src/bin/plain.rs"
+
+[dependencies]
+# Defuse Outlayer guest SDK (private repo, SSH): `outlayer:crypto`.
+defuse-outlayer-sdk = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
+hex = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
+[workspace]
