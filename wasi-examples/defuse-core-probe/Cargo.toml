@@ -10,6 +10,9 @@ name = "defuse-core-probe"
 path = "src/main.rs"
 
 [dependencies]
+# Defuse Outlayer guest SDK (private repo, SSH): `outlayer:crypto`.
+defuse-outlayer-sdk = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
+hex = "0.4"
 
 [profile.release]
 opt-level = "z"
