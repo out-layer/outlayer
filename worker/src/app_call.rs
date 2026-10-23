@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::api_client::ApiClient;
+use crate::keystore_client::KeystoreClient;
 
 pub const PREFIX: &str = "act_";
 
@@ -37,6 +38,26 @@ pub struct Scope {
     pub request_id: Option<u64>,
 }
 
+/// The keystore's view of the scope: what a storage record's seed is built from.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct KeystoreScope {
+    pub project_uuid: Option<String>,
+    pub wasm_hash: String,
+    pub account_id: String,
+    pub call_id: Option<String>,
+}
+
+impl Scope {
+    fn for_keystore(&self) -> KeystoreScope {
+        KeystoreScope {
+            project_uuid: self.project_uuid.clone(),
+            wasm_hash: self.wasm_hash.clone(),
+            account_id: self.account_id.clone(),
+            call_id: self.call_id.clone(),
+        }
+    }
+}
+
 pub struct CallToken {
     token: String,
 }
@@ -53,34 +74,59 @@ impl CallToken {
     }
 }
 
-/// A registered token: minted, registered, and revoked by [`AppCall::end`].
+/// A registered token: minted, registered with the coordinator and, when there is
+/// one, the keystore; revoked from both by [`AppCall::end`].
 pub struct AppCall {
     token: CallToken,
     hash: String,
+    at_keystore: bool,
 }
 
 impl AppCall {
     /// Mints and registers a token for a run of `scope` that may last
     /// `max_execution_seconds`. `None` when the run has no caller identity: there is
     /// nothing a token could be scoped to, and the guest gets no token.
-    pub async fn begin(api_client: &ApiClient, scope: Scope, max_execution_seconds: u64) -> Result<Option<Self>> {
+    pub async fn begin(
+        api_client: &ApiClient,
+        keystore_client: Option<&KeystoreClient>,
+        scope: Scope,
+        max_execution_seconds: u64,
+    ) -> Result<Option<Self>> {
         if scope.account_id.is_empty() {
             return Ok(None);
         }
         let token = CallToken::mint();
         let hash = token.hash();
+        let ttl = max_execution_seconds.saturating_add(TTL_MARGIN_SECONDS);
         api_client
-            .register_app_call(&hash, max_execution_seconds.saturating_add(TTL_MARGIN_SECONDS), &scope)
+            .register_app_call(&hash, ttl, &scope)
             .await
-            .context("register the run's call token")?;
-        Ok(Some(Self { token, hash }))
+            .context("register the run's call token with the coordinator")?;
+        let at_keystore = match keystore_client {
+            Some(ks) => {
+                if let Err(e) = ks.register_app_call(&hash, ttl, &scope.for_keystore()).await {
+                    // The coordinator half is live, so revoke it rather than run with a
+                    // token one service honours and the other does not.
+                    let _ = api_client.revoke_app_call(&hash).await;
+                    return Err(e.context("register the run's call token with the keystore"));
+                }
+                true
+            }
+            None => false,
+        };
+        Ok(Some(Self { token, hash, at_keystore }))
     }
 
     /// The run is over; the token must not open anything after it. A revocation
     /// that fails is logged: the registration's TTL ends it anyway.
-    pub async fn end(self, api_client: &ApiClient) {
+    pub async fn end(self, api_client: &ApiClient, keystore_client: Option<&KeystoreClient>) {
         if let Err(e) = api_client.revoke_app_call(&self.hash).await {
-            warn!("call token not revoked (its TTL will end it): {e:#}");
+            warn!("call token not revoked at the coordinator (its TTL will end it): {e:#}");
+        }
+        if let (true, Some(ks)) = (self.at_keystore, keystore_client) {
+            if let Err(e) = ks.revoke_app_call(&self.hash).await {
+                warn!("call token not revoked at the keystore (its TTL will end it): {e:#}");
+            }
         }
     }
 

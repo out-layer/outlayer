@@ -3071,7 +3071,7 @@ async fn handle_execute_job(
             call_id: env_vars.get("OUTLAYER_CALL_ID").filter(|c| !c.is_empty()).cloned(),
             request_id: Some(request_id),
         };
-        app_call::AppCall::begin(api_client, scope, resource_limits.max_execution_seconds).await?
+        app_call::AppCall::begin(api_client, keystore_client, scope, resource_limits.max_execution_seconds).await?
     } else {
         None
     };
@@ -3121,7 +3121,7 @@ async fn handle_execute_job(
         .await;
 
     if let Some(app_call) = app_call {
-        app_call.end(api_client).await;
+        app_call.end(api_client, keystore_client).await;
     }
 
     // The tasks this run answered, and the approved tasks it was refused,

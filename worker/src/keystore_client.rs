@@ -950,6 +950,33 @@ impl KeystoreClient {
         Ok(pubkey_hex)
     }
 
+    /// Registers a run's call token by its hash with the keystore, for sealing that
+    /// run's storage records.
+    pub async fn register_app_call(&self, token_hash: &str, ttl_seconds: u64, scope: &crate::app_call::KeystoreScope) -> Result<()> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            token_hash: &'a str,
+            ttl_seconds: u64,
+            scope: &'a crate::app_call::KeystoreScope,
+        }
+        let what = "app call registration";
+        let reply = self.post_json("/app-calls/register", || Ok(Body { token_hash, ttl_seconds, scope }), what, None).await?;
+        if !reply.status.is_success() {
+            anyhow::bail!("{} refused ({}): {}", what, reply.status, reply.text());
+        }
+        Ok(())
+    }
+
+    /// The run ended: its token opens nothing from now on.
+    pub async fn revoke_app_call(&self, token_hash: &str) -> Result<()> {
+        let what = "app call revocation";
+        let reply = self.post_json("/app-calls/revoke", || Ok(serde_json::json!({ "token_hash": token_hash })), what, None).await?;
+        if !reply.status.is_success() {
+            anyhow::bail!("{} refused ({}): {}", what, reply.status, reply.text());
+        }
+        Ok(())
+    }
+
     /// Decrypt secrets from contract using unified accessor format
     ///
     /// This method:
