@@ -24,6 +24,13 @@ pub const PREFIX: &str = "act_";
 /// Added to the run's time limit so the token outlives a run that ends on time.
 const TTL_MARGIN_SECONDS: u64 = 60;
 
+/// The longest registration the coordinator and the keystore accept.
+const MAX_TTL_SECONDS: u64 = 3600;
+
+fn ttl_for(max_execution_seconds: u64) -> u64 {
+    max_execution_seconds.saturating_add(TTL_MARGIN_SECONDS).min(MAX_TTL_SECONDS)
+}
+
 /// What the guest may touch: the same project and account the host functions
 /// would have named on its behalf.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -97,7 +104,7 @@ impl AppCall {
         }
         let token = CallToken::mint();
         let hash = token.hash();
-        let ttl = max_execution_seconds.saturating_add(TTL_MARGIN_SECONDS);
+        let ttl = ttl_for(max_execution_seconds);
         api_client
             .register_app_call(&hash, ttl, &scope)
             .await
@@ -163,6 +170,13 @@ pub fn envelope(meta: &HashMap<String, String>, api_base: &str, call_token: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ttl_is_the_run_plus_a_margin_and_never_above_the_services_cap() {
+        assert_eq!(ttl_for(180), 240);
+        assert_eq!(ttl_for(3540), 3600);
+        assert_eq!(ttl_for(u64::MAX), 3600);
+    }
 
     #[test]
     fn a_token_is_prefixed_random_and_hashed() {
