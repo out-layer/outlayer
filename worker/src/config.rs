@@ -475,6 +475,15 @@ impl Config {
             anyhow::bail!("At least one capability must be enabled (COMPILATION_ENABLED, EXECUTION_ENABLED or DOWNLOAD_ENABLED)");
         }
 
+        // A node that executes on the Defuse worker builds and fetches nothing: the
+        // coordinator refuses its poll otherwise.
+        if execution_engine == ExecutionEngine::DefuseWorker && (compilation_enabled || download_enabled) {
+            anyhow::bail!("EXECUTION_ENGINE=defuse-worker cannot be combined with COMPILATION_ENABLED or DOWNLOAD_ENABLED");
+        }
+        if execution_engine == ExecutionEngine::DefuseWorker && !execution_enabled {
+            anyhow::bail!("EXECUTION_ENGINE=defuse-worker needs EXECUTION_ENABLED=true");
+        }
+
         let capabilities = WorkerCapabilities {
             compilation: compilation_enabled,
             execution: execution_enabled,
