@@ -1,0 +1,3 @@
+# Matches the worker: the Defuse Outlayer crates need Rust >= 1.96.
+[toolchain]
+channel = "1.98.1"

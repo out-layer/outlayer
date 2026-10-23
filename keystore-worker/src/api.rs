@@ -655,6 +655,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/storage/encrypt", post(storage_encrypt_handler))
         .route("/storage/decrypt", post(storage_decrypt_handler))
         .route("/vrf/generate", post(vrf_generate_handler))
+        .merge(crate::app_crypto::worker_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             tee_session_middleware,
@@ -766,6 +767,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/pubkey", post(pubkey_handler)) // Public for dashboard encryption
         .route("/vrf/pubkey", get(vrf_pubkey_handler)) // Public VRF public key
+        .merge(crate::app_crypto::public_routes())
         .merge(worker_routes)
         .merge(coordinator_routes)
         .merge(admin_read_routes)

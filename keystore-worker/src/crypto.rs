@@ -515,6 +515,22 @@ impl Keystore {
         Ok(key)
     }
 
+    /// The seed of the `outlayer:crypto` family, the one the Defuse core's
+    /// `InMemorySigner` takes: HKDF-Extract-SHA256 with the label as salt and the
+    /// default master as input.
+    ///
+    /// Keyed by the label, not by the master: every other derivation here is
+    /// `HMAC(master, seed)`, so none of them, and no seed a caller builds, can
+    /// produce this value. Child keys of the family are additive, so a leaked one
+    /// exposes this seed's roots, never the master. Default master only. Never
+    /// cached; wiped when dropped.
+    pub fn derive_app_crypto_seed(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        let (prk, _) = Hkdf::<Sha256>::extract(Some(b"outlayer-crypto:v1"), &self.default_master);
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        seed.copy_from_slice(&prk);
+        seed
+    }
+
     /// `HMAC-SHA256(master, input)` for a declared key of either family.
     fn derive_declared_key(
         &self,

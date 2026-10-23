@@ -68,6 +68,8 @@ dstack-sdk = "0.1"  # Phala dstack SDK for TDX attestation
 
 # TEE authentication (challenge-response with register-contract)
 shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", branch = "main" }
+# Defuse Outlayer signer (private repo, SSH): the `outlayer:crypto` family.
+defuse-outlayer-signer = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1", features = ["ed25519", "secp256k1", "signing", "zeroize"] }
 reqwest = { version = "0.11", features = ["json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 

@@ -36,6 +36,7 @@ mod vault_verifier;
 mod signing_keys;
 mod encryption_keys;
 mod task_keys;
+mod app_crypto;
 
 use anyhow::{Context, Result};
 use config::{Config, TeeMode};
