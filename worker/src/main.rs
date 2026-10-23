@@ -486,10 +486,18 @@ async fn main() -> Result<()> {
             config::ExecutionEngine::Outlayer => executor,
             config::ExecutionEngine::DefuseWorker => {
                 info!("Execution engine: Defuse Outlayer worker at {}", config.defuse_worker_url);
-                executor.with_defuse_worker(executor::defuse_worker::DefuseWorker::connect(
-                    &config.defuse_worker_url,
-                    config.print_wasm_stderr,
-                )?)
+                for url in std::iter::once(&config.api_base_url).chain(config.keystore_base_urls.iter().flatten()) {
+                    executor::defuse_worker::reachable_from_the_sidecar(url)
+                        .context("a guest on the Defuse worker reaches the coordinator and the keystore over HTTPS")?;
+                }
+                executor.with_defuse_worker(
+                    executor::defuse_worker::DefuseWorker::connect(
+                        &config.defuse_worker_url,
+                        config.max_output_bytes,
+                        config.print_wasm_stderr,
+                    )
+                    .await?,
+                )
             }
         }
     };
@@ -2905,6 +2913,8 @@ async fn handle_execute_job(
         }
     };
 
+    let has_secrets = user_secrets.as_ref().is_some_and(|s| !s.is_empty());
+
     // Merge environment variables
     let mut env_vars = merge_env_vars(
         user_secrets,
@@ -3058,53 +3068,89 @@ async fn handle_execute_job(
         job.project_id.as_deref(),
         declared_manifest.as_ref(),
     );
-    // A run on the Defuse worker: what the env carried goes in the stdin envelope,
-    // with a one-time token this run's storage calls present instead of ours. The
-    // token's scope is the storage cell the host functions would have used — the
-    // same account and the same wasm hash, so the guest reaches the same records.
+    // A run on the Defuse worker. The sidecar applies its own egress policy and no
+    // manifest allowlist, so a connector — whose allowlist is what keeps its secrets
+    // on its venue — does not run there. A component built for the engine (the
+    // SDK's marker section) gets what the env carried as the stdin envelope, with
+    // a one-time token its storage calls present instead of ours; the token's scope
+    // is the storage cell the host functions would have used. Any other component
+    // gets the caller's input as it is, and never secrets it would not know to
+    // keep out of its output.
     let (app_call, run_input) = if config.execution_engine == config::ExecutionEngine::DefuseWorker {
-        let mut meta = env_vars.clone();
-        let app_call = match &storage_config {
-            Some(sc) => {
-                meta.insert("OUTLAYER_KEYSTORE_BASE".to_string(), sc.keystore_url.clone());
-                meta.insert("OUTLAYER_STORAGE_ACCOUNT".to_string(), sc.account_id.clone());
-                meta.insert("OUTLAYER_STORAGE_WASM_HASH".to_string(), sc.wasm_hash.clone());
-                let scope = app_call::Scope {
-                    project_uuid: Some(sc.project_uuid.clone()),
-                    project_id: job.project_id.clone(),
-                    wasm_hash: sc.wasm_hash.clone(),
-                    account_id: sc.account_id.clone(),
-                    wallet_id: wallet_id.cloned(),
-                    connector_id: sub_key_connector.clone(),
-                    call_id: env_vars.get("OUTLAYER_CALL_ID").filter(|c| !c.is_empty()).cloned(),
-                    request_id: Some(request_id),
-                };
-                // A token the services would not take is a refusal the caller is told
-                // about and paid back for, like a secret the keystore would not open —
-                // not an iteration error that leaves the job claimed.
-                match app_call::AppCall::begin(api_client, keystore_client, scope, resource_limits.max_execution_seconds).await {
-                    Ok(call) => call,
-                    Err(e) => {
-                        error!("❌ Call token: {e:#}");
-                        report_refusal(
-                            api_client,
-                            near_client,
-                            job,
-                            request_id,
-                            is_https_call,
-                            call_id.map(|s| s.as_str()),
-                            format!("The run could not be prepared on this engine: {e:#}"),
-                            Some(api_client::JobStatus::ExecutionFailed),
-                        )
-                        .await?;
-                        return Ok(());
+        if network_config.policy.is_enforced() {
+            report_refusal(
+                api_client,
+                near_client,
+                job,
+                request_id,
+                is_https_call,
+                call_id.map(|s| s.as_str()),
+                "This project's outbound allowlist cannot be enforced on this engine; it runs on the OutLayer engine only.".to_string(),
+                Some(api_client::JobStatus::ExecutionFailed),
+            )
+            .await?;
+            return Ok(());
+        }
+        if !app_call::built_for_engine(&wasm_bytes) {
+            if has_secrets {
+                report_refusal(
+                    api_client,
+                    near_client,
+                    job,
+                    request_id,
+                    is_https_call,
+                    call_id.map(|s| s.as_str()),
+                    "This build is not made for the Defuse engine, and its secrets cannot be delivered to it: build with the outlayer SDK feature `defuse-engine`.".to_string(),
+                    Some(api_client::JobStatus::ExecutionFailed),
+                )
+                .await?;
+                return Ok(());
+            }
+            (None, input_data.as_bytes().to_vec())
+        } else {
+            let mut meta = env_vars.clone();
+            let app_call = match &storage_config {
+                Some(sc) => {
+                    meta.insert("OUTLAYER_KEYSTORE_BASE".to_string(), sc.keystore_url.clone());
+                    meta.insert("OUTLAYER_STORAGE_ACCOUNT".to_string(), sc.account_id.clone());
+                    meta.insert("OUTLAYER_STORAGE_WASM_HASH".to_string(), sc.wasm_hash.clone());
+                    let scope = app_call::Scope {
+                        project_uuid: Some(sc.project_uuid.clone()),
+                        project_id: job.project_id.clone(),
+                        wasm_hash: sc.wasm_hash.clone(),
+                        account_id: sc.account_id.clone(),
+                        wallet_id: wallet_id.cloned(),
+                        connector_id: sub_key_connector.clone(),
+                        call_id: env_vars.get("OUTLAYER_CALL_ID").filter(|c| !c.is_empty()).cloned(),
+                        request_id: Some(request_id),
+                    };
+                    // A token the services would not take is a refusal the caller is told
+                    // about and paid back for, like a secret the keystore would not open —
+                    // not an iteration error that leaves the job claimed.
+                    match app_call::AppCall::begin(api_client, keystore_client, scope, resource_limits.max_execution_seconds).await {
+                        Ok(call) => call,
+                        Err(e) => {
+                            error!("❌ Call token: {e:#}");
+                            report_refusal(
+                                api_client,
+                                near_client,
+                                job,
+                                request_id,
+                                is_https_call,
+                                call_id.map(|s| s.as_str()),
+                                format!("The run could not be prepared on this engine: {e:#}"),
+                                Some(api_client::JobStatus::ExecutionFailed),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
                     }
                 }
-            }
-            None => None,
-        };
-        let input = app_call::envelope(&meta, &config.api_base_url, app_call.as_ref().map(|c| c.token()), input_data.as_bytes());
-        (app_call, input)
+                None => None,
+            };
+            let input = app_call::envelope(&meta, &config.api_base_url, app_call.as_ref().map(|c| c.token()), input_data.as_bytes());
+            (app_call, input)
+        }
     } else {
         (None, input_data.as_bytes().to_vec())
     };

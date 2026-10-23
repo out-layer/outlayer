@@ -40,6 +40,7 @@ shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", 
 # Defuse Outlayer gRPC API (private repo, SSH): the sidecar's `OutlayerService/Call`.
 defuse-outlayer-proto = { git = "ssh://git@github.com/zavodil/defuse-outlayer-upstream.git", tag = "worker/v0.8.1" }
 tonic = "0.14"
+url = "2"  # the sidecar egress check on the service URLs
 
 wasmtime = { version = "28", features = ["component-model", "async"] }
 wasmtime-wasi = "28"

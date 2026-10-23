@@ -84,19 +84,21 @@ services:
       start_period: 30s
 
   # The Defuse Outlayer worker, unmodified, as the execution engine
-  # (EXECUTION_ENGINE=defuse-worker). Reachable only on the compose network: no
-  # ports, no auth. Its seed is the test-mode one and signs nothing of value —
-  # the worker refuses components that import `outlayer:crypto`.
-  # Pin the image by digest: the compose is in the attestation.
+  # (EXECUTION_ENGINE=defuse-worker; start with `--profile defuse-worker`).
+  # Reachable only on the compose network: no ports, no auth. Its seed is the
+  # test-mode one and signs nothing of value — the worker refuses components that
+  # import `outlayer:crypto`. The attestation measures the compose TEXT, not env
+  # values: write the image digest literally here for an engine deployment.
   outlayer-core:
+    profiles: ["defuse-worker"]
     image: ${DOCKER_IMAGE_OUTLAYER_CORE}
     container_name: outlayer-core
     restart: on-failure:5
     environment:
       # Their executor logs the first 4 KiB of a failed guest's stdin at WARN, and
       # on this engine stdin is the envelope: the run's secrets and call token.
-      # The executor crate is therefore held to ERROR.
-      OUTLAYER__LOG: ${OUTLAYER_CORE_LOG:-info,defuse_outlayer_executor=error}
+      # The executor crate is held to ERROR whatever the operator's filter says.
+      OUTLAYER__LOG: ${OUTLAYER_CORE_LOG:-info},defuse_outlayer_executor=error
       OUTLAYER__SEED: ${OUTLAYER_CORE_SEED}
       OUTLAYER__SERVICE__ALLOW_UNDEPLOYED_CODE: "true"
       OUTLAYER__TELEMETRY__ENABLED: "false"
@@ -111,6 +113,8 @@ services:
       OUTLAYER__SERVICE__MAX_WASM_MEMORY_BYTES: ${OUTLAYER_CORE_MEMORY_BUDGET_BYTES:-2147483648}
       OUTLAYER__SERVICE__EXECUTOR__IO_LIMITS__STDIN_BYTES: "10485760"
       OUTLAYER__SERVICE__EXECUTOR__IO_LIMITS__STDOUT_BYTES: "10485760"
+      # The guest's stderr comes back in a failure message, as on the OutLayer engine
+      OUTLAYER__SERVICE__EXECUTOR__IO_LIMITS__STDERR_BYTES: "1048576"
       # Storage from the guest is HTTPS: every record costs egress bytes
       OUTLAYER__SERVICE__EXECUTOR__HTTP__MAX_TOTAL_BYTES: "67108864"
     expose:

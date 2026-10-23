@@ -21,6 +21,19 @@ use crate::keystore_client::KeystoreClient;
 
 pub const PREFIX: &str = "act_";
 
+/// The custom section a component built for this engine carries (the SDK's
+/// `defuse-engine` feature writes it). Only such a component gets the envelope: any
+/// other reads stdin as the caller's input and must never be handed secrets in it.
+pub const ENGINE_SECTION: &str = "outlayer.engine";
+pub const ENGINE_MARK: &[u8] = b"defuse-worker";
+
+pub fn built_for_engine(wasm: &[u8]) -> bool {
+    wasmparser::Parser::new(0).parse_all(wasm).any(|payload| match payload {
+        Ok(wasmparser::Payload::CustomSection(reader)) => reader.name() == ENGINE_SECTION && reader.data() == ENGINE_MARK,
+        _ => false,
+    })
+}
+
 /// Added to the run's time limit so the token outlives a run that ends on time.
 const TTL_MARGIN_SECONDS: u64 = 60;
 
