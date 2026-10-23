@@ -46,7 +46,7 @@ jobs:
           push: true
           tags: |
             ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-worker:${{ github.ref_name }}
-            ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-worker:latest
+            ${{ !contains(github.ref_name, '-') && format('{0}/near-outlayer-worker:latest', vars.DOCKERHUB_USERNAME) || '' }}
           platforms: linux/amd64
 
       - uses: actions/attest-build-provenance@v4
@@ -81,7 +81,7 @@ jobs:
           push: true
           tags: |
             ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-keystore:${{ github.ref_name }}
-            ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-keystore:latest
+            ${{ !contains(github.ref_name, '-') && format('{0}/near-outlayer-keystore:latest', vars.DOCKERHUB_USERNAME) || '' }}
           platforms: linux/amd64
 
       - uses: actions/attest-build-provenance@v4
@@ -123,7 +123,7 @@ jobs:
           push: true
           tags: |
             ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-core:${{ github.ref_name }}
-            ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-core:latest
+            ${{ !contains(github.ref_name, '-') && format('{0}/near-outlayer-core:latest', vars.DOCKERHUB_USERNAME) || '' }}
           platforms: linux/amd64
 
       - uses: actions/attest-build-provenance@v4
@@ -142,8 +142,11 @@ jobs:
     needs: [build-worker, build-keystore, build-outlayer-core]
     runs-on: ubuntu-latest
     steps:
+      # A tag with a suffix (v0.1.94-defuse.1) is a pre-release: it moves no `latest`
+      # image above and is not offered as the current release.
       - uses: softprops/action-gh-release@v3
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## Docker Images with Sigstore Attestation
 
