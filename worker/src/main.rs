@@ -3079,7 +3079,27 @@ async fn handle_execute_job(
                     call_id: env_vars.get("OUTLAYER_CALL_ID").filter(|c| !c.is_empty()).cloned(),
                     request_id: Some(request_id),
                 };
-                app_call::AppCall::begin(api_client, keystore_client, scope, resource_limits.max_execution_seconds).await?
+                // A token the services would not take is a refusal the caller is told
+                // about and paid back for, like a secret the keystore would not open —
+                // not an iteration error that leaves the job claimed.
+                match app_call::AppCall::begin(api_client, keystore_client, scope, resource_limits.max_execution_seconds).await {
+                    Ok(call) => call,
+                    Err(e) => {
+                        error!("❌ Call token: {e:#}");
+                        report_refusal(
+                            api_client,
+                            near_client,
+                            job,
+                            request_id,
+                            is_https_call,
+                            call_id.map(|s| s.as_str()),
+                            format!("The run could not be prepared on this engine: {e:#}"),
+                            Some(api_client::JobStatus::ExecutionFailed),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
             }
             None => None,
         };
