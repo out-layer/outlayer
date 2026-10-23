@@ -112,4 +112,5 @@ tempfile = "3.10"  # secure temp dir for native compilation (0700 perms + random
 
 [dev-dependencies]
 wat = "1"  # the executor tests assemble their guest modules from text
+bytes = "1"  # the Defuse core takes its input as `Bytes`
 hmac = "0.12"  # reference HMAC-SHA256 the encryption keys' own is checked against

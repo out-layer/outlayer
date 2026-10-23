@@ -1,0 +1,20 @@
+[package]
+name = "defuse-core-probe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A WASI P2 component for running guests on the Defuse Outlayer core"
+
+[[bin]]
+name = "defuse-core-probe"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
+[workspace]
