@@ -20,6 +20,7 @@
 //! - Token-based authentication for API access
 
 mod api;
+mod app_calls;
 mod config;
 mod crypto;
 mod eip712;

@@ -1571,8 +1571,10 @@ pub struct DecryptRawResponse {
 /// This keeps encryption keys isolated per project/wasm and per account.
 pub(super) async fn storage_encrypt_handler(
     State(state): State<AppState>,
+    scope: Option<axum::Extension<crate::app_calls::AppCallScope>>,
     Json(req): Json<StorageEncryptRequest>,
 ) -> Result<Json<StorageEncryptResponse>, ApiError> {
+    crate::app_calls::check(&scope, req.project_uuid.as_deref(), &req.wasm_hash, &req.account_id)?;
     // Check if keystore is ready
     if !state.is_ready() {
         return Err(ApiError::Unauthorized(
@@ -1637,8 +1639,10 @@ pub(super) async fn storage_encrypt_handler(
 /// Decrypt data from persistent storage
 pub(super) async fn storage_decrypt_handler(
     State(state): State<AppState>,
+    scope: Option<axum::Extension<crate::app_calls::AppCallScope>>,
     Json(req): Json<StorageDecryptRequest>,
 ) -> Result<Json<StorageDecryptResponse>, ApiError> {
+    crate::app_calls::check(&scope, req.project_uuid.as_deref(), &req.wasm_hash, &req.account_id)?;
     // Check if keystore is ready
     if !state.is_ready() {
         return Err(ApiError::Unauthorized(

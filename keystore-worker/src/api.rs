@@ -213,6 +213,8 @@ pub struct AppState {
     tee_challenges: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, TeeChallenge>>>,
     /// In-memory TEE session store: session_id -> TeeSession
     tee_sessions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, TeeSession>>>,
+    /// One-time tokens of guests on the Defuse worker (`app_calls`).
+    pub app_calls: crate::app_calls::Registry,
 }
 
 impl AppState {
@@ -239,6 +241,7 @@ impl AppState {
             mpc_context: std::sync::Arc::new(std::sync::OnceLock::new()),
             tee_challenges: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             tee_sessions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            app_calls: crate::app_calls::Registry::default(),
         }
     }
 
@@ -655,6 +658,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/storage/encrypt", post(storage_encrypt_handler))
         .route("/storage/decrypt", post(storage_decrypt_handler))
         .route("/vrf/generate", post(vrf_generate_handler))
+        .merge(crate::app_calls::worker_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             tee_session_middleware,
@@ -3223,6 +3227,10 @@ async fn tee_session_middleware(
     mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> Result<Response, ApiError> {
+    // A call token carries the identity of the worker that registered it.
+    if req.extensions().get::<crate::app_calls::AppCallScope>().is_some() {
+        return Ok(next.run(req).await);
+    }
     // Hand the validated worker identity to the handlers so a decrypt can be attributed to the
     // instance that asked for it — the only worker identifier the keystore can trust.
     if let Some(worker_public_key) = validate_tee_session(&state, req.headers())? {
@@ -3242,7 +3250,7 @@ pub struct WorkerIdentity(pub String);
 /// Checks Bearer token against ALLOWED_WORKER_TOKEN_HASHES.
 async fn worker_auth_middleware(
     State(state): State<AppState>,
-    req: axum::http::Request<axum::body::Body>,
+    mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> Result<Response, ApiError> {
     // Get Authorization header
@@ -3264,6 +3272,25 @@ async fn worker_auth_middleware(
         })?;
 
     // Hash token with SHA256
+    // A guest's one-time call token (`app_calls`): registered by a worker over its
+    // TEE session for one run, good for sealing that run's storage records only.
+    if token.starts_with(crate::app_calls::PREFIX) {
+        let path = req.uri().path().to_string();
+        if !crate::app_calls::path_allowed(&path) {
+            tracing::warn!(path = %path, "call token refused on this route");
+            return Err(ApiError::Forbidden("a call token does not open this route".to_string()));
+        }
+        let Some((scope, worker_public_key)) = state.app_calls.resolve(token) else {
+            tracing::warn!(path = %path, "unknown or expired call token");
+            return Err(ApiError::Unauthorized("Unknown or expired call token".to_string()));
+        };
+        req.extensions_mut().insert(scope);
+        if let Some(pk) = worker_public_key {
+            req.extensions_mut().insert(WorkerIdentity(pk));
+        }
+        return Ok(next.run(req).await);
+    }
+
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
