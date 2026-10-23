@@ -37,6 +37,10 @@ shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", 
 # FIX: Added 'cli' feature to export `bindings` module for WasiCommand.
 # wasmtime-wasi = { version = "37" } 
 
+# Defuse Outlayer gRPC API (private repo, SSH): the sidecar's `OutlayerService/Call`.
+defuse-outlayer-proto = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
+tonic = "0.14"
+
 wasmtime = { version = "28", features = ["component-model", "async"] }
 wasmtime-wasi = "28"
 wasmtime-wasi-http = "28"

@@ -1,8 +1,9 @@
+# syntax=docker/dockerfile:1
 # Dockerfile for NEAR OutLayer Worker - Phala Cloud Deployment
 # Optimized for Intel TDX TEE environment with dstack socket support
 
 # Stage 1: Build Rust worker binary
-FROM rust:1.93-alpine AS builder
+FROM rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
 
 # Install build dependencies (Alpine uses musl instead of glibc)
 # cmake/make/build-base/clang/perl are required to compile aws-lc-rs (ML-DSA backend pulled in
@@ -17,7 +18,15 @@ RUN apk add --no-cache \
     make \
     build-base \
     clang \
-    perl
+    perl \
+    openssh-client \
+    protobuf-dev
+
+# The Defuse Outlayer proto crate comes from a private repository over SSH: build with
+# `docker buildx build --ssh default`. GitHub's host key is pinned, not scanned.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN mkdir -p /root/.ssh && \
+    echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > /root/.ssh/known_hosts
 
 WORKDIR /build/worker
 
@@ -25,7 +34,7 @@ WORKDIR /build/worker
 COPY worker/Cargo.toml worker/Cargo.lock ./
 
 # Create dummy src to build dependencies
-RUN mkdir src && \
+RUN --mount=type=ssh mkdir src && \
     echo "fn main() {}" > src/main.rs && \
     echo "// dummy lib" > src/lib.rs && \
     cargo build --release --locked && \
@@ -36,7 +45,7 @@ COPY worker/src ./src
 COPY worker/wit ./wit
 
 # Build actual binary (dependencies already cached)
-RUN cargo build --release --locked --bin offchainvm-worker
+RUN --mount=type=ssh cargo build --release --locked --bin offchainvm-worker
 
 # Stage 2: Minimal runtime image
 FROM alpine:3.19
