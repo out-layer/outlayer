@@ -205,6 +205,99 @@ mod tests {
         assert!(r.resolve(token).is_none());
     }
 
+    /// The real router, a worker token, TEE mode off.
+    fn router() -> (axum::Router, String) {
+        use sha2::{Digest, Sha256};
+        let worker_token = "worker-secret";
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: "http://127.0.0.1:1".into(),
+            offchainvm_contract_id: "outlayer.test".into(),
+            allowed_worker_token_hashes: vec![hex::encode(Sha256::digest(worker_token.as_bytes()))],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let state = AppState::new(crate::crypto::Keystore::generate(), config, None);
+        state.mark_ready();
+        (crate::api::create_router(state), worker_token.to_string())
+    }
+
+    async fn post(app: &axum::Router, path: &str, bearer: &str, body: serde_json::Value) -> (u16, String) {
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("router");
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn encrypt_body(project: &str, wasm: &str, account: &str) -> serde_json::Value {
+        serde_json::json!({
+            "project_uuid": project, "wasm_hash": wasm, "account_id": account,
+            "key": "k", "value_base64": "dg==",
+        })
+    }
+
+    #[tokio::test]
+    async fn a_registered_token_seals_its_own_cell_and_nothing_else() {
+        let (app, worker) = router();
+        let token = "act_test-token";
+        let register = serde_json::json!({
+            "token_hash": token_hash(token), "ttl_seconds": 60,
+            "scope": { "project_uuid": "p1", "wasm_hash": "h1", "account_id": "bob.testnet", "call_id": "c1" },
+        });
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), register.clone()).await.0, 200);
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), register).await.0, 400, "a hash registers once");
+
+        let (status, body) = post(&app, "/storage/encrypt", token, encrypt_body("p1", "h1", "bob.testnet")).await;
+        assert_eq!(status, 200, "{body}");
+        let sealed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (status, body) = post(&app, "/storage/decrypt", token, serde_json::json!({
+            "project_uuid": "p1", "wasm_hash": "h1", "account_id": "bob.testnet",
+            "encrypted_key_base64": sealed["encrypted_key_base64"], "encrypted_value_base64": sealed["encrypted_value_base64"],
+        })).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["value_base64"], "dg==");
+
+        assert_eq!(post(&app, "/storage/encrypt", token, encrypt_body("p2", "h1", "bob.testnet")).await.0, 403, "another project");
+        assert_eq!(post(&app, "/storage/encrypt", token, encrypt_body("p1", "h2", "bob.testnet")).await.0, 403, "another build");
+        assert_eq!(post(&app, "/storage/encrypt", token, encrypt_body("p1", "h1", "@worker")).await.0, 403, "the worker's cell");
+        assert_eq!(post(&app, "/decrypt", token, serde_json::json!({})).await.0, 403, "project secrets are not a storage route");
+        assert_eq!(post(&app, "/vrf/generate", token, serde_json::json!({"alpha": "a"})).await.0, 403);
+        assert_eq!(post(&app, "/app-calls/register", token, serde_json::json!({})).await.0, 403, "a token cannot register tokens");
+        assert_eq!(post(&app, "/storage/encrypt", "act_unknown", encrypt_body("p1", "h1", "bob.testnet")).await.0, 401);
+
+        assert_eq!(post(&app, "/app-calls/revoke", worker.as_str(), serde_json::json!({ "token_hash": token_hash(token) })).await.0, 200);
+        assert_eq!(post(&app, "/storage/encrypt", token, encrypt_body("p1", "h1", "bob.testnet")).await.0, 401, "revoked");
+    }
+
+    #[tokio::test]
+    async fn registration_needs_the_worker_token_and_a_sane_request() {
+        let (app, worker) = router();
+        let scope = serde_json::json!({ "project_uuid": "p1", "wasm_hash": "h1", "account_id": "bob.testnet", "call_id": null });
+        assert_eq!(post(&app, "/app-calls/register", "not-a-worker", serde_json::json!({ "token_hash": "a".repeat(64), "ttl_seconds": 60, "scope": scope })).await.0, 401);
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), serde_json::json!({ "token_hash": "zz", "ttl_seconds": 60, "scope": scope })).await.0, 400);
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), serde_json::json!({ "token_hash": "b".repeat(64), "ttl_seconds": 7200, "scope": scope })).await.0, 400);
+        let empty_account = serde_json::json!({ "project_uuid": "p1", "wasm_hash": "h1", "account_id": "", "call_id": null });
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), serde_json::json!({ "token_hash": "c".repeat(64), "ttl_seconds": 60, "scope": empty_account })).await.0, 400);
+        assert_eq!(post(&app, "/storage/encrypt", worker.as_str(), encrypt_body("p9", "h9", "anyone.testnet")).await.0, 200, "the worker's own token is not scoped");
+    }
+
     #[test]
     fn only_storage_sealing_takes_a_token() {
         assert!(path_allowed("/storage/encrypt") && path_allowed("/storage/decrypt"));
