@@ -479,9 +479,25 @@ async fn main() -> Result<()> {
             exec_context = exec_context.with_compiled_cache(cache.clone());
         }
 
-        Executor::new(config.default_max_instructions, config.print_wasm_stderr)
+        let executor = Executor::new(config.default_max_instructions, config.print_wasm_stderr)
             .with_run_limits(config.wasm_memory_floor_mb, config.wasm_memory_ceiling_mb, config.max_output_bytes)
-            .with_context(exec_context)
+            .with_context(exec_context);
+        match config.execution_engine {
+            config::ExecutionEngine::Outlayer => executor,
+            config::ExecutionEngine::DefuseCore => {
+                let keystore = keystore_client
+                    .clone()
+                    .context("EXECUTION_ENGINE=defuse-core needs the keystore: outlayer:crypto is signed there")?;
+                let signer = app_crypto::KeystoreSigner::connect(Arc::new(keystore)).await?;
+                info!("Execution engine: Defuse Outlayer core");
+                executor.with_defuse_core(executor::defuse_core::DefuseCore::new(
+                    Arc::new(signer),
+                    config.wasm_memory_ceiling_mb,
+                    config.max_output_bytes,
+                    config.print_wasm_stderr,
+                )?)
+            }
+        }
     };
 
     // Create NearClient with operator signer from registration. A worker that

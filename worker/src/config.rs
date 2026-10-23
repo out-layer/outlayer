@@ -4,6 +4,13 @@ use near_primitives::types::AccountId;
 use std::env;
 use std::str::FromStr;
 
+/// What runs a job's wasm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionEngine {
+    Outlayer,
+    DefuseCore,
+}
+
 /// Worker configuration loaded from environment variables
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -35,6 +42,8 @@ pub struct Config {
     // "docker" - use Docker containers (requires Docker socket)
     // "native" - use native Rust toolchain with bubblewrap (for TEE/Phala)
     pub compilation_mode: String,
+    /// `EXECUTION_ENGINE`: our runtime, or the Defuse Outlayer core.
+    pub execution_engine: ExecutionEngine,
 
     // Docker for compilation (only used in "docker" mode)
     pub docker_image: String,
@@ -313,6 +322,12 @@ impl Config {
             .unwrap_or_else(|_| "execution_requested".to_string());
         let event_filter_min_version = env::var("EVENT_FILTER_MIN_VERSION").ok();
 
+        let execution_engine = match env::var("EXECUTION_ENGINE").unwrap_or_default().to_lowercase().as_str() {
+            "" | "outlayer" => ExecutionEngine::Outlayer,
+            "defuse-core" => ExecutionEngine::DefuseCore,
+            other => anyhow::bail!("Invalid EXECUTION_ENGINE: '{}'. Must be 'outlayer' or 'defuse-core'", other),
+        };
+
         // Compilation mode: docker (default) or native (bubblewrap)
         let compilation_mode = env::var("COMPILATION_MODE")
             .unwrap_or_else(|_| "docker".to_string())
@@ -571,6 +586,7 @@ impl Config {
             event_filter_function_name,
             event_filter_min_version,
             compilation_mode,
+            execution_engine,
             docker_image,
             compile_timeout_seconds,
             compile_memory_limit_mb,
@@ -863,6 +879,7 @@ mod tests {
             event_filter_function_name: "execution_requested".to_string(),
             event_filter_min_version: None,
             compilation_mode: "docker".to_string(),
+            execution_engine: ExecutionEngine::Outlayer,
             docker_image: "rust:1.75".to_string(),
             compile_timeout_seconds: 300,
             compile_memory_limit_mb: 2048,
