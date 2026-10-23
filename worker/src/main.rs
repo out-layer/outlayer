@@ -3059,26 +3059,34 @@ async fn handle_execute_job(
         declared_manifest.as_ref(),
     );
     // A run on the Defuse worker: what the env carried goes in the stdin envelope,
-    // with a one-time token this run's storage calls present instead of ours.
-    let app_call = if config.execution_engine == config::ExecutionEngine::DefuseWorker {
-        let scope = app_call::Scope {
-            project_uuid: project_uuid.clone(),
-            project_id: job.project_id.clone(),
-            wasm_hash: executed_wasm_sha256.clone(),
-            account_id: env_vars.get("NEAR_SENDER_ID").cloned().unwrap_or_default(),
-            wallet_id: wallet_id.cloned(),
-            connector_id: sub_key_connector.clone(),
-            call_id: env_vars.get("OUTLAYER_CALL_ID").filter(|c| !c.is_empty()).cloned(),
-            request_id: Some(request_id),
+    // with a one-time token this run's storage calls present instead of ours. The
+    // token's scope is the storage cell the host functions would have used — the
+    // same account and the same wasm hash, so the guest reaches the same records.
+    let (app_call, run_input) = if config.execution_engine == config::ExecutionEngine::DefuseWorker {
+        let mut meta = env_vars.clone();
+        let app_call = match &storage_config {
+            Some(sc) => {
+                meta.insert("OUTLAYER_KEYSTORE_BASE".to_string(), sc.keystore_url.clone());
+                meta.insert("OUTLAYER_STORAGE_ACCOUNT".to_string(), sc.account_id.clone());
+                meta.insert("OUTLAYER_STORAGE_WASM_HASH".to_string(), sc.wasm_hash.clone());
+                let scope = app_call::Scope {
+                    project_uuid: Some(sc.project_uuid.clone()),
+                    project_id: job.project_id.clone(),
+                    wasm_hash: sc.wasm_hash.clone(),
+                    account_id: sc.account_id.clone(),
+                    wallet_id: wallet_id.cloned(),
+                    connector_id: sub_key_connector.clone(),
+                    call_id: env_vars.get("OUTLAYER_CALL_ID").filter(|c| !c.is_empty()).cloned(),
+                    request_id: Some(request_id),
+                };
+                app_call::AppCall::begin(api_client, keystore_client, scope, resource_limits.max_execution_seconds).await?
+            }
+            None => None,
         };
-        app_call::AppCall::begin(api_client, keystore_client, scope, resource_limits.max_execution_seconds).await?
+        let input = app_call::envelope(&meta, &config.api_base_url, app_call.as_ref().map(|c| c.token()), input_data.as_bytes());
+        (app_call, input)
     } else {
-        None
-    };
-    let run_input: Vec<u8> = if config.execution_engine == config::ExecutionEngine::DefuseWorker {
-        app_call::envelope(&env_vars, &config.api_base_url, app_call.as_ref().map(|c| c.token()), input_data.as_bytes())
-    } else {
-        input_data.as_bytes().to_vec()
+        (None, input_data.as_bytes().to_vec())
     };
 
     let wallet_config = wallet_id.map(|wid| {
