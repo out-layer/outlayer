@@ -155,6 +155,9 @@ pub struct WorkerCapabilities {
     /// Can fetch a prebuilt `wasm_url` into the cache. Builds nothing and runs
     /// nothing it fetches; needs no docker.
     pub download: bool,
+    /// Executes on the Defuse Outlayer core (`EXECUTION_ENGINE=defuse-core`): the
+    /// coordinator then hands it only the jobs of `DEFUSE_CORE_PROJECTS`.
+    pub defuse_core: bool,
 }
 
 impl WorkerCapabilities {
@@ -169,6 +172,9 @@ impl WorkerCapabilities {
         }
         if self.download {
             result.push("download".to_string());
+        }
+        if self.execution && self.defuse_core {
+            result.push("defuse-core".to_string());
         }
         result
     }
@@ -469,6 +475,7 @@ impl Config {
             compilation: compilation_enabled,
             execution: execution_enabled,
             download: download_enabled,
+            defuse_core: execution_engine == ExecutionEngine::DefuseCore,
         };
 
         // FastFS receiver contract (optional)
@@ -765,7 +772,7 @@ mod tests {
 
     fn with_roles(execution: bool, compilation: bool, download: bool) -> Config {
         let mut c = create_test_config();
-        c.capabilities = WorkerCapabilities { compilation, execution, download };
+        c.capabilities = WorkerCapabilities { compilation, execution, download, defuse_core: false };
         c
     }
 
@@ -904,6 +911,7 @@ mod tests {
                 compilation: true,
                 execution: true,
                 download: false,
+                defuse_core: false,
             },
             fastfs_receiver: None,
             fastfs_sender_signer: None,
