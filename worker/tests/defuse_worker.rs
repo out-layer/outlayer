@@ -96,7 +96,7 @@ fn limits(max_instructions: u64, max_execution_seconds: u64) -> ResourceLimits {
 }
 
 async fn run(sidecar: &Sidecar, wasm: &[u8], input: &[u8], limits: &ResourceLimits) -> ExecutionResult {
-    let worker = DefuseWorker::connect(&sidecar.url, false).expect("client");
+    let worker = DefuseWorker::connect(&sidecar.url, 10 * 1024 * 1024, false).await.expect("client");
     Executor::new(FUEL, false)
         .with_defuse_worker(worker)
         .execute(wasm, None, input, limits, None, None, &ResponseFormat::Text, None, None, None, None)
@@ -124,9 +124,10 @@ async fn a_component_importing_outlayer_crypto_is_refused_before_the_call() {
 #[tokio::test(flavor = "multi_thread")]
 async fn time_runs_out_on_the_sidecar() {
     let Some(sidecar) = Sidecar::start() else { return };
-    let result = run(&sidecar, &plain_probe(), b"spin", &limits(u64::MAX, 1)).await;
+    let result = run(&sidecar, &plain_probe(), b"spin", &limits(1_000_000_000_000, 1)).await;
     assert!(!result.success);
-    assert!(result.error.as_deref().unwrap_or_default().contains("exceeded 1 seconds"), "{:?}", result.error);
+    assert_eq!(result.error.as_deref(), Some("Execution exceeded 5 seconds"), "the floor is five seconds, as on our runtime");
+    assert_eq!(result.instructions, 1_000_000_000_000, "a timeout spends the whole limit");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -196,5 +197,99 @@ mod sdk_on_the_sidecar {
         let bytes = envelope(&meta(), "https://api.example", None, b"get k");
         let out = text(run(&sidecar, &storage_probe(), &bytes, &limits(FUEL, 10)).await).await;
         assert!(out.starts_with("error: ") && out.contains("is not set"), "{out}");
+    }
+}
+
+
+/// A stand-in sidecar speaking their protocol, for the answers the real one gives
+/// rarely: a guest trap with fuel spent, a refusal, a dropped stream, a run that
+/// never ends. What the worker reports and charges for each is the point.
+mod fake_sidecar {
+    use std::time::Duration;
+
+    use defuse_outlayer_proto::{
+        outlayer_service_server::{OutlayerService, OutlayerServiceServer},
+        response, ExecuteResponse, ExecutionDetails, ExecutionOutcome, Request as PbRequest, Response as PbResponse,
+    };
+
+    use super::*;
+
+    #[derive(Clone)]
+    enum Answer {
+        GuestTrap { fuel: u64, logs: &'static str, error: &'static str },
+        Status(tonic::Code, &'static str),
+        Hang,
+    }
+
+    struct Fake(Answer);
+
+    #[tonic::async_trait]
+    impl OutlayerService for Fake {
+        async fn call(&self, _req: tonic::Request<PbRequest>) -> Result<tonic::Response<PbResponse>, tonic::Status> {
+            match self.0.clone() {
+                Answer::GuestTrap { fuel, logs, error } => Ok(tonic::Response::new(PbResponse {
+                    kind: Some(response::Kind::Execute(ExecuteResponse {
+                        output: Vec::new(),
+                        logs: logs.as_bytes().to_vec(),
+                        execution: Some(ExecutionOutcome {
+                            details: Some(ExecutionDetails { fuel_consumed: fuel }),
+                            error: Some(error.to_string()),
+                        }),
+                    })),
+                })),
+                Answer::Status(code, message) => Err(tonic::Status::new(code, message)),
+                Answer::Hang => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    unreachable!()
+                }
+            }
+        }
+    }
+
+    async fn serve(answer: Answer) -> String {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        tokio::spawn(tonic::transport::Server::builder().add_service(OutlayerServiceServer::new(Fake(answer))).serve(addr));
+        format!("http://{addr}")
+    }
+
+    async fn run(answer: Answer, limits: &ResourceLimits) -> ExecutionResult {
+        let url = serve(answer).await;
+        let worker = DefuseWorker::connect(&url, 1024 * 1024, false).await.expect("client");
+        Executor::new(FUEL, false)
+            .with_defuse_worker(worker)
+            .execute(&plain_probe(), None, b"echo x", limits, None, None, &ResponseFormat::Text, None, None, None, None)
+            .await
+            .expect("execute")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_trap_is_charged_what_it_spent_and_shows_its_stderr() {
+        let result = run(Answer::GuestTrap { fuel: 1234, logs: "panicked at main.rs:7\n", error: "wasm trap: unreachable" }, &limits(FUEL, 10)).await;
+        assert!(!result.success);
+        assert_eq!(result.instructions, 1234, "the fuel the sidecar counted");
+        let error = result.error.unwrap();
+        assert!(error.starts_with("panicked at main.rs:7\nTrap: wasm trap: unreachable"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sidecar_that_did_not_run_the_job_charges_nothing() {
+        for (code, message) in [
+            (tonic::Code::Unavailable, "shutting down"),
+            (tonic::Code::ResourceExhausted, "service overloaded"),
+            (tonic::Code::Cancelled, "stream reset"),
+        ] {
+            let result = run(Answer::Status(code, message), &limits(FUEL, 10)).await;
+            assert!(!result.success);
+            assert_eq!(result.instructions, 0, "{code:?}");
+            assert!(result.error.as_deref().unwrap().contains("did not run the job"), "{:?}", result.error);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_never_ends_is_a_timeout_with_the_full_penalty() {
+        let result = run(Answer::Hang, &limits(FUEL, 1)).await;
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("Execution exceeded 5 seconds"), "the floor is five seconds, as on our runtime");
+        assert_eq!(result.instructions, FUEL, "a timeout spends the whole limit");
     }
 }
