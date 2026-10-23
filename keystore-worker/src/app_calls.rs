@@ -59,7 +59,7 @@ pub fn check(
     match scope {
         Some(Extension(scope)) if !scope.allows(project_uuid, wasm_hash, account_id) => {
             tracing::warn!(
-                "app call token used outside its scope: asked project={:?} wasm={} account={}, scope project={:?} wasm={} account={}",
+                "app call token used outside its scope: asked project={:?} wasm={:?} account={:?}, scope project={:?} wasm={} account={}",
                 project_uuid, wasm_hash, account_id, scope.project_uuid, scope.wasm_hash, scope.account_id
             );
             Err(ApiError::Forbidden("the call token does not cover this project, build or account".to_string()))
@@ -90,20 +90,25 @@ impl Registry {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// `false` when the hash is already registered: a replay or a clash.
+    /// `false` when the hash is already registered with another scope: a clash, or
+    /// a replay carrying a different cell. The same registration again — a worker
+    /// retrying after a reply it never saw — is honoured as it stands.
     pub fn register(&self, token_hash: String, scope: AppCallScope, worker_public_key: Option<String>, ttl: Duration) -> bool {
         let mut map = self.lock();
         let now = Instant::now();
         map.retain(|_, r| r.expires_at > now);
-        if map.contains_key(&token_hash) {
-            return false;
+        if let Some(existing) = map.get(&token_hash) {
+            return existing.scope == scope && existing.worker_public_key == worker_public_key;
         }
         map.insert(token_hash, Registration { scope, worker_public_key, expires_at: now + ttl });
         true
     }
 
     pub fn revoke(&self, token_hash: &str) {
-        self.lock().remove(token_hash);
+        let mut map = self.lock();
+        map.remove(token_hash);
+        let now = Instant::now();
+        map.retain(|_, r| r.expires_at > now);
     }
 
     /// The scope and worker identity a presented token stands for, if registered and alive.
@@ -144,17 +149,38 @@ async fn register_handler(
     if req.token_hash.len() != 64 || !req.token_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(ApiError::BadRequest("token_hash must be 32 bytes of hex".to_string()));
     }
+    let token_hash = req.token_hash.to_ascii_lowercase();
     if req.ttl_seconds == 0 || req.ttl_seconds > MAX_TTL_SECONDS {
         return Err(ApiError::BadRequest(format!("ttl_seconds must be within 1..={MAX_TTL_SECONDS}")));
     }
-    if req.scope.account_id.is_empty() || req.scope.wasm_hash.is_empty() {
-        return Err(ApiError::BadRequest("scope.account_id and scope.wasm_hash are required".to_string()));
-    }
+    validate_scope(&req.scope)?;
     let worker_public_key = worker.map(|Extension(w)| w.0);
-    if !state.app_calls.register(req.token_hash, req.scope, worker_public_key, Duration::from_secs(req.ttl_seconds)) {
-        return Err(ApiError::BadRequest("this token hash is already registered".to_string()));
+    if !state.app_calls.register(token_hash, req.scope, worker_public_key, Duration::from_secs(req.ttl_seconds)) {
+        return Err(ApiError::BadRequest("this token hash is already registered with another scope".to_string()));
     }
     Ok(Json(serde_json::json!({ "registered": true })))
+}
+
+/// The seed a record is sealed under is `storage:{project}:{account}` (or
+/// `storage:wasm:{hash}:{account}`), so no field may be empty or carry the `:`
+/// separator, and the worker's own `@worker` cell is never a guest's.
+fn validate_scope(scope: &AppCallScope) -> Result<(), ApiError> {
+    let fields = [
+        ("scope.account_id", Some(scope.account_id.as_str())),
+        ("scope.wasm_hash", Some(scope.wasm_hash.as_str())),
+        ("scope.project_uuid", scope.project_uuid.as_deref()),
+    ];
+    for (name, value) in fields {
+        if let Some(v) = value {
+            if v.is_empty() || v.contains(':') {
+                return Err(ApiError::BadRequest(format!("{name} must be non-empty and must not contain ':'")));
+            }
+        }
+    }
+    if scope.account_id.starts_with('@') {
+        return Err(ApiError::BadRequest("scope.account_id must be an account, not a worker cell".to_string()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,7 +218,10 @@ mod tests {
     fn a_registration_is_single_use_and_expires() {
         let r = Registry::default();
         assert!(r.register("a".repeat(64), scope(), Some("pk".into()), Duration::from_secs(60)));
-        assert!(!r.register("a".repeat(64), scope(), None, Duration::from_secs(60)), "a hash registers once");
+        assert!(r.register("a".repeat(64), scope(), Some("pk".into()), Duration::from_secs(60)), "the same registration is honoured again");
+        assert!(!r.register("a".repeat(64), scope(), None, Duration::from_secs(60)), "another worker may not take the hash over");
+        let other = AppCallScope { account_id: "eve.testnet".into(), ..scope() };
+        assert!(!r.register("a".repeat(64), other, Some("pk".into()), Duration::from_secs(60)), "another cell may not take the hash over");
         let token = "act_x";
         assert!(r.resolve(token).is_none(), "a token whose hash is not registered resolves to nothing");
         let hash = token_hash(token);
@@ -262,7 +291,12 @@ mod tests {
             "scope": { "project_uuid": "p1", "wasm_hash": "h1", "account_id": "bob.testnet", "call_id": "c1" },
         });
         assert_eq!(post(&app, "/app-calls/register", worker.as_str(), register.clone()).await.0, 200);
-        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), register).await.0, 400, "a hash registers once");
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), register).await.0, 200, "the same registration again is a retry");
+        let other_scope = serde_json::json!({
+            "token_hash": token_hash(token), "ttl_seconds": 60,
+            "scope": { "project_uuid": "p9", "wasm_hash": "h1", "account_id": "bob.testnet", "call_id": null },
+        });
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), other_scope).await.0, 400, "the same hash with another cell is refused");
 
         let (status, body) = post(&app, "/storage/encrypt", token, encrypt_body("p1", "h1", "bob.testnet")).await;
         assert_eq!(status, 200, "{body}");
@@ -293,8 +327,18 @@ mod tests {
         assert_eq!(post(&app, "/app-calls/register", "not-a-worker", serde_json::json!({ "token_hash": "a".repeat(64), "ttl_seconds": 60, "scope": scope })).await.0, 401);
         assert_eq!(post(&app, "/app-calls/register", worker.as_str(), serde_json::json!({ "token_hash": "zz", "ttl_seconds": 60, "scope": scope })).await.0, 400);
         assert_eq!(post(&app, "/app-calls/register", worker.as_str(), serde_json::json!({ "token_hash": "b".repeat(64), "ttl_seconds": 7200, "scope": scope })).await.0, 400);
-        let empty_account = serde_json::json!({ "project_uuid": "p1", "wasm_hash": "h1", "account_id": "", "call_id": null });
-        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), serde_json::json!({ "token_hash": "c".repeat(64), "ttl_seconds": 60, "scope": empty_account })).await.0, 400);
+        for bad in [
+            serde_json::json!({ "project_uuid": "p1", "wasm_hash": "h1", "account_id": "", "call_id": null }),
+            serde_json::json!({ "project_uuid": "p1", "wasm_hash": "h1", "account_id": "@worker", "call_id": null }),
+            serde_json::json!({ "project_uuid": "p1", "wasm_hash": "h1", "account_id": "x:y", "call_id": null }),
+            serde_json::json!({ "project_uuid": "", "wasm_hash": "h1", "account_id": "bob.testnet", "call_id": null }),
+            serde_json::json!({ "project_uuid": "p1:x", "wasm_hash": "h1", "account_id": "bob.testnet", "call_id": null }),
+        ] {
+            assert_eq!(post(&app, "/app-calls/register", worker.as_str(), serde_json::json!({ "token_hash": "c".repeat(64), "ttl_seconds": 60, "scope": bad })).await.0, 400, "{bad}");
+        }
+        let upper = serde_json::json!({ "token_hash": token_hash("act_up").to_ascii_uppercase(), "ttl_seconds": 60, "scope": scope });
+        assert_eq!(post(&app, "/app-calls/register", worker.as_str(), upper).await.0, 200);
+        assert_eq!(post(&app, "/storage/encrypt", "act_up", encrypt_body("p1", "h1", "bob.testnet")).await.0, 200, "the hash is matched case-insensitively");
         assert_eq!(post(&app, "/storage/encrypt", worker.as_str(), encrypt_body("p9", "h9", "anyone.testnet")).await.0, 200, "the worker's own token is not scoped");
     }
 
