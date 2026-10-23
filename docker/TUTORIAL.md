@@ -24,6 +24,16 @@ phala cvms create --name outlayer-testnet-keystore --compose ./docker-compose.ke
 cd docker 
 phala deploy --name outlayer-testnet-worker --compose docker-compose.phala.yml --env-file .env.testnet-worker-phala --vcpu 1 --memory 1G --disk-size 2G --kms-id phala-prod10
 
+# A worker on the Defuse engine runs with the `outlayer-core` sidecar: start the
+# compose with `--profile defuse-worker`, and set in its env file
+#   EXECUTION_ENGINE=defuse-worker  COMPILATION_ENABLED=false  DOWNLOAD_ENABLED=false
+#   DOCKER_IMAGE_OUTLAYER_CORE=docker.io/outlayer/near-outlayer-core@sha256:...  (write the
+#     digest literally into the compose for a deployment: the attestation measures the text)
+#   OUTLAYER_CORE_SEED=<32 random bytes, hex>   (test-mode seed; signs nothing of value)
+#   OUTLAYER_CORE_WASM_MEMORY_BYTES / OUTLAYER_CORE_MEMORY_BUDGET_BYTES / OUTLAYER_CORE_MEM_LIMIT
+#     (the fleet's memory tier; concurrency = budget / per-run cost)
+# The coordinator routes only DEFUSE_WORKER_PROJECTS to such a worker.
+
 # Compilation does not run in the enclave: the TEE workers execute only
 # (COMPILATION_ENABLED=false). A separate worker compiles, and pins the image it
 # compiles in by digest — see worker/.env.testnet.worker1.

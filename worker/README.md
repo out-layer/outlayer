@@ -22,6 +22,29 @@ What a worker does is set by three switches (`src/config.rs`); at least one must
 | `DOWNLOAD_ENABLED` | `false` | Downloader: fetches a `WasmUrl`, checks its sha256 and caches it; no Docker, no build, runs nothing |
 | `COMPILATION_ENABLED` | `false` | Builder: builds a GitHub repository and fetches a `WasmUrl`; builds run only where the coordinator has `BUILDS_ENABLED=true` (default `false`) |
 
+A fourth switch picks the engine that runs the wasm:
+
+| Variable | Default | Engine |
+|----------|---------|--------|
+| `EXECUTION_ENGINE` | `outlayer` | `outlayer`: this worker's own wasmtime runtime with every host interface under `wit/`. `defuse-worker`: the Defuse Outlayer worker running beside this one in the same CVM (`docker/docker-compose.phala.yml`, service `outlayer-core`, compose profile `defuse-worker`); jobs go to its gRPC `Call` with the wasm inline |
+| `DEFUSE_WORKER_URL` | `http://127.0.0.1:50051` | The sidecar's gRPC endpoint, inside the CVM |
+
+On the `defuse-worker` engine the worker takes only the execute queue of the
+projects the coordinator lists in `DEFUSE_WORKER_PROJECTS` (it states the
+`defuse-worker` capability when it polls), and refuses to start with
+`COMPILATION_ENABLED` or `DOWNLOAD_ENABLED`. The sidecar's rules apply to the
+guest: an empty environment, no OutLayer host interfaces, `https` to port 443 of
+public names only, no monotonic clock. A component built with the SDK's
+`defuse-engine` feature carries the `outlayer.engine` section and receives what
+the environment would have held as a stdin envelope `{"meta": …, "input": …}`,
+with a one-time call token its storage calls present to the coordinator and the
+keystore (`/app-calls/*`); any other component receives the caller's input as it
+is, and a project with secrets is refused on this engine unless its build carries
+the section. Connectors (an enforced outbound allowlist) and components importing
+`outlayer:crypto` are refused on this engine. At startup `API_BASE_URL` and every
+`KEYSTORE_BASE_URLS` entry are checked against the sidecar's egress policy
+(`https`, port 443, a public multi-label name).
+
 Builds are off by default on both sides. The code sources a user can name are
 `Project` and `WasmUrl`, and a project version's source is a `WasmUrl`: a
 published `.wasm` named by its sha256, which the worker refuses when the bytes
@@ -214,6 +237,8 @@ POLL_TIMEOUT_SECONDS=60               # default: 60
 EXECUTION_ENABLED=true                # default: true
 DOWNLOAD_ENABLED=false                # default: false
 COMPILATION_ENABLED=false             # default: false — builds also need BUILDS_ENABLED=true on the coordinator
+EXECUTION_ENGINE=outlayer             # default: outlayer; defuse-worker = the sidecar (see Roles)
+DEFUSE_WORKER_URL=http://127.0.0.1:50051  # default; the compose uses http://outlayer-core:50051
 
 # Docker Compilation (builder role only)
 DOCKER_IMAGE=rust:1.75                # default: rust:1.75
