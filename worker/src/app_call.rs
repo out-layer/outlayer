@@ -1,0 +1,151 @@
+//! A run on the Defuse worker beside ours: its one-time token and its stdin envelope.
+//!
+//! That guest has no env vars and none of our host functions, so what the env
+//! carried arrives in `meta` on stdin, and the guest reaches storage over HTTPS
+//! with a token minted here for this run alone. The token is registered with the
+//! coordinator by its hash, over this worker's own attested channel, with the
+//! run's scope; it is revoked when the run ends. Only the hash leaves this process
+//! other than inside the guest's stdin.
+
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+use base64::Engine;
+use rand::RngCore;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tracing::warn;
+
+use crate::api_client::ApiClient;
+
+pub const PREFIX: &str = "act_";
+
+/// Added to the run's time limit so the token outlives a run that ends on time.
+const TTL_MARGIN_SECONDS: u64 = 60;
+
+/// What the guest may touch: the same project and account the host functions
+/// would have named on its behalf.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Scope {
+    pub project_uuid: Option<String>,
+    pub project_id: Option<String>,
+    pub wasm_hash: String,
+    pub account_id: String,
+    pub wallet_id: Option<String>,
+    pub connector_id: Option<String>,
+    pub call_id: Option<String>,
+    pub request_id: Option<u64>,
+}
+
+pub struct CallToken {
+    token: String,
+}
+
+impl CallToken {
+    pub fn mint() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Self { token: format!("{PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)) }
+    }
+
+    pub fn hash(&self) -> String {
+        hex::encode(Sha256::digest(self.token.as_bytes()))
+    }
+}
+
+/// A registered token: minted, registered, and revoked by [`AppCall::end`].
+pub struct AppCall {
+    token: CallToken,
+    hash: String,
+}
+
+impl AppCall {
+    /// Mints and registers a token for a run of `scope` that may last
+    /// `max_execution_seconds`. `None` when the run has no caller identity: there is
+    /// nothing a token could be scoped to, and the guest gets no token.
+    pub async fn begin(api_client: &ApiClient, scope: Scope, max_execution_seconds: u64) -> Result<Option<Self>> {
+        if scope.account_id.is_empty() {
+            return Ok(None);
+        }
+        let token = CallToken::mint();
+        let hash = token.hash();
+        api_client
+            .register_app_call(&hash, max_execution_seconds.saturating_add(TTL_MARGIN_SECONDS), &scope)
+            .await
+            .context("register the run's call token")?;
+        Ok(Some(Self { token, hash }))
+    }
+
+    /// The run is over; the token must not open anything after it. A revocation
+    /// that fails is logged: the registration's TTL ends it anyway.
+    pub async fn end(self, api_client: &ApiClient) {
+        if let Err(e) = api_client.revoke_app_call(&self.hash).await {
+            warn!("call token not revoked (its TTL will end it): {e:#}");
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token.token
+    }
+}
+
+/// stdin for the guest: `{"meta": {...}, "input": <the caller's input>}`.
+///
+/// `meta` is the env map as the guest would have seen it, plus `OUTLAYER_API_BASE`
+/// and, when the run has one, `OUTLAYER_CALL_TOKEN`. The input is carried as a
+/// string when it is UTF-8, as `input_base64` otherwise, so any byte sequence
+/// survives the trip.
+pub fn envelope(meta: &HashMap<String, String>, api_base: &str, call_token: Option<&str>, input: &[u8]) -> Vec<u8> {
+    let mut meta: serde_json::Map<String, serde_json::Value> =
+        meta.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+    meta.insert("OUTLAYER_API_BASE".to_string(), serde_json::Value::String(api_base.to_string()));
+    if let Some(token) = call_token {
+        meta.insert("OUTLAYER_CALL_TOKEN".to_string(), serde_json::Value::String(token.to_string()));
+    }
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("meta".to_string(), serde_json::Value::Object(meta));
+    match std::str::from_utf8(input) {
+        Ok(text) => envelope.insert("input".to_string(), serde_json::Value::String(text.to_string())),
+        Err(_) => envelope.insert(
+            "input_base64".to_string(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(input)),
+        ),
+    };
+    serde_json::to_vec(&serde_json::Value::Object(envelope)).expect("an object of strings serializes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_is_prefixed_random_and_hashed() {
+        let a = CallToken::mint();
+        let b = CallToken::mint();
+        assert!(a.token.starts_with(PREFIX) && a.token.len() == PREFIX.len() + 43);
+        assert_ne!(a.token, b.token);
+        assert_eq!(a.hash().len(), 64);
+        assert_ne!(a.hash(), b.hash());
+    }
+
+    #[test]
+    fn the_envelope_carries_meta_and_the_input_verbatim() {
+        let meta: HashMap<String, String> = [("NEAR_SENDER_ID".to_string(), "bob.testnet".to_string())].into();
+        let bytes = envelope(&meta, "https://api.example", Some("act_x"), br#"{"op":"echo"}"#);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["meta"]["NEAR_SENDER_ID"], "bob.testnet");
+        assert_eq!(v["meta"]["OUTLAYER_API_BASE"], "https://api.example");
+        assert_eq!(v["meta"]["OUTLAYER_CALL_TOKEN"], "act_x");
+        assert_eq!(v["input"], r#"{"op":"echo"}"#);
+        assert!(v.get("input_base64").is_none());
+    }
+
+    #[test]
+    fn a_run_without_a_token_has_no_token_field_and_bytes_survive() {
+        let bytes = envelope(&HashMap::new(), "u", None, &[0xff, 0xfe]);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["meta"].get("OUTLAYER_CALL_TOKEN").is_none());
+        assert!(v.get("input").is_none());
+        assert_eq!(v["input_base64"], "//4=");
+    }
+}

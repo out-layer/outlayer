@@ -1,5 +1,6 @@
 // Export modules for testing
 pub mod api_client;
+pub mod app_call;
 pub mod executor;
 pub mod net_guard;
 pub mod compiler;

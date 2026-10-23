@@ -965,6 +965,42 @@ impl ApiClient {
         .await
     }
 
+    /// Registers a run's call token by its hash, with the run's scope and a TTL.
+    pub async fn register_app_call(&self, token_hash: &str, ttl_seconds: u64, scope: &crate::app_call::Scope) -> Result<()> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            token_hash: &'a str,
+            ttl_seconds: u64,
+            scope: &'a crate::app_call::Scope,
+        }
+        let response = self
+            .add_auth_headers(self.client.post(format!("{}/app-calls/register", self.base_url)))
+            .json(&Body { token_hash, ttl_seconds, scope })
+            .send()
+            .await
+            .context("Failed to send app call registration")?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("app call registration refused ({}): {}", status, response.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// The run ended: its token opens nothing from now on.
+    pub async fn revoke_app_call(&self, token_hash: &str) -> Result<()> {
+        let response = self
+            .add_auth_headers(self.client.post(format!("{}/app-calls/revoke", self.base_url)))
+            .json(&serde_json::json!({ "token_hash": token_hash }))
+            .send()
+            .await
+            .context("Failed to send app call revocation")?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("app call revocation refused ({}): {}", status, response.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
     /// [`Self::complete_job`] plus the refund the guest asked for.
     ///
     /// The coordinator computes the author's share as

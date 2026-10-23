@@ -1,4 +1,5 @@
 mod api_client;
+mod app_call;
 mod collateral_fetcher;
 mod compiled_cache;
 mod compiler;
@@ -3057,6 +3058,29 @@ async fn handle_execute_job(
         job.project_id.as_deref(),
         declared_manifest.as_ref(),
     );
+    // A run on the Defuse worker: what the env carried goes in the stdin envelope,
+    // with a one-time token this run's storage calls present instead of ours.
+    let app_call = if config.execution_engine == config::ExecutionEngine::DefuseWorker {
+        let scope = app_call::Scope {
+            project_uuid: project_uuid.clone(),
+            project_id: job.project_id.clone(),
+            wasm_hash: executed_wasm_sha256.clone(),
+            account_id: env_vars.get("NEAR_SENDER_ID").cloned().unwrap_or_default(),
+            wallet_id: wallet_id.cloned(),
+            connector_id: sub_key_connector.clone(),
+            call_id: env_vars.get("OUTLAYER_CALL_ID").filter(|c| !c.is_empty()).cloned(),
+            request_id: Some(request_id),
+        };
+        app_call::AppCall::begin(api_client, scope, resource_limits.max_execution_seconds).await?
+    } else {
+        None
+    };
+    let run_input: Vec<u8> = if config.execution_engine == config::ExecutionEngine::DefuseWorker {
+        app_call::envelope(&env_vars, &config.api_base_url, app_call.as_ref().map(|c| c.token()), input_data.as_bytes())
+    } else {
+        input_data.as_bytes().to_vec()
+    };
+
     let wallet_config = wallet_id.map(|wid| {
         debug!("Wallet enabled for execution: wallet_id={}", wid);
         executor::WalletConfig {
@@ -3084,7 +3108,7 @@ async fn handle_execute_job(
         .execute(
             &wasm_bytes,
             Some(executed_wasm_sha256.as_str()),
-            input_data.as_bytes(),
+            &run_input,
             resource_limits,
             Some(env_vars),
             build_target,
@@ -3095,6 +3119,10 @@ async fn handle_execute_job(
             Some(network_config),
         )
         .await;
+
+    if let Some(app_call) = app_call {
+        app_call.end(api_client).await;
+    }
 
     // The tasks this run answered, and the approved tasks it was refused,
     // told to the store now that the guest has exited — however it exited: a
