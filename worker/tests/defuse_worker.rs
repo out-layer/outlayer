@@ -138,3 +138,63 @@ async fn fuel_runs_out_on_the_sidecar() {
     assert!(!result.success);
     assert!(result.error.as_deref().unwrap_or_default().to_lowercase().contains("fuel"), "{:?}", result.error);
 }
+
+/// The OutLayer SDK built for the Defuse engine reads the envelope the worker sends.
+mod sdk_on_the_sidecar {
+    use std::collections::HashMap;
+
+    use offchainvm_worker::app_call::envelope;
+
+    use super::*;
+
+    fn storage_probe() -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("wasi-examples/defuse-storage-probe/target/wasm32-wasip2/release/defuse-storage-probe.wasm");
+        if !path.exists() {
+            panic!("Test WASM not found at {}! Build it first:\ncd ../wasi-examples/defuse-storage-probe && ./build.sh", path.display());
+        }
+        std::fs::read(&path).expect("read the probe")
+    }
+
+    fn meta() -> HashMap<String, String> {
+        [("NEAR_SENDER_ID", "bob.testnet"), ("OUTLAYER_PROJECT_ID", "alice.testnet/app")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    async fn text(result: ExecutionResult) -> String {
+        assert!(result.success, "{:?}", result.error);
+        match result.output {
+            Some(ExecutionOutput::Text(t)) => t,
+            other => panic!("not text: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_guest_sees_meta_and_the_caller_input() {
+        let Some(sidecar) = Sidecar::start() else { return };
+        let wasm = storage_probe();
+        let run = |input: &str| {
+            let bytes = envelope(&meta(), "https://api.example", Some("act_test"), input.as_bytes());
+            let sidecar = &sidecar;
+            let wasm = wasm.clone();
+            async move { text(super::run(sidecar, &wasm, &bytes, &limits(FUEL, 10)).await).await }
+        };
+        assert_eq!(run("echo hello world").await, "hello world");
+        assert_eq!(run("var NEAR_SENDER_ID").await, "bob.testnet");
+        assert_eq!(run("sender").await, "bob.testnet");
+        assert_eq!(run("var OUTLAYER_CALL_TOKEN").await, "act_test");
+        assert_eq!(run("var NOPE").await, "<unset>");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_without_a_registered_cell_says_why() {
+        let Some(sidecar) = Sidecar::start() else { return };
+        let bytes = envelope(&meta(), "https://api.example", None, b"get k");
+        let out = text(run(&sidecar, &storage_probe(), &bytes, &limits(FUEL, 10)).await).await;
+        assert!(out.starts_with("error: ") && out.contains("is not set"), "{out}");
+    }
+}

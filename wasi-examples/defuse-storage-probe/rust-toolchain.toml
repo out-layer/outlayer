@@ -1,0 +1,9 @@
+# The worker had no toolchain file, so the Rust it needs was whatever the host happened to have.
+# That is how a deploy host on 1.90 hit `near-jsonrpc-client@0.22.0 requires rustc 1.93` on its
+# first rebuild after the July dependency bump — the lock file demanded a compiler nobody had
+# declared. rustup reads this and installs the right one automatically.
+#
+# 1.93.0 matches register-contract and keystore-dao-contract; the on-chain contracts stay on
+# 1.85.0 because their near-sdk pins require it.
+[toolchain]
+channel = "1.98.1"

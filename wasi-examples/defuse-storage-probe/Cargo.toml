@@ -1,0 +1,21 @@
+[package]
+name = "defuse-storage-probe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The OutLayer SDK on the Defuse worker engine: the envelope and storage over HTTPS"
+
+[[bin]]
+name = "defuse-storage-probe"
+path = "src/main.rs"
+
+[dependencies]
+outlayer = { path = "../../sdk/outlayer", features = ["defuse-engine"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
+[workspace]
