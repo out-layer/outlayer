@@ -1862,7 +1862,7 @@ dependencies = [
 [[package]]
 name = "defuse-outlayer-proto"
 version = "0.0.0-dev"
-source = "git+ssh://git@github.com/defuse-protocol/outlayer.git?tag=worker%2Fv0.8.1#8ebaf65e1e25585bcbb31a2c8dacdbc3829ed93b"
+source = "git+ssh://git@github.com/zavodil/defuse-outlayer-upstream.git?tag=worker%2Fv0.8.1#8ebaf65e1e25585bcbb31a2c8dacdbc3829ed93b"
 dependencies = [
  "prost",
  "tonic",
