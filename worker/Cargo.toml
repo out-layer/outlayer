@@ -42,7 +42,7 @@ defuse-outlayer-service = { git = "ssh://git@github.com/defuse-protocol/outlayer
 defuse-outlayer-executor = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
 defuse-outlayer-vm-runner = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
 defuse-outlayer-host = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
-defuse-outlayer-signer = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
+defuse-outlayer-signer = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1", features = ["ed25519", "secp256k1"] }
 defuse-outlayer-primitives = { git = "ssh://git@github.com/defuse-protocol/outlayer.git", tag = "worker/v0.8.1" }
 
 wasmtime = { version = "28", features = ["component-model", "async"] }

@@ -6,6 +6,7 @@ pub mod compiler;
 pub mod near_client;
 pub mod config;
 pub mod keystore_client;
+pub mod app_crypto;
 pub mod collateral_fetcher;
 pub mod fastfs;
 pub mod callers;

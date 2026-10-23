@@ -1,4 +1,5 @@
 mod api_client;
+mod app_crypto;
 mod collateral_fetcher;
 mod compiled_cache;
 mod compiler;

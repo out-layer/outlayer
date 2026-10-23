@@ -950,6 +950,35 @@ impl KeystoreClient {
         Ok(pubkey_hex)
     }
 
+    /// The `outlayer:crypto` root public keys (public route, no session).
+    pub async fn app_crypto_root_public_keys(&self) -> Result<crate::app_crypto::RootPublicKeys> {
+        let (base_url, _) = self.current_endpoint();
+        let response = self
+            .http_client
+            .get(format!("{}/crypto/root-public-keys", base_url))
+            .send()
+            .await
+            .context("Failed to get outlayer:crypto root public keys")?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("outlayer:crypto root public keys: keystore returned {}: {}", status, response.text().await.unwrap_or_default());
+        }
+        response.json().await.context("Failed to parse outlayer:crypto root public keys")
+    }
+
+    /// Sign with an `outlayer:crypto` child key; `path` is already scoped by the host.
+    pub async fn app_crypto_sign(
+        &self,
+        req: &crate::app_crypto::SignRequest,
+    ) -> Result<crate::app_crypto::SignResponse> {
+        let what = "outlayer:crypto sign";
+        let reply = self.post_json("/crypto/sign", || Ok(req), what, None).await?;
+        if !reply.status.is_success() {
+            anyhow::bail!("{} failed ({}): {}", what, reply.status, reply.text());
+        }
+        serde_json::from_slice(&reply.body).context("Failed to parse outlayer:crypto signature")
+    }
+
     /// Decrypt secrets from contract using unified accessor format
     ///
     /// This method:
