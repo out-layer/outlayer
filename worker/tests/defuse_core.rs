@@ -217,3 +217,50 @@ mod keystore_signer {
         );
     }
 }
+
+mod engine {
+    use offchainvm_worker::{
+        api_client::{ExecutionOutput, ResourceLimits, ResponseFormat},
+        executor::{defuse_core::DefuseCore, Executor},
+    };
+
+    use super::*;
+
+    fn executor() -> Executor {
+        let core = DefuseCore::new(Arc::new(InMemorySigner::from_seed(b"seed")), 64, 1024 * 1024, false).expect("core");
+        Executor::new(FUEL, false).with_defuse_core(core)
+    }
+
+    fn limits(max_instructions: u64, max_execution_seconds: u64) -> ResourceLimits {
+        ResourceLimits { max_instructions, max_memory_mb: 64, max_execution_seconds }
+    }
+
+    async fn run(input: &[u8], limits: &ResourceLimits) -> offchainvm_worker::api_client::ExecutionResult {
+        executor()
+            .execute(&probe(), None, input, limits, None, None, &ResponseFormat::Text, None, None, None, None)
+            .await
+            .expect("execute")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_runs_on_the_core() {
+        let result = run(b"echo hello", &limits(FUEL, 10)).await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.instructions > 0);
+        assert!(matches!(result.output, Some(ExecutionOutput::Text(ref t)) if t == "hello"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fuel_runs_out() {
+        let result = run(b"spin", &limits(10_000_000, 10)).await;
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or_default().contains("fuel"), "{:?}", result.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn time_runs_out() {
+        let result = run(b"spin", &limits(u64::MAX, 1)).await;
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or_default().contains("exceeded 1 seconds"), "{:?}", result.error);
+    }
+}

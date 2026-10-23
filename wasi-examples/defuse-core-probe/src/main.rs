@@ -1,6 +1,6 @@
 //! The first word of stdin picks the operation, the rest are its arguments:
 //! `echo <rest>`, `env` (number of environment variables), `clock` (reads the
-//! monotonic clock), `ed25519-pk <path>`, `ed25519-sign <path> <msg-hex>`,
+//! monotonic clock), `spin` (never returns), `ed25519-pk <path>`, `ed25519-sign <path> <msg-hex>`,
 //! `secp256k1-pk <path>`, `secp256k1-sign <path> <prehash-hex>`. Keys and
 //! signatures are written as hex; a secp256k1 key is SEC1 compressed, a
 //! secp256k1 signature is `r || s || v`.
@@ -24,6 +24,12 @@ fn main() {
         "echo" => rest.to_string(),
         "env" => std::env::vars().count().to_string(),
         "clock" => format!("{:?}", std::time::Instant::now().elapsed()),
+        "spin" => {
+            let mut n: u64 = 0;
+            loop {
+                n = std::hint::black_box(n.wrapping_add(1));
+            }
+        }
         "ed25519-pk" => hex::encode(DeriveSigner::<Ed25519, _>::derive_public_key(&HostSigner, args[0]).as_bytes()),
         "ed25519-sign" => {
             let msg = hex::decode(args[1]).expect("msg hex");
