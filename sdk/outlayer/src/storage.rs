@@ -94,7 +94,10 @@
 //! let blob = storage::get_raw("blob")?;
 //! ```
 
+#[cfg(not(feature = "defuse-engine"))]
 use crate::near::storage::api as raw;
+#[cfg(feature = "defuse-engine")]
+use crate::engine::storage as raw;
 
 #[cfg(feature = "encryption-keys")]
 pub mod sealed;

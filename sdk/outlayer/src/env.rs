@@ -55,10 +55,10 @@
 //!
 //! ```rust,ignore
 //! // Secrets stored via dashboard or contract are accessible as env vars
-//! let api_key = std::env::var("OPENAI_API_KEY").ok();
+//! let api_key = env::var("OPENAI_API_KEY");
 //! ```
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 /// Get the NEAR account ID that requested this execution
 ///
@@ -83,7 +83,7 @@ use std::io::{self, Read, Write};
 /// }
 /// ```
 pub fn signer_account_id() -> Option<String> {
-    std::env::var("NEAR_SENDER_ID").ok()
+    read_var("NEAR_SENDER_ID")
 }
 
 /// Get the transaction hash for this execution
@@ -99,7 +99,7 @@ pub fn signer_account_id() -> Option<String> {
 /// }
 /// ```
 pub fn transaction_hash() -> Option<String> {
-    std::env::var("NEAR_TRANSACTION_HASH").ok()
+    read_var("NEAR_TRANSACTION_HASH")
 }
 
 /// Get the execution request ID
@@ -108,7 +108,7 @@ pub fn transaction_hash() -> Option<String> {
 /// * `Some(request_id)` - The request ID assigned by the contract
 /// * `None` - Not available
 pub fn request_id() -> Option<String> {
-    std::env::var("OUTLAYER_REQUEST_ID").ok()
+    read_var("OUTLAYER_REQUEST_ID")
 }
 
 /// Get input data from the execution request
@@ -141,9 +141,30 @@ pub fn request_id() -> Option<String> {
 /// }
 /// ```
 pub fn input() -> Vec<u8> {
-    let mut buffer = Vec::new();
-    io::stdin().read_to_end(&mut buffer).unwrap_or(0);
-    buffer
+    #[cfg(feature = "defuse-engine")]
+    {
+        crate::engine::input()
+    }
+    #[cfg(not(feature = "defuse-engine"))]
+    {
+        use std::io::Read;
+        let mut buffer = Vec::new();
+        io::stdin().read_to_end(&mut buffer).unwrap_or(0);
+        buffer
+    }
+}
+
+/// One variable of the run: the environment on the OutLayer engine, `meta` on the
+/// Defuse engine.
+fn read_var(key: &str) -> Option<String> {
+    #[cfg(feature = "defuse-engine")]
+    {
+        crate::engine::var(key)
+    }
+    #[cfg(not(feature = "defuse-engine"))]
+    {
+        std::env::var(key).ok()
+    }
 }
 
 /// Get input data as a string
@@ -279,7 +300,7 @@ pub fn output_json<T: serde::Serialize>(value: &T) -> Result<(), serde_json::Err
 /// }
 /// ```
 pub fn var(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+    read_var(key)
 }
 
 /// Check if an environment variable is set
@@ -298,7 +319,7 @@ pub fn var(key: &str) -> Option<String> {
 /// }
 /// ```
 pub fn has_var(key: &str) -> bool {
-    std::env::var(key).is_ok()
+    read_var(key).is_some()
 }
 
 /// Get the predecessor account ID (the account that called OutLayer)
@@ -331,7 +352,7 @@ pub fn has_var(key: &str) -> bool {
 /// }
 /// ```
 pub fn predecessor_account_id() -> Option<String> {
-    std::env::var("NEAR_PREDECESSOR_ID").ok()
+    read_var("NEAR_PREDECESSOR_ID")
 }
 
 /// Get the account that relayed this call as a NEP-366 meta-transaction
@@ -351,5 +372,5 @@ pub fn predecessor_account_id() -> Option<String> {
 /// }
 /// ```
 pub fn relayer_account_id() -> Option<String> {
-    std::env::var("NEAR_RELAYER_ID").ok().filter(|id| !id.is_empty())
+    read_var("NEAR_RELAYER_ID").filter(|id| !id.is_empty())
 }

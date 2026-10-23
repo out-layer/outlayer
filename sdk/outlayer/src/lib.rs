@@ -74,6 +74,13 @@ compile_error!(
 // `worker/wit/deps/`: copy, never hand-edit. A changed signature is a new
 // package version that the worker serves next to the old one, and the crate's
 // own version does not reach the binary. See worker/wit/README.md.
+#[cfg(all(feature = "defuse-engine", any(feature = "signing-keys", feature = "encryption-keys", feature = "tasks")))]
+compile_error!("`defuse-engine` has no host functions: `signing-keys`, `encryption-keys` and `tasks` cannot be enabled with it.");
+
+#[cfg(feature = "defuse-engine")]
+pub mod engine;
+
+#[cfg(not(feature = "defuse-engine"))]
 wit_bindgen::generate!({
     world: "outlayer-host",
     path: "wit",
@@ -111,6 +118,7 @@ mod tasks_bindings {
 
 pub mod storage;
 pub mod env;
+#[cfg(not(feature = "defuse-engine"))]
 pub mod vrf;
 #[cfg(feature = "signing-keys")]
 pub mod signing_keys;
@@ -123,6 +131,7 @@ pub mod tasks;
 ///
 /// Most users should use the high-level `storage`, `env`, `vrf`, `signing_keys`,
 /// `encryption_keys` and `tasks` modules instead.
+#[cfg(not(feature = "defuse-engine"))]
 pub mod raw {
     pub use super::near::rpc::api as rpc;
     pub use super::near::storage::api as storage;
