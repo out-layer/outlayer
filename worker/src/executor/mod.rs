@@ -42,6 +42,7 @@ use crate::outlayer_rpc::RpcProxy;
 use crate::outlayer_storage::client::StorageConfig;
 
 pub mod sandbox;
+pub mod defuse_worker;
 mod wasi_p1;
 mod wasi_p2;
 mod pinned_http;
@@ -241,6 +242,8 @@ pub struct Executor {
     memory_floor_mb: u32,
     memory_ceiling_mb: u32,
     max_output_bytes: usize,
+    /// Set when jobs run on the Defuse Outlayer worker beside this one.
+    defuse_worker: Option<Arc<defuse_worker::DefuseWorker>>,
 }
 
 impl Executor {
@@ -253,7 +256,14 @@ impl Executor {
             memory_floor_mb: DEFAULT_MEMORY_FLOOR_MB,
             memory_ceiling_mb: DEFAULT_MEMORY_CEILING_MB,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            defuse_worker: None,
         }
+    }
+
+    /// Run every job on the Defuse Outlayer worker beside this one.
+    pub fn with_defuse_worker(mut self, worker: defuse_worker::DefuseWorker) -> Self {
+        self.defuse_worker = Some(Arc::new(worker));
+        self
     }
 
     /// The bounds a run's memory is held between and its stdout capacity
@@ -494,6 +504,11 @@ impl Executor {
         // instantiated.
         crate::signing_keys::check_run_keys(wasm_bytes, keys.signing.as_ref()).map_err(anyhow::Error::msg)?;
         crate::encryption_keys::check_run_keys(wasm_bytes, keys.encryption.as_ref()).map_err(anyhow::Error::msg)?;
+
+        if let Some(worker) = &self.defuse_worker {
+            let (output, fuel) = worker.execute(wasm_bytes, input_data, limits).await?;
+            return Ok((output, fuel, None));
+        }
 
         // Create effective execution context with per-execution overrides
         let has_overrides = storage_config.is_some()

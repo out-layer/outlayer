@@ -478,9 +478,19 @@ async fn main() -> Result<()> {
             exec_context = exec_context.with_compiled_cache(cache.clone());
         }
 
-        Executor::new(config.default_max_instructions, config.print_wasm_stderr)
+        let executor = Executor::new(config.default_max_instructions, config.print_wasm_stderr)
             .with_run_limits(config.wasm_memory_floor_mb, config.wasm_memory_ceiling_mb, config.max_output_bytes)
-            .with_context(exec_context)
+            .with_context(exec_context);
+        match config.execution_engine {
+            config::ExecutionEngine::Outlayer => executor,
+            config::ExecutionEngine::DefuseWorker => {
+                info!("Execution engine: Defuse Outlayer worker at {}", config.defuse_worker_url);
+                executor.with_defuse_worker(executor::defuse_worker::DefuseWorker::connect(
+                    &config.defuse_worker_url,
+                    config.print_wasm_stderr,
+                )?)
+            }
+        }
     };
 
     // Create NearClient with operator signer from registration. A worker that

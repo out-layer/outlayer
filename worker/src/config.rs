@@ -4,6 +4,13 @@ use near_primitives::types::AccountId;
 use std::env;
 use std::str::FromStr;
 
+/// What runs a job's wasm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionEngine {
+    Outlayer,
+    DefuseWorker,
+}
+
 /// Worker configuration loaded from environment variables
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -35,6 +42,10 @@ pub struct Config {
     // "docker" - use Docker containers (requires Docker socket)
     // "native" - use native Rust toolchain with bubblewrap (for TEE/Phala)
     pub compilation_mode: String,
+    /// `EXECUTION_ENGINE`: our runtime, or the Defuse Outlayer worker beside this one.
+    pub execution_engine: ExecutionEngine,
+    /// `DEFUSE_WORKER_URL`: the sidecar's gRPC endpoint, inside the CVM.
+    pub defuse_worker_url: String,
 
     // Docker for compilation (only used in "docker" mode)
     pub docker_image: String,
@@ -146,6 +157,10 @@ pub struct WorkerCapabilities {
     /// Can fetch a prebuilt `wasm_url` into the cache. Builds nothing and runs
     /// nothing it fetches; needs no docker.
     pub download: bool,
+    /// Executes on the Defuse Outlayer worker beside this one
+    /// (`EXECUTION_ENGINE=defuse-worker`): the coordinator then hands it only the
+    /// jobs of `DEFUSE_WORKER_PROJECTS`.
+    pub defuse_worker: bool,
 }
 
 impl WorkerCapabilities {
@@ -160,6 +175,9 @@ impl WorkerCapabilities {
         }
         if self.download {
             result.push("download".to_string());
+        }
+        if self.execution && self.defuse_worker {
+            result.push("defuse-worker".to_string());
         }
         result
     }
@@ -313,6 +331,13 @@ impl Config {
             .unwrap_or_else(|_| "execution_requested".to_string());
         let event_filter_min_version = env::var("EVENT_FILTER_MIN_VERSION").ok();
 
+        let execution_engine = match env::var("EXECUTION_ENGINE").unwrap_or_default().to_lowercase().as_str() {
+            "" | "outlayer" => ExecutionEngine::Outlayer,
+            "defuse-worker" => ExecutionEngine::DefuseWorker,
+            other => anyhow::bail!("Invalid EXECUTION_ENGINE: '{}'. Must be 'outlayer' or 'defuse-worker'", other),
+        };
+        let defuse_worker_url = env::var("DEFUSE_WORKER_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+
         // Compilation mode: docker (default) or native (bubblewrap)
         let compilation_mode = env::var("COMPILATION_MODE")
             .unwrap_or_else(|_| "docker".to_string())
@@ -454,6 +479,7 @@ impl Config {
             compilation: compilation_enabled,
             execution: execution_enabled,
             download: download_enabled,
+            defuse_worker: execution_engine == ExecutionEngine::DefuseWorker,
         };
 
         // FastFS receiver contract (optional)
@@ -571,6 +597,8 @@ impl Config {
             event_filter_function_name,
             event_filter_min_version,
             compilation_mode,
+            execution_engine,
+            defuse_worker_url,
             docker_image,
             compile_timeout_seconds,
             compile_memory_limit_mb,
@@ -749,7 +777,7 @@ mod tests {
 
     fn with_roles(execution: bool, compilation: bool, download: bool) -> Config {
         let mut c = create_test_config();
-        c.capabilities = WorkerCapabilities { compilation, execution, download };
+        c.capabilities = WorkerCapabilities { compilation, execution, download, defuse_worker: false };
         c
     }
 
@@ -863,6 +891,8 @@ mod tests {
             event_filter_function_name: "execution_requested".to_string(),
             event_filter_min_version: None,
             compilation_mode: "docker".to_string(),
+            execution_engine: ExecutionEngine::Outlayer,
+            defuse_worker_url: String::new(),
             docker_image: "rust:1.75".to_string(),
             compile_timeout_seconds: 300,
             compile_memory_limit_mb: 2048,
@@ -887,6 +917,7 @@ mod tests {
                 compilation: true,
                 execution: true,
                 download: false,
+                defuse_worker: false,
             },
             fastfs_receiver: None,
             fastfs_sender_signer: None,
