@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+# The Defuse Outlayer worker, built from source at a tag, for the `outlayer-core`
+# service beside our worker (docker-compose.phala.yml, EXECUTION_ENGINE=defuse-worker).
+#
+# Their own image is built with nix (dockerTools.buildLayeredImage) and is not
+# public, so this builds the same binary from the same tag in our alpine toolchain:
+# their release profile applies (LTO, panic=abort, stripped). The source is read
+# from the private mirror over SSH: `docker buildx build --ssh default`.
+#
+#   docker buildx build --ssh default -f docker/Dockerfile.outlayer-core \
+#     --build-arg UPSTREAM_REF=worker/v0.8.1 -t outlayer-core:worker-v0.8.1 .
+
+ARG UPSTREAM_URL=ssh://git@github.com/zavodil/defuse-outlayer-upstream.git
+ARG UPSTREAM_REF=worker/v0.8.1
+
+# Stage 1: build
+FROM rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
+ARG UPSTREAM_URL
+ARG UPSTREAM_REF
+
+# protobuf-dev: protoc for their proto crate's build script.
+RUN apk add --no-cache \
+    musl-dev \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static \
+    git \
+    cmake \
+    make \
+    build-base \
+    clang \
+    perl \
+    openssh-client \
+    protobuf-dev
+
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN mkdir -p /root/.ssh && \
+    echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > /root/.ssh/known_hosts
+
+WORKDIR /build
+RUN --mount=type=ssh git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_URL" upstream
+WORKDIR /build/upstream
+# Their workspace pins its own toolchain file; the builder image is that toolchain.
+RUN rm -f rust-toolchain rust-toolchain.toml
+# --locked: their Cargo.lock is the build; their `defuse-*` dependencies come from
+# the public near/intents repository.
+RUN --mount=type=ssh cargo build --release --locked -p defuse-outlayer-worker
+
+# Stage 2: runtime
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates libgcc
+COPY --from=builder /build/upstream/target/release/outlayer-worker /usr/local/bin/outlayer-worker
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+EXPOSE 50051
+# Non-root, as their image.
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/outlayer-worker"]

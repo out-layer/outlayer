@@ -31,11 +31,18 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
+      # The worker's `defuse-outlayer-proto` dependency is read from the private
+      # mirror of the Defuse Outlayer repository over SSH (read-only deploy key).
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.UPSTREAM_DEPLOY_KEY }}
+
       - id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.worker-phala
+          ssh: default
           push: true
           tags: |
             ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-worker:${{ github.ref_name }}
@@ -89,8 +96,50 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
 
+  # The Defuse Outlayer worker at the pinned tag, from the private mirror: the
+  # `outlayer-core` service beside our worker.
+  build-outlayer-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.UPSTREAM_DEPLOY_KEY }}
+
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.outlayer-core
+          ssh: default
+          push: true
+          tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-core:${{ github.ref_name }}
+            ${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-core:latest
+          platforms: linux/amd64
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: "docker.io/${{ vars.DOCKERHUB_USERNAME }}/near-outlayer-core"
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+        env:
+          DOCKER_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
   release:
-    needs: [build-worker, build-keystore]
+    needs: [build-worker, build-keystore, build-outlayer-core]
     runs-on: ubuntu-latest
     steps:
       - uses: softprops/action-gh-release@v3
@@ -102,6 +151,7 @@ jobs:
             |-------|--------|--------|
             | worker | `${{ needs.build-worker.outputs.digest }}` | [Sigstore](https://search.sigstore.dev/?hash=${{ needs.build-worker.outputs.digest }}) |
             | keystore | `${{ needs.build-keystore.outputs.digest }}` | [Sigstore](https://search.sigstore.dev/?hash=${{ needs.build-keystore.outputs.digest }}) |
+            | outlayer-core (Defuse worker, worker/v0.8.1) | `${{ needs.build-outlayer-core.outputs.digest }}` | [Sigstore](https://search.sigstore.dev/?hash=${{ needs.build-outlayer-core.outputs.digest }}) |
 
             ### Verification
             ```bash
