@@ -94,6 +94,14 @@ services:
     image: ${DOCKER_IMAGE_OUTLAYER_CORE}
     container_name: outlayer-core
     restart: on-failure:5
+    # Caged: their code and every guest run here. No capabilities, nothing writable but /tmp, and
+    # no /var/run/dstack.sock — the socket hands out the CVM's KMS-derived keys and TDX quotes.
+    user: "65532:65532"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
     environment:
       # Their executor logs the first 4 KiB of a failed guest's stdin at WARN, and
       # on this engine stdin is the envelope: the run's secrets and call token.
