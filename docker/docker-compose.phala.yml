@@ -102,11 +102,14 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 256
+    # A core dump would hold every concurrent run's stdin.
+    ulimits: { core: 0 }
+    cpus: 1.5
     environment:
-      # Their executor logs the first 4 KiB of a failed guest's stdin at WARN, and
-      # on this engine stdin is the envelope: the run's secrets and call token.
-      # The executor crate is held to ERROR whatever the operator's filter says.
-      OUTLAYER__LOG: ${OUTLAYER_CORE_LOG:-info},defuse_outlayer_executor=error
+      # Their executor logs the first 4 KiB of a failed guest's stdin and stdout at WARN (and
+      # every run at TRACE), and on this engine stdin is the envelope: the run's secrets and call
+      # token. The executor crate is silenced whatever the operator's filter says.
+      OUTLAYER__LOG: ${OUTLAYER_CORE_LOG:-info},defuse_outlayer_executor=off
       OUTLAYER__SEED: ${OUTLAYER_CORE_SEED}
       OUTLAYER__SERVICE__ALLOW_UNDEPLOYED_CODE: "true"
       OUTLAYER__TELEMETRY__ENABLED: "false"
