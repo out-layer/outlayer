@@ -27,8 +27,11 @@ phala deploy --name outlayer-testnet-worker --compose docker-compose.phala.yml -
 # A worker on the Defuse engine runs with the `outlayer-core` sidecar: start the
 # compose with `--profile defuse-worker`, and set in its env file
 #   EXECUTION_ENGINE=defuse-worker  COMPILATION_ENABLED=false  DOWNLOAD_ENABLED=false
-#   DOCKER_IMAGE_OUTLAYER_CORE=docker.io/outlayer/near-outlayer-core@sha256:...  (write the
-#     digest literally into the compose for a deployment: the attestation measures the text)
+#   DOCKER_IMAGE_OUTLAYER_CORE=<private registry>/outlayer-core@sha256:...  (Defuse's code is
+#     never in a public registry; write the digest literally into the compose for a
+#     deployment: the attestation measures the text)
+#   DSTACK_DOCKER_REGISTRY / DSTACK_DOCKER_USERNAME / DSTACK_DOCKER_PASSWORD  (the CVM logs in
+#     with these before it pulls; encrypted env only, never passed into a container)
 #   OUTLAYER_CORE_SEED=<32 random bytes, hex>   (test-mode seed; signs nothing of value)
 #   OUTLAYER_CORE_WASM_MEMORY_BYTES / OUTLAYER_CORE_MEMORY_BUDGET_BYTES / OUTLAYER_CORE_MEM_LIMIT
 #     (the fleet's memory tier; concurrency = budget / per-run cost)
