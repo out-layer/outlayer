@@ -20,6 +20,10 @@ use crate::tasks::statement::DeviceStatement;
 const OWNER: &str = "owner.testnet";
 const AGENT: &str = "agent.testnet";
 const PROJECT: &str = "p0000000000000001";
+/// A second owner whose row the agent's call may name beside the owner's.
+const OFFICER: &str = "officer.testnet";
+/// The officer's task key, as the keystore answers it beside their row.
+const OFFICER_KEY: [u8; 32] = [9u8; 32];
 /// The build the world's runs are of, and one more of the same project.
 const BUILD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const OTHER_BUILD: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -391,10 +395,11 @@ impl World {
 
     fn host(&self, run: Run<'_>) -> (TasksHostState, RunReport) {
         let report = RunReport::default();
-        // Another project's runs hold another key.
-        let key = match run.project_uuid == PROJECT {
-            true => self.project_key,
-            false => [8u8; 32],
+        // Another project's runs hold another key; so does another owner's row.
+        let key = match (run.project_uuid == PROJECT, run.owner) {
+            (true, OFFICER) => OFFICER_KEY,
+            (true, _) => self.project_key,
+            (false, _) => [8u8; 32],
         };
         let clock = self.clock.clone();
         let ready = Ready {
@@ -405,6 +410,8 @@ impl World {
             operation: run.operation.map(str::to_string),
             scope: Scope { project_uuid: run.project_uuid.to_string(), owner: run.owner.to_string() },
             profile: "probe".to_string(),
+            others: Vec::new(),
+            named_rows: Vec::new(),
             caller: run.caller.to_string(),
             consent: run.consent,
             recipient: RECIPIENT.to_string(),
@@ -414,6 +421,37 @@ impl World {
             now: Box::new(move || clock.load(Ordering::SeqCst)),
         };
         let state = TasksHostState { access: Access::Ready(Box::new(ready)), ..TasksHostState::new(None) };
+        (state, report)
+    }
+
+    /// A world with an officer too: a second owner with a device of their
+    /// own signed in and a key of their own on chain.
+    fn with_officer() -> (Self, p256::SecretKey) {
+        let world = Self::new();
+        let officer_device = device_key();
+        world.store.devices.lock().unwrap().push(signed("d2", OFFICER, &officer_device.public_key(), NOW + 86_400 * 7, &wallet(2), RECIPIENT));
+        let world = Self {
+            chain: Arc::new(FakeChain::holding(&[(OWNER, &near_key(&wallet(1))), (OFFICER, &near_key(&wallet(2)))])),
+            ..world
+        };
+        (world, officer_device)
+    }
+
+    /// The agent's run that named the owner's row and the officer's, each
+    /// opened by the keystore with its own task key.
+    fn agent_naming_the_officer(&self, id: &str) -> (TasksHostState, RunReport) {
+        let (mut state, report) = self.agent_with(id);
+        if let Access::Ready(ready) = &mut state.access {
+            ready.others.push(RowGrant {
+                owner: OFFICER.to_string(),
+                profile: "probe".to_string(),
+                grant: TaskGrant::new(zeroize::Zeroizing::new(OFFICER_KEY), true),
+            });
+            ready.named_rows = vec![
+                client::NamedRow { account_id: OWNER.to_string(), profile: "probe".to_string() },
+                client::NamedRow { account_id: OFFICER.to_string(), profile: "probe".to_string() },
+            ];
+        }
         (state, report)
     }
 
@@ -1226,6 +1264,7 @@ fn a_run_that_may_not_use_tasks_is_told_why_by_every_call() {
         operation: None,
         owner: with_row.then(|| OWNER.to_string()),
         profile: with_row.then(|| "probe".to_string()),
+        other_rows: Vec::new(),
         caller: Some(AGENT.to_string()),
         predecessor: Some(AGENT.to_string()),
         payment_key_nonce: Some(1),
@@ -1260,6 +1299,7 @@ fn a_run_a_contract_relayed_uses_no_tasks_whoever_signed_it() {
         operation: None,
         owner: Some(OWNER.to_string()),
         profile: Some("probe".to_string()),
+        other_rows: Vec::new(),
         caller: Some(signer.to_string()),
         predecessor: called.map(str::to_string),
         payment_key_nonce: None,
@@ -2238,6 +2278,7 @@ fn the_voucher_the_store_is_told_is_the_consent_that_is_sealed() {
             compute_limit_usd: "2500".into(),
             operation: "confirm".into(),
             build: BUILD.into(),
+            secrets_refs: Vec::new(),
         })
     );
     let keys = TaskKeys::derive(&world.project_key, &opened.id);
@@ -2412,4 +2453,87 @@ fn unlock_writes_a_notices_copy_as_any_tasks() {
     assert_eq!(world.owner("run-u").0.unlock().unwrap(), 1);
     assert!(world.store.row(&opened.id).copies.contains_key("d1"));
     world.page_reads(&opened.id);
+}
+
+/// A run that named the owner's row and an officer's opens a task for
+/// either. The officer's task is the officer's — sealed for their device,
+/// approved by their wallet — and is carried out by the preparer's run that
+/// names the officer's row first, as the platform starts it.
+#[test]
+fn a_task_opened_for_another_rows_owner_is_that_owners_and_the_preparer_still_carries_it_out() {
+    let (world, officer_device) = World::with_officer();
+    let (mut agent, _) = world.agent_naming_the_officer("run-a");
+
+    let stranger = agent.open_for("stranger.testnet".to_string(), email()).unwrap_err();
+    assert_eq!(stranger.reason, wit::Reason::NotGrantedByName);
+
+    let opened = agent.open_for(OFFICER.to_string(), email()).unwrap();
+    let row = world.store.row(&opened.id);
+    assert_eq!(row.scope.owner.as_str(), OFFICER, "the task is the officer's");
+    assert!(row.copies.contains_key("d2") && !row.copies.contains_key("d1"), "sealed for the officer's device, not the owner's");
+    assert_eq!(
+        row.task.voucher.as_ref().unwrap().secrets_refs,
+        vec![
+            client::NamedRow { account_id: OWNER.to_string(), profile: "probe".to_string() },
+            client::NamedRow { account_id: OFFICER.to_string(), profile: "probe".to_string() },
+        ],
+        "the run that carries it out names every row the preparing run named"
+    );
+    // The officer's page reads it with the officer's device.
+    let wrapped = row.copies.get("d2").unwrap();
+    let key = crypto::open_from(&officer_device, Purpose::DeviceCopy, &opened.id, wrapped).expect("the officer's device opens its copy");
+    let key: [u8; 32] = key.as_slice().try_into().unwrap();
+    let document = crypto::decrypt_content(&key, &opened.id, row.content.as_deref().unwrap()).unwrap();
+    let shown = Envelope::from_bytes(&document).unwrap();
+    assert_eq!((shown.owner.as_str(), shown.preparer.as_str()), (OFFICER, AGENT));
+    let hash = envelope::hash(&document);
+    assert_eq!(hash, opened.hash);
+
+    // The first row is the run's row again: the next task is the owner's,
+    // `open-for` of the owner is `open`, and the preparer reads all three.
+    let owners = agent.open(email()).unwrap();
+    assert_eq!(world.store.row(&owners.id).scope.owner.as_str(), OWNER);
+    let same = agent.open_for(OWNER.to_string(), email()).unwrap();
+    assert_eq!(world.store.row(&same.id).scope.owner.as_str(), OWNER);
+    assert_eq!(agent.status(opened.id.clone()).unwrap().state, wit::TaskState::Open);
+    let mut listed: Vec<String> = agent.mine().unwrap().into_iter().map(|t| t.id).collect();
+    listed.sort();
+    let mut expected = vec![opened.id.clone(), owners.id.clone(), same.id.clone()];
+    expected.sort();
+    assert_eq!(listed, expected);
+
+    // The officer signs; the platform starts the preparer's run with the
+    // officer's row first, and that run carries the task out.
+    world.store.approve(&opened.id, "run-c");
+    let at = world.clock.load(Ordering::SeqCst);
+    let approval = approved(OFFICER, &opened.id, &hash, None, None, at, &wallet(2), RECIPIENT);
+    let approval = wit::Approval { at: approval.at, public_key: approval.public_key, signature: approval.signature, nonce: approval.nonce };
+    let (mut carrier, _) = world.host(Run { id: "run-c", owner: OFFICER, ..world.agent_run() });
+    let answer = confirm(&mut carrier, &opened, &approval).unwrap();
+    assert_eq!((answer.operation.as_str(), answer.preparer.as_str()), ("confirm", AGENT));
+
+    // A run of the preparer's that names only the owner's row does not hold
+    // the officer's task; one that names the officer's row beside it reads
+    // and withdraws another such task.
+    let (mut other, _) = world.agent_naming_the_officer("run-d");
+    let second = other.open_for(OFFICER.to_string(), email()).unwrap();
+    assert_eq!(world.agent("run-e").status(second.id.clone()).unwrap_err().reason, wit::Reason::NotFound);
+    let (mut again, _) = world.agent_naming_the_officer("run-f");
+    assert_eq!(again.status(second.id.clone()).unwrap().state, wit::TaskState::Open);
+    again.cancel(second.id.clone()).unwrap();
+    assert_eq!(world.store.row(&second.id).state, State::Cancelled);
+
+    // A run that answered a task of the owner's opens the owner's next turn
+    // in that conversation, and a task for the officer in one of its own: a
+    // conversation is one owner's.
+    let (mut preparer, _) = world.agent_naming_the_officer("run-g");
+    let owners_task = preparer.open(email()).unwrap();
+    let approval = world.approve(&owners_task, "run-h");
+    let (mut carrier, _) = world.agent_naming_the_officer("run-h");
+    confirm(&mut carrier, &owners_task, &approval).unwrap();
+    let turn = carrier.open(email()).unwrap();
+    assert_eq!(turn.thread, owners_task.id, "the owner's next turn");
+    let officers = carrier.open_for(OFFICER.to_string(), email()).unwrap();
+    assert_eq!(officers.thread, officers.id, "the officer's task starts a conversation of its own");
+    assert_eq!(world.store.row(&officers.id).scope.owner.as_str(), OFFICER);
 }

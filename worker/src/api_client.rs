@@ -76,6 +76,11 @@ pub struct ExecutionRequest {
     pub input_data: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets_ref: Option<SecretsReference>,
+    /// Every row the call named, in order, when it named more than one;
+    /// `secrets_ref` is then its first. A coordinator that knows only one
+    /// row sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_refs: Option<Vec<SecretsReference>>,
     #[serde(default)]
     pub response_format: ResponseFormat,
     #[serde(default)]

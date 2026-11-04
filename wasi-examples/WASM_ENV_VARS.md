@@ -80,6 +80,24 @@ See [OutLayer SDK](./WASI_TUTORIAL.md#outlayer-sdk) for details.
 
 **NOT SET** when a `WasmUrl` source runs directly (without a project).
 
+## Secret Rows
+
+| Variable | Description | When Set |
+|----------|-------------|----------|
+| `OUTLAYER_SECRETS_ROWS` | The secret rows the call named and the keystore opened, as JSON, in the order named: `[{"owner":"compliance.acme.near","profile":"default","keys":["NEARAI_API_KEY","COMPLIANCE_CONFIG"]}]` — each row's owner, profile and the **names** of the variables it supplied, sorted. Never a value. | Only when a row opened |
+| `OUTLAYER_SECRETS_OWNER` | The first row's owner | Only when a row opened |
+| `OUTLAYER_SECRETS_PROFILE` | The first row's profile | Only when a row opened |
+
+A row is stored only by its owner's account, so this is the fact a row cannot
+state about itself: a component that trusts a variable checks which row
+supplied it, and takes that row's owner as who the configuration belongs to.
+A row named in the call but admitted by no rule refuses the run, so a row
+listed here is one that opened for this caller. The author's credential from
+the manifest (`author_secrets`) is the artefact's, not the call's, and is not
+listed.
+
+**NOT SET** — absent, never blank — when the call named no row.
+
 ```rust
 // Safe pattern for project vars
 fn get_project_info() -> Option<(String, String)> {
@@ -223,6 +241,9 @@ fn main() {
 | `OUTLAYER_PROJECT_OWNER` | If project | If project | **Yes** |
 | `OUTLAYER_PROJECT_NAME` | If project | If project | **Yes** |
 | `OUTLAYER_PROJECT_UUID` | If project | If project | **Yes** |
+| `OUTLAYER_SECRETS_ROWS` | If a row opened | If a row opened | No |
+| `OUTLAYER_SECRETS_OWNER` | If a row opened | If a row opened | No |
+| `OUTLAYER_SECRETS_PROFILE` | If a row opened | If a row opened | No |
 | `NEAR_PAYMENT_YOCTO` | Value | `"0"` | No |
 | `ATTACHED_USD` | Value | `"0"` | No |
 | `USD_PAYMENT` | `"0"` | Value | No |

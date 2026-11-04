@@ -103,6 +103,18 @@
 #        retires the first, which is told session_replaced
 #   V5   a session's token in another browser lists and opens nothing
 #   E9   a list that is whole says so: `more` is false
+#   R1   the agent names two rows (`secrets_refs`): the task opened `for` the
+#        second owner is theirs — their inbox lists it, the first owner's does
+#        not (OWNER_B, whose empty row the suite stores and deletes)
+#   R2   the second owner approves with their wallet; the preparer's run is
+#        started with both rows, the task's own first, and carries it out;
+#        the agent reads done under both rows; the attestation names both
+#   R3   a task for an account that owns none of the rows: not_granted_by_name
+#   R4   a variable the two rows set differently refuses the run naming it;
+#        rows that agree open together
+#   R5   five rows, as many as a call may name, open together and the task
+#        is the second owner's
+#   R6   six rows are refused at the door (400, "at most")
 #   A2   another owner's session: the first owner's task by its id is
 #        task_not_found, and is in no list of theirs
 #   A5   a second agent of the same owner reads, cancels and deletes nothing
@@ -173,7 +185,10 @@
 # A row whose fixture the environment does not supply is a SKIP:
 #   OWNER_B              a second owner, e.g. outlayer-bob.testnet; its key
 #                        file is OWNER_B_KEY_FILE, or the one in
-#                        ~/.near-credentials/<network>/ (A2)
+#                        ~/.near-credentials/<network>/ (A2, R1–R6: the suite
+#                        stores five rows of theirs for the probe, `tasks-probe`,
+#                        `tasks-probe-clash` and `tasks-probe-r3` to `-r5`, and
+#                        deletes them)
 #   AGENT2_PAYMENT_KEY, AGENT2_ACCOUNT   a second agent wallet (A5, L2, L1, N4)
 #   OWNER_PAYMENT_KEY    a payment key of the owner's own account (A7, L1: it
 #                        prepares the twentieth task, and the owner approves it)
@@ -329,7 +344,11 @@ https_as() {
   key="${!name:?$name is not set: a payment key}"
   key=${key//\\/\\\\}; key=${key//\"/\\\"}
   body=$(jq -nc --argjson i "$input" '{input:$i}')
-  if [[ -n "$ref" ]]; then
+  if [[ "$ref" == *,* ]]; then
+    # Several rows, "owner/profile,owner/profile": `secrets_refs`, in that order.
+    body=$(jq -c --arg refs "$ref" \
+      '. + {secrets_refs: ($refs | split(",") | map({account_id: (split("/")[0]), profile: (split("/")[1])}))}' <<<"$body")
+  elif [[ -n "$ref" ]]; then
     body=$(jq -c --arg o "${ref%%/*}" --arg pr "${ref#*/}" '. + {secrets_ref:{profile:$pr, account_id:$o}}' <<<"$body")
   fi
   RUN_RAW=""
@@ -400,6 +419,35 @@ fill() {
   done
   [[ "$opened" == "$2" ]]
 }
+# store_as <account> <key-file> <project> <profile> <secrets-json> <access> —
+# the CLI signs as that account, from a home of its own under STATE_DIR
+# holding a credentials file built from the account's key file. The key is
+# copied, never printed. True when the row is final on chain.
+store_as() {
+  local account=$1 key_file=$2 home="$STATE_DIR/home-$1" before out i after
+  mkdir -p "$home/$NETWORK" && chmod 700 "$home"
+  jq --arg c "$CONTRACT_ID" '{account_id, public_key, private_key, contract_id:$c, auth_type:"near_key"}' "$key_file" \
+    > "$home/$NETWORK/credentials.json" && chmod 600 "$home/$NETWORK/credentials.json"
+  before=$(jq -r '.updated_at // 0' <<<"$(row_of_owner "$3" "$4" "$account")")
+  out=$(OUTLAYER_HOME="$home" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set "$5" --project "$3" --profile "$4" --access "$6" 2>&1) \
+    || { note "could not store $3/$4 as $account: $(near_why "$out")"; return 1; }
+  for i in $(seq 1 30); do
+    after=$(jq -r '.updated_at // 0' <<<"$(row_of_owner "$3" "$4" "$account")")
+    [[ "$after" != "$before" && "$after" != "0" ]] && { note "stored $3/$4 as $account ($6)"; return 0; }
+    sleep 2
+  done
+  note "$3/$4 of $account never became final"; return 1
+}
+# delete_row_as <account> <project> <profile> — as `delete_row`, signed by
+# that account's key in ~/.near-credentials.
+delete_row_as() {
+  near --quiet contract call-function as-transaction "$CONTRACT_ID" delete_secrets \
+    json-args "$(jq -nc --argjson a "$(accessor_json "$2")" --arg pr "$3" '{accessor:$a, profile:$pr}')" \
+    prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' \
+    sign-as "$1" network-config "$NETWORK" sign-with-legacy-keychain send >/dev/null 2>&1
+}
+B_ROWS=""
+
 # status_of <task> — `task_status` by the key that prepared it: the agent's,
 # or the one STATUS_KEY names (a task is its preparer's to read).
 STATUS_KEY=AGENT_PAYMENT_KEY
@@ -599,6 +647,8 @@ cleanup() {
   for device in "${SIGNED_IN[@]}"; do
     owner sign-out "$device" >/dev/null 2>&1
   done
+  local b_profile
+  for b_profile in $B_ROWS; do delete_row_as "$OWNER_B" "$TASKS_PROBE" "$b_profile" || true; done
   rm -rf "$STATE_DIR"
   delete_row "$TASKS_PROBE" "$PROFILE" >/dev/null 2>&1 || true
 }
@@ -1592,6 +1642,135 @@ if want A2; then
     fi
   else
     fail "A2 prepare: error='$(said .error | head -c 200)'"
+  fi
+fi
+
+# ── several rows: a task for another row's owner ────────────────────────────
+if want R1; then
+  log "R1 the agent names two rows; the task is the second owner's"
+  OWNER_B="${OWNER_B:-}"
+  OWNER_B_KEY_FILE="${OWNER_B_KEY_FILE:-$HOME/.near-credentials/$NETWORK/$OWNER_B.json}"
+  B_REF="$PARENT/$PROFILE,$OWNER_B/$PROFILE"
+  if lacks R1 OWNER_B; then :
+  elif [[ "$OWNER_B" == "$PARENT" ]]; then
+    skip "R1 needs a second owner, and OWNER_B is the owner under test"
+  elif [[ ! -r "$OWNER_B_KEY_FILE" ]]; then
+    skip "R1 needs the key file of $OWNER_B (OWNER_B_KEY_FILE, or ~/.near-credentials/$NETWORK/): its row is stored and its approval signed with it"
+  elif ! store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$PROFILE" '{}' "$(whitelist "$OWNER_B" "$AGENT_ACCOUNT")"; then
+    fail "R1 the second owner's row could not be stored"
+  else
+    B_ROWS="$PROFILE"
+    # An empty row: the owner's consent to be asked, and nothing in it.
+    agent "$(jq -nc --arg o "$OWNER_B" '{operation:"prepare", title:"Escalated to the officer", body:"Rank these candidates", for:$o}')" "$B_REF"
+    B_TASK=$(said .output.task_id); B_HASH=$(said .output.task_hash)
+    if [[ "$(said .output.status)" == "awaiting_owner" && -n "$B_TASK" ]]; then
+      pass "R1 awaiting_owner, task $B_TASK, opened for $OWNER_B"
+      owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" sign-in other
+      if [[ "$(own .status)" == "200" ]]; then
+        owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" list other waiting
+        B_ROW=$(jq -c --arg t "$B_TASK" '.tasks[]? | select(.id == $t)' <<<"$OWN" 2>/dev/null)
+        if [[ -n "$B_ROW" && "$(jq -r .read.hash <<<"$B_ROW")" == "$B_HASH" ]]; then
+          pass "R1 $OWNER_B reads it in their own inbox; the hash is the run's"
+          [[ "$(jq -r .read.envelope.owner <<<"$B_ROW")" == "$OWNER_B" && "$(jq -r .read.envelope.preparer <<<"$B_ROW")" == "$AGENT_ACCOUNT" ]] \
+            && pass "R1 addressed to $OWNER_B, prepared by the agent" \
+            || fail "R1 owner/preparer: $(jq -r .read.envelope.owner <<<"$B_ROW") / $(jq -r .read.envelope.preparer <<<"$B_ROW")"
+        else
+          fail "R1 $OWNER_B's inbox does not list the task: $(own .failed | head -c 160) $(jq -r '.read.hash // "no hash"' <<<"${B_ROW:-{\}}")"
+        fi
+        owner list a waiting
+        [[ "$(jq -r --arg t "$B_TASK" '[.tasks[]? | select(.id == $t)] | length' <<<"$OWN")" == "0" ]] \
+          && pass "R1 and $PARENT's inbox holds nothing of it" \
+          || fail "R1 the task is listed to $PARENT, whose task it is not"
+
+        log "R2 the second owner approves; the preparer's run names their row first"
+        owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" approve "$B_TASK" "$B_HASH" - - other
+        if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" && -n "$(own .run)" ]]; then
+          B_RUN=$(own .run)
+          B_ENDED=""
+          for i in $(seq 1 24); do
+            https_as AGENT_PAYMENT_KEY "$B_REF" "$(jq -nc --arg t "$B_TASK" '{operation:"task_status", task_id:$t}')"
+            B_ENDED=$(said .output.state)
+            case "$B_ENDED" in open|approved|answering|"") sleep 5 ;; *) break ;; esac
+          done
+          if [[ "$B_ENDED" == "done" && "$(said .output.run)" == "$B_RUN" && "$(said .output.result.prepared_by)" == "$AGENT_ACCOUNT" ]]; then
+            pass "R2 done: the run $B_RUN carried it out and the agent reads the result under both rows"
+          else
+            fail "R2 the task ended '$B_ENDED' (run '$(said .output.run)', failure '$(said .output.failure_reason)'): $(said .output | head -c 200)"
+          fi
+          ATT=$(attestation_of_run "$B_RUN")
+          if [[ -n "$ATT" ]]; then
+            [[ "$(jq -r '.secrets_ref // ""' <<<"$ATT")" == "$OWNER_B/$PROFILE,$PARENT/$PROFILE" ]] \
+              && pass "R2 the run's attestation names both rows, the task's own first" \
+              || fail "R2 the attested secrets_ref is '$(jq -r .secrets_ref <<<"$ATT")'"
+          else
+            fail "R2 no attestation for the run $B_RUN"
+          fi
+        else
+          fail "R2 $OWNER_B's approval answered $(own .status) state='$(own .state)' reason='$(own .reason)' $(own .said)"
+        fi
+        owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" sign-out other
+      else
+        fail "R1 $OWNER_B could not sign in: $(own .status) $(own .failed | head -c 160)"
+      fi
+    else
+      fail "R1 prepare for $OWNER_B answered success=$(said .success) error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
+    fi
+
+    log "R3 a task for an account that owns none of the rows"
+    agent '{"operation":"prepare","title":"For nobody","for":"nobody-at-all.testnet"}' "$B_REF"
+    expect_refusal R3 not_granted_by_name
+
+    log "R4 a variable the two rows set differently"
+    CLASH="$PROFILE-clash"
+    if store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$CLASH" "$(jq -nc '{TASKS_PROBE_POLICY:"{\"v\":2}"}')" "$(whitelist "$OWNER_B" "$AGENT_ACCOUNT")"; then
+      B_ROWS="$B_ROWS $CLASH"
+      agent '{"operation":"prepare","title":"Two policies"}' "$PARENT/$PROFILE,$OWNER_B/$CLASH"
+      if [[ "$RUN_OK" != true && "$(said .error)$RUN_ERR" == *"two of the secret rows"* ]]; then
+        pass "R4 refused, naming the variable: $(head -c 120 <<<"$(said .error)$RUN_ERR")"
+      else
+        fail "R4 a run with TASKS_PROBE_POLICY from two rows: success=$(said .success) error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
+      fi
+      # The same value in two rows is one value.
+      agent '{"operation":"tasks"}' "$PARENT/$PROFILE,$OWNER_B/$PROFILE"
+      [[ "$(said .success)" == "true" ]] \
+        && pass "R4 and two rows that agree, or hold nothing, open together" \
+        || fail "R4 the empty row beside the owner's: success=$(said .success) error='$(said .error | head -c 160)'"
+    else
+      fail "R4 the clashing row could not be stored"
+    fi
+
+    log "R5 as many rows as a call may name, asked of the keystore together"
+    # Five: the owner's, the second owner's, and three more empty rows of the
+    # second owner's — each a keystore request of its own, sent beside the
+    # first row's.
+    R5_REF="$PARENT/$PROFILE,$OWNER_B/$PROFILE"
+    R5_STORED=true
+    for n in 3 4 5; do
+      if store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$PROFILE-r$n" '{}' "$(whitelist "$OWNER_B" "$AGENT_ACCOUNT")"; then
+        B_ROWS="$B_ROWS $PROFILE-r$n"; R5_REF="$R5_REF,$OWNER_B/$PROFILE-r$n"
+      else
+        R5_STORED=false; break
+      fi
+    done
+    if [[ "$R5_STORED" == true ]]; then
+      agent "$(jq -nc --arg o "$OWNER_B" '{operation:"prepare", title:"Five rows", for:$o}')" "$R5_REF"
+      R5_TASK=$(said .output.task_id)
+      if [[ "$(said .output.status)" == "awaiting_owner" && -n "$R5_TASK" ]]; then
+        pass "R5 five rows opened together; the task is $OWNER_B's"
+        https_as AGENT_PAYMENT_KEY "$R5_REF" "$(jq -nc --arg t "$R5_TASK" '{operation:"task_cancel", task_id:$t}')"
+      else
+        fail "R5 five rows: success=$(said .success) error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
+      fi
+      log "R6 one row more than a call may name is refused at the door"
+      https_as AGENT_PAYMENT_KEY "$R5_REF,$OWNER_B/$PROFILE-r6" '{"operation":"tasks"}'
+      if [[ "$HTTP_CODE" == 400 && "$RUN_ERR" == *"at most"* ]]; then
+        pass "R6 400: $(head -c 120 <<<"$RUN_ERR")"
+      else
+        fail "R6 six rows answered HTTP $HTTP_CODE: $(head -c 200 <<<"$RUN_ERR")"
+      fi
+    else
+      fail "R5 the second owner's extra rows could not be stored"
+    fi
   fi
 fi
 

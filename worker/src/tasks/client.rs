@@ -94,6 +94,18 @@ pub struct Voucher {
     /// The build that made the task: the version pinned where the platform
     /// pins one.
     pub build: String,
+    /// Every secret row the preparing run named, in order, when it named
+    /// more than one: the run that carries the task out names them again,
+    /// the task's own first. Empty when the run named one row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets_refs: Vec<NamedRow>,
+}
+
+/// A secret row as the call names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NamedRow {
+    pub account_id: String,
+    pub profile: String,
 }
 
 /// A task to store.

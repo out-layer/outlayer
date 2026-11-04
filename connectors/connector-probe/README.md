@@ -74,6 +74,8 @@ with no price and no fee.
 | `burn` | $0.01 | compute costs something: `{"operation":"burn","rounds":50}` burns instructions on demand |
 | `fetch` | $0.015 | the declared host (`rpc.testnet.fastnear.com`) is reachable |
 | `forbidden_fetch` | $0.015 | an undeclared host (`example.com`) is NOT |
+| `timed_fetch_within` | $0.015 | a host whose manifest entry names its own request time (`{"host": "httpbin.org", "timeout_secs": 8}`): a 4 s answer completes |
+| `timed_fetch_beyond` | $0.015 | and a 10 s answer from it times out at the entry's 8 s, not at the 30 s a bare entry has — passes when it fails, like `forbidden_fetch` |
 | `vrf` | $0.01, share 0 | `near:vrf`: randomness with the alpha it is bound to, and the public key beside it. A key that cannot be read is reported, not fatal — the alpha is what the proof rests on. Share 0 because what it proves is not about money |
 | `refund` | $0.01, share 70% | `near:payment`: the module hands part of the fee back, and over-refunding is refused — `ok` stays true either way, because a refused refund is still a well-formed answer, and `refund_error` carries the outcome. The share is deliberately NOT zero: a refund comes out of the AUTHOR's earnings, so with no share there would be nothing for the ledger row to show |
 | `sockets` | free | raw TCP (`1.1.1.1:80`) and a DNS lookup are refused — `wasi:http` is the only way out |

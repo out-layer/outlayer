@@ -165,13 +165,20 @@ Every outbound attempt is reported to the coordinator with whether the allowlist
 permitted it. The coordinator stores that trail and decides nothing — the
 allowlist is enforced inside the worker, where the keys are.
 
-**Each request has 30 seconds, and two that run out end the run.** A request
-that exceeds the timeout fails; the second one aborts the execution outright,
-because a guest still retrying a host that does not answer is spending paid
-time on nothing. Poll a slow venue with short requests and your own backoff,
-not with one long call. The execution limit itself is the coordinator's per
-call; a bridge that needs minutes takes a step per call and keeps its
-checkpoint in project storage.
+**Each request has 30 seconds, or the time its host's entry names, and two
+that run out end the run.** A request that exceeds its timeout fails; the
+second one aborts the execution outright, because a guest still retrying a
+host that does not answer is spending paid time on nothing. A host that
+legitimately takes longer — a model that generates for a minute — gets its
+own time in the manifest, `{"host": "cloud-api.near.ai", "timeout_secs":
+120}`, up to 180 s and never past the end of the run; that time is declared
+in the attested code, not chosen per call. The call must ask for a run long
+enough to hold it: `resource_limits.max_execution_seconds`, which is 60 when
+the call names none, so a 120 s entry on such a call is cut to what is left
+of those 60. Waiting is paid like any other second. Poll a slow
+venue with short requests and your own backoff, not with one long call. The
+execution limit itself is the coordinator's per call; a bridge that needs
+minutes takes a step per call and keeps its checkpoint in project storage.
 
 There are no raw sockets: the guest's only network path is `wasi:http`. TCP,
 UDP and name lookups are refused by the worker, so nothing can go around the

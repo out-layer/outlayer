@@ -196,6 +196,8 @@ impl Display {
 #[derive(Debug, Clone)]
 pub struct Task {
     request: raw::Request,
+    /// The owner the task is opened for, when it is not the first row's.
+    owner: Option<String>,
 }
 
 impl Task {
@@ -210,7 +212,24 @@ impl Task {
                 policy: policy.to_vec(),
                 life_seconds: 0,
             },
+            owner: None,
         }
+    }
+
+    /// Open it for `owner` instead of the first row's owner: the owner of
+    /// another secret row this run named (`secrets_refs` in the call) and the
+    /// keystore opened, admitted by name — the first of that owner's rows
+    /// when the run named several of theirs. An account that owns none of
+    /// the run's rows is refused [`Reason::NotGrantedByName`]. The task is then
+    /// that owner's — their inbox, their wallet's approval — and is still
+    /// carried out by this run's preparer on this run's consent.
+    ///
+    /// A company's officer is such an owner: a row of their own under the
+    /// project, admitting the employees whose escalations they take, and the
+    /// employee's call names the company's row and the officer's.
+    pub fn owner(mut self, owner: &str) -> Self {
+        self.owner = Some(owner.to_string());
+        self
     }
 
     /// How long the task waits, at most [`MAX_LIFE_SECS`]. Without it, that
@@ -241,7 +260,11 @@ impl Task {
     /// run with no payment key is refused [`Reason::NoPaymentKey`], except
     /// for a notice, which no run follows.
     pub fn open(self) -> Result<Opened> {
-        raw::open(&self.request).map_err(TaskError::from)
+        match self.owner.as_deref() {
+            None => raw::open(&self.request),
+            Some(owner) => raw::open_for(owner, &self.request),
+        }
+        .map_err(TaskError::from)
     }
 }
 

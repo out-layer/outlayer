@@ -103,6 +103,15 @@ impl TaskGrant {
     }
 }
 
+/// A secret row the run named beyond its first, with the task key the
+/// keystore answered beside it.
+#[derive(Debug)]
+pub struct RowGrant {
+    pub owner: String,
+    pub profile: String,
+    pub grant: TaskGrant,
+}
+
 impl std::fmt::Debug for TaskGrant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TaskGrant").field("admitted_by_name", &self.admitted_by_name).finish_non_exhaustive()
@@ -241,9 +250,14 @@ pub struct TasksRun {
     /// SHA-256 of the build that runs, hex: the measured bytes. A task names
     /// the build that made it, and is answered by that build only.
     pub build: Option<String>,
-    /// The owner and the profile of the secret row the run named.
+    /// The owner and the profile of the secret row the run named: the first,
+    /// when it named several.
     pub owner: Option<String>,
     pub profile: Option<String>,
+    /// The other rows the run named and the keystore opened, in order, each
+    /// with its own task key: a task may be opened for any of their owners
+    /// (`open-for`).
+    pub other_rows: Vec<RowGrant>,
     /// The operation the call names in its input, read by the host from the
     /// same bytes the contract priced; none when the input names none. A
     /// task is answered in the operation it names, and this is the host's
@@ -351,6 +365,7 @@ mod tests {
             operation: None,
             owner: Some("owner.testnet".to_string()),
             profile: Some("probe".to_string()),
+            other_rows: Vec::new(),
             caller: Some("agent.testnet".to_string()),
             predecessor: Some("agent.testnet".to_string()),
             payment_key_nonce: Some(1),

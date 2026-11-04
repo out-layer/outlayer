@@ -739,6 +739,18 @@ async fn worker_iteration(
     resource_limits.max_execution_seconds = resource_limits.max_execution_seconds.min(config.max_execution_seconds_cap);
     let input_data = execution_request.input_data.clone();
     let secrets_ref = execution_request.secrets_ref.clone();
+    // The rows named beyond the first: the coordinator sends the whole list
+    // beside its first, and a list that does not start with the first is
+    // read as the rows that are not it.
+    let extra_rows: Vec<api_client::SecretsReference> = execution_request
+        .secrets_refs
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| {
+            secrets_ref.as_ref().is_none_or(|first| first.profile != row.profile || first.account_id != row.account_id)
+        })
+        .collect();
     let response_format = execution_request.response_format.clone();
     let context = execution_request.context.clone();
     let user_account_id = execution_request.user_account_id.clone();
@@ -1177,6 +1189,7 @@ come from the coordinator's own flow. contract={:?} task={:?}",
                     &resource_limits,
                     &input_data,
                     secrets_ref.as_ref(),
+                    &extra_rows,
                     &response_format,
                     &context,
                     user_account_id.as_ref(),
@@ -1334,6 +1347,14 @@ pub const SYSTEM_ENV_VARS: &[&str] = &[
     "OUTLAYER_PROJECT_UUID",
     "OUTLAYER_PROJECT_NAME",
     "OUTLAYER_PROJECT_OWNER",
+    // The secret rows the call named and the keystore opened: whose they
+    // are, and which variable came from which. A row that only claims to be
+    // somebody's (an org named in a config) is told apart from one that is,
+    // by the account that could store it. No quoted word in this comment:
+    // the keystore reads this list from the source.
+    "OUTLAYER_SECRETS_ROWS",
+    "OUTLAYER_SECRETS_OWNER",
+    "OUTLAYER_SECRETS_PROFILE",
     // Custody. Written outside `merge_env_vars`, and stripped there like the
     // rest — the guest's authoritative answer is the `wallet::get_id` host
     // function, but a forged value in the environment would still mislead
@@ -1351,8 +1372,30 @@ pub const SYSTEM_ENV_VARS: &[&str] = &[
 ///
 /// For HTTPS calls, blockchain-related env vars are set to empty strings
 /// and additional HTTPS-specific vars are added (OUTLAYER_EXECUTION_TYPE, USD_PAYMENT, etc.)
+/// A secret row the call named and the keystore opened, as the guest is told
+/// of it: whose it is, and the NAMES of the variables it supplied — never a
+/// value. The guest reads it to know which row a variable came from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SecretsRow {
+    pub owner: String,
+    pub profile: String,
+    pub keys: Vec<String>,
+}
+
+impl SecretsRow {
+    /// The names a row supplied to the environment: a system name stored in
+    /// a row is stripped by `merge_env_vars` and so is not listed either —
+    /// the list says what the guest can read under the row's name.
+    pub fn new<'k>(owner: &str, profile: &str, keys: impl Iterator<Item = &'k String>) -> Self {
+        let mut keys: Vec<String> = keys.filter(|k| !SYSTEM_ENV_VARS.contains(&k.as_str())).cloned().collect();
+        keys.sort();
+        Self { owner: owner.to_string(), profile: profile.to_string(), keys }
+    }
+}
+
 fn merge_env_vars(
     user_secrets: Option<std::collections::HashMap<String, String>>,
+    secrets_rows: &[SecretsRow],
     context: &api_client::ExecutionContext,
     resource_limits: &api_client::ResourceLimits,
     request_id: u64,
@@ -1526,6 +1569,19 @@ fn merge_env_vars(
     }
     if let Some(proj_uuid) = project_uuid {
         env_vars.insert("OUTLAYER_PROJECT_UUID".to_string(), proj_uuid.clone());
+    }
+
+    // The rows the call named and the keystore opened, in the order named,
+    // each with the names of the variables it supplied. Written only when a
+    // row opened — ABSENT, not blank, otherwise: a guest asking whose
+    // configuration it holds must read "no row", never an empty owner.
+    if let Some(first) = secrets_rows.first() {
+        env_vars.insert("OUTLAYER_SECRETS_OWNER".to_string(), first.owner.clone());
+        env_vars.insert("OUTLAYER_SECRETS_PROFILE".to_string(), first.profile.clone());
+        env_vars.insert(
+            "OUTLAYER_SECRETS_ROWS".to_string(),
+            serde_json::to_string(secrets_rows).expect("three strings and a list of strings serialize"),
+        );
     }
 
     env_vars
@@ -1988,6 +2044,7 @@ async fn handle_execute_job(
     resource_limits: &api_client::ResourceLimits,
     input_data: &str,
     secrets_ref: Option<&api_client::SecretsReference>,
+    extra_rows: &[api_client::SecretsReference],
     response_format: &api_client::ResponseFormat,
     context: &api_client::ExecutionContext,
     user_account_id: Option<&String>,
@@ -2630,6 +2687,72 @@ async fn handle_execute_job(
     });
     let mut run_keys: Option<executor::RunKeys> = None;
     let mut task_grant: Option<tasks::TaskGrant> = None;
+    // Whether the row the call named exists and opened: a run that goes on
+    // with no secrets because the row was not found has no row to tell the
+    // guest of, and no row for others to join.
+    let mut first_row_opened = false;
+
+    // The rows named beyond the first, through a project only. Judged before
+    // any row is opened, so a call that will be refused makes no keystore
+    // round trip: the artefact says whether its environment may be several
+    // owners' — a module written for one row reads every variable as that
+    // owner's, and a caller's own row beside it could fill a name the
+    // owner's row lacks, a policy for one — and each row must be one the
+    // contract could hold. Their keystore requests go out beside the first
+    // row's, so the wait is one request's. Each asks its task key only: the
+    // declared signing and encryption keys come with the first row and
+    // belong to the run, not to a row; the task key is the row's, so a task
+    // may be opened for its owner (`open-for`).
+    let task_key_only = keystore_client::KeysRequest {
+        project_id: run_source.project_id,
+        keys: &[],
+        encryption_keys: &[],
+        task_key: asks_task_key,
+    };
+    let extras_decrypt = keystore_client.map(|keystore| keystore.with_keys(Some(&task_key_only)));
+    let mut extras_opening = None;
+    if !extra_rows.is_empty() {
+        if !declared_manifest.as_ref().is_some_and(|m| m.secrets_refs) {
+            let msg = "the call names several secret rows and the artefact's manifest does not declare `secrets_refs`: a module \
+                       takes its environment from one row unless it says otherwise"
+                .to_string();
+            error!("❌ {msg}");
+            report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::Custom)).await?;
+            return Ok(());
+        }
+        let (Some(secrets_ref), Some(project), Some(decrypt)) = (secrets_ref, job.project_id.as_deref(), extras_decrypt.as_ref()) else {
+            let msg = "several secret rows are named through a project, the first of them in `secrets_ref`, to a worker with a keystore".to_string();
+            error!("❌ {msg}");
+            report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::Custom)).await?;
+            return Ok(());
+        };
+        // Every row's shape first, the sender after, as for one row.
+        for secrets_ref in std::iter::once(secrets_ref).chain(extra_rows) {
+            if let Err(shape) = shared_tee_helpers::secrets_ref::well_formed_secrets_ref(&secrets_ref.profile, &secrets_ref.account_id) {
+                let msg = shape.to_string();
+                error!("❌ {}", msg);
+                report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::Custom)).await?;
+                return Ok(());
+            }
+        }
+        let caller = match proven_sender(user_account_id.map(|s| s.as_str()), &secrets_ref.account_id) {
+            Ok(sender) => sender,
+            Err(msg) => {
+                error!("❌ {}", msg);
+                report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::AccessDenied)).await?;
+                return Ok(());
+            }
+        };
+        extras_opening = Some(futures_util::future::join_all(extra_rows.iter().map(|row| {
+            info!("🔐 Decrypting secrets: profile={}, owner={}", row.profile, row.account_id);
+            decrypt.decrypt_secrets_by_project(
+                project, &row.profile, &row.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id,
+            )
+        })));
+    }
+    // The other rows' answers, in the order named, once asked beside the
+    // first row's.
+    let mut extras_opened: Vec<Result<keystore_client::RunSecrets>> = Vec::new();
 
     let user_secrets = if let (Some(secrets_ref), Some(keystore)) = (secrets_ref, keystore_client) {
         // A reference the contract could never hold is refused here, naming
@@ -2689,7 +2812,16 @@ async fn handle_execute_job(
             // already says it, and `update_access` moves it to the next build
             // without re-encrypting.
             info!("📦 Decrypting project-based secrets for project: {}", proj_id);
-            keystore.with_keys(keys_request.as_ref()).decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await
+            let first_opening = async { keystore.with_keys(keys_request.as_ref()).decrypt_secrets_by_project(proj_id, &secrets_ref.profile, &secrets_ref.account_id, caller, Some(data_id), Some(executed_wasm_sha256.as_str()), predecessor_id).await };
+            // The other rows the call named are asked beside it, not after.
+            match extras_opening.take() {
+                Some(extras) => {
+                    let (first, extras) = futures_util::future::join(first_opening, extras).await;
+                    extras_opened = extras;
+                    first
+                }
+                None => first_opening.await,
+            }
         } else {
             // Non-project execution: use code_source type for secrets
             match code_source {
@@ -2738,6 +2870,7 @@ async fn handle_execute_job(
                 match run.secrets {
                     Some(secrets) => {
                         info!("✅ Secrets decrypted successfully: {} environment variables", secrets.len());
+                        first_row_opened = true;
                         Some(secrets)
                     }
                     // The row does not exist, reported beside the declared keys:
@@ -2793,6 +2926,93 @@ async fn handle_execute_job(
         }
     } else {
         None
+    };
+
+    // What the guest is told of the row the call named: whose it is and which
+    // names it supplied. Taken here, before the author's credential joins the
+    // same map — that one is the artefact's, not the call's.
+    let mut secrets_rows: Vec<SecretsRow> = match (secrets_ref, user_secrets.as_ref(), first_row_opened) {
+        (Some(row), Some(secrets), true) => vec![SecretsRow::new(&row.account_id, &row.profile, secrets.keys())],
+        _ => Vec::new(),
+    };
+
+    // The other rows' answers join the first row's. The keystore judged each
+    // row's condition against the same proven caller; a row that does not
+    // exist refuses the run, and so does a name set differently by two rows
+    // — named by its name and never by a value — so no row shadows another.
+    let mut other_rows: Vec<tasks::RowGrant> = Vec::new();
+    let user_secrets = if extra_rows.is_empty() {
+        user_secrets
+    } else {
+        // A run with no row of its own has none for others to join.
+        let Some(mut merged) = user_secrets.filter(|_| first_row_opened) else {
+            let msg = "the first secret row this call names must exist and open before the others join it".to_string();
+            error!("❌ {msg}");
+            report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::Custom)).await?;
+            return Ok(());
+        };
+        if extras_opened.len() != extra_rows.len() {
+            let msg = format!("{} secret rows were named beyond the first and {} were asked for", extra_rows.len(), extras_opened.len());
+            error!("❌ {msg}");
+            report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::Failed)).await?;
+            return Ok(());
+        }
+        for (row, result) in extra_rows.iter().zip(std::mem::take(&mut extras_opened)) {
+            let named = format!("{}/{}", row.account_id, row.profile);
+            let secrets = match result {
+                Ok(run) => match run.secrets {
+                    Some(secrets) => {
+                        if let Some(grant) = run.task_grant {
+                            other_rows.push(tasks::RowGrant { owner: row.account_id.clone(), profile: row.profile.clone(), grant });
+                        }
+                        secrets
+                    }
+                    None => {
+                        let msg = format!("secret row {named} was named by the call and does not exist");
+                        error!("❌ {msg}");
+                        report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::AccessDenied)).await?;
+                        return Ok(());
+                    }
+                },
+                Err(e) => {
+                    let msg = if keystore_client::SecretsNotFound::is_missing(&e) {
+                        format!("secret row {named} was named by the call and does not exist")
+                    } else {
+                        format!("secret row {named}: {e}")
+                    };
+                    error!("❌ {msg}");
+                    let category = secrets_failure_category(&msg);
+                    report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(category)).await?;
+                    return Ok(());
+                }
+            };
+            secrets_rows.push(SecretsRow::new(&row.account_id, &row.profile, secrets.keys()));
+            for (name, value) in secrets {
+                // A system name is stripped from every row before the guest
+                // sees it: two rows "setting" one cannot conflict over a
+                // variable neither supplies.
+                if SYSTEM_ENV_VARS.contains(&name.as_str()) {
+                    continue;
+                }
+                match merged.get(&name) {
+                    Some(held) if *held != value => {
+                        let msg = format!(
+                            "the variable {name} is set by two of the secret rows this call names, with different values; \
+                             a run takes each name from one row"
+                        );
+                        error!("❌ {msg}");
+                        report_refusal(api_client, near_client, job, request_id, is_https_call, call_id.map(|s| s.as_str()), msg, Some(api_client::JobStatus::Custom)).await?;
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                    None => {
+                        merged.insert(name, value);
+                    }
+                }
+            }
+        }
+        info!("✅ {} secret rows opened", extra_rows.len() + 1);
+        Some(merged)
     };
 
     // The declared signing and encryption keys, for this run only: bound by the
@@ -2854,6 +3074,7 @@ async fn handle_execute_job(
         operation: connector_manifest::operation_from_input(&input_data).ok(),
         owner: secrets_ref.map(|r| r.account_id.clone()),
         profile: secrets_ref.map(|r| r.profile.clone()),
+        other_rows: std::mem::take(&mut other_rows),
         caller: user_account_id.cloned(),
         predecessor: predecessor_id.map(str::to_string),
         payment_key_nonce: payment_key_nonce.and_then(|nonce| u32::try_from(nonce).ok()),
@@ -2897,6 +3118,7 @@ async fn handle_execute_job(
     // Merge environment variables
     let mut env_vars = merge_env_vars(
         user_secrets,
+        &secrets_rows,
         context,
         resource_limits,
         request_id,
@@ -3321,8 +3543,9 @@ async fn handle_execute_job(
                                 hex::encode(output_hasher.finalize())
                             };
 
-                            // Format secrets_ref for attestation (None if empty fields)
-                            let secrets_ref_str = secrets_ref.and_then(|sr| sr.as_attestation_ref());
+                            // The rows the call named, for the attestation: one as it
+                            // always was, several joined with ',' in the order named.
+                            let secrets_ref_str = attestation_secrets_ref(secrets_ref, extra_rows);
 
                             // Generate TDX quote
                             match tdx_client.generate_task_attestation(
@@ -3506,8 +3729,9 @@ async fn handle_execute_job(
                             input_hasher.update(input_data.as_bytes());
                             let input_hash = hex::encode(input_hasher.finalize());
 
-                            // Format secrets_ref for attestation (None if empty fields)
-                            let secrets_ref_str = secrets_ref.and_then(|sr| sr.as_attestation_ref());
+                            // The rows the call named, for the attestation: one as it
+                            // always was, several joined with ',' in the order named.
+                            let secrets_ref_str = attestation_secrets_ref(secrets_ref, extra_rows);
 
                             match tdx_client.generate_task_attestation(
                                 "execute",
@@ -4055,6 +4279,18 @@ async fn refuse_claimed_jobs(
             .await?;
     }
     Ok(())
+}
+
+/// The attested `secrets_ref` field: the row the call named as
+/// `{account_id}/{profile}`, and when it named several, all of them in that
+/// order joined with `,`. A one-row call attests the string it always did.
+/// The field is text in the task hash, so a verifier changes nothing.
+fn attestation_secrets_ref(
+    first: Option<&api_client::SecretsReference>,
+    extra: &[api_client::SecretsReference],
+) -> Option<String> {
+    let rows: Vec<String> = first.into_iter().chain(extra).filter_map(|row| row.as_attestation_ref()).collect();
+    (!rows.is_empty()).then(|| rows.join(","))
 }
 
 /// The account a run is PROVEN to come from, for the keystore to judge a
@@ -4825,6 +5061,7 @@ mod verified_sender_tests {
 
             let env = merge_env_vars(
                 Some(secrets),
+                &[],
                 &empty_context(),
                 &limits(),
                 1,
@@ -4872,6 +5109,7 @@ mod verified_sender_tests {
         let owner = "alice.near".to_string();
         let env = merge_env_vars(
             None,
+            &[],
             &empty_context(),
             &limits(),
             1,
@@ -4904,6 +5142,77 @@ mod verified_sender_tests {
     /// bit-for-bit what it was before bindings existed — the coordinator sets
     /// the context sender to the caller's own name unless the call asked
     /// otherwise, and then there is nothing here to check.
+
+    /// The guest is told whose row opened and which names it supplied, and
+    /// nothing of the values; with no row it is told nothing, not a blank.
+    #[test]
+    fn the_opened_rows_are_told_to_the_guest_by_owner_and_names_only() {
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert("NEARAI_API_KEY".to_string(), "sk-live-secret".to_string());
+        secrets.insert("COMPLIANCE_CONFIG".to_string(), "{\"org\":\"acme\"}".to_string());
+        // A system name stored in the row is stripped below, and so is not
+        // among the names the row is said to supply.
+        secrets.insert("OUTLAYER_PROJECT_OWNER".to_string(), "forged.near".to_string());
+        let rows = vec![SecretsRow::new("compliance.acme.near", "default", secrets.keys())];
+        let owner = "alice.near".to_string();
+        let env = merge_env_vars(
+            Some(secrets),
+            &rows,
+            &empty_context(),
+            &limits(),
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(&"call-id".to_string()),
+            Some(&owner),
+            None,
+            None,
+            "https://rpc.mainnet.fastnear.com",
+        );
+        assert_eq!(env["OUTLAYER_SECRETS_OWNER"], "compliance.acme.near");
+        assert_eq!(env["OUTLAYER_SECRETS_PROFILE"], "default");
+        let rows_json: serde_json::Value = serde_json::from_str(&env["OUTLAYER_SECRETS_ROWS"]).unwrap();
+        assert_eq!(
+            rows_json,
+            serde_json::json!([{"owner": "compliance.acme.near", "profile": "default",
+                                "keys": ["COMPLIANCE_CONFIG", "NEARAI_API_KEY"]}]),
+            "names, sorted, and no value"
+        );
+        assert!(!env["OUTLAYER_SECRETS_ROWS"].contains("sk-live"), "never a value");
+
+        // No row opened: all three absent — and a secret of their names (a row
+        // claiming to be somebody's) does not survive.
+        let mut forged = std::collections::HashMap::new();
+        forged.insert("OUTLAYER_SECRETS_OWNER".to_string(), "compliance.acme.near".to_string());
+        forged.insert("OUTLAYER_SECRETS_ROWS".to_string(), "[]".to_string());
+        let env = merge_env_vars(
+            Some(forged),
+            &[],
+            &empty_context(),
+            &limits(),
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(&"call-id".to_string()),
+            Some(&owner),
+            None,
+            None,
+            "https://rpc.mainnet.fastnear.com",
+        );
+        for name in ["OUTLAYER_SECRETS_ROWS", "OUTLAYER_SECRETS_OWNER", "OUTLAYER_SECRETS_PROFILE"] {
+            assert!(!env.contains_key(name), "{name} must be absent, not forged or blank");
+        }
+    }
     #[test]
     fn without_a_claim_there_is_nothing_to_verify() {
         // HTTPS: sender is the paying key's owner, as always.
@@ -4958,6 +5267,7 @@ mod verified_sender_tests {
         let bound = "agent.tla".to_string();
         let env = merge_env_vars(
             None,
+            &[],
             &empty_context(),
             &limits(),
             1,
@@ -5042,6 +5352,7 @@ mod verified_sender_tests {
         let owner = "alice.near".to_string();
         let env = merge_env_vars(
             Some(secrets),
+            &[],
             &empty_context(),
             &limits(),
             1,

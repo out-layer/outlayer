@@ -168,6 +168,10 @@ if [ -f "$WORKER_MAIN" ] && [ -f "$WORKER_P2" ]; then
     python3 - src/main.rs "$WORKER_MAIN" "$WORKER_P2" <<'PY'
 import re, sys
 probe, worker_main, worker_p2 = (open(p).read() for p in sys.argv[1:4])
+# Production code only: the worker's tests insert forged and example names
+# into the same map, and those are not variables the worker injects.
+worker_main = worker_main.split("#[cfg(test)]", 1)[0]
+worker_p2 = worker_p2.split("#[cfg(test)]", 1)[0]
 def block(name):
     m = re.search(r'const %s: &\[&str\] = &\[(.*?)\];' % name, probe, re.S)
     return set(re.findall(r'"([A-Z_]+)"', m.group(1))) if m else set()

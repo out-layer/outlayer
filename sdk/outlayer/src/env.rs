@@ -86,6 +86,55 @@ pub fn signer_account_id() -> Option<String> {
     std::env::var("NEAR_SENDER_ID").ok()
 }
 
+/// A secret row the call named and the keystore opened, as the worker tells
+/// the component of it: whose it is, and the names of the variables it
+/// supplied. Never a value: the values are in the environment under those
+/// names.
+///
+/// Only the row's owner could have stored it, so this is the one fact a row
+/// cannot claim about itself: a configuration that says `"org": "acme"` is
+/// Acme's when the row that supplied it is owned by Acme's account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SecretsRow {
+    pub owner: String,
+    pub profile: String,
+    pub keys: Vec<String>,
+}
+
+/// The secret rows this run named, in the order the call named them, each
+/// with the names it supplied (`OUTLAYER_SECRETS_ROWS`). Empty when the run
+/// named no row, or named one that did not open. `Err` when the host wrote
+/// something that does not read, which is the host's fault and not a row
+/// that is absent.
+///
+/// # Example
+/// ```rust,ignore
+/// // The config is trusted only from the row that also holds the key, and
+/// // that row's owner is the organisation.
+/// let org = env::secrets_rows()?
+///     .into_iter()
+///     .find(|row| row.keys.iter().any(|k| k == "NEARAI_API_KEY") && row.keys.iter().any(|k| k == "COMPLIANCE_CONFIG"))
+///     .map(|row| row.owner);
+/// ```
+pub fn secrets_rows() -> Result<Vec<SecretsRow>, String> {
+    match std::env::var("OUTLAYER_SECRETS_ROWS") {
+        Err(_) => Ok(Vec::new()),
+        Ok(rows) => serde_json::from_str(&rows).map_err(|e| format!("OUTLAYER_SECRETS_ROWS does not read: {e}")),
+    }
+}
+
+/// The owner of the first row the call named (`OUTLAYER_SECRETS_OWNER`);
+/// `None` when no row opened.
+pub fn secrets_owner() -> Option<String> {
+    std::env::var("OUTLAYER_SECRETS_OWNER").ok()
+}
+
+/// The profile of the first row the call named (`OUTLAYER_SECRETS_PROFILE`);
+/// `None` when no row opened.
+pub fn secrets_profile() -> Option<String> {
+    std::env::var("OUTLAYER_SECRETS_PROFILE").ok()
+}
+
 /// Get the transaction hash for this execution
 ///
 /// # Returns

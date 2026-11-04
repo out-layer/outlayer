@@ -188,6 +188,26 @@ and by nothing else.
 "By name" is a `Whitelist` that lists the caller on the path that admitted
 them. A dated grant — `And[Whitelist, ValidUntil]` — is by name while it lasts.
 
+**Several rows.** A call over HTTPS may name several secret rows
+(`secrets_refs`, at most five, in order) of a project whose manifest says
+`"secrets_refs": true`; each opens for the caller as one does — the first
+must exist and open — and a task may be opened for the owner of any of them
+(`open-for`). Such a task opens a conversation of its own, whatever the run
+answered: a conversation is one owner's.
+That is how a company's officer takes an escalation without being the
+company's admin: a row of the officer's own under the project, holding
+nothing, whose condition admits by name the employees whose escalations they
+take. The employee's call names the company's row — the key, the
+configuration — and the officers'; the module opens the task for the officer
+the configuration names, and the officer reads it in their own inbox and
+approves it with their own wallet. The run that carries the task out is
+started with every row the preparing run named, the task's own row first:
+it holds the company's key and the officer's row again, and answers the task
+under the row it was made for. The preparer reads, cancels and deletes its
+tasks under every row the run names; `unlock` is the owner's own run naming
+their own row. A row named by the call that does not open refuses the run,
+and a variable set differently by two rows refuses it naming the variable.
+
 As with a bot in a messenger, nobody writes to a person who has not let them,
 and the owner silences whom they please: they mute an agent or a project in
 the inbox, and delete its waiting tasks at once. What is being acted on, and
@@ -504,7 +524,8 @@ is `ok([])`.
 
 | Function | Who | Does |
 |---|---|---|
-| `open(request)` | preparer | makes the task |
+| `open(request)` | preparer | makes the task, for the owner of the row the run named — the first, when the call named several |
+| `open-for(owner, request)` | preparer | makes the task for the owner of any row the run named and the keystore opened; an account that owns none of them is `not-granted-by-name` |
 | `mine()`, `status(id)` | preparer | its tasks — a turn is the preparer's of its conversation — or one of them; `status` also reads a task this run opened |
 | `cancel(id)`, `delete(id)` | preparer; or the run that opened the task | withdraws; deletes one nothing was carried out on (open, cancelled, rejected, expired, void, or failed with a reason that says nothing was done: `run_failed`, `run_not_started`, `run_refused:*`, a run never started) — one the owner's yes acted on, or may have, is refused `closed` |
 | `answered(id, hash, operation, policy, approval, supplied, note)` | the preparer's run the platform started for the task | verifies the owner's approval over this task, this hash and these words, and takes the answer; hands back `state`, the files, `supplied` and `note` opened |

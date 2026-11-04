@@ -13,6 +13,8 @@
     "burn",
     "fetch",
     "forbidden_fetch",
+    "timed_fetch_within",
+    "timed_fetch_beyond",
     "vrf",
     "refund",
     "sockets",
@@ -31,7 +33,11 @@
   "tasks": true,
   "capabilities": {
     "network": [
-      "rpc.testnet.fastnear.com"
+      "rpc.testnet.fastnear.com",
+      {
+        "host": "httpbin.org",
+        "timeout_secs": 8
+      }
     ]
   },
   "author_secrets": {

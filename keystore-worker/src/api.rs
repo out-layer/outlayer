@@ -115,6 +115,11 @@ const RESERVED_SECRET_KEYS: &[&str] = &[
     "USD_PAYMENT",
     "WALLET_ID",
     "NEAR_RPC_PROXY_AVAILABLE",
+    // Whose row opened and which names it supplied: the one fact a row must
+    // not be able to state about itself.
+    "OUTLAYER_SECRETS_ROWS",
+    "OUTLAYER_SECRETS_OWNER",
+    "OUTLAYER_SECRETS_PROFILE",
 ];
 
 /// Refuse a write that names one of [`RESERVED_SECRET_KEYS`].

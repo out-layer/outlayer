@@ -65,6 +65,11 @@
             "name": "seconds",
             "type": "integer",
             "doc": "For a `confirm_slow` task: how long its run waits, 1 to 170 seconds, sealed with the task."
+          },
+          {
+            "name": "for",
+            "type": "string",
+            "doc": "The owner of another row the call named (`secrets_refs`), whose task it then is: opened for them, in their inbox, approved by their wallet. The first row's owner when it is not named."
           }
         ]
       },
@@ -356,7 +361,7 @@
       },
       "task_delete": {
         "class": "write",
-        "doc": "Deletes a task this caller made that nothing was carried out on: open, cancelled, rejected, expired, void, or failed with a reason that says nothing was done. One the owner's yes acted on, or may have, is refused task_closed — it is the owner's record too.",
+        "doc": "Deletes a task this caller made that nothing was carried out on: open, cancelled, rejected, expired, void, or failed with a reason that says nothing was done. One the owner's yes acted on, or may have, is refused task_closed \u2014 it is the owner's record too.",
         "params": [
           {
             "name": "task_id",
@@ -377,5 +382,6 @@
         "params": []
       }
     }
-  }
+  },
+  "secrets_refs": true
 }

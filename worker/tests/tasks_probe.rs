@@ -429,6 +429,7 @@ impl World {
             operation: input.get("operation").and_then(|o| o.as_str()).map(str::to_string),
             owner: grant.map(|_| OWNER.to_string()),
             profile: grant.map(|_| "probe".to_string()),
+            other_rows: Vec::new(),
             caller: Some(caller.to_string()),
             predecessor: Some(caller.to_string()),
             payment_key_nonce: (!keyless).then(|| nonce_of(caller)),

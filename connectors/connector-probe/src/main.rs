@@ -24,6 +24,8 @@
 //! | `burn` | $0.01 | compute actually costs something: burns instructions on demand, so a charge can be watched |
 //! | `fetch` | $0.015 | the declared host is reachable |
 //! | `forbidden_fetch` | $0.015 | an undeclared host is NOT, and the refusal comes from the worker rather than from politeness here |
+//! | `timed_fetch_within` | $0.015 | a host whose manifest entry names its own request time (`httpbin.org`, 8 s): an answer inside it completes |
+//! | `timed_fetch_beyond` | $0.015 | and an answer past it times out — at the entry's 8 s, not the 30 s a bare entry has. Passes when it fails, like `forbidden_fetch` |
 //! | `vrf` | $0.01 | the ALPHA the randomness is bound to — the same seed through both doors must name the same account, differing only in the request id |
 //! | `refund` | $0.01 | money handed back reaches `earnings_history`: a non-zero `refund_usd` and an `amount` reduced by it. The worker computed this for a while and never sent it |
 //! | `guess_start` | $0.01 | a game of several turns through tasks: picks a number from 1 to `max` and opens an `input` task for the owner (`guess.rs`) |
@@ -152,6 +154,11 @@ const SYSTEM_VARS: &[&str] = &[
     "OUTLAYER_PROJECT_UUID",
     "OUTLAYER_PROJECT_NAME",
     "OUTLAYER_PROJECT_OWNER",
+    // The secret rows the call named and the keystore opened: whose, and
+    // which names each supplied.
+    "OUTLAYER_SECRETS_ROWS",
+    "OUTLAYER_SECRETS_OWNER",
+    "OUTLAYER_SECRETS_PROFILE",
     // Custody. Injected outside `merge_env_vars`, which is why it was missing
     // from every list until the worker's own `SYSTEM_ENV_VARS` was written
     // down and compared against the source.
@@ -182,6 +189,10 @@ const CONDITIONAL_VARS: &[&str] = &[
     "OUTLAYER_PROJECT_UUID",
     "OUTLAYER_PROJECT_NAME",
     "OUTLAYER_PROJECT_OWNER",
+    // "If a row opened"
+    "OUTLAYER_SECRETS_ROWS",
+    "OUTLAYER_SECRETS_OWNER",
+    "OUTLAYER_SECRETS_PROFILE",
     // "If wallet"
     "WALLET_ID",
     // "If proxy" — absent whenever the run has no RPC proxy attached.
@@ -202,6 +213,13 @@ const ALLOWED_HOST: &str = "https://rpc.testnet.fastnear.com";
 /// connector that fetched a caller-chosen host would be an SSRF gadget running
 /// inside a TEE with keys in it.
 const UNDECLARED_HOST: &str = "https://example.com";
+
+/// A host whose manifest entry names its own request time, 8 s, and must
+/// match `manifest.json`. The two URLs answer after 4 s and after 10 s: one
+/// side of the entry's time and the other, both well inside the 30 s a bare
+/// entry has, so what ends the second one can only be the entry.
+const TIMED_HOST_WITHIN: &str = "https://httpbin.org/delay/4";
+const TIMED_HOST_BEYOND: &str = "https://httpbin.org/delay/10";
 
 /// Secret names this connector looks for.
 ///
@@ -517,6 +535,16 @@ fn run(input: &Input, raw: &Value) -> Output {
             op,
             UNDECLARED_HOST,
             "an undeclared host must be refused by the worker, not by this module",
+        ),
+        "timed_fetch_within" => fetch(
+            op,
+            TIMED_HOST_WITHIN,
+            "a 4 s answer from a host whose entry gives 8 s must complete",
+        ),
+        "timed_fetch_beyond" => fetch(
+            op,
+            TIMED_HOST_BEYOND,
+            "a 10 s answer from a host whose entry gives 8 s must time out at the entry's time",
         ),
         "sockets" => sockets(op),
         "trap" => trap(),

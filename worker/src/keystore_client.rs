@@ -785,6 +785,7 @@ impl KeystoreClient {
                 }
             }
 
+            let sent_with = inst.session();
             let reply = match self.post_once(i, path, &build_body, what, vault_id).await {
                 Ok(reply) => reply,
                 Err(CallError::Unreachable(e)) => {
@@ -809,19 +810,26 @@ impl KeystoreClient {
             // The keystore answered, so it is up; it just no longer knows us. Unlike the first
             // handshake above, a reconnect that cannot happen is surfaced with the keystore's
             // status attached: "we got a 403 and could not re-handshake" names both halves.
+            //
+            // Requests go out concurrently — the rows of one run are asked together — and a
+            // keystore that restarted answers every one of them 403 at once. The first to get
+            // here re-handshakes; the others find the session already replaced and retry with
+            // it, rather than each making a handshake of its own.
             let status = reply.status;
-            match self.establish_session_on(i).await {
-                Ok(()) => {}
-                Err(CallError::Unreachable(e)) | Err(CallError::Stalled(e)) => {
-                    self.leave(i, what, &e);
-                    unreachable.push(e);
-                    continue;
-                }
-                Err(CallError::Final(e)) => {
-                    return Err(e.context(format!(
-                        "{} got {} and the TEE session reconnect failed",
-                        what, status
-                    )))
+            if inst.session() == sent_with {
+                match self.establish_session_on(i).await {
+                    Ok(()) => {}
+                    Err(CallError::Unreachable(e)) | Err(CallError::Stalled(e)) => {
+                        self.leave(i, what, &e);
+                        unreachable.push(e);
+                        continue;
+                    }
+                    Err(CallError::Final(e)) => {
+                        return Err(e.context(format!(
+                            "{} got {} and the TEE session reconnect failed",
+                            what, status
+                        )))
+                    }
                 }
             }
 

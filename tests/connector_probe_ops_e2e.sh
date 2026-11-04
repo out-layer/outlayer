@@ -50,6 +50,13 @@
 #                       RETURN VALUE. A refund inside what was attached lands; a
 #                       refund past it is refused there too. Needs CALLER to
 #                       hold a stablecoin balance inside the contract
+#   O9 `timed_fetch_within`  a host whose manifest entry names its own request
+#                       time (`httpbin.org`, 8 s): a 4 s answer completes
+#   O10 `timed_fetch_beyond` and a 10 s answer from the same host TIMES OUT —
+#                       inside the 30 s a bare entry has, so only the entry's
+#                       8 s can have ended it. Judged on `http_error` naming a
+#                       timeout; a completed fetch here means the entry's time
+#                       is not applied
 #
 # Needs: PAYMENT_KEY — a funded payment key; CALLER (O8 only) — an account with
 # a stablecoin balance INSIDE the contract and NEAR for the compute deposit.
@@ -298,6 +305,26 @@ else
       fail "O8 the over-refund neither landed nor was refused: $(head -c 200 <<<"$ANS")"
     fi
   fi
+fi
+
+# ── O9 / O10 a host entry's own request time ─────────────────────────────────
+log "O9 timed_fetch_within — a 4 s answer under an 8 s entry completes"
+call timed_fetch_within >/dev/null
+if [[ "$(out_field ok)" == "true" && "$(out_field http_status)" == "200" ]]; then
+  pass "O9 completed (HTTP $(out_field http_status))"
+else
+  fail "O9 a 4 s answer did not complete under an 8 s entry: $(head -c 200 <<<"$BODY")"
+fi
+
+log "O10 timed_fetch_beyond — a 10 s answer under the same entry times out"
+call timed_fetch_beyond >/dev/null
+TIMED_ERR=$(out_field http_error)
+if [[ "$(out_field ok)" == "true" ]]; then
+  fail "O10 A 10 s ANSWER COMPLETED under an 8 s entry — the entry's time is not applied (HTTP $(out_field http_status))"
+elif [[ "$TIMED_ERR" == *[Tt]imeout* ]]; then
+  pass "O10 timed out at the entry's time, not the 30 s default ($(head -c 80 <<<"$TIMED_ERR"))"
+else
+  fail "O10 neither completed nor timed out: $(head -c 200 <<<"$BODY")"
 fi
 
 verdict "connector-probe operations"

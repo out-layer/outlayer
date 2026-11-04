@@ -43,7 +43,7 @@ dashboard host `app.outlayer.ai` serves no API.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| POST | `/call/{owner}/{project}` | `X-Payment-Key` | Execute a project's WASI module. Body: `{"input": …, "secrets_ref"?, "async"?, "version_key"?, "resource_limits"?}`. Sync by default; `"async": true` returns a `call_id` |
+| POST | `/call/{owner}/{project}` | `X-Payment-Key` | Execute a project's WASI module. Body: `{"input": …, "secrets_ref"?, "secrets_refs"?, "async"?, "version_key"?, "resource_limits"?}`. `secrets_refs` names several secret rows in order (at most 5; not with `secrets_ref`; the project's manifest must say `"secrets_refs": true`): each opens for the caller as one does, their variables join (a name set differently by two rows refuses the run), and a task may be opened for the owner of any of them; refused on a connector that reads the wallet owner's policy row (Polymarket, Hyperliquid), which no other row joins. Sync by default; `"async": true` returns a `call_id` |
 | GET | `/calls/{call_id}` | `X-Payment-Key` of the calling key, or `Bearer wk_` of the wallet that owns it | Poll a `pending` call: an async one, or a sync one the API restarted during |
 | GET | `/payment-keys/balance` | `X-Payment-Key` | The key's balance |
 | GET | `/subscription/status` | `X-Payment-Key` | What a key has left — for a trial key, `trial.calls_left` |

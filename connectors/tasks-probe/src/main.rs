@@ -9,7 +9,7 @@
 //!
 //! | `operation` | Who | What it does |
 //! |---|---|---|
-//! | `prepare` | agent | opens a task from `title`, `body`, `kind` (`confirm`, `text`, `file`), `life_seconds`, and `files` (`[{name, content_type, text}]`); answers `awaiting_owner`. `answer_by` names the operation that answers a `confirm` task: `confirm` when it is not named, `confirm_slow`, `confirm_silent` or `confirm_trap`; `seconds` is sealed with a `confirm_slow` task as the time its run takes |
+//! | `prepare` | agent | opens a task from `title`, `body`, `kind` (`confirm`, `text`, `file`), `life_seconds`, and `files` (`[{name, content_type, text}]`); answers `awaiting_owner`. `for` names the owner of another row the call named (`secrets_refs`), whose task it then is. `answer_by` names the operation that answers a `confirm` task: `confirm` when it is not named, `confirm_slow`, `confirm_silent` or `confirm_trap`; `seconds` is sealed with a `confirm_slow` task as the time its run takes |
 //! | `prepare_many` | agent | opens `count` tasks (1 to 10) in one run, each as `prepare` makes it, and stops at the first that is refused; answers the tasks opened and the refusal |
 //! | `prepare_raw` | agent | opens a task whose display is `display` as given — for a display outside the bounds |
 //! | `notify` | agent, or any run the row admits by name — one on chain too | opens a notice from `title`, `body`, `life_seconds` and `files`; answers `notified`. `prepare` and `prepare_many` open notices too with `"kind": "notice"` |
@@ -87,7 +87,13 @@ struct Made {
 }
 
 fn open(made: Made, input: &Value) -> Result<Value, String> {
-    let opened = made.task.life_seconds(life(input)).open().map_err(|e| e.refusal())?;
+    let mut task = made.task.life_seconds(life(input));
+    // `for`: the owner of another row the call named (`secrets_refs`), whose
+    // task it then is — an officer's, in their own inbox.
+    if let Some(owner) = input.get("for").and_then(|v| v.as_str()) {
+        task = task.owner(owner);
+    }
+    let opened = task.open().map_err(|e| e.refusal())?;
     let mut answer = match made.notice {
         true => tasks::notified(&opened),
         false => tasks::awaiting_owner(&opened),

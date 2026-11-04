@@ -26,11 +26,22 @@
 //! ```jsonc
 //! {
 //!   "connector_id": "near-email",
-//!   "capabilities": { "network": ["api.near.email"] }
+//!   "capabilities": { "network": ["api.near.email", {"host": "cloud-api.near.ai", "timeout_secs": 120}] }
 //! }
 //! ```
+//!
+//! An entry is a hostname, or a hostname with the time one request to it may
+//! take. Without one a request has [`DEFAULT_HTTP_TIMEOUT_SECS`]; the manifest
+//! is inside the wasm and under the attestation, so a long timeout is a
+//! declared property of the code, never of the call.
 
 use serde::Deserialize;
+
+/// What one outbound request may take when its host's entry names no time.
+pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+/// The most an entry may name: the execution cap, since a request never
+/// outlives the run that made it.
+pub const MAX_HTTP_TIMEOUT_SECS: u64 = 180;
 
 /// Maximum manifest we will read. A manifest is a few hundred bytes; anything
 /// larger is either a mistake or an attempt to make us buffer a repository.
@@ -52,7 +63,7 @@ pub struct ProjectManifest {
     /// Accepted as an alias for `capabilities.network` so a manifest that
     /// declares nothing else does not need the nesting.
     #[serde(default)]
-    pub network: Option<Vec<String>>,
+    pub network: Option<Vec<NetworkEntry>>,
     /// Rate limits this connector declares about itself.
     ///
     /// DECLARATION, not enforcement. Enforcement is the coordinator's
@@ -110,6 +121,14 @@ pub struct ProjectManifest {
     /// `false` does not parse.
     #[serde(default)]
     pub tasks: bool,
+    /// Whether a call of this artefact may name several secret rows
+    /// (`secrets_refs`), whose variables join. Off, a call naming more than
+    /// one row is refused before anything is decrypted: a module that reads
+    /// its environment as one owner's must not be handed another's. A module
+    /// that declares it tells which row supplied what by
+    /// `OUTLAYER_SECRETS_ROWS`.
+    #[serde(default)]
+    pub secrets_refs: bool,
     /// Which doors a run may come through — see [`crate::callers`]. Absent
     /// admits every door. A block that breaks a rule does not parse, and
     /// neither does one that shuts the HTTPS door or the direct door of an
@@ -282,7 +301,71 @@ fn default_applies() -> String {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ManifestCapabilities {
     #[serde(default)]
-    pub network: Option<Vec<String>>,
+    pub network: Option<Vec<NetworkEntry>>,
+}
+
+/// One entry of the allowlist: a host, alone or with the time one request to
+/// it may take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkEntry {
+    /// `"api.near.email"`: the host, with [`DEFAULT_HTTP_TIMEOUT_SECS`].
+    Host(String),
+    /// `{"host": "cloud-api.near.ai", "timeout_secs": 120}`.
+    Timed { host: String, timeout_secs: u64 },
+}
+
+impl NetworkEntry {
+    pub fn host(&self) -> &str {
+        match self {
+            NetworkEntry::Host(host) | NetworkEntry::Timed { host, .. } => host,
+        }
+    }
+
+    /// The entry's own time, when it names one.
+    pub fn timeout_secs(&self) -> Option<u64> {
+        match self {
+            NetworkEntry::Host(_) => None,
+            NetworkEntry::Timed { timeout_secs, .. } => Some(*timeout_secs),
+        }
+    }
+
+    /// Read one entry, saying what is wrong with it: the manifest is public,
+    /// author-written text, and a refusal has to name the member.
+    fn from_value(value: serde_json::Value) -> Result<Self, String> {
+        use serde_json::Value;
+        let host_of = |host: &Value| match host {
+            Value::String(host) if !host.trim().is_empty() => Ok(host.clone()),
+            _ => Err("a network entry's host is a non-empty hostname".to_string()),
+        };
+        match value {
+            Value::String(_) => Ok(NetworkEntry::Host(host_of(&value)?)),
+            Value::Object(members) => {
+                if let Some(unknown) = members.keys().find(|k| !matches!(k.as_str(), "host" | "timeout_secs")) {
+                    return Err(format!(
+                        "a network entry has no member {unknown:?}; it has `host` and `timeout_secs`"
+                    ));
+                }
+                let host = host_of(members.get("host").unwrap_or(&Value::Null))?;
+                let timeout_secs = match members.get("timeout_secs").and_then(Value::as_u64) {
+                    Some(secs) if (1..=MAX_HTTP_TIMEOUT_SECS).contains(&secs) => secs,
+                    _ => {
+                        return Err(format!(
+                            "network entry {host:?}: `timeout_secs` is a whole number of seconds from 1 to {MAX_HTTP_TIMEOUT_SECS}"
+                        ))
+                    }
+                };
+                Ok(NetworkEntry::Timed { host, timeout_secs })
+            }
+            _ => Err("a network entry is a hostname, or {\"host\": ..., \"timeout_secs\": ...}".to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        NetworkEntry::from_value(value).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ProjectManifest {
@@ -305,7 +388,7 @@ impl ProjectManifest {
     /// nothing" is a manifest that says nothing about the network, while
     /// "declared an empty list" is a manifest that says this project talks to
     /// nobody. Collapsing them turns an explicit no into a silent yes.
-    pub fn allowlist(&self) -> Option<&[String]> {
+    pub fn allowlist(&self) -> Option<&[NetworkEntry]> {
         self.capabilities
             .as_ref()
             .and_then(|c| c.network.as_deref())
@@ -317,6 +400,24 @@ impl ProjectManifest {
     /// `secp256k1`" is what its author needs.
     pub fn read(bytes: &[u8]) -> Result<Self, String> {
         let manifest = serde_json::from_slice::<Self>(bytes).map_err(|e| e.to_string())?;
+        // A host listed twice with two different times would take the first
+        // entry's and silently drop the second's. The same host listed twice
+        // the same way is what it always was, and stays accepted: a manifest
+        // already deployed must not stop running.
+        if let Some(entries) = manifest.allowlist() {
+            let mut seen: std::collections::HashMap<String, Option<u64>> = std::collections::HashMap::new();
+            for entry in entries {
+                match seen.insert(normalize_host(entry.host()), entry.timeout_secs()) {
+                    Some(earlier) if earlier != entry.timeout_secs() => {
+                        return Err(format!(
+                            "the network list names {:?} twice with different times; one entry per host",
+                            entry.host()
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(callers) = manifest.callers.as_ref().filter(|_| manifest.tasks) {
             if !callers.admits_https() {
                 return Err("the manifest declares tasks, which the platform carries out in a call of the agent's over HTTPS, \
@@ -346,7 +447,27 @@ pub enum NetworkPolicy {
     Unrestricted,
     /// Only these hosts. An empty list means no outbound network at all, which
     /// is what a connector without a usable manifest gets.
-    Allowlist(Vec<String>),
+    Allowlist(Vec<AllowedHost>),
+}
+
+/// A host of the allowlist, with its own request time when its entry named
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedHost {
+    pub host: String,
+    pub timeout_secs: Option<u64>,
+}
+
+impl From<&NetworkEntry> for AllowedHost {
+    fn from(entry: &NetworkEntry) -> Self {
+        AllowedHost { host: entry.host().to_string(), timeout_secs: entry.timeout_secs() }
+    }
+}
+
+impl From<&str> for AllowedHost {
+    fn from(host: &str) -> Self {
+        AllowedHost { host: host.to_string(), timeout_secs: None }
+    }
 }
 
 impl NetworkPolicy {
@@ -360,11 +481,23 @@ impl NetworkPolicy {
     pub fn allows(&self, host: &str) -> bool {
         match self {
             NetworkPolicy::Unrestricted => true,
-            NetworkPolicy::Allowlist(hosts) => {
-                let host = normalize_host(host);
-                hosts.iter().any(|h| normalize_host(h) == host)
-            }
+            NetworkPolicy::Allowlist(_) => self.entry(host).is_some(),
         }
+    }
+
+    /// The time one request to `host` may take, when its entry names one.
+    /// `None` is the default, for an unlisted host and under no allowlist
+    /// alike.
+    pub fn timeout_for(&self, host: &str) -> Option<u64> {
+        self.entry(host).and_then(|h| h.timeout_secs)
+    }
+
+    /// The allowlist's entry for `host`, matched as a host is matched; none
+    /// under no allowlist.
+    fn entry(&self, host: &str) -> Option<&AllowedHost> {
+        let NetworkPolicy::Allowlist(hosts) = self else { return None };
+        let host = normalize_host(host);
+        hosts.iter().find(|h| normalize_host(&h.host) == host)
     }
 
     pub fn is_enforced(&self) -> bool {
@@ -529,7 +662,7 @@ pub fn resolve_network_policy(
     let is_connector =
         in_connector_namespace || manifest.is_some_and(ProjectManifest::declares_connector);
     match manifest.and_then(|m| m.allowlist()) {
-        Some(hosts) => NetworkPolicy::Allowlist(hosts.to_vec()),
+        Some(hosts) => NetworkPolicy::Allowlist(hosts.iter().map(AllowedHost::from).collect()),
         None if is_connector => NetworkPolicy::Allowlist(Vec::new()),
         None => NetworkPolicy::Unrestricted,
     }
@@ -551,6 +684,9 @@ pub struct EgressRecord {
     pub allowed: bool,
     /// Why it was refused. `None` when allowed.
     pub reason: Option<String>,
+    /// The time the request was given: the host's entry, cut to what was
+    /// left of the run. The audit then says why a request could take 100 s.
+    pub timeout_secs: u64,
 }
 
 /// Custom section carrying the manifest inside the wasm itself.
@@ -614,6 +750,7 @@ pub fn decide_egress(
     policy: &NetworkPolicy,
     host: Option<&str>,
     bytes: Option<u64>,
+    timeout_secs: u64,
     log: &std::sync::Mutex<Vec<EgressRecord>>,
 ) -> Option<String> {
     let reason = match host {
@@ -633,6 +770,7 @@ pub fn decide_egress(
             bytes,
             allowed: reason.is_none(),
             reason: reason.clone(),
+            timeout_secs,
         });
     }
 
@@ -849,10 +987,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nested.connector_id.as_deref(), Some("near-email"));
-        assert_eq!(nested.allowlist(), Some(&["api.near.email".to_string()][..]));
+        assert_eq!(nested.allowlist(), Some(&[NetworkEntry::Host("api.near.email".to_string())][..]));
 
         let flat = ProjectManifest::parse(br#"{"network":["api.near.email"]}"#).unwrap();
-        assert_eq!(flat.allowlist(), Some(&["api.near.email".to_string()][..]));
+        assert_eq!(flat.allowlist(), Some(&[NetworkEntry::Host("api.near.email".to_string())][..]));
     }
 
     #[test]
@@ -922,6 +1060,82 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_may_name_its_own_request_time() {
+        let m = ProjectManifest::parse(
+            br#"{"capabilities":{"network":["api.near.email",{"host":"cloud-api.near.ai","timeout_secs":120}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.allowlist(),
+            Some(
+                &[
+                    NetworkEntry::Host("api.near.email".to_string()),
+                    NetworkEntry::Timed { host: "cloud-api.near.ai".to_string(), timeout_secs: 120 },
+                ][..]
+            )
+        );
+        let policy = resolve_network_policy(true, Some(&m));
+        assert!(policy.allows("cloud-api.near.ai") && policy.allows("api.near.email"));
+        assert_eq!(policy.timeout_for("cloud-api.near.ai"), Some(120));
+        assert_eq!(policy.timeout_for("CLOUD-API.near.ai."), Some(120), "matched as a host is matched");
+        assert_eq!(policy.timeout_for("api.near.email"), None, "a bare entry keeps the default");
+        assert_eq!(policy.timeout_for("evil.example"), None);
+        assert_eq!(NetworkPolicy::Unrestricted.timeout_for("cloud-api.near.ai"), None);
+    }
+
+    #[test]
+    fn a_host_listed_twice_with_different_times_refuses_the_manifest() {
+        let twice = ProjectManifest::read(br#"{"network":["a.example",{"host":"A.example.","timeout_secs":120}]}"#).unwrap_err();
+        assert!(twice.contains("twice"), "{twice}");
+        let two_times = ProjectManifest::read(
+            br#"{"network":[{"host":"a.example","timeout_secs":60},{"host":"a.example","timeout_secs":120}]}"#,
+        )
+        .unwrap_err();
+        assert!(two_times.contains("twice"), "{two_times}");
+        // The same host twice the same way ran before and runs still.
+        assert!(ProjectManifest::read(br#"{"network":["a.example","a.example","b.example"]}"#).is_ok());
+        assert!(ProjectManifest::read(br#"{"network":[{"host":"a.example","timeout_secs":60},{"host":"a.example","timeout_secs":60}]}"#).is_ok());
+    }
+
+    #[test]
+    fn several_rows_are_declared_or_not() {
+        assert!(!ProjectManifest::parse(br#"{"tasks":true}"#).unwrap().secrets_refs);
+        assert!(ProjectManifest::parse(br#"{"secrets_refs":true}"#).unwrap().secrets_refs);
+        assert!(ProjectManifest::parse(br#"{"secrets_refs":"yes"}"#).is_none());
+    }
+
+    #[test]
+    fn a_timed_entry_outside_its_shape_refuses_the_manifest_naming_why() {
+        let refused = |entry: &str| {
+            ProjectManifest::read(format!(r#"{{"capabilities":{{"network":[{entry}]}}}}"#).as_bytes())
+                .expect_err(entry)
+        };
+        for (entry, names) in [
+            (r#"{"host":"a.example","timeout_secs":0}"#, "from 1 to 180"),
+            (r#"{"host":"a.example","timeout_secs":181}"#, "from 1 to 180"),
+            (r#"{"host":"a.example","timeout_secs":1.5}"#, "from 1 to 180"),
+            (r#"{"host":"a.example","timeout_secs":"120"}"#, "from 1 to 180"),
+            (r#"{"host":"a.example"}"#, "from 1 to 180"),
+            (r#"{"host":"a.example","timeout_secs":120,"timeout":5}"#, "no member \"timeout\""),
+            (r#"{"host":"","timeout_secs":120}"#, "non-empty hostname"),
+            (r#"{"timeout_secs":120}"#, "non-empty hostname"),
+            (r#"42"#, "a hostname, or"),
+            (r#""""#, "non-empty hostname"),
+        ] {
+            let why = refused(entry);
+            assert!(why.contains(names), "{entry}: {why}");
+        }
+        // The bounds themselves are entries.
+        for secs in [1, MAX_HTTP_TIMEOUT_SECS] {
+            let m = ProjectManifest::read(
+                format!(r#"{{"network":[{{"host":"a.example","timeout_secs":{secs}}}]}}"#).as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(resolve_network_policy(false, Some(&m)).timeout_for("a.example"), Some(secs));
+        }
+    }
+
+    #[test]
     fn tasks_need_the_https_door_and_the_direct_door() {
         // The run that answers comes over HTTPS; `only` shuts every door but the contracts it names.
         for callers in [r#"{"https":"deny"}"#, r#"{"contract":{"only":["game.testnet"]}}"#, r#"{"direct":"deny","https":"deny"}"#] {
@@ -956,7 +1170,7 @@ mod tests {
 
     #[test]
     fn matching_is_exact_and_case_insensitive() {
-        let policy = NetworkPolicy::Allowlist(vec!["API.Near.Email".to_string()]);
+        let policy = NetworkPolicy::Allowlist(vec!["API.Near.Email".into()]);
         assert!(policy.allows("api.near.email"));
         assert!(policy.allows("API.NEAR.EMAIL"));
         // A trailing root dot is the same host to every resolver; a policy that
@@ -970,7 +1184,7 @@ mod tests {
         // Listing a domain must not hand over everything under it: an attacker
         // who can register or control a subdomain would otherwise be inside the
         // allowlist. A project that needs a subdomain lists the subdomain.
-        let policy = NetworkPolicy::Allowlist(vec!["example.com".to_string()]);
+        let policy = NetworkPolicy::Allowlist(vec!["example.com".into()]);
         assert!(policy.allows("example.com"));
         assert!(!policy.allows("evil.example.com"));
         assert!(!policy.allows("example.com.evil.net"));
@@ -1027,7 +1241,7 @@ mod tests {
     #[test]
     fn a_declared_allowlist_is_enforced_for_anyone() {
         let m = ProjectManifest::parse(br#"{"capabilities":{"network":["a.example"]}}"#).unwrap();
-        let expected = NetworkPolicy::Allowlist(vec!["a.example".to_string()]);
+        let expected = NetworkPolicy::Allowlist(vec!["a.example".into()]);
         assert_eq!(resolve_network_policy(true, Some(&m)), expected);
         assert_eq!(resolve_network_policy(false, Some(&m)), expected);
     }
@@ -1094,7 +1308,7 @@ mod tests {
         let wasm = core_module(&[custom_section(MANIFEST_SECTION, MANIFEST_JSON)]);
         let manifest = manifest_from_wasm(&wasm).unwrap().expect("section must be found");
         assert_eq!(manifest.connector_id.as_deref(), Some("near-email"));
-        assert_eq!(manifest.allowlist(), Some(&["mail.near.email".to_string()][..]));
+        assert_eq!(manifest.allowlist(), Some(&[NetworkEntry::Host("mail.near.email".to_string())][..]));
     }
 
     #[test]
@@ -1203,7 +1417,7 @@ mod tests {
         assert!(manifest.declares_connector());
         assert_eq!(
             resolve_network_policy(false, Some(&manifest)),
-            NetworkPolicy::Allowlist(vec!["mail.near.email".to_string()])
+            NetworkPolicy::Allowlist(vec!["mail.near.email".into()])
         );
 
         // Declaring a connector_id but no network is still fail-closed, wherever
@@ -1238,10 +1452,10 @@ mod tests {
 
     #[test]
     fn a_host_outside_the_allowlist_is_refused_and_recorded() {
-        let policy = NetworkPolicy::Allowlist(vec!["api.near.email".to_string()]);
+        let policy = NetworkPolicy::Allowlist(vec!["api.near.email".into()]);
         let log = log();
 
-        let reason = decide_egress(&policy, Some("evil.example.com"), Some(42), &log);
+        let reason = decide_egress(&policy, Some("evil.example.com"), Some(42), 30, &log);
         assert!(reason.is_some(), "an unlisted host must be refused");
 
         // Refused AND recorded. The audit line is the deliverable of §C3 —
@@ -1259,10 +1473,10 @@ mod tests {
     fn an_allowed_host_is_also_recorded() {
         // Recording only refusals would leave the audit unable to answer
         // "where did this connector actually go".
-        let policy = NetworkPolicy::Allowlist(vec!["api.near.email".to_string()]);
+        let policy = NetworkPolicy::Allowlist(vec!["api.near.email".into()]);
         let log = log();
 
-        assert!(decide_egress(&policy, Some("api.near.email"), None, &log).is_none());
+        assert!(decide_egress(&policy, Some("api.near.email"), None, 30, &log).is_none());
 
         let records = log.lock().unwrap();
         assert_eq!(records.len(), 1);
@@ -1277,11 +1491,11 @@ mod tests {
         // against anything, and "cannot be checked" must never mean "allowed".
         for policy in [
             NetworkPolicy::Unrestricted,
-            NetworkPolicy::Allowlist(vec!["a.example".to_string()]),
+            NetworkPolicy::Allowlist(vec!["a.example".into()]),
         ] {
             let log = log();
-            assert!(decide_egress(&policy, None, None, &log).is_some());
-            assert!(decide_egress(&policy, Some(""), None, &log).is_some());
+            assert!(decide_egress(&policy, None, None, 30, &log).is_some());
+            assert!(decide_egress(&policy, Some(""), None, 30, &log).is_some());
             let records = log.lock().unwrap();
             assert_eq!(records.len(), 2);
             assert!(records.iter().all(|r| !r.allowed));
@@ -1296,7 +1510,7 @@ mod tests {
         let log = log();
         for host in ["api.near.email", "github.com", "example.com"] {
             assert!(
-                decide_egress(&policy, Some(host), None, &log).is_some(),
+                decide_egress(&policy, Some(host), None, 30, &log).is_some(),
                 "{} must be refused for a connector with no manifest",
                 host
             );
@@ -1310,7 +1524,7 @@ mod tests {
         // reaches what it always reached...
         let policy = resolve_network_policy(false, None);
         let log = log();
-        assert!(decide_egress(&policy, Some("anything.example"), Some(7), &log).is_none());
+        assert!(decide_egress(&policy, Some("anything.example"), Some(7), 30, &log).is_none());
         // ...and is still recorded, so the audit covers everything, not just
         // the projects that opted into an allowlist.
         let records = log.lock().unwrap();

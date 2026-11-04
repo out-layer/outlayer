@@ -367,8 +367,19 @@ interface api {
     }
 
     /// Open a task for the owner of the secret row this run was admitted to,
-    /// with this run's consent to the run that will carry it out.
+    /// with this run's consent to the run that will carry it out. In a run
+    /// that named several rows, the first row's owner; `open-for` names
+    /// another.
     open: func(request: request) -> result<opened, task-error>;
+
+    /// Open a task for `owner`: the owner of one of the secret rows this run
+    /// named and the keystore opened, admitted by name — the first row's
+    /// owner as `open` does, or another row's — the first of that owner's
+    /// rows when the run named several of theirs. An account that owns none
+    /// of the run's rows is refused `not-granted-by-name`. Everything else is
+    /// `open`: the task is that owner's, in their inbox, approved by their
+    /// wallet, and carried out by this run's preparer on this run's consent.
+    open-for: func(owner: string, request: request) -> result<opened, task-error>;
 
     /// The tasks whose preparer is this caller in this project for this
     /// owner: the open ones, and the outcomes kept.

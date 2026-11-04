@@ -83,7 +83,9 @@ and the worker:
 | stdout | — | 10 MiB; a write past it fails |
 
 A run that hits its time limit fails, and so does a run in which two HTTP
-requests each exceed the 30-second per-request timeout; either is charged for
+requests each exceed their per-request timeout — 30 seconds, or the
+`timeout_secs` the host's entry in the manifest's `network` list names
+(`CONNECTOR_MANIFEST.md`), never past the run's end; either is charged for
 the instructions and time it consumed.
 
 ## WASI Preview 1 vs Preview 2
@@ -391,7 +393,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `predecessor_account_id()` (`NEAR_PREDECESSOR_ID`) names the account that
 called the contract, and `relayer_account_id()` the relayer of a
-meta-transaction. See [WASM_ENV_VARS.md](./WASM_ENV_VARS.md) for every variable.
+meta-transaction. `secrets_rows()` (`OUTLAYER_SECRETS_ROWS`) names the secret
+rows the call named and the keystore opened — each row's owner, profile and
+the names of the variables it supplied, never a value — so a module that
+trusts a variable can tell which account stored it. See
+[WASM_ENV_VARS.md](./WASM_ENV_VARS.md) for every variable.
 
 ### Persistent Storage
 

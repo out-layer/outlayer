@@ -38,7 +38,7 @@ use super::client::{self, HttpStore, NewTask, Refusal, Scope, Store, StoreError,
 use super::crypto::{self, Purpose, Sealed, TaskKeys, DECRYPTION_FAILED};
 use super::envelope::{self, Consent, Envelope, SealedTask};
 use super::statement::{self, Approval, ApprovalRefused, Chain, Device, RpcChain};
-use super::{RunReport, TaskGrant, TasksRun};
+use super::{RowGrant, RunReport, TaskGrant, TasksRun};
 
 // A published interface version never changes a type: a changed signature is
 // a new package version, registered next to the old one (wit/README.md).
@@ -68,6 +68,13 @@ struct Ready {
     operation: Option<String>,
     scope: Scope,
     profile: String,
+    /// The other rows the run named, each with its task key. `open-for`
+    /// swaps one in as the run's row for the length of one open
+    /// ([`TasksHostState::with_row`]).
+    others: Vec<RowGrant>,
+    /// Every row the run named, in order, as the voucher of a task it opens
+    /// tells the run that carries the task out. Empty when it named one.
+    named_rows: Vec<client::NamedRow>,
     caller: String,
     /// The run's consent to the run that carries a task it opens out: its
     /// payment key, wallet, identity and compute limit. None in a run with no
@@ -217,6 +224,13 @@ impl TasksHostState {
             Ok(rpc) => rpc,
             Err(_) => return Access::Refused(wit::Reason::Unavailable, "the chain cannot be reached".to_string()),
         };
+        let named_rows = if run.other_rows.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once(client::NamedRow { account_id: owner.clone(), profile: profile.clone() })
+                .chain(run.other_rows.iter().map(|row| client::NamedRow { account_id: row.owner.clone(), profile: row.profile.clone() }))
+                .collect()
+        };
         Access::Ready(Box::new(Ready {
             grant,
             run: run.run,
@@ -225,6 +239,8 @@ impl TasksHostState {
             operation: run.operation,
             scope: Scope { project_uuid, owner },
             profile,
+            others: run.other_rows,
+            named_rows,
             caller,
             consent,
             recipient: chain.recipient,
@@ -819,9 +835,72 @@ fn display_in(display: wit::Display) -> envelope::Display {
     }
 }
 
-impl wit::Host for TasksHostState {
-    fn open(&mut self, request: wit::Request) -> Result<wit::Opened, wit::TaskError> {
-        let (opened, conversation) = (self.opened, self.conversation.clone());
+impl TasksHostState {
+    /// The index of the other row `owner` owns, or `None` for the first row's
+    /// owner.
+    fn row_of(&mut self, owner: &str, what: &str) -> Result<Option<usize>, wit::TaskError> {
+        let ready = self.access.ready()?;
+        if ready.scope.owner == owner {
+            return Ok(None);
+        }
+        match ready.others.iter().position(|row| row.owner == owner) {
+            Some(at) => Ok(Some(at)),
+            None => Err(refused(
+                wit::Reason::NotGrantedByName,
+                format!(
+                    "{owner} owns none of the secret rows this run named: {what} is for the owner of a row the call \
+                     named and the keystore opened"
+                ),
+            )),
+        }
+    }
+
+    /// Make the other row `at` the run's row — its owner, profile and task
+    /// key, with the devices read afresh — for the length of `f`, and put the
+    /// first row back after, whatever `f` answered.
+    fn with_row<R>(&mut self, at: Option<usize>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(at) = at else { return f(self) };
+        self.swap_row(at);
+        let devices = self.devices.take();
+        let answer = f(self);
+        self.devices = devices;
+        self.swap_row(at);
+        answer
+    }
+
+    fn swap_row(&mut self, at: usize) {
+        if let Access::Ready(ready) = &mut self.access {
+            let row = &mut ready.others[at];
+            std::mem::swap(&mut ready.scope.owner, &mut row.owner);
+            std::mem::swap(&mut ready.profile, &mut row.profile);
+            std::mem::swap(&mut ready.grant, &mut row.grant);
+        }
+    }
+
+    /// `f` under the first row, then under each other row until one answers
+    /// anything but `not-found`: a task of this preparer is under one of the
+    /// rows the run named.
+    fn under_any_row<R>(&mut self, mut f: impl FnMut(&mut Self) -> Result<R, wit::TaskError>) -> Result<R, wit::TaskError> {
+        let others = self.access.ready().map(|ready| ready.others.len()).unwrap_or(0);
+        let mut answer = self.with_row(None, &mut f);
+        for at in 0..others {
+            if !matches!(&answer, Err(e) if e.reason == wit::Reason::NotFound) {
+                break;
+            }
+            answer = self.with_row(Some(at), &mut f);
+        }
+        answer
+    }
+}
+
+impl TasksHostState {
+    /// `open`, for the row now in place. A task for another row's owner
+    /// (`another_owner`) opens a conversation of its own whatever this run
+    /// answered: a conversation is one owner's, and a turn in it cannot be
+    /// addressed to somebody else.
+    fn open_as(&mut self, request: wit::Request, another_owner: bool) -> Result<wit::Opened, wit::TaskError> {
+        let opened = self.opened;
+        let conversation = if another_owner { Conversation::Unanswered } else { self.conversation.clone() };
         self.count()?;
         let ready = self.access.ready()?;
         if !ready.is_the_owners() && !ready.grant.admitted_by_name {
@@ -1010,6 +1089,7 @@ impl wit::Host for TasksHostState {
                 compute_limit_usd: consent.compute_limit_usd.clone(),
                 operation: by.operation.clone(),
                 build: task.build.clone(),
+                secrets_refs: ready.named_rows.clone(),
             }),
             _ => None,
         };
@@ -1060,21 +1140,53 @@ impl wit::Host for TasksHostState {
         Ok(answer)
     }
 
+}
+
+impl wit::Host for TasksHostState {
+    fn open_for(&mut self, owner: String, request: wit::Request) -> Result<wit::Opened, wit::TaskError> {
+        let at = match self.row_of(&owner, "a task") {
+            Ok(at) => at,
+            Err(e) => {
+                self.count()?;
+                return Err(e);
+            }
+        };
+        self.with_row(at, |host| host.open_as(request, at.is_some()))
+    }
+
+    fn open(&mut self, request: wit::Request) -> Result<wit::Opened, wit::TaskError> {
+        self.open_as(request, false)
+    }
+
     fn mine(&mut self) -> Result<Vec<wit::Outcome>, wit::TaskError> {
-        let ready = self.enter()?;
-        let tasks = ready.store.mine(&ready.scope, &ready.caller, None).map_err(|e| store_failed(&e))?;
-        tasks.into_iter().map(|task| ready.outcome(task, Asked::TheList)).collect()
+        // Under every row the run named: a task this caller prepared is the
+        // owner's of whichever row it was opened for.
+        self.enter()?;
+        let rows = self.access.ready().map(|ready| ready.others.len()).unwrap_or(0);
+        let mut all = Vec::new();
+        for at in std::iter::once(None).chain((0..rows).map(Some)) {
+            let outcomes = self.with_row(at, |host| {
+                let ready = host.access.ready()?;
+                let tasks = ready.store.mine(&ready.scope, &ready.caller, None).map_err(|e| store_failed(&e))?;
+                tasks.into_iter().map(|task| ready.outcome(task, Asked::TheList)).collect::<Result<Vec<_>, _>>()
+            })?;
+            all.extend(outcomes);
+        }
+        Ok(all)
     }
 
     fn status(&mut self, id: String) -> Result<wit::Outcome, wit::TaskError> {
-        let ready = self.enter()?;
+        self.enter()?;
         an_id(&id)?;
-        let mut tasks = ready.store.mine(&ready.scope, &ready.caller, Some(&id)).map_err(|e| store_failed(&e))?;
-        match (tasks.pop(), tasks.is_empty()) {
-            (Some(task), true) if task.id == id => ready.outcome(task, Asked::ThisTask),
-            (None, _) => Err(refused(wit::Reason::NotFound, "no such task")),
-            _ => Err(refused(wit::Reason::Internal, "the task store answered with other tasks than the one asked")),
-        }
+        self.under_any_row(|host| {
+            let ready = host.access.ready()?;
+            let mut tasks = ready.store.mine(&ready.scope, &ready.caller, Some(&id)).map_err(|e| store_failed(&e))?;
+            match (tasks.pop(), tasks.is_empty()) {
+                (Some(task), true) if task.id == id => ready.outcome(task, Asked::ThisTask),
+                (None, _) => Err(refused(wit::Reason::NotFound, "no such task")),
+                _ => Err(refused(wit::Reason::Internal, "the task store answered with other tasks than the one asked")),
+            }
+        })
     }
 
     fn answered(
@@ -1135,15 +1247,21 @@ impl wit::Host for TasksHostState {
     }
 
     fn cancel(&mut self, id: String) -> Result<(), wit::TaskError> {
-        let ready = self.enter()?;
+        self.enter()?;
         an_id(&id)?;
-        ready.store.cancel(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
+        self.under_any_row(|host| {
+            let ready = host.access.ready()?;
+            ready.store.cancel(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
+        })
     }
 
     fn delete(&mut self, id: String) -> Result<(), wit::TaskError> {
-        let ready = self.enter()?;
+        self.enter()?;
         an_id(&id)?;
-        ready.store.delete(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
+        self.under_any_row(|host| {
+            let ready = host.access.ready()?;
+            ready.store.delete(&ready.scope, &ready.caller, &id).map_err(|e| store_failed(&e))
+        })
     }
 
     fn unlock(&mut self) -> Result<u32, wit::TaskError> {

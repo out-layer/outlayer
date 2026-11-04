@@ -71,10 +71,19 @@ use crate::tasks::{add_tasks_to_linker, TasksHostState};
 
 use super::ExecutionContext;
 
-/// Max time for a single outbound HTTP request from WASI (seconds)
-const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// After this many timed-out HTTP requests, WASI execution is aborted
 const HTTP_TIMEOUT_ABORT_THRESHOLD: u32 = 2;
+
+/// What one outbound request is given: its host's entry in the manifest, or
+/// the default, and never more than what is left of the run. At least one
+/// second, so a request made at the run's end still times out rather than
+/// never starting.
+fn request_timeout_secs(configured: Option<u64>, left: std::time::Duration) -> u64 {
+    configured
+        .unwrap_or(crate::connector_manifest::DEFAULT_HTTP_TIMEOUT_SECS)
+        .min(left.as_secs())
+        .max(1)
+}
 
 /// Host state for WASI P2 execution
 ///
@@ -116,6 +125,9 @@ struct HostState {
     /// The run's bounds (`sandbox::store_limits`), consulted by wasmtime on
     /// every growth of a memory or a table.
     limits: wasmtime::StoreLimits,
+    /// When the run's time is up: an outbound request is never given more
+    /// than what is left.
+    run_deadline: std::time::Instant,
 }
 
 impl WasiView for HostState {
@@ -163,7 +175,7 @@ impl WasiHttpView for HostState {
             tracing::warn!("WASI HTTP aborted: {} requests timed out, refusing new requests", current);
             return Ok(HostFutureIncomingResponse::ready(Ok(Err(
                 wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(
-                    Some(format!("Execution aborted: {} HTTP requests exceeded {}s timeout", current, HTTP_REQUEST_TIMEOUT_SECS))
+                    Some(format!("Execution aborted: {} HTTP requests exceeded their timeout", current))
                 )
             ))));
         }
@@ -174,7 +186,11 @@ impl WasiHttpView for HostState {
             .uri()
             .port_u16()
             .unwrap_or(if request.uri().scheme_str() == Some("http") { 80 } else { 443 });
-        let timeout_duration = std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS);
+        let timeout_secs = request_timeout_secs(
+            host.as_deref().and_then(|h| self.network_policy.timeout_for(h)),
+            self.run_deadline.saturating_duration_since(std::time::Instant::now()),
+        );
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
         // Body size as the guest declared it. Only used for the audit line, so
         // an absent Content-Length is recorded as unknown rather than guessed.
@@ -196,6 +212,7 @@ impl WasiHttpView for HostState {
             &self.network_policy,
             host.as_deref(),
             declared_bytes,
+            timeout_secs,
             &self.egress_log,
         ) {
             tracing::warn!(
@@ -257,7 +274,7 @@ impl WasiHttpView for HostState {
                     let count = timeout_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     tracing::warn!(
                         "WASI HTTP request timed out after {}s: {} (timeout count: {}/{})",
-                        HTTP_REQUEST_TIMEOUT_SECS, url, count, HTTP_TIMEOUT_ABORT_THRESHOLD
+                        timeout_secs, url, count, HTTP_TIMEOUT_ABORT_THRESHOLD
                     );
                     if count >= HTTP_TIMEOUT_ABORT_THRESHOLD {
                         tracing::error!("HTTP abuse detected: forcing WASI termination via epoch interrupt");
@@ -677,6 +694,7 @@ pub async fn execute(
         debug!("🔒 Outbound allowlist active: {:?}", network_policy);
     }
 
+    let timeout_secs = limits.max_execution_seconds.max(5);
     let host_state = HostState {
         wasi_ctx: wasi_builder.build(),
         wasi_http_ctx: WasiHttpCtx::new(),
@@ -694,13 +712,13 @@ pub async fn execute(
         network_policy,
         egress_log,
         limits: super::sandbox::store_limits(limits.max_memory_mb),
+        run_deadline: std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs),
     };
 
     // Create store with the run's bounds, the fuel limit and the epoch deadline
     let mut store = Store::new(&engine, host_state);
     store.limiter(|s| &mut s.limits);
     store.set_fuel(limits.max_instructions)?;
-    let timeout_secs = limits.max_execution_seconds.max(5);
     // Epoch interruption: engine ticks every second, deadline = timeout_secs ticks.
     // This interrupts even during host calls (wasi-http) unlike tokio::time::timeout.
     store.set_epoch_deadline(timeout_secs);
@@ -784,9 +802,9 @@ pub async fn execute(
     if http_timeouts >= HTTP_TIMEOUT_ABORT_THRESHOLD {
         return Err(super::sandbox::RunFailed {
             message: format!(
-                "Execution terminated: {} HTTP requests exceeded {}s timeout limit (penalty). \
+                "Execution terminated: {} HTTP requests exceeded their timeout (penalty). \
                  Full execution cost is charged with no refund (consumed {} instructions)",
-                http_timeouts, HTTP_REQUEST_TIMEOUT_SECS, fuel_consumed
+                http_timeouts, fuel_consumed
             ),
             instructions: fuel_consumed,
             penalty: true,
@@ -843,5 +861,21 @@ pub async fn execute(
             debug!("Component execution failed: {}", error_msg);
             Err(super::sandbox::RunFailed { message: error_msg, instructions: fuel_consumed, penalty: false }.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod request_timeout_tests {
+    use super::request_timeout_secs;
+    use std::time::Duration;
+
+    #[test]
+    fn a_request_gets_its_hosts_time_cut_to_what_is_left_of_the_run() {
+        let plenty = Duration::from_secs(170);
+        assert_eq!(request_timeout_secs(None, plenty), 30, "no entry: the default");
+        assert_eq!(request_timeout_secs(Some(120), plenty), 120, "the entry's time");
+        assert_eq!(request_timeout_secs(Some(120), Duration::from_secs(40)), 40, "never past the run's end");
+        assert_eq!(request_timeout_secs(None, Duration::from_secs(10)), 10, "the default is cut the same way");
+        assert_eq!(request_timeout_secs(Some(120), Duration::ZERO), 1, "at the end: one second, then it times out");
     }
 }

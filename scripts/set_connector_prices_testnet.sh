@@ -76,6 +76,8 @@ near_call() {
 #                                          not tell a working refund from a
 #                                          dropped one
 #   fetch              15000, 100%       — the whole fee to the author
+#   timed_fetch_*      15000, 100%       — as fetch; the pair exercises a host
+#                                          entry's own request time
 #   sockets            0                 — raw TCP and DNS must be refused;
 #                                          free, it moves nothing
 #   trap / sleep       10000, 70%        — the run never completes: a trap and
@@ -151,6 +153,8 @@ near_call set_project_pricing "$(cat <<EOF
       {"operation": "burn",            "price_usd": "10000", "developer_share_bp": 3333},
       {"operation": "fetch",           "price_usd": "15000", "developer_share_bp": 10000},
       {"operation": "forbidden_fetch", "price_usd": "15000", "developer_share_bp": 3333},
+      {"operation": "timed_fetch_within", "price_usd": "15000", "developer_share_bp": 10000},
+      {"operation": "timed_fetch_beyond", "price_usd": "15000", "developer_share_bp": 10000},
       {"operation": "vrf",             "price_usd": "10000", "developer_share_bp": 0},
       {"operation": "refund",          "price_usd": "10000", "developer_share_bp": 7000},
       {"operation": "sockets",         "price_usd": "0",     "developer_share_bp": 0},
