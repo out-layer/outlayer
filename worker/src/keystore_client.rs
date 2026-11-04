@@ -2169,7 +2169,7 @@ mod the_decrypt_request_carries_the_executing_build {
 #[cfg(test)]
 mod signing_key_requests {
     use super::*;
-    use crate::signing_keys::{CallerKind, KeyBinding, ManifestKey, SigningKeyType};
+    use crate::signing_keys::{KeyBinding, KeyCaller, ManifestKey, SigningKeyType};
 
     const H: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const SEED: &str = "b5ca092c9bb7c321f2d6f69c6eb147907d5df9fcc2309552786e7502706a7493";
@@ -2219,7 +2219,7 @@ mod signing_key_requests {
             path: "records".into(),
             key_type: SigningKeyType::Ed25519,
             bind: KeyBinding::Project,
-            caller: CallerKind::Signer,
+            caller: KeyCaller::Signer,
             vault: None,
         }]
     }
@@ -2483,7 +2483,7 @@ mod signing_key_requests {
         vec![crate::encryption_keys::EncryptionManifestKey {
             path: "records".into(),
             bind: KeyBinding::Project,
-            caller: CallerKind::Signer,
+            caller: crate::signing_keys::CallerKind::Signer,
             vault: None,
         }]
     }

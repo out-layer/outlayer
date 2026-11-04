@@ -30,6 +30,7 @@ One manifest per build, picked by a cargo feature (`manifests/`):
 | `signing-key-probe-project.wasm` | `project` (default) | `alpha`, `beta` — `bind: "project"` | a project version (WasmUrl) |
 | `signing-key-probe-project-v2.wasm` | `project,v2` | the same | a second version of that project |
 | `signing-key-probe-project-pred.wasm` | `project-pred` | `alpha` — `caller: "predecessor"`, `bind: "project"` | a version of the same project |
+| `signing-key-probe-project-none.wasm` | `project-none` | `alpha` — `caller: "none"`, `bind: "project"`: one key for every caller | a version of the same project |
 | `signing-key-probe-wasm.wasm` | `wasm` | `code` — `bind: "wasm"` | a direct run of its wasm URL |
 | `signing-key-probe-wasm-v2.wasm` | `wasm,v2` | the same | a direct run — another build, another key |
 | `signing-key-probe-project-vault.wasm` | `project-vault` | `alpha`, and `treasury` with vault `vault.alice.near` | the worker's component tests |
@@ -44,6 +45,7 @@ One manifest per build, picked by a cargo feature (`manifests/`):
 | `signing-key-probe-encryption-vault.wasm` | `encryption-vault` | encryption `alpha`, and `treasury` with vault `vault.alice.near` | a project version whose owner has that vault |
 | `signing-key-probe-encryption-pred.wasm` | `encryption-pred` | encryption `alpha` — `caller: "predecessor"`, `bind: "project"` | a project version |
 | `signing-key-probe-encryption-typed.wasm` | `encryption-typed` | encryption `alpha` with a `type` member | refused before it runs, however it is run |
+| `signing-key-probe-encryption-none.wasm` | `encryption-none` | encryption `alpha` with `caller: "none"` | refused before it runs, however it is run |
 
 `v2` changes one constant, so the same manifest has a second sha256. Only the
 encryption builds import `outlayer:encryption-keys`; the `encryption` build
@@ -110,7 +112,10 @@ except `project-pred`'s and `encryption-pred`'s. A `caller: "predecessor"` key b
 that called the contract instead — a DAO, a wallet contract — and refuses a run
 that carries none. The caller kind is part of the derivation: on a direct call,
 where the predecessor is the signer, the predecessor key at `alpha` is still
-another key than the signer key at `alpha`.
+another key than the signer key at `alpha`. `project-none`'s `alpha` is
+`caller: "none"`: one key for every caller of the project, neither the signer's
+nor the predecessor's; its `host_nep413` is an `err`. `encryption-none` declares
+an encryption key of no caller, which does not parse.
 
 Storage has an owner too: every record a run reads or writes sits in one
 account's cell of the project, and the manifest's `storage_account` names which

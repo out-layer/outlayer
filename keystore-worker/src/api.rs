@@ -1452,7 +1452,7 @@ async fn decrypt_with_keys(
                     k.kind.label(),
                     k.bind.label(),
                     k.caller.label(),
-                    k.account,
+                    k.account.as_ref().map(|a| a.as_str()).unwrap_or("-"),
                     k.vault.as_ref().map(|v| v.as_str()).unwrap_or("default")
                 )
             })

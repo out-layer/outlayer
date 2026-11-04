@@ -489,8 +489,10 @@ functions. The keystore derives each key for the run, bound to the project's
 on-chain uuid and to one account of the run, chosen per key with `caller`:
 `signer` (the default — the transaction's signer, the payment key's owner over
 HTTPS) or `predecessor` (the account that called the contract — a DAO, a wallet
-contract, the token contract on an `ft_transfer_call`). Your code names the key
-by `path` and gets a signature back, never the key. The key follows the uuid,
+contract, the token contract on an `ft_transfer_call`) — or `none`, one ed25519
+key for every caller of the project, for statements a verifier checks against
+one pinned public key. Your code names the key by `path` and gets a signature
+back, never the key. The key follows the uuid,
 so it survives code upgrades and a transfer of the project.
 
 Use one when somebody must be able to check what your connector said or did
@@ -517,7 +519,14 @@ Sign only messages your code composes from fields it has parsed and checked.
 And with a `signer` key, any contract the signer ever transacts with can start a
 run under the signer's key with input of its own — the input is not the
 signer's intent. A `predecessor` key binds to that contract instead; both are
-legitimate, and you choose.
+legitimate, and you choose. A `none` key is driven by every caller alike: sign
+with it only what your code composes under its own prefix, name the caller from
+the host — `NEAR_USER_ACCOUNT_ID`, the account that paid, or `NEAR_SENDER_ID`
+(`env::signer_account_id()`), the account the run acts as, which differs only
+under a bound identity — and expect no `sign-nep413` from it — the
+host refuses one, because it would log every caller in as the key's account.
+A caller's own secret rows are its input too: sign a variable only when
+`OUTLAYER_SECRETS_ROWS` shows it came from a row whose owner you trust.
 
 What a signing key has that a sub-key does not: it needs no wallet, so it works
 from `request_execution` as well as over HTTPS, and nothing outside a run of

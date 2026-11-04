@@ -110,8 +110,8 @@ impl Declared for EncryptionManifestKey {
     fn bind(&self) -> KeyBinding {
         self.bind
     }
-    fn caller(&self) -> CallerKind {
-        self.caller
+    fn caller(&self) -> crate::signing_keys::KeyCaller {
+        self.caller.into()
     }
     fn vault(&self) -> Option<&str> {
         self.vault.as_deref()
@@ -453,6 +453,9 @@ mod tests {
             serde_json::json!([{}]),
             serde_json::json!([{ "path": "k", "bind": "hash" }]),
             serde_json::json!([{ "path": "k", "caller": "sender" }]),
+            // No encryption key is of no caller: one every caller drives would
+            // let one caller resubmit another's sealed request and read it.
+            serde_json::json!([{ "path": "k", "caller": "none" }]),
             serde_json::json!([{ "path": "k", "valut": "vault.a.near" }]),
             serde_json::json!([{ "name": "k" }]),
         ] {

@@ -827,8 +827,9 @@ async fn a_sealed_record_is_ciphertext_under_a_mac_name() {
 }
 
 /// The predecessor build runs with its key; the typed build's manifest does
-/// not read — `type` is an unknown field on an encryption key — so a run of it
-/// is refused before anything is served.
+/// not read — `type` is an unknown field on an encryption key — and neither
+/// does the build whose encryption key is of no caller, so a run of either is
+/// refused before anything is served.
 #[tokio::test]
 async fn the_predecessor_build_runs_and_the_typed_build_does_not_read() {
     let pred = probe("encryption-pred");
@@ -841,6 +842,11 @@ async fn the_predecessor_build_runs_and_the_typed_build_does_not_read() {
     let typed = probe("encryption-typed");
     let e = offchainvm_worker::connector_manifest::manifest_from_wasm(&typed).unwrap_err();
     assert!(e.contains("unknown field `type`"), "{e}");
+
+    // No encryption key is of no caller: the manifest does not read.
+    let none = probe("encryption-none");
+    let e = offchainvm_worker::connector_manifest::manifest_from_wasm(&none).unwrap_err();
+    assert!(e.contains("unknown variant `none`"), "{e}");
 }
 
 /// The storage build without storage — what a direct run of its wasm URL is —

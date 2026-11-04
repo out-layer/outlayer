@@ -3277,20 +3277,20 @@ mod the_substitution_is_made_in_one_place {
 mod signing_key_seed_audit {
     use super::*;
     use crate::signing_keys::{
-        validate_request, CallerKind, KeyBinding, ProjectUuid, SigningKeyRequest, SigningKeyType, MAX_SIGNING_KEYS,
+        validate_request, KeyBinding, KeyCaller, ProjectUuid, SigningKeyRequest, SigningKeyType, MAX_SIGNING_KEYS,
         SIGNING_KEY_LABEL,
     };
 
     const H: &str = "abababababababababababababababababababababababababababababababab";
 
     /// Signing-key inputs across both shapes — `project` keys on a project run,
-    /// `wasm` keys on a direct run — both callers and every type, with fields
+    /// `wasm` keys on a direct run — every caller (`none` as ed25519) and every type, with fields
     /// chosen to look like other families' segments.
     fn signing_inputs() -> Vec<String> {
         let mut out = Vec::new();
         let paths = [
             "near", "evm", "check", "vrf-key", "storage", "project", "wasm_hash", "k", "wallet", "ecies", "signer", "predecessor",
-            "ed25519", "secp256k1", "ethereum",
+            "ed25519", "secp256k1", "ethereum", "none",
         ];
         let runs = [
             (Some(("wallet.near/evm", "p0000000000000001")), KeyBinding::Project),
@@ -3300,8 +3300,13 @@ mod signing_key_seed_audit {
         ];
         for key_type in SigningKeyType::ALL {
             for (project, bind) in runs {
-                for account in ["wallet.near", "ecies.near", "project.near", "signer.near", "secp256k1.near", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] {
-                    for caller in [CallerKind::Signer, CallerKind::Predecessor] {
+                for account in ["wallet.near", "ecies.near", "project.near", "signer.near", "none.near", "secp256k1.near", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] {
+                    // A key of no caller is ed25519 only.
+                    let callers: &[KeyCaller] = match key_type {
+                        SigningKeyType::Ed25519 => &[KeyCaller::Signer, KeyCaller::Predecessor, KeyCaller::None],
+                        SigningKeyType::Secp256k1 => &[KeyCaller::Signer, KeyCaller::Predecessor],
+                    };
+                    for &caller in callers {
                         for chunk in paths.chunks(MAX_SIGNING_KEYS) {
                             let keys: Vec<SigningKeyRequest> = chunk
                                 .iter()
@@ -3387,6 +3392,7 @@ mod signing_key_seed_audit {
         let signing = signing_inputs();
         assert!(signing.iter().any(|s| s.contains(":project:")) && signing.iter().any(|s| s.contains(":wasm:")));
         assert!(signing.iter().any(|s| s.contains(":signer:")) && signing.iter().any(|s| s.contains(":predecessor:")));
+        assert!(signing.iter().any(|s| s.contains(":none:")), "the audit covers keys of no caller");
         for t in SigningKeyType::ALL {
             let segment = format!("{SIGNING_KEY_LABEL}{}:", t.label());
             assert!(signing.iter().any(|s| s.starts_with(&segment)), "the audit covers {segment}");
@@ -3426,6 +3432,32 @@ mod signing_key_seed_audit {
                     assert!(!b.iter().any(|t| t.starts_with(s.as_str()) || s.starts_with(t.as_str())), "{s}");
                 }
             }
+        }
+    }
+
+    /// A key of no caller spells no string an account caller's key spells,
+    /// nor a prefix of one, either way round — the account names include
+    /// `none.near`, `signer.near` and paths spelled `signer`, `none`.
+    #[test]
+    fn a_key_of_no_caller_never_spells_an_account_callers_string() {
+        let all = signing_inputs();
+        let (no_caller, account): (Vec<&String>, Vec<&String>) = all.iter().partition(|s| {
+            let parts: Vec<&str> = s.split(':').collect();
+            parts.len() == 7 && parts[5] == "none"
+        });
+        assert!(!no_caller.is_empty() && !account.is_empty());
+        for n in &no_caller {
+            assert!(n.starts_with(&format!("{SIGNING_KEY_LABEL}ed25519:")), "{n} is not ed25519");
+            for a in &account {
+                assert!(!a.starts_with(n.as_str()) && !n.starts_with(a.as_str()), "{n} / {a}");
+            }
+        }
+        // Every account caller's string has eight segments, its caller word
+        // one of two; every no-caller string seven, its caller word `none`.
+        for a in &account {
+            let parts: Vec<&str> = a.split(':').collect();
+            assert_eq!(parts.len(), 8, "{a}");
+            assert!(parts[5] == "signer" || parts[5] == "predecessor", "{a}");
         }
     }
 
@@ -3480,7 +3512,7 @@ mod signing_key_seed_audit {
                 path: "k".into(),
                 key_type: SigningKeyType::Ed25519,
                 bind: KeyBinding::Project,
-                caller: CallerKind::Signer,
+                caller: KeyCaller::Signer,
                 vault: None,
             }],
         )
@@ -3578,7 +3610,7 @@ mod encryption_key_seed_audit {
                                 bind.label().to_string(),
                                 bound_to,
                                 caller.label().to_string(),
-                                k.account.to_string(),
+                                k.account.as_ref().expect("an account caller's key has its account").to_string(),
                                 k.path.as_str().to_string(),
                             ];
                             out.push((tuple, String::from_utf8(k.input.as_bytes().to_vec()).unwrap()));
@@ -3603,7 +3635,7 @@ mod encryption_key_seed_audit {
     /// Signing-key inputs of one type over the same runs, callers and paths.
     fn signing_inputs_of(key_type: SigningKeyType) -> Vec<String> {
         inputs_of(
-            |p, bind, caller| SigningKeyRequest { path: p.to_string(), key_type, bind, caller, vault: None },
+            |p, bind, caller| SigningKeyRequest { path: p.to_string(), key_type, bind, caller: caller.into(), vault: None },
             crate::signing_keys::MAX_SIGNING_KEYS,
         )
         .into_iter()
@@ -4105,7 +4137,7 @@ mod signing_keys_at_the_door {
             path: path.into(),
             key_type: SigningKeyType::Ed25519,
             bind,
-            caller: CallerKind::Signer,
+            caller: CallerKind::Signer.into(),
             vault: vault.map(Into::into),
         }
     }
@@ -4120,7 +4152,7 @@ mod signing_keys_at_the_door {
 
     /// A project key of the run's predecessor.
     fn predkey(path: &str) -> SigningKeyRequest {
-        SigningKeyRequest { caller: CallerKind::Predecessor, ..pkey(path) }
+        SigningKeyRequest { caller: CallerKind::Predecessor.into(), ..pkey(path) }
     }
 
     /// A keyed request naming no row: a project run when `project` is named, a
@@ -5031,7 +5063,7 @@ mod signing_keys_at_the_door {
         crate::encryption_keys::EncryptionKeyRequest {
             path: path.into(),
             bind,
-            caller: CallerKind::Signer,
+            caller: CallerKind::Signer.into(),
             vault: vault.map(Into::into),
         }
     }

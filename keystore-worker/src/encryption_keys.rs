@@ -98,8 +98,8 @@ impl KeyDeclaration for EncryptionKeyRequest {
     fn bind(&self) -> KeyBinding {
         self.bind
     }
-    fn caller(&self) -> CallerKind {
-        self.caller
+    fn caller(&self) -> crate::signing_keys::KeyCaller {
+        self.caller.into()
     }
     fn vault(&self) -> Option<&str> {
         self.vault.as_deref()
@@ -140,7 +140,7 @@ mod tests {
     }
 
     fn signing(path: &str, bind: KeyBinding) -> SigningKeyRequest {
-        SigningKeyRequest { path: path.into(), key_type: SigningKeyType::Ed25519, bind, caller: CallerKind::Signer, vault: None }
+        SigningKeyRequest { path: path.into(), key_type: SigningKeyType::Ed25519, bind, caller: CallerKind::Signer.into(), vault: None }
     }
 
     /// A run through project `alice.near/app` as `bob.near`, on build H1.
@@ -304,6 +304,10 @@ mod tests {
             r#"{"path":"k","valut":"vault.alice.near"}"#,
             r#"{"path":"k","bind":"hash"}"#,
             r#"{"path":"k","caller":"sender"}"#,
+            // A project-wide encryption key would let one caller resubmit
+            // another's sealed request and read the answer: `none` is no
+            // value of an encryption key's `caller`.
+            r#"{"path":"k","caller":"none"}"#,
             r#"{"name":"k"}"#,
         ] {
             assert!(serde_json::from_str::<EncryptionKeyRequest>(body).is_err(), "{body}");

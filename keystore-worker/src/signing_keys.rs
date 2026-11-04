@@ -30,8 +30,14 @@
 //!   `predecessor` key on a request that carries no `predecessor_id` is
 //!   refused.
 //!
+//! * `none` — no account, a signing key of type ed25519 only ([`KeyCaller`]):
+//!   `signing-key:v1:ed25519:{project|wasm}:{bound_to}:none:{path}`, one key
+//!   for every caller of the project (or of the build). An encryption key's
+//!   `caller` has no `none`.
+//!
 //! The choice is a segment of the string with a fixed label, so a signer key
-//! and a predecessor key for one account are two keys.
+//! and a predecessor key for one account are two keys, and a key of no caller
+//! — whose string has no account segment — is a third.
 //!
 //! A key is issued strictly by how the code is run. A request that names a
 //! `project_id` is a project run; one that names none is a direct run of a wasm
@@ -218,7 +224,7 @@ pub trait KeyDeclaration {
     fn path(&self) -> &str;
     fn kind(&self) -> KeyKind;
     fn bind(&self) -> KeyBinding;
-    fn caller(&self) -> CallerKind;
+    fn caller(&self) -> KeyCaller;
     fn vault(&self) -> Option<&str>;
 }
 
@@ -296,6 +302,58 @@ impl CallerKind {
     }
 }
 
+/// Whom a declared key belongs to: one of the job's accounts
+/// ([`CallerKind`]), or — a signing key only — no caller at all. What a
+/// signing key's `caller` parses as; an encryption key's `caller` parses as
+/// [`CallerKind`], which has no `none`, so a project-wide encryption key
+/// cannot even be written.
+///
+/// A `none` key belongs to its binding and its path alone:
+/// `signing-key:v1:{type}:project:{project_uuid}:none:{path}` or
+/// `signing-key:v1:{type}:wasm:{wasm_sha256}:none:{path}`. Every caller of
+/// the project (or of the build) drives the same key, so it speaks for the
+/// code and never for a caller: ed25519 only, and the worker signs no
+/// NEP-413 message with it — a NEP-413 signature is a login as the key's
+/// implicit account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyCaller {
+    #[default]
+    Signer,
+    Predecessor,
+    None,
+}
+
+impl KeyCaller {
+    /// The segment this choice contributes to the derivation string.
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyCaller::Signer => CallerKind::Signer.label(),
+            KeyCaller::Predecessor => CallerKind::Predecessor.label(),
+            KeyCaller::None => "none",
+        }
+    }
+
+    /// The account of the job the key belongs to; `None` for a key of no
+    /// caller.
+    pub fn account_kind(self) -> Option<CallerKind> {
+        match self {
+            KeyCaller::Signer => Some(CallerKind::Signer),
+            KeyCaller::Predecessor => Some(CallerKind::Predecessor),
+            KeyCaller::None => None,
+        }
+    }
+}
+
+impl From<CallerKind> for KeyCaller {
+    fn from(caller: CallerKind) -> Self {
+        match caller {
+            CallerKind::Signer => KeyCaller::Signer,
+            CallerKind::Predecessor => KeyCaller::Predecessor,
+        }
+    }
+}
+
 /// One key as the worker asks for it, copied from the running artefact's
 /// manifest. Unknown fields are refused: a misspelled `vault` would otherwise
 /// be read as "no vault" and derive from the default master, a misspelled
@@ -311,7 +369,7 @@ pub struct SigningKeyRequest {
     #[serde(default)]
     pub bind: KeyBinding,
     #[serde(default)]
-    pub caller: CallerKind,
+    pub caller: KeyCaller,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault: Option<String>,
 }
@@ -327,7 +385,7 @@ impl KeyDeclaration for SigningKeyRequest {
     fn bind(&self) -> KeyBinding {
         self.bind
     }
-    fn caller(&self) -> CallerKind {
+    fn caller(&self) -> KeyCaller {
         self.caller
     }
     fn vault(&self) -> Option<&str> {
@@ -502,6 +560,24 @@ impl DerivationInput {
         account: &AccountId,
         path: &KeyPath,
     ) -> Result<Self, String> {
+        Self::from_parts(kind, binding, &[caller.label(), account.as_str()], path)
+    }
+
+    /// A signing key of no caller (`caller: "none"`):
+    /// `signing-key:v1:{type}:project:{project_uuid}:none:{path}` or
+    /// `signing-key:v1:{type}:wasm:{wasm_sha256}:none:{path}`. The caller
+    /// segment is the fixed word `none` and no account follows, so this
+    /// string is never one a `signer` or `predecessor` key spells: their
+    /// caller segment is another word. An encryption key, and a signing key
+    /// of any type but ed25519, is refused here as in [`validate_request`].
+    pub fn of_no_caller(kind: KeyKind, binding: Binding<'_>, path: &KeyPath) -> Result<Self, String> {
+        if kind != KeyKind::Signing(SigningKeyType::Ed25519) {
+            return Err(format!("{} of type {} cannot be of no caller", kind.family().a_noun(), kind.label()));
+        }
+        Self::from_parts(kind, binding, &[KeyCaller::None.label()], path)
+    }
+
+    fn from_parts(kind: KeyKind, binding: Binding<'_>, caller: &[&str], path: &KeyPath) -> Result<Self, String> {
         let (tag, bound_to) = match binding {
             Binding::Project(uuid) => (KeyBinding::Project.label(), uuid.as_str()),
             Binding::Wasm(wasm) => (KeyBinding::Wasm.label(), wasm.as_str()),
@@ -509,7 +585,9 @@ impl DerivationInput {
         let parts: Vec<&str> = kind
             .type_segment()
             .into_iter()
-            .chain([tag, bound_to, caller.label(), account.as_str(), path.as_str()])
+            .chain([tag, bound_to])
+            .chain(caller.iter().copied())
+            .chain([path.as_str()])
             .collect();
         let family = kind.family();
         if let Some(bad) = parts.iter().find(|p| p.is_empty() || p.contains(':')) {
@@ -547,9 +625,10 @@ pub struct ValidatedKey {
     pub path: KeyPath,
     pub kind: KeyKind,
     pub bind: KeyBinding,
-    pub caller: CallerKind,
-    /// The job's signer or predecessor, as `caller` says.
-    pub account: AccountId,
+    pub caller: KeyCaller,
+    /// The job's signer or predecessor, as `caller` says; `None` exactly for
+    /// a key of no caller.
+    pub account: Option<AccountId>,
     pub vault: Option<AccountId>,
 }
 
@@ -609,7 +688,18 @@ impl ValidatedKeys {
                     ));
                 }
             };
-            let input = DerivationInput::new(key.kind, binding, key.caller, &key.account, &key.path)?;
+            let input = match (key.caller.account_kind(), key.account.as_ref()) {
+                (Some(caller), Some(account)) => DerivationInput::new(key.kind, binding, caller, account, &key.path)?,
+                (None, None) => DerivationInput::of_no_caller(key.kind, binding, &key.path)?,
+                // `validate_request` pairs them; anything else is a key it did not make.
+                _ => {
+                    return Err(format!(
+                        "key {:?}: caller {} and its account do not agree",
+                        key.path.as_str(),
+                        key.caller.label()
+                    ))
+                }
+            };
             keys.push(BoundKey {
                 path: key.path,
                 kind: key.kind,
@@ -645,9 +735,10 @@ pub struct BoundKey {
     pub path: KeyPath,
     pub kind: KeyKind,
     pub bind: KeyBinding,
-    pub caller: CallerKind,
-    /// The account the key belongs to: the job's signer or predecessor.
-    pub account: AccountId,
+    pub caller: KeyCaller,
+    /// The account the key belongs to: the job's signer or predecessor;
+    /// `None` for a key of no caller.
+    pub account: Option<AccountId>,
     pub vault: Option<AccountId>,
     pub input: DerivationInput,
 }
@@ -741,14 +832,27 @@ pub fn validate_request<D: KeyDeclaration>(
             }
         }
         let account = match request.caller() {
-            CallerKind::Signer => signer.clone(),
-            CallerKind::Predecessor => predecessor.clone().ok_or_else(|| {
+            KeyCaller::Signer => Some(signer.clone()),
+            KeyCaller::Predecessor => Some(predecessor.clone().ok_or_else(|| {
                 format!(
                     "key {:?} belongs to the predecessor (caller \"predecessor\"), and this run carries no \
                      predecessor_id to bind it to",
                     path.as_str()
                 )
-            })?,
+            })?),
+            // Every caller drives one such key: it signs for the code, never
+            // for a caller, and only as ed25519. An encryption key of no
+            // caller cannot be written; refused here all the same.
+            KeyCaller::None if kind == KeyKind::Signing(SigningKeyType::Ed25519) => None,
+            KeyCaller::None => {
+                return Err(format!(
+                    "key {:?}: {} of type {} cannot be of no caller (caller \"none\"); only an ed25519 signing \
+                     key can",
+                    path.as_str(),
+                    kind.family().a_noun(),
+                    kind.label()
+                ))
+            }
         };
         let vault = match (request.vault(), request.bind()) {
             (None, _) => None,
@@ -903,7 +1007,7 @@ mod tests {
             path: path.to_string(),
             key_type: SigningKeyType::Ed25519,
             bind: KeyBinding::Project,
-            caller: CallerKind::Signer,
+            caller: KeyCaller::Signer,
             vault: None,
         }
     }
@@ -913,7 +1017,7 @@ mod tests {
     }
 
     fn pred_req(path: &str) -> SigningKeyRequest {
-        SigningKeyRequest { caller: CallerKind::Predecessor, ..req(path) }
+        SigningKeyRequest { caller: KeyCaller::Predecessor, ..req(path) }
     }
 
     /// A run through project `alice.near/app` as `bob.near`, on build H1.
@@ -944,7 +1048,7 @@ mod tests {
         assert_eq!(project.id.owner().as_str(), "alice.near");
         assert_eq!(project.uuid.as_str(), P1);
         assert_eq!(v.signer.as_str(), "bob.near");
-        assert_eq!(v.keys[0].account.as_str(), "bob.near");
+        assert_eq!(v.keys[0].account.as_ref().unwrap().as_str(), "bob.near");
         assert!(v.predecessor.is_none());
         let w = bound_direct(&[wasm_req("session")]).unwrap();
         assert_eq!(w.keys[0].input.as_str(), format!("signing-key:v1:ed25519:wasm:{H1}:signer:bob.near:session"));
@@ -955,7 +1059,7 @@ mod tests {
             .bind(Some(uuid(P1)))
             .unwrap();
         assert_eq!(d.keys[0].input.as_str(), "signing-key:v1:ed25519:project:p0000000000000001:predecessor:dao.near:votes");
-        assert_eq!(d.keys[0].account.as_str(), "dao.near");
+        assert_eq!(d.keys[0].account.as_ref().unwrap().as_str(), "dao.near");
         assert_eq!(d.predecessor.as_ref().unwrap().as_str(), "dao.near");
     }
 
@@ -991,10 +1095,14 @@ mod tests {
         assert_eq!(CallerKind::Signer.label(), "signer");
         assert_eq!(CallerKind::Predecessor.label(), "predecessor");
         let r: SigningKeyRequest = serde_json::from_str(r#"{"path":"k","type":"ed25519"}"#).unwrap();
-        assert_eq!(r.caller, CallerKind::Signer);
+        assert_eq!(r.caller, KeyCaller::Signer);
         let r: SigningKeyRequest = serde_json::from_str(r#"{"path":"k","type":"ed25519","caller":"predecessor"}"#).unwrap();
-        assert_eq!(r.caller, CallerKind::Predecessor);
-        for bad in ["Signer", "PREDECESSOR", "", "user", "sender", "signer:x", "both"] {
+        assert_eq!(r.caller, KeyCaller::Predecessor);
+        let r: SigningKeyRequest = serde_json::from_str(r#"{"path":"k","type":"ed25519","caller":"none"}"#).unwrap();
+        assert_eq!(r.caller, KeyCaller::None);
+        assert_eq!(KeyCaller::None.label(), "none");
+        assert_eq!(KeyCaller::None.account_kind(), None);
+        for bad in ["Signer", "PREDECESSOR", "", "user", "sender", "signer:x", "both", "None", "NONE", "nobody"] {
             let body = format!(r#"{{"path":"k","type":"ed25519","caller":"{bad}"}}"#);
             assert!(serde_json::from_str::<SigningKeyRequest>(&body).is_err(), "caller {bad:?}");
         }
@@ -1093,6 +1201,49 @@ mod tests {
         assert!(validate(&[wasm_req("c"), req("a")]).is_err());
         assert!(validate_direct(&[wasm_req("a"), wasm_req("b"), req("c")]).is_err());
         assert!(validate_direct(&[req("c"), wasm_req("a")]).is_err());
+    }
+
+    /// A signing key of no caller: one string for every signer, no
+    /// predecessor needed, ed25519 only, a vault allowed on a project key
+    /// as on any; and no string of it is an account caller's.
+    #[test]
+    fn a_key_of_no_caller_belongs_to_the_binding_and_the_path_alone() {
+        let none = |r: SigningKeyRequest| SigningKeyRequest { caller: KeyCaller::None, ..r };
+        let project = |signer: &str, keys: &[SigningKeyRequest]| {
+            validate_request(Some("alice.near/app"), signer, None, Some(H1), keys).and_then(|v| v.bind(Some(uuid(P1))))
+        };
+        let direct = |signer: &str, keys: &[SigningKeyRequest]| validate_request(None, signer, None, Some(H1), keys).and_then(|v| v.bind(None));
+
+        let bob = project("bob.near", &[none(req("label"))]).unwrap();
+        let dave = project("dave.near", &[none(req("label"))]).unwrap();
+        assert_eq!(bob.keys[0].input.as_str(), format!("signing-key:v1:ed25519:project:{P1}:none:label"));
+        assert_eq!(bob.keys[0].input, dave.keys[0].input, "every signer, one key");
+        assert!(bob.keys[0].account.is_none());
+        let w = direct("bob.near", &[none(wasm_req("label"))]).unwrap();
+        assert_eq!(w.keys[0].input.as_str(), format!("signing-key:v1:ed25519:wasm:{H1}:none:label"));
+        // Beside an account caller's key of the same path name: two keys.
+        let mixed = project("bob.near", &[none(req("a")), req("b")]).unwrap();
+        assert_eq!(mixed.keys[1].input.as_str(), format!("signing-key:v1:ed25519:project:{P1}:signer:bob.near:b"));
+        // A signer whose name is the caller word spells another string.
+        let named_none = project("none.near", &[req("label")]).unwrap();
+        assert_eq!(named_none.keys[0].input.as_str(), format!("signing-key:v1:ed25519:project:{P1}:signer:none.near:label"));
+        assert_ne!(named_none.keys[0].input, bob.keys[0].input);
+        // A vault on a project key, as on any; none on a wasm key, as on any.
+        assert!(project("bob.near", &[SigningKeyRequest { vault: Some("vault.alice.near".into()), ..none(req("k")) }]).is_ok());
+        assert!(direct("bob.near", &[SigningKeyRequest { vault: Some("vault.alice.near".into()), ..none(wasm_req("k")) }]).is_err());
+        // The run still needs a real signer.
+        assert!(project("anonymous", &[none(req("k"))]).unwrap_err().contains("needs a real caller"));
+
+        // ed25519 only.
+        let secp = SigningKeyRequest { key_type: SigningKeyType::Secp256k1, ..none(req("evm")) };
+        let e = project("bob.near", &[secp]).unwrap_err();
+        assert!(e.contains("cannot be of no caller") && e.contains("secp256k1"), "{e}");
+        // And the string itself is never made for another kind.
+        let path = KeyPath::parse("k").unwrap();
+        let p1 = uuid(P1);
+        for kind in [KeyKind::Signing(SigningKeyType::Secp256k1), KeyKind::Encryption] {
+            assert!(DerivationInput::of_no_caller(kind, Binding::Project(&p1), &path).is_err(), "{kind:?}");
+        }
     }
 
     /// The worker's placeholder for a missing sender is not a caller.
@@ -1417,7 +1568,7 @@ mod tests {
                     KeyBinding::Project => v.project.as_ref().unwrap().uuid.as_str(),
                     KeyBinding::Wasm => v.wasm_sha256.as_str(),
                 };
-                assert_eq!(&parts[4..], &[bound_to, k.caller.label(), k.account.as_str(), k.path.as_str()]);
+                assert_eq!(&parts[4..], &[bound_to, k.caller.label(), k.account.as_ref().unwrap().as_str(), k.path.as_str()]);
             }
         }
     }

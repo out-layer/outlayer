@@ -46,6 +46,13 @@
 #       the same relay gets the SAME key — the relay contract's; it signs, and
 #       the signature verifies HERE; the `project` build relayed keeps the
 #       signer's alpha. Without RELAY_CONTRACT the relayed half SKIPS, loudly
+#   S23 caller none (the `project-none` build, a version of the project): the
+#       key at alpha is neither the signer's nor the predecessor's; $CALLER2
+#       gets the same key; it signs, verified HERE; sign-nep413 with it is an
+#       err; the signer keys still differ per caller
+#   S24 SIGNING_BASELINE: absent, the run writes the public keys of the
+#       signer, predecessor and wasm keys to it; present, they must equal it
+#       (run before and after a deploy). Without the variable it SKIPS
 #
 # SKIPs loudly, whole, when the keystore or the worker predates signing keys.
 #
@@ -61,7 +68,7 @@
 #
 # Env: OFFLINE=1 (dry run only: no chain reads; ignored with --apply).
 #
-# Money: seven FastFS uploads (~230 KB each), project storage, and one on-chain
+# Money: eight FastFS uploads (~230 KB each), project storage, and one on-chain
 # run per probe at $DEPOSIT (~27 runs; a relayed run's unused deposit comes
 # back to its signer, as a direct run's does).
 #
@@ -314,7 +321,7 @@ if [[ "$APPLY" != true ]]; then
   else
     note "project: $PROJECT ($(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{project_id:$p}')" | jq -r 'if .project_id then "on chain, active " + .active_version else "not on chain yet" end' 2>/dev/null || echo 'unreadable'))"
   fi
-  for v in project project-v2 project-pred wasm wasm-v2; do
+  for v in project project-v2 project-pred project-none wasm wasm-v2; do
     f="$VARIANTS/signing-key-probe-$v.wasm"
     if [[ -f "$f" ]]; then
       h=$(sha_of "$f")
@@ -333,18 +340,18 @@ fi
 
 log "build the probe"
 (cd "$PROBE_DIR" && ./build.sh >/dev/null) || { echo "✗ $PROBE_DIR/build.sh failed" >&2; exit 1; }
-for v in project project-v2 project-pred wasm wasm-v2; do
+for v in project project-v2 project-pred project-none wasm wasm-v2; do
   set_for hash "$v" "$(sha_of "$VARIANTS/signing-key-probe-$v.wasm")"
   note "$v sha256 $(get_for hash "$v")"
 done
 
 log "upload to FastFS"
-for v in project project-v2 project-pred wasm wasm-v2; do
+for v in project project-v2 project-pred project-none wasm wasm-v2; do
   url=$(fastfs_upload "$VARIANTS/signing-key-probe-$v.wasm" "$(get_for hash "$v")") || { echo "✗ upload of $v never served its bytes" >&2; exit 1; }
   set_for url "$v" "$url"
   note "$v at $url"
 done
-H_P=$(get_for hash project); H_P2=$(get_for hash project-v2); H_PP=$(get_for hash project-pred); H_W=$(get_for hash wasm); H_W2=$(get_for hash wasm-v2)
+H_P=$(get_for hash project); H_P2=$(get_for hash project-v2); H_PP=$(get_for hash project-pred); H_PN=$(get_for hash project-none); H_W=$(get_for hash wasm); H_W2=$(get_for hash wasm-v2)
 U_P=$(get_for url project); U_W=$(get_for url wasm); U_W2=$(get_for url wasm-v2)
 
 log "publish $PROJECT"
@@ -353,9 +360,9 @@ if [[ -z "$(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{proje
   grep -q 'succeeded' <<<"$out" || { echo "✗ create_project failed: $(near_why "$out")" >&2; exit 1; }
   sleep 4
 fi
-# project v1 active; v2, the predecessor build and the wasm build as inactive
+# project v1 active; v2, the predecessor build, the no-caller build and the wasm build as inactive
 # versions of the same project.
-for v in project project-v2 project-pred wasm; do
+for v in project project-v2 project-pred project-none wasm; do
   [[ -n "$(version_on_chain "$(get_for hash "$v")")" ]] && continue
   active=false; [[ "$v" == project ]] && active=true
   out=$(call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$(get_for url "$v")" "$(get_for hash "$v")")" --argjson a "$active" \
@@ -363,7 +370,7 @@ for v in project project-v2 project-pred wasm; do
   grep -q 'succeeded' <<<"$out" || { echo "✗ add_version $v failed: $(near_why "$out")" >&2; exit 1; }
   sleep 4
 done
-for v in project project-v2 project-pred wasm; do
+for v in project project-v2 project-pred project-none wasm; do
   [[ "$(version_on_chain "$(get_for hash "$v")")" == "WasmUrl" ]] || { echo "✗ $(get_for hash "$v") ($v) is not a WasmUrl version of $PROJECT" >&2; exit 1; }
 done
 call "$PARENT" set_active_version "$(jq -nc --arg n "$PROJECT_NAME" --arg v "$H_P" '{project_name:$n, version_key:$v}')" '0 NEAR' >/dev/null
@@ -603,6 +610,59 @@ else
   ran_ok "S22 relayed project build" && { [[ -n "$ALPHA" && "$(out_field .keys.alpha.public_key)" == "$ALPHA" ]] \
     && pass "S22 a signer key does not move with the relay: the project build relayed holds $PARENT's alpha" \
     || fail "S22 the project build relayed holds $(out_field .keys.alpha.public_key), not $PARENT's alpha $ALPHA"; }
+fi
+
+# ── S23 a key of no caller ──────────────────────────────────────────────────
+
+log "S23 a key of no caller: one key for every caller, no NEP-413"
+NONE_PK=""
+run_src "$PARENT" "$(project_src "$H_PN")" '{"operation":"all_public_keys"}'
+if ran_ok "S23 all_public_keys"; then
+  remember_keys
+  NONE_PK=$(out_field .keys.alpha.public_key)
+  [[ "$NONE_PK" =~ ^[0-9a-f]{64}$ && "$NONE_PK" != "$ALPHA" && "$NONE_PK" != "${PRED:-}" ]] \
+    && pass "S23 the no-caller key at alpha is neither $PARENT's signer key nor its predecessor key" \
+    || fail "S23 the no-caller key at alpha is '$NONE_PK' (signer $ALPHA, predecessor ${PRED:-none})"
+fi
+run_src "$CALLER2" "$(project_src "$H_PN")" '{"operation":"all_public_keys"}'
+ran_ok "S23 $CALLER2 all_public_keys" && { [[ -n "$NONE_PK" && "$(out_field .keys.alpha.public_key)" == "$NONE_PK" ]] \
+  && pass "S23 $CALLER2 gets the same key: the project's, whoever calls" \
+  || fail "S23 two callers, two no-caller keys: $NONE_PK and $(out_field .keys.alpha.public_key)"; }
+run_src "$PARENT" "$(project_src "$H_PN")" "$(jq -nc --arg m "$MSG_HEX" '{operation:"sign",path:"alpha",message_hex:$m}')"
+ran_ok "S23 sign" && { [[ -n "$NONE_PK" && "$(verify_local "$NONE_PK" "$MSG_HEX" "$(out_field .signature)")" == ok ]] \
+  && pass "S23 the no-caller key signs, verified here, and again on a second run" \
+  || fail "S23 the no-caller signature does not verify under '$NONE_PK'"; }
+run_src "$PARENT" "$(project_src "$H_PN")" "$(jq -nc --arg n "$(printf '%064x' 7)" \
+  '{operation:"host_nep413",path:"alpha",message:"Login to example.com",recipient:"example.com",nonce_hex:$n}')"
+if [[ "$RUN_OK" == true && "$(out_field .status)" == err && "$(out_field .message)" == *"of no caller"* ]]; then
+  pass "S23 sign-nep413 with the no-caller key is an err: $(out_field .message | head -c 120)"
+else
+  fail "S23 sign-nep413 with the no-caller key answered $(out_field .status): $(head -c 200 <<<"$RUN_OUT$RUN_ERR")"
+fi
+# Beside it, the signer keys of the project still differ per caller (S3).
+[[ -n "${OTHER_ALPHA:-}" && "$OTHER_ALPHA" != "$ALPHA" ]] && pass "S23 and the signer keys still differ per caller" \
+  || fail "S23 the signer keys no longer differ per caller ($ALPHA / ${OTHER_ALPHA:-none})"
+
+# ── S24 the existing keys did not move ──────────────────────────────────────
+#
+# SIGNING_BASELINE names a file of public keys (no secret: public keys only).
+# Absent, this run writes it; present, this run's keys must equal it — run
+# once before a keystore or worker deploy and once after.
+
+log "S24 the existing keys did not move"
+if [[ -z "${SIGNING_BASELINE:-}" ]]; then
+  skip "S24 SIGNING_BASELINE names no file: set it, run before the deploy, run again after"
+else
+  NOW_KEYS=$(jq -nc --arg a "$ALPHA" --arg b "$BETA" --arg o "${OTHER_ALPHA:-}" --arg c "$CODE" --arg p "${PRED:-}" \
+    '{signer_alpha:$a, signer_beta:$b, caller2_alpha:$o, wasm_code:$c, predecessor_alpha:$p}')
+  if [[ ! -s "$SIGNING_BASELINE" ]]; then
+    printf '%s\n' "$NOW_KEYS" > "$SIGNING_BASELINE"
+    note "S24 baseline written to $SIGNING_BASELINE: run again after the deploy"
+  elif [[ "$(jq -cS . "$SIGNING_BASELINE")" == "$(jq -cS . <<<"$NOW_KEYS")" ]]; then
+    pass "S24 every signer, predecessor and wasm key equals the baseline in $SIGNING_BASELINE"
+  else
+    fail "S24 the keys moved: baseline $(jq -c . "$SIGNING_BASELINE"), now $NOW_KEYS"
+  fi
 fi
 
 # ── S13–S19 secp256k1 keys and the host's sign-nep413 ────────────────────────

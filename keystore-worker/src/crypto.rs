@@ -1879,7 +1879,7 @@ mod tests {
             path: path.to_string(),
             key_type,
             bind,
-            caller,
+            caller: caller.into(),
             vault: None,
         };
         let (project_id, uuid) = match bind {
@@ -2032,6 +2032,100 @@ mod tests {
         let ed = signing_seed_hex(&ks, &signing_key_input(APP, "bob.near", H1, Project, "records"));
         assert_eq!(ed, "f6f531d0b454d922a8e1f530f41f3a1cd008c56c496e36c958f2d4013358ac3d");
         assert_ne!(ed, "772890cc14851d53236ca8223391e336f711aedaaca1ee1922e9ad6452661b90");
+    }
+
+    /// A signing key of no caller (`caller: "none"`) on a run of `project`
+    /// (or a direct run of `wasm`) signed by `signer`.
+    fn no_caller_input(
+        project: Option<(&str, &str)>,
+        signer: &str,
+        wasm: &str,
+        bind: crate::signing_keys::KeyBinding,
+        path: &str,
+    ) -> crate::signing_keys::DerivationInput {
+        use crate::signing_keys::{KeyBinding, KeyCaller, ProjectUuid, SigningKeyRequest, SigningKeyType};
+        let request = SigningKeyRequest {
+            path: path.to_string(),
+            key_type: SigningKeyType::Ed25519,
+            bind,
+            caller: KeyCaller::None,
+            vault: None,
+        };
+        let (project_id, uuid) = match bind {
+            KeyBinding::Project => {
+                let (id, uuid) = project.expect("a project key needs its project");
+                (Some(id), Some(ProjectUuid::parse(uuid).unwrap()))
+            }
+            KeyBinding::Wasm => (None, None),
+        };
+        crate::signing_keys::validate_request(project_id, signer, None, Some(wasm), &[request])
+            .unwrap()
+            .bind(uuid)
+            .unwrap()
+            .keys
+            .remove(0)
+            .input
+    }
+
+    /// Pinned vectors for keys of no caller: the seeds computed with Python's
+    /// `hmac` over the exact strings shown, under the fixture master; the
+    /// public keys with two independent ed25519 implementations
+    /// (`cryptography` and PyNaCl), which agree, and which reproduce the
+    /// first vector of [`signing_key_pinned_vectors`]. One key for every
+    /// signer of the run. Do not update the vectors; find what changed.
+    #[test]
+    fn no_caller_signing_key_pinned_vectors() {
+        use crate::signing_keys::KeyBinding::{Project, Wasm};
+        let ks = Keystore::from_master_secret(&fixed_master()).unwrap();
+        let cases = [
+            (
+                APP,
+                Project,
+                "records",
+                format!("signing-key:v1:ed25519:project:{P1}:none:records"),
+                "1093cd65f0789965f6f102c267b72e543005a99e4a88739f5bb68ae8f744b58b",
+                "fd460d933d1937f8f55ad56cd5386532b6739e6ee10ab1844dbd8fd2daeca2e9",
+            ),
+            (
+                None,
+                Wasm,
+                "records",
+                format!("signing-key:v1:ed25519:wasm:{H1}:none:records"),
+                "e2553618422810f1684d06ea94e7d5d81d917d2a608604d7bb37d692b20acfb8",
+                "f3fd2ba92eed2866a8bd30b2ec00ba5302c632c3647c693a664f196674f831c5",
+            ),
+            (
+                Some(("carol.near/app", P2)),
+                Project,
+                "records",
+                format!("signing-key:v1:ed25519:project:{P2}:none:records"),
+                "86fe48ea6758718e2ab5777f5e0afb0817b00e9ecf5155adc30c04618c03b244",
+                "9f77cdbe3abeafb7815271da5440090cebd4e5918bd7838fc66ab0d804471702",
+            ),
+            (
+                APP,
+                Project,
+                "label",
+                format!("signing-key:v1:ed25519:project:{P1}:none:label"),
+                "3295bdb51b9cf2dfd34f222aa0bb4ca2b081d4329f39569e7ce43c515380bed2",
+                "d7b47b49d479e74fe3a557960ea1f6640931747d26f9e5dca0b2b5673056eca7",
+            ),
+        ];
+        for (project, bind, path, string, seed, public_key) in cases {
+            // Every signer of the run derives the one key.
+            let inputs = ["bob.near", "dave.near"].map(|signer| no_caller_input(project, signer, H1, bind, path));
+            assert_eq!(inputs[0], inputs[1], "{string}: two signers, two keys");
+            assert_eq!(inputs[0].as_str(), string);
+            let derived = ks.derive_signing_key_seed(None, &inputs[0]).unwrap();
+            assert_eq!(hex::encode(derived.as_ref()), seed, "{string}");
+            let vk = SigningKey::from_bytes(&derived).verifying_key();
+            assert_eq!(hex::encode(vk.as_bytes()), public_key, "{string}");
+        }
+        // Beside it, the signer key of the same run and path is bob's alone.
+        assert_eq!(
+            signing_seed_hex(&ks, &signing_key_input(APP, "bob.near", H1, Project, "records")),
+            "f6f531d0b454d922a8e1f530f41f3a1cd008c56c496e36c958f2d4013358ac3d"
+        );
     }
 
     /// Every type, every binding: one (run, caller, path) under two types is

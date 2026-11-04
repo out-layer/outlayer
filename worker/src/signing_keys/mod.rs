@@ -15,7 +15,9 @@
 //! directly or as a project's version. `caller: "signer"` (the default) binds
 //! the key to the job's `user_account_id`, `caller: "predecessor"` to its
 //! `predecessor_id`, and a `predecessor` key on a run with no predecessor is
-//! refused. One key that does not match refuses the whole run, here before any
+//! refused. `caller: "none"` binds an ed25519 key to no account: one key for
+//! every caller of the project (or the build), which `sign-nep413` refuses.
+//! One key that does not match refuses the whole run, here before any
 //! secret is decrypted, and again in the keystore; see
 //! `keystore-worker/src/signing_keys.rs` and `wit/deps/signing-keys.wit`.
 //!
@@ -133,6 +135,34 @@ pub enum CallerKind {
     Predecessor,
 }
 
+/// Whom a signing key belongs to: one of the job's accounts
+/// ([`CallerKind`]), or no caller at all. What a signing key's `caller`
+/// parses as; an encryption key's parses as [`CallerKind`], which has no
+/// `none`, so a project-wide encryption key cannot be declared.
+///
+/// A `none` key belongs to its binding and its path alone: every caller of
+/// the project (or of the build) drives the same key, so it speaks for the
+/// code and never for a caller. ed25519 only, and `sign-nep413` refuses it —
+/// a NEP-413 signature is a login as the key's implicit account, which
+/// every caller could otherwise make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyCaller {
+    #[default]
+    Signer,
+    Predecessor,
+    None,
+}
+
+impl From<CallerKind> for KeyCaller {
+    fn from(caller: CallerKind) -> Self {
+        match caller {
+            CallerKind::Signer => KeyCaller::Signer,
+            CallerKind::Predecessor => KeyCaller::Predecessor,
+        }
+    }
+}
+
 /// How this run was started, as the job the coordinator gave the worker says.
 ///
 /// Read from the job and nothing else: its `project_id` — which the contract
@@ -177,7 +207,7 @@ pub struct ManifestKey {
     #[serde(default)]
     pub bind: KeyBinding,
     #[serde(default)]
-    pub caller: CallerKind,
+    pub caller: KeyCaller,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault: Option<String>,
 }
@@ -189,7 +219,7 @@ impl Declared for ManifestKey {
     fn bind(&self) -> KeyBinding {
         self.bind
     }
-    fn caller(&self) -> CallerKind {
+    fn caller(&self) -> KeyCaller {
         self.caller
     }
     fn vault(&self) -> Option<&str> {
@@ -203,7 +233,7 @@ impl Declared for ManifestKey {
 pub trait Declared {
     fn path(&self) -> &str;
     fn bind(&self) -> KeyBinding;
-    fn caller(&self) -> CallerKind;
+    fn caller(&self) -> KeyCaller;
     fn vault(&self) -> Option<&str>;
 }
 
@@ -242,7 +272,16 @@ pub fn validate_key_path(path: &str) -> Result<(), String> {
 /// manifest is read ([`deserialize_declared`]), so a manifest that breaks one
 /// of these does not parse.
 pub fn check_declarations(keys: &[ManifestKey]) -> Result<(), String> {
-    check_family_declarations(SIGNING, keys)
+    check_family_declarations(SIGNING, keys)?;
+    // A key of no caller is ed25519 only: one key every caller drives.
+    if let Some(key) = keys.iter().find(|k| k.caller == KeyCaller::None && k.key_type != SigningKeyType::Ed25519) {
+        return Err(format!(
+            "the signing key {:?} is of no caller (caller \"none\") and of type {}; a key of no caller is ed25519",
+            key.path,
+            key.key_type.label()
+        ));
+    }
+    Ok(())
 }
 
 /// [`check_declarations`] for any family: the same rules, the family's own
@@ -351,7 +390,7 @@ pub fn check_family_against_run<K: Declared>(family: Family, keys: &[K], run: &R
                 ))
             }
         }
-        if key.caller() == CallerKind::Predecessor && run.predecessor_id.is_none() {
+        if key.caller() == KeyCaller::Predecessor && run.predecessor_id.is_none() {
             return Err(format!(
                 "the {noun} {path:?} belongs to the predecessor (caller \"predecessor\"), and this run carries \
                  no predecessor to bind it to; a predecessor key is issued only to a run some account called \
@@ -613,6 +652,15 @@ impl SigningKeys {
         callback_url: Option<&str>,
     ) -> Result<Nep413Signed, String> {
         let key = self.get(path, vault)?;
+        // A NEP-413 signature is a login as the key's implicit account; a key
+        // every caller drives would let every caller log in as the project.
+        if key.declared.caller == KeyCaller::None {
+            return Err(format!(
+                "signing key {:?} is of no caller (caller \"none\"), and sign-nep413 signs with a key of one \
+                 caller only: a NEP-413 signature logs in as the key's account; sign a message of your own with sign",
+                key.declared.path
+            ));
+        }
         let Secret::Ed25519(signing) = &key.secret else {
             return Err(format!(
                 "sign-nep413 signs with an ed25519 key, and signing key {:?} is {}",
@@ -791,9 +839,9 @@ mod tests {
             called_run(),
         )
         .unwrap();
-        assert_eq!(keys[0].caller, CallerKind::Signer);
-        assert_eq!(keys[1].caller, CallerKind::Predecessor);
-        assert_eq!(keys[2].caller, CallerKind::Signer);
+        assert_eq!(keys[0].caller, KeyCaller::Signer);
+        assert_eq!(keys[1].caller, KeyCaller::Predecessor);
+        assert_eq!(keys[2].caller, KeyCaller::Signer);
         assert_eq!(
             serde_json::to_value(&keys[1]).unwrap(),
             serde_json::json!({ "path": "theirs", "type": "ed25519", "bind": "project", "caller": "predecessor" })
@@ -801,6 +849,25 @@ mod tests {
         for bad in ["sender", "Signer", "PREDECESSOR", "", "both", "user"] {
             assert!(manifest(serde_json::json!([{ "path": "k", "type": "ed25519", "caller": bad }])).is_err(), "caller {bad:?}");
         }
+    }
+
+    /// A key of no caller: parsed, forwarded as `none`, needing no
+    /// predecessor on any run its binding allows; ed25519 only.
+    #[test]
+    fn a_key_of_no_caller_is_parsed_forwarded_and_ed25519_only() {
+        let keys = declared(serde_json::json!([{ "path": "label", "type": "ed25519", "caller": "none" }]), project_run()).unwrap();
+        assert_eq!(keys[0].caller, KeyCaller::None);
+        assert_eq!(
+            serde_json::to_value(&keys[0]).unwrap(),
+            serde_json::json!({ "path": "label", "type": "ed25519", "bind": "project", "caller": "none" })
+        );
+        let wasm = serde_json::json!([{ "path": "label", "type": "ed25519", "bind": "wasm", "caller": "none" }]);
+        assert!(declared(wasm, direct_run()).is_ok());
+        for bad in ["None", "NONE", "nobody", "null"] {
+            assert!(manifest(serde_json::json!([{ "path": "k", "type": "ed25519", "caller": bad }])).is_err(), "caller {bad:?}");
+        }
+        let e = manifest(serde_json::json!([{ "path": "evm", "type": "secp256k1", "caller": "none" }])).unwrap_err();
+        assert!(e.contains("of no caller") && e.contains("secp256k1"), "{e}");
     }
 
     /// A predecessor key needs a run some account called the contract for.
@@ -1278,6 +1345,27 @@ mod tests {
         assert!(keys.sign_nep413("payouts", None, "m", "r", &nonce(), None).unwrap_err().contains("names none"));
         let signed = keys.sign_nep413("payouts", Some("vault.alice.near"), "m", "r", &nonce(), None).unwrap();
         assert_eq!(hex::decode(&signed.account_id).unwrap(), keys.public_key("payouts", Some("vault.alice.near")).unwrap());
+    }
+
+    /// A key of no caller signs and has a public key; it makes no NEP-413
+    /// signature, which would log every caller in as the key's account.
+    #[test]
+    fn a_key_of_no_caller_signs_but_makes_no_nep413_signature() {
+        use ed25519_dalek::Verifier;
+        let declared = vec![ManifestKey {
+            path: "label".into(),
+            key_type: SigningKeyType::Ed25519,
+            bind: KeyBinding::Project,
+            caller: KeyCaller::None,
+            vault: None,
+        }];
+        let keys = SigningKeys::from_keystore(&declared, seeds(&[("label", SEED_A)])).unwrap();
+        let public = keys.public_key("label", None).unwrap();
+        let signature = keys.sign("label", None, b"outlayer-attested-ai-label/1\n{}").unwrap();
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&public.try_into().unwrap()).unwrap();
+        assert!(vk.verify(b"outlayer-attested-ai-label/1\n{}", &ed25519_dalek::Signature::from_slice(&signature).unwrap()).is_ok());
+        let e = keys.sign_nep413("label", None, "Login to example.com", "example.com", &nonce(), None).unwrap_err();
+        assert!(e.contains("of no caller") && e.contains("sign-nep413"), "{e}");
     }
 
     #[test]

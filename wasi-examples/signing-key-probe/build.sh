@@ -4,6 +4,7 @@
 #   signing-key-probe-project.wasm        alpha, beta — bind "project"
 #   signing-key-probe-project-v2.wasm     the same manifest, another sha256
 #   signing-key-probe-project-pred.wasm   alpha — caller "predecessor", bind "project"
+#   signing-key-probe-project-none.wasm   alpha — caller "none", bind "project": one key for every caller
 #   signing-key-probe-wasm.wasm           code — bind "wasm"
 #   signing-key-probe-wasm-v2.wasm        the same manifest, another sha256
 #   signing-key-probe-project-vault.wasm  alpha, and treasury with a vault
@@ -18,6 +19,7 @@
 #   signing-key-probe-encryption-vault.wasm  encryption alpha, and treasury with a vault
 #   signing-key-probe-encryption-pred.wasm   encryption alpha — caller "predecessor"
 #   signing-key-probe-encryption-typed.wasm  encryption alpha with a `type` (refused)
+#   signing-key-probe-encryption-none.wasm   encryption alpha with caller "none" (refused)
 #   signing-key-probe-project-misspelled.wasm  the project keys and an unknown top-level member (refused)
 #
 # and checks each: the manifest section is in the artefact and is the right
@@ -162,6 +164,7 @@ build() {
 build project        project                manifests/project.json       alpha beta
 build project-v2     project,v2             manifests/project.json       alpha beta
 build project-pred   project-pred           manifests/project-pred.json  alpha
+build project-none   project-none           manifests/project-none.json  alpha
 build wasm           wasm                   manifests/wasm.json          code
 build wasm-v2        wasm,v2                manifests/wasm.json          code
 build project-vault  project-vault          manifests/project-vault.json alpha treasury
@@ -176,6 +179,7 @@ build encryption-wasm-v2 encryption-wasm,v2  manifests/encryption-wasm.json  cod
 build encryption-vault   encryption-vault    manifests/encryption-vault.json alpha treasury
 build encryption-pred    encryption-pred     manifests/encryption-pred.json  alpha
 build encryption-typed   encryption-typed    manifests/encryption-typed.json alpha
+build encryption-none    encryption-none     manifests/encryption-none.json  alpha
 build project-misspelled project-misspelled  manifests/project-misspelled.json alpha beta
 
 # Two builds of one manifest must be two hashes, or "a new version" and
@@ -191,9 +195,9 @@ for pair in "project project-v2" "wasm wasm-v2" "encryption encryption-v2" "encr
 done
 
 # The secp256k1 builds must declare a secp256k1 key, and no other build one.
-for variant in project project-v2 project-pred wasm wasm-v2 project-vault project-secp wasm-secp \
+for variant in project project-v2 project-pred project-none wasm wasm-v2 project-vault project-secp wasm-secp \
                encryption encryption-v2 encryption-storage encryption-storage-pred encryption-wasm encryption-wasm-v2 \
-               encryption-vault encryption-pred encryption-typed; do
+               encryption-vault encryption-pred encryption-typed encryption-none; do
     wasm="$OUT/signing-key-probe-$variant.wasm"
     case "$variant" in
         *-secp)
@@ -213,7 +217,7 @@ done
 # declares a predecessor key, and exactly one keeps its storage in the
 # predecessor's cell.
 for variant in encryption encryption-v2 encryption-storage encryption-storage-pred encryption-wasm encryption-wasm-v2 \
-               encryption-vault encryption-pred encryption-typed; do
+               encryption-vault encryption-pred encryption-typed encryption-none; do
     wasm="$OUT/signing-key-probe-$variant.wasm"
     typed=no; grep -qa '"type": "xchacha20poly1305"' "$wasm" && typed=yes
     pred=no; grep -qa '"caller": "predecessor"' "$wasm" && pred=yes
@@ -238,7 +242,7 @@ for variant in project project-misspelled encryption-storage encryption-storage-
 done
 
 # Exactly one of the signing-only builds declares a predecessor key.
-for variant in project project-v2 project-pred wasm wasm-v2 project-vault project-secp wasm-secp project-misspelled; do
+for variant in project project-v2 project-pred project-none wasm wasm-v2 project-vault project-secp wasm-secp project-misspelled; do
     wasm="$OUT/signing-key-probe-$variant.wasm"
     pred=no; grep -qa '"caller": "predecessor"' "$wasm" && pred=yes
     want_pred=no; [ "$variant" = project-pred ] && want_pred=yes
@@ -248,5 +252,17 @@ for variant in project project-v2 project-pred wasm wasm-v2 project-vault projec
     fi
 done
 
+# Exactly one signing build and one encryption build declare a key of no
+# caller.
+for variant in project project-v2 project-pred project-none wasm wasm-v2 project-vault project-secp wasm-secp \
+               encryption encryption-v2 encryption-pred encryption-typed encryption-none; do
+    none=no; grep -qa '"caller": "none"' "$OUT/signing-key-probe-$variant.wasm" && none=yes
+    want_none=no; case "$variant" in project-none|encryption-none) want_none=yes ;; esac
+    if [ "$none" != "$want_none" ]; then
+        echo "ERROR: $OUT/signing-key-probe-$variant.wasm: a key of no caller $none (want $want_none)"
+        exit 1
+    fi
+done
+
 echo ""
-echo "OK: eighteen variants in $OUT/"
+echo "OK: twenty variants in $OUT/"

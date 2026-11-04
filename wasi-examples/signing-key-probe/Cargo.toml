@@ -13,13 +13,15 @@ path = "src/main.rs"
 # Which manifest the build embeds — exactly one of `project`, `project-pred`,
 # `wasm`, `project-vault`, `project-secp`, `wasm-secp`, `encryption`,
 # `encryption-storage`, `encryption-storage-pred`, `encryption-wasm`, `encryption-vault`,
-# `encryption-pred`, `encryption-typed`.
+# `encryption-pred`, `encryption-typed`, `project-none`, `encryption-none`.
 # `project` is the default, so a plain `cargo build`, and a build of the
 # repository on the platform (which passes no features), embeds it.
 default = ["project"]
 project = []
 # A signing key with `caller: "predecessor"`, bind project.
 project-pred = []
+# A signing key with `caller: "none"`, bind project: one key for every caller.
+project-none = []
 wasm = []
 project-vault = []
 # The secp256k1 builds: a secp256k1 key beside an ed25519 one on a project
@@ -44,6 +46,8 @@ encryption-vault = ["enc-api"]
 encryption-pred = ["enc-api"]
 # A manifest that names a `type` on an encryption key: refused before it runs.
 encryption-typed = ["enc-api"]
+# An encryption key with `caller: "none"`: refused before it runs.
+encryption-none = ["enc-api"]
 # The `project` manifest with one unknown top-level member
 # (`storage_acount`): refused before it runs, naming the member.
 project-misspelled = []

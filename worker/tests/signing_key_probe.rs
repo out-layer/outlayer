@@ -611,6 +611,38 @@ async fn a_secp256k1_key_answers_with_the_pinned_key_address_and_signature() {
 
 /// The host's `sign-nep413` answers the guest-built signature byte for byte —
 /// PyNaCl's — and refuses a secp256k1 key and a nonce that is not 32 bytes.
+/// The `project-none` build: a key of no caller, declared as such, signs
+/// and has its public key; the host makes no NEP-413 signature with it.
+/// Which caller drives it is the keystore's derivation, not the guest's: the
+/// same seed here for two runs is what one key for every caller means.
+#[tokio::test]
+async fn a_key_of_no_caller_signs_and_the_host_makes_no_nep413_signature_with_it() {
+    let wasm = probe("project-none");
+    let m = offchainvm_worker::connector_manifest::manifest_from_wasm(&wasm).unwrap().unwrap();
+    let declared = serde_json::to_value(m.signing_keys.clone().unwrap()).unwrap();
+    assert_eq!(declared[0]["caller"], "none", "{declared}");
+    let keys = || keys_for(&wasm, &[("alpha", SEED_A)]);
+
+    let pk = answer(&wasm, keys(), json!({ "operation": "public_key", "path": "alpha" })).await;
+    assert_eq!(pk["public_key"], PUB_A, "{pk}");
+    let signed = answer(&wasm, keys(), json!({ "operation": "sign", "path": "alpha", "message_hex": hex::encode(b"record #1") })).await;
+    assert_eq!(signed["status"], "ok", "{signed}");
+    assert_eq!(signed["signature"], SIG_A_RECORD_1, "{signed}");
+
+    let host = answer(
+        &wasm,
+        keys(),
+        json!({
+            "operation": "host_nep413", "path": "alpha",
+            "message": "Login to example.com", "recipient": "example.com",
+            "nonce_hex": hex::encode(nonce()), "callback_url": null,
+        }),
+    )
+    .await;
+    assert_eq!(host["status"], "err", "{host}");
+    assert!(host["message"].as_str().unwrap_or_default().contains("of no caller"), "{host}");
+}
+
 #[tokio::test]
 async fn the_host_nep413_signature_is_the_guest_built_one() {
     use base64::Engine;

@@ -22,7 +22,10 @@
 //!   run through a project whose running version is published as a WasmUrl.
 //! - `bind: "wasm"`: the key belongs to this exact build and the caller. Issued
 //!   only to a direct run of a wasm URL.
-//! - `caller`: `"signer"` (the default) or `"predecessor"`.
+//! - `caller`: `"signer"` (the default), `"predecessor"`, or `"none"` — an
+//!   ed25519 key of no caller: one key for every caller of the project (or of
+//!   the build), for statements of the code that a verifier checks against one
+//!   pinned public key. [`sign_nep413`] refuses a `none` key.
 //! - `vault` (only with `bind: "project"`): derive from that vault's master.
 //!
 //! A call passes the key's declared vault exactly: `None` for a key declared
@@ -37,7 +40,15 @@
 //! component composes itself, from fields it has parsed and checked, under a
 //! fixed prefix or structure of its own. Any contract the signer transacts with
 //! can start a run under the signer's key with input of its own choosing, so the
-//! input is never the signer's intent.
+//! input is never the signer's intent. Every caller drives a `none` key alike: a
+//! message signed with it names the caller from the host, never from the
+//! input: [`crate::env::signer_account_id`] (`NEAR_SENDER_ID`, the account the
+//! run acts as) or `env::var("NEAR_USER_ACCOUNT_ID")` (the account that paid)
+//! — the same account, except under a bound identity, where the first is the
+//! bound agent's. The
+//! environment is input too: a caller names secret rows of its own for the
+//! run, so a variable is signed only when [`crate::env::secrets_rows`] shows it
+//! came from a row whose owner the component trusts.
 //!
 //! ## Usage
 //!

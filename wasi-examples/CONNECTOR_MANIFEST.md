@@ -205,7 +205,7 @@ every path.
 | `path` | `[a-z0-9][a-z0-9_-]{0,31}`, unique in the list | The key's name and an input of its derivation. The same path gives the same key for as long as its binding holds; another path is another key. Renaming a path loses the key, any address made from its public key, and every signature checked against it. |
 | `type` | `ed25519` \| `secp256k1` | The key's algorithm, and an input of its derivation (`signing-key:v1:{type}:{project\|wasm}:…`): one secret never serves two algorithms. A path is declared once whatever its type — the same path under the other type would be another key. |
 | `bind` | `project` (default) \| `wasm` | How the code must be run to get the key, and what the key belongs to besides the caller. There is no repository binding. |
-| `caller` | `signer` (default) \| `predecessor` | Which account of the run the key belongs to: the transaction's signer (the payment key's owner over HTTPS), or the account that called the contract. A segment of the derivation, so the two never derive one key. |
+| `caller` | `signer` (default) \| `predecessor` \| `none` | Which account of the run the key belongs to: the transaction's signer (the payment key's owner over HTTPS), or the account that called the contract — or, with `none`, no account: one key for every caller of the project (or of the build). A segment of the derivation, so no two choices derive one key. `none` is ed25519 only. |
 | `vault` | a NEAR account id | `project` keys only: derive from that vault's master instead of the default one. |
 
 At most 3 keys. A key with an unknown field is refused, not read with the field
@@ -231,8 +231,31 @@ the input can.
   binds to the token contract. A run that carries no predecessor is refused
   before it starts.
 
-Both are legitimate; the module author chooses per key. A signer key and a
-predecessor key for one account are two keys. A run with no caller account is
+* `none`: no account. The key belongs to the binding and the path alone —
+  `signing-key:v1:ed25519:project:{project_uuid}:none:{path}`, or
+  `…:wasm:{wasm_sha256}:none:{path}` — so every caller of the project (of
+  the build, for `bind: "wasm"`) drives the same key, and a verifier pins
+  one public key for the project. It is the voice of the code, never of a
+  caller. Only an ed25519 key can be `none`, and `sign-nep413` refuses it: a
+  NEP-413 signature is a login as the key's implicit account, which every
+  caller would otherwise make. The host cannot see what a module signs with
+  `sign`, so the rule below is the module's: sign with a `none` key only
+  messages the module composes, under a fixed prefix of its own, and name
+  the caller in them from the host, never from the input: the account that
+  paid is `NEAR_USER_ACCOUNT_ID` (`env::var`), the account the run acts as
+  is `NEAR_SENDER_ID` (`env::signer_account_id()`) — the same account,
+  except under Agent Connect's bound identity, where it is the bound
+  agent's (`WASM_ENV_VARS.md`) — every caller can make it sign whatever the module will sign for
+  any of them. The environment is input too: a caller names secret rows of
+  its own for the run (`secrets_ref`, `secrets_refs`), and their variables
+  are the caller's. Take what a `none` key signs from the input, the code,
+  and only those variables whose row the module has checked in
+  `OUTLAYER_SECRETS_ROWS` — the row's owner is the one fact a row cannot
+  claim about itself. A `vault` works on a `none` key as on any `project`
+  key.
+
+All three are legitimate; the module author chooses per key. A signer key, a
+predecessor key and a key of no caller are three keys. A run with no caller account is
 refused: the worker's placeholder for a missing account is refused by name,
 before it could pass as an account id.
 
@@ -409,7 +432,7 @@ declares no key gets an `err` for every path.
 |---|---|---|
 | `path` | `[a-z0-9][a-z0-9_-]{0,31}`, unique in the list | The key's name and an input of its derivation. The same path gives the same key for as long as its binding holds. **Renaming a path loses the key, and with it everything the key sealed.** |
 | `bind` | `project` (default) \| `wasm` | As for a signing key. |
-| `caller` | `signer` (default) \| `predecessor` | As for a signing key. |
+| `caller` | `signer` (default) \| `predecessor` | As for a signing key; there is no `none` — an encryption key every caller drove would let one caller resubmit another's sealed request and read the answer, so `none` does not parse. |
 | `vault` | a NEAR account id | `project` keys only, as for a signing key. |
 
 At most 5 encryption keys, counted apart from the signing keys: a manifest may

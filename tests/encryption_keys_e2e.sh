@@ -13,6 +13,7 @@
 #   encryption-wasm-v2  the same manifest, another sha256                       (direct)
 #   encryption-pred     encryption alpha — caller predecessor, bind project     (a version; direct, E5)
 #   encryption-typed    encryption alpha with a `type`                          (direct, E10)
+#   encryption-none     encryption alpha with caller "none"                     (direct, E12)
 #
 # What each row pins:
 #   E1  encrypt: two seals of one plaintext are two ciphertexts with two
@@ -81,6 +82,9 @@
 #       starts, naming the unknown field (the keystore's own refusal of a
 #       `type` in a keyed /decrypt is pinned by its unit tests; the suite has
 #       no worker token to send one)
+#   E12 an encryption key of no caller (`caller: "none"`) → the run is
+#       refused before it starts, naming the value: no encryption key is one
+#       every caller drives
 #   SC  the storage cell (manifest `storage_account`), observed through the
 #       guest. SC3, a direct call: a record encryption-storage-pred writes,
 #       encryption-storage reads — one cell, the signer's. SC1, relayed through
@@ -142,7 +146,7 @@ OFFLINE="${OFFLINE:-0}"
 RELAY_CONTRACT="${RELAY_CONTRACT:-}"
 PROBE_DIR="$REPO_ROOT/wasi-examples/signing-key-probe"
 VARIANTS="$PROBE_DIR/target/variants"
-BUILDS="encryption encryption-v2 encryption-storage encryption-storage-pred encryption-wasm encryption-wasm-v2 encryption-pred encryption-typed"
+BUILDS="encryption encryption-v2 encryption-storage encryption-storage-pred encryption-wasm encryption-wasm-v2 encryption-pred encryption-typed encryption-none"
 # The builds published as versions of $PROJECT; `encryption` is the active one.
 VERSIONS="encryption encryption-v2 encryption-storage encryption-storage-pred encryption-wasm encryption-pred"
 export OUTLAYER_NETWORK="$NETWORK"
@@ -1097,6 +1101,14 @@ if want E10; then
   log "E10 an encryption key that names a type is refused before the run starts"
   direct "$PARENT" encryption-typed '{"operation":"all_encryption_keys"}'
   refused_without_keys "E10 the typed build" 'unknown field `type`'
+fi
+
+# ── E12 an encryption key of no caller ──────────────────────────────────────
+
+if want E12; then
+  log "E12 an encryption key of no caller is refused before the run starts"
+  direct "$PARENT" encryption-none '{"operation":"all_encryption_keys"}'
+  refused_without_keys "E12 the no-caller build" 'unknown variant `none`'
 fi
 
 # ── E7 no key material anywhere ─────────────────────────────────────────────

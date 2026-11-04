@@ -52,12 +52,14 @@ use serde_json::{json, Map, Value};
     feature = "encryption-vault",
     feature = "encryption-pred",
     feature = "encryption-typed",
-    feature = "project-misspelled"
+    feature = "project-misspelled",
+    feature = "project-none",
+    feature = "encryption-none"
 )))]
 compile_error!(
     "choose the manifest: --features project | project-pred | wasm | project-vault | project-secp | wasm-secp | encryption | \
      encryption-storage | encryption-storage-pred | encryption-wasm | encryption-vault | encryption-pred | encryption-typed | \
-     project-misspelled"
+     project-misspelled | project-none | encryption-none"
 );
 
 /// How many manifest features this build names: exactly one is allowed.
@@ -74,7 +76,9 @@ const MANIFEST_FEATURES: usize = cfg!(feature = "project") as usize
     + cfg!(feature = "encryption-vault") as usize
     + cfg!(feature = "encryption-pred") as usize
     + cfg!(feature = "encryption-typed") as usize
-    + cfg!(feature = "project-misspelled") as usize;
+    + cfg!(feature = "project-misspelled") as usize
+    + cfg!(feature = "project-none") as usize
+    + cfg!(feature = "encryption-none") as usize;
 const _: () = assert!(MANIFEST_FEATURES == 1, "exactly one manifest feature: pass --no-default-features with one");
 
 /// Embeds `$file` as the `outlayer.manifest` custom section — covered by the
@@ -123,6 +127,10 @@ manifest!("../manifests/encryption-pred.json");
 manifest!("../manifests/encryption-typed.json");
 #[cfg(feature = "project-misspelled")]
 manifest!("../manifests/project-misspelled.json");
+#[cfg(feature = "project-none")]
+manifest!("../manifests/project-none.json");
+#[cfg(feature = "encryption-none")]
+manifest!("../manifests/encryption-none.json");
 
 /// Which build this is. Part of every answer, so the constant is in the binary
 /// and `v2` really is another sha256.
