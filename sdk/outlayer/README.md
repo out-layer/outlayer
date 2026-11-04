@@ -18,7 +18,7 @@ Signing keys, encryption keys (with sealed storage) and tasks are opt-in feature
 
 ```toml
 [dependencies]
-outlayer = { version = "0.2.0", features = ["signing-keys", "encryption-keys", "tasks"] }
+outlayer = { version = "0.2", features = ["signing-keys", "encryption-keys", "tasks"] }
 ```
 
 | Feature | Adds | Host interface |
@@ -71,8 +71,9 @@ Access execution context and I/O:
 use outlayer::env;
 
 // Get NEAR account info
-let signer = env::signer_account_id();           // User who signed tx (alice.near)
-let predecessor = env::predecessor_account_id(); // Contract that called OutLayer
+let signer = env::signer_account_id();           // NEAR_SENDER_ID (alice.near)
+let predecessor = env::predecessor_account_id(); // Account that called OutLayer (on-chain runs)
+let relayer = env::relayer_account_id();         // Relayer of a meta-transaction, if any
 let tx_hash = env::transaction_hash();
 
 // Input/Output
@@ -83,12 +84,16 @@ env::output_json(&response)?;
 let api_key = env::var("OPENAI_API_KEY");
 ```
 
-**Available environment variables:**
-- `NEAR_SENDER_ID` - Account that signed the transaction
-- `NEAR_PREDECESSOR_ID` - Contract that called OutLayer
-- `NEAR_TRANSACTION_HASH` - Transaction hash
-- `USD_PAYMENT` - Attached USD payment (micro-units)
-- Custom secrets stored via dashboard
+**Common environment variables:**
+- `OUTLAYER_EXECUTION_TYPE` - `NEAR` (on-chain request) or `HTTPS`
+- `NEAR_SENDER_ID` - On-chain: the transaction signer. HTTPS: the payment key owner (or the bound account with `use_bound_identity`)
+- `NEAR_USER_ACCOUNT_ID` - The paying account
+- `NEAR_PREDECESSOR_ID` - Account that called OutLayer (empty over HTTPS)
+- `NEAR_TRANSACTION_HASH` - Transaction hash (empty over HTTPS)
+- `ATTACHED_USD` (on-chain) / `USD_PAYMENT` (HTTPS) - Payment to the project owner, stablecoin minimal units
+- Your secrets, stored with the dashboard or `outlayer secrets set`
+
+The full list is in [wasi-examples/WASM_ENV_VARS.md](https://github.com/out-layer/outlayer/blob/main/wasi-examples/WASM_ENV_VARS.md).
 
 ### Storage (`outlayer::storage`)
 
@@ -127,8 +132,8 @@ let price = storage::get_worker_from_project("oracle:ETH", Some("oracle.near/pri
 
 **Storage isolation:**
 - User storage: Isolated per caller (`alice.near` can't read `bob.near`'s data)
-- Worker storage: Shared across all users, only accessible from WASM
-- Public storage: Cross-project readable (for oracles, shared configs)
+- Worker storage: Shared across all users of the project, only accessible from WASM
+- Public storage (`set_worker_with_options(.., Some(false))`, stored unencrypted): readable by other projects and over HTTPS (`GET /public/storage/get`)
 
 ### Version Migration
 
@@ -216,13 +221,33 @@ sealed::delete("records", None, "init")?;
 
 `has` and `delete` return a failed storage call as `Err`, never as `false`.
 
+Encryption is randomized, so compare-and-swap compares the stored ciphertext,
+never a plaintext: `get` returns a `Sealed` holding both, and it is the
+`expected` argument of `set_if_equals` for the same record. A `Sealed` read
+from another record (another name, path or vault) is refused with an `Err`:
+
+```rust
+let mut current = sealed::get("records", None, "balance:alice")?.ok_or("missing")?;
+loop {
+    let next = update(current.plaintext());
+    match sealed::set_if_equals("records", None, "balance:alice", &current, &next)? {
+        (true, _) => break,
+        (false, Some(actual)) => current = actual, // changed by another run
+        (false, None) => return Err("deleted".into()),
+    }
+}
+```
+
+The operator still sees that a record exists, when it is touched, and its length
+(plaintext + 41 bytes). `list_keys` returns tags, not names.
+
 ### Tasks (`outlayer::tasks`, feature `tasks`)
 
 An agent prepares; the owner reads and approves with one signature; the
 agent's run carries it out. A run admitted to an owner's secret row leaves that
 owner a task; the owner approves it in their inbox, and the platform starts a
 run of the agent — on the agent's own payment key — in the operation the task
-names. Declare `"tasks": true` in the manifest. The model is in `docs/TASKS.md`.
+names. Declare `"tasks": true` in the manifest. The model is in [docs/TASKS.md](https://github.com/out-layer/outlayer/blob/main/docs/TASKS.md).
 
 ```rust
 use outlayer::tasks::{self, Display, FieldKind, WrittenBy};
@@ -258,25 +283,21 @@ A refusal is a `TaskError`: a `reason` to branch on and a sentence.
 is never an error — `mine()` with no tasks is an empty list — and a store that
 did not answer is never an empty list.
 
-Encryption is randomized, so compare-and-swap compares the stored ciphertext,
-never a plaintext: `get` returns a `Sealed` holding both, and it is the
-`expected` argument of `set_if_equals` for the same record. A `Sealed` read
-from another record (another name, path or vault) is refused with an `Err`:
+### VRF (`outlayer::vrf`)
+
+Verifiable randomness: the keystore signs `alpha = "vrf:{request_id}:{sender_id}:{seed}"`
+with its Ed25519 VRF key; the worker sets `request_id` and `sender_id`, the guest
+supplies only the seed (no `:`), and a run may make at most 10 calls.
 
 ```rust
-let mut current = sealed::get("records", None, "balance:alice")?.ok_or("missing")?;
-loop {
-    let next = update(current.plaintext());
-    match sealed::set_if_equals("records", None, "balance:alice", &current, &next)? {
-        (true, _) => break,
-        (false, Some(actual)) => current = actual, // changed by another run
-        (false, None) => return Err("deleted".into()),
-    }
-}
+use outlayer::vrf;
+
+let r = vrf::random("round-1")?;          // r.output_hex, r.signature_hex, r.alpha
+let (bytes, signature_hex, alpha) = vrf::random_bytes("round-1")?;
+let pubkey = vrf::public_key()?;          // same key as GET /vrf/pubkey
 ```
 
-The operator still sees that a record exists, when it is touched, and its length
-(plaintext + 41 bytes). `list_keys` returns tags, not names.
+Verification, on chain or off: [VRF.md](https://github.com/out-layer/outlayer/blob/main/VRF.md).
 
 ## Example Project
 
@@ -349,21 +370,25 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
 }
 ```
 
-Build and test:
+Build and run it on testnet (storage is served by OutLayer workers, so a
+module that uses it does not run under a plain `wasmtime`):
 
 ```bash
 cargo build --target wasm32-wasip2 --release
-echo '{"action":"increment"}' | wasmtime target/wasm32-wasip2/release/my-outlayer-app.wasm
+export OUTLAYER_NETWORK=testnet
+outlayer upload target/wasm32-wasip2/release/my-outlayer-app.wasm
+outlayer deploy my-outlayer-app <FastFS URL printed by upload>
+outlayer run <your-account>/my-outlayer-app '{"action":"increment"}'
 ```
+
+See the [CLI reference](https://github.com/out-layer/outlayer/blob/main/docs/CLI.md).
 
 ## Publishing to crates.io
 
 ```bash
 cd sdk/outlayer
 
-# 1. Bump version in Cargo.toml
-#    0.1.2 -> 0.1.3 (patch)
-#    0.1.2 -> 0.2.0 (minor)
+# 1. Bump version in Cargo.toml and add a CHANGELOG.md entry
 
 # 2. Verify it compiles for the target, with and without the features
 cargo check --target wasm32-wasip2
@@ -378,15 +403,8 @@ cargo publish
 ```
 
 **Before publishing:**
-- Ensure `version` in `Cargo.toml` is bumped
-- Ensure `wit/` directory is included (check that `.gitignore` doesn't exclude it)
-- WIT files (`wit/world.wit`, `wit/deps/*.wit`) must be in the published crate — `wit-bindgen` reads them at compile time
-
-**If WIT files are missing from the published crate**, add to `Cargo.toml`:
-```toml
-[package]
-include = ["src/**/*", "wit/**/*", "Cargo.toml", "README.md", "LICENSE*"]
-```
+- `wit/world.wit` and `wit/deps/*.wit` must be in the package (`cargo package --list`): `wit-bindgen` reads them at compile time
+- `wit/deps/*.wit` are copies of the worker's `worker/wit/deps/`. A changed signature is a new interface version that workers serve before any build against it is published — see [worker/wit/README.md](https://github.com/out-layer/outlayer/blob/main/worker/wit/README.md)
 
 ## Documentation
 

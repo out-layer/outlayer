@@ -21,10 +21,9 @@ For the end-to-end **sovereign exit runbook** (initiate → wait →
 finalize → master recovery → wallet re-derivation → secret decrypt),
 see [`docs/LEAVING_OUTLAYER.md`](../docs/LEAVING_OUTLAYER.md).
 
-For the **architectural overview** of why the vault exists and how
-it interacts with the keystore / coordinator / MPC, see the rendered
-dashboard docs at https://app.outlayer.ai/docs/vaults (source:
-[`dashboard/app/docs/vaults/page.tsx`](../dashboard/app/docs/vaults/page.tsx)).
+For the **architecture and trust model** — how the vault interacts
+with the keystore, coordinator and MPC — see [`VAULTS.md`](../VAULTS.md)
+and https://app.outlayer.ai/docs/vaults.
 
 For **deploying the WASM as a NEP-591 global contract** so customers
 can run `outlayer vault init` against it, see
@@ -57,12 +56,10 @@ Key invariants enforced at runtime:
    `unilateral_initiate_recovery`, `finalize_recovery`,
    `unlocked_add_key`, `clear_unused_tee_keys` all require
    `predecessor_account_id() == self.parent`.
-3. **No in-place upgrade**: `Vault` is `PanicOnDefault` and there is
-   no `migrate()`. The borsh layout was changed when
-   `initial_tee_key` was added at position 4; old WASM hashes are
-   permanently incompatible with new ones. Each customer's vault
-   is bound to whatever WASM hash was used in the original
-   `UseGlobalContract` action — pinned forever.
+3. **No in-place upgrade**: no method deploys code and there is no
+   `migrate()`. Each customer's vault is bound to the WASM hash of
+   its original `UseGlobalContract` action, forever. A new contract
+   version reaches a customer only through a new vault.
 4. **Recovery is one-way**: `unlocked` only flips false → true,
    inside `callback_after_swap`, and only if the atomic
    DeleteKey + AddFullAccessKey batch succeeded. There is no method
@@ -84,13 +81,13 @@ Key invariants enforced at runtime:
 |---|---|---|
 | `propose_tee_key(public_key) -> Promise` | **permissionless** (DAO gate inside the callback) | Add a DAO-approved keystore-worker pubkey as a function-call AccessKey scoped to `(receiver=vault, methods=["request_master"])`. Hard cap of `MAX_REGISTERED_TEE_KEYS = 32`. Hostile race-add attacker pays gas, can only enqueue *already* DAO-approved keys — no funds exfiltration, only future-rotation blocking; mitigated by `clear_unused_tee_keys`. |
 | `clear_unused_tee_keys(public_keys) -> Promise` | parent only | Delete a list of registered TEE keys (typo-guarded — panics on unknown key). Useful for unwinding noisy `propose_tee_key` races. |
-| `callback_add_tee_key(public_key, dao_approved)` | `#[private]` self-callback | Commits the AddKey promise iff the DAO view-call returned `is_keystore_approved == true`. Otherwise panics and rolls back. |
+| `callback_add_tee_key(public_key)` + DAO result | `#[private]` self-callback | Records the key and emits the AddKey promise iff the DAO view-call returned `is_keystore_approved == true`. Otherwise panics; nothing changes. |
 
 ### MPC proxy
 
 | Method | Caller | Purpose |
 |---|---|---|
-| `request_master(request) -> Promise` | **vault self-call only** (signed by a TEE function-call key with `signer_account_id == current_account_id`) | Cross-contract proxy to `mpc_contract.request_app_private_key(request)`. Attaches `1 yoctoNEAR` and 150 TGas; returns the MPC response payload directly to the caller. The `predecessor == current` gate prevents anyone from forging a CKD request encrypted to their own pubkey using the public on-chain derivation path. |
+| `request_master(request) -> Promise` | **vault self-call only** (`predecessor == current_account_id`, i.e. a transaction signed by a key on the vault), and only while locked | Cross-contract proxy to `mpc_contract.request_app_private_key({request})`. Attaches `1 yoctoNEAR` and 150 TGas from the vault's balance; returns the MPC response payload to the caller. The self-call gate prevents anyone from requesting the master encrypted to their own key using the public on-chain derivation path. |
 
 ### Recovery — initiation
 
@@ -112,7 +109,7 @@ Key invariants enforced at runtime:
 
 | Method | Caller | Purpose |
 |---|---|---|
-| `unlocked_add_key(public_key, full_access, allowance)` | parent only, **requires `unlocked == true`** | Add an arbitrary access key to the (now-customer-controlled) vault. `full_access = true` adds a FullAccess key; otherwise adds a function-call key scoped to `(vault, ["*"])` with the given allowance (defaults to 1 NEAR). Zero allowance is rejected. |
+| `unlocked_add_key(public_key, full_access, allowance)` | parent only, **requires `unlocked == true`** | Add another access key to the (now customer-controlled) vault, on top of the full-access key `finalize_recovery` installed. `full_access = true` adds a full-access key; otherwise a function-call key on the vault, all methods, with the given allowance (default 1 NEAR). Zero allowance is rejected. |
 
 ### Views
 
@@ -213,11 +210,13 @@ cargo near build non-reproducible-wasm --no-abi
 ./build-docker.sh
 ```
 
-Produces `target/near/vault_contract.wasm` (also copied to `res/`).
-The hash printed at the end is what gets passed to
-`dao.outlayer.near.approve_vault_version`. Default build settings
-produce mainnet semantics (7-day delays, 1-day MIN exit window, 30-day
-MAX).
+Both scripts write `res/vault_contract.wasm` and print its SHA-256 in
+hex; `approve_vault_version` takes the same hash in base58
+(`Base58CryptoHash`). Default build settings produce mainnet semantics
+(7-day delays, 1-day MIN exit window, 30-day MAX). The committed
+`res/vault_contract.wasm` hashes to
+`G7ktGSeAkG6Q8YKZY3S8AKEYUMk9msdZbuFEGn4qaFJZ`, the version approved on
+`dao.outlayer.near`.
 
 ### Sandbox / testnet QA build
 
@@ -226,7 +225,7 @@ hash need second-granularity delays:
 
 ```bash
 cd vault-contract
-cargo test --features test-timing --test integration
+cargo +stable test --features test-timing --test integration
 # or for a testnet WASM:
 cargo near build non-reproducible-wasm --no-abi --features test-timing
 ```
@@ -250,14 +249,18 @@ fits in a browser-wallet URL. Full procedure in
 
 ## Tests
 
+The dev-dependencies (near-workspaces, near-sandbox) need a newer
+rustc than the contract's pinned `1.85.0`, so run the tests with
+`cargo +stable`.
+
 | Suite | Run | Coverage |
 |---|---|---|
-| `cargo test --lib` | unit tests, ~50 ms | 47 tests covering range checks, panic conditions, predecessor-only enforcement, deferred-state-commit invariants. Uses mocked block timestamps. |
-| `cargo test --features test-timing --test integration` | near-workspaces sandbox, ~90 s | 23 tests covering full multi-tx flows: atomic deploy, cessation + unilateral happy paths, DAO revocation mid-recovery, window expiry, race conditions on `propose_tee_key`, key-swap atomicity, post-unlock `unlocked_add_key`. |
-| `tests/sovereignty_e2e.sh` (repo root) | testnet, ~7 min | 14-step end-to-end sovereign exit on real testnet: deploy → wallet → keystore-signed transfer → finalize_recovery → keystore refuses → CKD recovery → local wallet derivation → local-key send-near → on-chain ciphertext fetch → local secret decrypt. |
-| `tests/vault_detach_test.sh` | testnet, ~2 min | Run only the detach half against an existing vault + secret (skip deploy/setup). |
-| `tests/vault_multi_customer_isolation.sh` | testnet, ~3 min | Phase 10 scenario 5: two vaults under the same parent, distinct keys, header-override ignored. |
-| `tests/vault_backward_compat.sh` | testnet, ~1 min | Phase 10 scenario 6: legacy default-master path (no `vault_id`) still works. |
+| `cargo +stable test --lib` | unit tests, under a second | Range checks, panic conditions, parent-only enforcement, deferred-state-commit invariants, with mocked block timestamps. |
+| `cargo +stable test --features test-timing --test integration` | near-workspaces sandbox | Multi-tx flows: atomic deploy, cessation + unilateral paths, DAO revocation mid-recovery, window expiry, `propose_tee_key` races, key-swap atomicity, post-unlock `unlocked_add_key`. |
+| `tests/vault_recovery_e2e.sh` (repo root) | testnet | Contract recovery state machine against a `test-timing` build deployed with `near` CLI. |
+| `tests/vault_e2e.sh` | testnet | CLI-driven vault deploy. |
+| `tests/unified_vault_e2e.sh` | testnet | V1 multi-customer isolation, V2 N wallets per vault, V3/V5 sovereign exit with offline re-derivation and a transfer signed by the recovered key, V4 secret decryption after recovery, V6 secrets created for an agent under a vault. |
+| `tests/vault_backward_compat.sh` | testnet | Default-master path (no `vault_id`). |
 
 ---
 
@@ -268,12 +271,14 @@ through OutLayer's coordinator HTTP API. Two distinct steps:
 
 ### Step 1: `outlayer vault init` (or dashboard "Create vault")
 
+- `POST /customer/derive-tee-key` fetches the TEE pubkey for the
+  `AddKey` action.
 - Atomic deploy via `UseGlobalContract` (5 actions: CreateAccount,
-  Transfer, UseGlobalContract, `new(...)`, AddKey).
-- Calls `POST /customer/register` on the coordinator. This
-  triggers the keystore-worker's `mark_vault_verified` transaction
-  on the DAO so the vault lands in
-  `keystore-dao.verified_vaults`.
+  Transfer of 1 NEAR, UseGlobalContract, `new(...)`, AddKey).
+- `POST /customer/sign-verification` makes the keystore re-check the
+  vault and submit `mark_vault_verified` on the DAO, so the vault lands
+  in `keystore-dao.verified_vaults`. `outlayer vault resume <vault>`
+  repeats this step.
 - **No API key is issued.** The vault exists on chain and is
   DAO-verified, but no `wk_` has been minted yet.
 
@@ -285,17 +290,18 @@ Mint one wallet API key bound to the vault. Returns:
 {
   "api_key": "wk_<64 hex>",
   "wallet_id": "<UUID v4>",
-  "near_account_id": "<hex of HMAC-SHA256(per_vault_master, 'wallet:<wallet_id>:near')[..32].verifying_key>",
+  "near_account_id": "<hex of the ed25519 public key of HMAC-SHA256(per_vault_master, 'wallet:<wallet_id>:near')>",
   "handoff_url": "https://app.outlayer.ai/wallet?key=wk_...",
   "trial": { ... }
 }
 ```
 
-Call this N times for N wallets under the same vault. Migration
-`20260511000001` dropped the UNIQUE constraint on
-`wallet_accounts.vault_id` so the coordinator stores N rows linking
-the same vault to N distinct `wallet_id`s. Each `wallet_id` gets a
-cryptographically isolated NEAR address because the seed differs.
+Call this N times for N wallets under the same vault. Each
+`wallet_id` gets its own NEAR address because the seed differs. Save
+every `wallet_id`: the sovereign exit needs it to re-derive that
+wallet's key. `POST /customer/register {"vault_account_id": "<vault>",
+"webhook_url": "..."}` does the same and subscribes the URL to vault
+events.
 
 ### `/wallet/v1/*` auth
 
@@ -304,17 +310,16 @@ Authorization: Bearer wk_<api_key>
 ```
 
 Coordinator pipeline:
-1. Hash the API key, look up in `wallet_api_keys` table → get
-   `wallet_id` and `customer_account_id` (= the vault_id if
-   vault-bound, else NULL for legacy default-master wallets).
+1. Hash the API key (only SHA-256 hashes are stored) and look up its
+   `wallet_id` and vault binding (none for default-master wallets).
 2. Forward `X-Customer-Vault: <vault_id>` to the keystore on every
-   signing call. Keystore uses it to select the per-vault master
-   via MPC CKD (or default master if absent).
+   keystore call. The keystore uses it to select the per-vault master
+   (or the default master if absent), after its on-chain serving gate.
 
 **The vault binding is auth-driven, never request-driven.** A
 client-supplied `X-Customer-Vault` header on a `/wallet/v1` call
 is ignored — the binding lives on the API key's DB row. Test
-coverage: [`tests/vault_multi_customer_isolation.sh`](../tests/vault_multi_customer_isolation.sh).
+coverage: [`tests/unified_vault_e2e.sh`](../tests/unified_vault_e2e.sh) V1.
 
 ### Per-user patterns (one parent, many sub-wallets)
 
@@ -347,22 +352,21 @@ the application server. Documented in
 | A | `wk_`'s per user | Drain just that user's wallet, revoke single `wk_` | High-value vaults; explicit per-user audit trail |
 | B | parent `wk_` | Drain all sub-wallets; revoke parent `wk_` via `DELETE /api-key/:hash`, individually revoke pre-minted sub-keys | Default for stateless apps with vault sovereignty |
 
-The legacy **deterministic `POST /register`** path (5-tuple) does
-**NOT support `vault_id`** — the coordinator returns HTTP 400.
+The **deterministic `POST /register`** path (signed account + seed)
+does **not** accept `vault_id` — the coordinator returns HTTP 400.
 Use Path A or B above for vault-scoped sub-wallets.
 
-### Default master vs vault — legacy compatibility
+### Default master (no vault)
 
-Pre-vault customers register with empty body:
+Registering without a vault:
 
 ```bash
 curl -X POST https://api.outlayer.ai/register -d '{}'
 ```
 
-This produces a wk_ tied to the **OutLayer default master** (no
-vault_id). Existing pre-vault wallets keep working indefinitely —
-the keystore's `derive_keypair(customer = None, seed)` path is
-unchanged. Tests: [`tests/vault_backward_compat.sh`](../tests/vault_backward_compat.sh).
+This produces a `wk_` tied to the **OutLayer default master** (no
+vault binding): the keystore's `derive_keypair(customer = None, seed)`
+path. Tests: [`tests/vault_backward_compat.sh`](../tests/vault_backward_compat.sh).
 
 ---
 
@@ -371,12 +375,13 @@ unchanged. Tests: [`tests/vault_backward_compat.sh`](../tests/vault_backward_com
 ```
 vault-contract/
 ├── src/
-│   └── lib.rs                # entire contract: ~1700 lines
+│   └── lib.rs                # entire contract
 ├── tests/
 │   ├── integration.rs        # near-workspaces sandbox suite
+│   ├── testnet.rs            # tests against testnet
 │   └── mock-keystore-dao/    # tiny mock keystore-DAO contract used by integration tests
 ├── res/
-│   └── vault_contract.wasm   # build output, also referenced by tests
+│   └── vault_contract.wasm   # build output (mainnet-approved hash), also referenced by tests
 ├── build.sh                  # non-reproducible build (fast iteration)
 ├── build-docker.sh           # reproducible build (canonical hash for DAO approval)
 ├── Cargo.toml                # `test-timing` feature flag declared here
@@ -394,6 +399,7 @@ vault-contract/
 | keystore-worker (in-TEE custodian) | [`../keystore-worker/`](../keystore-worker/) |
 | coordinator (HTTP API) | [`outlayer-coordinator`](https://github.com/out-layer/outlayer-coordinator) (separate repo) |
 | customer-recovery tool | [`../scripts/customer-recovery/`](../scripts/customer-recovery/) |
-| dashboard vault UI | [`../dashboard/app/vault/page.tsx`](../dashboard/app/vault/page.tsx) |
+| dashboard vault UI | [dashboard](https://github.com/out-layer/dashboard) `app/vault/page.tsx`, `lib/vault.ts` |
+| architecture & trust model | [`../VAULTS.md`](../VAULTS.md) |
 | Sovereign exit runbook | [`../docs/LEAVING_OUTLAYER.md`](../docs/LEAVING_OUTLAYER.md) |
 | Rendered architecture docs | https://app.outlayer.ai/docs/vaults |

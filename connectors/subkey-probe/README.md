@@ -4,12 +4,13 @@ A connector whose only job is exercising **EVM sub-keys** through the
 `outlayer:wallet` host functions — the path from a guest's `label` to a key the
 keystore derives under `connector.{connector_id}.{label}`.
 
-It exists because `connector-probe` deliberately does not import the wallet
-interface (a component that imports it cannot run without a wallet, and most
-probe calls carry none), and `wallet-probe` is deliberately not a connector
-(no `connector_id`, so no sub-keys). This module is both: a connector with a
-manifest, importing `outlayer:wallet`, with `network: []` — the wallet
-functions are host calls, not HTTP, and it reaches nothing else.
+It exists apart from `connector-probe`, which does not import the wallet
+interface (most probe calls carry no wallet), and from
+`wasi-examples/wallet-probe`, which is not a connector (no `connector_id`, so
+no sub-keys). This module is both: a connector with a manifest, importing
+`outlayer:wallet`, with `network: []` — the wallet functions are host calls,
+not HTTP, and it reaches nothing else. Testnet only: the coordinator's
+registry lists it there and nowhere else.
 
 ## Operations
 
@@ -37,8 +38,8 @@ curl -s https://testnet-api.outlayer.ai/call/connectors.outlayer.testnet/subkey-
 
 `X-Payment-Key` is a key the custody wallet itself owns; `X-Wallet-Id` is that
 wallet's id (what `GET /wallet/v1/address` returns as `wallet_id`), and it may
-only confirm the wallet the key identifies, never choose another. Without the
-header the worker refuses to start the module.
+only confirm the wallet the key identifies, never choose another. Without a
+wallet the module still runs, and every wallet function answers `no_wallet`.
 
 `sign` is gated by the wallet's `evm_sign` capability: a wallet with no policy
 is unrestricted; one with a policy needs `evm_sign.allowed: true`, or the
@@ -50,6 +51,5 @@ operation answers `policy_denied`.
 ./build.sh          # checks wit/wallet.wit against the worker's, builds, prints the hash
 ```
 
-Publish under the connectors namespace, price it with
-`scripts/set_connector_prices_testnet.sh`, and make sure the coordinator's
-registry lists `subkey-probe` (it does, testnet only).
+Publish under the connectors namespace (`connectors.outlayer.testnet/subkey-probe`)
+and price it with `scripts/set_connector_prices_testnet.sh`.

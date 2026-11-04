@@ -1,231 +1,203 @@
-# Keystore Worker - TEE Secret Management for NEAR OutLayer
+# Keystore Worker
 
-The **Keystore Worker** is a secure service that runs in a Trusted Execution Environment (TEE) to manage encryption/decryption of user secrets for the NEAR OutLayer platform.
+The keystore is the OutLayer service that holds master secrets and derives every key
+from them: the keys that encrypt and decrypt user secrets, custody-wallet signing keys,
+per-project storage keys, VRF keys, and the keys a WebAssembly artefact declares. It runs
+as a dstack confidential VM on Intel TDX hosts operated by OutLayer.
 
-## Overview
+Callers:
 
-When users want to execute code that requires secrets (API keys, credentials, etc.), they encrypt those secrets with the keystore's public key. The keystore worker then decrypts these secrets ONLY for verified executor workers running in TEE environments.
+- **TEE workers** — decrypt a job's secrets and receive its declared keys, encrypt and
+  decrypt storage, VRF.
+- **The coordinator** — relays the dashboard's secret-store calls and every custody-wallet
+  operation (derive an address, check a policy, sign).
+- **Anyone** — `/health`, `/pubkey` (default master), `/vrf/pubkey`.
 
-**Security Model:**
-- Private key **NEVER** leaves TEE memory
-- Only verified workers can request decryption: the handshake checks that the worker's key is an
-  access key on the operator account (`OPERATOR_ACCOUNT_ID`) — where `register_worker_key` puts
-  it after verifying a TDX quote — and every later request carries the resulting session
-- Token-based authentication for API access
-- Public key is published on-chain in the NEAR contract
+## Where the master comes from
 
-## Architecture
+In production (`TEE_MODE=outlayer_tee`, `USE_TEE_REGISTRATION=true`):
+
+1. At boot the keystore generates a registration keypair (`KEYSTORE_KEY_TYPE`, ed25519 or
+   ml-dsa-65) in enclave memory. It is never written to disk.
+2. It reads its TDX measurements from a fresh quote and asks the DAO contract
+   (`KEYSTORE_DAO_CONTRACT`) whether they are approved. If not, it submits nothing and stops.
+3. The init account (`INIT_ACCOUNT_ID`) submits `submit_keystore_registration` with the
+   quote; the contract verifies it and opens a proposal.
+4. The keystore polls for approval for up to 30 minutes. A DAO vote installs its key as a
+   function-call key on the DAO account.
+5. With that key it calls the DAO's `request_key`, which forwards a confidential key
+   derivation (CKD) request to the NEAR MPC contract. The response is encrypted to a
+   one-shot BLS12-381 key generated in enclave memory; the keystore decrypts it, verifies
+   it against `MPC_PUBLIC_KEY`, and stretches it with HKDF to the 32-byte default master.
+   Every approved keystore receives the same master, so a restarted or upgraded keystore
+   reads every secret stored before.
+6. Only then does it bind its HTTP port. An instance that fails any step stays up without
+   a listener, so the gateway never routes traffic to it.
+
+Per-customer vault masters are derived on first use: the keystore signs
+`request_master` on the customer's own vault contract with a key derived for that vault,
+and the vault forwards the CKD request to MPC. The derivation path is an HMAC of the
+default master, so nobody outside an approved keystore can request the same master
+first. Vault masters live in memory and are evicted when the vault leaves enclave control.
+
+The contract side, and what the DAO owner and the DAO account's full-access key can do at
+this stage, is in [keystore-dao-contract/README.md](../keystore-dao-contract/README.md).
+
+Outside a TEE (`TEE_MODE=none`, `USE_TEE_REGISTRATION=false`) the master is
+`KEYSTORE_MASTER_SECRET`, or a random one generated at start and printed once to stderr
+(or to the file named by `KEYSTORE_MASTER_SECRET_OUT_PATH_NON_TEE`). In TEE mode either of
+those variables aborts startup, and `TEE_MODE=outlayer_tee` without
+`USE_TEE_REGISTRATION=true` aborts too.
+
+## How a worker authenticates
+
+A request to a worker route needs both:
+
+1. `Authorization: Bearer <token>` whose SHA-256 is in `ALLOWED_WORKER_TOKEN_HASHES`;
+2. `X-TEE-Session: <uuid>` naming a live session, when `TEE_MODE=outlayer_tee`.
+
+A session comes from a challenge-response:
 
 ```
-┌─────────────────────────────────────┐
-│  User / Contract                    │
-│  - Gets pubkey from contract        │
-│  - Encrypts secrets with pubkey     │
-└────────┬────────────────────────────┘
-         │
-         ↓ (encrypted secrets in request_execution)
-┌─────────────────────────────────────┐
-│  NEAR Contract                      │
-│  - Stores keystore pubkey           │
-│  - Validates requests               │
-└─────────────────────────────────────┘
-         ↓
-┌─────────────────────────────────────┐
-│  Executor Worker (in TEE)           │
-│  - Receives task with encrypted     │
-│  - Opens a TEE session              │
-│  - Requests decryption              │
-└────────┬────────────────────────────┘
-         │
-         ↓ POST /decrypt (X-TEE-Session)
-┌─────────────────────────────────────┐
-│  Keystore Worker (in TEE)           │
-│  ✓ Verify the TEE session           │
-│  ✓ Decrypt with private key         │
-│  ✓ Return plaintext (over TLS)      │
-│  - Private key stays in TEE         │
-└─────────────────────────────────────┘
+POST /tee-challenge                      → {"challenge": "<64 hex>"}     (valid 60 s, one use)
+POST /register-tee {public_key, challenge, signature}
+     → signature verified (schemes allowed by TEE_ALLOWED_KEY_TYPES)
+     → view_access_key(OPERATOR_ACCOUNT_ID, public_key) must exist on chain
+     → {"session_id": "<uuid>"}
 ```
 
-## Features
+`OPERATOR_ACCOUNT_ID` is the worker registration contract (`worker.outlayer.near`), which
+adds a worker's key only after verifying its TDX quote; see
+[WORKER_ATTESTATION.md](../WORKER_ATTESTATION.md).
 
-- **TEE-Ready:** Designed for Intel SGX, AMD SEV-SNP, or simulated TEE
-- **High Performance:** Async/await with Tokio for parallel request handling
-- **Secure:** Workers authenticate with a bearer token plus a challenge-response TEE session; a
-  request without a live session is refused
-- **Simple API:** RESTful HTTP endpoints
-- **Contract Integration:** Publishes public key to NEAR contract
-- **Token Auth:** SHA256 bearer tokens for additional security layer
-- **CKD Support:** Confidential Key Derivation via NEAR MPC Network for deterministic secrets
+What the check does and does not cover:
 
-## API Endpoints
+- It accepts **any** access key on the operator account, of any permission. A full-access
+  key on `worker.outlayer.near`, if one is present, opens a session as well as a
+  TDX-registered key does.
+- The key is checked once, at `/register-tee`. Sessions live in memory until the keystore
+  restarts; they do not expire, and removing the key from the operator account does not
+  end a session already open.
+- With `TEE_MODE=none` no session is required: the bearer token alone reaches the worker
+  routes.
 
-### `GET /health`
+A restarted keystore has no sessions; a worker that receives "TEE session not found"
+re-registers and retries.
 
-In TEE mode (`USE_TEE_REGISTRATION=true`) the HTTP port is bound only after the instance is ready
-(DAO approval + MPC-derived master); until then connections are refused. This is what lets the
-dstack gateway balance one hostname across several instances of a version: an instance that is
-still waiting for its vote is simply not connectable.
-Liveness only, no auth. Deliberately carries nothing about fleet state — see
-`/admin/loaded-vaults` for that.
+## API
 
-**Response:**
-```json
-{
-  "status": "ok",
-  "tee_mode": "OutlayerTee"
-}
-```
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /health` | none | `{"status": "ok", "tee_mode": "outlayer_tee" \| "none"}` |
+| `POST /pubkey` | none; coordinator or worker token when `vault_id` is set | public key to encrypt a secret to |
+| `GET /vrf/pubkey` | none | VRF public key |
+| `POST /decrypt`, `/encrypt`, `/decrypt-raw`, `/storage/encrypt`, `/storage/decrypt`, `/vrf/generate` | worker token + TEE session | job secrets and declared keys; storage; VRF |
+| `POST /add_generated_secret`, `/update_user_secrets` | coordinator token | secrets generated inside the keystore; secret updates |
+| `POST /wallet/*` (derive-address, sign, evm/*, solana/*, sign-policy, sign-secret-store, sign-secret-delete, check-policy, encrypt-policy, decrypt-policy, derive-ephemeral-key) | coordinator token | custody wallets |
+| `POST /sign-vault-verification` | coordinator token | verifies a vault and submits `mark_vault_verified` on the DAO |
+| `POST /derive-vault-tee-key` | coordinator or worker token | public key a vault must carry for the keystore |
+| `POST /tee-challenge`, `/register-tee` | coordinator or worker token | TEE session |
+| `GET /admin/loaded-vaults` | coordinator or worker token | vault masters currently in memory |
+| `POST /admin/evict-customer`, `/admin/ban-vault` | worker token | drop a vault master; ban a vault on the DAO |
+
+With TEE registration the port opens only once the master is loaded. Errors are
+`{"error": "<message>"}`.
 
 ### `POST /pubkey`
-Get keystore public key. Public for `vault_id = null`; a vault-scoped request requires a
-coordinator or worker token, because it can trigger an on-chain CKD derivation paid by that
-vault.
 
-**Response:**
 ```json
-{
-  "public_key_hex": "a1b2c3d4...",
-  "public_key_base58": "Ed25519:..."
-}
+{"seed": "github.com/alice/app:alice.near", "secrets_json": "{\"API_KEY\":\"...\"}", "vault_id": null}
 ```
+
+Returns `{"pubkey": "<hex>"}`, the X25519 public key of
+`HMAC-SHA256(master, "ecies:" || seed)`. Before deriving, the keystore parses
+`secrets_json` and refuses reserved names and the `PROTECTED_` prefix, which marks secrets
+generated inside the keystore. `secrets_json` carries the plaintext secrets: the dashboard
+sends it through the coordinator's `/secrets/pubkey`, so the coordinator relays them in the
+clear on the way to this check. The ciphertext the client then stores on the contract is
+ECIES: X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305,
+`[0x01 | ephemeral_pubkey(32) | nonce(12) | ciphertext | tag(16)]`.
 
 ### `POST /decrypt`
-Decrypt secrets for verified TEE worker (requires auth)
 
-**Headers:**
-```
-Authorization: Bearer <worker-token>
-X-TEE-Session: <session-id>
-```
-
-**Request:**
 ```json
 {
-  "encrypted_secrets": "base64-encoded-ciphertext",
-  "task_id": "optional-task-id"
+  "accessor": {"type": "Repo", "repo": "github.com/alice/app", "branch": null},
+  "profile": "default",
+  "owner": "alice.near",
+  "user_account_id": "bob.near",
+  "task_id": "123",
+  "executed_wasm_sha256": "<64 hex>",
+  "predecessor_id": "bob.near"
 }
 ```
 
-**Response:**
-```json
-{
-  "plaintext_secrets": "base64-encoded-plaintext"
-}
-```
-
-**Error Response:**
-```json
-{
-  "error": "TEE session not found"
-}
-```
+`accessor.type` is `Repo`, `WasmHash`, `Project` or `System`. The keystore reads the
+encrypted row from the contract (`NEAR_CONTRACT_ID`), evaluates its access condition
+(`AllowAll`, `Whitelist`, `AccountPattern`, `NearBalance`, `FtBalance`, `NftOwned`,
+`DaoMember`, `ValidUntil`, `WasmHash`, `Predecessor`, `Logic`, `Not`) and returns
+`{"plaintext_secrets": "<base64>"}`. `user_account_id`, `predecessor_id` and
+`executed_wasm_sha256` are taken from the worker on the trust of its session; balances,
+membership and ownership are read from the chain. A body that names `signing_keys`,
+`encryption_keys` or `task_key` is a keyed request, described under "Signing keys" below.
 
 ## Configuration
 
-Create a `.env` file (see `.env.example`):
+| Variable | Required | Meaning |
+|---|---|---|
+| `SERVER_HOST`, `SERVER_PORT` | no (`0.0.0.0`, `8081`) | listen address |
+| `NEAR_NETWORK` | no (`testnet`) | |
+| `NEAR_RPC_URL` | yes | keyed RPC; every chain read and the registration transactions |
+| `OFFCHAINVM_CONTRACT_ID` | yes | the OutLayer contract (`outlayer.near`) |
+| `NEAR_CONTRACT_ID` | yes, to read secrets | the contract secrets are read from (`outlayer.near`) |
+| `ALLOWED_WORKER_TOKEN_HASHES` | yes | comma-separated SHA-256 hex of worker tokens |
+| `ALLOWED_COORDINATOR_TOKEN_HASHES` | yes | comma-separated SHA-256 hex of coordinator tokens |
+| `TEE_MODE` | no (`none`) | `outlayer_tee` or `none` |
+| `USE_TEE_REGISTRATION` | no (`false`) | `true`: master from MPC after the DAO vote |
+| `OPERATOR_ACCOUNT_ID` | with `outlayer_tee` | account whose access keys admit a worker (`worker.outlayer.near`) |
+| `TEE_ALLOWED_KEY_TYPES` | no (`ed25519`) | worker key schemes accepted for sessions, e.g. `ed25519,ml-dsa-65` |
+| `KEYSTORE_KEY_TYPE` | no (`ed25519`) | registration key scheme: `ed25519` or `ml-dsa-65` |
+| `KEYSTORE_DAO_CONTRACT` | with TEE registration | `dao.outlayer.near` |
+| `INIT_ACCOUNT_ID`, `INIT_ACCOUNT_PRIVATE_KEY` | with TEE registration | pays for `submit_keystore_registration` (`init-keystore.outlayer.near`) |
+| `MPC_CONTRACT_ID` | with TEE registration | `v1.signer` (mainnet), `v1.signer-prod.testnet` |
+| `MPC_DOMAIN_ID` | with TEE registration | BLS12-381 domain, `2` |
+| `MPC_PUBLIC_KEY` | with TEE registration | the domain's `bls12381g2:` public key; CKD responses are verified against it |
+| `DSTACK_SIMULATOR_ENDPOINT` | no | dstack socket for quotes, `/var/run/dstack.sock` in the CVM |
+| `KEYSTORE_MASTER_SECRET` | non-TEE only | 64-hex master |
+| `KEYSTORE_MASTER_SECRET_OUT_PATH_NON_TEE` | non-TEE only | file a generated master is written to (mode 0600) |
+| `KEYSTORE_ALLOW_INLINE_POLICY` | no | testing only: lets `/wallet/check-policy` take an inline encrypted policy instead of reading it from the chain |
+| `LOG_MASTER_KEY_HASH` | no | `true` logs a SHA-256 of the master and extra registration diagnostics |
+| `RUST_LOG` | no | log filter |
+
+A token is generated and hashed like this; the worker or coordinator holds the token,
+the keystore only its hash:
 
 ```bash
-# Server
-SERVER_HOST=0.0.0.0
-SERVER_PORT=8081
-
-# NEAR Configuration
-NEAR_NETWORK=testnet
-NEAR_RPC_URL=https://rpc.testnet.fastnear.com/?apiKey=<your-fastnear-key>
-OFFCHAINVM_CONTRACT_ID=outlayer.testnet
-
-# Keystore account (must be authorized in contract)
-KEYSTORE_ACCOUNT_ID=keystore.testnet
-KEYSTORE_PRIVATE_KEY=ed25519:...
-
-# NEAR RPC Client (for reading secrets from contract)
-# Both are REQUIRED for repo-based secrets to work:
-NEAR_CONTRACT_ID=outlayer.testnet
-
-# Master Secret for Key Derivation
-# Generate: openssl rand -hex 32
-KEYSTORE_MASTER_SECRET=your_master_secret_hex_64_chars
-# optional, non-TEE only: where a generated master is written instead of stderr
-KEYSTORE_MASTER_SECRET_OUT_PATH_NON_TEE=/path/to/master.env
-
-# Worker authentication (SHA256 hashes of bearer tokens)
-ALLOWED_WORKER_TOKEN_HASHES=hash1,hash2,hash3
-
-# TEE mode (sgx|sev|simulated|none)
-TEE_MODE=none
-
-# Logging
-RUST_LOG=info,keystore_worker=debug
-```
-
-## Setup
-
-### 1. Generate Keystore Account and Key
-
-```bash
-# Create a new NEAR account for keystore
-near create-account keystore.testnet --useFaucet
-
-# Generate a new keypair (this will be stored in ~/.near-credentials)
-# Or use an existing key from the credentials file
-```
-
-### 2. Generate Worker Auth Tokens
-
-```bash
-# Generate a secure random token
 TOKEN=$(openssl rand -hex 32)
-echo "Worker token: $TOKEN"
-
-# Hash it with SHA256
-TOKEN_HASH=$(echo -n "$TOKEN" | sha256sum | cut -d' ' -f1)
-echo "Token hash (add to .env): $TOKEN_HASH"
+printf '%s' "$TOKEN" | shasum -a 256 | cut -d' ' -f1
 ```
 
-Add the hash to `ALLOWED_WORKER_TOKEN_HASHES` in `.env`:
-```
-ALLOWED_WORKER_TOKEN_HASHES=cbd8f6f0e3e8ec29d3d1f58a2c8c6d6e8d7f5a4b3c2d1e0f1a2b3c4d5e6f7a8b
-```
+## Running
 
-Workers will use the original token (not the hash) in their requests:
-```
-Authorization: Bearer <original-token>
-```
-
-### 3. Configure Contract
-
-The keystore worker will verify that its public key matches the contract's stored key on startup. You need to set the public key in the contract first:
-
-```bash
-# Get the public key from keystore worker startup logs or /pubkey endpoint
-# Then call contract method:
-near contract call-function as-transaction outlayer.testnet set_keystore_pubkey json-args '{"pubkey_hex":"a1b2c3d4..."}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' sign-as keystore.testnet network-config testnet sign-with-keychain send
-```
-
-### 4. Run Keystore Worker
+Locally, without a TEE:
 
 ```bash
 cd keystore-worker
-
-# Install dependencies
-cargo build --release
-
-# Run
+cp .env.example .env     # TEE_MODE=none, USE_TEE_REGISTRATION=false; set the token hashes
+echo 'OFFCHAINVM_CONTRACT_ID=outlayer.testnet' >> .env   # required, absent from the example
 cargo run --release
-
-# Or run directly
-./target/release/keystore-worker
+curl http://localhost:8081/health
 ```
 
-You should see:
-```
-INFO  Starting NEAR OutLayer Keystore Worker
-INFO  Keystore initialized, public_key=a1b2c3d4...
-INFO  ✓ Public key verified - matches contract
-INFO  Keystore worker API server started, addr=0.0.0.0:8081
-INFO  Ready to serve decryption requests from executor workers
-```
+`scripts/run_keystore.sh [dev|testnet|mainnet]` runs it with `.env.dev`, `.env.testnet`
+or `.env`.
+
+In production the keystore runs as a dstack CVM built from a pinned, attested release
+image (`deploy/self-hosted-tdx/40-deploy-keystore.sh`). From an operator machine,
+`scripts/deploy_tdx.sh keystore <testnet|mainnet> --version <ver> --node <host>` deploys
+it, reads the new measurements, approves them on the DAO as the owner, waits for the
+registration proposal and votes on it (printed for manual signing on mainnet), then polls
+`/health`.
 
 ## Deploying
 
@@ -236,150 +208,14 @@ change their shared request shape in a single release with no deprecation window
 meets a keystore of a different version. With several instances listed the worker holds a TEE
 session on the one serving it and moves to the next only when that one becomes unreachable.
 
-Restarting the keystore mints a fresh ephemeral registration key and needs a DAO vote within
-~30 minutes, so schedule the release when a voter is on hand. Retire the previous version's
-keys afterwards: paste the `export KEEP_DAL=…` / `export KEEP_AMS=…` lines that
-`outlayer keystore-keys <net>` prints on the nodes, then run `scripts/revoke_old_keystore_keys.sh <network>`.
+Restarting the keystore mints a fresh registration key and needs a DAO vote within 30
+minutes, so schedule the release when a voter is on hand. Retire the previous version's
+keys afterwards with `scripts/revoke_old_keystore_keys.sh <network>`: it asks each TDX node
+for the registration keys of its running keystores (`worker-ctl.sh keystore-keys <net>`),
+keeps those, and proposes revoking every other approved key and removing every older
+approved image.
 
-## Testing
-
-### Test Health Endpoint
-
-```bash
-curl http://localhost:8081/health
-```
-
-### Managing Secrets
-
-Use the **Dashboard UI** at http://localhost:3000/secrets to:
-- Create/edit/delete secrets with JSON format
-- Configure access control (AllowAll, Whitelist, NEAR/FT/NFT balance)
-- Client-side ChaCha20-Poly1305 encryption
-
-Secrets are encrypted in browser and stored on contract.
-
-## TEE Integration
-
-### Current Status
-- ✅ Production TEE via Intel TDX (Phala Network)
-- ✅ Worker TEE sessions (challenge-response over a key held on the operator account)
-- ✅ Worker registration with on-chain verification
-- ✅ Masters never persisted: the default master is CKD-derived at boot, per-vault masters on
-  first touch, and the registration keypair lives only in memory
-
-### Alternative TEE Deployment Options
-
-**Intel SGX:**
-1. Add dependency: `sgx_tstd`, `sgx_types`
-2. Implement sealed storage in `initialize_keystore()`
-3. Integrate Intel Attestation Service (IAS) or DCAP
-4. Build with `cargo build --target x86_64-fortanix-unknown-sgx`
-
-**AMD SEV-SNP:**
-1. Add dependency: `sev` crate
-2. Implement SEV attestation verification
-3. Use SNP guest tools for attestation generation
-4. Build with appropriate target
-
-**Key Changes for TEE:**
-- Implement sealed storage for private key persistence
-- Add remote attestation with hardware root of trust
-
-(AEAD encryption and X25519 ECDH were previously listed here as pending; both are
-implemented — see `src/crypto.rs`.)
-
-## Confidential Key Derivation (CKD)
-
-### Overview
-
-The keystore integrates with NEAR's **Confidential Key Derivation (CKD)** - an advanced cryptographic primitive that leverages the NEAR MPC Network to provide deterministic secrets for TEE applications. Unlike traditional key derivation, CKD uses distributed computation where multiple MPC nodes collaborate to generate secrets without any single node knowing the final value.
-
-### How It Works with MPC Network
-
-```
-TEE App → Developer Contract → MPC Contract → MPC Network
-    ↑                                               ↓
-    └─── Encrypted Secret (Y, C) ←─────────────────┘
-
-No single MPC node knows the final secret!
-```
-
-The CKD protocol flow:
-1. TEE app generates fresh ElGamal key pair (a, A) and includes A in attestation
-2. Developer contract validates TEE attestation and calls MPC contract
-3. Each MPC node computes partial BLS signature using its secret share
-4. Coordinator aggregates encrypted shares into (Y, C)
-5. Only the TEE app can decrypt using private key a to get final secret
-
-### Security Properties
-
-1. **Deterministic** - Same app_id always produces the same secret
-2. **Private** - Secret known only to the requesting TEE app
-3. **Distributed** - No single MPC node has the complete secret
-4. **TEE-protected** - Secrets computed and used only inside secure enclaves
-5. **Threshold security** - Requires t-of-n MPC nodes to cooperate
-
-### Cryptographic Foundation
-
-- **BLS signatures** on pairing-friendly BLS12-381 curves
-- **ElGamal encryption** for secure transport
-- **HKDF** for final key derivation
-- **Threshold cryptography** ensuring no single point of failure
-
-### Use Case: Persistent Secrets
-
-When a user stores secrets for their repository:
-1. Keystore derives a unique child key for that repo
-2. Secrets are encrypted with the child key
-3. After keystore restart, the same child key can be regenerated
-4. Secrets remain accessible without storing any keys on disk
-
-### Implementation
-
-The CKD is implemented using HMAC-SHA256 with domain separation:
-
-```rust
-// Derive child key for a specific repository
-let child_key = hmac_sha256(
-    master_key,
-    format!("keystore-ckd:{}:{}", repo_url, owner)
-);
-```
-
-This ensures:
-- **No key reuse** across different repositories
-- **Consistent keys** for the same repository
-- **Cryptographic isolation** between users and repos
-
-### Benefits
-
-1. **No key management overhead** - Only derivation key needs protection
-2. **Automatic key rotation** - Change derivation key to rotate all derived keys
-3. **Audit trail** - Can track which repos had keys derived
-4. **Compliance** - Keys are never persisted, only derived when needed
-
-## Security Considerations
-
-### Current Implementation
-
-Production-ready security features:
-
-1. **TEE:** Intel TDX via Phala Network with hardware attestation
-2. **Attestation:** On-chain verification via worker registration contract
-3. **Key Storage:** TEE sealed storage with hardware binding
-4. **Encryption:** ECIES — ephemeral X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305
-   AEAD. Wire format: `[0x01 | ephemeral_pubkey(32) | nonce(12) | ciphertext | tag(16)]`.
-   Only the TEE holds the private key; the key published by `/pubkey` can encrypt but
-   not decrypt.
-
-### Security Best Practices
-
-- Keystore runs exclusively in TEE environment
-- Worker registration verified on-chain before execution
-- Access control validated for each secret request
-- Rate limiting at coordinator level
-- Audit logging for all decrypt operations
-- Monitoring and alerting via coordinator
+## Keys
 
 ### Adding a key family
 
@@ -393,13 +229,15 @@ adding a family:
 
 1. **Know which endpoints hand out private material.** Two do:
    `/wallet/derive-ephemeral-key` (payment checks) and `/decrypt` when it names
-   `signing_keys` (signing keys, to a TEE worker). The exporter builds
-   `wallet:{id}:{chain}:{sub_path}` from two request strings and returns the
-   private key. Any signing key whose seed that endpoint could spell is a
-   signing key it can export. The families it cannot reach are: two-segment
-   seeds under `wallet:` (it always appends a non-empty third segment), and
-   anything under a different root. `/decrypt` builds its strings itself, from
-   validated fields, only under `signing-key:v1:` — see "Signing keys" below.
+   `signing_keys`, `encryption_keys` or `task_key` (key material, to a TEE
+   worker). The exporter builds `wallet:{id}:{chain}:{sub_path}` from two
+   request strings and returns the private key. Any signing key whose seed that
+   endpoint could spell is a signing key it can export. The families it cannot
+   reach are: two-segment seeds under `wallet:` (it always appends a non-empty
+   third segment), and anything under a different root. `/decrypt` builds its
+   strings itself, from validated fields, only under `signing-key:v1:`,
+   `encryption-key:v1:` and `task-key:v1:` — see "Signing keys" below,
+   `src/encryption_keys.rs` and `src/task_keys.rs`.
 
 2. **Give a new signing family its own root, not a level under `wallet:`.**
    EVM sub-keys are `subkey:{id}:evm:{sub_path}` for this reason alone — under
@@ -416,7 +254,7 @@ adding a family:
    spellings that derive one key, or one that derives a different key than the
    caller wrote, are both silent.
 
-`no_exportable_seed_can_name_a_signing_key` in `api.rs` encodes the invariant:
+`no_exportable_seed_can_name_a_signing_key` in `api_tests.rs` encodes the invariant:
 add the new family's seed to that test before adding the family.
 
 ### Signing keys
@@ -442,8 +280,8 @@ No other binding exists; any other `bind` value is refused.
   key and its `predecessor_id` for a `predecessor` key; `wasm_sha256` 64
   lowercase hex. No field can hold a `:`, so the string parses back uniquely.
   The keystore builds it (`src/signing_keys.rs`); a request never supplies one,
-  and the project's `owner/name` id is not part of it. At most 3 keys per
-  request.
+  and the project's `owner/name` id is not part of it. At most 3 signing keys
+  per request.
 - **Issued strictly by how the code is run.** A request that names a
   `project_id` is a project run and holds `project` keys only; one that names
   none is a direct run of a wasm URL and holds `wasm` keys only. There is no
@@ -456,25 +294,26 @@ No other binding exists; any other `bind` value is refused.
   request.
 - **Trusted, not verified:** `user_account_id`, `predecessor_id`,
   `executed_wasm_sha256` and `project_id` come from the worker on the trust of
-  its TEE attestation, exactly as for secrets. Verified on chain: the project's
+  its TEE session, exactly as for secrets. Verified on chain: the project's
   version and owner, the vault's ownership.
-- **One request per run.** A `/decrypt` body with a `signing_keys` member
-  (other than `null` or `[]`) is a `KeyedDecryptRequest`: the job's secret row
-  if it has one (`accessor` + `profile` + `owner`, all or none), plus
-  `signing_keys: [{path, type, bind?, caller?, vault?}]`, `project_id`,
-  `executed_wasm_sha256`, `user_account_id`, `predecessor_id`. Every other body
-  is read by the same extractor as always and answered byte for byte as before;
-  an object naming `signing_keys` twice is neither and is refused (422) before
+- **One request per run.** A `/decrypt` body with a `signing_keys` or
+  `encryption_keys` member (other than `null` or `[]`), or a `task_key` member
+  (other than `null` or `false`), is a `KeyedDecryptRequest`: the job's secret
+  row if it has one (`accessor` + `profile` + `owner`, all or none), plus
+  `signing_keys: [{path, type, bind?, caller?, vault?}]`, `encryption_keys`,
+  `task_key`, `project_id`, `executed_wasm_sha256`, `user_account_id`,
+  `predecessor_id`. Every other body is a plain `DecryptRequest`; an object
+  naming one of those members twice is neither and is refused (422) before
   either parser reads it. The answer is an object with independent parts:
-  `{"secrets": {"status": "decrypted", "plaintext_secrets": …} | {"status": "not_found", "error": …}, "signing_keys": {path: seed_hex}}`
-  (`secrets` only when a row was named).
+  `{"secrets": {"status": "decrypted", "plaintext_secrets": …} | {"status": "not_found", "error": …}, "signing_keys": {path: seed_hex}, "encryption_keys": {path: key_hex}, "task_key": …}`
+  (each part only when the request asked for it).
 - **Independent checks.** The keys are judged first and in full; any refusal
   fails the whole request with `{"error": …, "code": "signing_keys_refused"}`
   before the row is read. The row is then judged by its own access condition,
   exactly as without keys: a row that does not exist (`ApiError::SecretsNotFound`,
-  on the wire the same 400 as always) is reported as
-  `secrets.status = "not_found"` beside the keys; any other refusal of the row
-  fails the request with the status and message it always had.
+  a 400 on a plain request) is reported as `secrets.status = "not_found"`
+  beside the keys; any other refusal of the row fails the request with the
+  status and message a plain request gets.
 - A project run must run a `WasmUrl` version of its project:
   `get_version(project_id, executed_wasm_sha256)` on the contract must answer
   with a `WasmUrl` source of that hash, and `get_project(project_id)` must
@@ -499,73 +338,43 @@ No other binding exists; any other `bind` value is refused.
   family, for both string shapes. A caller-written seed — a raw seed sent to
   `/pubkey`, `/encrypt` or `/add_generated_secret`, or a `Repo` secret
   accessor's `{repo}:{owner}[:{branch}]`, whose repository and branch are free
-  strings on chain — that starts with `signing-key:` or `encryption-key:` is
-  refused with a 400; a repository URL never starts there. Were one derived,
-  it would reach the master only as `ecies:` + seed, or bare for its public
-  key alone.
+  strings on chain — that starts with `signing-key:`, `encryption-key:` or
+  `task-key:` is refused with a 400; a repository URL never starts there. Were
+  one derived, it would reach the master only as `ecies:` + seed, or bare for
+  its public key alone.
 
 ## Troubleshooting
 
-### "Public key mismatch" error on startup
+### Startup stops at "TEE measurements not approved"
 
-**Cause:** The keystore's private key doesn't match the public key stored in the contract.
+The build's five measurements are not on the DAO's approved list; no transaction was sent.
+The log prints the `add_approved_measurements` call to sign as the DAO owner. Approve, then
+restart the keystore. `scripts/deploy_tdx.sh keystore` does this as part of a deploy.
 
-**Fix:**
-1. Check `KEYSTORE_PRIVATE_KEY` is correct
-2. Check `OFFCHAINVM_CONTRACT_ID` points to the right contract
-3. Call `set_keystore_pubkey` on contract with correct public key
-4. Or generate a new keystore and update contract
+### Startup stops waiting for the DAO vote
 
-### "TEE session not found" / "session expired"
+The registration proposal was not approved within 30 minutes. The instance stays up without
+a listener. Restart it after a voter is available: the restart generates a new key and a new
+proposal.
 
-**Cause:** The keystore has no live session for this worker — it restarted (sessions live in
-memory only), or the worker never completed the challenge-response handshake.
+### "TEE session not found or expired"
 
-**Fix:**
-1. The worker re-registers automatically on this error for `/decrypt`, `/encrypt` and
-   `/decrypt-raw`; check its logs for a failed re-handshake and its cause
-2. Verify the worker's key is still an access key on the operator account (removed keys, e.g.
-   by `remove_worker_keys`, invalidate the handshake)
-3. Jobs that were mid-execution when the keystore restarted fail by design — retry them
+The keystore has no session for this worker: it restarted, or the worker never completed the
+handshake. The worker re-registers on this error for `/decrypt`, `/encrypt` and
+`/decrypt-raw`; if that fails, check that the worker's key is still an access key on
+`OPERATOR_ACCOUNT_ID`.
 
-### "Unauthorized" error
+### "Invalid worker token"
 
-**Cause:** Worker token is invalid or not in allowed list.
-
-**Fix:**
-1. Check worker has correct `KEYSTORE_AUTH_TOKEN` in its `.env`
-2. Verify token hash is in keystore's `ALLOWED_WORKER_TOKEN_HASHES`
-3. Token must match exactly (including whitespace)
-
-## Performance
-
-**Expected throughput:**
-- ~1000 decrypt operations/second (single worker, no TEE overhead)
-- ~100-500 ops/sec with SGX attestation verification
-- Linear scaling with CPU cores (tokio async runtime)
-
-**Latency:**
-- < 1ms for decryption operation (X25519 ECDH + ChaCha20-Poly1305)
-- ~10-50ms with SGX remote attestation
-- Network latency depends on deployment topology
+The worker's `KEYSTORE_AUTH_TOKEN` hashes to nothing in `ALLOWED_WORKER_TOKEN_HASHES`.
 
 ## Development
 
-### Run tests
 ```bash
 cargo test
-```
-
-### Run with debug logging
-```bash
 RUST_LOG=debug cargo run
-```
-
-### Build for production
-```bash
-cargo build --release
 ```
 
 ## License
 
-MIT (same as parent project)
+Apache-2.0.

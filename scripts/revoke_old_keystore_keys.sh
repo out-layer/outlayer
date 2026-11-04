@@ -302,11 +302,14 @@ stale_images = [m for m in images_onchain if m not in keep_images]
 w(f"\n=> revoke {len(old_keys)} key(s) via {-(-len(old_keys) // BATCH)} proposal(s); "
   f"drop {len(stale_images)} of {len(images_onchain)} approved image(s)\n")
 
+# zavodil.near carries too many access keys for the legacy keychain file; its votes sign through
+# near-cli's own keychain. The testnet signer and both owners live in the legacy keychain.
+SIGNER_KEYCHAIN = "sign-with-keychain" if NETWORK == "mainnet" else "sign-with-legacy-keychain"
 for n in range(0, len(old_keys), BATCH):
     args = json.dumps({"public_keys": old_keys[n:n + BATCH]})
     print(f"near contract call-function as-transaction {DAO} propose_revoke_keystore_keys "
           f"json-args '{args}' prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' "
-          f"sign-as {SIGNER} network-config {NETWORK} sign-with-legacy-keychain send")
+          f"sign-as {SIGNER} network-config {NETWORK} {SIGNER_KEYCHAIN} send")
 
 if forced_unknown_image:
     w("\nImage cleanup SKIPPED: a kept key has no readable proposal, so its image is unknown and "

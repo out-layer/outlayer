@@ -8,7 +8,7 @@ read it and neither can we.
 This is also the reference example of a **public** connector: the whole source
 is here, the manifest is in the artefact, and the author's one credential is a
 W5 author secret rather than anything a caller supplies. Read it alongside
-[docs/CONNECTORS.md](../../docs/CONNECTORS.md).
+[docs/CONNECTORS.md](../../../docs/CONNECTORS.md).
 
 ## Operations
 

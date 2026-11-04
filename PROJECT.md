@@ -4,9 +4,11 @@
 
 ## Executive Summary
 
-**NEAR OutLayer** gives an AI agent two things inside one attested Intel TDX enclave: a multi-chain **custody wallet** whose keys never leave the enclave and whose spending policy its owner sets, and **verifiable compute** — arbitrary untrusted code executed with hardware-enforced guarantees and an enclave-signed attestation of what ran.
+**NEAR OutLayer** gives an AI agent two things inside one attested Intel TDX enclave: a multi-chain **custody wallet** whose keys are derived and used inside the enclave and whose spending policy its owner sets, and **verifiable compute** — arbitrary untrusted code executed with hardware-enforced guarantees and an enclave-signed attestation of what ran.
 
 Compute reaches customers primarily as **connectors**: named operations with on-chain prices (`send_email`, `pay_invoice`) that run in the same enclave that holds the keys. It is also callable directly by a NEAR smart contract via the yield/resume mechanism, or by any backend over HTTPS.
+
+What OutLayer as operator can and cannot do — including the governance keys it holds at this stage (a full-access key on `dao.outlayer.near`, owner-only measurement approval, contracts upgraded by key) — is in [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md#governance-at-this-stage).
 
 Two integration modes:
 - **Blockchain (NEAR transactions)**: Smart contract calls `request_execution()` → worker executes in TEE → result resumes on-chain
@@ -24,14 +26,16 @@ Two integration modes:
 
 | Component | Description |
 |-----------|-------------|
-| `contract/` | Main NEAR contract (`outlayer.near`) — execution requests, secrets, projects, payments |
-| `coordinator/` | HTTP API server — task queue (PostgreSQL + Redis), WASM cache, HTTPS API gateway |
-| `worker/` | Polls tasks, fetches a published WASM and checks its sha256, executes it in TEE (Intel TDX via Phala Cloud); its compiler exists but is off by default (see [Code sources and builds](#code-sources-and-builds)) |
-| `keystore-worker/` | Secrets decryption service running in TEE, accessed directly by worker (not via coordinator) |
+| `contract/` | Main NEAR contract (`outlayer.near`) — execution requests, secrets, projects, payments, wallet policies |
+| coordinator (private repo `out-layer/coordinator`) | HTTP API server — task queue (PostgreSQL + Redis), WASM cache, HTTPS API gateway, Agent Custody wallet API |
+| `worker/` | Polls tasks, fetches a published WASM and checks its sha256, executes it with wasmtime inside an Intel TDX CVM (self-hosted dstack); its compiler exists but is off by default (see [Code sources and builds](#code-sources-and-builds)) |
+| `keystore-worker/` | Key derivation, signing and secrets decryption, running in TEE. Workers call it directly for secrets; the coordinator forwards wallet requests to it |
 | `register-contract/` | NEAR contract for TEE worker key registration with TDX quote verification (deployed to `worker.outlayer.near`) |
-| `keystore-dao-contract/` | DAO governance contract for keystore worker registration |
-| `dashboard/` | Next.js UI — project management, secrets, executions, earnings, documentation |
-| `sdk/` | `outlayer` crate for WASM components (storage, env, RPC) — wasm32-wasip2 only |
+| `keystore-dao-contract/` | DAO governance contract for keystore registration (`dao.outlayer.near`) |
+| `vault-contract/` | Per-customer vault: a customer's own custody root |
+| [dashboard](https://github.com/out-layer/dashboard) (separate repo) | Next.js UI — project management, secrets, executions, earnings, wallet policy and approvals, documentation |
+| `sdk/outlayer/` | `outlayer` crate for WASM components (storage, env, RPC, VRF; signing keys, encryption keys, tasks behind features) — wasm32-wasip2 only |
+| `connectors/` | Connectors: public ones in-tree, pro ones as private submodules |
 | `self-hosted-scheduler/` | [Generic scheduler](https://github.com/out-layer/self-hosted-scheduler) for autonomous agents — interval, storage-diff, webhook triggers |
 | [outlayer-cli](https://github.com/out-layer/outlayer-cli) | CLI for deploying, running, and managing agents (separate repo) |
 | `wasi-examples/` | Example WASI containers |
@@ -45,9 +49,11 @@ OutLayer Contract → yield (data_id) + emit event
     ↓
 Worker Network → poll event, fetch/cache WASM (sha256 checked), execute in TEE
     ↓
-Worker → resolve_execution(request_id, response) → resume
+Worker (operator key) → resolve_execution(request_id, response) → resume
     ↓
-User Contract → on_execution_response(response) callback
+OutLayer Contract → on_execution_response: charge, refund, emit execution_completed
+    ↓
+User Contract → its own callback receives the output (JSON value, or null on failure)
 ```
 
 ### Execution Flow (HTTPS API)
@@ -69,7 +75,7 @@ Coordinator → return JSON response (or poll via GET /calls/{call_id})
 ### Code sources and builds
 
 A user names one of two sources: `Project` (the normal case) or `WasmUrl` (a
-direct run of a published file). A project version's source is a `WasmUrl`. A
+direct run of a published file). A project version created by the CLI or dashboard is a `WasmUrl`. A
 version is a file named by its hash, so what a caller runs and pays for cannot
 change under that version afterwards — a repository can change under the same
 name and commit history can be rewritten. The worker fetches a `wasm_url` only
@@ -142,6 +148,7 @@ pub struct ResourceLimits {
 |-------|-------|
 | `MAX_INSTRUCTIONS` | 500,000,000,000 (500 billion) |
 | `MAX_EXECUTION_SECONDS` | 180 (3 minutes) |
+| `MAX_MEMORY_MB` | 4096 |
 | `MAX_COMPILATION_SECONDS` | 300 (5 minutes; builds only) |
 
 ### RequestParams
@@ -151,8 +158,9 @@ pub struct RequestParams {
     pub force_rebuild: bool,           // Build parameter: force recompilation even if cached
     pub store_on_fastfs: bool,         // Build parameter: store compiled WASM to FastFS
     pub compile_only: bool,            // Build parameter: compile only, no execution
-    pub project_uuid: Option<String>,  // Set automatically for Project source
-    pub attached_usd: Option<U128>,    // Payment to project developer (stablecoin micro-units)
+    pub project_uuid: Option<String>,  // Set by the contract from a Project source; a caller's value is ignored
+    pub attached_usd: Option<U128>,    // Payment to project developer (stablecoin micro-units), Project source only
+    pub use_bound_identity: bool,      // Agent Connect: run the guest under the caller's bound account name
 }
 ```
 
@@ -217,21 +225,21 @@ pub fn request_execution(
 );
 ```
 
-**Compile-only mode**: When `resource_limits` is `None` or `params.compile_only` is `true`, only compilation occurs (no execution), charged the base fee. It is a build path: with builds off it is not offered to users.
+**Compile-only mode**: When `resource_limits` is `None` or `params.compile_only` is `true`, only compilation occurs (no execution); the required deposit is the base fee. It is a build path: with builds off it runs nothing. A caller that wants a run passes `resource_limits`, even as `{}`.
 
-**Large payloads**: Input data >= 10KB is stored in contract state only (not in event log). Workers fetch via `get_request()`.
+**Large payloads**: Input data >= 10,000 bytes is stored in contract state only (not in the event log); workers fetch it via `get_request()`. Input beyond 32 KB holds a storage deposit of 0.00001 NEAR per byte while the request is pending, returned at settlement — `estimate_execution_cost(resource_limits, input_len)` includes it.
 
 ### resolve_execution (operator-only)
 
-Called by worker after execution completes. Resumes the yield with the response.
+Called by a worker after execution completes; resumes the yield with the response. The operator account is `worker.outlayer.near`: each registered worker holds a function-call access key on it, scoped to `resolve_execution`, `submit_execution_output_and_resolve`, `resume_topup` and `resume_delete_payment_key`.
 
-### submit_execution_output_and_resolve (operator-only)
+### submit_execution_output / submit_execution_output_and_resolve (operator-only)
 
-Two-call flow for large outputs: first submit output data, then resolve. Used when output exceeds event log limits.
+Large outputs: the output is stored in contract state first, then the request is resolved with metadata only. `submit_execution_output_and_resolve` does both in one call.
 
 ### cancel_stale_execution
 
-The sender can cancel a request still pending after 10 minutes (`EXECUTION_TIMEOUT = 600 * 1_000_000_000` nanoseconds). Refunds the whole `attached_usd` to the sender and the payment above the charge to the payer: the base fee when no output was delivered, the compute estimate for the limits when the output was delivered through the 2-call flow (`output_submitted`) and the callback never settled it.
+The sender can cancel a request still pending after 10 minutes (`EXECUTION_TIMEOUT = 600 * 1_000_000_000` nanoseconds). Refunds the whole `attached_usd` to the sender and the payment above the charge to the payer: the base fee when no output was delivered, the compute estimate for the limits when the output was delivered through the 2-call flow (`output_submitted`) and the callback never settled it. The contract owner's `emergency_cancel_execution(request_id)` cancels any pending request and refunds in full.
 
 ---
 
@@ -241,7 +249,7 @@ The sender can cancel a request still pending after 10 minutes (`EXECUTION_TIMEO
 
 ```rust
 pub enum SecretAccessor {
-    Repo { repo: String, branch: Option<String> },   // rows stored earlier: listed and deleted; CLI and dashboard store nothing new under it
+    Repo { repo: String, branch: Option<String> },   // listed and deleted; the CLI and dashboard refuse new values under it
     WasmHash { hash: String },                         // WASM hash secrets
     Project { project_id: String },                    // Project secrets (all versions)
     System(SystemSecretType),                           // Payment Keys
@@ -268,17 +276,20 @@ pub fn store_secrets(
     profile: String,
     encrypted_secrets_base64: String,
     access: AccessCondition,
+    vault_id: Option<AccountId>,   // null = default master; Some = encrypted under that vault's master
 );
 ```
 
-Requires storage deposit (refunded on deletion). Secrets encrypted client-side with keystore's public key.
+Requires storage deposit (refunded on deletion). Secrets are encrypted client-side with a public key the keystore derives from its master over a seed naming the accessor and owner (`POST /secrets/pubkey`). Off-chain callers pass `vault_id` explicitly (`null` for the default master). `store_agent_secret` stores a secret owned by a custody wallet (proven by the wallet's keystore signature), paid for by the caller; it takes only `Project` and `WasmHash` accessors.
 
 ### AccessCondition — Who Can Trigger Decryption
 
-9 variants with full compositional logic:
+12 variants with full compositional logic (stored versioned; new variants are appended, never inserted):
 
 ```rust
 pub enum AccessCondition {
+    Logic { operator: LogicOperator, conditions: Vec<AccessCondition> },
+    Not { condition: Box<AccessCondition> },
     AllowAll,
     Whitelist { accounts: Vec<AccountId> },
     AccountPattern { pattern: String },                // Regex, e.g., ".*\\.gov\\.near"
@@ -286,8 +297,9 @@ pub enum AccessCondition {
     FtBalance { contract: AccountId, operator: ComparisonOperator, value: NearToken },
     NftOwned { contract: AccountId, token_id: Option<String> },
     DaoMember { dao_contract: AccountId, role: String },
-    Logic { operator: LogicOperator, conditions: Vec<AccessCondition> },
-    Not { condition: Box<AccessCondition> },
+    ValidUntil { until_ns: U64 },                      // Admits until this block timestamp
+    WasmHash { hash: String },                         // Only a run of this exact build (hash measured by the worker)
+    Predecessor { condition: Box<AccessCondition> },   // Judge the inner condition on the calling account, not the signer
 }
 
 pub enum ComparisonOperator { Gte, Lte, Gt, Lt, Eq, Ne }
@@ -298,11 +310,11 @@ pub enum LogicOperator { And, Or }
 
 1. User stores encrypted secrets in contract via `store_secrets()`
 2. Execution request includes `secrets_ref: { profile, account_id }`
-3. Worker fetches encrypted secrets from contract
-4. Worker sends to keystore (running in TEE) for decryption
-5. Keystore validates access conditions (balance checks, whitelist, etc. via NEAR RPC)
-6. If authorized, keystore decrypts using derived keypair (CKD/MPC)
-7. Decrypted secrets injected as environment variables to WASM runtime
+3. Worker asks the keystore (running in TEE) to decrypt, naming the accessor (project, WASM hash or repo), profile and owner, the caller, and the sha256 it measured on the WASM it is about to run
+4. Keystore reads the ciphertext and access condition from the contract
+5. Keystore validates the access condition (balance checks, whitelist, `WasmHash` against the measured hash, etc. via NEAR RPC)
+6. If authorized, keystore decrypts with a key derived from its master secret (obtained from NEAR MPC via CKD), or the vault's master for a vault-bound secret
+7. Decrypted secrets are injected as environment variables into the WASM run
 
 ---
 
@@ -352,10 +364,10 @@ pub struct VersionInfo {
 | Method | Returns |
 |--------|---------|
 | `get_project(project_id)` | `Option<ProjectView>` |
-| `list_user_projects(account_id, from_index, limit)` | `Vec<ProjectView>` |
+| `list_user_projects(account_id)` | `Vec<ProjectView>` |
 | `get_version(project_id, version_key)` | `Option<VersionView>` |
-| `list_versions(project_id, from_index, limit)` | `Vec<VersionView>` |
-| `get_version_count(project_id)` | `u32` |
+| `list_versions(project_id, from_index, limit)` | `Vec<VersionView>` (default limit 50, max 100) |
+| `get_version_count(project_id)` | `u64` |
 
 ---
 
@@ -369,13 +381,13 @@ owner:nonce:secret
 
 - **owner**: NEAR account ID (e.g., `alice.near`)
 - **nonce**: Key number, starts at 1
-- **secret**: Base64-encoded secret
+- **secret**: random secret (the CLI generates 32 random bytes, hex-encoded)
 
 Payment keys are stored as secrets with `accessor: System(PaymentKey)`, `profile: nonce.to_string()`.
 
 ### Creating Payment Keys
 
-Payment keys are created via the dashboard or by calling `store_secrets()` with `System(PaymentKey)` accessor. The `get_next_payment_key_nonce(account_id)` view method returns the next available nonce.
+Payment keys are created via the dashboard, `outlayer keys create`, or directly by calling `store_secrets()` with the `System(PaymentKey)` accessor. The `get_next_payment_key_nonce(account_id)` view method returns the next available nonce. A custody wallet can also create one over HTTPS (`POST /wallet/v1/create-payment-key`); its trial or sponsored key lives at nonce 0, which the contract never issues, and exists only in the coordinator.
 
 ### Top-Up Methods
 
@@ -388,7 +400,7 @@ Payment keys are created via the dashboard or by calling `store_secrets()` with 
 }
 ```
 
-Minimum top-up: $0.01 (`MIN_TOP_UP_AMOUNT = 10_000` micro-units).
+`owner` is optional and defaults to the sender (it is needed when the transfer comes from `intents.near`). Minimum top-up: $0.01 (`MIN_TOP_UP_AMOUNT = 10_000` micro-units).
 
 **Buying a subscription (ft_transfer_call)** — a different action with different
 consequences: the money does NOT become the key's balance, so it is never
@@ -408,10 +420,9 @@ A payment that names a plan not on sale, or does not cover it, or names a key
 that does not exist, fails the transfer — which returns the money.
 
 **With NEAR**:
-`top_up_payment_key_with_near(nonce)` — wraps NEAR → wNEAR → swaps via Intents to stablecoin (mainnet only). Minimum: 0.01 NEAR deposit + execution fees.
+`top_up_payment_key_with_near(nonce, swap_contract_id)` — wraps NEAR → wNEAR → swaps via Intents to stablecoin (mainnet only). The deposit must cover 0.01 NEAR execution cost plus at least 0.01 NEAR to wrap.
 
-**With any whitelisted token**:
-`top_up_payment_key_with_token(token_contract, amount, nonce)` — swaps via Intents.
+`top_up_payment_key_with_token` exists in the contract ABI but is disabled: it panics.
 
 ### Deleting Payment Keys
 
@@ -426,8 +437,9 @@ that does not exist, fails the transfer — which returns the money.
 | Header | Required | Description |
 |--------|----------|-------------|
 | `X-Payment-Key` | Yes | `owner:nonce:secret` |
-| `X-Compute-Limit` | No | Max compute cost in stablecoin micro-units (default: 10000 = $0.01) |
-| `X-Attached-Deposit` | No | Payment to project author in micro-units |
+| `X-Compute-Limit` | No | Max compute cost in stablecoin micro-units (coordinator default `DEFAULT_COMPUTE_LIMIT`, 10000 = $0.01) |
+| `X-Attached-Deposit` | No | Payment to project author in micro-units (refused for a granted key, e.g. a trial) |
+| `X-Wallet-Id` | No | The paying key's own wallet, for a connector that acts on it |
 | `Content-Type` | Yes | `application/json` |
 
 **Request body**:
@@ -443,15 +455,19 @@ that does not exist, fails the transfer — which returns the money.
 **Sync response**:
 ```json
 {
+  "call_id": "uuid",
   "status": "completed",
   "output": "...",
   "compute_cost": "45000",
-  "job_id": 12345,
-  "attestation_url": "https://app.outlayer.ai/attestations/12345"
+  "instructions": 123456,
+  "time_ms": 42,
+  "attestation_url": "/attestations/by-call/{call_id}"
 }
 ```
 
-**Async mode**: Set `"async": true` → returns `{ "call_id": "uuid", "status": "pending", "poll_url": "..." }`. Poll with `GET /calls/{call_id}`.
+`attestation_url` is relative to the API base and is omitted for a failed call.
+
+**Async mode**: Set `"async": true` → returns `{ "call_id": "uuid", "status": "pending", "poll_url": "..." }`. Poll with `GET /calls/{call_id}`, authenticated with the same `X-Payment-Key` (or the owning wallet's `Bearer wk_`).
 
 ---
 
@@ -499,11 +515,11 @@ View current pricing: `get_pricing()` (NEAR tuple) or `get_pricing_full()` (Pric
 
 ### TEE Platform
 
-All workers run inside **Intel TDX** (Trust Domain Extension) confidential VMs on **Phala Cloud**. The TEE provides:
+Workers and keystores run inside **Intel TDX** (Trust Domain Extensions) confidential VMs on OutLayer's own TDX hosts, deployed with dstack (`deploy/self-hosted-tdx/`). The TEE provides:
 
-- Hardware-encrypted memory (host OS cannot read worker memory)
+- Hardware-encrypted memory (the host OS cannot read worker memory)
 - Hardware-measured code identity (5 measurements)
-- Cryptographic attestation quotes signed by Intel
+- Attestation quotes whose signature chains to Intel's root certificate (collateral from Intel PCS, verified with Intel DCAP)
 
 ### 5-Measurement TDX Verification
 
@@ -519,62 +535,67 @@ pub struct ApprovedMeasurements {
 }
 ```
 
-All 5 measurements must match an admin-approved set. This prevents dev/debug TDX images (which may have SSH access) from passing verification.
+All 5 measurements must match an approved set. This prevents dev/debug TDX images (which may have SSH access) from passing verification. Approved sets are added by the register-contract's owner (`add_approved_measurements`); at this stage that is a single OutLayer key.
 
 ### Worker Registration Flow
 
-1. Worker generates ed25519 keypair inside TEE
-2. Worker requests TDX quote from hardware (public key embedded in `report_data`)
+1. Worker generates an ed25519 (or ML-DSA-65) keypair inside the TEE
+2. Worker requests a TDX quote with the key bound in `report_data` (the ed25519 public key itself, or the SHA-256 of an ML-DSA-65 key)
 3. Worker calls `register_worker_key()` on `worker.outlayer.near` with the quote
-4. Contract verifies Intel TDX signature, extracts all 5 measurements, checks against approved list
-5. Contract adds worker's public key as a scoped access key (can only call `resolve_execution`, `submit_execution_output_and_resolve`, `resume_topup`, `resume_delete_payment_key`)
+4. Contract verifies the quote's Intel signature chain against the stored collateral, extracts all 5 measurements, checks them against the approved list
+5. Contract adds the worker's public key as a function-call access key on `worker.outlayer.near`, scoped to `resolve_execution`, `submit_execution_output_and_resolve`, `resume_topup`, `resume_delete_payment_key` on `outlayer.near`
 
 ### TEE Session Protocol (Challenge-Response)
 
 After on-chain registration, workers establish sessions with coordinator and keystore:
 
 ```
-Worker → POST /tee-challenge → Server returns 32-byte challenge
+Worker → POST /workers/tee-challenge → Server returns 32-byte challenge
 Worker → Sign challenge with TEE private key
-Worker → POST /register-tee { public_key, challenge, signature }
-Server → Verify signature + NEAR RPC view_access_key (key exists on worker.outlayer.near?)
-Server → Issue session UUID
-Worker → All requests include X-TEE-Session: {session_id}
+Worker → POST /workers/register-tee { public_key, challenge, signature }
+Server → Verify challenge freshness + signature + NEAR RPC: key exists on worker.outlayer.near
+Server → Issue session id
+Worker → Requests include X-TEE-Session: {session_id}
 ```
 
-Coordinator stores sessions in PostgreSQL. Keystore stores sessions in memory (workers auto-re-register on 403).
+Coordinator stores sessions in PostgreSQL. Keystore stores sessions in memory (workers re-register on 403).
 
 ### Trust Model
 
-**What operator CANNOT do** (hardware-enforced):
-- Extract decrypted secrets from TEE
-- Modify execution results without detection
-- Run different code than attested
+**What the operator cannot do with the TEE** (hardware-enforced):
+- Read decrypted secrets or keys from TEE memory
+- Modify execution results without breaking the attestation
+- Run code other than the attested build under a registered worker key
 - Forge attestation reports
 
-**What operator CAN do**:
-- Refuse to execute (censorship)
-- Shut down infrastructure (availability)
+**What the operator can do**:
+- Refuse to execute (censorship), shut down infrastructure (availability)
+- Everything the governance keys allow at this stage: approve measurements alone, upgrade contracts by key, and use the full-access key on `dao.outlayer.near` — see [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md#governance-at-this-stage)
+- As coordinator: withhold or misroute requests, and the residual custody trust listed in [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md#11-limits-we-state-plainly)
 
 ### Verification
 
-- **Phala Trust Center**: View exact image hash and measurements
-- **GitHub Releases**: Release binaries with Sigstore certification (cryptographic proof that binary matches source)
+- **Docker images**: the worker and keystore images are built by GitHub Actions with Sigstore build-provenance attestations (`gh attestation verify oci://…@<digest>`)
 - **On-chain**: `near view worker.outlayer.near get_approved_measurements` shows all approved measurement sets
+- **Per execution**: `GET /attestations/by-call/{call_id}` (or `/by-tx/{tx_hash}`, `/by-request/{request_id}`) returns the TDX quote; `GET /public/collateral` serves the Intel collateral to verify it. Walkthrough: https://app.outlayer.ai/docs/trust-verification
 
 ---
 
 ## SDK — `outlayer` Crate
 
-The `outlayer` crate on crates.io provides high-level APIs for WASM components. **Requires wasm32-wasip2** (WASI Preview 2 / Component Model).
+The `outlayer` crate on crates.io provides high-level APIs for WASM components. **Requires wasm32-wasip2** (WASI Preview 2 / Component Model). See [sdk/outlayer/README.md](sdk/outlayer/README.md).
 
 ### Modules
 
 | Module | Description |
 |--------|-------------|
 | `outlayer::storage` | Persistent encrypted storage across executions |
-| `outlayer::env` | Execution context — input, output, signer |
-| `outlayer::raw` | Low-level WIT bindings (`near:storage/api@0.2.0`, `near:rpc/api`) |
+| `outlayer::env` | Execution context — input, output, signer, predecessor |
+| `outlayer::vrf` | Verifiable random function |
+| `outlayer::signing_keys` | Feature `signing-keys`: sign with keys the keystore derives (`outlayer:signing-keys@0.1.0`) |
+| `outlayer::encryption_keys` | Feature `encryption-keys`: seal data only the component can open (`outlayer:encryption-keys@0.1.0`) |
+| `outlayer::tasks` | Feature `tasks`: tasks between an agent and its owner (`outlayer:tasks@0.1.0`) |
+| `outlayer::raw` | Low-level WIT bindings (`near:storage/api@0.2.0`, `near:rpc/api@0.1.0`, `near:vrf/api@0.1.0`) |
 
 ### Example
 
@@ -599,80 +620,48 @@ cargo build --target wasm32-wasip2 --release
 
 ## Coordinator API Routes
 
-### Protected Routes (worker auth required)
+The public HTTPS API is listed in [API.md](API.md); admin routes and their auth model are in [docs/ADMIN.md](docs/ADMIN.md). The routes below serve workers.
+
+### Worker Routes (worker bearer token)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/jobs/claim` | Worker claims a job |
-| POST | `/jobs/complete` | Worker completes a job |
+| POST | `/jobs/claim` · `/jobs/complete` | Claim / complete a job |
 | GET | `/executions/poll` | Poll for new tasks |
-| POST | `/executions/create` | Create execution task |
-| GET | `/wasm/:checksum` | Download cached WASM |
+| GET | `/wasm/:checksum` · `/wasm/exists/:checksum` | Download / check cached WASM |
 | POST | `/wasm/upload` | Upload a built WASM (builder role) |
-| GET | `/wasm/exists/:checksum` | Check WASM cache |
-| POST | `/locks/acquire` | Acquire distributed lock |
-| DELETE | `/locks/release/:lock_key` | Release lock |
+| POST / DELETE | `/locks/acquire` · `/locks/release/:lock_key` | Distributed lock |
 | POST | `/workers/heartbeat` | Worker heartbeat |
-| POST | `/workers/task-completion` | Notify task done |
-| POST | `/workers/tee-challenge` | TEE challenge request |
-| POST | `/workers/register-tee` | TEE session registration |
+| POST | `/workers/tee-challenge` · `/workers/register-tee` | TEE session setup |
 | POST | `/attestations` | Store attestation |
-| GET | `/github/resolve-branch` | Resolve branch to commit (builds only) |
-| POST | `/storage/set`, `set-if-absent`, `set-if-equals` | Worker storage operations |
-| POST | `/storage/get`, `get-by-version`, `has`, `delete` | Worker storage queries |
-| GET | `/storage/list`, `usage` | Storage metadata |
+| GET | `/github/resolve-branch` | Resolve commit to branch (builds only) |
+| POST | `/internal/system-logs` | Store raw logs (see below) |
+
+### Worker Routes (worker token + TEE session)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/executions/create` | Create execution task |
+| POST | `/workers/task-completion` · GET `/workers/block-cursor` | Task completion notice / event-monitor cursor |
+| POST | `/storage/set`, `set-if-absent`, `set-if-equals`, `get`, `get-by-version`, `has`, `delete`, `get-public` | Project storage |
+| GET | `/storage/list`, `/storage/usage` | Storage metadata |
 | POST | `/storage/clear-all`, `clear-version`, `clear-project` | Storage cleanup |
-| POST | `/storage/get-public` | Read public storage |
-| GET | `/projects/uuid` | Resolve project UUID |
-| DELETE | `/projects/cache` | Invalidate one project's cached name → uuid |
-| POST | `/projects/cache/invalidate` | Invalidate cached name → uuid for `{project_ids: [..]}` (transfer relay: old and new name) |
-| POST | `/topup/create` | Create top-up task |
-| POST | `/topup/complete` | Complete top-up |
-| POST | `/payment-keys/delete-task/create` | Create delete key task |
-| POST | `/projects/cleanup-task/create` | Create storage cleanup task; drops the deleted name's cached uuid |
+| GET / DELETE / POST | `/projects/uuid` · `/projects/cache` · `/projects/cache/invalidate` | Resolve project UUID / invalidate cached name → uuid |
+| POST | `/topup/create` · `/topup/complete` | Payment key top-up |
+| POST | `/payment-keys/init` · `/payment-keys/delete` · `/payment-keys/delete-task/create` | Payment key lifecycle |
+| POST | `/projects/cleanup-task/create` | Storage cleanup task for a deleted project |
 | GET | `/system-callbacks/poll` | Poll system callback tasks |
 | POST | `/https-calls/complete` | Complete HTTPS call |
-| POST | `/payment-keys/delete` | Delete payment key data |
-| POST | `/payment-keys/init` | Initialize payment key |
-
-### Public Routes (no auth)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/public/workers` | List active workers |
-| GET | `/public/jobs` | List recent jobs |
-| GET | `/public/stats` | Platform statistics |
-| GET | `/public/repos/popular` | Popular repositories |
-| GET | `/public/wasm/info` | WASM cache info |
-| GET | `/public/wasm/exists/:checksum` | Check WASM exists |
-| GET | `/public/pricing` | Current pricing |
-| POST | `/public/pricing/refresh` | Refresh pricing from contract |
-| GET | `/public/users/:user_account_id/earnings` | User earnings |
-| GET | `/public/projects/storage` | Project storage info |
-| GET | `/public/payment-keys/:owner/:nonce/balance` | Payment key balance |
-| GET | `/public/payment-keys/:owner/:nonce/usage` | Payment key usage history |
-| GET | `/public/project-earnings/:project_owner` | Project owner earnings |
-| GET | `/public/project-earnings/:project_owner/history` | Earnings history |
-| GET | `/health` | Health check |
-| GET | `/health/detailed` | Detailed health |
-| GET | `/attestations/:job_id` | Get attestation |
-
-### HTTPS API Routes (Payment Key auth, permissive CORS, 100 req/min IP limit)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/call/:project_owner/:project_name` | Execute project |
-| GET | `/calls/:call_id` | Poll async result |
-| GET | `/payment-keys/balance` | Authenticated balance check |
+| POST | `/egress-audit` | Record a run's outbound connections |
+| POST | `/owner-tasks/*` | Owner tasks host interface ([docs/TASKS.md](docs/TASKS.md)) |
 
 ### Other Routes
 
 | Group | Auth | Routes |
 |-------|------|--------|
 | Secrets | IP rate limited (10/min) | `/secrets/pubkey`, `/secrets/add_generated_secret`, `/secrets/update_user_secrets` |
-| Public Storage | IP rate limited (100/min), permissive CORS | `/public/storage/get`, `/public/storage/batch` |
-| Internal | None (worker network only) | `/internal/system-logs` |
-| Admin | Admin bearer token | `/admin/compile-logs/:job_id`, `/admin/grant-payment-key`, `/admin/grant-keys`, `/admin/grant-keys/:owner/:nonce`, `/admin/workers/:worker_id` |
+| Public | None | `/public/*`, `/attestations/*`, `/vrf/pubkey`, `/health` — see [API.md](API.md) |
+| Admin | Admin bearer token | `/admin/*` — see [docs/ADMIN.md](docs/ADMIN.md) |
 
 ---
 
@@ -696,52 +685,56 @@ cargo build --target wasm32-wasip2 --release
 | `get_user_stablecoin_balance(account_id)` | `U128` | User deposit balance |
 | `get_pending_request_ids(from_index, limit)` | `Vec<u64>` | Paginated pending IDs |
 | `get_next_payment_key_nonce(account_id)` | `u32` | Next available nonce (starts at 1) |
+| `get_payment_key_nonce_floor(account_id)` | `u32` | Highest nonce the contract has seen the owner create or delete |
+| `get_subscription_plans()` | `Vec<SubscriptionPlan>` | Plans on sale |
+| `get_project_pricing(project_id)` · `get_project_max_price(project_id)` | `Option<ProjectPricing>` · `U128` | What a priced (curated) project charges |
+| `get_priced_projects(from_index, limit)` · `get_priced_project_count()` | `Vec<String>` · `u64` | Priced projects |
 
 ---
 
 ## Event Schema
 
+Events are NEP-297 logs (`EVENT_JSON:` prefix) with `standard` and `version` from `get_event_metadata()` (defaults `near-outlayer`, `1.0.0`). `data` is a one-element array.
+
 ```json
 {
   "standard": "near-outlayer",
   "version": "1.0.0",
-  "event": "execution_request",
-  "data": {
-    "request_id": 12345,
-    "data_id": "0x...",
-    "sender_id": "client.near",
-    "execution_source": { "Project": { "project_id": "alice.near/my-app", "version_key": null } },
-    "resolved_source": { "WasmUrl": { "url": "https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm", "hash": "<sha256>", "build_target": "wasm32-wasip2" } },
-    "secrets_ref": { "profile": "default", "account_id": "alice.near" },
-    "input_data": "{}",
-    "resource_limits": { "max_instructions": 1000000000, "max_memory_mb": 128, "max_execution_seconds": 60 },
-    "response_format": "Text",
-    "payment": "1000000000000000000000000",
-    "params": { "project_uuid": "p0000000000000001" }
-  }
+  "event": "execution_requested",
+  "data": [{
+    "request_data": "{\"request_id\":12345,\"sender_id\":\"client.near\",\"predecessor_id\":\"client.near\",\"code_source\":{\"WasmUrl\":{...}},\"resource_limits\":{...},\"input_data\":\"{}\",\"input_data_in_state\":false,\"secrets_ref\":null,\"response_format\":\"Text\",\"payment\":\"...\",\"attached_usd\":\"0\",\"timestamp\":...,\"compile_only\":false,\"force_rebuild\":false,\"store_on_fastfs\":false,\"use_bound_identity\":false,\"project_uuid\":\"p0000000000000001\",\"project_id\":\"alice.near/my-app\"}",
+    "data_id": [/* 32 bytes */],
+    "timestamp": 1730000000000000000
+  }]
 }
 ```
+
+`request_data` is a JSON string; `code_source` is the resolved source. When `input_data_in_state` is true, `input_data` is empty and the worker reads it with `get_request()`.
+
+On settlement the contract emits `execution_completed` with `sender_id`, `code_source`, `resources_used`, `success`, `error_message`, `payment_charged`, `payment_refunded`, `compilation_note`, `timestamp`.
 
 ---
 
 ## WASM Environment Variables
 
-Variables injected into WASM execution context:
+Variables injected into WASM execution context (system names are stripped from secrets before they are set; full list: `SYSTEM_ENV_VARS` in `worker/src/main.rs`):
 
 | Variable | Blockchain | HTTPS API |
 |----------|------------|-----------|
 | `OUTLAYER_EXECUTION_TYPE` | `"NEAR"` | `"HTTPS"` |
 | `NEAR_NETWORK_ID` | `"mainnet"` / `"testnet"` | `"mainnet"` / `"testnet"` |
-| `NEAR_SENDER_ID` | Transaction signer | Payment Key owner |
+| `NEAR_SENDER_ID` | Transaction signer | Payment key owner (or the bound account with `use_bound_identity`) |
+| `NEAR_USER_ACCOUNT_ID` | Paying account | Payment key owner |
+| `NEAR_PREDECESSOR_ID` | Calling account | `""` |
 | `USD_PAYMENT` | `"0"` | X-Attached-Deposit value |
+| `ATTACHED_USD` | `attached_usd` | `"0"` |
 | `NEAR_PAYMENT_YOCTO` | Attached NEAR | `"0"` |
 | `OUTLAYER_CALL_ID` | `""` | call_id UUID |
+| `NEAR_REQUEST_ID` | Request id | `""` |
 | `NEAR_TRANSACTION_HASH` | Transaction hash | `""` |
-| `NEAR_BLOCK_HEIGHT` | Block number | `""` |
-| `NEAR_BLOCK_TIMESTAMP` | Block timestamp | `""` |
-| `OUTLAYER_PROJECT_ID` | owner/name | owner/name |
-| `OUTLAYER_PROJECT_OWNER` | Project owner | Project owner |
-| `OUTLAYER_PROJECT_NAME` | Project name | Project name |
+| `NEAR_BLOCK_HEIGHT` · `NEAR_BLOCK_TIMESTAMP` | Block number / timestamp | `""` |
+| `NEAR_MAX_INSTRUCTIONS` · `NEAR_MAX_MEMORY_MB` · `NEAR_MAX_EXECUTION_SECONDS` | Limits | Limits |
+| `OUTLAYER_PROJECT_ID` · `OUTLAYER_PROJECT_OWNER` · `OUTLAYER_PROJECT_NAME` · `OUTLAYER_PROJECT_UUID` | Set for a project | Set for a project |
 
 Plus all decrypted secrets as environment variables (if `secrets_ref` provided).
 
@@ -749,74 +742,54 @@ Plus all decrypted secrets as environment variables (if `secrets_ref` provided).
 
 ## Production Application: near.email
 
-Blockchain-native email for NEAR accounts. Every NEAR account has an email: `alice.near` → `alice@near.email`.
+Blockchain-native email for NEAR accounts. Every NEAR account has an email: `alice.near` → `alice@near.email`. Source: `wasi-examples/near-email` (submodule).
 
 **Architecture**: SMTP server → encrypt with derived public key → store in PostgreSQL → OutLayer TEE decrypts on read
 
-**Key derivation** (BIP32-style): SMTP server derives per-user public keys from master public key without knowing the master secret. Master private key lives only inside OutLayer TEE.
+**Key derivation** (BIP32-style): the SMTP server derives per-user public keys from the master public key without knowing the master secret. The master private key is an OutLayer secret, decrypted only inside the TEE worker (subject to the [governance caveats](docs/NON_CUSTODIAL.md#governance-at-this-stage)).
 
-**Security**: Emails encrypted on receipt, stored encrypted, decrypted only inside TEE with wallet owner's authorization.
-
----
-
-## Implementation Status
-
-### Completed
-
-| Component | Status |
-|-----------|--------|
-| Smart Contract | Production — yield/resume, secrets (4 accessor types, 9 access conditions), projects, pricing (NEAR + USD), developer earnings |
-| Coordinator | Production — PostgreSQL + Redis, task queue, WASM cache (LRU eviction), HTTPS API, earnings tracking |
-| Worker | Production — wasmi with fuel metering, WASI env vars, sha256-checked WASM download, TEE attestation (Intel TDX); Docker-sandboxed compiler present, off by default |
-| Keystore | Production — TEE-based decryption, CKD/MPC key derivation, access condition validation, TEE session auth |
-| Register Contract | Production — 5-measurement TDX verification, scoped access keys |
-| Dashboard | Production — project management, secrets UI, executions view, earnings page, documentation |
-| SDK | Published — `outlayer` crate on crates.io, wasm32-wasip2, storage + env + RPC |
-| Agent Custody | Production — multi-chain wallets for AI agents, MPC+TEE key derivation, policy engine, multisig, NEAR Intents |
-| Scheduler | Production — [self-hosted-scheduler](https://github.com/out-layer/self-hosted-scheduler), config-driven (TOML), interval/storage-diff/webhook triggers, Telegram alerts |
+**Security**: Emails encrypted on receipt, stored encrypted, decrypted only inside the TEE for the account's owner.
 
 ---
 
 ## Agent Custody
 
-Multi-chain custody wallets for AI agents. Agent gets an API key, private keys live in TEE, wallet owner controls policy. Full spec: [CUSTODY.md](CUSTODY.md).
+Multi-chain custody wallets for AI agents. The agent gets an API key, wallet keys are derived and used in the keystore TEE, the wallet owner controls the policy. User-facing reference: https://app.outlayer.ai/docs/agent-custody. Custody model and its limits: [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md).
 
 ### Architecture
 
-- **Coordinator** (`coordinator/src/wallet/`) — stateless proxy. Auth API key, forward to keystore, track usage in PostgreSQL
-- **Keystore TEE** (`keystore-worker/src/api.rs` wallet routes) — key derivation (`HMAC-SHA256(MPC_master, "wallet:{id}:{chain}")`), tx signing, policy evaluation. All inside Intel TDX
+- **Coordinator** (`src/wallet/` in the coordinator repo) — authenticates API keys (stores only SHA-256 hashes of `wk_` keys), forwards to the keystore; keeps usage counters, pending approvals and a readable copy of wallet policies in PostgreSQL. Trusted for custody: cumulative limits are counted here, and for swaps, cross-chain withdrawals, confidential transfers, limit orders and payment checks it supplies the intents message the enclave signs
+- **Keystore TEE** (`keystore-worker/src/api.rs` wallet routes) — key derivation (`HMAC-SHA256(master, "wallet:{id}:{chain}")`, master from NEAR MPC), tx signing, policy evaluation against the policy it reads from the chain before signing. All inside Intel TDX
 - **Contract** (`contract/src/wallet.rs`) — encrypted policy storage, freeze/unfreeze, on-chain signature verification
 - **Worker WASI** (`worker/src/outlayer_wallet/`) — `outlayer:wallet/api@0.1.0` host functions for WASI containers
-- **Dashboard** (`dashboard/app/wallet/`) — policy management, approvals, audit log
+- **Dashboard** (`app/wallet/` in the dashboard repo) — policy management, approvals, audit log
 
 ### Key Files
 
 | File | Description |
 |------|-------------|
-| `coordinator/src/wallet/handlers.rs` | HTTP handlers: register, withdraw, call, approve, policy |
-| `coordinator/src/wallet/auth.rs` | API key auth (SHA-256 hash lookup) |
-| `coordinator/src/wallet/policy.rs` | Negative cache, NEAR RPC `has_wallet_policy()` |
-| `coordinator/src/wallet/backend/intents.rs` | NEAR Intents integration |
-| `keystore-worker/src/api.rs` | Wallet endpoints: `/wallet/derive-address`, `/wallet/sign`, `/wallet/{evm,solana}/sign-*`, `/wallet/*-policy`, `/wallet/sign-secret-*` |
-| `keystore-worker/src/crypto.rs` | `derive_keypair()` — HMAC-SHA256 from MPC master secret |
-| `contract/src/wallet.rs` | `WalletPolicyEntry`, store/freeze/unfreeze/has/get methods |
+| coordinator `src/wallet/handlers.rs` | HTTP handlers: register, withdraw, call, approve, policy |
+| coordinator `src/wallet/auth.rs` | API key auth (SHA-256 hash lookup), `Bearer near:` auth |
+| coordinator `src/wallet/policy.rs` | Negative policy cache, NEAR RPC `has_wallet_policy()`; a wallet with a policy is checked by the keystore every time |
+| coordinator `src/wallet/backend/intents.rs` | NEAR Intents integration |
+| `keystore-worker/src/api.rs` | Wallet endpoints: `/wallet/derive-address`, `/wallet/derive-ephemeral-key`, `/wallet/sign`, `/wallet/{evm,solana}/sign-*`, `/wallet/{check,decrypt,encrypt,sign}-policy`, `/wallet/sign-secret-{store,delete}` |
+| `keystore-worker/src/crypto.rs` | `derive_keypair()` — HMAC-SHA256 from the master secret |
+| `contract/src/wallet.rs` | `WalletPolicyEntry`, store/freeze/unfreeze/delete/has/get methods |
 | `worker/wit/deps/wallet.wit` | WASI WIT interface |
-| `dashboard/app/wallet/` | 5 pages: handoff, manage, approvals, approval detail, audit |
-| `dashboard/app/docs/agent-custody/page.tsx` | User-facing documentation |
 
 ### API Endpoints
 
-Base: `https://api.outlayer.ai`
+Base: `https://api.outlayer.ai`. Full list: [API.md](API.md#agent-custody-wallet-api).
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/register` | None | Create wallet → API key + NEAR address |
 | GET | `/wallet/v1/address?chain=` | Bearer | Derive address for any chain |
-| POST | `/wallet/v1/intents/withdraw` | Bearer | Gasless withdraw via Intents. `chain=near`: `token=near`/omitted (default) delivers native NEAR (unwraps wNEAR, no recipient storage), `token=nep141:wrap.near` delivers wNEAR. Other chains delivered native via 1Click |
+| POST | `/wallet/v1/intents/withdraw` | Bearer | Gasless withdraw via Intents (mainnet only). `chain=near`: `token=near`/omitted (default) delivers native NEAR (unwraps wNEAR, no recipient storage), `token=nep141:wrap.near` delivers wNEAR. Other chains delivered native via 1Click |
 | POST | `/wallet/v1/intents/withdraw/dry-run` | Bearer | Simulate withdrawal |
 | POST | `/wallet/v1/call` | Bearer | Native NEAR contract call |
 | GET | `/wallet/v1/requests/{id}` | Bearer | Poll async status |
-| GET | `/wallet/v1/policy` | Bearer | View decrypted policy |
+| GET | `/wallet/v1/policy` | Bearer | View the wallet's policy |
 | POST | `/wallet/v1/encrypt-policy` | Bearer | Encrypt policy for on-chain storage |
 | POST | `/wallet/v1/approve/{id}` | None — the vote proves the voter | Multisig vote: a NEP-413 signature by an approver's access key, or an authorization a keyless approver's wallet contract resolves |
 | POST | `/wallet/v1/reject/{id}` | None — the vote proves the voter | Multisig NO vote, proven the same two ways; a policy approver's reject vetoes |
@@ -824,11 +797,11 @@ Base: `https://api.outlayer.ai`
 
 ### Database Tables
 
-`coordinator/migrations/20260220000001_wallet.sql`
+Coordinator migrations (`migrations/20260220000001_wallet.sql` and later):
 
 | Table | Purpose |
 |-------|---------|
-| `wallet_accounts` | wallet_id → near_pubkey, policy cache, frozen flag |
+| `wallet_accounts` | wallet_id → near_pubkey, policy copy, frozen flag |
 | `wallet_api_keys` | SHA-256(api_key) → wallet_id |
 | `wallet_requests` | Async operations (withdraw, deposit, call) |
 | `wallet_pending_approvals` | Multisig state machine |
@@ -840,71 +813,17 @@ Base: `https://api.outlayer.ai`
 
 ### Policy Engine
 
-Encrypted on NEAR blockchain → decrypted only inside TEE. Rules: per-tx limits, velocity limits (hourly/daily/monthly), address whitelist/blacklist, time restrictions, rate limits, multisig approval thresholds, emergency freeze. See [CUSTODY.md](CUSTODY.md) for full policy format.
+The policy is stored encrypted on NEAR (`store_wallet_policy`). The keystore TEE reads it from the chain (one RPC, latest block) and decrypts it before signing; the coordinator also keeps a readable copy in PostgreSQL. Rules: per-tx limits, velocity limits (hourly/daily/monthly), address whitelist/blacklist, time restrictions, rate limits, multisig approval thresholds, emergency freeze. Per-transaction limits, multisig and freeze are enforced in the enclave; cumulative limits are counted by the coordinator and are best-effort under concurrency. Policy format: https://app.outlayer.ai/docs/agent-custody.
 
 ---
 
-## System Hidden Logs — Admin Debugging Guide
+## System Hidden Logs — Admin Debugging
 
-### CRITICAL SECURITY WARNING
+The coordinator's `system_hidden_logs` table holds **raw stderr/stdout** from compilation and execution containers. It is never exposed through `/public/*` or any user-facing response: code a user submits can print file contents, environment variables or internal paths to stderr (`cat /etc/passwd` in a `build.rs`), so the raw text is admin-only.
 
-The `system_hidden_logs` table contains **RAW stderr/stdout** from compilation and execution containers. This data **MUST NEVER** be exposed via public API endpoints.
-
-#### Security Risk
-
-Malicious users can craft code that outputs system file contents:
-
-```rust
-// In build.rs or main.rs
-fn main() {
-    std::process::Command::new("cat")
-        .arg("/etc/passwd")
-        .output()
-        .unwrap();
-}
-```
-
-If these logs are exposed publicly, attackers can read server configuration, leak environment variables, discover internal paths, and enumerate packages.
-
-### Access Control
-
-#### Safe Access Methods
-
-1. **SSH/Localhost Only**
-   ```bash
-   ssh admin@coordinator-server
-   curl http://localhost:8080/admin/compile-logs/186
-   ```
-
-2. **Direct Database Access**
-   ```sql
-   psql postgres://postgres:password@localhost/offchainvm
-   SELECT * FROM system_hidden_logs WHERE request_id = 186;
-   ```
-
-#### NEVER Do This
-
-- Expose `/admin/compile-logs/:request_id` via public URL
-- Add log data to `/public/*` endpoints
-- Return raw logs in API responses to users
-- Include in dashboard frontend
-
-### Configuration
-
-**Disable log storage** (production):
-```bash
-# worker/.env
-SAVE_SYSTEM_HIDDEN_LOGS_TO_DEBUG=false
-```
-
-Users still see safe, classified error messages (e.g., "Repository not found", "Rust compilation failed").
-
-**Enable log storage** (development):
-```bash
-SAVE_SYSTEM_HIDDEN_LOGS_TO_DEBUG=true  # Default
-```
-
-### Database Schema
+- **Reading**: `GET /admin/compile-logs/:job_id` with the admin bearer token ([docs/ADMIN.md](docs/ADMIN.md)), or the table directly
+- **Writing**: workers store logs only when `SAVE_SYSTEM_HIDDEN_LOGS_TO_DEBUG=true` (the worker's built-in default; the TDX deployment sets it to `false`)
+- Users always get a classified, safe message instead
 
 ```sql
 CREATE TABLE system_hidden_logs (
@@ -912,15 +831,15 @@ CREATE TABLE system_hidden_logs (
     request_id BIGINT NOT NULL,
     job_id BIGINT,
     log_type VARCHAR(50) NOT NULL,  -- 'compilation' or 'execution'
-    stderr TEXT,                     -- May contain leaked data
-    stdout TEXT,                     -- May contain leaked data
+    stderr TEXT,
+    stdout TEXT,
     exit_code INTEGER,
     execution_error TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 ```
 
-### Error Classification System
+### Error Classification
 
 The worker classifies errors into safe, user-facing descriptions (the repository, git and build classes come from the compiler, which runs only where builds are enabled):
 
@@ -936,9 +855,4 @@ The worker classifies errors into safe, user-facing descriptions (the repository
 | `build_script_error` | "Build script execution failed..." |
 | `compilation_error` | Generic fallback |
 
-### Related Files
-
-- `coordinator/migrations/20251027000001_add_compilation_logs.sql`
-- `coordinator/src/handlers/internal.rs` — admin endpoints
-- `worker/src/compiler/docker.rs` — error extraction and classification
-- `worker/src/config.rs` — `SAVE_SYSTEM_HIDDEN_LOGS_TO_DEBUG` flag
+Related files: coordinator `migrations/20251027000001_add_compilation_logs.sql` and `src/handlers/internal.rs`; `worker/src/compiler/docker.rs` (classification); `worker/src/config.rs` (`SAVE_SYSTEM_HIDDEN_LOGS_TO_DEBUG`).

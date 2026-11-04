@@ -15,12 +15,11 @@ The rules it exercises — `signing_keys` in the manifest, `bind`, `caller`,
 
 ## Why it is not part of `wallet-probe`
 
-A module that imports `outlayer:wallet` is refused at startup when the request
-names no wallet (see [`wallet-probe/README.md`](../wallet-probe/README.md)). A
-signing key needs no wallet: it works from an on-chain `request_execution` as
-well as over HTTPS with an ordinary payment key. Putting the import here next
-to the wallet one would have tied every run of this probe to a wallet it does
-not use.
+A signing key needs no wallet: it works from an on-chain `request_execution` as
+well as over HTTPS with an ordinary payment key. `build.sh` holds each build to
+the interfaces it exercises and nothing of ours besides, so a wallet import
+here would be a probe of two things at once
+([`wallet-probe/README.md`](../wallet-probe/README.md) is the wallet's).
 
 ## The builds
 

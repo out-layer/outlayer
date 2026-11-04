@@ -14,24 +14,34 @@ A proxy contract is a NEAR smart contract that:
 User → Your Contract → OutLayer Contract → Worker → Callback → Your Contract
 ```
 
+`request_execution` yields until the worker resolves the run, and its return
+value is the run's output. Your callback, chained with `.then(...)`, receives
+that output.
+
+A working proxy is [random-example/random-contract](./random-example/random-contract/):
+everything below is taken from it.
+
 ## Basic Setup
 
 ### Dependencies
 
 ```toml
 # Cargo.toml
-[dependencies]
-near-sdk = "5.9.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = { version = "5.9.0", features = ["legacy"] }
+serde_json = "1.0"
+schemars = "0.8"
 
 [profile.release]
 codegen-units = 1
-opt-level = "z"
+opt-level = "s"
 lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
 ```
 
 ### Toolchain
@@ -42,125 +52,137 @@ lto = true
 channel = "1.85.0"
 ```
 
+Build with `cargo near build`.
+
 ## OutLayer Contract Interface
 
-Define the external contract interface:
+Define the external contract interface. Every argument but `source` is
+optional:
 
 ```rust
-use near_sdk::{ext_contract, AccountId, Gas, NearToken};
-
-const OUTLAYER_CONTRACT_ID: &str = "outlayer.near"; // or "outlayer.testnet"
+use near_sdk::{ext_contract, AccountId};
 
 #[ext_contract(ext_outlayer)]
+#[allow(dead_code)]
 trait OutLayer {
     fn request_execution(
         &mut self,
-        source: serde_json::Value,
-        resource_limits: serde_json::Value,
-        input_data: String,
-        secrets_ref: Option<serde_json::Value>,
-        response_format: String,
+        source: near_sdk::serde_json::Value,
+        resource_limits: Option<near_sdk::serde_json::Value>,
+        input_data: Option<String>,
+        secrets_ref: Option<near_sdk::serde_json::Value>,
+        response_format: Option<String>,
         payer_account_id: Option<AccountId>,
+        params: Option<near_sdk::serde_json::Value>,
     );
 }
 ```
+
+The contract is `outlayer.near` on mainnet and `outlayer.testnet` on testnet.
 
 ### Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `source` | JSON | The code to run: a `Project` or a `WasmUrl` (see [Code Source Formats](#code-source-formats)) |
-| `resource_limits` | JSON | Memory, instructions, time limits. Always pass it (`{}` takes the defaults): a request without it runs nothing |
-| `input_data` | String | JSON input for your WASM |
-| `secrets_ref` | Option<JSON> | `{"profile": "...", "account_id": "..."}` — the stored secrets to decrypt for the run |
-| `response_format` | String | `"Text"` (default), `"Json"` or `"Bytes"` |
-| `payer_account_id` | Option<AccountId> | Who gets refund on failure |
+| `resource_limits` | JSON | `max_instructions`, `max_memory_mb`, `max_execution_seconds`; a missing field takes its default (1 billion, 128, 60). Always pass it (`{}` takes the defaults): a request without it compiles only and runs nothing. Caps: 500 billion instructions, 180 seconds, 4096 MB |
+| `input_data` | String | Input for your WASM, delivered on stdin |
+| `secrets_ref` | JSON | `{"profile": "...", "account_id": "..."}` — the stored secrets to decrypt for the run |
+| `response_format` | String | `"Text"` (default), `"Json"` or `"Bytes"` — how the run's stdout is returned |
+| `payer_account_id` | AccountId | Who receives the unused deposit; defaults to the account that called OutLayer, i.e. your contract |
+| `params` | JSON | Optional extras, e.g. `attached_usd` (a stablecoin payment to the project's owner, drawn from the calling account's stablecoin balance in the contract) |
 
 ## Simple Example: Coin Flip
 
-A minimal proxy that calls OutLayer for random number generation.
+A minimal proxy that calls OutLayer for a random number. The module prints
+`{"random_number": 0}` or `{"random_number": 1}`, so the request asks for
+`Json` and the callback deserializes exactly that.
 
 ```rust
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::{env, near_bindgen, AccountId, Gas, NearToken, Promise, PromiseError};
+use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::{env, ext_contract, near_bindgen, AccountId, Gas, PanicOnDefault, Promise, PromiseError};
 
-const OUTLAYER_CONTRACT_ID: &str = "outlayer.near";
-const MIN_DEPOSIT: NearToken = NearToken::from_millinear(10); // 0.01 NEAR
 const CALLBACK_GAS: Gas = Gas::from_tgas(5);
 
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct RandomResponse {
+    pub random_number: u32,
+}
+
 #[ext_contract(ext_outlayer)]
+#[allow(dead_code)]
 trait OutLayer {
     fn request_execution(
         &mut self,
-        source: serde_json::Value,
-        resource_limits: serde_json::Value,
-        input_data: String,
-        secrets_ref: Option<serde_json::Value>,
-        response_format: String,
+        source: near_sdk::serde_json::Value,
+        resource_limits: Option<near_sdk::serde_json::Value>,
+        input_data: Option<String>,
+        secrets_ref: Option<near_sdk::serde_json::Value>,
+        response_format: Option<String>,
         payer_account_id: Option<AccountId>,
+        params: Option<near_sdk::serde_json::Value>,
     );
 }
 
 #[ext_contract(ext_self)]
-trait SelfCallback {
-    fn on_flip_result(&mut self, player: AccountId) -> String;
+#[allow(dead_code)]
+trait ExtSelf {
+    fn on_flip_result(
+        &mut self,
+        player: AccountId,
+        #[callback_result] result: Result<Option<RandomResponse>, PromiseError>,
+    ) -> String;
 }
 
 #[near_bindgen]
-#[derive(BorshDeserialize, BorshSerialize, Default)]
+#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
+#[borsh(crate = "near_sdk::borsh")]
 pub struct CoinFlip {
+    outlayer_contract_id: AccountId,
     wins: u64,
     losses: u64,
 }
 
 #[near_bindgen]
 impl CoinFlip {
+    #[init]
+    pub fn new(outlayer_contract_id: AccountId) -> Self {
+        Self { outlayer_contract_id, wins: 0, losses: 0 }
+    }
+
     #[payable]
     pub fn flip(&mut self) -> Promise {
-        let deposit = env::attached_deposit();
-        assert!(deposit >= MIN_DEPOSIT, "Minimum deposit is 0.01 NEAR");
-
         let player = env::predecessor_account_id();
 
-        // Code source - the active version of a project
-        let source = serde_json::json!({
-            "Project": {
-                "project_id": "alice.near/random-wasm",
-                "version_key": null
-            }
+        // The active version of a project
+        let source = near_sdk::serde_json::json!({
+            "Project": { "project_id": "alice.near/random-wasm", "version_key": null }
         });
 
-        // Resource limits
-        let resource_limits = serde_json::json!({
-            "max_memory_mb": 64,
-            "max_instructions": 1_000_000_000u64,
-            "max_execution_seconds": 30
+        let resource_limits = near_sdk::serde_json::json!({
+            "max_instructions": 10_000_000_000u64,
+            "max_memory_mb": 128u32,
+            "max_execution_seconds": 60u64
         });
 
-        // Input data
-        let input_data = serde_json::json!({
-            "action": "flip"
-        }).to_string();
-
-        // Calculate gas for OutLayer call
-        let remaining_gas = env::prepaid_gas().saturating_sub(CALLBACK_GAS);
-
-        ext_outlayer::ext(OUTLAYER_CONTRACT_ID.parse().unwrap())
-            .with_attached_deposit(deposit)
-            .with_static_gas(remaining_gas)
-            .with_unused_gas_weight(1)
+        ext_outlayer::ext(self.outlayer_contract_id.clone())
+            .with_attached_deposit(env::attached_deposit())
+            .with_unused_gas_weight(1) // all gas not reserved below goes to OutLayer
             .request_execution(
                 source,
-                resource_limits,
-                input_data,
-                None,           // no secrets
-                "Text".into(),
-                Some(player.clone()), // refund to player on failure
+                Some(resource_limits),
+                Some(r#"{"min":0,"max":1}"#.to_string()),
+                None,                       // no secrets
+                Some("Json".to_string()),
+                Some(player.clone()),       // the unused deposit goes to the player
+                None,
             )
             .then(
                 ext_self::ext(env::current_account_id())
                     .with_static_gas(CALLBACK_GAS)
-                    .on_flip_result(player)
+                    .on_flip_result(player),
             )
     }
 
@@ -168,26 +190,22 @@ impl CoinFlip {
     pub fn on_flip_result(
         &mut self,
         player: AccountId,
-        #[callback_result] result: Result<Option<String>, PromiseError>,
+        #[callback_result] result: Result<Option<RandomResponse>, PromiseError>,
     ) -> String {
         match result {
-            Ok(Some(output)) => {
-                if output.contains("heads") {
-                    self.wins += 1;
-                    format!("{} won! Result: {}", player, output)
-                } else {
-                    self.losses += 1;
-                    format!("{} lost! Result: {}", player, output)
-                }
+            Ok(Some(r)) if r.random_number == 0 => {
+                self.wins += 1;
+                format!("{} won", player)
             }
-            Ok(None) => {
+            Ok(Some(_)) => {
                 self.losses += 1;
-                "No result returned".to_string()
+                format!("{} lost", player)
             }
-            Err(_) => {
-                // Deposit refunded to payer_account_id
-                "Execution failed".to_string()
-            }
+            // The run failed or printed nothing: OutLayer returned null and has
+            // already refunded the unused deposit to the player
+            Ok(None) => "Execution failed".to_string(),
+            // request_execution itself was refused (see Error Handling)
+            Err(_) => "Request refused".to_string(),
         }
     }
 
@@ -206,7 +224,7 @@ file whose bytes do not match the hash. A project version's source is always a
 ### Project (normal case)
 
 ```rust
-let source = serde_json::json!({
+let source = near_sdk::serde_json::json!({
     "Project": {
         "project_id": "alice.near/my-app",
         "version_key": null  // null = active version; otherwise the version's wasm hash
@@ -217,7 +235,7 @@ let source = serde_json::json!({
 ### WasmUrl (direct run of a published file)
 
 ```rust
-let source = serde_json::json!({
+let source = near_sdk::serde_json::json!({
     "WasmUrl": {
         "url": "https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm",
         "hash": "<sha256>",
@@ -226,27 +244,30 @@ let source = serde_json::json!({
 });
 ```
 
-The URL must be `https://` on the default port.
+The URL must be `https://`; `hash` is 64 lowercase hex characters. A direct run
+has no project: no project storage, no author secrets and no `Project`-bound
+keys.
 
-## Advanced: OutLayerResponse Wrapper
+## Reading the Result
 
-For JSON responses, OutLayer wraps results:
+What the callback receives is the run's output as a JSON value, in the
+requested `response_format`:
+
+| `response_format` | The callback receives | Deserialize as |
+|---|---|---|
+| `Json` | the JSON the module printed | `Option<YourType>` |
+| `Text` | the output as a JSON string | `Option<String>` |
+| `Bytes` | the output as a base64 string | `Option<String>` |
+| any, failed run | `null` | `None` |
+
+There is no envelope of OutLayer's around the output. If your module prints
+one of its own — `private-dao-example`'s prints `{"success", "result",
+"error"}` — the callback deserializes that shape, because it is what the module
+printed.
 
 ```rust
 #[derive(Deserialize)]
-struct OutLayerResponse<T> {
-    success: bool,
-    result: Option<T>,
-    error: Option<String>,
-}
-```
-
-### Parsing JSON Results
-
-```rust
-use serde::Deserialize;
-
-#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
 struct VoteResult {
     yes_votes: u64,
     no_votes: u64,
@@ -257,34 +278,16 @@ struct VoteResult {
 pub fn on_tally_result(
     &mut self,
     proposal_id: u64,
-    #[callback_result] result: Result<Option<String>, PromiseError>,
+    #[callback_result] result: Result<Option<VoteResult>, PromiseError>,
 ) {
-    let Ok(Some(output)) = result else {
+    let Ok(Some(vote_result)) = result else {
         env::log_str("Execution failed");
         return;
     };
-
-    // Parse OutLayerResponse wrapper
-    let response: OutLayerResponse<VoteResult> = match serde_json::from_str(&output) {
-        Ok(r) => r,
-        Err(e) => {
-            env::log_str(&format!("Parse error: {}", e));
-            return;
-        }
-    };
-
-    if !response.success {
-        env::log_str(&format!("WASM error: {:?}", response.error));
-        return;
-    }
-
-    if let Some(vote_result) = response.result {
-        // Update proposal state
-        if let Some(proposal) = self.proposals.get_mut(&proposal_id) {
-            proposal.yes_votes = vote_result.yes_votes;
-            proposal.no_votes = vote_result.no_votes;
-            proposal.passed = Some(vote_result.passed);
-        }
+    if let Some(proposal) = self.proposals.get_mut(&proposal_id) {
+        proposal.yes_votes = vote_result.yes_votes;
+        proposal.no_votes = vote_result.no_votes;
+        proposal.passed = Some(vote_result.passed);
     }
 }
 ```
@@ -294,109 +297,90 @@ pub fn on_tally_result(
 For WASM that needs encrypted secrets (API keys, private keys):
 
 ```rust
-#[payable]
-pub fn execute_with_secrets(&mut self) -> Promise {
-    let player = env::predecessor_account_id();
+// The secrets this contract stored under profile "default"
+let secrets_ref = near_sdk::serde_json::json!({
+    "profile": "default",
+    "account_id": env::current_account_id()
+});
 
-    // The secrets this contract stored under profile "default"
-    let secrets_ref = serde_json::json!({
-        "profile": "default",
-        "account_id": env::current_account_id()
-    });
-
-    ext_outlayer::ext(OUTLAYER_CONTRACT_ID.parse().unwrap())
-        .with_attached_deposit(env::attached_deposit())
-        .with_static_gas(env::prepaid_gas().saturating_sub(CALLBACK_GAS))
-        .with_unused_gas_weight(1)
-        .request_execution(
-            source,
-            resource_limits,
-            input_data,
-            Some(secrets_ref),  // <- secrets reference
-            "Json".into(),
-            Some(player),
-        )
-        .then(/* callback */)
-}
+ext_outlayer::ext(self.outlayer_contract_id.clone())
+    .with_attached_deposit(env::attached_deposit())
+    .with_unused_gas_weight(1)
+    .request_execution(
+        source,
+        Some(resource_limits),
+        Some(input_data),
+        Some(secrets_ref),          // <- secrets reference
+        Some("Json".to_string()),
+        Some(player),
+        None,
+    )
+    .then(/* callback */)
 ```
 
-The WASM code accesses secrets via env vars:
+A secret's access condition is judged against the transaction's **signer** —
+the user who called your contract — unless it names the predecessor
+(`Predecessor{…}`), which is your contract. Store the row with a condition
+that admits the callers you mean.
+
+The WASM code reads secrets as env vars:
 
 ```rust
 // In your WASM
 let api_key = std::env::var("API_KEY").ok();
-let private_key = std::env::var("PRIVATE_KEY").ok();
 ```
 
 ## Gas Management
 
-### Constants
+`request_execution` reserves the gas of its own settlement callback out of the
+gas it is given, and more for a large `input_data` (25 MGas per byte above
+32 KB). Reserve a fixed amount for your callback and give OutLayer the rest:
 
 ```rust
-const CALLBACK_GAS: Gas = Gas::from_tgas(5);      // 5 TGas for callback
-const OUTLAYER_BASE_GAS: Gas = Gas::from_tgas(10); // Minimum for OutLayer
-```
-
-### Gas Allocation Pattern
-
-```rust
-// Reserve gas for callback, give rest to OutLayer
-let remaining_gas = env::prepaid_gas()
-    .saturating_sub(CALLBACK_GAS)
-    .saturating_sub(Gas::from_tgas(5)); // buffer for current call
-
 ext_outlayer::ext(...)
-    .with_static_gas(remaining_gas)
-    .with_unused_gas_weight(1)  // OutLayer gets unused gas
+    .with_unused_gas_weight(1)              // OutLayer gets all unreserved gas
     .request_execution(...)
+    .then(
+        ext_self::ext(env::current_account_id())
+            .with_static_gas(Gas::from_tgas(5)) // your callback's fixed share
+            .on_result(...)
+    )
 ```
 
-### `with_unused_gas_weight(1)`
-
-This is important - it tells NEAR to give any unused gas from the current call to the OutLayer call. OutLayer needs gas to:
-1. Parse and validate request
-2. Store job in queue
-3. Return result via callback
+Have users attach 300 TGas to the call into your contract.
 
 ## Deposit Requirements
 
-OutLayer charges based on computation used. Minimum: **0.01 NEAR**.
+The deposit must cover the compute estimate for the requested limits, plus
+storage for an `input_data` over 32 KB. The contract answers the exact figure:
 
-```rust
-const MIN_DEPOSIT: NearToken = NearToken::from_millinear(10);
-
-#[payable]
-pub fn my_method(&mut self) -> Promise {
-    let deposit = env::attached_deposit();
-    assert!(deposit >= MIN_DEPOSIT, "Minimum deposit is 0.01 NEAR");
-    // ...
-}
+```bash
+near view outlayer.testnet estimate_execution_cost \
+  '{"resource_limits":{"max_instructions":10000000000,"max_memory_mb":128,"max_execution_seconds":60},"input_len":null}'
 ```
 
-Unused deposit is refunded to `payer_account_id`.
+A request with less is refused. What the run does not use is refunded to
+`payer_account_id`.
 
 ## Multiple OutLayer Calls
 
-For complex workflows with multiple OutLayer calls:
+For complex workflows with multiple OutLayer calls, start the second call from
+the first one's callback:
 
 ```rust
 #[payable]
 pub fn complex_workflow(&mut self) -> Promise {
-    let deposit = env::attached_deposit();
-    let half_deposit = NearToken::from_yoctonear(deposit.as_yoctonear() / 2);
+    let half_deposit = NearToken::from_yoctonear(env::attached_deposit().as_yoctonear() / 2);
 
-    // First call
-    let first_call = ext_outlayer::ext(OUTLAYER_CONTRACT_ID.parse().unwrap())
+    ext_outlayer::ext(self.outlayer_contract_id.clone())
         .with_attached_deposit(half_deposit)
         .with_static_gas(Gas::from_tgas(50))
-        .request_execution(/* step 1 params */);
-
-    // Chain with callback that triggers second call
-    first_call.then(
-        ext_self::ext(env::current_account_id())
-            .with_static_gas(Gas::from_tgas(100))
-            .on_first_result()
-    )
+        .request_execution(/* step 1 params */)
+        .then(
+            ext_self::ext(env::current_account_id())
+                .with_static_gas(Gas::from_tgas(100))
+                .on_first_result()
+        )
 }
 
 #[private]
@@ -404,17 +388,16 @@ pub fn on_first_result(
     &mut self,
     #[callback_result] result: Result<Option<String>, PromiseError>,
 ) -> Promise {
-    // Process first result, then call OutLayer again
-    let second_call = ext_outlayer::ext(OUTLAYER_CONTRACT_ID.parse().unwrap())
-        .with_attached_deposit(NearToken::from_millinear(10))
+    // Process first result, then call OutLayer again with the rest of the deposit
+    ext_outlayer::ext(self.outlayer_contract_id.clone())
+        .with_attached_deposit(self.reserved_for_step_two())
         .with_static_gas(Gas::from_tgas(50))
-        .request_execution(/* step 2 params */);
-
-    second_call.then(
-        ext_self::ext(env::current_account_id())
-            .with_static_gas(Gas::from_tgas(5))
-            .on_final_result()
-    )
+        .request_execution(/* step 2 params */)
+        .then(
+            ext_self::ext(env::current_account_id())
+                .with_static_gas(Gas::from_tgas(5))
+                .on_final_result()
+        )
 }
 ```
 
@@ -422,27 +405,11 @@ pub fn on_first_result(
 
 ### Callback Result Types
 
-```rust
-#[callback_result] result: Result<Option<String>, PromiseError>
-```
-
-| Result | Meaning |
-|--------|---------|
-| `Ok(Some(output))` | Success, WASM returned output |
-| `Ok(None)` | Success but no output (unusual) |
-| `Err(PromiseError)` | OutLayer call failed |
-
-### Refunds on Failure
-
-When `payer_account_id` is set, OutLayer refunds unused deposit on failure:
-
-```rust
-ext_outlayer::ext(...)
-    .request_execution(
-        // ...
-        Some(env::predecessor_account_id()), // refund to caller
-    )
-```
+| Result | Meaning | The deposit |
+|--------|---------|-------------|
+| `Ok(Some(output))` | The run succeeded and printed `output` | the unused part is refunded to `payer_account_id` |
+| `Ok(None)` | The run failed, timed out or printed nothing | the run is charged what it used (the base fee if it never started); the rest goes to `payer_account_id` |
+| `Err(PromiseError)` | `request_execution` panicked: refused at the door (insufficient deposit, a limit above its cap, an invalid source, a paused contract) | NEAR returns the whole attached deposit to **your contract**, the predecessor of the failed call — forward it to the user if it was theirs |
 
 ## Build & Deploy
 
@@ -450,21 +417,19 @@ ext_outlayer::ext(...)
 # Build
 cargo near build
 
-# Deploy
-near deploy your-contract.testnet ./target/near/your_contract.wasm
-
-# Initialize (if needed)
-near call your-contract.testnet new '{}' --accountId your-contract.testnet
+# Deploy with the init call
+near deploy your-contract.testnet ./target/near/your_contract.wasm \
+  --initFunction new --initArgs '{"outlayer_contract_id":"outlayer.testnet"}'
 ```
 
-## Testing Locally
+## Testing
 
 ```bash
 # Call your proxy contract
 near call your-contract.testnet flip '{}' \
     --accountId alice.testnet \
     --deposit 0.1 \
-    --gas 100000000000000
+    --gas 300000000000000
 ```
 
 ## Complete Example Structure
@@ -490,8 +455,9 @@ cargo near build
 
 - [WASI Tutorial](./WASI_TUTORIAL.md) - Building WASM modules for OutLayer
 - [WASM Environment Variables](./WASM_ENV_VARS.md) - Env vars available in WASM
-- [random-example](./random-example/) - Simple coin flip example
-- [private-dao-example](./private-dao-example/) - Complex DAO with voting
+- [random-example](./random-example/) - Coin flip: module and proxy contract
+- [private-dao-example](./private-dao-example/) - DAO with encrypted voting
+- [test-storage-ark/relay-contract](./test-storage-ark/README.md#relay-contract-relay-contract) - A relay that forwards a refused request's deposit back to its caller
 
 ## Examples in This Repository
 

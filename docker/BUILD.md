@@ -1,82 +1,48 @@
-# Multi-Platform Docker Build Guide
+# Compiler Image Build
 
-## Building WasmEdge Compiler Image for linux/amd64 and linux/arm64
+`docker/Dockerfile.wasmedge-compiler` is the image GitHub builds run in
+(`DOCKER_IMAGE` on a builder worker) and the one `scripts/build_github_wasm.sh`
+uses to compute a project's wasm hash before publishing. It fixes every input
+that decides the bytes: the rust base by digest, `wasm-tools` and
+`cargo-component` by version, binaryen (`wasm-opt`) by exact package.
 
-### Step 1: Create buildx builder with docker-container driver
-```bash
-docker buildx create --name multiarch --driver docker-container --use
-```
+## Build and push (amd64 only)
 
-### Step 2: Bootstrap the builder
-```bash
-docker buildx inspect --bootstrap
-```
+The architecture changes the bytes: the same commit, image digest and recipe
+compile to different wasm on amd64 and arm64. The image is therefore built
+for `linux/amd64` only, and anyone checking a hash on another machine runs it
+emulated.
 
-### Step 3: Login to Docker Hub (if not already logged in)
-```bash
-docker login
-```
-
-### Step 4: Build and push multi-platform image
-This single command builds for both amd64 and arm64, and pushes to Docker Hub:
 ```bash
 docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t outlayer/wasmedge-compiler:rust1.85-wasi25 \
+  --platform linux/amd64 \
+  -t outlayer/wasmedge-compiler:<tag> \
   -f docker/Dockerfile.wasmedge-compiler \
   --push \
   .
 ```
 
-**Note:** The `--push` flag automatically pushes the image to Docker Hub after building.
-No need for separate `docker push` command.
+Tag names carry the toolchain so a human can read them
+(`rust1.97-wasi25-b120`: rust 1.97, WASI SDK 25, binaryen 120).
 
-### Deliberately no `latest` tag
+## No `latest` tag; deployments pin the digest
 
-There is none, and adding one would undo the point. `ensure_image` runs a pull on **every**
-compile job, so a floating tag means anything pushed to this repository enters production
-compilation with no deploy and no review. The image also decides which toolchain produces the
-wasm whose hash the enclave attests — an unpinned compiler makes that measurement
-irreproducible, which is the same reason every example commits its `Cargo.lock`.
-
-Tag names carry the toolchain (`rust1.85-wasi25`) so a human can read them; deployments pin
-the **digest**:
+`ensure_image` pulls on **every** compile job, so a floating tag would let
+anything pushed to this repository enter production compilation with no
+deploy and no review, and would make the measured wasm hash irreproducible.
 
 ```bash
-docker buildx imagetools inspect outlayer/wasmedge-compiler:rust1.85-wasi25
+docker buildx imagetools inspect outlayer/wasmedge-compiler:<tag>
 # -> Digest: sha256:...
-
-# in the worker's env file
-DOCKER_IMAGE=outlayer/wasmedge-compiler@sha256:5c996303f707381f463e591d7b0650e64816e63e7bc1d98ab72a62abf55b146e
 ```
 
-The base image is digest-pinned in the Dockerfile for the same reason: `rust:1.85` is a moving
-tag. Bump it deliberately.
+Put the digest in the builder worker's env (`DOCKER_IMAGE=outlayer/wasmedge-compiler@sha256:…`)
+and in `DEFAULT_IMAGE` of `scripts/build_github_wasm.sh`; the two must name the
+same image, or a hash computed locally will not match the server's.
 
----
+## Bumping the image
 
-## Pulling the Image on Server
-
-After pushing to Docker Hub, pull on your server:
-
-```bash
-# On Ubuntu server (amd64)
-docker pull outlayer/wasmedge-compiler:rust1.85-wasi25
-
-# Verify architecture
-docker run --rm outlayer/wasmedge-compiler:rust1.85-wasi25 uname -m
-# Should output: x86_64
-```
-
-## Using the Image in Worker
-
-Update `worker/.env`:
-```bash
-DOCKER_IMAGE=outlayer/wasmedge-compiler@sha256:5c996303f707381f463e591d7b0650e64816e63e7bc1d98ab72a62abf55b146e
-```
-
-Restart worker:
-```bash
-cd worker
-cargo run
-```
+A new image gives every GitHub-built project a new hash. The coordinator's
+wasm cache is keyed by `repo:commit:build_target` and says nothing about the
+compiler, so clear it when `DOCKER_IMAGE` changes; otherwise a cached commit
+keeps serving its old bytes while a fresh build of it gives the new hash.

@@ -6,7 +6,7 @@ Every contributor must sign the [Contributor License Agreement](CLA.md) before a
 request can be merged. There is no bot — a maintainer checks this before merging, so
 please sign in your pull request without being asked.
 
-Signing takes one comment. What it does is give OutLayer LLC a broad license
+Signing takes one comment. What it does is give OutLayer, Inc. a broad license
 to your contribution, including the right to relicense it. Without that right the
 project could never change its own licensing terms, so this is not negotiable.
 

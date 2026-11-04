@@ -21,8 +21,8 @@ custody stack works**, and how the suite keeps real funds safe.
 | `unified_op_e2e.sh` | **testnet** | auth-sign, sign_message (+ed25519-verify), approve/reject + **2-of-2 multisig**, negatives (hash-substitution, cross-wallet replay), delete-account guards + destructive delete, api-key signed derive, vault-scope parity, wallet_id v2 invariants, on-chain-signer proof |
 | `unified_op_e2e_intents.sh` | **mainnet** | cross_chain_withdraw gate, payment_check gate + claim/reclaim/batch + **partial-claim/double-claim**, FT withdraw→external via solver, swap gate, swap & cross-chain under multisig, gasless swap-quote/insufficient/withdraw-dry-run, deposit-intent chain matrix, **confidential** shield/unshield/swap-multisig |
 | `wallet_confidential_e2e.sh` | **mainnet** | standalone phase-based confidential deep-dive (shield/unshield/balance/x-chain deposit+withdraw/conf-swap). T16 in the intents file is the smoke-test slice; this file is the full exploration. |
-| `unified_vault_e2e.sh` | **testnet** | _(planned)_ vault sovereign-exit/recovery/isolation: finalize_recovery→keystore-refuses→re-derive, detach secret-decrypt, multi-wallet-per-vault, multi-customer isolation, endpoint parity; **V6** a secret CREATED for an agent under a vault (both money paths, and what the wallet's signature covers) |
-| `call_credentials_e2e.sh` | **testnet** | who may call what, K1–K6 — the whole credential matrix on one stack: no credential is refused on both a connector and an ordinary project; a `wk_` authenticates a WALLET route in the same run and still buys nothing (the removed second credential must not come back); a claimed trial reaches a connector and is refused on an ordinary project **by scope**, not by balance; a funded payment key reaches both. **Claims this account's one trial — it cannot be undone or repeated.** |
+| `unified_vault_e2e.sh` | **testnet** | vault sovereign-exit/recovery/isolation (V1–V6): finalize_recovery→keystore-refuses→re-derive, detach secret-decrypt, multi-wallet-per-vault, multi-customer isolation, endpoint parity; **V6** a secret CREATED for an agent under a vault (both money paths, and what the wallet's signature covers) |
+| `call_credentials_e2e.sh` | **testnet** | who may call what, K1–K6 — the whole credential matrix on one stack: no credential is refused on both a connector and an ordinary project; a `wk_` authenticates a WALLET route in the same run and still buys nothing (a payment key is the one paying credential); a claimed trial reaches a connector and is refused on an ordinary project **by scope**, not by balance; a funded payment key reaches both. **Claims this account's one trial — it cannot be undone or repeated.** |
 | `connector_pricing_e2e.sh` | **testnet** | connector money, C1–C11 — results of the last full run are logged in [CONNECTOR_TEST_LOG.md](CONNECTOR_TEST_LOG.md): the on-chain admission gate (exact price, the `operation` field, refusals), the author's share per OPERATION in the contract's ledger, the same connector over HTTPS incl. the outbound allowlist, `/admin/earnings` against the chain, the fee landing on top of compute + the reservation returning, the owner's secret reaching the guest only when asked, the trial's ten calls and the funded key's absence of a call limit (C7), the egress audit / call log, what a timed-out or never-claimed call costs (C9, needs the fleet arranged — see its comment), the trial key with its scope and its author-pays-nothing rule (C10), and the refusals — a trial cannot pay an author, a deposit to a connector is void, and `agent: true` is refused — every key is a string its holder presents (C11). **C7 and C10 each claim a trial; when none is on offer (`trial_unavailable`) the rows skip** (C7 on a wallet it mints itself, so order does not matter) — `ONLY=C1,C2,C3,C4,C5,C8,C11` repeats the rest without claiming. |
 
 `tests/legacy/` holds the **older standalone tests whose coverage was ported into the unified suite**
@@ -36,16 +36,22 @@ re-grow legacy).
 
 **Always dry-run first** (prints the plan, exits 0, moves nothing) by dropping `--apply`.
 
+Every run goes through a keyed FastNEAR RPC (`lib/rpc.sh`: `FASTNEAR_API_KEY` or near-cli's
+config); a suite that prints `⚠ no FastNEAR API key` is not to be trusted past that line. The other
+rules for live runs are in [README.md](README.md#rules-for-every-live-run).
+
 ```bash
 # ── 1. TESTNET (everything non-intents) ──────────────────────────────────────
 #   prereq: outlayer login testnet (as PARENT); APPROVER creds in ~/.near-credentials/testnet/
-PARENT=zavodil.testnet APPROVER1=zavodil2.testnet APPROVER2=zavodil2.testnet \
+#   MPC_PUBLIC_KEY enables the vault dimensions (without it they are SKIP-noted)
+MPC_PUBLIC_KEY=bls12381g2:... PARENT=<parent>.testnet \
+  APPROVER1=<approver1>.testnet APPROVER2=<approver2>.testnet \
   ./tests/unified_op_e2e.sh --apply
 
 # ── 2. MAINNET intents (real money) ──────────────────────────────────────────
-#   prereq: outlayer login mainnet (as PARENT=fastjambo.near); a MAINNET approver with creds;
-#           EXTERNAL_ACCT must be storage-registered on wrap.near (zavodil.near is)
-NETWORK=mainnet PARENT=fastjambo.near EXTERNAL_ACCT=zavodil.near \
+#   prereq: outlayer login mainnet (as PARENT); a MAINNET approver with creds;
+#           EXTERNAL_ACCT must be storage-registered on wrap.near
+NETWORK=mainnet PARENT=<parent>.near EXTERNAL_ACCT=<registered>.near \
   APPROVER1=<mainnet-approver> APPROVER2=<mainnet-approver> \
   ./tests/unified_op_e2e_intents.sh --apply
 
@@ -54,10 +60,10 @@ ONECLICK_CONFIDENTIAL_JWT=1 ./tests/unified_op_e2e_intents.sh --apply   # (with 
 
 # ── 3. CONFIDENTIAL deep-dive (optional, mainnet, phase-based) ────────────────
 ONECLICK_CONFIDENTIAL_JWT=1 COORDINATOR_URL=https://api.outlayer.ai \
-  NETWORK=mainnet PARENT=fastjambo.near ./tests/wallet_confidential_e2e.sh roundtrip
+  NETWORK=mainnet PARENT=<parent>.near ./tests/wallet_confidential_e2e.sh roundtrip
 
-# ── 4. VAULT sovereign-exit (testnet) — planned ──────────────────────────────
-#   ./tests/unified_vault_e2e.sh --apply
+# ── 4. VAULT sovereign-exit (testnet) ────────────────────────────────────────
+MPC_PUBLIC_KEY=bls12381g2:... PARENT=<parent>.testnet ./tests/unified_vault_e2e.sh --apply
 ```
 
 Subset: `ONLY=T1,T11 …` runs just those. The mainnet file targets mainnet by default (its env
@@ -71,9 +77,8 @@ Every value-moving test is wrapped so a real-money run cannot strand funds:
   run (so funds aren't left mid-flight by a continuing suite). The EXIT trap then sweeps.
 - **Per-test return** — each money test calls `return_test_funds` (sweep) at its end; the EXIT trap
   is the abort-path safety net.
-- **`sweep_one`** — drains a throwaway sub-wallet back to the constant `BENEFICIARY`
-  (**zavodil.near** mainnet / **zavodil.testnet** testnet — a real, existing, wNEAR-registered sink, so
-  DeleteAccount never burns): withdraw any intents wNEAR FIRST, then DeleteAccount the native, then
+- **`sweep_one`** — drains a throwaway sub-wallet back to the constant `BENEFICIARY` (overridable;
+  the default is a real, existing, wNEAR-registered sink on each network, so DeleteAccount never burns): withdraw any intents wNEAR FIRST, then DeleteAccount the native, then
   reclaim the on-chain policy-storage deposit.
 - **`verify_all_drained`** — final pass over EVERY sub-wallet created this run; any residual native
   >0.01 NEAR or non-zero intents balance is a **LEAK** (fails the suite, prints the recovery seed).
@@ -84,8 +89,8 @@ Every value-moving test is wrapped so a real-money run cannot strand funds:
 
 > ⚠️ **Tracking lives in FILES, not bash arrays** (`SWEEP_QUEUE`/`RUN_LEDGER`). `new_subwallet` runs
 > inside the `read … < <(new_subwallet …)` process-substitution subshell, where bash-array appends
-> are lost — a file append survives. This was the root cause of every historical test-fund leak.
-> The helper section is DUPLICATED across `unified_op_e2e.sh` ↔ `unified_op_e2e_intents.sh` — fix BOTH.
+> are lost — a file append survives. The helper section is DUPLICATED across `unified_op_e2e.sh`,
+> `unified_op_e2e_intents.sh` and `unified_vault_e2e.sh` — fix all three.
 
 > ⚠️ **Cross-chain is one-way.** T10 (cross_chain_withdraw) and the confidential x-chain withdraw
 > target other chains (ethereum burn / solana) and CANNOT be swept back. They run **UNFUNDED** —
@@ -94,8 +99,10 @@ Every value-moving test is wrapped so a real-money run cannot strand funds:
 
 ## What "the whole stack works" means
 
-Green = all three canonical runs pass with `verify_all_drained` reporting **0 leaks**:
+Green = the canonical runs pass with `verify_all_drained` reporting **0 leaks**:
 1. `unified_op_e2e.sh` on testnet (op-signing + auth + delete + multisig + vault-scope).
 2. `unified_op_e2e_intents.sh` on mainnet (intents value-flow + multisig + payment-checks + confidential smoke).
-3. (deep) `wallet_confidential_e2e.sh roundtrip` on mainnet, and `unified_vault_e2e.sh` on testnet
-   (sovereign-exit) once they're in place.
+3. `unified_vault_e2e.sh` on testnet (isolation + sovereign exit).
+4. (deep) `wallet_confidential_e2e.sh roundtrip` on mainnet.
+
+`run_custody.sh` runs the testnet custody suites in one sequential pass.

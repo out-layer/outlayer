@@ -76,9 +76,9 @@ of a call every other check passed, so a rule never widens the policy. A
 condition the operation does not carry (an amount on a cancellation) makes the
 policy unreadable, like a misspelt field. `ask` then follows this document
 exactly as a listed operation does. The reference is
-[`connectors/mercury-connector`](../connectors/mercury-connector/)
-(`src/rules.rs`; conditions `min_usd`, `max_usd`, `methods`, `payee`), proved
-live by `tests/mercury_rules_e2e.sh` (MR0–MR8).
+`connectors/mercury-connector` (a private submodule; `src/rules.rs`,
+conditions `min_usd`, `max_usd`, `methods`, `payee`), proved live by
+`tests/mercury_rules_e2e.sh` (MR0–MR8).
 
 **`status` reports it.** The connector's `status` (or whatever operation
 reports the policy) answers `confirm` with the other members, as the policy
@@ -196,34 +196,59 @@ approval. The operation:
    note goes into it — and answers the run.
 
 ```rust
-pub(crate) fn confirm(input: &Input) -> Result<Value, String> {
+pub(crate) fn confirm(input: &Input) -> Result<Value, tasks::Refused> {
     let (call, rules) = before_answer(input, policy::load())?;
     let answer = tasks::answered_for(ANSWERED_BY, &call, &policy::stored()).map_err(|e| e.refusal())?;
-    after_answer(&rules, &answer, crate::on_chain(), crate::deliver, |id, result| {
-        tasks::report(id, result).map_err(|e| e.refusal())
-    })
+    let notice = std::cell::RefCell::new(None);
+    after_answer(
+        &rules,
+        &answer,
+        crate::on_chain(),
+        crate::deliver,
+        |id, result| tasks::report(id, result).map_err(|e| e.refusal()),
+        |id, refusal| {
+            let told = tasks::failed_and_told(id, refusal, &policy::stored());
+            *notice.borrow_mut() = told.notice;
+            told.reported.map_err(|e| e.refusal())
+        },
+    )
+    .map_err(|refusal| tasks::Refused { refusal, notice: notice.take() })
 }
 
 fn after_answer(
     rules: &policy::Policy,
     answer: &tasks::Answer,
     on_chain: bool,
-    send: impl FnOnce(&policy::Policy, &Prepared, policy::Counted) -> Result<Value, String>,
+    send: impl FnOnce(&policy::Policy, &Prepared, policy::Counted) -> Result<Value, gmail::Unsent>,
     report: impl FnOnce(&str, &[u8]) -> Result<(), String>,
+    fail: impl FnOnce(&str, &str) -> Result<(), String>,
 ) -> Result<Value, String> {
-    let message = held(&answer.state, &answer.files).map_err(closed)?;
-    message.check(rules).map_err(closed)?;
-    let mut sent = send(rules, &message, policy::Counted::Confirmed).map_err(closed)?;
+    // Nothing was sent: the agent reads why as the failed task's result.
+    let refused = |why: String| {
+        let refusal = closed(why);
+        let _ = fail(&answer.id, &refusal);
+        Err(refusal)
+    };
+    let message = match held(&answer.state, &answer.files).and_then(|m| m.check(rules).map(|_| m)) {
+        Ok(message) => message,
+        Err(why) => return refused(why),
+    };
+    let mut sent = match send(rules, &message, policy::Counted::Confirmed) {
+        Ok(sent) => sent,
+        Err(gmail::Unsent::Refused(why)) => return refused(why),
+        // The request went out: it may have acted, so nothing is reported.
+        Err(gmail::Unsent::Unknown(why)) => return Err(outcome_unknown(why)),
+    };
     if let Some(note) = answer.note.as_deref().and_then(|n| std::str::from_utf8(n).ok()) {
-        sent["note"] = serde_json::json!(note);
+        with_note(&mut sent, note); // cut to what a report holds (16 KiB)
     }
     report(&answer.id, sent.to_string().as_bytes()).map_err(|e| sent_unreported(e, &sent))?;
     Ok(answered_with(&sent, &answer.id, on_chain))
 }
 ```
 
-`after_answer` takes the action and the report as arguments so that a unit
-test drives everything after the answer without a host (§7).
+`after_answer` takes the action, the report and the failure as arguments so
+that a unit test drives everything after the answer without a host (§7).
 
 A task answered and not reported ends `failed`; the report is what makes it
 `done`. What is reported is sealed for the preparer, so it may be whole —

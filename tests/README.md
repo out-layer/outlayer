@@ -1,420 +1,143 @@
-# NEAR OutLayer Test Suite
+# OutLayer Test Suites
 
-Complete test suite for NEAR OutLayer platform.
+Shell suites against a deployed stack (coordinator, keystore, workers,
+contracts), plus a fast local gate. Each suite's header comment is its
+reference: what it proves, its inputs, how to run it. This page is the map
+and the rules every live run follows.
 
-## Test Structure
+- Worker unit and integration tests (no live stack): [worker/TESTING.md](../worker/TESTING.md)
+- Custody / wallet / intents run order and the fund-safety model: [TESTING.md](TESTING.md)
+- Smaller wallet suites and the unit tests behind them: [WALLET_TESTS.md](WALLET_TESTS.md)
+- Superseded suites kept for reference: [legacy/README.md](legacy/README.md)
+- Last full connector-pricing run: [CONNECTOR_TEST_LOG.md](CONNECTOR_TEST_LOG.md)
 
-```
-tests/
-├── unit.sh          - Unit tests (WASM execution, cargo test)
-├── e2e.sh          - End-to-end tests (NEAR contract flow)
-├── transactions.sh  - Transaction tests (real testnet execution)
-├── job_workflow.sh  - ⭐ Job-based workflow tests (NEW!)
-├── verify_jobs.sh   - Database verification (jobs, timings, duplicates)
-└── run_all.sh      - Run all tests in sequence
-```
+## Rules for every live run
 
-## Quick Start
+- **A keyed RPC, always.** A suite that reads the chain builds `RPC_URL`
+  through `lib/rpc.sh` (directly or via `lib/hos_common.sh`): an `RPC_URL` in
+  the environment wins; otherwise the FastNEAR key comes from
+  `FASTNEAR_API_KEY` or near-cli's own config. Without a key the suite prints
+  `⚠ no FastNEAR API key` and runs unkeyed — stop there: the unkeyed host's
+  rate limits and timeouts read exactly like product failures. A suite that
+  only shells out to near-cli uses near-cli's `rpc_url`, which must be the
+  keyed one. Suites print the endpoint with `rpc_url_public` (host and
+  `(keyed)` / `(UNKEYED)`), never `$RPC_URL`.
+- **Secrets never reach the terminal.** No keyed URL, payment key, `wk_`
+  token, admin bearer or private key is echoed or written to a tracked file.
+  Credentials come from the environment or gitignored env files; a missing one
+  is a `${VAR:?}` failure, never a default literal.
+- **Testnet by default.** Everything that does not touch NEAR Intents runs on
+  testnet (`https://testnet-api.outlayer.ai`, `outlayer.testnet`). Intents
+  exist on mainnet only — testnet answers their routes with 503 — so the
+  intents suites run on mainnet with real funds; see the table below.
+- **Dry run first.** Most suites print their plan and move nothing unless
+  given `--apply`.
+- **Sequentially.** The wallet routes are rate-limited per IP (100 requests a
+  minute); two suites in parallel produce 429s and resets indistinguishable
+  from defects. The runners below sleep between suites.
+- **Database reads** go through `PSQL_CMD`, a wrapper that runs one SQL
+  statement on the coordinator's host; the database is not reachable from
+  elsewhere.
+- **Webhooks**: `hook_receiver.sh ensure` gives a public receiver
+  (Cloudflare quick tunnel) for suites that need one.
 
-### Run All Tests
+## Runners
 
-```bash
-cd tests
-./run_all.sh
-```
+| Runner | What it runs |
+|---|---|
+| `unit.sh` | Builds the example wasm and runs the worker's `cargo test`; no network |
+| `run_all.sh` | `unit.sh`, then the wallet suites against a **local** coordinator on `localhost:8080` (skipped when none answers) |
+| `run_custody.sh` | Every custody suite, sequentially, against testnet; prints the plan without `--apply`; needs `PARENT` and, for some suites, `PSQL_CMD` |
+| `run_hos_suite.sh` | Every HoS Agent Connect suite, sequentially, with a coverage report |
+| `run_tests.py` | Runs suites under a pty (for keychain prompts); env from `tests/.env.tests` (gitignored): `MPC_PUBLIC_KEY`, `PARENT`, `APPROVER`, `NETWORK`; `--list`, `--group`, `--all` |
 
-### Run Individual Tests
+## Suites by area
 
-```bash
-# Unit tests only
-./unit.sh
+Network is the suite's default; most take `NETWORK` / `COORDINATOR_URL`.
 
+### Custody and wallet
 
+| Suite | Network |
+|---|---|
+| `unified_op_e2e.sh` — canonical wallet operations: auth, sign, approve/reject, multisig, negatives, delete guards, vault scope | testnet |
+| `unified_op_e2e_intents.sh` — intents value flows, payment checks, swaps under multisig, confidential smoke | **mainnet, real funds** |
+| `unified_vault_e2e.sh` — vault isolation, sovereign exit, secret decrypt before/after recovery (V1–V6) | testnet |
+| `wallet_confidential_e2e.sh` — confidential intents deep-dive | **mainnet, real funds** |
+| `route_gaps_e2e.sh` — withdraw and swap routes, dry and quoted only | mainnet, moves nothing |
+| `money_settlement_step{1,2,3}_e2e.sh` — settlement after a coordinator release | **mainnet, real funds** |
+| `approval_flow_wk_e2e.sh`, `approval_votes_e2e.sh`, `contract_wallet_votes_e2e.sh`, `full_access_key_e2e.sh` — who may approve, and with which key | testnet |
+| `velocity_accounting_e2e.sh`, `velocity_two_doors_e2e.sh`, `wallet_concurrent_spend_e2e.sh`, `custody_limit_e2e.sh` — limits and counters | testnet |
+| `wallet_policy_mode_e2e.sh`, `policy_storage_refund_e2e.sh`, `internal_policy_sync_e2e.sh` — policy storage and sync | testnet |
+| `vault_key_rotation_e2e.sh`, `vault_recovery_e2e.sh`, `vault_backward_compat.sh` — vault keys and recovery | testnet |
+| `wallet_probe_e2e.sh` — wallet host functions as a WASI guest sees them | testnet |
+| `refusals_e2e.sh`, `stuck_request_repair_e2e.sh` | testnet |
+| `wallet_*` mode, signing and dry-run suites | see [WALLET_TESTS.md](WALLET_TESTS.md) |
 
-# End-to-end tests (requires testnet contract)
-./e2e.sh
-```
+### HoS Agent Connect
 
-## Test 1: Unit Tests
+`hos_fixture.sh` (shared fixture), `hos_endpoints_e2e.sh`,
+`hos_decoder_policy_e2e.sh`, `hos_custody_matrix_e2e.sh`,
+`hos_identity_e2e.sh`, `hos_lifecycle_e2e.sh`, `hos_dos_e2e.sh`,
+`hos_gas_floor_e2e.sh`, `hos_lease_stub_e2e.sh`, `hos_lease_live_e2e.sh`,
+`hos_lease_bravo_e2e.sh`, `binding_lifecycle_e2e.sh`,
+`bound_identity_onchain_e2e.sh`, `personal_wallet_e2e.sh`,
+`personal_wallet_global_e2e.sh` — testnet; run them with `run_hos_suite.sh`.
+Stub contracts: `deputy-stub/`, `hos-status-stub/`.
 
-**File**: `unit.sh`
+### Secrets and keys
 
-**What it tests**:
-- ✅ Building WASM test modules (get-random, ai-example)
-- ✅ Worker unit tests with cargo
-- ✅ WASM execution functionality
-- ✅ Fuel metering
+`secret_access_conditions_e2e.sh`, `secret_build_lock_e2e.sh`,
+`secret_build_lock_fresh_project_e2e.sh`, `secret_predecessor_e2e.sh`,
+`secret_predecessor_cli_e2e.sh`, `secret_prepublish_hash_e2e.sh`,
+`secrets_security_e2e.sh`, `signing_keys_e2e.sh`, `encryption_keys_e2e.sh`,
+`storage_scope_e2e.sh`, `gmail_delegation_e2e.sh` — testnet.
 
-**Prerequisites**:
-- Rust 1.85+
-- wasm32-wasip1 and wasm32-wasip2 targets installed
+### Connectors, payments, subscriptions
 
-**Run**:
-```bash
-./unit.sh
-```
+`connector_pricing_e2e.sh`, `connector_budget_parallel_e2e.sh`,
+`connector_probe_ops_e2e.sh`, `guess_game_e2e.sh`, `mercury_rules_e2e.sh`,
+`tasks_e2e.sh`, `call_credentials_e2e.sh` (claims the account's one trial),
+`sponsor_e2e.sh`, `gift_subscription_e2e.sh`, `gift_followup_e2e.sh` — testnet.
 
-**Expected output**:
-```
-🧪 Unit Tests - WASM Execution
-===============================
+### Contract and platform
 
-🔨 Building test WASM modules...
+`contract_probe_e2e.sh`, `contract_hotfix_e2e.sh`, `caller_gate_e2e.sh`,
+`input_storage_e2e.sh`, `project_transfer_e2e.sh`,
+`cleanup_verification_e2e.sh`, `system_event_effects_e2e.sh`,
+`worker_memory_e2e.sh` (fixture `mem-probe/`), `worker_soft_stop_e2e.sh` —
+testnet.
 
-📦 Building get-random (WASI P1)...
-✓ get-random built successfully
-📦 Building ai-example (WASI P2)...
-✓ ai-example built successfully
+### Basic execution
 
-🧪 Running worker unit tests...
+| Script | What it does |
+|---|---|
+| `e2e.sh` | One `request_execution` on `outlayer.testnet` for `out-layer/random-example`; result checked by hand |
+| `transactions.sh` | Sends the requests in `worker/test_transactions.txt` to the testnet contract |
+| `parallel_execution.sh`, `parallel_ai_execution.sh` | Concurrent requests across several workers |
+| `verify_jobs.sh` | Job statistics, timings, cache use and duplicate detection from the coordinator DB; `PSQL_CMD=<wrapper> ./verify_jobs.sh` |
 
-✅ All unit tests passed!
-```
-
-## Test 3: End-to-End Tests
-
-**File**: `e2e.sh`
-
-**What it tests**:
-- ✅ Full flow from contract to result
-- ✅ Event monitoring
-- ✅ Compilation in Docker
-- ✅ WASM execution
-- ✅ Result submission to contract
-
-**Prerequisites**:
-- Contract deployed on testnet (`outlayer.testnet`)
-- NEAR CLI installed
-- Coordinator running
-- Worker running with valid operator keys
-- Testnet account with NEAR tokens
-
-**Setup**:
-```bash
-# Terminal 1: Start coordinator
-cd coordinator
-cargo run
-
-# Terminal 2: Start worker
-cd worker
-RUST_LOG=info cargo run
-
-# Terminal 3: Run test
-cd tests
-./e2e.sh
-```
-
-**Configuration** (optional environment variables):
-```bash
-# Use custom contract
-CONTRACT_ID=mycontract.testnet ./e2e.sh
-
-# Use custom caller account
-CALLER_ACCOUNT=myaccount.testnet ./e2e.sh
-
-# Custom payment amount
-PAYMENT=0.5 ./e2e.sh
-```
-
-**Expected output**:
-```
-🧪 End-to-End Test - NEAR Contract Flow
-========================================
-
-📝 Configuration:
-  Contract: outlayer.testnet
-  Caller: outlayer.testnet
-  Payment: 0.1 NEAR
-  Repo: https://github.com/out-layer/random-example
-  Commit: main
-
-🔍 Checking prerequisites...
-✓ NEAR CLI available
-
-🚀 Sending execution request to contract...
-
-Transaction sent successfully!
-
-✅ Transaction sent!
-
-📊 Next steps:
-  1. Check worker logs for execution progress
-  2. View result in NEAR Explorer
-  3. Query contract state
-```
-
-**Worker logs to expect**:
-```
-INFO  Received task: Compile { request_id: 16, ... }
-INFO  🔨 Starting compilation
-INFO  ✅ Compilation successful
-INFO  ⚙️  Executing WASM
-INFO  ✅ Execution completed: success=true
-INFO  📤 Submitting result to NEAR
-INFO  ✅ Result submitted successfully
-```
-
-## Run All Tests
-
-**File**: `run_all.sh`
-
-Runs all tests in sequence:
-1. Unit tests (always runs)
-2. Compilation tests (skips if Docker not running)
-3. Integration tests (skips if coordinator not running)
-4. E2E tests (manual - requires testnet setup)
+## Vault contract and monitor tests (no live stack)
 
 ```bash
-./run_all.sh
+cargo test --manifest-path keystore-dao-contract/Cargo.toml --lib
+cargo test --manifest-path vault-contract/Cargo.toml --lib
+cargo test --manifest-path vault-contract/Cargo.toml --features test-timing --test integration   # near-sandbox
+cargo test --manifest-path outlayer-monitor/Cargo.toml --bins
+cargo test --manifest-path outlayer-monitor/Cargo.toml --bins --features lake-source
+cargo test --manifest-path wasi-examples/vault-checker/Cargo.toml --bins
 ```
 
-## Troubleshooting
+`vault_recovery_e2e.sh unilateral [--apply]` builds the vault contract with
+`test-timing` (cessation delay 30 s, unilateral exit window 10 s), deploys it
+to a fresh testnet sub-account and drives a unilateral recovery to
+`unlocked == true`. That build's hash differs from the production one and
+fails `vault-checker` by design. `vault_e2e.sh` is a manual runbook that
+prints and runs CLI steps; it asserts nothing.
 
-### Unit Tests
+## Helpers
 
-**"Target not found: wasm32-wasip1"**
-```bash
-rustup target add wasm32-wasip1 wasm32-wasip2
-```
-
-**"Cargo build failed"**
-```bash
-# Clean and rebuild
-cd wasi-examples/get-random
-cargo clean
-cargo build --release --target wasm32-wasip1
-```
-
-### End-to-End Tests
-
-**"NEAR CLI not found"**
-```bash
-npm install -g near-cli
-```
-
-**"Transaction rejected"**
-- Check operator permissions on contract
-- Verify worker has correct private keys
-
-**"Worker not processing"**
-- Check worker logs: `RUST_LOG=info cargo run`
-- Verify worker .env configuration
-- Check event monitor is enabled
-
-**"Execution timeout"**
-- Increase resource limits in request
-- Check Docker compilation logs
-
-## CI/CD Integration
-
-### GitHub Actions Example
-
-```yaml
-name: Test Suite
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_PASSWORD: postgres
-      redis:
-        image: redis:7
-
-    steps:
-      - uses: actions/checkout@v3
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: wasm32-wasip1
-
-      - name: Run unit tests
-        run: ./tests/unit.sh
-
-```
-
-## Additional Resources
-
-- [Worker Testing Guide](../worker/TESTING.md) - Detailed testing documentation
-- [WASI Tutorial](../wasi-examples/WASI_TUTORIAL.md) - WASM module development
-- [WASI Test Runner](../wasi-examples/wasi-test-runner/) - Module validation tool
-
-## Test Development
-
-### Adding New Tests
-
-1. Create test script in `/tests/`
-2. Make it executable: `chmod +x your_test.sh`
-3. Follow naming convention: `test_*.sh`
-4. Add to `run_all.sh` if appropriate
-5. Document in this README
-
-### Test Script Template
-
-```bash
-#!/bin/bash
-# Description of what this test does
-
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-echo "🧪 Test Name"
-echo "============"
-echo ""
-
-# Your test logic here
-
-echo ""
-echo "✅ Test passed!"
-```
-
-## Test 6: Job-Based Workflow ⭐ NEW
-
-**File**: `job_workflow.sh`
-
-**What it tests**:
-- ✅ First execution creates both compile + execute jobs
-- ✅ Second execution reuses cached WASM (execute job only)
-- ✅ Multiple workers don't duplicate work (race condition test)
-- ✅ Job claiming is atomic and conflict-free
-
-**Prerequisites**:
-- Contract deployed on testnet
-- Coordinator running on http://localhost:8080
-- Worker(s) running (recommended: 2+ for race condition test)
-
-**Run**:
-```bash
-./job_workflow.sh
-```
-
-**Expected output**:
-```
-🧪 Job-Based Workflow Integration Test
-=======================================
-
-Part 1: First Execution (Compile + Execute)
-✓ Transaction 1 sent successfully
-  Request ID: 50
-
-📊 Expected worker logs:
-  • 🎯 Claiming jobs for request_id=50
-  • ✅ Claimed 2 job(s) (compile + execute)
-  • 🔨 Starting compilation job_id=101
-  • ✅ Compilation successful: time=45000ms
-  • ⚙️ Starting execution job_id=102
-  • ✅ Execution successful
-
-Part 2: Second Execution (Execute Only - Cached WASM)
-✓ Transaction 2 sent successfully
-  Request ID: 51
-
-📊 Expected worker logs:
-  • ✅ Claimed 1 job(s) (execute ONLY - WASM cached!)
-  • 📥 Downloading WASM: checksum=XXX
-  • ✅ Execution successful
-  ✓ NO COMPILATION - WASM was reused from cache!
-
-Part 3: Race Condition Test
-✓ Transaction 3 sent successfully
-
-Worker 1:
-  • ✅ Claimed 1 job(s)
-  • ✅ Execution successful
-
-Worker 2:
-  • ⚠️ Failed to claim: already claimed by another worker
-  • (Moves to next task)
-  ✓ Only ONE worker processed the task!
-
-✅ Job Workflow Test Completed!
-```
-
-**What to verify**:
-1. First execution: 2 jobs created (compile + execute)
-2. Second execution: 1 job created (execute only)
-3. No duplicate jobs in database
-4. Cache hit ratio > 1 (more executes than compiles)
-
-## Test 7: Database Verification
-
-**File**: `verify_jobs.sh`
-
-**What it tests**:
-- ✅ Job statistics and counts
-- ✅ Compilation and execution timing
-- ✅ WASM cache effectiveness
-- ✅ Worker performance metrics
-- ✅ Race condition detection (duplicate jobs)
-- ✅ Failed/pending job analysis
-
-**Prerequisites**:
-- `PSQL_CMD`: a command that runs one SQL statement against the coordinator
-  database (on testnet: `.idea/testnet-runners/psql_testnet.sh`)
-- Jobs exist in the database (run job_workflow.sh first)
-
-**Run**:
-```bash
-PSQL_CMD=/path/to/psql_runner ./verify_jobs.sh
-```
-
-**Expected output**:
-```
-🔍 Job Database Verification
-============================
-
-📊 Job Statistics:
-┌──────────┬───────────┬───────┬─────────────────┐
-│ job_type │  status   │ count │ unique_requests │
-├──────────┼───────────┼───────┼─────────────────┤
-│ compile  │ completed │    15 │              15 │
-│ execute  │ completed │    45 │              30 │
-└──────────┴───────────┴───────┴─────────────────┘
-
-🔨 Compilation Jobs (with timing):
-┌────────┬────────────┬─────────────┬──────────┬─────────────────┐
-│ job_id │ request_id │  worker_id  │  status  │ compile_time_ms │
-├────────┼────────────┼─────────────┼──────────┼─────────────────┤
-│    101 │         50 │  worker-1   │completed │       45230     │
-└────────┴────────────┴─────────────┴──────────┴─────────────────┘
-
-⚙️ Execution Jobs (with metrics):
-┌────────┬────────────┬─────────────┬──────────────┬──────────────┐
-│ job_id │ request_id │ exec_time_ms │ instructions │    status    │
-├────────┼────────────┼──────────────┼──────────────┼──────────────┤
-│    102 │         50 │     1234     │   5000000    │  completed   │
-└────────┴────────────┴──────────────┼──────────────┼──────────────┘
-
-📦 WASM Cache Effectiveness:
-┌───────────────────────┬────────────┐
-│   checksum_preview    │ times_used │
-├───────────────────────┼────────────┤
-│ abc123...             │     30     │
-└───────────────────────┴────────────┘
-
-✓ Execute/Compile ratio: 3.00
-✓ WASM cache is being utilized!
-
-🔍 Race Condition Detection:
-✓ No duplicate jobs - UNIQUE constraint working correctly!
-```
-
-**What to verify**:
-1. No duplicate jobs (UNIQUE constraint working)
-2. Execute/Compile ratio > 1 (cache is working)
-3. All compile jobs have time_ms > 0
-4. All execute jobs have instructions > 0
-5. No stuck jobs in pending state
-
----
-
-**Last updated**: 2025-10-17
-**Test coverage**: Unit + Integration + E2E + Job Workflow
-**Platform**: NEAR OutLayer MVP (Job-based workflow)
+`lib/` holds what the suites share: `rpc.sh` (keyed RPC, `rpc_url_public`),
+`near_sign.sh`, `hos_common.sh`, `money_e2e.sh`, `secrets_common.sh`,
+`tasks_common.sh`, and the node helpers for signing, passkey and EVM votes,
+the webhook receiver and the tasks page. A new suite sources `lib/rpc.sh`
+rather than naming an RPC host of its own.

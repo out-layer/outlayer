@@ -1,17 +1,36 @@
 # WASI Test Runner
 
-Universal test tool to validate WASM modules for NEAR OutLayer compatibility.
+A local tool that runs a WASM module the way an OutLayer worker starts one —
+stdin in, stdout out, fuel metering, wasmtime 28 — and checks the result.
 
-## What It Tests
+## What It Checks
 
-✅ Binary format correctness (WASI P1 or P2)
-✅ Fuel metering (instruction counting)
-✅ Input/output handling (stdin → stdout)
-✅ Resource limits (memory, instructions)
-✅ JSON validation
-✅ Output size limits
-✅ Compatibility with wasmtime 28+
-✅ NEAR RPC host functions (view calls and transactions)
+✅ Binary format (WASI P1 module or P2 component)
+✅ Fuel metering (instruction counting, with a fuel limit)
+✅ Input/output handling (stdin → stdout, non-empty output)
+✅ JSON output (a warning, not a failure, when stdout is not JSON)
+✅ NEAR RPC host functions (`near:rpc/api@0.1.0`, with `--rpc`)
+
+## Where It Differs From the Worker
+
+Passing here does not prove a module runs on OutLayer. The runner:
+
+- links only `near:rpc`, not `near:storage`, `near:payment`, `near:vrf`,
+  `outlayer:wallet`, `outlayer:signing-keys`, `outlayer:encryption-keys` or
+  `outlayer:tasks`: a component that imports one of those fails to instantiate
+  here;
+- preopens the host's `/tmp` as `.` for a P2 component, while the worker gives a
+  run no directory at all: a module that writes files passes here and fails
+  there;
+- does not enforce `max_memory_mb` (the flag sizes the stdout buffer) and has
+  no time limit, while the worker enforces both (`WASI_TUTORIAL.md`, Overview);
+- does not apply the worker's outbound-HTTP rules (no internal addresses, a
+  manifest's network allowlist, the 30-second per-request timeout);
+- warns about output over 900 bytes, a limit OutLayer does not have: stdout
+  holds up to 10 MiB, and an on-chain answer of 1024 bytes or more is
+  delivered in two steps;
+- sets none of the worker's environment variables: pass what your module
+  reads with `--env`.
 
 ## Installation
 
@@ -34,14 +53,13 @@ cargo build --release
 ./target/release/wasi-test --wasm your-app.wasm --input-file input.json
 ```
 
-### Test with Custom Limits
+### Test with a Custom Fuel Limit
 
 ```bash
 ./target/release/wasi-test \
   --wasm your-app.wasm \
   --input '{"value":42}' \
-  --max-instructions 50000000 \
-  --max-memory-mb 256
+  --max-instructions 50000000
 ```
 
 ### Verbose Mode
@@ -73,17 +91,10 @@ cargo build --release
 ### Test with NEAR RPC (View Calls Only)
 
 ```bash
-# Test rpc-test-ark with view calls
+# rpc-test-ark runs its fixed testnet suite; it reads no input
 ./target/release/wasi-test \
   --wasm ../rpc-test-ark/target/wasm32-wasip2/release/rpc-test-ark.wasm \
-  --input '{"test":"view_account","account_id":"outlayer.testnet"}' \
-  --rpc \
-  --max-instructions 50000000000
-
-# Test with custom RPC endpoint
-./target/release/wasi-test \
-  --wasm ../rpc-test-ark/target/wasm32-wasip2/release/rpc-test-ark.wasm \
-  --input '{"test":"all","account_id":"outlayer.testnet"}' \
+  --input '{}' \
   --rpc \
   --rpc-url "https://rpc.testnet.fastnear.com" \
   --max-instructions 50000000000
@@ -92,7 +103,7 @@ cargo build --release
 ### Test with NEAR RPC (Transactions)
 
 ```bash
-# Test botfather-example - create accounts (requires credentials via env)
+# botfather-example - create accounts (requires credentials via env)
 ./target/release/wasi-test \
   --wasm ../botfather-example/target/wasm32-wasip2/release/bot-father.wasm \
   --input '{"action":"create_accounts","prompt":"space theme","count":3,"deposit_per_account":"1000000000000000000000000"}' \
@@ -104,7 +115,7 @@ cargo build --release
   --rpc-allow-transactions \
   --max-instructions 50000000000
 
-# Test botfather-example - list accounts (no credentials needed)
+# botfather-example - list accounts (no credentials needed)
 ./target/release/wasi-test \
   --wasm ../botfather-example/target/wasm32-wasip2/release/bot-father.wasm \
   --input '{"action":"list_accounts","indices":[]}' \
@@ -112,89 +123,57 @@ cargo build --release
   --env NEAR_SENDER_ID=alice.testnet \
   --rpc \
   --max-instructions 50000000000
-
-# Test botfather-example - fund specific accounts
-./target/release/wasi-test \
-  --wasm ../botfather-example/target/wasm32-wasip2/release/bot-father.wasm \
-  --input '{"action":"fund_accounts","total_amount":"30000000000000000000000000","indices":[0,2]}' \
-  --env PROTECTED_MASTER_KEY=ed25519:... \
-  --env NEAR_SENDER_ID=alice.testnet \
-  --env NEAR_SENDER_PRIVATE_KEY=ed25519:... \
-  --rpc \
-  --rpc-allow-transactions \
-  --max-instructions 50000000000
 ```
+
+`NEAR_SENDER_ID` stands in for the variable the worker sets to the caller's
+account; on OutLayer no secret can set it. `PROTECTED_MASTER_KEY` stands in for
+a secret the keystore generates.
 
 ## Example Output
 
 ### Successful Test
 
 ```
-🔍 Testing WASM module: random-example.wasm
-📝 Input: {"min":1,"max":100}
-⚙️  Max instructions: 10000000000
-💾 Max memory: 128 MB
+Testing WASM module: random-example.wasm
+Input: {"min":1,"max":100}
+Max instructions: 10000000000
+Max memory: 128 MB
 
-✓ Detected: WASI Preview 1 Module
-✅ Execution successful!
+Detected: WASI Preview 1 Module
+Execution successful!
 
-📊 Results:
+Results:
   - Fuel consumed: 456789 instructions
-  - Output size: 24 bytes
+  - Output size: 20 bytes
 
-📤 Output:
+Output:
 {"random_number":42}
 
-✓ Output is valid JSON
-✅ All checks passed! Module is compatible with NEAR OutLayer.
+Output is valid JSON
+All checks passed! Module is compatible with NEAR OutLayer.
 ```
 
 ### Failed Test
 
 ```
-🔍 Testing WASM module: broken-app.wasm
-📝 Input: {}
-⚙️  Max instructions: 10000000000
-💾 Max memory: 128 MB
+Testing WASM module: broken-app.wasm
+Input: {}
+Max instructions: 10000000000
+Max memory: 128 MB
 
-❌ Execution failed!
+Detected: WASI Preview 1 Module
+Execution failed!
 
 Error: Failed to find _start function. Make sure you're using [[bin]] format with fn main()
 
-💡 Common issues:
+Common issues:
   - Make sure you're using [[bin]] format, not [lib]
   - Check that you have fn main() as entry point
   - Verify you're reading from stdin and writing to stdout
   - Use correct build target (wasm32-wasip1 or wasm32-wasip2)
 
-📚 See WASI_TUTORIAL.md for detailed guide
+See WASI_TUTORIAL.md for detailed guide
 ```
-
-## What Gets Validated
-
-### 1. Binary Format
-- ✅ Valid WASI P1 module with `_start` entry point
-- ✅ Valid WASI P2 component with component model
-- ❌ Old library format with custom exports
-
-### 2. Input Handling
-- ✅ Reads from stdin
-- ❌ Uses command-line arguments (not supported)
-
-### 3. Output Handling
-- ✅ Writes to stdout
-- ✅ Flushes output buffer
-- ⚠️  Warns if output > 900 bytes
-- ⚠️  Warns if output is not JSON
-
-### 4. Resource Metering
-- ✅ Fuel consumption tracked
-- ✅ Memory limits enforced
-- ✅ Reports actual instruction count
-
-### 5. Compatibility
-- ✅ Works with wasmtime 28+
-- ✅ Same runtime as NEAR OutLayer worker
 
 ## Testing Your Own Module
 
@@ -227,10 +206,6 @@ cargo run --release -- \
   --input-file test-input.json \
   --verbose
 ```
-
-### Step 4: Check Results
-
-If all checks pass, your module is ready for NEAR OutLayer! 🎉
 
 ## Common Issues & Solutions
 
@@ -274,19 +249,6 @@ cargo build --target wasm32-wasip2 --release
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-### "Output is 2000 bytes (limit is 900 bytes)"
-
-**Problem**: Output too large for NEAR Protocol
-
-**Solution**: Truncate before returning:
-```rust
-let mut output = generate_output();
-if output.len() > 800 {
-    output.truncate(800);
-    output.push_str("...");
-}
-```
-
 ## Integration with CI/CD
 
 ### GitHub Actions Example
@@ -300,13 +262,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: wasm32-wasip1
+        run: rustup target add wasm32-wasip1
 
       - name: Build WASM
         run: cargo build --target wasm32-wasip1 --release
@@ -341,11 +300,14 @@ Options:
           [default: 10000000000]
 
       --max-memory-mb <MAX_MEMORY_MB>
-          Maximum memory in MB
+          Sizes the stdout buffer; memory itself is not limited
           [default: 128]
 
   -e, --env <ENV>
           Environment variables (format: KEY=value, can be specified multiple times)
+
+  -v, --verbose
+          Verbose output
 
       --rpc
           Enable NEAR RPC proxy (provides near:rpc/api host functions)
@@ -359,57 +321,35 @@ Options:
           [default: 100]
 
       --rpc-allow-transactions
-          Allow transaction methods (call, transfer)
-
-  -v, --verbose
-          Verbose output
+          Allow transaction methods (send-tx, call, transfer); implies --rpc
 
   -h, --help
           Print help
-
-  -V, --version
-          Print version
 ```
 
 ## NEAR RPC Host Functions
 
-When `--rpc` flag is enabled, the test runner provides `near:rpc/api` host functions that WASM modules can use to interact with NEAR blockchain.
+With `--rpc`, the runner provides the `near:rpc/api@0.1.0` interface — the same
+WIT as the worker's (`worker/wit/world.wit`). Every function returns
+`(result, error)`; `finality-or-block` takes `"final"`, `"optimistic"`, a block
+height or hash, empty meaning `"final"`. The full list is in
+[rpc-test-ark](../rpc-test-ark/README.md#wit-interface).
 
-### Available Functions
+**Transaction Functions** (require `--rpc-allow-transactions` and credentials
+the module supplies):
+- `call(signer_id, signer_key, receiver_id, method_name, args_json, deposit_yocto, gas, wait_until)`
+- `transfer(signer_id, signer_key, receiver_id, amount_yocto, wait_until)`
+- `send-tx(signed_tx_base64, wait_until)`
 
-**View Functions** (read-only, no credentials required):
-- `view(contract_id, method_name, args_json)` - Call view function on contract
-- `view_account(account_id)` - Get account information (balance, storage, etc.)
-- `view_access_key(account_id, public_key)` - Get access key information
-- `block(finality_or_block_id)` - Get block information
-- `gas_price()` - Get current gas price
-- `raw(method, params_json)` - Raw JSON-RPC call
-
-**Transaction Functions** (require `--rpc-allow-transactions` + credentials via `--env`):
-- `call(signer_id, signer_key, receiver_id, method_name, args_json, deposit_yocto, gas)` - Call contract method with transaction
-- `transfer(signer_id, signer_key, receiver_id, amount_yocto)` - Transfer NEAR tokens
+The runner waits for `FINAL` on `call` and `transfer` whatever `wait_until`
+says.
 
 ### Security Model
 
-**CRITICAL**: Worker (test runner) NEVER signs transactions with its own key. All transaction signer credentials MUST be provided by WASM via environment variables:
-
-- `NEAR_SENDER_ID` - Account ID that will sign transactions
-- `NEAR_SENDER_PRIVATE_KEY` - Private key in NEAR format (ed25519:base58...)
-
-WASM code reads these from environment and explicitly passes to `call()` or `transfer()` functions. This is the same security model as production OutLayer workers.
-
-### Environment Variables
-
-Pass secrets and configuration to WASM using `--env` flag:
-
-```bash
---env NEAR_SENDER_ID=alice.testnet \
---env NEAR_SENDER_PRIVATE_KEY=ed25519:... \
---env OPENAI_API_KEY=sk-... \
---env PROTECTED_MASTER_KEY=ed25519:...
-```
-
-WASM code accesses these via standard `std::env::var("KEY_NAME")`.
+Neither the runner nor a worker signs with a key of its own. The module passes
+the signer's account and private key (NEAR format, `ed25519:base58...`) to
+`call()` or `transfer()`. On OutLayer the private key comes from a secret, and
+`NEAR_SENDER_ID` is the caller's account set by the worker.
 
 ### Example: Testing WASM with RPC
 
@@ -417,19 +357,19 @@ WASM code accesses these via standard `std::env::var("KEY_NAME")`.
 // In your WASM code (Rust)
 use std::env;
 
-// Read credentials from environment (passed via --env)
-let signer_id = env::var("NEAR_SENDER_ID").unwrap();
-let signer_key = env::var("NEAR_SENDER_PRIVATE_KEY").unwrap();
+let signer_id = env::var("NEAR_SENDER_ID").unwrap_or_default();
+let signer_key = env::var("NEAR_SENDER_PRIVATE_KEY").unwrap_or_default();
 
-// Call NEAR RPC host function
-let (result, error) = near::rpc::api::view_account(&signer_id);
+// View call ("" = final)
+let (result, error) = near::rpc::api::view_account(&signer_id, "");
 
-// For transactions, explicitly provide credentials
+// Transaction, signed with the key the module was given
 let (tx_hash, error) = near::rpc::api::transfer(
-    &signer_id,           // From env
-    &signer_key,          // From env
+    &signer_id,
+    &signer_key,
     "receiver.testnet",
     "1000000000000000000000000",  // 1 NEAR in yoctoNEAR
+    "",                           // wait_until: "" = FINAL
 );
 ```
 
@@ -447,7 +387,7 @@ Test this WASM:
 ## Requirements
 
 - Rust 1.85+ (for building test runner)
-- wasmtime 28+ (included as dependency)
+- wasmtime 28 (included as dependency)
 - Valid WASI P1 or P2 WASM binary
 
 ## See Also
@@ -457,9 +397,3 @@ Test this WASM:
 - [ai-example](../ai-example/) - Example WASI P2 component
 - [rpc-test-ark](../rpc-test-ark/) - Example with NEAR RPC host functions
 - [botfather-example](../botfather-example/) - Example with RPC transactions and secrets
-- [SECURITY_AUDIT_REPORT.md](../SECURITY_AUDIT_REPORT.md) - Security model for transaction signing
-
----
-
-**Last updated**: 2025-11-24
-**Compatible with**: wasmtime 28+, NEAR OutLayer MVP

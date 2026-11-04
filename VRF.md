@@ -1,7 +1,7 @@
 # OutLayer VRF — Verifiable Random Function
 
 Cryptographically provable randomness for NEAR smart contracts.
-No oracle trust required — anyone can verify the proof on-chain.
+Anyone can verify the proof on-chain: the output was produced by OutLayer's VRF key for exactly this alpha, and cannot have been re-rolled. That the output was unpredictable rests on the VRF key staying inside attested enclaves — see [Unpredictable without the key](#2-unpredictable-without-the-key).
 
 ## How it works
 
@@ -25,7 +25,7 @@ WASI Module                    Worker (TEE)                  Keystore (TEE)
     |<-----------------------------|
 
 On-chain verification:
-    env::ed25519_verify(signature, alpha.as_bytes(), vrf_pubkey)  // native NEAR, ~26 TGas
+    env::ed25519_verify(signature, alpha.as_bytes(), vrf_pubkey)  // native NEAR host function
 ```
 
 ### Alpha format
@@ -34,8 +34,8 @@ On-chain verification:
 vrf:{request_id}:{sender_id}:{user_seed}
 ```
 
-- **request_id** — from blockchain event or HTTPS call ID. Auto-injected by worker, WASM cannot set it.
-- **sender_id** — signer account (blockchain) or payment key owner (HTTPS). Auto-injected by worker.
+- **request_id** — the contract's request id (on-chain request) or the numeric request id the coordinator assigns to an HTTPS call. Auto-injected by worker, WASM cannot set it.
+- **sender_id** — the paying account: the transaction's sender (blockchain) or the payment key owner (HTTPS). It is not the bound name a `use_bound_identity` run uses. Auto-injected by worker.
 - **user_seed** — arbitrary string from developer's WASM module. Must not contain `:`.
 
 Example: `vrf:98321:alice.near:coin-flip`
@@ -56,11 +56,13 @@ Ed25519 signatures are deterministic per RFC 8032. Same key + same alpha = same 
 
 ### 2. Unpredictable without the key
 
-The VRF private key lives only inside TEE (Intel TDX via Phala Cloud). It is derived from the master secret via `HMAC-SHA256(master_secret, "vrf-key")`. The master secret is distributed through MPC key ceremony — no single party holds it.
+The VRF private key is derived inside the keystore TEE (Intel TDX) from the keystore's shared master secret via `HMAC-SHA256(master_secret, "vrf-key")` — always the default OutLayer master, never a customer vault's. The master secret is issued by the NEAR MPC network (chain-key derivation), where no single node holds it.
+
+Stage caveat: `dao.outlayer.near` currently also carries a full-access key that can obtain the shared master outside an enclave, and measurement approval is owner-only (see [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md#governance-at-this-stage)). Whoever holds the master can compute the VRF output for any alpha in advance. Verification proves the output was not re-rolled; it does not prove nobody could predict it.
 
 ### 3. Non-manipulable alpha
 
-The WASM module only provides `user_seed`. The worker auto-prepends `request_id` (from the blockchain event) and `sender_id` (the caller's account). The WASM guest cannot change these values.
+The WASM module only provides `user_seed`. The worker auto-prepends `request_id` and `sender_id`. The WASM guest cannot change these values. On an on-chain request `request_id` comes from the contract's event; on an HTTPS call it is assigned by the coordinator.
 
 This means:
 - Same seed by different users → different output (sender_id differs)
@@ -83,7 +85,7 @@ The VRF public key is available at `GET /vrf/pubkey` and can be hardcoded in sma
 All keystore instances derive the VRF keypair from the same master secret with the fixed seed `"vrf-key"`. This means:
 - All instances produce the same VRF public key
 - Any instance can generate the same output for the same alpha
-- Keystore restarts don't change the key
+- Keystore restarts don't change the key (the key changes only if the master secret does)
 
 ### 6. Rate-limited
 
@@ -140,7 +142,7 @@ for i in 0..5 {
 
 - `user_seed` must not contain `:` (used as alpha delimiter)
 - Max 10 VRF calls per execution
-- VRF requires keystore — project must be deployed on OutLayer
+- VRF requires the keystore — the module must run on OutLayer workers (a component that imports `near:vrf/api` fails to start where VRF is unavailable)
 
 ### On-chain verification (NEAR smart contract)
 
@@ -152,7 +154,7 @@ fn verify_vrf(
     alpha: &str,              // from VRF output
     signature: &[u8; 64],    // from VRF output (signature_hex decoded)
 ) -> bool {
-    // NEAR native ed25519_verify: ~1 TGas
+    // NEAR native ed25519_verify
     env::ed25519_verify(signature, alpha.as_bytes(), vrf_pubkey)
 }
 ```
@@ -296,14 +298,13 @@ console.log('Output:', output);
 **NEAR contract (on-chain):**
 ```rust
 let valid = env::ed25519_verify(&signature_bytes, alpha.as_bytes(), &vrf_pubkey_bytes);
-// ~26 TGas, native NEAR support
 ```
 
 ### 3. Verify alpha integrity
 
 The alpha `vrf:{request_id}:{sender_id}:{user_seed}` contains:
-- **request_id** — visible in the blockchain transaction event (from `request_execution` call)
-- **sender_id** — the account that initiated the request
+- **request_id** — visible in the `execution_requested` event of the `request_execution` call (on-chain requests; for an HTTPS call it is the coordinator's id and cannot be checked against the chain)
+- **sender_id** — the account that paid for the request
 - **user_seed** — the seed from the WASM input
 
 Reconstruct and compare:
@@ -316,11 +317,11 @@ assert alpha == expected_alpha, "Alpha mismatch — possible tampering"
 
 1. `ed25519_verify(vrf_pubkey, alpha, signature)` — signature is valid
 2. `SHA256(signature) == output_hex` — output matches signature
-3. Alpha contains correct `request_id` from blockchain event
+3. Alpha contains correct `request_id` from the blockchain event (on-chain requests)
 4. Alpha contains correct `sender_id` (the caller)
 5. VRF public key matches `GET /vrf/pubkey`
 
-If all 5 checks pass, the random output is provably correct and was not manipulated.
+If all 5 checks pass, the output is the one OutLayer's VRF key gives for this alpha: it was not re-rolled or swapped after the fact. Unpredictability depends on the key's custody (see above).
 
 ## API reference
 

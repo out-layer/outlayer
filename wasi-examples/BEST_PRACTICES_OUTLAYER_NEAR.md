@@ -22,7 +22,7 @@ use outlayer::env;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get the account that signed the transaction
     let signer = env::signer_account_id()
-        .ok_or("No signer - must be called via NEAR transaction")?;
+        .ok_or("No signer - not running on OutLayer")?;
 
     println!("Called by: {}", signer);
 
@@ -34,10 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 ### Key Points
-- `env::signer_account_id()` returns `Option<String>`
-- Returns `None` when called via HTTPS API without payment key
-- Returns the NEAR account ID (e.g., `alice.near`) when called via blockchain transaction
-- For HTTPS API calls with Payment Key, the key owner's account is used
+- `env::signer_account_id()` returns `Option<String>` (it reads `NEAR_SENDER_ID`)
+- Returns the NEAR account ID (e.g., `alice.near`) that signed the transaction when called via blockchain transaction
+- For HTTPS API calls, the payment key owner's account — every HTTPS call carries a payment key
+- Returns `None` only outside OutLayer (e.g. local wasmtime)
 
 ### Dependencies (Cargo.toml)
 
@@ -153,25 +153,25 @@ export async function callOutLayer(
   return parseTransactionResult(result);
 }
 
+// The output is the return value of OutLayer's receipt: the module's own JSON
+// (response_format 'Json'), or `null` when the run failed.
 function parseTransactionResult(result: any): any {
-  let successValue: string | null = null;
-
-  if (result?.receipts_outcome) {
-    for (const receipt of result.receipts_outcome) {
-      if (receipt?.outcome?.status?.SuccessValue) {
-        successValue = receipt.outcome.status.SuccessValue;
-        break;
-      }
-    }
-  }
-
-  if (!successValue) {
+  const receipt = result?.receipts_outcome?.find(
+    (r: any) =>
+      r?.outcome?.executor_id === OUTLAYER_CONTRACT &&
+      r?.outcome?.status?.SuccessValue
+  );
+  if (!receipt) {
     throw new Error('No result from OutLayer execution');
   }
 
-  const decoded = atob(successValue);
-  const response = JSON.parse(decoded);
+  const response = JSON.parse(atob(receipt.outcome.status.SuccessValue));
+  if (response === null) {
+    throw new Error('OutLayer execution failed');
+  }
 
+  // near.email's module answers {success, error, ...}: that envelope is the
+  // module's own convention, not OutLayer's.
   if (!response.success) {
     throw new Error(response.error || 'Unknown error');
   }
@@ -235,14 +235,14 @@ async function badPattern() {
 Payment Keys allow users to interact with OutLayer via HTTPS API instead of blockchain transactions. Benefits:
 - No transaction approval popups
 - Faster response times
-- Larger payload support (10MB vs ~1.5MB)
+- Request bodies up to 10 MB
 - Pre-paid execution costs
 
 ### Create Payment Keys
 
 Users create Payment Keys at the OutLayer Dashboard. Format: `owner:nonce:secret`
 
-Example: `alice.near:0:a1b2c3d4...`
+Example: `alice.near:1:a1b2c3d4...` (a key you create has nonce 1 or above)
 
 ### Frontend: Payment Key Mode
 
@@ -313,7 +313,8 @@ async function callOutLayerHttps(action: string, params: Record<string, any>): P
     throw new Error(result.error || 'Execution failed');
   }
 
-  return JSON.parse(result.output);
+  // `output` is the module's JSON, already parsed: an HTTPS call reads stdout as Json
+  return result.output;
 }
 
 // Unified call function - routes to HTTPS or blockchain
@@ -341,7 +342,7 @@ function AccountMenu() {
   return (
     <div>
       <input
-        placeholder="alice.near:0:secret..."
+        placeholder="alice.near:1:secret..."
         value={paymentKeyInput}
         onChange={e => setInput(e.target.value)}
       />
@@ -687,4 +688,4 @@ export async function signOut(): Promise<void> {
 
 ---
 
-*Based on near.email production implementation. Last updated: 2025-01*
+*Based on the near.email implementation (`wasi-examples/near-email`).*

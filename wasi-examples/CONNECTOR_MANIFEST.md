@@ -141,11 +141,9 @@ any recipient is outside near.email. That distinction is one only the connector
 can make, which is why the key is built from the request rather than from the
 price list.
 
-**A word we do not recognise is read at its strictest, not dropped.** That is
-deliberate, and it is the second version of this rule: the first one skipped
-what it could not parse, and when the audience names changed, every manifest
-already published kept its old word and quietly stopped declaring anything at
-all. Nobody noticed, because nothing failed.
+**A word we do not recognise is read at its strictest, not dropped.** A rule
+that skipped what it could not parse would let a manifest stop declaring
+anything the day a word it uses is renamed, and nothing would fail to say so.
 
 Being read strictly cannot hurt anybody but this connector's own callers — a
 declaration is unioned with the coordinator's rules and every applicable rule
@@ -625,7 +623,7 @@ operation out of them:
 
 | Reader | What it does with it |
 |---|---|
-| the contract | prices the call on chain, and requires that exact price |
+| the contract | prices the call on chain, and requires at least that price (the excess comes back) |
 | the coordinator | bills it and picks which limit rule applies |
 | the worker | refuses to run a connector call that names none |
 | your guest | dispatches on it |
@@ -656,9 +654,10 @@ before the request reaches us. It does not change what we price.
 **Prices.** The price of an operation lives **on chain**, in the contract's
 `project_pricing` table, and nowhere else. A connector author who could set
 their own price would set it to zero and burn our workers; and the chain
-enforces it — `request_execution` refuses a call that does not attach the
-operation's exact price — so a second copy baked into a published wasm could
-only ever disagree with the one that decides. A manifest carries no price.
+enforces it — `request_execution` refuses a call that attaches less than the
+operation's price, and returns any excess at settlement — so a second copy
+baked into a published wasm could only ever disagree with the one that
+decides. A manifest carries no price.
 
 **The author's share** lives there too, per operation, next to the price it
 splits, along with the account it is paid to. Same reason: it is what the
@@ -739,9 +738,8 @@ is called like any other project:
 POST /call/connectors.outlayer.near/{id}
 ```
 
-There is no separate connector endpoint and no alias. While a short name and the
-thing it ran could differ, the same code had two doors and every check on one
-had to be mirrored onto the other.
+There is no separate connector endpoint and no alias: one door per project,
+so no check has to be mirrored onto a second one.
 
 Which ids are curated is a list in the coordinator's source
 (`src/handlers/connector_registry.rs`), so adding a connector is a code change

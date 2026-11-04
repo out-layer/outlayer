@@ -1,28 +1,46 @@
 # OutLayer Smart Contract
 
-NEAR smart contract for off-chain WASM execution using yield/resume mechanism.
+NEAR contract for off-chain WASM execution through yield/resume, plus the
+on-chain records the rest of OutLayer reads: projects and their versions,
+encrypted secrets, payment keys, and encrypted wallet policies.
 
 - Testnet: `outlayer.testnet`
 - Mainnet: `outlayer.near`
 
+`get_config` answers `[owner, operator]`. The operator is the worker
+registration account (`worker.outlayer.near`; `worker.outlayer.testnet` on
+testnet); each TEE worker holds a function-call key on it scoped to
+`resolve_execution`, `submit_execution_output_and_resolve`, `resume_topup` and
+`resume_delete_payment_key`.
+
 ## Features
 
-- **Yield/Resume Mechanism**: Uses `promise_yield_create` to pause execution
-- **Off-chain Computation**: Execute arbitrary WASM code off-chain
-- **Resource Limits**: Configurable limits for instructions, memory, and time
-- **Dynamic Pricing**: Cost calculated based on actual resource usage
-- **Stale Request Cancellation**: Users can cancel requests after timeout
-- **Admin Controls**: Owner can manage operators, pricing, and pause contract
-- **Secret Management**: Encrypted secrets support via keystore worker integration
+- **Yield/resume**: `request_execution` creates a yield promise; a worker runs
+  the code and resumes it with the result, which the calling contract receives
+  as the return value.
+- **Resource limits** on instructions, memory and time, with hard caps.
+- **Usage-based pricing**: the deposit covers the worst case for the limits; the
+  unused part is refunded at settlement.
+- **Stale request cancellation** by the sender after a timeout.
+- **Projects**: named, versioned code with its own storage namespace.
+- **Secrets**: ciphertext and an access condition stored here; the keystore
+  (TEE) decrypts and judges the condition.
+- **Payment keys** for the HTTPS API, and **wallet policies** for agent custody.
+- **Owner controls**: operator, pricing, pause, project prices, subscription plans.
 
 ## Contract API
 
-### User Functions
+Who may call: *owner* = `assert_owner` (the contract owner), *operator* =
+`assert_operator` (the operator account), *private* = the contract itself
+(callbacks). Everything else is open to any account, acting on its own records
+(the predecessor).
 
-#### `request_execution`
-Request off-chain execution of WASM code.
+### Execution
 
-**Basic execution (no secrets):**
+#### `request_execution` (payable)
+
+`request_execution(source, resource_limits?, input_data?, secrets_ref?, response_format?, payer_account_id?, params?)`
+
 ```bash
 near call outlayer.testnet request_execution '{
   "source": {
@@ -33,90 +51,117 @@ near call outlayer.testnet request_execution '{
     "max_memory_mb": 128,
     "max_execution_seconds": 60
   },
-  "input_data": "{\"key\": \"value\"}"  
-}' --accountId user.testnet --deposit 0.01
+  "input_data": "{\"key\": \"value\"}"
+}' --accountId user.testnet --deposit 0.01 --gas 100000000000000
 ```
 
-`source` names a published `.wasm` by its sha256; the worker refuses a file
-whose bytes do not match the hash. `Project` is the normal case
-(`version_key: null` = the active version, otherwise the version's wasm hash);
-a published file runs directly as
-`{"WasmUrl": {"url": "https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm", "hash": "<sha256>", "build_target": "wasm32-wasip2"}}`.
-The URL must be `https://` on the default port. A project version's source is
-always a `WasmUrl`.
+- `source` is an `ExecutionSource`:
+  - `{"Project": {"project_id", "version_key"}}` — the normal case.
+    `version_key: null` runs the active version; otherwise it names a version
+    (its wasm hash). The run gets the project's storage namespace.
+  - `{"WasmUrl": {"url", "hash", "build_target"}}` — runs a published file
+    directly, e.g.
+    `{"WasmUrl": {"url": "https://main.fastfs.io/alice.near/outlayer.near/<sha256>.wasm", "hash": "<sha256>", "build_target": "wasm32-wasip2"}}`.
+    The contract requires `url` to be `https://` (at most 2048 bytes, no
+    whitespace) and `hash` to be the SHA-256 as 64 lowercase hex characters; the
+    worker also refuses a URL with an explicit port and a file whose bytes do
+    not match the hash.
+  - `{"GitHub": {"repo", "commit", "build_target"}}` — accepted by the contract,
+    but building from sources is off by default on the coordinator
+    (`BUILDS_ENABLED`), so such a request is refused off chain. Publish a
+    `.wasm` and use `Project` or `WasmUrl`.
+- `resource_limits` — `{max_instructions?, max_memory_mb?, max_execution_seconds?}`;
+  a field left out takes its default (1 billion, 128 MB, 60 s). **Always pass
+  it, even as `{}`**: a request without `resource_limits` is compile-only and
+  runs nothing.
+- `input_data` — the guest's stdin. 10,000 bytes and more is left out of the
+  event and read by the worker from state (`get_request`).
+- `secrets_ref` — `{profile, account_id}`: the secret row the run asks the
+  keystore for. `profile` must satisfy the rule `store_secrets` applies (1–64
+  bytes of letters, digits, `-` or `_`); a reference no row could match is
+  refused before the request yields.
+- `response_format` — `Text` (default), `Json` or `Bytes`.
+- `payer_account_id` — who receives the NEAR refund; default the caller.
+- `params` — `RequestParams`:
+  - `attached_usd` (U128, stablecoin minimal units, `1000000` = $1) — payment to
+    the project's owner, debited from the caller's stablecoin balance in the
+    contract (`ft_on_transfer` with `deposit_balance`). `Project` source only.
+  - `use_bound_identity` (bool) — run the guest under the caller's bound
+    account name.
+  - `force_rebuild`, `store_on_fastfs`, `compile_only` — build controls.
+    `force_rebuild` is refused for a `WasmUrl` source; `store_on_fastfs`
+    requires `force_rebuild`; compile-only refuses a non-empty `input_data`.
+  - `project_uuid` is set by the contract from a `Project` source and cleared
+    otherwise; a value the caller passes is ignored.
 
-**With encrypted secrets (e.g., API keys):**
-```bash
-# 1. Get keystore public key
-near contract call-function as-read-only outlayer.testnet get_keystore_pubkey json-args {} network-config testnet now
+**Whose identity.** The `execution_requested` payload carries `sender_id` =
+the transaction's signer and `predecessor_id` = the calling account. The
+keystore judges a secret's condition against the signer (see
+[Access conditions](#access-conditions)). The stored request's `sender_id` is
+the predecessor: it is the account that may cancel, and the one the
+stablecoin is debited from and returned to.
 
-# 2. Encrypt your secrets with the public key (use keystore encryption library)
-# encrypted_data = encrypt_for_keystore(pubkey, "OPENAI_API_KEY=sk-...")
-
-# 3. Call with encrypted secrets
-near call outlayer.testnet request_execution '{
-  "source": {...},
-  "resource_limits": {...},
-  "input_data": "{...}",
-  "secrets_ref": {
-    "profile": "default",
-    "account_id": "dev.testnet"
-  }
-}' --accountId user.testnet --deposit 0.1
-```
-
-`secrets_ref.profile` is checked at the door with the rule `store_secrets`
-applies to a profile name — 1–64 bytes of letters, digits, `-` or `_` — and a
-reference no row could match is refused before the request yields, naming
-that rule.
+**Priced projects.** A project with a price (`get_project_pricing`) is charged
+per operation: `input_data` must be a JSON object of at most 10,000 bytes with
+a non-empty string `"operation"` at the top level, the project must sell that
+operation, and `attached_usd` must be at least its price. The excess comes back
+to the caller's stablecoin balance at settlement. Not applied to compile-only
+requests.
 
 **Deposit.** `estimate_execution_cost(resource_limits, input_len)` is what to
-attach: the compute estimate for the limits, plus — for an `input_data` longer
-than 32 KB — 0.00001 NEAR per byte above that, held while the request is
-pending and returned at settlement with the rest of the refund. Up to 32 KB
-the deposit is the compute estimate alone. The settlement callback is given
-gas in proportion to the input it will remove from state, out of the gas
-attached to the call, so a call carrying megabytes needs more gas as well
-(25 MGas per byte above 32 KB, about 52 TGas for 2 MiB; within 32 KB nothing changes).
+attach: the compute estimate for the limits
+(`base_fee + max_instructions/1e6 × per_million_instructions_fee + max_execution_seconds × 1000 × per_ms_fee`),
+plus — for an `input_data` longer than 32 KB — 0.00001 NEAR per byte above
+that, held while the request is pending and returned at settlement. A
+compile-only request requires the base fee.
+
+**Gas.** The settlement callback is created with 50 TGas taken from the gas
+attached to the call, so attach more than that (the example uses 100 TGas).
+Above 32 KB of input it gets 25 MGas more per byte (about 52 TGas more for
+2 MiB).
 
 **Return value.** The calling contract receives the output as a JSON value:
 the guest's JSON for `Json`, a string for `Text`, base64 for `Bytes`, and
 `null` when the run failed or produced nothing.
 
-**Limits.** `get_max_limits` answers `max_instructions` (500 billion),
-`max_execution_seconds` (180) as its first two values; `max_memory_mb` is capped
-at 4096 (wasm32's bound). A request above a cap is refused at the door.
+**Limits.** `get_max_limits` answers `[max_instructions, max_execution_seconds, max_compilation_seconds]`
+= `[500000000000, 180, 300]`; `max_memory_mb` is capped at 4096 (wasm32's
+bound). A request above a cap is refused at the door.
 
-**What a run is charged.** A success pays `base_fee + instructions + time`,
-capped at the compute deposit. A failed run pays the same formula on
-what the worker reports it used, capped the same way; a failure before the
-guest ran reports little or nothing and costs about the base fee. A run the
-chain's yield window (200 blocks) outlived pays the base fee. The storage part
-of a large input always comes back; the stablecoin comes back whole when the
-run fails or times out, and on a success goes to the developer less any change
-and the guest's own refund.
+**What a run is charged.** A success pays
+`base_fee + instructions/1e6 × per_million_instructions_fee + time_ms × per_ms_fee`,
+plus `compile_time_ms × per_compile_ms_fee` when the worker compiled, capped at
+the NEAR attached minus the input storage part. A failed run pays the same
+formula on what the worker reports it used, capped the same way; a failure
+before the guest ran reports little or nothing and costs about the base fee. A
+run the chain's yield window (200 blocks) outlived pays the base fee. The
+storage part of a large input always comes back. The stablecoin comes back
+whole when the run fails or times out; on a success the price goes to the
+project (split with the author for a priced project), less the guest's own
+refund, and any change returns to the caller.
 
 #### `cancel_stale_execution`
-Cancel a request still pending after the timeout (10 minutes). Returns the
-whole of the stablecoin and the NEAR above the charge, the storage part of a
-large input always included. The charge is the base fee when no output was
-delivered — as a timed-out request pays — and the compute estimate
-for the limits when the worker has delivered the output through the 2-call
-flow and the callback never settled it: the run happened and its output is
-readable with `get_pending_output`.
+
+Only the request's sender, only after 10 minutes. Returns the whole of the
+stablecoin and the NEAR above the charge, the storage part of a large input
+always included. The charge is the base fee when no output was delivered — as
+a timed-out request pays — and the compute estimate for the limits when the
+worker has delivered the output through the 2-call flow and the callback never
+settled it: the run happened and its output is readable with
+`get_pending_output`.
 
 ```bash
-near call outlayer.testnet cancel_stale_execution '{
-  "request_id": 123
-}' --accountId user.testnet
+near call outlayer.testnet cancel_stale_execution '{"request_id": 123}' --accountId user.testnet
 ```
 
 ### Operator Functions
 
 #### `resolve_execution`
-Resolve execution with results (called by worker).
 
-**Small output (<1024 bytes):**
+`resolve_execution(request_id, response)` — operator. Resumes the yield with an
+`ExecutionResponse`; used when the response fits the yield-resume payload limit
+(1024 bytes).
+
 ```bash
 near call outlayer.testnet resolve_execution '{
   "request_id": 0,
@@ -124,107 +169,133 @@ near call outlayer.testnet resolve_execution '{
     "success": true,
     "output": {"Text": "Hello, NEAR!"},
     "error": null,
-    "resources_used": {
-      "instructions": 1000000,
-      "time_ms": 100
-    }
+    "resources_used": {"instructions": 1000000, "time_ms": 100, "compile_time_ms": null},
+    "compilation_note": null,
+    "refund_usd": null
   }
-}' --accountId operator.testnet
+}' --accountId worker.outlayer.testnet
 ```
+
+`refund_usd` is the guest's refund of part of `attached_usd`, clamped to the
+price.
 
 #### `submit_execution_output_and_resolve`
-Optimized single-transaction method for large outputs (>1024 bytes). Used automatically by worker.
+
+`submit_execution_output_and_resolve(request_id, output, success, error, resources_used, compilation_note)`
+— operator. Stores a large output in the request and resumes the yield in the
+same call; the callback reads the output from state. This flow carries no
+`refund_usd`.
+
+`submit_execution_output(request_id, output)` (operator) stores the output
+alone, to be followed by `resolve_execution`; worker keys are not scoped to it.
+
+#### `resume_topup` / `resume_delete_payment_key`
+
+`resume_topup(data_id, result)` and `resume_delete_payment_key(data_id, result)`
+— operator. Resume the yields of a payment-key top-up and delete; `data_id` is
+hex. `result` is `{"Success": {"new_encrypted_data"}}` / `{"Error": {"message"}}`
+for a top-up, `"Success"` / `{"Error": {"message"}}` for a delete. Both panic
+when no yield is waiting (it timed out and was settled, or was already
+resumed).
+
+### Owner Functions
+
+All `assert_owner`.
+
+| Method | What it does |
+|---|---|
+| `set_owner(new_owner_id)` | Hand the owner role on |
+| `set_operator(new_operator_id)` | Change the operator account |
+| `set_paused(paused)` | Pause: refuses `request_execution`, `create_project`, `add_version`, `accept_project_transfer`, `store_wallet_policy`, `freeze_wallet`, `unfreeze_wallet`, `set_storage_refund_to`, `top_up_payment_key_with_near` |
+| `set_pricing(base_fee?, per_million_instructions_fee?, per_ms_fee?, per_compile_ms_fee?, base_fee_usd?, per_million_instructions_fee_usd?, per_sec_fee_usd?, per_compile_ms_fee_usd?)` | NEAR prices (yoctoNEAR) and HTTPS API prices (stablecoin minimal units); each `U128` string, an omitted one is unchanged |
+| `set_payment_token_contract(token_contract?)` | The stablecoin `ft_on_transfer` accepts and earnings are paid in; `null` clears it. The contract account must be registered on the token (`storage_deposit`) |
+| `set_subscription_plans(plans)` | Replace the plan list: `[{index, name, price_usd, active}]`, at most 16, unique indexes, each named and priced; an index already in the list keeps its name |
+| `set_project_pricing(project_id, pricing)` | Price an existing project: `{author_account_id, operations: [{operation, price_usd, developer_share_bp}]}`, 1–32 unique operations, share ≤ 10000 bp |
+| `remove_project_pricing(project_id)` | Unprice a project |
+| `set_event_metadata(standard?, version?)` | The NEP-297 `standard` / `version` events carry |
+| `emergency_cancel_execution(request_id)` | Cancel one pending request; refunds the whole NEAR deposit and the stablecoin |
+| `cancel_pending_requests(request_ids)` → `u64` | Cancel a list; refunds the NEAR deposit only — the request's `attached_usd` is not returned to the sender's stablecoin balance on this path |
+| `clear_all_pending_requests(limit?)` → `u64` | Cancel up to `limit` (default 100) pending requests from id 0; refunds NEAR and stablecoin |
 
 ```bash
-near call outlayer.testnet submit_execution_output_and_resolve '{
-  "request_id": 0,
-  "output": {"Text": "Very long output..."},
-  "success": true,
-  "error": null,
-  "resources_used": {
-    "instructions": 1000000,
-    "time_ms": 100,
-    "compile_time_ms": null
-  },
-  "compilation_note": null
-}' --accountId operator.testnet
-```
-
-**Note**: Worker automatically chooses between `resolve_execution` (small output) and `submit_execution_output_and_resolve` (large output) based on payload size.
-
-### Admin Functions
-
-#### `set_operator`
-Change operator account.
-
-```bash
-near call outlayer.testnet set_operator '{
-  "new_operator_id": "new-operator.testnet"
-}' --accountId owner.testnet
-```
-
-#### `set_pricing`
-Update pricing parameters.
-
-```bash
-near call outlayer.testnet set_pricing '{
-  "base_fee": "10000000000000000000000",
-  "per_instruction_fee": "1000000000000000",
-  "per_mb_fee": "100000000000000000000",
-  "per_second_fee": "1000000000000000000000"
-}' --accountId owner.testnet
-```
-
-#### `set_paused`
-Pause/unpause contract.
-
-```bash
-near call outlayer.testnet set_paused '{
-  "paused": true
-}' --accountId owner.testnet
+near call outlayer.testnet set_pricing '{"base_fee": "1000000000000000000000"}' --accountId <owner>
 ```
 
 ### View Functions
 
-#### `get_request`
-Get execution request by ID.
+| Method | Answer |
+|---|---|
+| `get_request(request_id)` | The pending `ExecutionRequest`, or `null` once settled |
+| `get_pending_request_ids(from_index?, limit?)` | Pending ids (default limit 100) |
+| `get_pending_output(request_id)` / `has_pending_output(request_id)` | Output delivered through the 2-call flow, not yet settled |
+| `get_stats()` | `[total_executions, total_fees_collected]` |
+| `get_pricing()` | `[base_fee, per_million_instructions_fee, per_ms_fee, per_compile_ms_fee]` |
+| `get_pricing_full()` | The NEAR prices and the HTTPS API prices (`base_fee_usd`, `per_million_instructions_fee_usd`, `per_sec_fee_usd`, `per_compile_ms_fee_usd`) |
+| `estimate_execution_cost(resource_limits?, input_len?)` | Deposit for `request_execution`, yoctoNEAR |
+| `get_max_limits()` | `[max_instructions, max_execution_seconds, max_compilation_seconds]` |
+| `get_config()` | `[owner, operator]` |
+| `get_event_metadata()` | `[standard, version]` |
+| `is_paused()` | `bool` |
+| `get_payment_token_contract()` | The configured stablecoin, or `null` |
+| `get_subscription_plans()` | The whole plan list, withdrawn plans included |
+| `get_project_pricing(project_id)` | The project's price list, or `null` |
+| `get_project_max_price(project_id)` | The most one call can cost; `"0"` when unpriced |
+| `get_priced_projects(from_index?, limit?)` / `get_priced_project_count()` | Priced project ids (default 100, at most 500 per page) |
+| `get_developer_earnings(account_id)` | Stablecoin earned and not withdrawn |
+| `get_user_stablecoin_balance(account_id)` | Stablecoin available for `attached_usd` |
+| `get_storage_version()` | The state layout the code expects (`"11"`) |
 
 ```bash
-near view outlayer.testnet get_request '{
-  "request_id": 123
-}'
+near view outlayer.testnet get_request '{"request_id": 123}'
 ```
 
-#### `get_stats`
-Get contract statistics.
+### Stablecoin: deposits and earnings
 
-```bash
-near contract call-function as-read-only outlayer.testnet get_stats json-args {} network-config testnet now
-```
+The configured stablecoin arrives through NEP-141 `ft_transfer_call` to this
+contract; `ft_on_transfer` refuses any other token. `msg` is one of:
 
-#### `get_pricing`
-Get current pricing.
+- `{"action": "deposit_balance"}` — credits the sender's balance for
+  `attached_usd`.
+- `{"action": "top_up_payment_key", "nonce": N, "owner": "<optional>"}` — tops
+  up a payment key (at least 10000 = $0.01; `owner` defaults to the sender).
+  The worker re-encrypts the key's balance and resumes; a failure or a timeout
+  returns the tokens.
+- `{"action": "buy_subscription", "nonce": N, "plan": P, "owner": "<optional>"}` —
+  buys plan `P` for an existing key. A payment short of the plan, an unknown or
+  withdrawn plan, or a missing key refuses the whole transfer; an overpayment
+  is kept and reported in the event.
 
-```bash
-near view outlayer.testnet get_pricing '{}'
-```
-
-#### `get_config`
-Get contract configuration.
-
-```bash
-near view outlayer.testnet get_config '{}'
-```
+`withdraw_developer_earnings()` (payable, at least 1 yoctoNEAR) transfers the
+caller's whole earnings balance; the balance is restored if the transfer fails.
 
 ### Project Functions
 
 A project is `{owner}/{name}`: the name is 1–64 bytes of ASCII letters,
 digits, `-` or `_` (a Cyrillic `а` in `polymаrket` is not a name — it would
-read as the real one). `create_project`, `add_version`, `set_active_version`,
-`remove_version` and `delete_project` are the owner's; see
-[PROJECT.md](../PROJECT.md) for their arguments.
+read as the real one). The owner calls every write with the bare name; the
+caller is the owner.
 
-#### `accept_project_transfer`
+- `create_project(name, source)` (payable) — `source` is a `CodeSource`
+  (`WasmUrl` or `GitHub`, held to the same rules as in `request_execution`);
+  it becomes the active version. Attach the storage deposit; the panic names
+  the figure and the excess is refunded.
+- `add_version(project_name, source, set_active)` (payable).
+- `set_active_version(project_name, version_key)`.
+- `remove_version(project_name, version_key)` — not the active one; refunds
+  the version's deposit.
+- `delete_project(project_name)` — refunds the project's deposit and emits
+  `system_event` `ProjectStorageCleanup { project_id, project_uuid, timestamp }`
+  so workers erase its storage.
+
+A version key is the wasm hash for a `WasmUrl` source and `{repo}@{commit}`
+for a `GitHub` one.
+
+Views: `get_project(project_id)`, `list_user_projects(account_id)`,
+`get_version(project_id, version_key)`,
+`list_versions(project_id, from_index?, limit?)` (default 50, at most 100),
+`get_version_count(project_id)`, `has_project_uuid(project_uuid)`.
+
+#### `accept_project_transfer` (payable)
 
 A project moves only onto an acceptance given by the account that will own
 it, for exactly that project and that owner. Without one, `transfer_project`
@@ -235,7 +306,7 @@ without that account asking for it.
 ```bash
 # bob agrees to take alice.testnet/my-app. The deposit pays for the record and
 # comes back when it is consumed or revoked; estimate_transfer_acceptance_cost
-# quotes it (about 0.002 NEAR).
+# quotes it (about 0.001–0.003 NEAR, by the length of the names).
 near call outlayer.testnet accept_project_transfer '{"from": "alice.testnet", "name": "my-app"}' --accountId bob.testnet --deposit 0.01
 ```
 
@@ -268,8 +339,8 @@ near call outlayer.testnet transfer_project '{"project_name": "my-app", "new_own
 Renames `alice.testnet/my-app` to `bob.testnet/my-app`; the uuid, the versions
 and the storage stay. Requires bob's acceptance, consumes it and returns its
 deposit to bob. A priced project does not move: pricing is the contract
-owner's, so the OutLayer operator unprices it (`remove_project_pricing`)
-first. Emits `ProjectTransferred`.
+owner's, so the contract owner unprices it (`remove_project_pricing`) first.
+Emits `ProjectTransferred { old_project_id, new_project_id, project_uuid, old_owner, new_owner }`.
 
 #### `estimate_transfer_acceptance_cost`
 
@@ -281,13 +352,21 @@ The deposit `accept_project_transfer` will charge, in yoctoNEAR.
 
 ### Wallet Policy Functions
 
-A custody wallet's policy is stored here encrypted; only the keystore decrypts
-it. The account that sends `store_wallet_policy` becomes its controller.
+A custody wallet's policy is stored here encrypted by the keystore; the
+coordinator keeps a readable copy for its own checks, and the keystore reads
+the on-chain entry before it signs. The account that sends
+`store_wallet_policy` becomes its controller.
 
-#### `store_wallet_policy`
-Create or update a policy. Needs a signature by the wallet's own key over
-`store_wallet_policy:v1:{wallet_pubkey}:{len}:{encrypted_data}:{caller}` (the
-keystore makes it) and a storage deposit (`estimate_wallet_policy_cost`).
+#### `store_wallet_policy` (payable)
+
+`store_wallet_policy(wallet_pubkey, encrypted_data, wallet_signature, storage_refund_to?)`.
+Create or update a policy. `wallet_pubkey` is `ed25519:<hex32>` or
+`secp256k1:<hex33>`; `encrypted_data` is at most 100 KB. Needs a signature by
+the wallet's own key over
+`sha256("store_wallet_policy:v1:{wallet_pubkey}:{len}:{encrypted_data}:{caller}")`
+(the keystore makes it) and a storage deposit (`estimate_wallet_policy_cost`).
+An update must come from the same controller and keeps the frozen flag. Emits
+`WalletPolicyUpdated { wallet_pubkey, owner, encrypted_data, frozen }`.
 
 `storage_refund_to` (optional) names who the storage deposit goes back to —
 for a sponsor that pays it while the owner signs. It is set only when the
@@ -297,9 +376,9 @@ shrinks the policy, and the whole deposit on `delete_wallet_policy`. The owner
 keeps every power over the policy itself (update, freeze, delete); it cannot
 change where the deposit goes. That includes the excess of the owner's own
 attachment on an update: attach exactly `estimate_wallet_policy_cost`, or the
-rest goes to the beneficiary. Without the argument, refunds go to the caller,
-as before. The argument is covered by the owner's transaction signature, so a
-NEP-366 relayer cannot change it.
+rest goes to the beneficiary. Without the argument, refunds go to the caller.
+The argument is covered by the owner's transaction signature, so a NEP-366
+relayer cannot change it.
 
 ```bash
 near contract call-function as-transaction outlayer.testnet store_wallet_policy json-args '{
@@ -309,6 +388,7 @@ near contract call-function as-transaction outlayer.testnet store_wallet_policy 
 ```
 
 #### `set_storage_refund_to`
+
 Hand the refunds on: `{"item": {"WalletPolicy": {"wallet_pubkey": "ed25519:<hex>"}}, "storage_refund_to": "other.testnet"}`.
 Only the current beneficiary can call it — to pass the deposit to another
 sponsor, or to the owner to give it back. The owner cannot take it, and a
@@ -319,21 +399,23 @@ nothing is refunded: the record keeps its size. Emits `StorageRefundToChanged`.
 that no longer exists fails on chain and the NEAR stays with the contract; the
 contract cannot check this in advance.
 
-`StorageItem` is what a refundable deposit is held for. Today it has one
-variant, `WalletPolicy { wallet_pubkey }`; a new kind of sponsored storage is a
-new variant and an argument on its creating call.
+`StorageItem` is what a refundable deposit is held for. It has one variant,
+`WalletPolicy { wallet_pubkey }`.
 
 #### `delete_wallet_policy`
+
 Controller only. Returns the whole deposit to the beneficiary when one is set,
 otherwise to the caller, and drops the beneficiary: a policy created again
 under the key starts without one. The `WalletPolicyDeleted` event carries
 `refunded_to`.
 
 #### `freeze_wallet` / `unfreeze_wallet`
+
 Controller only, no wallet signature: the emergency stop for a compromised
-agent key.
+agent key. Emit `WalletFrozenChanged { wallet_pubkey, owner, frozen }`.
 
 #### Views
+
 - `get_wallet_policy(wallet_pubkey)` → `{owner, encrypted_data, frozen, updated_at, storage_refund_to, storage_deposit}` or `null`. A sponsor checks `storage_refund_to` before it pays.
 - `get_wallet_policies_by_owner(owner)` → `[{wallet_pubkey, owner, frozen, updated_at, storage_refund_to}]`.
 - `has_wallet_policy(wallet_pubkey)` → `bool`.
@@ -341,101 +423,94 @@ agent key.
 
 ### Secrets Management Functions
 
-#### `store_secrets`
-Store encrypted secrets under an accessor: `{"Project": {"project_id"}}` (every
-version of a project) or `{"WasmHash": {"hash"}}` (one build). A `Repo` accessor
-names a row stored earlier for a repository: such a row is read and deleted
-like any other, and nothing new is stored, updated or re-scoped for a
-repository. `profile` names the row: 1–64 bytes of letters, digits, `-` or `_`.
-The same rule refuses, at `request_execution`, a `secrets_ref` no row could
-match.
+The contract stores ciphertext and an access condition; it never sees a
+plaintext. The encryption key comes from the keystore through the API
+(`POST https://api.outlayer.ai/secrets/pubkey`), not from this contract;
+`outlayer secrets set` (CLI) and the dashboard do the encryption and the
+`store_secrets` call.
 
-**Important:** Always estimate storage cost first using `estimate_storage_cost` to attach the correct deposit.
+#### `store_secrets` (payable)
+
+`store_secrets(accessor, profile, encrypted_secrets_base64, access, vault_id)`.
+Store encrypted secrets under `(accessor, profile, caller)`. The accessor is:
+
+- `{"Project": {"project_id"}}` — every version of a project; the project must
+  exist.
+- `{"WasmHash": {"hash"}}` — one build; 64 hex characters, stored lower-case.
+- `{"System": "PaymentKey"}` — a payment key (see
+  [Payment keys](#payment-keys)).
+- `{"Repo": {"repo", "branch"}}` — accepted by the contract and read with a
+  fallback from a branch to `branch: null`; the CLI refuses it for new values,
+  since OutLayer runs published `.wasm` builds.
+
+`profile` names the row: 1–64 bytes of letters, digits, `-` or `_`; a profile of
+64 lowercase hex characters names an agent and is refused unless the owner is
+that implicit account. The same rule refuses, at `request_execution`, a
+`secrets_ref` no row could match.
+
+`vault_id`: pass it explicitly, `null` for the default OutLayer master, or the
+vault account whose master encrypted the ciphertext. `null` leaves an existing
+vault binding of the row in place; `unbind_secret_vault(accessor, profile)`
+removes one.
+
+A store on an existing row replaces the ciphertext and the condition; the
+deposit already held counts towards the new size, and the excess comes back.
 
 ```bash
-# 1. Estimate storage cost. The arguments are the slot the store will use:
-# the ACCESSOR, the profile, the owner, the ciphertext and the
-# condition — the condition is priced too, so a large whitelist costs more.
+# 1. Estimate storage cost for the exact slot, ciphertext and condition.
 near view outlayer.testnet estimate_storage_cost '{
   "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
   "profile": "default",
   "owner": "alice.testnet",
-  "encrypted_secrets_base64": "YWJjZGVm...",
+  "encrypted_secrets_base64": "<base64>",
   "access": "AllowAll",
   "vault_id": null
 }'
-# Output: "1500000000000000000000" (0.0015 NEAR)
+# Output: yoctoNEAR as a string
 
-# 2. Store secrets with exact deposit
+# 2. Store; attach at least the estimate, the excess is refunded.
 near call outlayer.testnet store_secrets '{
   "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
   "profile": "default",
-  "encrypted_secrets_base64": "YWJjZGVm...",
+  "encrypted_secrets_base64": "<base64>",
   "access": "AllowAll",
   "vault_id": null
-}' --accountId alice.testnet --deposit 0.0015
+}' --accountId alice.testnet --deposit 0.01
 ```
 
 #### `estimate_storage_cost`
-Estimate the storage cost before storing secrets. Returns exact cost in yoctoNEAR.
 
-```bash
-near view outlayer.testnet estimate_storage_cost '{
-  "accessor": {"WasmHash": {"hash": "<sha256>"}},
-  "profile": "production",
-  "owner": "alice.testnet",
-  "encrypted_secrets_base64": "YWJjZGVm...",
-  "access": {"Whitelist": {"accounts": ["alice.testnet", "bob.testnet"]}},
-  "vault_id": null
-}'
-```
+`estimate_storage_cost(accessor, profile, owner, encrypted_secrets_base64, access, vault_id)`
+→ yoctoNEAR. Refuses a condition the store would refuse. The size counted:
 
-**Pricing factors:**
-- Base overhead: 40 bytes (LookupMap entry)
-- Key size: accessor + profile + owner (with Borsh length prefixes)
-- Value size: encrypted_secrets + access condition + timestamps
-- Index overhead: 64 bytes (for new secrets)
-- Storage price: 0.00001 NEAR per byte
+- 40 bytes of record overhead;
+- the key: accessor, profile and owner, Borsh-encoded with length prefixes;
+- the value: the ciphertext (+4), the condition's JSON (+10), and 32 bytes of
+  timestamps and deposit;
+- 64 bytes for the owner's index entry;
+- with a vault binding (passed, or already on the row): 40 + the key + 68;
+- a new payment key adds the owner's nonce floor entry, once per owner.
 
-**Note:** Complex access conditions (e.g., Whitelist with many accounts) cost more than simple ones (e.g., AllowAll).
+All at 0.00001 NEAR per byte. A large `Whitelist` costs more than `AllowAll`.
 
-#### `get_secrets`
-Retrieve a stored secret row (called by keystore worker).
+#### `update_access` (payable)
 
-```bash
-near view outlayer.testnet get_secrets '{
-  "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
-  "profile": "default",
-  "owner": "alice.testnet"
-}'
-```
-
-#### `delete_secrets`
-Delete secrets and get storage deposit refund.
-
-```bash
-near call outlayer.testnet delete_secrets '{
-  "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
-  "profile": "default"
-}' --accountId alice.testnet
-```
-
-#### `update_access`
-Change who may read a stored secret. The condition moves and the ciphertext
-stays, so no value is re-entered and a TEE-generated key is never lost. Keyed on
+`update_access(accessor, profile, new_access)`. Change who may read a stored
+secret. The condition moves and the ciphertext stays, so no value is
+re-entered and a TEE-generated key is never lost. Keyed on
 `(accessor, profile, caller)`: only the owner of the row can change it, and a
 non-owner's call panics with `Secrets not found`. This is how an owner hands a
 secret to an agent and takes it back — the agent names `{account_id: owner,
 profile}` in `secrets_ref`.
 
 Payable, because a condition is stored bytes: a `Whitelist` of two thousand
-accounts occupies some fifty kilobytes whichever door it arrives through. The
-row is re-priced against the new condition and the deposit already held counts
-towards it, so narrowing refunds the difference, an edit that does not change
-the size needs nothing, and only growth asks for more. Call
-`estimate_storage_cost` with the row's existing `encrypted_secrets_base64` and
-the new condition to learn the figure; attaching it is always sufficient, and
-the excess comes back in the same transaction.
+accounts occupies some fifty kilobytes. The row is re-priced against the new
+condition and the deposit already held counts towards it, so narrowing refunds
+the difference, an edit that does not change the size needs nothing, and only
+growth asks for more. Call `estimate_storage_cost` with the row's existing
+`encrypted_secrets_base64` and the new condition to learn the figure;
+attaching it is always sufficient, and the excess comes back in the same
+transaction.
 
 ```bash
 near call outlayer.testnet update_access '{
@@ -451,30 +526,79 @@ near call outlayer.testnet update_access '{
 }' --accountId alice.testnet --gas 30000000000000 --deposit 0.1
 ```
 
+#### `delete_secrets`
+
+`delete_secrets(accessor, profile)` — the caller's row; refunds its storage
+deposit and drops its vault binding. It accepts any accessor, a payment key
+included, and tells the coordinator nothing: delete a payment key with
+`delete_payment_key`.
+
+```bash
+near call outlayer.testnet delete_secrets '{
+  "accessor": {"Project": {"project_id": "alice.testnet/my-app"}},
+  "profile": "default"
+}' --accountId alice.testnet
+```
+
+#### `store_agent_secret` (payable) / `delete_agent_secret`
+
+`store_agent_secret(agent_pubkey, accessor, profile, encrypted_secrets_base64, access, vault_id, wallet_signature)`
+stores a secret OWNED by an agent wallet — the implicit account of the ed25519
+`agent_pubkey` — paid for by the caller, who receives every refund. The
+accessor is `Project` or `WasmHash` only. `wallet_signature` is the wallet
+key's signature, made by the keystore, over the SHA-256 of
+`store_secrets_for:v1:{agent_pubkey}:{len(accessor)}:{accessor}:{profile}:{encrypted_secrets_base64}:{caller}:{vault_id or empty}:{access as JSON}`,
+where `{accessor}` is the project id, or `wasm:{hash}`.
+
+`delete_agent_secret(agent_pubkey, accessor, profile, wallet_signature)` removes
+one on the signature of the same key over
+`delete_agent_secret:v1:{agent_pubkey}:{len(accessor)}:{accessor}:{profile}:{caller}`;
+the deposit goes to the caller. Neither accepts a payment key.
+
+#### Reads
+
+- `get_secrets(accessor, profile, owner)` → `{encrypted_secrets, access, created_at, updated_at, storage_deposit, accessor}` or `null`.
+- `get_secret_with_vault(accessor, profile, owner)` → `{profile, vault_id}` (the keystore reads this).
+- `get_secret_vault(accessor, profile, owner)` → the bound vault, or `null`.
+- `secrets_exist(accessor, profile, owner)` → `bool`.
+- `list_user_secrets(account_id, from_index?, limit?)` → one page of
+  `{accessor, profile, created_at, updated_at, storage_deposit, access}`.
+  Omitting the paging arguments gives the first 100, not the whole set; `limit`
+  is capped at 500. Ask for the next page until one comes back short.
+- `list_profiles(_repo, _branch)` always returns `[]`; use `list_user_secrets`.
+
+```bash
+near view outlayer.testnet list_user_secrets '{"account_id": "alice.testnet", "from_index": 0, "limit": 100}'
+```
+
 #### Access conditions
+
 `access` (on `store_secrets` and `update_access`) is an `AccessCondition`, evaluated
 by the keystore inside the TEE against the account the run is attributed to — the
 transaction's SIGNER on chain (a contract that relays `request_execution` is the
 predecessor and pays, but the signer is the one judged — unless the condition
 says otherwise with `Predecessor`), a payment key's owner over HTTPS — never
-against a name the call claims. Variants: `"AllowAll"`; `{"Whitelist": {"accounts": [...]}}` (exact match);
+against a name the call claims. Variants (12): `"AllowAll"`;
+`{"Whitelist": {"accounts": [...]}}` (exact match);
 `{"AccountPattern": {"pattern": "..."}}` (a regex anchored to the whole id);
-`{"NearBalance": {"operator": "Gte", "value": "<yocto>"}}`; `{"FtBalance": {"contract",
-"operator", "value"}}`; `{"NftOwned": {"contract", "token_id"}}`; `{"DaoMember":
-{"dao_contract", "role"}}`; `{"ValidUntil": {"until_ns": "<nanoseconds since the
-epoch, as a string>"}}` (admits strictly before that instant); `{"WasmHash": {"hash":
-"<SHA-256 of the build, 64 lowercase hex>"}}` (admits only a run of that exact build —
-the keystore compares it with the hash the worker measured on the bytes it executes;
-`update_access` moves a row to the next build without re-encrypting);
-`{"Predecessor": {"condition": ...}}` (judges the condition it wraps on the account
-that CALLED the contract — `predecessor_account_id`: the relaying contract, or the
-signer on a direct call — so `And[Whitelist[me], Predecessor{Whitelist[me]}]` admits only
-the owner's own direct calls and `Predecessor{Whitelist[dao]}` only calls through that
-DAO; over HTTPS the payment key's owner is judged as the calling account too, so there
-the wrapper adds nothing); `{"Logic": {"operator":
-"And" | "Or", "conditions": [...]}}` and `{"Not": {"condition": ...}}` to combine
-them. The contract stores the condition without evaluating it; the Borsh layout of
-`SecretProfile.access` is the variant order, so new variants are only ever appended.
+`{"NearBalance": {"operator", "value": "<yocto>"}}`; `{"FtBalance": {"contract",
+"operator", "value"}}`; `{"NftOwned": {"contract", "token_id"}}` (`token_id`
+optional); `{"DaoMember": {"dao_contract", "role"}}`; `{"ValidUntil": {"until_ns":
+"<nanoseconds since the epoch, as a string>"}}` (admits strictly before that
+instant); `{"WasmHash": {"hash": "<SHA-256 of the build, 64 lowercase hex>"}}`
+(admits only a run of that exact build — the keystore compares it with the hash
+the worker measured on the bytes it executes; `update_access` moves a row to the
+next build without re-encrypting); `{"Predecessor": {"condition": ...}}` (judges
+the condition it wraps on the account that CALLED the contract —
+`predecessor_account_id`: the relaying contract, or the signer on a direct call —
+so `And[Whitelist[me], Predecessor{Whitelist[me]}]` admits only the owner's own
+direct calls and `Predecessor{Whitelist[dao]}` only calls through that DAO; over
+HTTPS the payment key's owner is judged as the calling account too, so there the
+wrapper adds nothing); `{"Logic": {"operator": "And" | "Or", "conditions": [...]}}`
+and `{"Not": {"condition": ...}}` to combine them. Comparison operators are
+`Gte`, `Lte`, `Gt`, `Lt`, `Eq`, `Ne`. The contract stores the condition without
+evaluating it; the Borsh layout of `SecretProfile.access` is the variant order,
+so new variants are only ever appended.
 
 The contract stores no condition the keystore would refuse to judge, so both
 `store_secrets` and `update_access` refuse one past these bounds — and
@@ -486,35 +610,29 @@ The contract stores no condition the keystore would refuse to judge, so both
   chose, and a shared keystore waits for all of them;
 * at most **16** `AccountPattern` leaves and **4096 bytes** of pattern text in
   all. A pattern's compiled size is not its text size, and the keystore
-  compiles every pattern of a condition before judging a decrypt.
+  compiles every pattern of a condition before judging a decrypt;
+* every `WasmHash` leaf is 64 lowercase hex characters;
+* every `Logic` node holds at least one condition (an empty `And` would admit
+  everyone).
 
 A whitelist is answered from the condition itself, so neither its size nor the
 number of whitelist leaves is bounded — the only cost is storage, which the
 row's owner pays for.
 
-#### `list_user_secrets`
-One PAGE of the secrets stored by an account. It reads storage per entry, so an
-unbounded answer would eventually exceed the view's gas and fail for everyone —
-omitting the paging arguments gives the first 100, not the whole set. Ask for the
-next page until one comes back short.
+### Payment keys
 
-```bash
-near view outlayer.testnet list_user_secrets '{
-  "account_id": "alice.testnet",
-  "from_index": 0,
-  "limit": 100
-}'
-```
+A payment key is a secret under the `{"System": "PaymentKey"}` accessor whose
+profile is its nonce, created with `store_secrets`. The nonce is a number from 1
+to 2147483647 (0 is reserved for keys the coordinator issues itself), and a key
+is written once: a second store at the same nonce is refused. Creating one
+emits `system_event` `TopUpPaymentKey` with amount 0, which registers the key
+with the coordinator.
 
-`limit` is capped at 500. Both arguments may be omitted.
-
-#### Payment key nonces
-A payment key is a secret under the `System: PaymentKey` accessor whose profile
-is its nonce. A nonce is handed out to an owner once: `store_secrets` refuses a
-payment key at or below the owner's floor — the highest nonce the contract has
-seen them create or delete — with "has already been used". The coordinator
-keeps a deleted key's row under `(owner, nonce)`, and a new key there would
-bring it back with the old balance and grants.
+A nonce is handed out to an owner once: `store_secrets` refuses a payment key
+at or below the owner's floor — the highest nonce the contract has seen them
+create or delete — with "has already been used". The coordinator keeps a
+deleted key's row under `(owner, nonce)`, and a new key there would bring it
+back with the old balance and grants.
 
 - `get_next_payment_key_nonce({account_id})` — the lowest nonce a new key may
   take: one above both the live keys and the floor.
@@ -523,15 +641,34 @@ bring it back with the old balance and grants.
 
 The floor is raised when a key is created and when one is deleted, so it holds
 every nonce the contract has seen come or go; a key older than the owner's
-floor entry is recorded when it is deleted. Its entry is
-paid once, by the owner's first key (included in `estimate_storage_cost`), and
-is not refunded: it outlives every key. `delete_payment_key` refunds the key's
-storage deposit; its unspent balance is forfeited.
+floor entry is recorded when it is deleted. Its entry is paid once, by the
+owner's first key (included in `estimate_storage_cost`), and is not refunded:
+it outlives every key.
+
+- `delete_payment_key(nonce)` (payable, at least 1 yoctoNEAR) — yields until
+  the worker has deleted the key in the coordinator (`DeletePaymentKey` event,
+  `resume_delete_payment_key`), then removes the row and refunds its storage
+  deposit. The key's unspent balance is not returned. On an error or a timeout
+  the key stays.
+- Top-up with the stablecoin: `ft_on_transfer` with `top_up_payment_key` (see
+  [Stablecoin](#stablecoin-deposits-and-earnings)).
+- `top_up_payment_key_with_near(nonce, swap_contract_id)` (payable) — **mainnet
+  only** (NEAR Intents). Wraps the attached NEAR minus 0.01 NEAR to wNEAR,
+  sends it to `swap_contract_id` and requests a swap to the stablecoin through
+  the `publishintent.near/payment-keys-with-intents` project. Requires at least
+  0.01 NEAR above that 0.01 NEAR and an existing key of the caller's.
+- `top_up_payment_key_with_token(nonce, token_id, amount, swap_contract_id)` is
+  disabled: it always panics.
 
 ## Events
 
+NEP-297 logs, `EVENT_JSON:{"standard", "version", "event", "data": [ … ]}`;
+`data` is a one-element array. `standard` and `version` are the deployment's
+(`get_event_metadata`; `near-outlayer` / `1.0.0` unless set).
+
 ### `execution_requested`
-Emitted when user requests execution.
+
+Emitted by `request_execution`; workers pick requests up from it.
 
 ```json
 {
@@ -539,15 +676,19 @@ Emitted when user requests execution.
   "version": "1.0.0",
   "event": "execution_requested",
   "data": [{
-    "request_data": "{...}",
+    "request_data": "{\"request_id\":0,\"sender_id\":\"...\",\"predecessor_id\":\"...\",\"code_source\":{...},\"resource_limits\":{...},\"input_data\":\"...\",\"input_data_in_state\":false,\"secrets_ref\":null,\"response_format\":\"Text\",\"payment\":\"...\",\"attached_usd\":\"0\",\"timestamp\":0,\"compile_only\":false,\"force_rebuild\":false,\"store_on_fastfs\":false,\"use_bound_identity\":false,\"project_uuid\":null,\"project_id\":null}",
     "data_id": [0,1,2,...],
     "timestamp": 1234567890
   }]
 }
 ```
 
+`request_data` is a JSON string; `data_id` is the yield's 32 bytes.
+
 ### `execution_completed`
-Emitted when execution is completed.
+
+Emitted at settlement when the worker resumed the yield (not on a yield
+timeout).
 
 ```json
 {
@@ -557,76 +698,31 @@ Emitted when execution is completed.
   "data": [{
     "sender_id": "user.testnet",
     "code_source": {...},
-    "resources_used": {...},
+    "resources_used": {"instructions": 0, "time_ms": 0, "compile_time_ms": null},
     "success": true,
+    "error_message": null,
+    "payment_charged": "...",
+    "payment_refunded": "...",
+    "compilation_note": null,
     "timestamp": 1234567890
   }]
 }
 ```
+
+### `system_event`
+
+`data` is `[{"<Variant>": {...}}]`, one of: `TopUpPaymentKey`,
+`DeletePaymentKey`, `SubscriptionPurchased`, `WalletPolicyUpdated`,
+`WalletPolicyDeleted`, `WalletFrozenChanged`, `StorageRefundToChanged`,
+`ProjectTransferred`, `ProjectTransferAccepted`, `ProjectTransferRevoked`,
+`ProjectStorageCleanup`.
 
 ## Build & Deploy
 
 ### Build
 
 ```bash
-./build.sh
-```
-
-### Deploy with init
-
-```bash
-near contract deploy outlayer.testnet use-file res/local/outlayer_contract.wasm with-init-call new json-args '{"owner_id":"owner.outlayer.testnet","operator_id":"worker.outlayer.testnet"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' network-config testnet sign-with-keychain send
-```
-
-### Set event standard
-
-```
-near contract call-function as-transaction dev.outlayer.testnet set_event_metadata json-args '{"standard":"near-outlayer-dev"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as owner.outlayer.testnet network-config testnet sign-with-keychain send
-```
-
-
-### Set operator account
-
-```
-near contract call-function as-transaction dev.outlayer.testnet set_operator json-args '{"new_operator_id":"dev.outlayer.testnet"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as owner.outlayer.testnet network-config testnet sign-with-keychain send
-```
-
-### Set testnet USDC
-
-near contract call-function as-transaction dev.outlayer.testnet set_payment_token_contract json-args '{"token_contract":"usdc.fakes.testnet"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as owner.outlayer.testnet network-config testnet sign-with-keychain send
-
-# register storage
-near contract call-function as-transaction usdc.fakes.testnet storage_deposit json-args '{"account_id": "dev.outlayer.testnet"}' prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' sign-as dev.outlayer.testnet network-config testnet sign-with-keychain send
-
-### Deploy without init
-
-A deploy that changes the state shape runs `migrate` in the same transaction
-(or straight after). `get_storage_version` answers the shape the code expects:
-`"11"` adds `project_transfer_acceptances` (from `"10"`).
-
-```bash
-near contract deploy dev.outlayer.testnet use-file res/local/outlayer_contract.wasm without-init-call network-config testnet sign-with-keychain send
-```
-
-```bash
-near contract deploy outlayer.testnet use-file res/local/outlayer_contract.wasm without-init-call network-config testnet sign-with-keychain send
-
- near contract call-function as-transaction outlayer.testnet migrate json-args {} prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as outlayer.testnet network-config testnet sign-with-keychain send
-```
-
-# Mainnet
-```
-near contract deploy outlayer.near use-file res/local/outlayer_contract.wasm without-init-call network-config mainnet sign-with-keychain send
-
-near contract deploy outlayer.near use-file res/local/outlayer_contract.wasm with-init-call migrate json-args '{}' prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' network-config mainnet sign-with-keychain send
-
-near contract call-function as-transaction outlayer.near migrate json-args {} prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as outlayer.near network-config mainnet sign-with-keychain send
-
-near contract call-function as-transaction outlayer.near new json-args '{"owner_id":"owner.outlayer.near","operator_id":"worker.outlayer.near"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as outlayer.near network-config mainnet sign-with-keychain send
-
-near contract call-function as-transaction outlayer.near set_payment_token_contract json-args '{"token_contract":"17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as owner.outlayer.near network-config mainnet sign-with-keychain send
-
-near contract call-function as-transaction 17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1 storage_deposit json-args '{"account_id": "outlayer.near"}' prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' sign-as outlayer.near network-config mainnet sign-with-keychain send
+./build.sh   # cargo near build non-reproducible-wasm → res/local/outlayer_contract.wasm
 ```
 
 ### Test
@@ -635,6 +731,33 @@ near contract call-function as-transaction 17208628f84f5d6ad33f0da3bbbeb27ffcb39
 cargo test
 ```
 
+### Initialize
+
+`new(owner_id, operator_id?, event_standard?, event_version?)`; the operator
+defaults to the owner.
+
+```bash
+near contract deploy <contract-account> use-file res/local/outlayer_contract.wasm with-init-call new json-args '{"owner_id":"<owner>","operator_id":"<operator>"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' network-config testnet sign-with-keychain send
+```
+
+### Upgrade
+
+The contract is upgraded by redeploying it with the contract account's
+full-access key, without a vote or a delay; see
+[Governance at this stage](../docs/NON_CUSTODIAL.md#governance-at-this-stage).
+
+`get_storage_version` answers the state layout the code expects. A deploy that
+changes the layout calls `migrate` (private: signed by the contract account) in
+the same transaction; `migrate` reads the previous layout (`"10"`) and writes
+`"11"`, and fails on any other state. A deploy that keeps the layout calls
+nothing.
+
+```bash
+near contract deploy outlayer.testnet use-file res/local/outlayer_contract.wasm without-init-call network-config testnet sign-with-keychain send
+
+near contract deploy outlayer.near use-file res/local/outlayer_contract.wasm with-init-call migrate json-args '{}' prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' network-config mainnet sign-with-keychain send
+```
+
 ## License
 
-MIT
+Apache-2.0

@@ -6,7 +6,7 @@ License Agreement. It has not been reviewed by a lawyer and is not legal advice.
 
 ---
 
-Thank you for your interest in OutLayer, a project of **OutLayer LLC** (the
+Thank you for your interest in OutLayer, a project of **OutLayer, Inc.** (the
 "Company"). To clarify the intellectual property license granted with Contributions
 from any person or entity, the Company must have on file a signed Contributor License
 Agreement ("Agreement") from each Contributor, indicating agreement to the terms

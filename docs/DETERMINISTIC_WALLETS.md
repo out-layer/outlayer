@@ -2,43 +2,44 @@
 
 ## Why this matters
 
-OutLayer wallets run inside TEE (Intel TDX) — keys never leave the enclave. Combined with NEAR MPC network for cross-chain signing, this gives integrators **verifiable custody**: any wallet operation can be audited on-chain, and the TEE attestation proves the key was never extracted.
+OutLayer wallet keys are derived on demand inside an Intel TDX enclave (the keystore) from a master secret issued by the NEAR MPC network; they are never stored, and no endpoint exports them. At this stage OutLayer still holds governance keys that bear on that guarantee — see [Governance at this stage](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md#governance-at-this-stage).
 
-Deterministic wallets make this accessible to any developer: one NEAR account → unlimited wallets for your users, with TEE-backed security and cross-chain capabilities out of the box. No key management, no per-user storage, no infrastructure to maintain.
+Deterministic wallets let one NEAR account own any number of wallets for its users without storing a credential per user. The wallet is identified by `(account_id, seed)`, and every request is authenticated by a fresh signature from that account's key.
 
 ## Problem
 
-POST /register creates wallets with random API keys. Clients (bots, servers) must store per-user api_key in their DB. DB leak = all wallets compromised.
+`POST /register` without a body creates a wallet with a random `wk_` API key. A client serving many users must store one `wk_` per user; a leak of that store is a leak of every wallet.
 
 ## Solution
 
-Deterministic wallets authenticated by NEAR signature on every request. Coordinator stores zero auth secrets. Client derives wallet access from its NEAR key + seed — nothing to store per-user.
+Authenticate with a NEAR signature on every request. The coordinator stores no auth secret for these wallets: it checks the signature and that the signing key is a full-access key of the account. The client derives wallet access from its NEAR key + a seed — nothing to store per user.
 
-Key revocation = remove key from NEAR account. Effect within 60 seconds (cache TTL).
+Key revocation = remove the key from the NEAR account. It takes effect within 60 seconds (the coordinator's access-key cache).
 
 ## Use cases
 
-**Web app with OAuth login.** Server has one NEAR key. User logs in via Google/GitHub/etc. Server derives `seed = SHA256(provider + ":" + user_id)`, calls /register, user gets a wallet instantly. Zero per-user key storage. DB stores only user profiles, not wallet credentials.
+**Web app with OAuth login.** The server holds one NEAR key. A user logs in via Google/GitHub; the server sets `seed = hex(SHA256(provider + ":" + user_id))` and the user has a wallet. No per-user key storage.
 
-**Telegram/Discord bot.** Bot has one NEAR key in env. For each user: `seed = SHA256(telegram_user_id)`. Bot re-derives wallet on every request from BOT_SECRET. No per-user DB.
+**Telegram/Discord bot.** The bot holds one NEAR key in env. For each user, `seed = hex(SHA256(telegram_user_id))`. No per-user DB.
 
-**AI agent spawning sub-agents.** Parent agent derives a `wk_` key from (near_key, seed, index), registers its hash via `PUT /wallet/v1/api-key`, hands the key string to sub-agent. Sub-agent uses simple `Bearer wk_...` — zero crypto, works with any HTTP client or LLM framework. Parent can re-derive the key anytime without storage.
+**AI agent spawning sub-agents.** The parent derives a `wk_` key from (its key, seed, index), registers its hash via `PUT /wallet/v1/api-key`, and hands the key string to the sub-agent. The sub-agent uses a plain `Bearer wk_...` — no crypto, works with any HTTP client or LLM framework. The parent can re-derive the key at any time without storage.
 
-All three share the same pattern: **one NEAR account, many wallets, zero stored secrets. Access control via NEAR keys.**
+All three share one pattern: **one NEAR account, many wallets, no stored per-user secrets, access control through NEAR keys.**
 
-## What integrators get out of the box
+## What every wallet gets
 
-Every deterministic wallet has the same capabilities as a regular wallet — all existing features work via the same API:
+A deterministic wallet is a wallet like any other; every `/wallet/v1/*` endpoint works the same way:
 
-- **Multi-chain addresses** — NEAR, Ethereum, Base, Arbitrum, Solana, Bitcoin derived from one wallet via NEAR MPC network
-- **Gasless swaps** — `/intents/swap` via solver relay, no gas needed on wallet
-- **Cross-chain deposits** — any source chain (Solana, Ethereum, Bitcoin, EVM L2s) → NEAR via the 1Click bridge (`/deposit-intent`)
-- **On-chain calls** — arbitrary NEAR contract calls (`/call`)
-- **Token transfers** — NEAR native + any NEP-141 token
-- **Policy engine** — spending limits, allowed actions, freeze thresholds, multisig approval
-- **Webhooks** — notifications on wallet events
-- **TEE attestation** — all wallet keys derived inside Intel TDX, verifiable on-chain
-- **Trial** — a wallet made by `POST /register` can claim fifty connector calls in its first week (`POST /trial-key`), no payment setup needed
+- **Addresses** — the NEAR implicit account, one `0x` address for every EVM chain, and a Solana address, all derived from the wallet (`GET /wallet/v1/address`). Other chains are reached through NEAR Intents.
+- **Swaps** — `/wallet/v1/intents/swap` through 1Click, gasless from the intents balance.
+- **Cross-chain deposits and withdrawals** — `/wallet/v1/intents/deposit/cross-chain` and `/wallet/v1/intents/withdraw` through 1Click.
+- **On-chain calls** — NEAR contract calls (`/wallet/v1/call`).
+- **Token transfers** — native NEAR (`/wallet/v1/transfer`) and intents balances (`/wallet/v1/intents/transfer`).
+- **Policy engine** — capabilities, limits, whitelists, time windows, rate limit, multisig approval, freeze.
+- **Webhooks** — the policy's `webhook_url` receives wallet events.
+- **Trial** — a wallet can claim a trial key (`POST /trial-key`) within its first days; the `trial` block of the `POST /register` response states the calls and days.
+
+Intents operations are mainnet only.
 
 ## Architecture
 
@@ -47,30 +48,31 @@ Client (bot)                    Coordinator                  Keystore (TEE)
    |                                |                            |
    |-- Bearer near:<signed JSON> -->|                            |
    |                                |-- verify ed25519 sig       |
-   |                                |-- RPC: pubkey in account?  |
+   |                                |-- RPC: full-access key?    |
    |                                |-- derive wallet_id         |
-   |                                |-- keystore_derive_address->|
-   |                                |<-- near implicit account --|
-   |<-- { wallet_id, account_id } --|                            |
+   |                                |-- create row if new        |
+   |                                |-- operation -------------->|
+   |                                |<-- signature / address ----|
+   |<-- result ---------------------|                            |
 ```
 
-- **Auth** = NEAR signature verification (ed25519, in-process) + access key check (RPC, cached 60s)
-- **Wallet keys** = keystore derives & signs (existing path, unchanged)
-- **Coordinator DB** = wallet_accounts row only, no auth secrets
+- **Auth** = ed25519 signature verification in the coordinator + a full-access-key check over RPC, cached 60 s.
+- **Wallet keys** = derived and used by the keystore, as for every wallet.
+- **Coordinator DB** = a `wallet_accounts` row; no auth secret for `Bearer near:`.
 
 ## Auth: Bearer token format
 
-Single `Authorization` header for both wallet types. Middleware detects format by prefix:
+One `Authorization` header for every wallet type, told apart by prefix:
 
 ```
-# Random wallets (existing)
+# Random wallets and delegate keys
 Authorization: Bearer wk_a1b2c3d4...
 
-# Deterministic wallets (new)
+# Deterministic wallets
 Authorization: Bearer near:<base64url>
 ```
 
-The base64url payload is a JSON object:
+The base64url payload (padding optional) is a JSON object:
 
 ```json
 {
@@ -84,54 +86,29 @@ The base64url payload is a JSON object:
 
 | Field | Description |
 |-------|-------------|
-| `account_id` | NEAR account_id of the client |
-| `seed` | Arbitrary string — determines which wallet |
-| `pubkey` | NEAR public key (ed25519:base58) |
-| `timestamp` | Unix timestamp (seconds) |
-| `signature` | ed25519 signature of `"auth:<seed>:<timestamp>"` |
+| `account_id` | The client's NEAR account |
+| `seed` | Which wallet: 1–256 characters of `[a-zA-Z0-9._-]` (no `:`) |
+| `pubkey` | A **full-access** key of `account_id`, `ed25519:<base58>` (or the key of an implicit account that does not exist on chain yet). A function-call key is refused |
+| `timestamp` | Unix seconds, within ±30 s of the coordinator's clock |
+| `signature` | Raw ed25519 signature (not NEP-413), base58, of `auth:<seed>:<timestamp>` |
+| `vault_id` | Optional. Scopes the wallet to a per-customer vault; the signed message is then `auth:<seed>:<timestamp>:<vault_id>`, and `account_id` must be the vault's parent on chain |
 
-## Auth middleware flow
+The wallet is created on the first authenticated request; `POST /register` is optional for a `Bearer near:` client.
 
-```
-1. Try X-Internal-Wallet-Auth + X-Wallet-Id: an active worker token, from a
-   worker address (WORKER_ALLOWED_IPS), with the worker's active TEE session
-   (X-TEE-Session) when REQUIRE_TEE_SESSION=true
-2. Try Bearer near:... → NEAR signature auth:
-   a. base64url-decode → parse JSON
-   b. Verify timestamp ±30 sec (MAX_TIMESTAMP_SKEW = 30)
-   c. Parse pubkey "ed25519:<base58>" → raw 32 bytes
-   d. Verify raw ed25519 signature of "auth:<seed>:<timestamp>" against pubkey
-   e. Access key cache check: "account_id\0pubkey" → valid?
-      - Cache hit → use cached result
-      - Cache miss → NEAR RPC view_access_key (single call, no retry)
-      - Cache result for 60s (both positive and negative)
-   f. Derive wallet_id = deterministic(account_id, seed)
-   g. Verify wallet_id exists in wallet_accounts
-   h. Return WalletAuth { wallet_id, ... }
-3. Try Bearer wk_... → existing api_key auth (unchanged)
-4. No auth → Err(MissingAuth)
-```
+### Verification
 
-**Two timestamp windows:**
-- `MAX_TIMESTAMP_SKEW = 30` sec — Bearer near: auth (every request, tight)
-- `MAX_REGISTRATION_SKEW = 300` sec (5 min) — POST /register, PUT /api-key with NEAR sig in body (setup steps)
+1. base64url-decode → parse JSON; validate `seed`.
+2. Rebuild `auth:<seed>:<timestamp>` (`:<vault_id>` appended when present), check the timestamp (±30 s), verify the raw ed25519 signature against `pubkey`.
+3. Check that `pubkey` is a full-access key of `account_id`: cached result, otherwise one NEAR RPC call. Both answers are cached for 60 s.
+4. With `vault_id`: check the vault is verified on the DAO contract and that `account_id` is its parent.
+5. `wallet_id = UUID(SHA256("outlayer:deterministic-wallet-id:" + account_id + ":" + seed [+ "\0vault:" + vault_id])[..16])`.
+6. Create the `wallet_accounts` row if it does not exist.
 
-All wallet/v1/* endpoints receive `WalletAuth` — they don't know or care how it was obtained.
+Two timestamp windows:
+- ±30 s for `Bearer near:` (every request).
+- ±300 s for `POST /register` and `PUT /wallet/v1/api-key` with a NEAR signature in the body (setup steps).
 
-### Access key cache
-
-```rust
-struct AccessKeyCache {
-    // "account_id\0pubkey" → (valid, cached_at)
-    // NUL-separated composite key avoids tuple allocation on lookup
-    entries: Arc<RwLock<HashMap<String, (bool, Instant)>>>,
-}
-```
-
-- TTL: 60 seconds
-- Max entries: 10K (lazy cleanup on write, same pattern as ApiKeyCache)
-- Negative caching: invalid keys cached for 60s to prevent RPC spam
-- Security tradeoff: 60s window after key deletion before access revoked
+The order the coordinator tries credentials: the worker's internal credential (`X-Internal-Wallet-Auth` + `X-Wallet-Id`, for WASI host functions), then `Bearer near:`, then `Bearer wk_` (looked up by SHA-256 hash).
 
 ## POST /register — deterministic path
 
@@ -147,33 +124,17 @@ struct AccessKeyCache {
 }
 ```
 
-All 5 fields present = deterministic path. All absent = current behavior (random key).
+Any of these five fields present = deterministic path, and then all five are required. None present = random wallet with a `wk_` key. The deterministic path does not take `vault_id` (400); a vault-scoped deterministic wallet is reached with `Bearer near:` carrying `vault_id`.
 
 ### Validation
 
-1. All 5 fields must be present together, else 400
-2. `seed` must not be empty
-3. Parse `message` via `rsplit_once(':')` — extract seed and timestamp, verify seed matches `seed` field. Seeds may contain `:`.
-4. Timestamp ±5 min (`MAX_REGISTRATION_SKEW = 300` — longer window for setup operations)
-5. Parse `pubkey` "ed25519:\<base58\>" → raw 32 bytes
-6. Verify **raw ed25519** signature (NOT NEP-413) of `message` against `pubkey`
-7. NEAR RPC: `check_access_key_exists(rpc_url, account_id, pubkey)` — **only for new wallets** (cached 60s)
+1. `seed` is 1–256 characters of `[a-zA-Z0-9._-]`.
+2. `message` is `register:<seed>:<timestamp>` with the same seed.
+3. Timestamp within ±300 s.
+4. Raw ed25519 signature (not NEP-413) of `message` verifies against `pubkey`.
+5. For a wallet that does not exist yet: `pubkey` is a full-access key of `account_id` (cached 60 s).
 
-### Wallet creation
-
-```
-wallet_id = UUID(SHA256("outlayer:deterministic-wallet-id:" + account_id + ":" + seed))
-```
-
-Deterministic. Same (account_id, seed) = same wallet_id = same NEAR implicit account.
-
-```sql
-INSERT INTO wallet_accounts (wallet_id) VALUES ($1) ON CONFLICT DO NOTHING
--- rows_affected > 0 → new wallet, derive address via keystore
--- rows_affected = 0 → existing wallet, skip inserts, derive address (idempotent)
-```
-
-RPC access key check: only when creating (rows_affected > 0). Idempotent return skips RPC.
+`POST /register` is rate-limited per IP.
 
 ### Response
 
@@ -185,71 +146,41 @@ RPC access key check: only when creating (rows_affected > 0). Idempotent return 
 }
 ```
 
-No `api_key`. No `handoff_url`. Client doesn't need them.
+No `api_key` and no `handoff_url`. Repeating the call returns the same wallet, without `trial`.
 
 ## Key rotation
 
-**No endpoint needed.**
+No endpoint needed.
 
 ```bash
-# 1. Bot adds new NEAR key
+# 1. Add the new key
 near add-key my-tg-bot.near ed25519:NEW_KEY
 
-# 2. Bot starts signing with new key — works immediately (RPC sees new key)
+# 2. Sign with the new key — accepted at once
 
-# 3. Bot removes old key
+# 3. Remove the old key
 near delete-key my-tg-bot.near ed25519:OLD_KEY
 
-# 4. Within 60s, old key expires from cache → 401 for anyone using it
+# 4. Within 60 s the cached answer for the old key expires → 401
 ```
 
-Wallet identity = (account_id, seed). Keys rotate freely. No coordinator action needed.
+The wallet is `(account_id, seed)`; keys rotate freely.
 
-## Key revocation (compromised key)
+## What the keystore does
 
-```bash
-# Remove compromised key from NEAR account
-near delete-key my-tg-bot.near ed25519:COMPROMISED
+- Derives the wallet's keys (`wallet:{wallet_id}:near`, `:evm`, `:solana`) from the master on demand.
+- Evaluates the wallet's policy and signs.
 
-# Within 60 seconds: cache expires, attacker gets 401
-# No coordinator action. No DB update. Automatic.
-```
-
-## What uses keystore (unchanged)
-
-Keystore (TEE) still:
-- Derives wallet's ed25519 keypair from `"wallet:{wallet_id}:near"`
-- Signs NEAR transactions on behalf of the wallet
-- Wallet's implicit NEAR account is custodial (keystore holds private key)
-
-What's NOT stored anywhere: auth credentials. Coordinator DB has zero secrets for deterministic wallets.
-
-## What to reuse from existing code
-
-| Component | Location | Usage |
-|-----------|----------|-------|
-| `verify_ed25519()` | `wallet/auth.rs:293` | Signature verification |
-| `check_access_key_exists()` | `near_client.rs:276` | RPC access key check |
-| `MAX_TIMESTAMP_SKEW = 30` | `wallet/auth.rs:25` | Timestamp validation |
-| `state.near_rpc_url` | `wallet/mod.rs:46` | RPC URL |
-| `ed25519-dalek`, `bs58` | `Cargo.toml` | Already in deps |
-| `keystore_derive_address()` | `wallet/handlers.rs` | Wallet address derivation |
-| `build_trial_info()` | `wallet/handlers.rs` | The trial offer in the response |
-| `INSERT ON CONFLICT` pattern | current diff | Race condition safe |
-| `Bytes` body parsing | current diff | Backward compat |
-| `ApiKeyCache` pattern | `wallet/auth.rs` | Same DashMap + TTL pattern for AccessKeyCache |
+No auth credential for `Bearer near:` is stored anywhere.
 
 ## PUT /wallet/v1/api-key — delegate key for sub-agents
 
-Registers a client-derived `wk_` key hash. Creates sub-wallet if not exists. Idempotent.
+Registers the SHA-256 hash (64 hex characters) of a client-derived `wk_` key, creating the wallet it opens if needed. Idempotent. Two auth modes.
 
-**Two auth modes:**
+### Mode 1: Bearer header (an existing wallet creates a sub-wallet)
 
-### Mode 1: Bearer header (custody wallets)
+An authenticated wallet (`Bearer wk_...` or `Bearer near:...`) creates a sub-wallet. No NEAR signature in the body.
 
-Custody wallet (`Bearer wk_...`) or deterministic wallet (`Bearer near:...`) creates a sub-wallet. No NEAR signatures needed — parent is already authenticated.
-
-Sends `Authorization: Bearer wk_...` header + minimal body:
 ```json
 {
   "seed": "sub-task-42",
@@ -257,13 +188,12 @@ Sends `Authorization: Bearer wk_...` header + minimal body:
 }
 ```
 
-Sub-wallet_id = `deterministic(parent_wallet_id, seed)`. No RPC check.
+Sub-wallet `wallet_id = deterministic(parent_wallet_id, seed, parent's vault)`. A vault-bound parent's sub-wallets derive from the same vault. No RPC check.
 
-**Ambiguity guard:** If both Bearer header AND signature fields (account_id, pubkey, message, signature) are present in body → 400 error. Prevents silent fallthrough bugs.
+**Ambiguity guard:** a Bearer header together with any of `account_id`, `pubkey`, `message`, `signature` or `vault_id` in the body → 400.
 
-### Mode 2: NEAR signature in body (external NEAR accounts)
+### Mode 2: NEAR signature in the body (a NEAR account, no Bearer header)
 
-No Bearer header. All 6 fields required:
 ```json
 {
   "account_id": "parent-agent.near",
@@ -275,68 +205,42 @@ No Bearer header. All 6 fields required:
 }
 ```
 
-Timestamp window: ±5 min. Raw ed25519 signature. RPC check for new wallets.
+Timestamp within ±300 s, raw ed25519 signature, and `pubkey` must be a full-access key of `account_id` on every call. Optional `vault_id`: `account_id` must be the vault's parent. The wallet is `deterministic(account_id, seed, vault)` — the same wallet `Bearer near:` reaches for that account, seed and vault.
 
 ### Response (both modes)
 
 ```json
 {
   "wallet_id": "uuid-string",
-  "near_account_id": "hex64-implicit-account"
+  "near_account_id": "hex64-implicit-account",
+  "vault_id": "vault.example.near"
 }
 ```
 
-### Flow (Mode 1 — Bearer)
+`vault_id` is present only for a vault-scoped wallet.
 
-1. Authenticate via Bearer header (existing `authenticate()`)
-2. Reject if signature fields also present (ambiguous auth)
-3. Derive wallet_id = `deterministic(parent_wallet_id, seed)`
-4. Create wallet if not exists (no RPC check — parent is authenticated)
-5. Store key_hash in wallet_api_keys (INSERT ON CONFLICT DO NOTHING — idempotent)
-6. Return wallet info
+## DELETE /wallet/v1/api-key/:key_hash — revoke a key
 
-### Flow (Mode 2 — NEAR sig)
+Revokes one `wk_` key of the authenticated wallet. Auth: any credential of that wallet (`Bearer near:...` or `Bearer wk_...`). The key stops working at once. Response: `{"revoked": true}`.
 
-1. Validate signature + timestamp (±5 min)
-2. NEAR RPC: check pubkey is on account (cached 60s, skip if wallet already exists)
-3. Derive wallet_id = `deterministic(account_id, seed)`
-4. Create wallet if not exists (INSERT ON CONFLICT DO NOTHING)
-5. Store key_hash in wallet_api_keys (INSERT ON CONFLICT DO NOTHING — idempotent)
-6. Return wallet info
-
-## DELETE /wallet/v1/api-key/:key_hash — revoke delegate key
-
-Revokes a `wk_` key for a deterministic wallet. **Auth: `Bearer near:...` header** (unlike PUT, wallet must already exist here, so normal auth middleware works).
-
-Sets `revoked_at = NOW()` in wallet_api_keys. The `wk_` key stops working after auth cache expires (60s).
-
-Coordinator verifies the caller owns the wallet (derives wallet_id from Bearer's account_id + seed, checks key_hash belongs to that wallet_id).
-
-**Cannot revoke the last key.** If wallet has only one active `wk_` key, DELETE returns 409 Conflict. This prevents locking out wallets that are only accessible via `wk_` keys (Flow 1 random wallets). Deterministic wallet owners can always access via `Bearer near:...` regardless, but the guard applies uniformly.
+**The last active key cannot be revoked** (409 Conflict), so a wallet reachable only through `wk_` keys cannot lock itself out. The rule counts `wk_` keys only: a deterministic wallet with a single delegate key cannot revoke it, even though its account can still sign `Bearer near:` requests.
 
 ### Sub-agent usage
 
 ```python
-# Parent: derive key (no storage needed, re-derive anytime)
-api_key = f"wk_{hmac_sha256(near_private_key, f'{seed}:0').hex()}"
+# Parent: derive the key (no storage needed, re-derive any time)
+api_key = "wk_" + hmac.new(NEAR_SECRET, f"{seed}:0".encode(), hashlib.sha256).hexdigest()
 
-# Parent: register key hash (idempotent, call once or many times)
-requests.put(".../wallet/v1/api-key", json={
+# Parent: register its hash (idempotent)
+requests.put(f"{API_BASE}/wallet/v1/api-key", json={
     "account_id": ACCOUNT_ID, "seed": "sub-task-42",
-    "key_hash": sha256(api_key.encode()).hexdigest(),
+    "key_hash": hashlib.sha256(api_key.encode()).hexdigest(),
     "pubkey": NEAR_PUBKEY, "message": message, "signature": sig,
 })
 
-# Parent hands string to sub-agent
-sub_agent.set_bearer_token(api_key)
-
-# Sub-agent: zero crypto, zero dependencies
-requests.get(".../wallet/v1/balance",
+# Sub-agent: plain Bearer token
+requests.get(f"{API_BASE}/wallet/v1/balance",
     headers={"Authorization": f"Bearer {api_key}"})
-
-# Later, on another machine, without any DB:
-api_key = f"wk_{hmac_sha256(near_private_key, f'{seed}:0').hex()}"
-# Same key, re-derived from (near_key, seed, index)
 ```
 
 ## Summary of endpoints
@@ -344,64 +248,31 @@ api_key = f"wk_{hmac_sha256(near_private_key, f'{seed}:0').hex()}"
 | Endpoint | Auth | Creates wallet? | Returns api_key? | Use case |
 |----------|------|----------------|-----------------|----------|
 | `POST /register` (no body) | None | Yes (random) | Yes (`wk_`) | Quick start, testing |
-| `POST /register` (with signature) | NEAR sig in body | Yes (deterministic) | No | Server/bot, uses `Bearer near:...` |
-| `PUT /wallet/v1/api-key` | Bearer header OR NEAR sig in body | Yes if needed | No (caller knows it) | Register delegate key for sub-agent |
-| `DELETE /wallet/v1/api-key/:key_hash` | `Bearer near:...` or `Bearer wk_...` | No | — | Revoke delegate key (last key protected) |
+| `POST /register` (with signature) | NEAR sig in body | Yes (deterministic) | No | Server/bot that then uses `Bearer near:...` |
+| any `/wallet/v1/*` with `Bearer near:` | NEAR sig in header | Yes, on first use | No | Every request of a deterministic client |
+| `PUT /wallet/v1/api-key` | Bearer header OR NEAR sig in body | Yes if needed | No (caller knows it) | Register a delegate key for a sub-agent |
+| `DELETE /wallet/v1/api-key/:key_hash` | `Bearer near:...` or `Bearer wk_...` | No | — | Revoke a key (last key protected) |
 
-## OutLayer auth signatures from the wallet key — POST /wallet/v1/auth-sign
+## Auth signatures from the wallet's own key — POST /wallet/v1/auth-sign
 
-To produce OutLayer's own Bearer / register / api-key auth token **from the wallet's TEE key**
-(not from a locally-held NEAR key), use the dedicated `POST /wallet/v1/auth-sign` endpoint.
+To produce OutLayer's `Bearer near:` / register / api-key auth signature **with the wallet's TEE key** (rather than a NEAR key you hold), call `POST /wallet/v1/auth-sign`.
 
-> The old `POST /wallet/v1/sign-message` `"format": "raw"` parameter is **removed** — calling
-> `/sign-message` with `format:"raw"` now returns an error pointing here. `/sign-message` only
-> produces NEP-413 signatures (and enforces a default-DENY recipient allowlist); it is no longer a
-> raw byte signer.
-
-Request body: `{ "purpose": "bearer" | "register" | "api-key", "seed": "...", "vault_id": "..." }`
-(`vault_id` is only valid for `bearer`). The keystore **constructs** the exact domain-separated auth
-string with a fresh server timestamp and signs it raw ed25519 (an `Op::Auth` — non-fund, always
-allowed on a non-frozen wallet, never a 32-byte tx hash). Response:
+Request body: `{ "purpose": "bearer" | "register" | "api-key", "seed": "...", "vault_id": "..." }` (`vault_id` only for `bearer`). The keystore builds the exact domain-separated string with a fresh server timestamp and signs it raw ed25519. It moves no funds, so it is allowed on any wallet that is not frozen. Response:
 
 ```json
 {
-  "auth_message": "auth:<seed>:<timestamp>",   // send verbatim
+  "auth_message": "auth:<seed>:<timestamp>",
   "auth_timestamp": 1712000000,
   "signature": "<base58, no ed25519: prefix>",
   "public_key": "ed25519:<base58>"
 }
 ```
 
-For an arbitrary plain ed25519 signature over your own bytes (custom auth protocols, off-chain
-proofs on a chain the structured policy doesn't cover), use the `raw` op via `/wallet/sign` — gated
-by the default-DENY `raw_sign` capability (with an optional per-chain allowlist).
-
-## What to write new
-
-1. **`parse_near_pubkey(s: &str) -> Result<[u8; 32]>`** — parse `"ed25519:<base58>"` → raw bytes
-2. **`AccessKeyCache`** — in-memory cache for NEAR RPC results, 60s TTL
-3. **`extract_near_bearer_auth()`** — parse `Bearer near:<base64>`, verify sig, check access key, derive wallet_id
-4. **`register_deterministic()`** — handler for deterministic path in register
-5. **`register_api_key()`** — handler for PUT /wallet/v1/api-key (register client-derived key hash)
-6. **`revoke_api_key()`** — handler for DELETE /wallet/v1/api-key/:key_hash (revoke delegate key, NEAR sig auth)
-7. **`RegisterRequest`** — extended with 5 new optional fields
-8. **Update `authenticate()`** — check Bearer prefix: `wk_` → existing path, `near:` → new path
-
-## What does NOT change
-
-- POST /register without body — current behavior, random key
-- Bearer wk_... auth — unchanged, works for random wallets
-- Worker — unchanged (stateless proxy)
-- Keystore-worker — unchanged
-- All wallet/v1/* endpoint handlers — unchanged (only auth layer adds new path)
-- DB migrations — no new tables (wallet_accounts, wallet_api_keys reused)
-  - wallet_api_keys used for random wallets (Flow 1) and delegate `wk_` keys (Flow 4), not for `Bearer near:...` auth
+Send `auth_message` verbatim. `POST /wallet/v1/sign-message` produces NEP-413 signatures only and does not sign raw bytes. It never signs for an intents verifier (`intents.near`, `intents.far`), and under a policy only for the recipients listed in `capabilities.sign_message.allowed_recipients`.
 
 ## Flow examples
 
-All Python examples share these helpers (defined in Flow 2): `_sign_message()`, `_make_bearer()`, `NEAR_SECRET`, `NEAR_PUBKEY`, `ACCOUNT_ID`, `API_BASE`.
-
-Flows 4, 6, 7 also use:
+All Python examples share the helpers defined in Flow 2: `_sign_message()`, `_make_bearer()`, `NEAR_SECRET`, `NEAR_PUBKEY`, `ACCOUNT_ID`, `API_BASE`. Flows 6 and 7 also use:
 
 ```python
 def wallet_request_by_seed(seed: str, method: str, path: str, **kwargs):
@@ -412,9 +283,9 @@ def wallet_request_by_seed(seed: str, method: str, path: str, **kwargs):
     )
 ```
 
-### Flow 1: Quick start (existing behavior, no changes)
+### Flow 1: Quick start (random wallet)
 
-A developer wants to try the API. No NEAR account needed.
+No NEAR account needed.
 
 ```python
 # 1. Register — one call, no auth
@@ -422,21 +293,18 @@ resp = requests.post("https://api.outlayer.ai/register")
 api_key = resp.json()["api_key"]          # "wk_a1b2c3..."
 account = resp.json()["near_account_id"]  # "hex64..."
 
-# 2. Use wallet — simple Bearer token
+# 2. Use the wallet — plain Bearer token
 requests.get("https://api.outlayer.ai/wallet/v1/balance",
     headers={"Authorization": f"Bearer {api_key}"})
-
-# Same with curl:
-# curl -H "Authorization: Bearer wk_a1b2c3..." .../wallet/v1/balance
 ```
 
-Developer stores `api_key`. If lost — wallet is lost (no recovery).
+The developer stores `api_key`. The coordinator keeps only its SHA-256 hash; a lost key cannot be recovered.
 
 ---
 
 ### Flow 2: Telegram bot (deterministic, NEAR signature auth)
 
-Bot has one NEAR key in env. Creates wallets for thousands of users. Stores nothing per-user.
+The bot holds one full-access NEAR key in env and creates wallets for any number of users, storing nothing per user.
 
 ```python
 import hashlib, hmac, json, time, base64, requests
@@ -444,7 +312,7 @@ from nacl.signing import SigningKey
 import base58
 
 # ── Setup (once, in env) ──────────────────────────────────────────────
-NEAR_SECRET = load_near_secret_bytes()          # 32 bytes from env
+NEAR_SECRET = load_near_secret_bytes()          # 32-byte ed25519 seed of a full-access key
 NEAR_KEY = SigningKey(NEAR_SECRET)
 NEAR_PUBKEY = f"ed25519:{base58.b58encode(NEAR_KEY.verify_key.encode()).decode()}"
 ACCOUNT_ID = "my-tg-bot.near"
@@ -460,7 +328,7 @@ def _seed_for_user(telegram_user_id: int) -> str:
     return hashlib.sha256(str(telegram_user_id).encode()).hexdigest()
 
 def _make_bearer(seed: str) -> str:
-    """Build Bearer near:... token for wallet API calls."""
+    """Build the Bearer near:... token for one wallet API call."""
     timestamp = int(time.time())
     message = f"auth:{seed}:{timestamp}"
     payload = json.dumps({
@@ -473,12 +341,10 @@ def _make_bearer(seed: str) -> str:
     token = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
     return f"near:{token}"
 
-# ── Registration (idempotent — safe to call on every bot /start) ──────
-def ensure_wallet(telegram_user_id: int) -> dict:
-    seed = _seed_for_user(telegram_user_id)
+# ── Registration (idempotent — safe on every /start) ──────────────────
+def ensure_wallet_with_seed(seed: str) -> dict:
     timestamp = int(time.time())
     message = f"register:{seed}:{timestamp}"
-
     resp = requests.post(f"{API_BASE}/register", json={
         "account_id": ACCOUNT_ID,
         "seed": seed,
@@ -487,8 +353,11 @@ def ensure_wallet(telegram_user_id: int) -> dict:
         "signature": _sign_message(message),
     })
     return resp.json()
-    # First call:  creates wallet, returns { wallet_id, near_account_id, trial }
-    # Repeat call: returns same wallet, skips creation
+    # First call:  creates the wallet, returns { wallet_id, near_account_id, trial }
+    # Repeat call: returns the same wallet
+
+def ensure_wallet(telegram_user_id: int) -> dict:
+    return ensure_wallet_with_seed(_seed_for_user(telegram_user_id))
 
 # ── Wallet operations (Bearer near:... on every request) ─────────────
 def wallet_request(telegram_user_id: int, method: str, path: str, **kwargs):
@@ -507,38 +376,35 @@ def on_balance(user_id: int):
     resp = wallet_request(user_id, "GET", "/wallet/v1/balance")
     send_message(user_id, f"Balance: {resp.json()}")
 
-def on_swap(user_id: int, token_in: str, token_out: str, amount: str):
+def on_swap(user_id: int, token_in: str, token_out: str, amount_in: str):
     resp = wallet_request(user_id, "POST", "/wallet/v1/intents/swap", json={
-        "token_in": token_in,
-        "token_out": token_out,
-        "amount": amount,
+        "token_in": token_in,      # e.g. "nep141:wrap.near"
+        "token_out": token_out,    # e.g. "nep141:usdt.tether-token.near"
+        "amount_in": amount_in,    # smallest units
     })
     send_message(user_id, f"Swap: {resp.json()}")
 
-def on_send(user_id: int, receiver: str, amount: str):
+def on_send(user_id: int, receiver: str, amount_yocto: str):
     resp = wallet_request(user_id, "POST", "/wallet/v1/transfer", json={
         "to": receiver,
-        "amount": amount,
+        "amount": amount_yocto,
     })
     send_message(user_id, f"Sent: {resp.json()}")
 ```
 
-Bot stores zero per-user keys. Restart bot, redeploy, move to another server — everything works. NEAR key in env is the only secret.
+The bot stores no per-user keys. Restart, redeploy, move servers — everything keeps working. The NEAR key in env is the only secret, and it is a full-access key of the bot's account: keep the account for this purpose only.
 
 ---
 
 ### Flow 3: Web app with Google login (deterministic, NEAR signature auth)
 
-Same as Telegram bot, but seed derived from OAuth provider + user ID.
+Same as the bot, with the seed derived from the OAuth provider and user ID.
 
 ```python
-# User logs in via Google OAuth → server gets google_user_id
 def on_google_login(google_user_id: str) -> dict:
     seed = hashlib.sha256(f"google:{google_user_id}".encode()).hexdigest()
-    # ... same ensure_wallet() / wallet_request() as above
     return ensure_wallet_with_seed(seed)
 
-# User logs in via GitHub
 def on_github_login(github_user_id: str) -> dict:
     seed = hashlib.sha256(f"github:{github_user_id}".encode()).hexdigest()
     return ensure_wallet_with_seed(seed)
@@ -547,11 +413,13 @@ def on_github_login(github_user_id: str) -> dict:
 # Same provider + same person = always the same wallet
 ```
 
+The seed is a hex digest, so it satisfies the seed alphabet whatever the provider's IDs contain.
+
 ---
 
-### Flow 4a: Custody wallet creating sub-agents (Bearer auth, no crypto)
+### Flow 4a: Custody wallet creating sub-agents (Bearer auth, no NEAR key)
 
-Parent agent has a `wk_` API key (custody wallet). No NEAR key needed.
+The parent has a `wk_` API key and no NEAR key.
 
 ```python
 import hashlib, requests
@@ -561,7 +429,7 @@ PARENT_KEY = "wk_..."
 HEADERS = {"Authorization": f"Bearer {PARENT_KEY}", "Content-Type": "application/json"}
 
 def create_sub_agent_wallet(task_id: str) -> tuple[str, str]:
-    seed = f"sub-agent:{task_id}"
+    seed = f"sub-agent-{task_id}"
     sub_key = f"wk_{hashlib.sha256(f'{seed}:0:{PARENT_KEY}'.encode()).hexdigest()}"
     key_hash = hashlib.sha256(sub_key.encode()).hexdigest()
 
@@ -571,34 +439,33 @@ def create_sub_agent_wallet(task_id: str) -> tuple[str, str]:
     ).json()
     return resp["near_account_id"], sub_key
 
-# Create and hand key to sub-agent
 account, key = create_sub_agent_wallet("task-42")
 # Sub-agent uses: Authorization: Bearer wk_...
 ```
 
+A parent registered with `vault_id` passes its vault to every sub-wallet.
+
 ---
 
-### Flow 4b: External NEAR account creating sub-agents (NEAR signature)
+### Flow 4b: NEAR account creating sub-agents (NEAR signature)
 
-Parent agent has a NEAR key. Creates wallets for sub-agents. Sub-agents use simple Bearer tokens — no crypto libraries needed.
+The parent holds a NEAR key; sub-agents get plain Bearer tokens.
 
 ```python
-# ── Parent agent ──────────────────────────────────────────────────────
-
 def create_sub_agent_wallet(task_id: str, key_index: int = 0) -> tuple[str, str]:
-    """Create wallet + derive a wk_ key for a sub-agent.
-    Returns (near_account_id, api_key). Can be called again to re-derive."""
+    """Create the wallet + derive a wk_ key for a sub-agent.
+    Returns (near_account_id, api_key). Call again to re-derive."""
 
-    seed = f"sub-agent:{task_id}"
+    seed = f"sub-agent-{task_id}"
 
-    # 1. Derive wk_ key deterministically (parent can re-derive anytime)
+    # 1. Derive the wk_ key deterministically
     key_material = hmac.new(
         NEAR_SECRET, f"{seed}:{key_index}".encode(), hashlib.sha256
     ).hexdigest()
     api_key = f"wk_{key_material}"
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
 
-    # 2. Register key hash in coordinator (idempotent)
+    # 2. Register its hash (idempotent)
     timestamp = int(time.time())
     message = f"api-key:{seed}:{timestamp}"
     resp = requests.put(f"{API_BASE}/wallet/v1/api-key", json={
@@ -609,158 +476,126 @@ def create_sub_agent_wallet(task_id: str, key_index: int = 0) -> tuple[str, str]
         "message": message,
         "signature": _sign_message(message),
     })
-    near_account_id = resp.json()["near_account_id"]
+    return resp.json()["near_account_id"], api_key
 
-    return near_account_id, api_key
-
-# 3. Parent creates sub-agent, hands it the key
 account, key = create_sub_agent_wallet("task-42")
-sub_agent = spawn_agent(
-    task="Buy 10 USDT on NEAR",
-    wallet_key=key,  # simple string
-)
+sub_agent = spawn_agent(task="Buy 10 USDT on NEAR", wallet_key=key)
 
-# ── Sub-agent (zero crypto, any language, any LLM framework) ─────────
-
+# ── Sub-agent (no crypto, any language) ───────────────────────────────
 def sub_agent_main(wallet_key: str):
     headers = {"Authorization": f"Bearer {wallet_key}"}
-
-    # Check balance
     balance = requests.get(f"{API_BASE}/wallet/v1/balance", headers=headers).json()
-    print(f"Balance: {balance}")
-
-    # Execute swap
     swap = requests.post(f"{API_BASE}/wallet/v1/intents/swap", headers=headers, json={
-        "token_in": "wrap.near",
-        "token_out": "usdt.tether-token.near",
-        "amount": "10.0",
+        "token_in": "nep141:wrap.near",
+        "token_out": "nep141:usdt.tether-token.near",
+        "amount_in": "10000000000000000000000000",   # 10 wNEAR
     }).json()
-    print(f"Swap result: {swap}")
 
-# ── Later: parent re-derives the key without any storage ─────────────
-# Parent's server restarts, DB is empty, doesn't matter:
+# ── Later: the parent re-derives the key without any storage ─────────
 _, same_key = create_sub_agent_wallet("task-42")  # same key as before
 ```
+
+The sub-agent's wallet here is the wallet `Bearer near:` reaches for `(ACCOUNT_ID, "sub-agent-task-42")`, so the parent can operate it directly too.
 
 ---
 
 ### Flow 5: NEAR key rotation
 
-Bot's NEAR key was exposed. Rotate without affecting wallets.
+The bot's NEAR key was exposed. Rotate without affecting wallets.
 
 ```bash
-# 1. Generate new key
 near generate-key --outputDir ./new-key
-
-# 2. Add new key to the NEAR account (on-chain tx, signed by old key)
-near add-key my-tg-bot.near ed25519:NEW_PUBLIC_KEY
-
-# 3. Update bot's env with new key, restart bot
-# Bot now signs with new key → works immediately (RPC sees new key)
-
-# 4. Remove old key
+near add-key my-tg-bot.near ed25519:NEW_PUBLIC_KEY      # full access
+# Update the bot's env with the new key, restart the bot
 near delete-key my-tg-bot.near ed25519:OLD_PUBLIC_KEY
-
-# 5. Within 60 seconds: anyone using old key → cache expires → 401
+# Within 60 s, Bearer near: tokens signed by the old key → 401
 ```
 
-Wallets are NOT affected — wallet_id depends on (account_id, seed), not on which key signs.
+Wallets are not affected — `wallet_id` depends on `(account_id, seed)`, not on the key.
 
-**Note for Flow 4 (sub-agents):** if parent rotates NEAR key, existing `wk_` keys keep working (they're in wallet_api_keys, independent of NEAR key). But `hmac(near_private_key, ...)` changes, so parent can no longer re-derive old `wk_` keys. For sub-agents created after rotation, parent uses new key. Old sub-agent keys remain valid until revoked.
+**For Flow 4b:** existing `wk_` keys keep working after a rotation (they are stored by hash, independent of the NEAR key), but the parent derived them with the old key and can no longer re-derive them. Sub-agents created afterwards use keys derived from the new key. Old sub-agent keys stay valid until revoked.
 
 ---
 
 ### Flow 6: Key revocation (compromised key)
 
 ```bash
-# Remove compromised key from NEAR account
 near delete-key my-tg-bot.near ed25519:COMPROMISED_KEY
-
-# Result:
-# - Bearer near:... signed by compromised key → 401 within 60s (cache expires)
-# - Bearer wk_... keys derived from compromised key → still work (stored by hash)
+# - Bearer near: signed by the compromised key → 401 within 60 s
+# - wk_ keys derived from it → still work (stored by hash)
 ```
 
-To also revoke `wk_` delegate keys derived from the compromised NEAR key:
+To revoke the `wk_` delegate keys derived from the compromised key:
 
 ```python
-# Parent re-derives the key_hash of each compromised wk_ key (knows seed + index)
 for seed, index in compromised_sub_agents:
-    old_key = f"wk_{hmac_sha256(OLD_NEAR_SECRET, f'{seed}:{index}').hex()}"
+    old_key = "wk_" + hmac.new(OLD_NEAR_SECRET, f"{seed}:{index}".encode(), hashlib.sha256).hexdigest()
     old_hash = hashlib.sha256(old_key.encode()).hexdigest()
-
-    # Revoke via DELETE (authenticated with new NEAR key)
+    # Authenticated with the new NEAR key
     wallet_request_by_seed(seed, "DELETE", f"/wallet/v1/api-key/{old_hash}")
 ```
 
+Register the replacement key first: the last active `wk_` key of a wallet cannot be revoked (409).
+
 ---
 
-### Flow 7: Sub-agent with policy (spending limits)
+### Flow 7: Sub-agent with a policy (spending limits)
 
-Parent creates a wallet for sub-agent with restrictions: max $5 per swap, no transfers.
-Uses existing policy system — no new endpoints needed.
+The parent creates a wallet for the sub-agent that may only swap wNEAR, at most 5 wNEAR per swap. Setting a policy is three steps: encrypt it, have the wallet sign it for the account that will store it, store it on chain.
 
 ```python
 # ── Parent agent ──────────────────────────────────────────────────────
 
-# 1. Create wallet + wk_ key for sub-agent (same as Flow 4)
+# 1. Create the wallet + wk_ key for the sub-agent (Flow 4b)
 account, sub_key = create_sub_agent_wallet("task-42")
+seed = "sub-agent-task-42"
+wallet_id = wallet_request_by_seed(seed, "GET", "/wallet/v1/address?chain=near").json()["wallet_id"]
 
-# 2. Set policy on the wallet (parent signs with Bearer near:...)
-seed = "sub-agent:task-42"
+# 2. Encrypt the policy in the keystore
+encrypted = wallet_request_by_seed(seed, "POST", "/wallet/v1/encrypt-policy", json={
+    "wallet_id": wallet_id,
+    "rules": {
+        "transaction_types": ["swap"],
+        "limits": {"per_transaction": {"nep141:wrap.near": "5000000000000000000000000"}},
+    },
+    "capabilities": {"swap": {"allowed": True}},
+}).json()                                # { encrypted_base64, wallet_pubkey }
 
-# 2a. Encrypt policy rules via keystore TEE
-policy_resp = wallet_request_by_seed(seed, "POST", "/wallet/v1/encrypt-policy", json={
-    "rules": [
-        {"action": "swap", "max_amount_usd": "5.00"},
-        {"action": "balance", "allow": True},
-        {"action": "transfer", "deny": True},
-        {"action": "delete", "deny": True},
-    ],
-    "freeze_threshold_usd": "20.00",  # freeze wallet if balance drops below $20
-})
-encrypted_policy = policy_resp.json()
-
-# 2b. Sign encrypted policy with wallet's key (coordinator asks keystore).
-# `caller` is the NEAR account that will send store_wallet_policy — it is part
-# of what gets signed, so the answer works for that account and no other.
-wallet_request_by_seed(seed, "POST", "/wallet/v1/sign-policy", json={
-    **encrypted_policy,
+# 3. Have the wallet sign it for the account that will store it.
+#    `caller` is part of what is signed: the answer works for that account only.
+signed = wallet_request_by_seed(seed, "POST", "/wallet/v1/sign-policy", json={
+    "encrypted_data": encrypted["encrypted_base64"],
     "caller": "you.near",
-})
-# Send store_wallet_policy from that account → enforced on every operation
+}).json()                                # { signature_hex, public_key_hex }
 
-# 3. Hand wk_ key to sub-agent
+# 4. you.near calls store_wallet_policy on outlayer.near with a storage deposit
+#    (estimate_wallet_policy_cost gives the amount):
+#      { "wallet_pubkey": encrypted["wallet_pubkey"],
+#        "encrypted_data": encrypted["encrypted_base64"],
+#        "wallet_signature": signed["signature_hex"] }
+#    you.near becomes the policy's controller: only it can update, freeze or delete it.
+
+# 5. Hand the wk_ key to the sub-agent
 sub_agent = spawn_agent(task="Buy USDT", wallet_key=sub_key)
 
-# ── Sub-agent tries to use the wallet ────────────────────────────────
-
+# ── Sub-agent ─────────────────────────────────────────────────────────
 headers = {"Authorization": f"Bearer {sub_key}"}
 
-# ✅ Check balance — allowed
-requests.get(f"{API_BASE}/wallet/v1/balance", headers=headers)
+requests.get(f"{API_BASE}/wallet/v1/balance", headers=headers)          # reads are not policy-gated
 
-# ✅ Swap $3 of NEAR → USDT — allowed (under $5 limit)
 requests.post(f"{API_BASE}/wallet/v1/intents/swap", headers=headers, json={
-    "token_in": "wrap.near",
-    "token_out": "usdt.tether-token.near",
-    "amount_usd": "3.00",
+    "token_in": "nep141:wrap.near", "token_out": "nep141:usdt.tether-token.near",
+    "amount_in": "3000000000000000000000000",                          # 3 wNEAR: allowed
 })
 
-# ❌ Swap $10 — denied by policy
 requests.post(f"{API_BASE}/wallet/v1/intents/swap", headers=headers, json={
-    "token_in": "wrap.near",
-    "token_out": "usdt.tether-token.near",
-    "amount_usd": "10.00",
-})
-# → 403 {"error": "Policy denied: max_amount_usd exceeded"}
+    "token_in": "nep141:wrap.near", "token_out": "nep141:usdt.tether-token.near",
+    "amount_in": "10000000000000000000000000",                         # 10 wNEAR
+})  # → 403 policy_denied (per-transaction limit)
 
-# ❌ Transfer to external address — denied by policy
 requests.post(f"{API_BASE}/wallet/v1/transfer", headers=headers, json={
-    "to": "attacker.near",
-    "amount": "100",
-})
-# → 403 {"error": "Policy denied: transfer not allowed"}
+    "to": "attacker.near", "amount": "100",
+})  # → 403 policy_denied (transfer is not an allowed transaction type)
 ```
 
-Policy is enforced at coordinator level, inside TEE. Sub-agent cannot bypass it — policy is checked before keystore signs any transaction. Parent can update policy anytime via `Bearer near:...`.
+The keystore evaluates the policy inside the TEE before it signs; the sub-agent's key cannot bypass it. The cumulative limits (daily, hourly, monthly, rate limit) are counted by the coordinator. The controller account changes the policy, or freezes the wallet, with a transaction of its own. The policy format is documented at https://app.outlayer.ai/docs/agent-custody.

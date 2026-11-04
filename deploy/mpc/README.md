@@ -5,9 +5,9 @@ on your **own bare-metal Intel TDX server**, with working on-chain TEE attestati
 to end from an unprovisioned machine to a node that is registered and awaiting the
 governance vote.
 
-This was validated on **testnet** (node account `fastnearmpc.testnet`) on a servers.com
-Dell R760 (2× Xeon Gold 6548Y+, Emerald Rapids), 2026-06-17. The mainnet path is the same
-with mainnet accounts/contract.
+Validated on **testnet** (node account `fastnearmpc.testnet`) on a servers.com Dell R760
+(2× Xeon Gold 6548Y+, Emerald Rapids). The mainnet path is the same with mainnet
+accounts/contract (see [Mainnet differences](#mainnet-differences)).
 
 > **Scope — this is node *operation*, not OutLayer custody.** Running an MPC node makes
 > you a **participant** in NEAR Chain Signatures: you hold a share of the network's
@@ -134,7 +134,7 @@ racadm get BIOS.SysSecurity
 
 **Also update BIOS + microcode** (Maintenance → System Update) so the platform TCB is
 current. The on-chain attestation rejects any platform whose TCB is not `UpToDate` — and on
-a self-hosted box, TCB recovery is *your* job, not Phala's.
+a self-hosted box, TCB recovery is the operator's job.
 
 > **Do NOT factory-reset SGX again** once registered. `SgxFactoryReset On` (values are
 > `On`/`Off`, not `Enabled`) forces a fresh platform registration but **changes the
@@ -245,7 +245,6 @@ first:
    ```bash
    ssh root@<existing-node> 'jq -r .ApiKey /opt/intel/sgx-dcap-pccs/config/default.json'
    ```
-   On our fleet it's also saved at `near-offshore/.env.cf` (32 hex chars, the bare key).
 2. **From your own saved secret store.**
 3. **Fresh from Intel** — <https://api.portal.trustedservices.intel.com/> → subscribe to
    "Intel SGX Provisioning Certification Service" → copy the primary key.
@@ -275,7 +274,7 @@ p,api,h = sys.argv[1:4]
 d = json.load(open(p)); d["ApiKey"] = api; d["UserTokenHash"] = h
 json.dump(d, open(p,'w'), indent=4)
 PY
-sudo systemctl restart pccs                   # ams-1 only; NEVER restart pccs on a live node
+sudo systemctl restart pccs                   # fresh node only; never restart pccs under running CVMs
 
 # Push the platform manifest to the LOCAL PCCS:
 cd /tmp
@@ -411,7 +410,7 @@ git fetch --tags
 git worktree add ~/dstack-v0.5.11 v0.5.11
 cd ~/dstack-v0.5.11/key-provider-build
 
-# Point its QCNL at the LOCAL PCCS (default is Phala's public one) BEFORE building:
+# Point its QCNL at the LOCAL PCCS (the shipped default is a remote public PCCS) BEFORE building:
 cat > sgx_default_qcnl.conf <<'JSON'
 { "pccs_url": "https://localhost:8081/sgx/certification/v4/", "use_secure_cert": false,
   "retry_times": 6, "retry_delay": 10, "pck_cache_expire_hours": 168,
@@ -540,7 +539,7 @@ AUTO_YES=1 ./deploy-launcher.sh \
 [mpc_node_config]
 account_id = "fastnearmpc.testnet"
 # the node's advertised P2P address (public IP : nearcore P2P port):
-#   e.g. 173.237.9.76:24567
+#   e.g. <public-ip>:24567
 # secret_store_key / backup keys are generated here (NOT deterministic — see below)
 
 [mpc_node_config.near_init]
@@ -782,8 +781,8 @@ Run top-to-bottom on a fresh box; each line is a gate for the next.
 
 ## Mainnet differences
 
-Same procedure with mainnet values: contract `v1.signer-prod.near` (verify the exact account
-in NEAR's current docs before use), mainnet node account, mainnet RPC
+Same procedure with mainnet values: MPC contract `v1.signer` (the account the mainnet keystore
+DAO and `outlayer-monitor` use), mainnet node account, mainnet RPC
 `rpc.mainnet.fastnear.com`, the mainnet manifest digests from NEAR's release, and mainnet
 boot nodes. Mainnet TCB/collateral hygiene matters more — keep the Intel PCS collateral for
 your FMSPC refreshed (Intel updates TCB roughly monthly), or attestation expires.
@@ -796,5 +795,3 @@ your FMSPC refreshed (Intel updates TCB roughly monthly), or attestation expires
   [`../self-hosted-tdx/10-build-dstack.sh`](../self-hosted-tdx/10-build-dstack.sh)
 - dstack: <https://github.com/Dstack-TEE/dstack/blob/master/docs/deployment.md>
 - Intel PCS API key: <https://api.portal.trustedservices.intel.com/>
-</content>
-</invoke>

@@ -3,8 +3,9 @@
 These are the OLD standalone wallet/custody/intents tests whose coverage was **ported into the
 unified suite** (`../unified_op_e2e.sh`, `../unified_op_e2e_intents.sh`, `../unified_vault_e2e.sh`).
 Kept for reference / diffing — **not part of the canonical run** (see `../TESTING.md`). They are NOT
-maintained: helpers here predate the fund-safety fixes (subshell-file tracking, constant
-`BENEFICIARY`, `verify_all_drained`). If you find a real behavior asserted ONLY here, port it INTO the
+maintained and lack the fund-safety machinery of the unified suite (file-based sweep tracking,
+constant `BENEFICIARY`, `verify_all_drained`), and they do not source `../lib/rpc.sh`: do not run one
+with real funds, and if you run one at all, set near-cli's `rpc_url` to a keyed FastNEAR endpoint first. If you find a real behavior asserted ONLY here, port it INTO the
 unified suite — do not re-grow this folder.
 
 ## Mapping (legacy file → unified test that replaced it)
@@ -35,4 +36,4 @@ unified suite — do not re-grow this folder.
 - `wallet_intents_e2e.sh`, `wallet_mode1_agent.sh`, `wallet_mode2_policy.sh` — `/tokens`, `/audit`, `/requests`, `/invalidate-cache`, idempotency-dedup, rate-limit (small deltas; partly covered by T14).
 - `vault_backward_compat.sh` — legacy non-vault `/register` default-master.
 
-(Everything else in `../` is infra: compilation, jobs, parallel, unit, integration, transactions, run_all, e2e, verify_jobs.)
+The full index of live suites is [`../README.md`](../README.md).

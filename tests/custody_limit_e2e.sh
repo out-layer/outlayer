@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# The custody ceiling on testnet: a wallet without a subscription may run 100
-# custody operations a day, the 101st is a typed 429, and a subscription on
+# The custody ceiling on testnet: a wallet without a subscription may run 1000
+# custody operations a day, the 1001st is a typed 429, and a subscription on
 # the wallet's own key lifts it.
 #
 # The counted operation is a `transfer` the wallet's policy DENIES: the ceiling
@@ -18,17 +18,20 @@
 #       payment key (nonce >= 1) funded with the cheapest plan's price, the
 #       plan bought from it (POST /subscription/purchase), then the same
 #       transfer is 403 policy_denied again
-#   L4  a swap quote does not count — on testnet the route answers 503
+#   L2b a route counted outside the policy gate meets the same ceiling: with
+#       the ceiling reached, a NEP-413 /wallet/v1/sign-message is 429
+#       operation_limit_reached
+#   L4  a swap quote counts too — on testnet the route answers 503
 #       service_unavailable before anything is counted, so this is a skip
 #
 # Run:
 #   PARENT=outlayer-alice.testnet ./tests/custody_limit_e2e.sh --apply
-#   LIMIT=100 is the free-tier ceiling (`operation_limits`, custody:* / day).
+#   LIMIT=1000 is the free-tier ceiling (`operation_limits`, custody:* / day).
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 
 [[ "${1:-}" == "--apply" ]] || { warn "Dry run. Pass --apply."; exit 0; }
-LIMIT="${LIMIT:-100}"
+LIMIT="${LIMIT:-1000}"
 hos_require
 
 # transfer_h — a denied transfer; sets HTTP, BODY and RETRY_AFTER (the header).
@@ -82,6 +85,11 @@ else
   fail "L2 expected 429, got HTTP $HTTP $(err_of): $(msg_of)"
 fi
 
+log "L2b a NEP-413 sign-message meets the same ceiling"
+api "$SEED" POST /wallet/v1/sign-message '{"message":"custody ceiling e2e","recipient":"custody-limit.e2e"}' >/dev/null
+if [[ "$HTTP" == 429 && "$(err_of)" == operation_limit_reached ]]; then pass "L2b sign-message refused 429 operation_limit_reached"
+else fail "L2b expected 429 operation_limit_reached, got HTTP $HTTP $(err_of): $(msg_of)"; fi
+
 log "L3 a subscription on the wallet's own key lifts the ceiling"
 # api_pk <payment-key> <METHOD> <path> [body] — presented as X-Payment-Key.
 api_pk() {
@@ -117,11 +125,11 @@ else
   fi
 fi
 
-log "L4 a swap quote is not counted"
+log "L4 a swap quote is counted"
 api "$SEED" POST /wallet/v1/intents/swap/quote \
   '{"token_in":"nep141:wrap.near","token_out":"nep141:usdt.tether-token.near","amount_in":"1000000000000000000000000"}' >/dev/null
 if [[ "$HTTP" == 503 && "$(err_of)" == service_unavailable ]]; then
-  skip "L4 swap quotes are mainnet-only (503 service_unavailable on testnet); the quote is not counted by construction (no authorize_custody_operation on the route)"
+  skip "L4 swap quotes are mainnet-only (503 service_unavailable on testnet, answered before the count)"
 else
   fail "L4 unexpected answer to a quote on testnet: HTTP $HTTP $(err_of)"
 fi

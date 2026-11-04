@@ -1,57 +1,27 @@
 # Worker Examples
 
-Development examples and standalone test programs.
+Standalone development programs; not part of the test suite.
 
 ## test_fuel_component.rs
 
-**Purpose**: Standalone test for WASI P2 component fuel metering.
+Loads a WASI P2 component (`wasi-examples/ai-example`) into a wasmtime engine
+with fuel metering enabled and sets a fuel budget on a store. It checks that a
+component loads with `consume_fuel(true)`; it does not run the component.
 
-**What it does**:
-- Loads a WASI P2 component (ai-example)
-- Executes with wasmtime
-- Measures fuel consumption
-- Demonstrates component instantiation
-
-**Usage**:
 ```bash
-# Build ai-example component first
-cd ../../wasi-examples/ai-example
+cd wasi-examples/ai-example
 cargo build --release --target wasm32-wasip2
 
-# Run example
 cd ../../worker
 cargo run --example test_fuel_component
 ```
 
-**Expected output**:
-```
-Component size: 500000 bytes
-Fuel consumed: 8663 instructions
-Output: Error: OPENAI_API_KEY not found...
-```
+Output: `✅ Component loaded with fuel enabled!` and `✅ Fuel metering WORKS
+with component model!`, or the load / fuel error.
 
-**When to use**:
-- Debugging component loading issues
-- Testing fuel metering accuracy
-- Isolated component execution testing
-- Development of new component features
+## Adding an example
 
-**Note**: This is a development tool, not part of the automated test suite.
+`examples/<name>.rs` with a `main`, run with `cargo run --example <name>`.
 
-## Adding New Examples
-
-Create `examples/your_example.rs`:
-```rust
-fn main() {
-    println!("Example logic here");
-}
-```
-
-Run with:
-```bash
-cargo run --example your_example
-```
-
----
-
-For production tests, see [/tests/README.md](../../tests/README.md)
+Worker tests: [../TESTING.md](../TESTING.md). Live suites:
+[tests/README.md](../../tests/README.md).

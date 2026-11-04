@@ -5,7 +5,7 @@ OutLayer. It exists because this repository is a monorepo whose components are n
 all released under the same terms — the root `LICENSE` does **not** automatically
 govern every subdirectory.
 
-Copyright holder for all first-party code: **OutLayer LLC**.
+Copyright holder for all first-party code: **OutLayer, Inc.**.
 
 ## Rationale
 
@@ -80,7 +80,7 @@ terms. Nothing in the dependency tree obliges OutLayer to release proprietary co
 ## Contributions
 
 All contributions require a signed Contributor License Agreement — see
-`CONTRIBUTING.md` and `CLA.md`. The CLA grants OutLayer LLC the right to
+`CONTRIBUTING.md` and `CLA.md`. The CLA grants OutLayer, Inc. the right to
 relicense contributed material, which is what preserves the ability to change any of
 the above terms in the future.
 

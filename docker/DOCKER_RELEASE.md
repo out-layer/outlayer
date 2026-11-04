@@ -1,57 +1,43 @@
 # Docker Image Release Guide
 
-## Overview
+Production worker and keystore images are built by GitHub Actions
+(`.github/workflows/release-docker.yml`) and carry a Sigstore build-provenance
+attestation, which ties each image digest to a commit of this public
+repository. The digest is what a TDX CVM's compose names, so the measured
+application can be traced back to source.
 
-Production Docker images are built and signed via GitHub Actions with Sigstore attestation.
-This proves images were built from this public repository, enabling Phala TEE verification.
+## Building a release
 
-## Building a Release
-
-### From any branch
-
-Tags can be created on any commit, not just main:
+Push a tag starting with `v`, from any commit:
 
 ```bash
-# From main branch
-git checkout main
-git tag v1.0.0
-git push origin v1.0.0
-
-# From feature branch
-git checkout feature/my-changes
-git tag v1.0.0-rc1
-git push origin v1.0.0-rc1
-
-# From specific commit
-git tag v1.0.0 abc1234
-git push origin v1.0.0
+git tag v<X.Y.Z>
+git push origin v<X.Y.Z>
 ```
 
-### Tag naming convention
-
-- `v1.0.0` - Production release
-- `v1.0.0-rc1` - Release candidate
-- `v1.0.0-beta` - Beta release
-- `v0.0.1-test` - Test release (for workflow testing)
+Suffixes such as `-rc1`, `-beta` or `-defuse.1` mark pre-releases; the
+workflow treats every `v*` tag the same.
 
 ## What happens on tag push
 
-1. GitHub Actions builds `worker` and `keystore` images (linux/amd64)
-2. Images are pushed to Docker Hub: `outlayer/near-outlayer-worker`, `outlayer/near-outlayer-keystore`
-3. Sigstore attestation is created linking image digest to this repository
-4. GitHub Release is created with digests and verification links
+1. GitHub Actions builds `docker/Dockerfile.worker-phala` and
+   `docker/Dockerfile.keystore-phala` for linux/amd64
+2. Pushes them to Docker Hub as `outlayer/near-outlayer-worker` and
+   `outlayer/near-outlayer-keystore`, tagged with the git tag and `latest`
+3. Creates a Sigstore attestation for each digest and pushes it to the registry
+4. Creates a GitHub Release whose body lists both digests and the verify command
 
-## Verifying Images
+One run per tag: a duplicate delivery of the same tag push cancels the earlier
+run, so a release never names a digest it did not build.
 
-### Using GitHub CLI
+## Verifying images
 
 ```bash
-gh attestation verify oci://docker.io/outlayer/near-outlayer-worker:v1.0.0 -R out-layer/outlayer
+gh attestation verify oci://docker.io/outlayer/near-outlayer-worker@sha256:<digest> -R out-layer/outlayer
 ```
 
-Images up to and including `v0.1.58` are attested under the `fastnear` GitHub organization
-(the repository's former home), so `-R out-layer/outlayer` finds no attestation for them.
-Verify those with the owner flag instead:
+Images up to and including `v0.1.58` are attested under the `fastnear`
+GitHub organization, so `-R out-layer/outlayer` finds no attestation for them:
 
 ```bash
 gh attestation verify oci://docker.io/outlayer/near-outlayer-worker:v0.1.58 --owner fastnear
@@ -59,41 +45,36 @@ gh attestation verify oci://docker.io/outlayer/near-outlayer-worker:v0.1.58 --ow
 gh attestation verify oci://docker.io/outlayer/near-outlayer-worker:v0.1.58 --bundle-from-oci --owner fastnear
 ```
 
-### Using Sigstore web
+Or search the digest on https://search.sigstore.dev/.
 
-Visit: https://search.sigstore.dev/?hash=sha256:...
+## Deploying a release
 
-(Replace with actual digest from GitHub Release)
+Deploy by digest, never by tag: a tag can be moved, a digest cannot.
+`scripts/deploy_tdx.sh <worker|keystore> <net> --version <ver> --node <host>`
+reads the digest from the GitHub release of `v<ver>` (`--digest` overrides
+the lookup), checks its attestation (`-R out-layer/outlayer`, then `--owner
+fastnear`) and deploys the CVM with that digest in its compose
+(`deploy/self-hosted-tdx/<component>/docker-compose.yaml`,
+`image: docker.io/outlayer/near-outlayer-<component>@sha256:…`). An
+attestation that does not verify is printed as `NOT verified` and the deploy
+continues: read that line before approving the measurements.
 
-## Using Verified Images in Phala
+## Unattested builds
 
-Use SHA256 digest (from GitHub Release) instead of tags in docker-compose:
-
-```yaml
-# Instead of (mutable tag):
-image: outlayer/near-outlayer-worker:v1.0.0
-
-# Use (immutable digest):
-image: docker.io/outlayer/near-outlayer-worker@sha256:abc123...
-```
-
-The digest ensures the exact same image is used, preventing tag mutation attacks.
-
-## Local Development Builds
-
-For quick iteration without Sigstore (not for production):
+For iteration only, never for a measured deployment:
 
 ```bash
 ./scripts/build_and_push_phala.sh outlayer v0.1.42 worker
 ./scripts/build_and_push_keystore_tee.sh outlayer v0.1.42
 ```
 
-## GitHub Repository Setup
+These push an image without a Sigstore attestation; `deploy_tdx.sh` resolves
+digests from GitHub releases and will not find them.
 
-Before first release, configure GitHub repository:
+## GitHub repository setup
 
 **Variables** (Settings > Variables > Actions):
-- `DOCKERHUB_USERNAME`: Your Docker Hub username or organization (e.g., `outlayer`)
+- `DOCKERHUB_USERNAME`: Docker Hub user or organization (`outlayer`)
 
 **Secrets** (Settings > Secrets > Actions):
 - `DOCKERHUB_TOKEN`: Docker Hub access token with Read & Write permissions

@@ -43,11 +43,12 @@ Ordered by what it costs, not by how it reads.
 
 | Reach | Routes |
 |---|---|
-| **Spends our money** | `POST /admin/grant-payment-key` — funds an existing key from our balance and marks it `is_grant`: that balance cannot be withdrawn or forwarded to a developer. Refuses the trial key (nonce 0) with 400 and points to `grant-subscription`. `POST /admin/grant-subscription` `{owner, nonce, amount_usd?, days?, note?}` — sets what an existing key (the trial included) can spend from its allowance to exactly `amount_usd` (default `GIFT_SUBSCRIPTION_USD`) and runs it until at least now + `days` (default `GIFT_SUBSCRIPTION_DAYS`, 1–3650). `amount_usd` may be lower than `GIFT_SUBSCRIPTION_USD`, never higher (400). 409 when the key can already spend more than `amount_usd`; 404 when the key, or on nonce 0 the claimed trial, does not exist. On nonce 0 it converts the trial (`trial_converted`: no call count, `has_subscription: true`). It does not touch the key's balance or set `is_grant`; the allowance cannot be withdrawn or attached as `X-Attached-Deposit` (`allowance_no_deposit`). Neither route can CREATE a key. `POST /admin/sponsor-codes` mints a code any wallet can redeem for up to `GIFT_SUBSCRIPTION_USD` of allowance on its nonce-0 key (created on redeem), `max_uses` times — see below. So a leaked token reaches: arbitrary non-withdrawable value on any existing key through `grant-payment-key`, up to `GIFT_SUBSCRIPTION_USD` of allowance at a time through `grant-subscription` — the attacker's own keys included — and, through a code with no `max_uses`, that much on every wallet the attacker can mint until the code is switched off; all of it spendable on compute and connector operations at our cost. |
-| **Breaks operations** | `DELETE /admin/workers/{worker_id}`, `DELETE /admin/grant-keys/{owner}/{nonce}` — remove records other things rely on. |
+| **Turns the service off** | `PUT /admin/maintenance {"enabled": true}` — every route but `/health` and `/admin/*` answers 503 to everyone, workers included, until it is turned off; see below. |
+| **Spends our money** | `POST /admin/grant-payment-key` `{owner, nonce, amount, note?}` — adds `amount` (minimal units, no cap) to an existing key's balance and marks it `is_grant`: that balance cannot be withdrawn or forwarded to a developer. Only a key with no user money on it (at most the $0.01 creation minimum, absorbed into the grant) or a key that is already a grant; a user-funded key is 409, a missing one 404. Refuses the trial key (nonce 0) with 400 and points to `grant-subscription`. `POST /admin/grant-subscription` `{owner, nonce, amount_usd?, days?, note?}` — sets what an existing key (the trial included) can spend from its allowance to exactly `amount_usd` (default `GIFT_SUBSCRIPTION_USD`) and runs it until at least now + `days` (default `GIFT_SUBSCRIPTION_DAYS`, 1–3650). `amount_usd` may be lower than `GIFT_SUBSCRIPTION_USD`, never higher (400). 409 when the key can already spend more than `amount_usd`; 404 when the key, or on nonce 0 the claimed trial, does not exist. On nonce 0 it converts the trial (`trial_converted`: no call count, `has_subscription: true`). It does not touch the key's balance or set `is_grant`; the allowance cannot be withdrawn or attached as `X-Attached-Deposit` (`allowance_no_deposit`). It also detaches the key from any sponsor code it carried (`sponsored_by`). Neither route can CREATE a key. `POST /admin/sponsor-codes` mints a code any wallet can redeem for up to `GIFT_SUBSCRIPTION_USD` of allowance on its nonce-0 key (created on redeem), `max_uses` times — see below. So a leaked token reaches: arbitrary non-withdrawable value on any existing unfunded or grant key through `grant-payment-key`, up to `GIFT_SUBSCRIPTION_USD` of allowance at a time through `grant-subscription` — the attacker's own keys included — and, through a code with no `max_uses`, that much on every wallet the attacker can mint until the code is switched off; all of it spendable on compute and connector operations at our cost. |
+| **Breaks operations** | `DELETE /admin/workers/{worker_id}` — deletes every `worker_status` row of that id. `DELETE /admin/grant-keys/{owner}/{nonce}` — soft-deletes a grant key (`is_grant` only; 404 otherwise). |
 | **Widens what the coordinator concludes** | `POST /admin/binding-zones`, `POST /admin/hos-impl-code-hashes`, `POST /admin/hos-impl-versions`, `POST /admin/wallet-code-hashes`, `POST /admin/contract-wallet-code-hashes` — see below; all are lists whose growth relaxes a check. |
 | **Reads customer data** | `GET /admin/earnings`, `/admin/connector-calls`, `/admin/egress-audit`, `/admin/compile-logs/{job_id}`, `/admin/health/detailed`. Egress audit is every outbound attempt every guest made. |
-| **Reads customer data** (also) | `GET /admin/sponsor-codes` — which codes exist and how much their grants spent; no owners, no keys. |
+| **Reads customer data** (also) | `GET /admin/grant-keys?limit=&offset=` — every live `is_grant` key except unconverted trials: owner, nonce, balance, spent, reserved, project ids. `GET /admin/sponsor-codes` — which codes exist and how much their grants spent; no owners, no keys. |
 | **Harmless to repeat** | `POST /admin/collateral/check`, `GET /admin/collateral/status`, `GET /admin/binding-implementations`, `POST /admin/keystore-stats/refresh`, `POST /admin/connector-prices/refresh` — refreshes and reads, idempotent by construction. |
 
 ## The allowlists
@@ -100,8 +101,7 @@ something about the account, or a condition we must not act on?
 It authorizes nothing. The spend grant on the leased account does that, and the
 contract enforces it whatever this table says.
 
-**Empty means we conclude nothing** — the same behaviour as before the list
-existed. Adding a hash is what makes a refusal from an account running something
+**Empty means we conclude nothing.** Adding a hash is what makes a refusal from an account running something
 else readable as evidence, so a row WIDENS what the coordinator is willing to
 conclude. That is the less-safe direction, and it is why this is an admin action
 rather than a config default.
@@ -185,10 +185,11 @@ partner's: run the suite with `KEEP=1` and
 
 A decoder is CODE: the frozen wire structs of one `w_execute_extension` request
 schema, compiled into the shared crate and therefore into the keystore's
-measured image (`hos::DECODERS`, today `[1]`). Which partner `impl_version` a
-decoder reads is DATA, and it lives here — the partner renumbers on every
-redeploy of their implementation whether or not the wire changed, and a mapping
-compiled into the enclave made each of their releases a release of ours.
+measured image (`shared_tee_helpers::hos::DECODERS`, `[1]` in this build).
+Which partner `impl_version` a decoder reads is DATA, and it lives here — the
+partner renumbers on every redeploy of their implementation whether or not the
+wire changed, and a mapping compiled into the enclave would make each of their
+releases a release of ours.
 
 ```
 GET    /admin/hos-impl-versions
@@ -308,7 +309,7 @@ the redeem.
 
 | Route | Does |
 |---|---|
-| `POST /admin/sponsor-codes` `{name, allowance_usd?, grant_days?, max_uses?, redeem_until?, max_parallel?, one_per_ip?, lifts_custody_ceiling?}` | Mints a code. Answers `201 {id, code, …}`; **the code is shown once**, only its hash is kept. `allowance_usd` (minimal units) defaults to and is capped by `GIFT_SUBSCRIPTION_USD`; `grant_days` defaults to `GIFT_SUBSCRIPTION_DAYS`, 1–3650; `max_uses` absent is unlimited; `redeem_until` absent is until switched off; `max_parallel` (1–1000, default 1) is how many allowance calls one sponsored key may have in flight; `one_per_ip` lets each client address redeem the code once — default true when `max_uses` is set, false when it is not; `lifts_custody_ceiling` (default false) lets a grant of the code lift the free tier's custody ceiling (`custody:*`, 100 a month) as a bought subscription does. |
+| `POST /admin/sponsor-codes` `{name, allowance_usd?, grant_days?, max_uses?, redeem_until?, max_parallel?, one_per_ip?, lifts_custody_ceiling?}` | Mints a code. Answers `201 {id, code, …}`; **the code is shown once**, only its hash is kept. `allowance_usd` (minimal units) defaults to and is capped by `GIFT_SUBSCRIPTION_USD`; `grant_days` defaults to `GIFT_SUBSCRIPTION_DAYS`, 1–3650; `max_uses` absent is unlimited; `redeem_until` absent is until switched off; `max_parallel` (1–1000, default 1) is how many allowance calls one sponsored key may have in flight; `one_per_ip` lets each client address redeem the code once — default true when `max_uses` is set, false when it is not; `lifts_custody_ceiling` (default false) lets a grant of the code lift the free tier's custody ceiling (the `custody:*` per-day `unpaid` row of `operation_limits`; the migration seeds 100) as a bought subscription does. |
 | `PATCH /admin/sponsor-codes/{id}` `{active?, max_uses?, max_parallel?, redeem_until?, lifts_custody_ceiling?, extend_days?, end_now?}` | `active: false` stops new redeems, what was granted runs to its end. `lifts_custody_ceiling` applies to the grants already given too: the tier is read on every custody call. `extend_days` tops every grant of the code back up to `allowance_usd` and moves its end to at least that many days from now (one gift per key; a key that can already spend more is skipped, counted in `skipped`; a key whose `wk_` was revoked is left out). `end_now` sets every live grant's `expires_at` to now. The two contradict each other and are refused together. |
 | `GET /admin/sponsor-codes` | Every code with its settings, `uses` (times redeemed), `live` (keys carrying it whose grant has not ended) and `allowance_spent_usd` (spent by the keys carrying it). |
 
@@ -330,6 +331,35 @@ and an address never redeems a `one_per_ip` code twice, whatever the key
 carried in between. A redeem refused for any reason — unknown code, switched
 off, past `redeem_until`, used up, this wallet or this address already
 redeemed it — answers `404 sponsor_code_invalid` and says no more.
+
+## Maintenance — `/admin/maintenance`
+
+One switch for an incident or a move: the API is off for everyone and comes
+back as it was when the switch is turned off.
+
+| Route | Does |
+|---|---|
+| `PUT /admin/maintenance` `{enabled, note?}` | On: every request but `GET /health`, `/admin/*` and a CORS preflight answers `503`, `Retry-After: 300`, `{"error":"maintenance","message":"…try again later."}` — clients and workers alike. Nothing is accepted and no work is handed out; a task a worker's poll had already taken off the queue goes back to it. Off: everything as before. Answers the stored switch. |
+| `GET /admin/maintenance` | `{enabled, note, changed_at}`. |
+
+The switch is stored in the database: a restart keeps it, and a copy restored
+from a dump taken while it was on starts with it on. Background loops keep
+running; when one of them is the problem, stop the container.
+
+A worker caught mid-task cannot report its result while the switch is on.
+Before a planned switch, soft-stop the workers first (`worker-ctl.sh stop` on
+the node, `NAME=<cvm>` for a CVM other than the default; see
+`deploy/self-hosted-tdx/docs/cvm-operations.md`): they finish what they
+hold and take nothing new. The chain events they would have relayed are read
+again from the saved block cursor when they start, if they were stopped for
+fewer than 1000 blocks.
+
+```bash
+set -a; . scripts/.env; set +a      # ADMIN_BEARER_TOKEN_TESTNET
+printf 'Authorization: Bearer %s\n' "$ADMIN_BEARER_TOKEN_TESTNET" | curl -sS -H @- \
+  -X PUT https://testnet-api.outlayer.ai/admin/maintenance \
+  -H 'Content-Type: application/json' -d '{"enabled": true, "note": "<why>"}'
+```
 
 ## Adding an admin route
 

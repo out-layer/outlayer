@@ -1,12 +1,12 @@
 # Vault contract — global-contract deploy
 
-The vault WASM is deployed once on-chain as a [Global Contract by hash](https://docs.near.org/protocol/global-contracts) and every customer's `vault.X` account references it via `Action::UseGlobalContract`. This drops the per-vault deploy tx from ~200 KB (DeployContract carrying the inline WASM) to under 1 KB (UseGlobalContract carrying just the 32-byte SHA256), which is what makes browser-wallet flows like MyNearWallet's URL-redirect signing tractable for vault init.
+The vault WASM is deployed on chain as a [Global Contract by hash](https://docs.near.org/protocol/global-contracts) and every customer's vault account references it with `Action::UseGlobalContract`. The per-vault deploy transaction then carries a 32-byte SHA-256 instead of the ~190 KB WASM, which keeps it small enough for browser-wallet URL-redirect signing (e.g. MyNearWallet).
 
-## One-time deploy (per network)
+## One-time deploy (per network, per WASM version)
 
-Run **once** per network. Anyone with enough NEAR (~1.5 NEAR for storage) can deploy; the resulting global identifier is the WASM's SHA-256 — same as the hash already approved on the keystore-DAO, so no extra DAO vote is required.
+Anyone with enough NEAR to pay the storage can deploy; the global identifier is the WASM's SHA-256, whoever paid. Deploying makes the code available; customers' clients use it only once the keystore DAO has approved the same hash.
 
-### Testnet 
+### Testnet
 ```bash
 near contract deploy-as-global use-file \
   res/vault_contract.wasm \
@@ -14,17 +14,14 @@ near contract deploy-as-global use-file \
   outlayer.testnet \
   network-config testnet sign-with-keychain send
 
-
 near contract call-function as-transaction \
   dao.outlayer.testnet approve_vault_version \
-  json-args '{"hash":"9PWV7bvvZUzimQyRyK6ivZ97jjKW9bodpVVwzfmCTpVQ","label":"v1.1","audit_url":null}' \
+  json-args '{"hash":"<base58 sha256>","label":"<label>","audit_url":null}' \
   prepaid-gas '30 Tgas' attached-deposit '0 NEAR' \
-  sign-as zavodil.testnet network-config testnet sign-with-keychain send
+  sign-as <dao-member>.testnet network-config testnet sign-with-keychain send
 ```
 
-Replace `outlayer.testnet` with whichever account is paying storage. On mainnet:
-
-### Mainnet 
+### Mainnet
 ```bash
 near contract deploy-as-global use-file \
   res/vault_contract.wasm \
@@ -32,71 +29,58 @@ near contract deploy-as-global use-file \
   outlayer.near \
   network-config mainnet sign-with-keychain send
 
-
 near contract call-function as-transaction \
   dao.outlayer.near approve_vault_version \
-  json-args '{"hash":"G7ktGSeAkG6Q8YKZY3S8AKEYUMk9msdZbuFEGn4qaFJZ","label":"v1.1","audit_url":null}' \
+  json-args '{"hash":"<base58 sha256>","label":"<label>","audit_url":null}' \
   prepaid-gas '30 Tgas' attached-deposit '0 NEAR' \
-  sign-as zavodil.near network-config mainnet sign-with-keychain send
+  sign-as <dao-member>.near network-config mainnet sign-with-keychain send
 ```
 
-The deploy tx is small (just the WASM bytes + storage staking) — it does not hit any wallet URL limit. Use a CLI signer for it.
+Replace `outlayer.testnet` / `outlayer.near` with whichever account pays storage. A mainnet deploy must use a build WITHOUT `--features test-timing` (see [README.md](./README.md#building)).
 
-After landing, the global identifier is the same `Base58CryptoHash` value that's already approved via `keystore-dao.approve_vault_version`. Confirm on-chain availability:
+`approve_vault_version` executes once `approval_threshold` (>50%) DAO members have called it with the same `label` and `audit_url`; each call returns the vote count so far. With the DAO at one member, one call approves.
+
+Check what is approved:
 
 ```bash
-HASH=GiQkqctRW3oGWbSDk5V4MPqZrWw3zf8GDaU75a78pgbD   # whatever shasum -a 256 res/vault_contract.wasm | base58 says
-near contract call-function as-read-only ... # not applicable
+near contract call-function as-read-only dao.outlayer.near \
+  list_approved_vault_versions json-args '{}' network-config mainnet now
+```
 
-# Easier: raw RPC
-curl -sS -X POST https://rpc.testnet.fastnear.com -H 'Content-Type: application/json' -d "{
+Check the code is available as a global contract:
+
+```bash
+HASH=<base58 sha256 of res/vault_contract.wasm>
+curl -sS -X POST https://rpc.mainnet.fastnear.com -H 'Content-Type: application/json' -d "{
   \"jsonrpc\":\"2.0\",\"id\":\"q\",\"method\":\"query\",
   \"params\":{\"request_type\":\"view_global_contract_code\",
               \"finality\":\"final\",
               \"code_hash\":\"$HASH\"}}"
 ```
 
-Should return `{ "result": { "code_base64": "...", "block_height": ... }, ... }`.
+It returns `{ "result": { "code_base64": "...", "hash": "...", "block_height": ..., "block_hash": "..." }, ... }`.
 
-## What the vault deploy tx looks like now
+## The vault deploy transaction
 
-`buildVaultDeployActions` in `dashboard/lib/vault.ts` and the equivalent in `outlayer-cli/src/near.rs` build the same five-action atomic deploy:
+`buildVaultDeployActions` in the dashboard's `lib/vault.ts` and `atomic_deploy_vault` in `outlayer-cli/src/near.rs` build the same five-action atomic deploy, signed by the parent account:
 
-1. `CreateAccount` — the new sub-account for the vault.
-2. `Transfer` — initial NEAR balance (storage + small reserve for the vault's outbound MPC `request_master` calls).
-3. **`UseGlobalContract { CodeHash: <32 bytes> }`** — references the WASM already on chain. **Nothing about the WASM bytes ships in this tx.**
-4. `FunctionCall { method: "new", args: { parent, keystore_dao, mpc_contract, initial_exit_window } }` — runs the contract's constructor.
-5. `AddKey` — the TEE-derived function-call key, scoped to `(receiver=<vault>, methods=["request_master"])`.
-
-Both contract bytecode and wallet UX benefit:
-- Tx body is bounded by step 4's `args` JSON (~200 bytes) and step 5's pubkey + permission, so the whole atomic deploy fits comfortably inside MyNearWallet's URL.
-- All vaults share one canonical WASM in global storage instead of duplicating ~150 KB per customer.
+1. `CreateAccount` — the vault sub-account.
+2. `Transfer` — 1 NEAR: storage plus a standing reserve for the vault's outbound `request_master` gas prepayments.
+3. **`UseGlobalContract { CodeHash: <32 bytes> }`** — references the WASM already on chain.
+4. `FunctionCall { method: "new", args: { parent, keystore_dao, mpc_contract, initial_tee_pubkey, initial_exit_window } }` — the constructor.
+5. `AddKey` — the TEE-derived function-call key (same pubkey as `initial_tee_pubkey`), scoped to `(receiver=<vault>, methods=["request_master"])`, unlimited allowance.
 
 ## Updating the WASM
 
-Bumping the vault contract is the same flow as before, with one extra step:
+1. Edit `vault-contract/src/lib.rs`. Rebuild with `./build.sh`, or `./build-docker.sh` for the reproducible hash.
+2. Deploy the new WASM as a global contract (`near contract deploy-as-global use-file ... as-global-hash`). Each global hash costs storage separately; earlier versions stay referenceable.
+3. Approve the new hash on the DAO (`approve_vault_version`, quorum-gated as above). Optionally `deprecate_vault_version` the previous one (single DAO member; existing vaults keep working).
+4. `outlayer vault init` and the dashboard's Create Vault view-call `keystore_dao.list_approved_vault_versions()` and use the most recent non-deprecated entry — no client rebuild needed.
 
-1. Edit `vault-contract/src/lib.rs`. Rebuild via `bash build.sh` (or `build-docker.sh` for the canonical reproducible hash).
-2. **Deploy the new WASM as a global contract** with `near contract deploy-as-global use-file ... as-global-hash`. Each global hash costs storage independently; the previous version stays referenceable for vaults that were already deployed against it.
-3. **Approve the new hash via DAO multisig** — `keystore-dao.approve_vault_version`.
-4. Customers calling `outlayer vault init` (or the dashboard's Create Vault) from then on will use the new hash automatically: both clients view-call `keystore_dao.list_approved_vault_versions()` and pick the most recent non-deprecated entry, so the `UseGlobalContract` action references whatever hash the DAO has just whitelisted — no client rebuild needed.
-
-Old vaults keep working — they were deployed via `UseGlobalContract { CodeHash: <old_hash> }` and that reference is permanent. They use the old contract's behaviour until the parent does an unlock + redeploy from scratch (or the vault-checker bans them off the verified set).
-
-## Why this matters
-
-Without global contracts, the vault contract's ~150 KB WASM has to be base64-encoded into the wallet's redirect URL. That blew past the 32 KB URL ceiling MyNearWallet enforces, so customers couldn't sign vault deploys through a browser wallet at all. With UseGlobalContract:
-
-| | Old (DeployContract inline) | New (UseGlobalContract) |
-|---|---|---|
-| Tx payload size | ~200 KB | < 1 KB |
-| Browser wallet redirect | ❌ Fails URL limit | ✅ Fits comfortably |
-| Per-vault on-chain WASM bytes | 150 KB × N | 0 (single global copy) |
-| Storage cost per vault | Pays full WASM | Just account storage |
-| WASM upgrade flow | None — each vault baked-in forever | Add new global hash, new vaults pick it up |
+Existing vaults keep the code they were deployed with: the `UseGlobalContract { CodeHash }` reference is permanent and the contract cannot redeploy itself. A customer moves to a new version by deploying a new vault. `revoke_vault_version` (quorum-gated) removes a hash from the approved set: a vault on it can no longer pass `/customer/sign-verification`, but a vault already in `verified_vaults` keeps being served until the DAO bans it (`ban_vault`).
 
 ## Caveats
 
-- The deployer of a global contract by hash pays storage permanently; there's no method to delete a global contract. Pick the canonical operator account.
-- Anyone can deploy a WASM as a global contract; the hash is what identifies it, not who paid. So an attacker could front-run the operator and deploy the same WASM. That's harmless: hash-addressed deploys are content-addressed.
-- The `as-global-account-id` mode is mutable (the deployer account can replace the code). We use `as-global-hash` precisely so the on-chain code is immutable — vaults reference an unchangeable artefact.
+- The payer of a global contract by hash pays storage permanently; a global contract cannot be deleted. Use the canonical operator account.
+- Anyone can deploy a WASM as a global contract. That is harmless: hash-addressed deploys are content-addressed, and only DAO-approved hashes are used.
+- The `as-global-account-id` mode is mutable (the deployer account can replace the code). Vaults use `as-global-hash` so the code they reference cannot change.

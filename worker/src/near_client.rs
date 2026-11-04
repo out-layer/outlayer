@@ -1566,6 +1566,17 @@ mod only_a_taken_transaction_is_reported_as_done {
         assert!(matches!(refused.reason, super::Refusal::NoYield(_)), "{refused}");
     }
 
+    /// The outcome testnet returned for a second `resume_topup` of a yield the
+    /// worker had already resumed (tx in the file): the contract's panic, read
+    /// as a gone yield.
+    #[test]
+    fn the_chains_own_answer_to_a_resume_with_no_yield_is_a_gone_yield() {
+        let o: FinalExecutionOutcomeView =
+            serde_json::from_str(include_str!("testdata/resume_topup_no_yield_testnet.json")).unwrap();
+        let refused = NearClient::require_taken("resume_topup", &o).unwrap_err();
+        assert!(matches!(refused.reason, super::Refusal::NoYield(_)), "{refused}");
+    }
+
     #[test]
     fn an_unfinished_transaction_is_refused() {
         assert!(refusal(&outcome(json!("Started"), vec![])).contains("not finished"));

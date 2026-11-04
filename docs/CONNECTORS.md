@@ -14,16 +14,21 @@ Read this first for the model, that one for the field-by-field reference.
 
 **A connector is an ordinary project that we curated and priced.** There is no
 separate connector runtime, no special deployment, no second API. You write a
-WASI module, publish it like any project, and what makes it a connector is
-decided from two facts:
+WASI module, publish it like any project, and what makes it a connector is:
 
 * it is published under the curated namespace (`connectors.outlayer.near` on
-  mainnet, `connectors.outlayer.testnet` on testnet), and
-* its wasm carries a manifest declaring a `connector_id`.
+  mainnet, `connectors.outlayer.testnet` on testnet), as `{namespace}/{id}`;
+* the coordinator's connector registry lists `{id}` for that network. The
+  registry is code (`connector_registry.rs`), not a table, so a connector
+  arrives with a coordinator release and an operator cannot repoint a name;
+* its wasm carries a manifest declaring `connector_id` equal to `{id}`.
 
-Membership is a comparison against the owner account of a `project_id`, which
-makes "is this a connector" a structural fact rather than something a project
-claims about itself.
+The namespace is a comparison against the owner account of a `project_id`,
+which makes "is this a connector" a structural fact rather than something a
+project claims about itself. The worker is stricter than the coordinator in
+one direction only: a project in the namespace, or one whose manifest declares
+a `connector_id`, gets the connector's fail-closed network rule (§3) whether
+or not the registry lists it.
 
 ### Why the category exists at all
 
@@ -33,7 +38,7 @@ the internet. Three things follow, and they are the whole difference:
 
 | | ordinary project | connector |
 |---|---|---|
-| outbound network | open | **only the hosts your manifest declares** |
+| outbound network | public hosts, unless its manifest declares a list | **only the hosts your manifest declares** |
 | operation naming | your business | a required top-level `operation` string |
 | pricing | per call | **per operation, on chain** |
 
@@ -48,9 +53,10 @@ other calls, other agents' secrets, or the wallet's keys — the same isolation
 every project gets.
 
 It is also not a way to charge whatever you like. Prices live on chain and
-nowhere else, and the contract refuses a call that does not attach the exact
-price of the operation it names. A price baked into your wasm could only ever
-disagree with the one that decides.
+nowhere else, set by the contract's owner, and the contract refuses a call
+that attaches less than the price of the operation it names; anything
+attached over the price comes back to the caller. A price baked into your wasm
+could only ever disagree with the one that decides.
 
 ---
 
@@ -74,15 +80,16 @@ is a defaulted price and the cheapest one is what an attacker would pick.
 
 An operation with no on-chain price is refused too. Unpriced is not free.
 
-**A connector runs its active version, and only that.** The `version_key` a
-call may otherwise use to pin a published version is refused on a connector
-project (`invalid_version_key`, 400). An older version would run an older
+**Over HTTPS a connector runs its active version, and only that.** The
+`version_key` a call may otherwise use to pin a published version is refused
+on a connector project (`invalid_version_key`, 400). **On chain it is not:**
+`request_execution` with a `Project` source runs whichever published version
+its `version_key` names, connector or not. An older version runs an older
 manifest — its network allowlist and its declared limits — and older code
-under the curated name, and its manifest report would replace the connector's
-declared limits for every caller until the active version ran again. To take a
-version out of service, switch the active version and `remove_version` it on
-chain; publishing a fix alone leaves the old one callable on ordinary projects,
-and never callable on a connector.
+under the curated name, and its manifest report replaces the connector's
+declared limits for every caller until the active version runs again. So
+publishing a fix is not enough: to take a version out of service, switch the
+active version and `remove_version` the old one on chain.
 
 Two constraints come with the format: a priced project's request must be a JSON
 object, and on chain it must be at most **10 KB** — the contract parses it, and
@@ -118,7 +125,7 @@ policy the same way:
   anything else withholds the fields and says how to ask
   (`{"present": …, "sealed": false, "note": …}`). Fail-closed: a missing
   variable is treated as public.
-* The seal is the pair near.email runs on: the `ecies` crate in the guest
+* The seal is the `ecies` crate in the guest
   (`default-features = false, features = ["pure"]`), `eciesjs` in the browser —
   secp256k1 ECDH → HKDF-SHA256 → AES-256-GCM, in a format the two libraries
   keep compatible with each other, so nothing about the bytes is ours to get
@@ -395,8 +402,7 @@ The full list of injected variables, and what each means, is in
 
 `NEAR_SENDER_ID` is the identity the guest acts as. It is injected by the worker
 and cannot be chosen by the caller — that is what the two rules above are for.
-near.email turns it into the mailbox it sends from; treat it as the account you
-are acting for.
+Treat it as the account you are acting for.
 
 `NEAR_USER_ACCOUNT_ID` is who **paid**. The two are the same unless the caller
 is an Agent Connect wallet running under a bound account's name, which is opt-in
@@ -443,12 +449,13 @@ the HTTPS wallet API, by the holder of the wallet's credential. A module that
 must move the wallet's own funds uses the policy-metered operations
 (`withdraw`, `transfer`, `swap`), not a signature.
 
-A wallet-using connector is **HTTPS-only**. The wallet reaches the guest from
-the call's credential — a payment key the custody wallet owns, plus
-`X-Wallet-Id` — and the on-chain door carries no such thing, so a module that
-imports `outlayer:wallet` cannot start from `request_execution` at all. Keep
-wallet operations in a connector that is called over HTTPS, and let an on-chain
-caller use a different one.
+Wallet operations are **HTTPS-only**. The wallet reaches the guest from the
+call's credential — a payment key the custody wallet owns, plus
+`X-Wallet-Id` — and the on-chain door carries no such thing. A module that
+imports `outlayer:wallet` still starts on a run with no wallet (its
+`tasks_unlock`, say, needs none), and every wallet function there answers
+`no_wallet: …` and reaches nothing. Serve wallet operations over HTTPS, and
+answer `no_wallet` as a refusal like any other.
 
 By convention a venue connector uses two labels: `trading` for the account
 the venue knows (the key that signs orders) and `bridge` for the EVM address
@@ -653,9 +660,12 @@ applicable one must pass — and none of them can raise another.
 
 ### 5.1 Price (the contract)
 
-Per operation, in the contract's pricing table, with the author's share and the
-account it pays to alongside it. The chain enforces it: `request_execution`
-refuses a call that does not attach the operation's exact price.
+Per operation, in the contract's pricing table (`get_project_pricing`), with
+the author's share and the account it pays to alongside it. The contract's
+owner sets it (`set_project_pricing`). The chain enforces it:
+`request_execution` refuses a call that attaches less than the operation's
+price, and returns what was attached over it. The coordinator mirrors the
+table every 60 seconds and bills HTTPS calls from that copy.
 
 You do not set this in your manifest: it carries no price.
 
@@ -691,24 +701,25 @@ changes nothing. There is no comparison to get wrong and no drift to detect.
 when the declaration is stored:
 
 ```jsonc
-// in your manifest
-{ "operation": "send:external", "window": "day", "max_count": 3, "applies": "covered" }
+// in the Gmail connector's manifest
+{ "operation": "send", "window": "day", "max_count": 500, "applies": "everyone" }
 // what it becomes, and what the counter is keyed by
-"gmail:send:external"
+"gmail:send"
 ```
 
-Write the prefix yourself and you get `gmail:gmail:send:external`.
+Write the prefix yourself and you get `gmail:gmail:send`.
 Rules are matched exactly, so it caps nothing — and nothing tells you: no error,
 no log, no failing call. You would ship believing you had limited yourself. The
 id is added rather than accepted so a manifest cannot declare limits about a
 *different* connector.
 
-The rest of the name is yours and may be finer than the operation. `send:external`
-is not a second operation — it is what a `send` counts as when any recipient is
-outside near.email, a distinction only the connector can make.
+A call is counted as `{id}:{operation}`. A finer key — the same operation
+counted differently by what it carries — is the registry's `limit_key`, in the
+coordinator's code, and no connector uses one. A manifest rule on a name no
+call is counted as matches nothing.
 
-Use this for a cap that protects something only you know about — mail
-deliverability is the canonical case. It travels inside the wasm and is covered
+Use this for a cap that protects something only you know about — a ceiling
+below the upstream service's own quota is the canonical case. It travels inside the wasm and is covered
 by the on-chain hash, so it holds even where the coordinator's own table does
 not.
 
@@ -729,9 +740,10 @@ Independent of anything you declare:
   or `owner/*`. Empty means any project. The wildcard is a whole trailing
   segment only: `owner/pre*` does not match `owner/prefix`.
 * **balance or subscription** — a call is paid from the key's money or from an
-  allowance. A subscription runs **one call at a time** per key; a second
-  concurrent one falls back to money if the key has any, and is refused with
-  `call_already_in_flight` (retryable) if it does not. Money-paid calls have no
+  allowance. A subscription runs **one call at a time** per key (a sponsored
+  key runs as many as its sponsor code's `max_parallel`); a further
+  concurrent one is paid from the key's balance when that covers it, and is
+  refused with `call_already_in_flight` (retryable) when it does not. Money-paid calls have no
   concurrency limit and never occupy the subscription's slot.
 * **compute** — resource limits per call, clamped to the tier's ceilings.
 
@@ -772,9 +784,10 @@ or loses without its description fails the build; a parameter it gains does not.
 
 ## 7. Testing before you ship
 
-`connectors/connector-probe` exists for exactly this. It is published,
-priced, metered and manifested like a real connector, and every operation
-reports one fact about the platform rather than doing work:
+`connectors/connector-probe` exists for exactly this (testnet only). It is
+published, priced, metered and manifested like a real connector, and every
+operation reports one fact about the platform rather than doing work. The
+core ones — the whole list, tasks and refunds included, is in its README:
 
 | operation | what it proves |
 |---|---|
@@ -802,8 +815,10 @@ access; one that echoed secrets would make every test run a leak.
 4. Publish under the curated namespace.
 5. Price every operation on chain, including the free ones — unpriced is
    refused, not free.
-6. Decide whose secret you need: yours (`secrets_ref` + an `AccessCondition`) or
-   the caller's (`X-Use-Owner-Secret`). Most connectors need neither.
+6. Decide whose secret you need: yours (`author_secrets` in the manifest; the
+   row's `AccessCondition` admits callers), the owner's (a row the call names
+   in `secrets_ref`), or the agent's own (`X-Use-Owner-Secret`). Most
+   connectors need none.
 7. Declare a `limits` entry for anything only you know is fragile.
 8. Handle errors. Read `NEAR_SENDER_ID` for who you act as and
    `NEAR_USER_ACCOUNT_ID` for who paid; never take either from the input.
@@ -815,5 +830,5 @@ access; one that echoed secrets would make every test run a leak.
 * [`wasi-examples/CONNECTOR_MANIFEST.md`](../wasi-examples/CONNECTOR_MANIFEST.md) — manifest reference
 * [`wasi-examples/WASI_TUTORIAL.md`](../wasi-examples/WASI_TUTORIAL.md) — writing and building a WASI guest
 * [`wasi-examples/WASM_ENV_VARS.md`](../wasi-examples/WASM_ENV_VARS.md) — every injected variable
-* [`skills.outlayer.ai/outlayer-connectors`](https://skills.outlayer.ai/outlayer-connectors/SKILL.md) — the library as an AGENT reads it: the call, the refusal codes, what a call costs, and one line per connector. Every connector publishes its own skill beside it (`https://skills.outlayer.ai/<connector>/SKILL.md`), with a pointer to that URL next to the code; write one when you publish, because an agent that has to infer your operations from prose gets them wrong
+* [`skills.outlayer.ai/outlayer-connectors`](https://skills.outlayer.ai/outlayer-connectors/SKILL.md) — the library as an AGENT reads it: the call, the refusal codes, what a call costs, and one line per connector. Every connector publishes its own skill beside it (`https://skills.outlayer.ai/<id>-connector/SKILL.md`), with a pointer to that URL next to the code; write one when you publish, because an agent that has to infer your operations from prose gets them wrong
 * [`connectors/connector-probe/`](../connectors/connector-probe/) — a working connector to copy

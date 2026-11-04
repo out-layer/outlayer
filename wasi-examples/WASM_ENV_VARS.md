@@ -1,6 +1,8 @@
 # WASM Environment Variables
 
-Environment variables available to your WASM code during execution.
+Environment variables available to your WASM code during execution. WASI P1
+modules and P2 components receive the same set; the authoritative list is
+`SYSTEM_ENV_VARS` in `worker/src/main.rs`.
 
 > **Note**: For WASI P2 modules, consider using the [OutLayer SDK](./WASI_TUTORIAL.md#outlayer-sdk) instead of raw env vars. The SDK provides type-safe access via `outlayer::env::signer_account_id()` and persistent storage via `outlayer::storage`.
 
@@ -49,9 +51,12 @@ let display_name = sender_id.strip_suffix(account_suffix).unwrap_or(&sender_id);
 | Variable | NEAR Mode | HTTPS Mode |
 |----------|-----------|------------|
 | `NEAR_SENDER_ID` | Transaction signer account; for a meta-transaction, the account that signed the delegate action | Payment Key owner |
-| `NEAR_USER_ACCOUNT_ID` | Same as sender | Same as sender |
+| `NEAR_USER_ACCOUNT_ID` | The account that sent the transaction (the payer) | Payment Key owner (the payer) |
 
-Always set in both modes.
+Always set in both modes. The two are the same account unless the request sets
+`use_bound_identity` (Agent Connect): then `NEAR_SENDER_ID` is the bound
+account, verified against the chain inside the worker's TEE before the run
+starts, and `NEAR_USER_ACCOUNT_ID` stays the paying account.
 
 **Recommended**: For WASI P2, use the OutLayer SDK instead:
 
@@ -229,11 +234,13 @@ fn main() {
 | `NEAR_MAX_MEMORY_MB` | Yes | Yes | No |
 | `NEAR_MAX_EXECUTION_SECONDS` | Yes | Yes | No |
 | `WALLET_ID` | If wallet | If wallet | No |
-| `NEAR_RPC_PROXY_AVAILABLE` | If proxy | If proxy | No |
+| `NEAR_RPC_PROXY_AVAILABLE` | `"1"` if the RPC proxy is on (P2 only) | `"1"` if the RPC proxy is on (P2 only) | No |
 
-Every name in this table is **reserved**: `store_secrets` refuses it as a secret
-key, and the worker strips it from your secrets before writing its own value. So
-what you read here always came from the worker — never from whoever called you.
+Every name in this table is **reserved**: the keystore refuses it as a secret
+name when secrets are encrypted, and the worker strips it from your secrets
+before writing its own value. So what you read here always came from the
+worker — never from whoever called you. The `PROTECTED_` prefix is reserved as
+well: only secrets the keystore generates carry it.
 
 `WALLET_ID` is informational. The authoritative answer is the `wallet::get_id`
 host function, which cannot be influenced by the environment at all.

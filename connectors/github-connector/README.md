@@ -2,8 +2,12 @@
 
 An agent works in the owner's GitHub account — **as the owner** — without ever
 holding the credential. Issues, comments, files, branches, commits, pull
-requests, reviews and gists. The token stays in the enclave; the owner's policy
-decides what the agent may do with it.
+requests, reviews and gists. Once stored, the token is decrypted only in the
+keystore and worker TEEs and never appears in an answer (while connecting, it
+passes through the connect page's server-side code exchange and the owner's
+browser, which seals it); the owner's policy decides what the agent may do with
+it. The trust and governance model at this stage is in
+[`docs/NON_CUSTODIAL.md`](../../docs/NON_CUSTODIAL.md).
 
 There are no prompts here and no judgement. This is an interface to GitHub: what
 to read, what to write and whether a change is any good is the agent's business;
@@ -49,8 +53,10 @@ repository is a disclosure too.
 }
 ```
 
-Every field narrows; absent means the narrowest reading, not the widest. `*`
-matches any run of characters, `/` included, and is the only wildcard.
+Every field narrows; absent means the narrowest reading, not the widest — except
+`paths` (absent: any path not under `.github/`) and `marker` (absent: the
+default marker). `*` matches any run of characters, `/` included, and is the
+only wildcard.
 
 Two rules worth stating on their own:
 
@@ -185,8 +191,9 @@ cell, then made, and its whole result is left for the agent, sealed, in
 | refused | the task | the refusal |
 |---|---|---|
 | before the answer is taken: no `task_id` or `task_hash`, no policy or an unreadable one, anything the host refuses the answer for (`task_not_found`, `not_the_preparer`, `task_approval_invalid`, `task_hash_mismatch`, `task_answer_invalid`, `task_store_unavailable`, `task_closed`, `task_expired`, `task_void`) | stays as it was in the run; the platform ends it `failed` with `run_refused:unreported` (a refusal of the connector's own, which the host never saw) or `run_refused:<reason>` (one of the host's) | as it is |
-| after: a state that is not a write, the policy, the day's count, the token, GitHub's refusal of the write | ends `failed` | its own code, and a sentence ending "The task is closed: to make this write, prepare it again" |
-| after the write was made: its result could not be left for the agent | ends `failed` | its own code, and "The write WAS made on GitHub (…) and the task is closed without its result: do not prepare it again" |
+| after: a state that is not a write, the policy, the day's count, the token, GitHub's refusal of the write | ends `failed` as `run_failed`, the refusal in its result; the owner is told in a notice under the task | its own code, and a sentence ending "The task is closed: to make this write, prepare it again" |
+| a write reached GitHub and its outcome is not known: an earlier step was made, or GitHub's answer was lost | ends `failed` as `run_unreported` | its own code, and "… so it MAY have been made: check the repository before preparing it again" |
+| after the write was made: its result could not be left for the agent | ends `failed` as `run_unreported` | its own code, and "The write WAS made on GitHub (…) and the task is closed without its result: do not prepare it again" |
 
 **What `confirm` answers.** The run the platform starts is an HTTPS call, so
 it answers what the write answers, with `status`, `task_id` and `action`. On
@@ -218,6 +225,7 @@ The word before the colon is the contract; branch on it.
 
 | word | what it means | retry? |
 |---|---|---|
+| `credential_missing` | no `GITHUB_TOKEN` reached the run: the call named no row of the owner's, or the row holds none | no — name the owner's row, or the owner connects |
 | `policy_missing`, `policy_unreadable` | the owner has stored no policy, or one this build cannot read | no — the owner acts |
 | `policy_denied` | the policy does not allow this | no — the owner acts |
 | `invalid` | the request is wrong: a missing field, a bad path, GitHub's own validation | no — fix and call again |
@@ -227,11 +235,13 @@ The word before the colon is the contract; branch on it.
 | `conflict` | the branch or file moved since it was read | read again, then repeat |
 | `rate_limited` | GitHub is throttling; the sentence says how long | after the wait, once |
 | `token_rejected` | the token was revoked or replaced | no — the owner reconnects |
-| `github_unavailable`, `github_unreachable` | GitHub answered 5xx, or could not be reached | later |
+| `github_unavailable`, `github_unreachable` | GitHub answered 5xx, or could not be reached | later — but after a write, check whether it was made first |
+| `github_refused` | GitHub answered a status none of the above covers | no |
 | `too_large` | the file is past the limit the operation returns | no |
 
-A refused write costs nothing: the place in the day's budget is taken before
-GitHub is called and given back unless GitHub accepted.
+A refused write costs no place in the day's budget: the place is taken before
+GitHub is called and given back unless GitHub accepted. The operation's fee is
+charged all the same, because the run ran.
 
 ## What the owner stores
 
@@ -275,10 +285,9 @@ near contract call-function as-transaction outlayer.testnet create_project \
 CONTRACT=outlayer.testnet OWNER=owner.outlayer.testnet ./set-prices.sh testnet
 ```
 
-Being a connector also needs an entry in the coordinator's
-`connector_registry.rs`, which is code: it arrives with a coordinator release.
-Until then the project runs as an ordinary project — no per-operation price, and
-no outbound allowlist.
+Being a connector also needs its entry in the coordinator's
+`connector_registry.rs`, which is code and ships with a coordinator release;
+`github` is listed on both networks.
 
 ## Layout
 

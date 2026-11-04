@@ -1,137 +1,168 @@
 # Agent Custody: Outlayer (TEE) vs. TLA active-signer (on-chain MPC)
 
-An objective side-by-side of the two custody models, followed by notes on the
-theses. The two are built for different jobs — this is meant to make the
-trade-offs visible, not to declare a winner.
+A side-by-side of the two custody models, followed by notes on each point.
+The two are built for different jobs; this is meant to make the trade-offs
+visible, not to declare a winner. The OutLayer column describes OutLayer's
+code. The `active-signer` column describes that design as it was presented
+to us; its figures are our estimates, not measurements.
 
 ## Comparison
 
 | Dimension | Outlayer custody (TEE) | TLA `active-signer` (on-chain MPC) |
 |---|---|---|
-| Trust root | Intel TDX enclave, remotely attested (Intel DCAP / PCS) &nbsp;\* | NEAR MPC network + on-chain `active-signer` contract |
-| Where the key lives | Sealed in the enclave, never leaves | Held by no one — threshold-shared across MPC nodes |
-| Signature latency | Sub-second (in-enclave, ~ms) | ~2–6 s — signer call + MPC yield/resume, multi-block |
-| Overhead per signed action | None beyond the action's own transaction | Signer function-call + MPC round + broadcast, on top of the action |
-| Gas to produce a signature | None | ~0.003–0.008 NEAR/sig (tens of TGas burned) |
-| Chains from one custody | NEAR, Solana (ed25519), EVM (secp256k1) | NEAR — `active-signer` builds NEAR transactions |
-| Account onboarding | Implicit account — no `create_account` / `add_key`, no intents key registration | Named account — MPC-derive + `create_account` + `add_key` + funding (~0.002+ NEAR storage), **plus** `add_public_key` on `intents.near`, all on-chain per agent |
-| Concurrency | Parallel in-enclave signing | Per-account nonce commit serializes actions |
-| Action set | Programmable (capabilities, reject-if-tx guards) | `function_call` + `transfer` only, enforced at the type level |
+| Trust root | Intel TDX enclave, remotely attested (Intel DCAP / PCS), plus OutLayer's coordinator and, at this stage, OutLayer-held governance keys &nbsp;\* | NEAR MPC network + on-chain `active-signer` contract |
+| Where the key lives | Derived on demand inside the keystore enclave from a master secret; never stored, no endpoint exports it. Stage caveat: the DAO account's full-access key can obtain the shared master outside an enclave | Held by no one — threshold-shared across MPC nodes |
+| Producing a signature | One coordinator → keystore round trip, which includes one RPC view read of the on-chain policy; no transaction, no MPC round | Signer call + MPC yield/resume, multi-block (~2–6 s, estimate) |
+| Overhead per signed action | None beyond the action's own transaction or intent | Signer function-call + MPC round + broadcast, on top of the action |
+| Gas to produce a signature | None | ~0.003–0.008 NEAR/sig (estimate) |
+| Chains from one custody | NEAR (ed25519), Solana (ed25519), EVM (secp256k1, one address on every EVM chain) | NEAR — `active-signer` builds NEAR transactions |
+| Account onboarding | Implicit account — no `create_account` / `add_key` and no `intents.near` key registration | Named account — MPC-derive + `create_account` + `add_key` + funding for storage, **plus** `add_public_key` on `intents.near`, all on chain per agent |
+| Concurrency | Money-moving operations on one wallet are serialized by the coordinator (velocity limits, NEAR nonces); separate wallets run in parallel | Per-account nonce commit serializes actions |
+| Action set | Programmable policy: capabilities, limits, whitelists, approvals, reject-if-transaction guards | `function_call` + `transfer` only, enforced at the type level |
 | Ownership transfer / resale | Not a native primitive | Native — compare-and-swap of the operating key |
-| Built-in recovery | Via composition (vaults / external policy) | Native policy engine — timelock, watcher quorum, attestation |
+| Built-in recovery | Of the custody root: per-customer vaults with a unilateral exit (testnet). Of an agent's authority: by composition | Native policy engine — timelock, watcher quorum, attestation |
 | Human-readable identity | Implicit hex by default | Named (TLA sub-account, e.g. `agent.claude`) |
-| Verifiability of authority | Remote attestation of the measured code | On-chain contract logic + MPC network |
+| Verifiability of authority | Remote attestation of the measured code; on-chain approval of measurements | On-chain contract logic + MPC network |
 
-\* Both models ultimately root in MPC — the difference is *when* and *how often*.
-Outlayer's per-key material is deterministically derived from a master secret
-that the keystore-worker obtains **once, at startup, from the NEAR MPC network**.
-That derivation runs inside the enclave, is deterministic, and the master never
-leaves the enclave. From then on the worker signs locally, with no further MPC
-call per action. The `active-signer` model instead calls MPC (`v1.signer`) on
-**every** signature. So it is not "TEE vs MPC" — both use MPC — it is one MPC
-touch at worker startup to seed an in-enclave master versus one MPC round-trip
-per signed action.
+\* Both models root in MPC; the difference is *when* and *how often*.
+OutLayer's wallet keys are derived (HMAC-SHA256) from a master secret that the
+keystore obtains from the NEAR MPC network through an on-chain `request_key`
+call on the DAO contract, which only an approved, attested keystore's access
+key can make. The shared root is obtained when the keystore starts; a
+per-customer vault's master is obtained through the customer's own vault
+contract when the keystore first serves that vault. From then on the keystore
+signs locally, with no MPC call per action. The `active-signer` model calls
+MPC (`v1.signer`) on **every** signature. So it is not "TEE vs MPC": it is one
+MPC derivation per master versus one MPC round-trip per signed action.
 
-Rows 10–13 are where the TLA model is stronger: ownership transfer, a built-in
-recovery policy engine, and human-readable names are first-class there and are
-not native to Outlayer custody. Rows 3–9 are where the TEE model is stronger,
-and they cluster around one thing: signing is local, not an on-chain round-trip.
+The master stays in enclave memory, with one exception at this stage:
+`dao.outlayer.near` carries a full-access key, and a transaction signed with it
+passes the `request_key` check, so its holder can obtain the shared master
+outside any enclave. See
+[Governance at this stage](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md#governance-at-this-stage).
 
-## Notes on the theses
+Ownership transfer, a built-in recovery engine for an agent's authority, and
+human-readable names are first-class in the TLA model and not native to
+OutLayer custody. Signing cost, signing latency, chain coverage and onboarding
+are where the TEE model is stronger, and they come from one thing: signing is
+local, not an on-chain round-trip. Concurrency is not a difference: both
+serialize per account.
+
+## Notes
 
 ### Latency and cost per action
 
-Outlayer signs inside the enclave: sub-second, no on-chain round-trip, and no gas
-to produce the signature. The on-chain-signer + MPC path pays, for **every**
-signed action, a function-call transaction into the signer contract, an MPC
-signing round (yield / resume across several blocks, seconds of latency), and a
-broadcast. Both models still pay the underlying transaction's own gas when the
-action hits the chain; the difference is the signing overhead layered on top. At
-wallet cadence — a few transactions a day — that overhead is negligible. At agent
-cadence — many actions a minute — it dominates.
+OutLayer signs inside the keystore enclave, with no transaction and no gas to
+produce the signature. The keystore reads the wallet's encrypted policy from
+the chain (a view call, free) before it signs. The on-chain-signer + MPC path
+pays, for **every** signed action, a function-call transaction into the signer
+contract, an MPC signing round (yield / resume across several blocks), and a
+broadcast. Both models pay the underlying transaction's own gas when the action
+hits the chain; the difference is the signing overhead layered on top. At
+wallet cadence — a few transactions a day — that overhead is negligible. At
+agent cadence — many actions a minute — it dominates.
+
+End to end, an OutLayer operation that moves money also waits for its own
+settlement (a NEAR transaction, or an intent through the solver relay), which
+is seconds, not milliseconds.
 
 **Worked example — an agent doing one action per minute** (1,440 actions/day):
 
 - *TLA `active-signer`:* ~0.003–0.008 NEAR of signing overhead per action →
-  roughly **4–12 NEAR/day**, purely in signing overhead, before the underlying
-  transactions' own gas — plus 2–6 s of added latency on every action. It scales
-  linearly with cadence, so an agent acting every few seconds costs
-  proportionally more.
-- *Outlayer:* **0 NEAR** of signing overhead and sub-second signing, at any
-  cadence.
+  roughly **4–12 NEAR/day**, before the underlying transactions' own gas, plus
+  the MPC round's latency on every action.
+- *Outlayer:* **0 NEAR** of signing overhead. A free-tier wallet has a daily
+  ceiling on custody operations; a subscription lifts it.
 
-These figures are estimates — `1 TGas ≈ 0.0001 NEAR` at floor gas price, tens of
-TGas burned along the `active-signer` → `v1.signer` → callback chain
-(confidence: low–moderate). The point is the order of magnitude and that the cost
-accrues **per action**, not the exact number.
+The `active-signer` figures are estimates — `1 TGas ≈ 0.0001 NEAR` at floor
+gas price, tens of TGas burned along the `active-signer` → `v1.signer` →
+callback chain (confidence: low–moderate). The point is the order of magnitude
+and that the cost accrues **per action**.
 
 ### One custody, multiple chains
 
-The same derived-key root signs NEAR (ed25519), Solana (ed25519) and EVM
-(secp256k1). There is no per-chain signing contract to deploy or maintain. The
-`active-signer` model, as designed, builds NEAR transactions specifically.
+One wallet signs NEAR (ed25519), Solana (ed25519) and EVM (secp256k1); each
+chain family has its own derivation seed, so a signature for one can never be
+a signature for another. There is no per-chain signing contract to deploy. For
+EVM and Solana the client builds and broadcasts the transaction; the keystore
+only signs. The `active-signer` model, as designed, builds NEAR transactions.
 
 ### Onboarding: implicit accounts
 
-Agents onboard as NEAR implicit accounts — the account ID *is* the public key —
-so there is no `create_account` and no `add_key`. A single off-chain signature is
-enough to start transacting, which is what keeps NEAR Intents onboarding to one
-signature with no on-chain key registration. The named-account model requires
-on-chain account creation, funding for storage, and a key install per agent.
+Agents get NEAR implicit accounts — the account ID *is* the public key — so
+there is no `create_account` and no `add_key`. A wallet can receive funds and
+act on `intents.near` without any on-chain setup. The named-account model
+requires on-chain account creation, funding for storage, and a key install per
+agent.
 
 There is a second, intents-specific cost. NEAR Intents authorizes a NEP-413
-signature against a public key. For an implicit account the account ID *is* that
-key, so Intents can derive it directly and nothing needs to be registered. For a
-named account the key cannot be inferred from the name, so the signing key must
-be registered with `intents.near` via `add_public_key` before Intents will
-recognize the account — an extra on-chain call per agent that the implicit model
-skips entirely.
+signature against a public key. For an implicit account the account ID *is*
+that key, so Intents derives it directly and nothing needs to be registered.
+For a named account the key cannot be inferred from the name, so it must be
+registered with `intents.near` via `add_public_key` before Intents will
+recognize the account — an extra on-chain call per agent.
 
-### Programmable policy, co-located with the key
+### Programmable policy, evaluated next to the key
 
-Signing policy runs in the same attested enclave that holds the key: a capability
-model per key, canonical-operation signing with reject-if-transaction guards, and
-per-customer master-secret isolation. The `active-signer` model takes a different
-and also-strong approach to safety — the action set is restricted to
-`function_call` + `transfer` at the type level, so dangerous actions cannot be
-expressed at all. Ours is programmable; theirs is hard-restricted. Different
-tools for different risk models.
+The keystore enclave that holds the key evaluates the wallet's policy before
+every signature: capabilities per primitive (default-deny under a policy),
+per-transaction caps, recipient whitelists, time windows, freeze and
+multisig approvals. Two parts sit outside the enclave and are trusted to the
+coordinator: the cumulative counters (daily, hourly, monthly caps and the
+hourly rate limit), and, for five intents operations (swaps, cross-chain
+withdrawals, confidential-intents operations, limit orders, payment checks),
+the message that is signed. Details:
+[Limits we state plainly](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md#11-limits-we-state-plainly).
 
-### Compute and custody in one environment
+The `active-signer` model restricts the action set to `function_call` +
+`transfer` at the type level, so dangerous actions cannot be expressed at all.
+Ours is programmable; theirs is hard-restricted. Different tools for different
+risk models.
 
-Outlayer pairs custody with verifiable compute. An agent's logic and its
-signing run in the same TEE, so it can compute privately and sign the result in
-one attested environment rather than splitting where it thinks from where it
-signs. The TLA model is a custody-and-ownership layer; it has no co-located
-compute story, and does not need one.
+### Compute and custody on one platform
+
+OutLayer pairs custody with verifiable compute. An agent's logic runs in an
+attested TDX worker and its keys are used in an attested TDX keystore; the
+worker reaches the wallet through host functions that the coordinator routes
+to the keystore. The agent can compute privately and sign the result without
+leaving attested hardware, though the two run in separate enclaves with the
+coordinator between them. The TLA model is a custody-and-ownership layer; it
+has no compute component, and does not need one.
 
 ### Concurrency
 
-There is no per-account on-chain nonce commit serializing an agent's actions; the
-enclave signs in parallel. In the `active-signer` model the nonce is committed
-per account per action, which serializes concurrent actions from one account.
+The coordinator serializes money-moving operations per wallet: the velocity
+limits need a consistent read-evaluate-record window, and NEAR transactions
+from one account need ordered nonces. A second operation on a busy wallet
+waits briefly, then is told `wallet_busy`. Separate wallets do not block each
+other, so an agent that needs parallelism spreads it across wallets. The
+`active-signer` model serializes per account on its nonce commit. Neither model
+signs in parallel for one account.
 
-### Honest trust assumptions
+### Trust assumptions
 
-To be precise rather than to overclaim:
+- OutLayer trusts the Intel TDX hardware and the DCAP / Intel PCS attestation
+  chain, plus on-chain approval of the enclave's measurements. It is a
+  single-vendor hardware trust root.
+- OutLayer's coordinator is trusted for agent custody: it authenticates API
+  keys, keeps the cumulative counters and pending approvals, and supplies the
+  signed message for five intents operations.
+- At this stage governance runs on single keys held by OutLayer: the DAO's
+  full-access key, owner-only measurement approval, and contracts upgraded by
+  key. See [Governance at this stage](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md#governance-at-this-stage).
+- The TLA model trusts the NEAR MPC network (threshold, no single holder) and
+  the correctness of the `active-signer` contract.
 
-- Outlayer trusts the Intel TDX TEE and the DCAP / Intel PCS attestation chain,
-  plus on-chain approval of the enclave's measurements. It is a single-vendor
-  hardware trust root.
-- The TLA model trusts the NEAR MPC network (threshold, no single holder) and the
-  correctness of the `active-signer` contract.
-
-These are genuinely different roots — threshold-distributed versus attested
-hardware — not one strictly stronger than the other. The latency, cost,
-multi-chain and co-located-compute properties above are consequences of the TEE
-root; the ownership, recovery and naming primitives are consequences of the
-on-chain root.
+These are different roots — threshold-distributed versus attested hardware
+plus an operator — not one strictly stronger than the other. The cost,
+chain-coverage and co-located-compute properties above are consequences of
+the TEE root; the ownership, recovery and naming primitives are consequences
+of the on-chain root.
 
 ### Where the two compose
 
-Naming and recovery can sit **on top of** Outlayer custody without changing the
-root. A native-mode recovery that targets ordinary NEAR accounts already reaches
-Outlayer's implicit accounts, so recovery does not require moving custody or
-adopting named accounts. The sensible split is one custody root (TEE, for
-agent-cadence signing) with a policy layer — naming, ownership, recovery —
-composing above it.
+Naming and recovery can sit **on top of** OutLayer custody without changing
+the root: OutLayer's wallets are ordinary NEAR implicit accounts, so a policy
+layer that targets ordinary NEAR accounts can target them. The sensible split
+is one custody root (TEE, for agent-cadence signing) with a policy layer —
+naming, ownership, recovery — composing above it.

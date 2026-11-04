@@ -3,9 +3,9 @@
 A connector that does nothing useful, so that everything **around** a connector
 can be tested.
 
-The real connectors need something outside the platform to answer — near.email
-is mainnet-only, Mercury needs a bank account — which leaves the connector path
-itself unexercisable by them alone: pricing, the fixed fee per firing, the
+The real connectors need something outside the platform to answer — Gmail
+needs a Google account, Mercury a bank account — which leaves the connector
+path itself unexercisable by them alone: pricing, the per-operation fee, the
 per-operation caps, the owner's secret, the outbound allowlist. This one is
 published like a connector, priced like a connector and metered like a
 connector — and reports back what it saw, with nothing external in the way.
@@ -185,5 +185,5 @@ test run into a leak.
 
 ## Where the full runbook is
 
-`docs/TESTNET_RUNBOOK.md` in the coordinator repository — the ordered list of
+`docs/TESTNET_RUNBOOK.md` in the coordinator repository (private) — the ordered list of
 calls that checks each limit and each refusal, with what a pass looks like.

@@ -1,16 +1,18 @@
 # Payment Checks
 
-Gasless agent-to-agent payments via ephemeral intents accounts. Agent A locks tokens into a check and sends a single key to Agent B, who claims the funds — no gas, no on-chain account, no private key exchange. Supports partial claims, expiry, and reclaim.
+Gasless agent-to-agent payments through ephemeral NEAR Intents accounts. Agent A locks tokens from its intents balance into a check and sends a single key to Agent B, who claims the funds into its own wallet — no gas, no on-chain account, no exchange of wallet keys. Supports partial claims, expiry, and reclaim.
+
+Payment checks run on NEAR Intents, which is mainnet only: on testnet every endpoint answers 503. The website reference is https://app.outlayer.ai/docs/payment-checks.
 
 ## Why Payment Checks
 
 | Problem | Payment Checks Solution |
 |---------|------------------------|
-| Direct transfers require gas (NEAR) from both sides | Fully gasless — uses solver relay with off-chain NEP-413 signatures |
-| Receiver needs an on-chain account with gas | Receiver only needs a wallet API key |
+| Direct transfers require NEAR for gas | Create, claim and reclaim are gasless — solver relay with off-chain NEP-413 signatures |
+| Receiver needs an on-chain account with gas | Receiver needs only an OutLayer wallet credential |
 | Direct transfers are irreversible | Sender can reclaim unclaimed funds at any time |
 | No native partial payment support | Built-in partial claim and partial reclaim |
-| Escrow requires smart contract development | Check acts as lightweight escrow — one API call |
+| Escrow requires smart contract development | A check acts as lightweight escrow — one API call |
 
 ## How It Works
 
@@ -38,44 +40,56 @@ Agent A (Sender)              Agent B (Receiver)
 
 ### Step-by-step
 
-1. **Create** — Agent A calls `POST /wallet/v1/payment-check/create`. The TEE derives a unique ephemeral key, transfers tokens from the wallet to the ephemeral account via solver relay (gasless), and returns a `check_key`.
+1. **Create** — Agent A calls `POST /wallet/v1/payment-check/create`. The tokens must already be in A's intents balance (`POST /wallet/v1/intents/deposit` or a cross-chain deposit). The keystore derives a unique ephemeral key, the wallet signs a transfer of the tokens from its intents balance to the ephemeral account, the coordinator publishes it to the solver relay, and the response carries the `check_key`.
 
 2. **Share** — Agent A sends the `check_key` to Agent B over any channel (HTTP, message, QR code). The key is a 64-char hex string.
 
-3. **Peek** (optional) — Agent B calls `POST /wallet/v1/payment-check/peek` with the key to verify the check's balance, memo, and expiry before claiming.
+3. **Peek** (optional) — Agent B calls `POST /wallet/v1/payment-check/peek` with the key to read the check's balance, memo, status and expiry before claiming.
 
-4. **Claim** — Agent B calls `POST /wallet/v1/payment-check/claim` with the key. The coordinator signs a transfer intent from the ephemeral account to Agent B's wallet via solver relay. Supports partial claims.
+4. **Claim** — Agent B calls `POST /wallet/v1/payment-check/claim` with the key. The coordinator signs, with the `check_key`, a transfer intent from the ephemeral account to Agent B's intents balance and publishes it. Supports partial claims.
 
-5. **Reclaim** (optional) — Agent A can reclaim any unclaimed funds at any time via `POST /wallet/v1/payment-check/reclaim`. The TEE re-derives the ephemeral key (no need to store it).
+5. **Reclaim** (optional) — Agent A can reclaim unclaimed funds via `POST /wallet/v1/payment-check/reclaim`. The keystore derives the ephemeral key again, so A does not need to store it.
 
 ## Transfer Mechanism
 
-All operations use the **NEAR Intents solver relay** — a gasless off-chain transfer protocol. Instead of on-chain transactions (which require NEAR for gas), the coordinator signs NEP-413 messages and submits them to the solver relay.
+Every leg is a NEAR Intents `transfer` intent: the coordinator gets a NEP-413 signature and submits it to the solver relay, which executes it on `intents.near`. Nothing pays gas.
 
 | Operation | From → To | Who Signs | Gas |
 |-----------|-----------|-----------|-----|
-| Create | Wallet → Ephemeral | Wallet key (TEE keystore) | None |
-| Claim | Ephemeral → Claimer | Ephemeral key (from check_key) | None |
-| Reclaim | Ephemeral → Creator | Ephemeral key (TEE re-derivation) | None |
+| Create | Sender's intents balance → ephemeral account | Sender's wallet key (keystore TEE) | None |
+| Claim | Ephemeral account → claimer's intents balance | The `check_key`, used by the coordinator | None |
+| Reclaim | Ephemeral account → sender's intents balance | The ephemeral key, derived again by the keystore and used by the coordinator | None |
 
 ### Ephemeral Accounts
 
-Each check gets its own ephemeral account on `intents.near`, derived from the wallet's master secret + a monotonic counter. This gives each check an isolated balance that can only be moved by whoever holds the `check_key` (claim) or by the TEE re-deriving the key (reclaim).
+Each check gets its own account on `intents.near`, derived from the wallet's master secret and a per-wallet counter. This gives each check an isolated balance that can be moved by whoever holds the `check_key`, or by the sender through a reclaim.
 
 ```
-Key derivation hierarchy:
-  wallet:{id}:near                        ← main wallet key
+Key derivation (HMAC-SHA256 with the wallet's master, inside the keystore):
+  wallet:{id}:near                        ← main wallet key (never exported)
   wallet:{id}:near:check:{counter}        ← ephemeral key per check
 
 The check_key IS the raw ed25519 private key of the ephemeral account.
 The ephemeral account ID = hex(public_key) on intents.near.
 ```
 
+A wallet bound to a per-customer vault derives its check keys from the vault's master.
+
+## Policy
+
+Under a stored policy, creating a check needs `capabilities.payment_check.allowed = true` (default-DENY), and the check's token and amount are held to the policy's per-transaction limit. A check routes funds to whoever holds its key, so a recipient whitelist cannot gate it; the capability is the gate. A wallet with no policy can create checks freely.
+
+The create message is supplied by the coordinator, not built by the enclave: see [Limits we state plainly](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md#11-limits-we-state-plainly).
+
 ## API Reference
 
 Base URL: `https://api.outlayer.ai/wallet/v1/payment-check`
 
-All endpoints require `Authorization: Bearer wk_...` header.
+Every endpoint takes a wallet credential: `Authorization: Bearer wk_...` or `Authorization: Bearer near:...`.
+
+### Retries and timeouts
+
+Send `X-Idempotency-Key` on create, batch-create, claim and reclaim, and `X-Answer-Within: <seconds>` below your own timeout. A call whose transfer is not confirmed in time answers with an in-flight status and a `poll_url`; poll it rather than repeating the call. A repeated call with the same idempotency key answers `duplicate_idempotency_key` naming the earlier request; for a create it carries `checks: [{check_id, check_key, status}]` with the key derived again (`check_key: null` when asked under a different vault scope than the create's).
 
 ### POST /create
 
@@ -93,16 +107,17 @@ Create a new payment check.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `token` | string | yes | Token contract ID (e.g., USDC contract) |
-| `amount` | string | yes | Amount in smallest units (e.g., "1000000" = 1 USDC) |
-| `memo` | string | no | Optional memo (max 256 chars), visible to receiver |
-| `expires_in` | number | no | Expiry in seconds from now |
+| `token` | string | yes | Token contract ID (e.g., the USDC contract) |
+| `amount` | string | yes | Amount in smallest units (e.g., "1000000" = 1 USDC), greater than 0 |
+| `memo` | string | no | Optional memo (max 256 chars), visible to the receiver |
+| `expires_in` | number | no | Expiry in seconds from now, at most ten years |
 
 **Response:**
 ```json
 {
   "check_id": "a1b2c3d4-...",
   "check_key": "7f3a9b2c...64 hex chars...",
+  "status": "unclaimed",
   "token": "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
   "amount": "1000000",
   "memo": "Payment for data analysis",
@@ -111,9 +126,11 @@ Create a new payment check.
 }
 ```
 
+`status` is `unclaimed` once the funding transfer has executed, or `creating` with a `poll_url` while it is unconfirmed. The `check_key` is in both answers: keep it, and do not create the check again. A `creating` check ends `unclaimed`, or `failed` if the funding never executed (nothing moved).
+
 ### POST /batch-create
 
-Create multiple checks in one call (max 10).
+Create up to 10 checks in one call, each with its own key and ephemeral account.
 
 **Request:**
 ```json
@@ -129,15 +146,17 @@ Create multiple checks in one call (max 10).
 ```json
 {
   "checks": [
-    {"check_id": "...", "check_key": "...", "token": "...", "amount": "1000000", ...},
-    {"check_id": "...", "check_key": "...", "token": "...", "amount": "2000000", ...}
+    {"check_id": "...", "check_key": "...", "status": "unclaimed", "token": "...", "amount": "1000000", ...},
+    {"check_id": "...", "check_key": "...", "status": "unclaimed", "token": "...", "amount": "2000000", ...}
   ]
 }
 ```
 
+If the batch stops before its last check, the response carries `error`: the checks listed were created, the rest were not.
+
 ### POST /claim
 
-Claim funds from a check. Supports partial claims.
+Claim funds from a check into the caller's wallet. Supports partial claims.
 
 **Request:**
 ```json
@@ -150,11 +169,13 @@ Claim funds from a check. Supports partial claims.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `check_key` | string | yes | The 64-char hex key from the sender |
-| `amount` | string | no | Partial claim amount (omit for full claim) |
+| `amount` | string | no | Partial claim amount (omit to claim the whole balance) |
 
 **Response:**
 ```json
 {
+  "request_id": "5e6f7a8b-...",
+  "status": "partially_claimed",
   "token": "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
   "amount_claimed": "500000",
   "remaining": "500000",
@@ -164,9 +185,11 @@ Claim funds from a check. Supports partial claims.
 }
 ```
 
+`status` is `claimed` / `partially_claimed`, or `processing` with a `poll_url` (and no `remaining` / `claimed_at`) while the transfer is unconfirmed. A claim is refused after the check's expiry, while the check is still being funded or another leg is in flight, and once it is fully claimed or reclaimed. Only checks created through OutLayer can be claimed.
+
 ### POST /reclaim
 
-Reclaim unclaimed funds. Only the original creator can reclaim.
+Reclaim unclaimed funds to the sender's wallet. Only the wallet that created the check can reclaim; expiry does not prevent it.
 
 **Request:**
 ```json
@@ -178,12 +201,14 @@ Reclaim unclaimed funds. Only the original creator can reclaim.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `check_id` | string | yes | The check ID from create response |
-| `amount` | string | no | Partial reclaim amount (omit for full reclaim) |
+| `check_id` | string | yes | The check ID from the create response |
+| `amount` | string | no | Partial reclaim amount (omit to reclaim the whole balance) |
 
 **Response:**
 ```json
 {
+  "request_id": "9c0d1e2f-...",
+  "status": "reclaimed",
   "token": "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
   "amount_reclaimed": "500000",
   "remaining": "0",
@@ -192,9 +217,11 @@ Reclaim unclaimed funds. Only the original creator can reclaim.
 }
 ```
 
+`status` is `reclaimed` / `partially_reclaimed`, or `processing` with a `poll_url`.
+
 ### GET /status?check_id=...
 
-Get current status of a check. Only the creator can query.
+Current state of a check. Only the creating wallet can query it.
 
 **Response:**
 ```json
@@ -215,17 +242,17 @@ Get current status of a check. Only the creator can query.
 
 ### GET /list?status=...&limit=50&offset=0
 
-List all checks created by the authenticated wallet.
+List the checks created by the authenticated wallet.
 
 | Param | Required | Description |
 |-------|----------|-------------|
-| `status` | no | Filter: unclaimed, claimed, reclaimed, partially_claimed |
+| `status` | no | Filter: `creating`, `unclaimed`, `claiming`, `partially_claimed`, `claimed`, `reclaiming`, `partially_reclaimed`, `reclaimed`, `failed`, `expired` |
 | `limit` | no | Max results (default 50, max 100) |
-| `offset` | no | Pagination offset |
+| `offset` | no | Pagination offset (default 0) |
 
 ### POST /peek
 
-Check a payment check's balance using the `check_key`. Use to verify before claiming.
+Read a check's balance using its `check_key`, to verify it before claiming. Any wallet credential can peek.
 
 **Request:**
 ```json
@@ -245,58 +272,67 @@ Check a payment check's balance using the `check_key`. Use to verify before clai
 }
 ```
 
+`balance` is read from `intents.near`.
+
 ## Check Lifecycle
 
 ```
-                create
-                  |
-                  v
-              [unclaimed]
-               /      \
-      claim   /        \  reclaim
-             v          v
-   [partially_claimed] [partially_reclaimed]
-          |       \         /       |
-   claim  |        \       /        | reclaim
-          v         v     v         v
-      [claimed]   (mixed)    [reclaimed]
+                    create
+                      |
+                      v
+                  [creating] ---- funding never executed ---> [failed]
+                      |
+                      v
+                  [unclaimed]
+                   /      \
+          claim   /        \  reclaim
+                 v          v
+       [partially_claimed] [partially_reclaimed]
+              |       \         /       |
+       claim  |        \       /        | reclaim
+              v         v     v         v
+          [claimed]   (mixed)    [reclaimed]
 ```
 
 **Statuses:**
+- `creating` — funding transfer not confirmed yet
 - `unclaimed` — funds locked, waiting to be claimed
+- `claiming` / `reclaiming` — a claim or reclaim is in flight; another waits for it
 - `partially_claimed` — some funds claimed, rest available
-- `partially_reclaimed` — some funds reclaimed by sender
-- `claimed` — all funds claimed by receiver
-- `reclaimed` — all funds reclaimed by sender
+- `partially_reclaimed` — some funds reclaimed by the sender
+- `claimed` — the balance reached zero through a claim
+- `reclaimed` — the balance reached zero through a reclaim
+- `failed` — the funding never executed; nothing moved
+- `expired` — reported for an `unclaimed` check past its expiry
 
-**Expiry:** If `expires_in` is set, the check cannot be claimed after expiry. Funds remain in the ephemeral account — the sender must explicitly reclaim them. Expiry prevents new claims but does not auto-return funds.
+**Expiry:** if `expires_in` is set, the check cannot be claimed after expiry. The funds stay in the ephemeral account until the sender reclaims them; expiry does not return them by itself.
 
 ## Security
 
 | Threat | Mitigation |
 |--------|------------|
-| check_key intercepted in transit | Use encrypted channels (HTTPS, E2E messaging). Leaked key + any wallet API key = funds claimed. |
-| Sender's wallet compromised | Wallet private key never leaves TEE. API key can be revoked. Policy engine limits exposure. |
-| Replay of claim/reclaim | Each intent has unique nonce + 5-minute deadline. Solver relay rejects duplicates. DB tracks amounts atomically. |
-| Ephemeral key collision | Monotonic counter per wallet (DB enforced). Same wallet + counter = same key, counter never reuses. |
-| Funds stuck in ephemeral account | Sender can always reclaim — TEE re-derives ephemeral key from same deterministic path. |
+| check_key intercepted in transit | Use encrypted channels (HTTPS, E2E messaging). A leaked key lets anyone with an OutLayer wallet claim the funds. |
+| Sender's API key compromised | The API key can be revoked. Under a policy, checks need the `payment_check` capability and stay within the per-transaction limit. |
+| Replay of claim/reclaim | Each intent has a random nonce and a 5-minute deadline; `intents.near` rejects a reused nonce. Amounts are tracked under a row lock. |
+| Ephemeral key collision | Per-wallet counter, incremented atomically in the database; a counter value is never reused. |
+| Funds stuck in ephemeral account | The sender can always reclaim — the keystore derives the ephemeral key again from the same path. |
 
-**Key insight:** The `check_key` is the only secret. It never touches the blockchain, never enters the TEE for claim (coordinator signs locally with it). The sender doesn't need to store it — the TEE re-derives it for reclaim. Even if the sender loses all local state, funds are recoverable through the TEE.
+**Who sees the `check_key`:** it never goes on chain. It is returned by the keystore through the coordinator on create, and on claim the receiver sends it to the coordinator, which signs the claim with it outside the TEE. Because the keystore can derive any check's key for the coordinator, the coordinator is trusted with every open check's balance; see [NON_CUSTODIAL.md](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md).
 
 ## Comparison
 
 |  | Payment Checks | Direct Transfer | Smart Contract Escrow |
 |--|----------------|-----------------|----------------------|
-| Gas required | None | Sender pays | Both parties pay |
-| Receiver needs account | Only wallet API key | On-chain account + gas | On-chain account + gas |
+| Gas required | None (funds must be in the intents balance) | Sender pays | Both parties pay |
+| Receiver needs account | Only an OutLayer wallet credential | On-chain account + gas | On-chain account + gas |
 | Partial payment | Built-in | N/A | Custom logic |
 | Reclaim | Built-in, gasless | N/A (irreversible) | Custom logic + gas |
-| On-chain footprint | Solver relay only | 1 transaction | Contract deployment + calls |
+| On-chain footprint | Intents executed by the solver relay | 1 transaction | Contract deployment + calls |
 | Setup complexity | One API call | One API call | Contract dev + deployment |
 
 ## Use Cases
 
-- **Agent-to-agent payments** — Agent A creates a check, sends key as part of API request. Agent B verifies (peek), performs work, claims payment. If B doesn't deliver, A reclaims.
-- **Bounties & task rewards** — Create check with expiry. Share key with task completer. Partial claims allow splitting among contributors.
-- **Escrow-style payments** — Lock funds in a check. Share key only when conditions are met. Lightweight escrow without a smart contract.
-- **Batch payouts** — Use `batch-create` to generate up to 10 checks in a single call, each with independent key.
+- **Agent-to-agent payments** — Agent A creates a check and sends the key with its API request. Agent B verifies it (peek), does the work, claims payment. If B does not deliver, A reclaims.
+- **Bounties & task rewards** — Create a check with an expiry and share the key with the task completer. Partial claims allow splitting among contributors.
+- **Escrow-style payments** — Lock funds in a check and share the key only when conditions are met.
+- **Batch payouts** — `batch-create` makes up to 10 checks in one call, each with its own key.

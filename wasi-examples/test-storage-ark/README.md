@@ -9,7 +9,7 @@ This WASI Preview 2 component demonstrates and tests the `near:storage@0.2.0` ho
 ## Features
 
 - **Persistent Storage**: Data persists across executions
-- **Encrypted**: All data is encrypted before storage using keystore TEE
+- **Encrypted**: Every value this example writes is encrypted by the keystore before it is stored (the `-raw` functions of `near:storage`, which this example does not call, store bytes as given — see `signing-key-probe`'s `encryption-storage` builds)
 - **Per-User Isolation**: Each user's data is isolated using different encryption keys
 - **Worker-Private Storage**: Special storage only accessible by WASM, not users
 - **Public Storage**: Unencrypted storage readable by other projects (e.g., oracle price feeds)
@@ -171,13 +171,13 @@ Read from another project, by its name or by its uuid:
 
 Verify via HTTP (`project` takes the name or the uuid; `project_uuid` is an alias of it, in either form):
 ```bash
-# JSON format (default) - base64 encoded value
-curl "http://localhost:8080/public/storage/get?project=oracle.near/price-feed&key=oracle:ETH"
-curl "http://localhost:8080/public/storage/get?project_uuid=p0000000000000001&key=oracle:ETH"
+# JSON format (default) - base64 encoded value (testnet: https://testnet-api.outlayer.ai)
+curl "https://api.outlayer.ai/public/storage/get?project=oracle.near/price-feed&key=oracle:ETH"
+curl "https://api.outlayer.ai/public/storage/get?project_uuid=p0000000000000001&key=oracle:ETH"
 # {"exists":true,"value":"eyJwcmljZSI6IjM1MDAuMDAifQ=="}
 
 # Raw format - returns raw bytes
-curl "http://localhost:8080/public/storage/get?project_uuid=p0000000000000001&key=oracle:ETH&format=raw"
+curl "https://api.outlayer.ai/public/storage/get?project_uuid=p0000000000000001&key=oracle:ETH&format=raw"
 # {"price":"3500.00"}
 ```
 
@@ -255,7 +255,7 @@ PostgreSQL (storage_data table)
 
 ## Security Notes
 
-- All data is encrypted using keystore TEE before storage
+- Every value written with the encrypted functions is encrypted by the keystore TEE before storage
 - Encryption key is derived from: `storage:{project_uuid}:{account_id}`
 - Worker-private storage uses `@worker` as account_id
 - Data is isolated per user - each user can only read/write their own data
@@ -328,12 +328,12 @@ storage::get_worker_from_project("oracle:ETH", Some("p0000000000000001"))
 **External HTTP API:**
 ```bash
 # JSON format (default)
-curl "http://coordinator/public/storage/get?project=oracle.near/price-feed&key=oracle:ETH"
-curl "http://coordinator/public/storage/get?project_uuid=p0000000000000001&key=oracle:ETH"
+curl "https://api.outlayer.ai/public/storage/get?project=oracle.near/price-feed&key=oracle:ETH"
+curl "https://api.outlayer.ai/public/storage/get?project_uuid=p0000000000000001&key=oracle:ETH"
 # {"exists":true,"value":"<base64-encoded-value>"}
 
 # Raw format - returns raw bytes
-curl "http://coordinator/public/storage/get?...&format=raw"
+curl "https://api.outlayer.ai/public/storage/get?...&format=raw"
 ```
 
 **Key points:**

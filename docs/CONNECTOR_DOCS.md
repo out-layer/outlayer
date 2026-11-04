@@ -33,7 +33,7 @@ Never write any of these from reading prose, including this document's examples.
 | what an operation costs | the chain: `get_project_pricing` for the project. Not the price script — that is the writer, and a row may have been changed since |
 | the author's share | the same price rows (`developer_share_bp`) |
 | daily caps the connector declares | `limits` in `manifest.json` |
-| which hosts it may reach | `capabilities.network` in `manifest.json`; absent means unrestricted, which is a claim worth making explicitly |
+| which hosts it may reach | `capabilities.network` in `manifest.json`; for a connector, absent or empty means it reaches no host at all (fail-closed), which is a claim worth making explicitly |
 | the secret key names a caller must store | the `*_ENV` constants in the source, not the README that mentions them |
 | whether it carries a credential of its own | `author_secrets` in `manifest.json`, and whether that row exists on chain |
 | the exact words of a refusal | the `format!` that produces it |
@@ -109,7 +109,7 @@ permission: *"an empty policy allows sending to anyone; `max_attachment_kb` is
 the only field that denies by default."*
 
 **Name the limit that actually binds, in the unit it is counted in — and no
-other number beside it.** A trial is fifty calls. If the documentation also quotes
+other number beside it.** A trial is a number of calls (fifty by default). If the documentation also quotes
 a dollar figure that exists behind it, a reader does arithmetic on the dollars,
 concludes they have ninety calls, and is stopped at fifty holding what looks like
 a balance. A figure the reader cannot act on is not context, it is a second
@@ -164,9 +164,11 @@ that describes an unpublished build is worse than none: it reads as current.
 
 ## 6. Before publishing
 
-* `./build.sh` in the connector — it already refuses a build when the manifest,
-  the dispatch and the README disagree about the operations, and it verifies the
-  manifest's vocabulary and the injected system variables.
+* `./build.sh` in the connector — it already refuses a build when the manifest
+  and the dispatch disagree about the operations or the `describe` block, and it
+  verifies the manifest's vocabulary. `connector-probe/build.sh` also holds the
+  README's operation list and the injected system variables to the code; copy
+  those checks into a connector that wants them.
 * Read the prices off the chain and compare them with the cost table.
 * Call the connector's free `status` on the network you documented, and check
   that its answer matches what the skill says that answer means.

@@ -1,209 +1,204 @@
 # Worker Attestation
 
-How NEAR OutLayer cryptographically verifies that workers run inside Intel TDX and restricts sensitive operations to attested code.
+How NEAR OutLayer ties an execution worker to an approved build running inside Intel TDX,
+and what each check does and does not cover.
 
 ## Overview
 
-Every worker runs inside an **Intel TDX** (Trust Domain Extension) confidential VM on Phala Cloud. Before a worker can submit execution results or decrypt user secrets, it must prove two things:
+Execution workers run as dstack confidential VMs on Intel TDX hosts operated by OutLayer.
+(Compiling a GitHub repository to WebAssembly happens outside the TEE; only execution runs
+in the workers.) Attestation happens at three points:
 
-1. **Its code is genuine** — the TDX hardware measurements (MRTD + RTMR0-3) match an admin-approved set.
-2. **It holds a TEE-generated private key** — the ed25519 keypair was created inside the TEE and the public key is registered on-chain.
-
-These proofs happen at two distinct stages: **key registration** (on-chain, at startup) and **session establishment** (off-chain, challenge-response with coordinator and keystore).
-
-## Architecture
+1. **Key registration, on chain, at startup.** The worker's public key is admitted only
+   with a TDX quote that Intel's signature chain vouches for and whose five measurements
+   (MRTD + RTMR0–3) are on an approved list.
+2. **Sessions, off chain.** The worker proves to the coordinator and to the keystore, each
+   separately, that it holds a key registered in step 1.
+3. **Per-execution attestation.** Every execution produces a fresh TDX quote over a hash of
+   the task, which anyone can verify afterwards.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Worker (Intel TDX)                                 │
-│                                                     │
-│  1. Generate ed25519 keypair                        │
-│  2. Generate TDX quote (public key in report_data)  │
-│  3. Call register-contract → on-chain key            │
-│  4. Challenge-response → coordinator session         │
-│  5. Challenge-response → keystore session            │
-│  6. Work: auth_key + X-TEE-Session on every request │
-└────────┬──────────────────┬─────────────────────────┘
-         │                  │
-         ▼                  ▼
-┌────────────────┐  ┌───────────────┐
-│  Coordinator   │  │  Keystore     │
-│  (PostgreSQL)  │  │  (in-memory)  │
-│                │  │               │
-│  verify sig    │  │  verify sig   │
-│  check NEAR    │  │  check NEAR   │ ← independent RPC
-│  issue session │  │  issue session│
-└────────────────┘  └───────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│  register-contract (NEAR)   │
-│  Source of truth for keys   │
-│  Verifies TDX quotes        │
-│  Stores keys as access keys │
-└─────────────────────────────┘
+Worker (Intel TDX CVM)
+  1. keypair in the CVM; TDX quote with the key in report_data
+  2. ── register_worker_key ──────────────► worker.outlayer.near (register contract)
+                                              verify quote, check 5 measurements,
+                                              add the key to its own account
+  3. challenge-response ──► coordinator  (session in Postgres)  ─┐ each checks the key
+  4. challenge-response ──► keystore     (session in memory)    ─┘ on chain itself
+  5. per task: TDX quote over SHA-256(task fields) ──► coordinator ──► public attestation
 ```
 
-## Stage 1: On-Chain Key Registration
+## Stage 1: on-chain key registration
 
-Happens once per worker startup. Code: `worker/src/registration.rs`.
+Code: `worker/src/registration.rs`, `worker/src/tdx_attestation.rs`,
+`register-contract/src/lib.rs`.
 
-### Steps
+1. **Keypair.** The worker generates a keypair (`WORKER_KEY_TYPE`: `ed25519` by default, or
+   `ml-dsa-65`) inside the CVM and writes it to `~/.near-credentials/worker-keypair.json` in
+   its container, so a restart that keeps the container reuses the key.
+2. **Quote.** It asks dstack (`/var/run/dstack.sock`) for a TDX quote whose
+   `report_data[0..32]` is the raw ed25519 public key, or SHA-256 of an ml-dsa-65 public
+   key. The quote carries the five measurements of the CVM: firmware, kernel and boot
+   configuration, and the application compose (RTMR3).
+3. **Pre-check.** It reads the measurements from its own quote and waits for
+   `is_measurements_approved` to return `true` before spending gas.
+4. **On-chain verification.** The init worker account calls `register_worker_key` on the
+   register contract (`worker.outlayer.near`; `worker.outlayer.testnet` on testnet). The
+   contract:
+   - verifies the quote with `dcap-qvl` against Intel collateral it has cached for the
+     quote's platform (FMSPC) — a caller cannot supply its own;
+   - refuses any TCB status other than `UpToDate` and any quote with outstanding Intel
+     security advisories;
+   - requires MRTD + RTMR0–3 together to match one owner-approved entry;
+   - requires the submitted key to match the quote's `report_data`;
+   - adds the key to its own account as a function-call key: receiver `outlayer.near`,
+     methods `resolve_execution`, `submit_execution_output_and_resolve`, `resume_topup`,
+     `resume_delete_payment_key`, 10 NEAR allowance.
+5. **Result.** `worker.outlayer.near` is the operator account of `outlayer.near`, which
+   accepts execution results from it. The worker signs those transactions with the
+   registered key.
 
-1. **Keypair generation.** The worker generates a fresh ed25519 keypair inside the TEE (`worker/src/registration.rs:80-99`). The private key never leaves the confidential VM. The keypair is persisted to `~/.near-credentials/worker-keypair.json` so that a soft restart reuses the same key.
-
-2. **TDX quote generation.** The worker calls the Phala dstack SDK to produce a TDX quote (`worker/src/tdx_attestation.rs:33-54`). The worker's public key is embedded in the first 32 bytes of `report_data`, cryptographically binding the key to the TEE instance. The quote also contains **5 hardware measurements** (MRTD + RTMR0-3) of the entire TEE image.
-
-3. **On-chain verification.** The worker sends the quote to `register_worker_key()` on the register-contract (`register-contract/src/lib.rs:120-187`). The contract:
-   - Verifies the Intel TDX signature using `dcap-qvl` (same library as NEAR MPC Node).
-   - Extracts all 5 measurements (MRTD, RTMR0-3) and checks them against the admin-approved list.
-   - Extracts the public key from `report_data` and confirms it matches the `public_key` argument.
-   - Adds the public key as an access key on its own account, scoped to `resolve_execution` and related methods on the main outlayer contract.
-
-4. **Result.** The worker now has a NEAR access key that can only call specific methods on the outlayer contract. This key is the basis for all subsequent attestation.
-
-### What the contract proves
+A worker whose key is already on the account skips the registration call.
 
 | Property | How |
-|----------|-----|
-| Key was generated in a TEE | Public key extracted from TDX `report_data`, signed by Intel |
-| TEE runs approved code | All 5 measurements (MRTD + RTMR0-3) checked against admin-maintained allowlist |
-| Key is scoped | Access key limited to specific contract methods with 10 NEAR gas allowance |
+|---|---|
+| The key was generated in a TDX CVM | it is bound in the quote's `report_data`, under Intel's signature |
+| The CVM runs an approved build | all five measurements must match an entry the contract owner approved |
+| The platform is current | TCB `UpToDate`, no advisories, collateral within its validity window |
+| The key is scoped | function-call key on four methods of `outlayer.near`, 10 NEAR allowance |
 
-## Stage 2: TEE Session Establishment (Challenge-Response)
+Contract details, collateral handling and the owner's methods:
+[register-contract/README.md](register-contract/README.md).
 
-After on-chain registration, the worker establishes **sessions** with the coordinator and keystore using a challenge-response protocol. This proves to each service that the caller holds the private key registered on-chain — without re-verifying the full TDX quote.
+## Stage 2: sessions with the coordinator and the keystore
 
-Shared cryptographic logic lives in the `tee-auth` crate (`tee-auth/src/lib.rs`), used by both coordinator and keystore.
-
-### Protocol
+After registration the worker opens a session with the coordinator and one with the
+keystore. Both use the same protocol (`shared-tee-helpers`): the server checks the key on
+chain itself, so neither trusts the other.
 
 ```
-Worker                          Server (coordinator or keystore)
-  │                                │
-  │  POST /tee-challenge           │
-  │  (bearer auth_key)             │
-  │ ─────────────────────────────► │
-  │                                │  Generate 32 random bytes
-  │  { challenge: "a1b2c3..." }    │  Store with timestamp
-  │ ◄───────────────────────────── │
-  │                                │
-  │  Sign challenge with TEE key   │
-  │                                │
-  │  POST /register-tee            │
-  │  { public_key, challenge,      │
-  │    signature }                 │
-  │ ─────────────────────────────► │
-  │                                │  1. Validate challenge (one-time, <60s)
-  │                                │  2. Verify ed25519 signature
-  │                                │  3. NEAR RPC view_access_key
-  │                                │     → key exists on register-contract?
-  │                                │  4. Create session
-  │  { session_id: UUID }          │
-  │ ◄───────────────────────────── │
-  │                                │
-  │  All subsequent requests:      │
-  │  Authorization: Bearer <token> │
-  │  X-TEE-Session: <session_id>   │
-  │ ─────────────────────────────► │
+Worker                                   Server
+  POST /tee-challenge   (bearer token) ─►  32 random bytes, valid 60 s, one use
+  ◄─ {"challenge": "<hex>"}
+  POST /register-tee {public_key, challenge, signature}
+                                       ─►  1. challenge exists and is fresh
+                                           2. signature verifies (allowed key schemes only)
+                                           3. view_access_key(OPERATOR_ACCOUNT_ID, public_key)
+                                           4. new session
+  ◄─ {"session_id": "<uuid>"}
+  every later request: Authorization: Bearer <token>, X-TEE-Session: <uuid>
 ```
 
-### Verification steps (server-side)
+| | Coordinator | Keystore |
+|---|---|---|
+| Endpoints | `POST /workers/tee-challenge`, `POST /workers/register-tee` | `POST /tee-challenge`, `POST /register-tee` |
+| Challenge | bound to the worker token that requested it | not bound to a token |
+| Session store | Postgres `worker_tee_sessions`, bound to the token; survives restarts | memory; lost on restart |
+| Re-registration | deactivates the previous session of the same key | adds a session |
+| Enforced when | `REQUIRE_TEE_SESSION=true` | `TEE_MODE=outlayer_tee` |
+| Without a session | refused (401) on every worker route except those a compiler outside the TEE also uses (job claim, WASM cache, locks, heartbeat, attestation upload, session setup) | `/decrypt`, `/encrypt`, `/decrypt-raw`, `/storage/*`, `/vrf/generate` refused (403) |
 
-1. **Challenge lookup.** Find the challenge in storage, verify it belongs to this worker's token and is less than 60 seconds old. Delete it (one-time use).
+On startup the worker opens both sessions (five attempts each) and stops if either fails.
+When the keystore answers "TEE session not found", the worker opens a new session and
+retries.
 
-2. **Signature verification.** `tee_auth::verify_signature()` — parse the ed25519 public key, decode the hex challenge to raw bytes, verify the signature. Uses `ed25519-dalek`.
+What a session proves and what it does not:
 
-3. **On-chain key check.** `tee_auth::check_access_key_on_contract()` — NEAR RPC `view_access_key` query against the register-contract account. If the key exists, it was registered via TDX attestation. If it was removed (admin revocation), the check fails.
+- **Any access key on the operator account passes step 3**, whatever its permission. A
+  full-access key on `worker.outlayer.near`, if one is present, opens sessions as a
+  TDX-registered key does, and the main contract likewise accepts results from any key on
+  that account.
+- **The key is checked once**, when the session opens. Sessions do not expire; removing the
+  key from the operator account stops new sessions but does not end an open one (a
+  keystore session lasts until the keystore restarts, a coordinator session until the same
+  key opens a new one or the worker token is deactivated).
+- The worker's `user_account_id`, `predecessor_id`, `project_id` and executed WASM hash are
+  accepted by the keystore on the trust of the session.
 
-4. **Session creation.**
-   - Coordinator: stored in PostgreSQL (`worker_tee_sessions` table), survives restarts.
-   - Keystore: stored in-memory (`HashMap<Uuid, TeeSession>`), lost on restart.
+## Stage 3: per-execution attestation
 
-### Coordinator specifics
+For every execution the worker requests a new TDX quote with
 
-- Endpoints: `POST /workers/tee-challenge`, `POST /workers/register-tee`
-- Auth middleware (`coordinator/src/auth.rs`) extracts `X-TEE-Session` header and validates against DB.
-- DB query only runs when `REQUIRE_TEE_SESSION=true` (no overhead when feature is off).
-- HTTPS call handler (`coordinator/src/handlers/call.rs`) rejects results without a valid session when the feature flag is on.
+```
+report_data[0..32]  = SHA-256( task_type ‖ task_id ‖ repo ‖ commit ‖ build_target ‖ wasm_hash ‖
+                               input_hash ‖ output_hash ‖ block_height ‖ caller_account_id ‖
+                               project_id ‖ secrets_ref ‖ timestamp ‖ attached_usd )
+report_data[32..64] = zero
+```
 
-### Keystore specifics
+(absent optional fields are skipped; integers are little-endian). The worker uploads it to
+the coordinator (`POST /attestations`), and anyone can fetch it:
 
-- Endpoints: `POST /tee-challenge`, `POST /register-tee`
-- Keystore verifies the key on register-contract **independently** — a compromised coordinator cannot forge sessions.
-- Session middleware checks `X-TEE-Session` on all worker endpoints (`/decrypt`, `/encrypt`, `/storage/*`).
-- In-memory sessions are lost on keystore restart; workers detect 403 and re-register automatically (two HTTP calls, no blockchain transaction).
+- `GET https://api.outlayer.ai/attestations/{job_id}`, `/attestations/by-call/{call_id}`,
+  `/attestations/by-request/{request_id}`, `/attestations/by-tx/{tx_hash}`
+- `GET https://api.outlayer.ai/public/collateral?fmspc=<fmspc>&at=<time>` — the Intel
+  collateral that was current when the execution ran
 
-### Worker specifics
+Verifying one means checking the quote's signature chain against that collateral, checking
+the five measurements against the register contract's approved list
+(`is_measurements_approved`), and recomputing the task hash from the inputs and outputs. The
+dashboard's [Trust & Verification](https://app.outlayer.ai/docs/trust-verification) page
+and the `outlayer-verify` tool do this.
 
-- Code: `worker/src/api_client.rs` — `register_tee_session()` and `register_keystore_tee_session()` both use the shared `do_tee_challenge_response()` method.
-- On startup, the worker registers sessions with both coordinator and keystore (`worker/src/main.rs:311-340`).
-- `ApiClient` and `KeystoreClient` both attach `X-TEE-Session` to every subsequent request via `add_auth_headers()`.
-- If session registration fails, the worker logs a warning and continues (graceful degradation when `REQUIRE_TEE_SESSION=false`).
+The per-execution quote binds the result to an approved build, not to the worker's
+registered key.
 
-## Layers of Defense
+## Threat model
 
-| Layer | What it does | When |
-|-------|-------------|------|
-| `auth_key` (bearer token) | Anti-spam, identifies worker | Every request |
-| TDX attestation (on-chain) | Proves code identity + key origin | Worker startup |
-| Challenge-response (coordinator) | Proves private key possession | Session setup |
-| Challenge-response (keystore) | Independent proof, not trusting coordinator | Session setup |
-| `X-TEE-Session` header | Binds requests to verified identity | Every request |
-| `view_access_key` (NEAR RPC) | Checks key still exists on contract | Session setup |
+| Threat | Mitigation | Limit |
+|---|---|---|
+| Unapproved code registers a key | the contract checks the quote and all five measurements | the contract owner decides which measurements are approved |
+| Attacker holds a worker token | cannot sign a challenge without a registered key | with enforcement off (`REQUIRE_TEE_SESSION=false`, keystore `TEE_MODE=none`) the token alone is enough |
+| Replayed challenge | one use, 60 s lifetime | — |
+| Compromised coordinator forges a keystore session | the keystore checks the key on chain itself | the coordinator is trusted for custody in other ways (API keys, policies) |
+| Leaked worker key | owner calls `remove_worker_keys`; no new session and no on-chain result with it after that | sessions already open continue, including HTTPS result completion on the coordinator (see Stage 2) |
+| Keys of retired workers | `scripts/revoke_old_worker_keys.sh` removes every key not held by a running worker | a key file that survives elsewhere stays valid until removed |
+| Full-access key on the operator account | none in the protocol | it passes the operator and session checks; see Governance below |
 
-## Threat Model
+## Governance at this stage
 
-| Threat | Mitigation |
-|--------|-----------|
-| Attacker knows auth_key | Cannot sign challenge — no TEE private key |
-| Attacker reads public keys from chain | Cannot sign challenge |
-| Attacker replays a signed challenge | Challenge is one-time use and expires in 60 seconds |
-| Coordinator is compromised | Keystore verifies independently via its own NEAR RPC call |
-| Worker restarts | New keypair generated → new on-chain registration → new sessions |
-| Leaked worker private key | Admin calls `remove_worker_keys()` on contract → `view_access_key` returns false → no new sessions |
-| Stale keys accumulate on contract | `remove_worker_keys()` deletes keys individually (independent promises) and frees ~0.042 NEAR storage per key |
+The register contract's owner (`owner.outlayer.near`) approves measurements, replaces
+collateral and removes keys alone, without a vote, and the contract upgrades with the
+account's full-access key. Every such action is a public NEAR transaction. See
+[docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md#governance-at-this-stage).
 
 ## Configuration
 
+### Worker
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TEE_MODE` | `none` | `outlayer_tee` in production: real TDX quotes |
+| `USE_TEE_REGISTRATION` | `true` | register a TEE-generated key; `false` signs with `OPERATOR_PRIVATE_KEY` instead (development only) |
+| `WORKER_KEY_TYPE` | `ed25519` | `ed25519` or `ml-dsa-65` |
+| `OPERATOR_ACCOUNT_ID` | — | the register contract account, e.g. `worker.outlayer.near` |
+| `INIT_ACCOUNT_ID`, `INIT_ACCOUNT_PRIVATE_KEY` | — | pays for `register_worker_key` (`init-worker.outlayer.near`) |
+| `API_AUTH_TOKEN` | — | coordinator worker token |
+| `KEYSTORE_BASE_URLS`, `KEYSTORE_AUTH_TOKEN` | — | keystore instances and worker token; required for an execution worker in TEE mode |
+
 ### Coordinator
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `OPERATOR_ACCOUNT_ID` | (none) | Account where TEE worker keys are registered as access keys (e.g., `worker.outlayer.testnet`). Required for TEE session endpoints. |
-| `REQUIRE_TEE_SESSION` | `false` | When `true`, HTTPS call completions require a valid `X-TEE-Session`. |
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPERATOR_ACCOUNT_ID` | — | account whose access keys admit a worker session |
+| `REQUIRE_TEE_SESSION` | `false` | `true` refuses worker routes without a session |
+| `TEE_ALLOWED_KEY_TYPES` | `ed25519` | worker key schemes accepted |
 
 ### Keystore
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `OPERATOR_ACCOUNT_ID` | (none) | Account where TEE worker keys are registered. Used for NEAR RPC verification. |
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPERATOR_ACCOUNT_ID` | — | required with `TEE_MODE=outlayer_tee` |
+| `TEE_MODE` | `none` | `outlayer_tee` requires a session on worker routes |
+| `TEE_ALLOWED_KEY_TYPES` | `ed25519` | worker key schemes accepted |
 
-### Worker
+## Key cleanup
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `USE_TEE_REGISTRATION` | `true` | Enable TDX-based key registration flow. |
-| `OPERATOR_ACCOUNT_ID` | (required) | Operator account where register-contract is deployed and keys are stored. |
-| `TEE_MODE` | `outlayer_tee` | `outlayer_tee` for production, `none` for dev. |
-
-## Zero-Downtime Rollout
-
-Deploy in this order:
-
-1. Coordinator with `REQUIRE_TEE_SESSION=false` + keystore with `TEE_MODE=none` — new endpoints exist but are not enforced.
-2. Workers with `TEE_MODE=outlayer_tee` — they register TEE sessions on startup. Existing workers without sessions continue to work.
-3. Set `REQUIRE_TEE_SESSION=true` on coordinator and `TEE_MODE=outlayer_tee` on keystore — only attested workers can submit results and decrypt secrets.
-
-## Key Cleanup
-
-Each worker restart generates a new keypair, leaving dead access keys on the operator account (~0.042 NEAR storage each). Clean up periodically:
+Worker keys stay on `worker.outlayer.near` until removed. After a fleet change:
 
 ```bash
-near call worker.outlayer.near remove_worker_keys \
-  '{"public_keys": ["ed25519:...", "ed25519:..."]}' \
-  --accountId outlayer.near \
-  --gas 300000000000000
+./scripts/revoke_old_worker_keys.sh mainnet             # report: keys kept, keys to remove
+./scripts/revoke_old_worker_keys.sh mainnet --send      # remove_worker_keys, signed by the owner
 ```
 
-Removing a key also instantly invalidates any TEE sessions that depend on it — the next `view_access_key` check will fail.
+Each removal frees the key's storage on the account.

@@ -1,35 +1,22 @@
 # wallet-probe
 
 A WASI module whose only job is exercising the `outlayer:wallet` host
-functions.
-
-Until this existed, nothing in `wasi-examples/` imported that world. The
-interface was described in `worker/wit/deps/wallet.wit`, implemented in
-`worker/src/outlayer_wallet/host_functions.rs`, unit-tested on the worker's
-side — and reached by no guest anywhere. A break in the guest-facing half would
-have surfaced first in somebody's agent, in production, as a wallet call that
-returned nothing.
+functions (`worker/wit/deps/wallet.wit`, implemented in
+`worker/src/outlayer_wallet/host_functions.rs`) from a real guest.
 
 ## Why it is not part of `connector-probe`
 
 The worker gives a component the wallet host functions only if the component
-**imports** them (`has_wallet_import` in `worker/src/executor/wasi_p2.rs`), and
-if it imports them while the request carries no wallet id, the worker refuses to
-instantiate it at all:
+**imports** them (`has_wallet_import` in `worker/src/executor/wasi_p2.rs`). On a
+run that names no wallet every one of them answers:
 
 ```
-WASM imports outlayer:wallet/api but wallet is not available.
-Wallet requires: X-Wallet-Id header in the execution request.
+no_wallet: this run has no wallet; the operation needs a call made with the wallet's own payment key and X-Wallet-Id
 ```
 
-That happens before `main` runs. Most calls to `connector-probe` carry no
-wallet — every payment-key call, every trial-key call, every on-chain
-`request_execution` — so adding the import there would have failed all of them,
-`ping` included. One import would have taken the whole probe down.
-
-So the split is forced rather than chosen: **a module that imports the wallet
-can only ever be called with a wallet**, and that is the entire contract of this
-one.
+so the import is harmless to a module that never calls them. Here every
+operation calls them, and `connector-probe` keeps the wallet out so that its
+own answers stay about the connector path and nothing else.
 
 ## Not a connector
 
@@ -67,20 +54,22 @@ about the wallet host functions depends on the owner.
 
 Two things are required and neither is optional:
 
-* `Authorization: Bearer wk_...` — the custody wallet's own key. An ordinary
-  payment key identifies no wallet, and the call is refused with
-  `X-Wallet-Id cannot be honoured for this credential`.
+* `X-Payment-Key: <owner>:<nonce>:<secret>` — a payment key the custody wallet
+  itself owns: its owner is the wallet's implicit account. A key owned by a
+  named account identifies no wallet, and the call is refused with
+  `X-Wallet-Id cannot be honoured for this credential`. A `Bearer wk_...` alone
+  does not pay for a call and is refused (`wk_is_not_a_payer`).
 * `X-Wallet-Id: <wallet id>` — the wallet must be **named**. An absent header,
   or one with an empty value, means "no wallet": the header is trimmed and
   dropped when blank, and a call that never asked for a wallet does not get
-  one. For this module that is not a quieter run, it is a refusal to start.
+  one. For this module that means every operation answers `no_wallet`.
 
-Get the id from `GET /wallet/v1/address?chain=near` (`wallet_id` in the
-response), then:
+Get the id from `GET /wallet/v1/address?chain=near` (authenticated with the
+wallet's `Authorization: Bearer wk_...`; `wallet_id` in the response), then:
 
 ```bash
-curl -s -X POST "$COORDINATOR_URL/call/$OWNER/wallet-probe" \
-  -H "Authorization: Bearer $WK" \
+curl -s -X POST "https://testnet-api.outlayer.ai/call/$OWNER/wallet-probe" \
+  -H "X-Payment-Key: $WALLET_PAYMENT_KEY" \
   -H "X-Wallet-Id: $WALLET_ID" \
   -H 'Content-Type: application/json' \
   -d '{"input":{"operation":"whoami"}}'
@@ -174,7 +163,8 @@ request nobody can read is a dead end dressed as an instruction.
 
 ```bash
 ./build.sh          # checks the WIT copy, the manifest section and the wallet import
-outlayer deploy     # or upload the wasm and publish a version by hash
+outlayer upload target/wasm32-wasip2/release/wallet-probe.wasm   # prints the FastFS URL
+outlayer deploy wallet-probe <FastFS URL>                        # adds the version and activates it
 ```
 
 `build.sh` refuses to produce an artefact that does not import

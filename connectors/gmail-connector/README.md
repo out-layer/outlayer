@@ -1,7 +1,11 @@
 # gmail-connector
 
 An agent sends mail from the owner's own Gmail address, under a policy the owner
-stored. The credential never leaves the enclave and never appears in an answer.
+stored. Once stored, the credential is decrypted only in the keystore and worker
+TEEs and never appears in an answer. (While connecting, the refresh token passes
+through the connect page's server-side code exchange and the owner's browser,
+which seals it; see "Connecting an account". The trust and governance model at
+this stage is in [`docs/NON_CUSTODIAL.md`](../../docs/NON_CUSTODIAL.md).)
 
 It **only sends**. The credential carries the single scope `gmail.send`, which
 authorises sending and nothing else — not reading the mailbox, not even reading
@@ -71,8 +75,9 @@ message is sent after; a task whose answer was taken never returns to `open`.
 | refused | the task | the refusal |
 |---|---|---|
 | before the answer is taken: no `task_id` or `task_hash`, a policy absent or unreadable, anything the host refuses the answer for (`task_not_found`, `not_the_preparer`, `task_approval_invalid`, `task_hash_mismatch`, `task_answer_invalid`, `task_store_unavailable`, `task_closed`, `task_expired`, `task_void`) | stays as it was in the run; the platform ends it `failed` with `run_refused:unreported` (a refusal of the connector's own, which the host never saw) or `run_refused:<reason>` (one of the host's) | as it is |
-| after: a state that is not a message, the day's count, the credential, building the message, Google's refusal of the send | ends `failed` | its own code, and a sentence ending "The task is closed: to send this message, prepare it again" |
-| after the message left: the result could not be left for the agent | ends `failed` | its own code, and "The message WAS sent (Gmail message …) and the task is closed without its result: do not prepare it again" |
+| after: a state that is not a message, the day's count, the credential, building the message, Google's refusal of the send | ends `failed` as `run_failed`, the refusal in its result; the owner is told in a notice under the task | its own code, and a sentence ending "The task is closed: to send this message, prepare it again" |
+| after the request went out and its outcome is not known: Google's answer lost, a 5xx, a 2xx that does not read | ends `failed` as `run_unreported` | its own code, and "… so the message MAY have been sent: check the Sent folder before preparing it again" |
+| after the message left: the result could not be left for the agent | ends `failed` as `run_unreported` | its own code, and "The message WAS sent (Gmail message …) and the task is closed without its result: do not prepare it again" |
 
 **What `confirm` answers.** The run the platform starts is an HTTPS call, so
 it answers what a send answers, with `status` and `task_id`. On chain
@@ -100,7 +105,7 @@ true}`. Without a key: over HTTPS the policy goes in the clear, as the transport
 already is; on chain (`OUTLAYER_EXECUTION_TYPE` is anything but `HTTPS`) the
 fields are withheld and the answer says how to ask.
 
-The seal is the pair near.email runs on: the `ecies` crate here, `eciesjs` in
+The seal is the `ecies` crate here, `eciesjs` in
 the browser — secp256k1 ECDH → HKDF-SHA256 → AES-256-GCM, in a format the two
 libraries keep compatible with each other. A key that is not a point on the
 curve is refused, and a malformed one is refused before Google is asked for
@@ -123,7 +128,7 @@ commas: a comma makes it a malformed address, not a list.
 | network | project | state |
 |---|---|---|
 | testnet | `connectors.outlayer.testnet/gmail` | live |
-| mainnet | `connectors.outlayer.near/gmail` | live, same bytes as testnet |
+| mainnet | `connectors.outlayer.near/gmail` | live |
 
 The active version, its source URL and the prices are on chain and are the only
 place to read them from:
@@ -146,8 +151,8 @@ wins**: when both are present the caller's client is used and nothing of ours
 enters that run. The names are deliberately not the author's: a key defined by
 both the author and the caller refuses the run.
 
-The refresh token stays in the enclave; what leaves is one request to Google for
-an access token, which is cached in project storage — keyed by a digest of the
+At run time the refresh token is used only inside the enclave; what leaves is
+one request to Google for an access token, which is cached in project storage — keyed by a digest of the
 credential, so a replaced credential never inherits the previous one's token —
 until shortly before it expires.
 
@@ -163,7 +168,7 @@ public key and stores it with `store_secrets`:
 | accessor | `Project(connectors.outlayer.{testnet,near}/gmail)` |
 | profile | `gmail` |
 | access | `Whitelist[the connecting account]` |
-| keys | `GMAIL_REFRESH_TOKEN`, and `GMAIL_POLICY` as `{}` |
+| keys | `GMAIL_REFRESH_TOKEN`, and `GMAIL_POLICY` as the page's policy editor left it (`{}` when nothing was narrowed) |
 
 The empty policy is consent to send with nothing narrowed — see below. The owner
 grants an agent by adding its payer account to that whitelist, and the agent
@@ -230,7 +235,7 @@ enclave before anything reaches Google.
 Fail-closed at the edges only: with **no** `GMAIL_POLICY` nothing is sent, and a
 policy this build cannot parse — an unknown field included — refuses sending too.
 Within a policy that exists, every field is a narrowing: absent means permitted.
-`{}`, which the connect page writes, therefore allows any recipient, any number
+`{}`, which the connect page writes when the owner narrows nothing, therefore allows any recipient, any number
 of messages, any number of addresses per message. The exception is
 `max_attachment_kb`: without it the agent may not send files at all, because
 silence about attachments is not permission. `recipient_domains: ["any"]`, or
@@ -278,10 +283,12 @@ which is charged before the run.)
 ./build.sh
 ```
 
-Checks that the artefact carries the `outlayer.manifest` section, that the
-manifest's operations are exactly the ones the code dispatches on, that the limit
-words are ones the platform knows, and that `author_secrets.profile` is declared.
-Prints the SHA-256 to publish.
+Checks that the SDK's `tasks.wit` is the worker's, that the artefact carries the
+`outlayer.manifest` section and imports `outlayer:tasks`, that the manifest's
+operations are exactly the ones the code dispatches on and lists, that the limit
+words are ones the platform knows, that `author_secrets.profile` is declared, and
+that every dispatched operation is in `describe` with its parameters. Prints the
+SHA-256 to publish.
 
 ## Publish
 

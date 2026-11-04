@@ -150,9 +150,10 @@ A task opened by that run is the next **turn** of the answered task's
 conversation: it carries the answered task's `thread`, and it is the same
 agent's — the inbox shows it from that agent, the agent's `mine` and `status`
 list it, and it counts in that agent's share and under its mute. A turn is
-opened whatever the owner's row says of that agent now: one the row no
-longer admits is still the preparer of a turn in the owner's own inbox,
-which muting that agent and deleting its waiting tasks clears. A run that
+held to the owner's row as any task is: the run that answers names that row,
+so a row that no longer admits the agent refuses the run, and one that
+admits it by a rule naming no account refuses the turn
+(`not-granted-by-name`). A run that
 answered tasks of more than one conversation opens none: `open` is refused
 `internal`. A run that answered nothing — or whose every answer was refused
 — opens in a conversation of its own.
@@ -205,17 +206,17 @@ the outcomes kept, stay.
 | `policy_hash` | the hash of the policy the task was made under |
 | `build` | SHA-256 of the build that made the task: the code the owner's proof names, and the build the run that answers must be of |
 | consent | sealed beside the envelope, never shown: the preparing run's payment key (its nonce), wallet, whether its identity was bound, and its compute limit — what the run that carries the task out must be admitted with. The store keeps the same facts in the clear as the task's **voucher**, from which the platform starts that run |
+| `thread` | the id of the first task of the conversation; a turn keeps the conversation's preparer |
+| life | 24 hours at most; a project may ask for less, but not under 15 minutes for a task that takes an answer (a notice has no floor) |
 
 The task key is under the master of the vault the owner's row is bound to,
 and under the default master for a row bound to none: what a vault seals, it
 seals with its own key, tasks included. The store records the vault beside
 each task (`vault` in the inbox's list), so what a vault's owner did is
 known as the vault's.
-| `thread` | the id of the first task of the conversation; a turn keeps the conversation's preparer |
-| life | 24 hours at most; a project may ask for less |
 
-Everything but `state` is one document, the **envelope**, written once in a
-fixed order. `task_hash` is the SHA-256 of its bytes. The owner's page hashes
+Everything but `state` and the consent is one document, the **envelope**,
+written once in a fixed order. `task_hash` is the SHA-256 of its bytes. The owner's page hashes
 the bytes it opened and the owner's answer names that hash, so what was shown
 is what is acted on.
 
@@ -267,16 +268,18 @@ report, are ended `failed` by the platform (`run_not_started` and
 (`409 task_ending`) before the owner's signature is spent: the run it would
 start, paid by the agent, could not take the task in time.
 
-A task that leaves `open` loses what it showed at once — the sealed copy and
-every device's copy. Its outcome is kept 30 days.
+A task keeps what it showed — the sealed copy, every device's copy and its
+files — while it is `open` or `approved`, and loses it at once when the run
+takes its answer or the task ends any other way. Its outcome is kept 30 days.
 
 ### Limits
 
 | Limit | Value |
 |---|---|
-| open tasks addressed to one owner | 20 |
+| tasks addressed to one owner, `open` and `approved` together | 20 |
 | tasks one run opens | 5 |
-| a task's life | 24 hours |
+| a task's life | 24 hours at most; 15 minutes at least for one that takes an answer |
+| `policy` | 64 KiB |
 | what the waiting tasks of one owner hold together | 64 MiB |
 | files of one task | 10, and 6 MiB together: what one call carries |
 | `state` | 256 KiB |
@@ -298,7 +301,8 @@ The coordinator stores a task and opens none of it.
 | the envelope | twice: sealed under a key of the enclave, and under a content key wrapped to each of the owner's devices | the owner, on a signed-in device; the host |
 | the files | under the task's content key, each bound to the task and to its place | the owner, on a signed-in device; the project's code, when the task is answered |
 | `state` | sealed under the key of the enclave | the project's code, when the task is answered |
-| what the owner supplies, the note beside their approval, the reason of a rejection | encrypted by the owner's page to the task's reply key | the project's code, in the run that answers; the preparer's next run |
+| what the owner supplies, the note beside their approval | encrypted by the owner's page to the task's reply key; dropped when the run takes the answer | the project's code, in the run that answers |
+| the reason of a rejection | encrypted by the owner's page to the task's reply key | the preparer's next run, as the task's outcome |
 | the owner's approval — the signature, the key, the nonce, the minute | in the clear | the coordinator at the door; the host in the run that answers, which verifies it again |
 | the result | sealed under the key of the enclave | the preparer's run |
 | who asked whom, through which project, of what kind, when, the state | readable by the coordinator | the owner in a session; the preparer; the coordinator |
@@ -456,12 +460,13 @@ up to thirty behind. A `confirm` task takes no `supplied`; an `input` task
 takes one. A notice takes no approval and no rejection: both are 400
 `invalid_request`, an approval before its nonce is spent; Got it closes it,
 and on a task that is not a notice is 400 too. The answer is `{id, state, run}`, with `failure_reason` when the
-run could not be started and the task is `failed` at once. A key removed
+run could not be started and the task is `failed` at once; a task failed
+`build_changed` has no `run`. A key removed
 from the account between the door and the run passes the door — the chain's
 word is kept five minutes, as at sign-in — and is refused in the enclave.
 
 A refusal is `{"error": sentence, "reason": code, "terminal": bool}`. Nothing
-waiting is `{"tasks": []}`; no session is 401 `session_required`, with no count
+waiting is `{"tasks": [], "more": false}`; no session is 401 `session_required`, with no count
 and no list, and the session of a device that a later sign-in retired is 401
 `session_replaced`; a store or a chain that did not answer is 503
 `upstream_unavailable` with `Retry-After`. A refusal is never an empty list.
@@ -503,7 +508,8 @@ is `ok([])`.
 | `mine()`, `status(id)` | preparer | its tasks — a turn is the preparer's of its conversation — or one of them; `status` also reads a task this run opened |
 | `cancel(id)`, `delete(id)` | preparer; or the run that opened the task | withdraws; deletes one nothing was carried out on (open, cancelled, rejected, expired, void, or failed with a reason that says nothing was done: `run_failed`, `run_not_started`, `run_refused:*`, a run never started) — one the owner's yes acted on, or may have, is refused `closed` |
 | `answered(id, hash, operation, policy, approval, supplied, note)` | the preparer's run the platform started for the task | verifies the owner's approval over this task, this hash and these words, and takes the answer; hands back `state`, the files, `supplied` and `note` opened |
-| `report(id, result)` | the same run | leaves the result for the preparer |
+| `report(id, result)` | the same run | leaves the result for the preparer: the task was carried out |
+| `report-failure(id, result)` | the same run | leaves the result for the preparer: the task was not carried out; it ends `failed` as `run_failed` |
 | `unlock()` | owner | writes the copies for the devices now in force |
 
 `open` seals the run's consent into the task — its payment key, wallet,
@@ -523,13 +529,13 @@ a task refused at that door is `failed` with `run_refused:<reason>`.
 | `muted` | `muted` | the owner muted this agent or this project |
 | `inbox-full` | `inbox_full` | a limit of open tasks, or of what they hold together |
 | `run-limit` | `task_run_limit` | this run opened as many tasks (5), or made as many calls of the interface (100), as one run may |
-| `display-invalid` | `display_invalid` | what is shown is outside the bounds, or the kind and `answer-by` disagree — a notice names none, a task that takes an answer names one; the message names what |
+| `display-invalid` | `display_invalid` | what is shown is outside the bounds, or the kind and `answer-by` disagree — a notice names none, a task that takes an answer names one — or a life under 15 minutes for a task that takes an answer; the message names what |
 | `too-large` | `task_too_large` | `state`, `policy`, the files, the envelope or a result |
 | `life-too-long` | `task_life_too_long` | a life asked beyond the maximum |
 | `no-payment-key` | `task_no_payment_key` | `open` of a task that takes an answer in a run on chain: such a task is opened over HTTPS, with the payment key that will pay for the run that carries it out. A notice needs none |
-| `not-found` | `task_not_found` | no such task of this project, owner and preparer |
+| `not-found` | `task_not_found` | no such task of this project, owner and preparer; `report` or `report-failure` of a task this run did not answer |
 | `not-the-owner` | `not_the_owner` | `unlock` in another account's run |
-| `not-the-preparer` | `not_the_preparer` | `answered` or `report` in a run that is not the one the platform started for the task: another account, another payment key, another wallet, another identity, or more compute than the preparing run was allowed |
+| `not-the-preparer` | `not_the_preparer` | `answered` in a run that is not the one the platform started for the task: another account, another payment key, another wallet, another identity, or more compute than the preparing run was allowed |
 | `approval-invalid` | `task_approval_invalid` | the owner's signature does not verify over this task, this hash and these words, is by a key that is not a full-access key of the owner's account, is too old or too far ahead, or the task was never approved |
 | `hash-mismatch` | `task_hash_mismatch` | the hash named is not the task's |
 | `answer-invalid` | `task_answer_invalid` | another operation than the one the task names; or what was supplied, or the note, is not what was asked, or does not open; or the task is a notice, which takes no answer |

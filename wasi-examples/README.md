@@ -103,8 +103,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 3. Test Locally
 
 ```bash
-# With wasmtime
+# With wasmtime (a P2 component that makes HTTP requests needs -S http)
 echo '{"test":"data"}' | wasmtime your-app.wasm
+echo '{"test":"data"}' | wasmtime run -S http your-app.wasm
 
 # With test runner (recommended)
 cd wasi-test-runner
@@ -147,8 +148,9 @@ Before deploying to NEAR OutLayer, ensure:
 - ✅ Reading from stdin (not args)
 - ✅ Writing to stdout (not stderr)
 - ✅ Flushing stdout after write
-- ✅ JSON input/output format
-- ✅ Output ≤ 900 bytes
+- ✅ Valid JSON on stdout when the caller asks for `Json` (every HTTPS call does)
+- ✅ Output within 10 MiB (the worker's stdout capacity)
+- ✅ No file access: a run has no filesystem, keep data in memory
 - ✅ Built with wasm32-wasip1 or wasm32-wasip2
 - ✅ Tested with [test runner](./wasi-test-runner/)
 
@@ -213,8 +215,8 @@ wasm-tools component wit your-app.wasm
 | "entry symbol not defined: _initialize" | Use `[[bin]]` instead of `[lib]` |
 | "Failed to find _start function" | Add `fn main()` entry point |
 | Empty output | Add `io::stdout().flush()?` |
-| "Not a valid WASI P1/P2" | Check build target |
-| Output truncated | Reduce output to ≤900 bytes |
+| "not a valid WASI P2 component or WASI P1 module" | Check build target |
+| JSON parse error on an HTTPS call | stdout must be one JSON value: no extra prints |
 
 See [WASI_TUTORIAL.md](./WASI_TUTORIAL.md#common-pitfalls) for detailed solutions.
 
@@ -257,14 +259,9 @@ Note that most subdirectories here are **git submodules** with their own reposit
 and are governed by the `LICENSE` in those repositories rather than by these files:
 `random-example`, `ai-example`, `echo-example`, `oracle-example`, `captcha-example`, `weather-example`,
 `private-dao-example`, `botfather-example`, `env-test-example`, `test-secrets-example`,
-`vrf-example`, `intents-example`, `eth-proof-example`, `near-email`.
+`vrf-example`, `intents-example`, `eth-proof-example`, `eas-attestor`, `near-email`.
 
 `near-email` is Apache-2.0 rather than dual-licensed: it is a finished product built on
 OutLayer, not an example to copy from.
 
 See [LICENSING.md](../LICENSING.md) for the full component map.
-
----
-
-**Last updated**: 2025-10-15
-**Compatible with**: wasmtime 28+, NEAR OutLayer MVP
