@@ -54,12 +54,14 @@ use serde_json::{json, Map, Value};
     feature = "encryption-typed",
     feature = "project-misspelled",
     feature = "project-none",
+    feature = "wasm-none",
+    feature = "project-none-secp",
     feature = "encryption-none"
 )))]
 compile_error!(
     "choose the manifest: --features project | project-pred | wasm | project-vault | project-secp | wasm-secp | encryption | \
      encryption-storage | encryption-storage-pred | encryption-wasm | encryption-vault | encryption-pred | encryption-typed | \
-     project-misspelled | project-none | encryption-none"
+     project-misspelled | project-none | wasm-none | project-none-secp | encryption-none"
 );
 
 /// How many manifest features this build names: exactly one is allowed.
@@ -78,6 +80,8 @@ const MANIFEST_FEATURES: usize = cfg!(feature = "project") as usize
     + cfg!(feature = "encryption-typed") as usize
     + cfg!(feature = "project-misspelled") as usize
     + cfg!(feature = "project-none") as usize
+    + cfg!(feature = "wasm-none") as usize
+    + cfg!(feature = "project-none-secp") as usize
     + cfg!(feature = "encryption-none") as usize;
 const _: () = assert!(MANIFEST_FEATURES == 1, "exactly one manifest feature: pass --no-default-features with one");
 
@@ -129,6 +133,10 @@ manifest!("../manifests/encryption-typed.json");
 manifest!("../manifests/project-misspelled.json");
 #[cfg(feature = "project-none")]
 manifest!("../manifests/project-none.json");
+#[cfg(feature = "wasm-none")]
+manifest!("../manifests/wasm-none.json");
+#[cfg(feature = "project-none-secp")]
+manifest!("../manifests/project-none-secp.json");
 #[cfg(feature = "encryption-none")]
 manifest!("../manifests/encryption-none.json");
 

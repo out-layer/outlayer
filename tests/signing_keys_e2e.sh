@@ -49,7 +49,15 @@
 #   S23 caller none (the `project-none` build, a version of the project): the
 #       key at alpha is neither the signer's nor the predecessor's; $CALLER2
 #       gets the same key; it signs, verified HERE; sign-nep413 with it is an
-#       err; the signer keys still differ per caller
+#       err; the signer keys still differ per caller; a second version keeps
+#       it; every probe attack on it is an err (at the cap and determinism
+#       ok); relayed through $RELAY_CONTRACT it is the same key
+#   S25 caller none with bind wasm (`wasm-none`, run from its URL): $PARENT and
+#       $CALLER2 get one key, which is neither the signer wasm key nor the
+#       project's no-caller key; $CALLER2's signature verifies HERE; the v2
+#       build gets another key
+#   S26 a secp256k1 key of no caller (`project-none-secp`) → the run is
+#       refused before it starts, naming why
 #   S24 SIGNING_BASELINE: absent, the run writes the public keys of the
 #       signer, predecessor and wasm keys to it; present, they must equal it
 #       (run before and after a deploy). Without the variable it SKIPS
@@ -68,7 +76,7 @@
 #
 # Env: OFFLINE=1 (dry run only: no chain reads; ignored with --apply).
 #
-# Money: eight FastFS uploads (~230 KB each), project storage, and one on-chain
+# Money: twelve FastFS uploads (~230 KB each), project storage, and one on-chain
 # run per probe at $DEPOSIT (~27 runs; a relayed run's unused deposit comes
 # back to its signer, as a direct run's does).
 #
@@ -321,7 +329,7 @@ if [[ "$APPLY" != true ]]; then
   else
     note "project: $PROJECT ($(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{project_id:$p}')" | jq -r 'if .project_id then "on chain, active " + .active_version else "not on chain yet" end' 2>/dev/null || echo 'unreadable'))"
   fi
-  for v in project project-v2 project-pred project-none wasm wasm-v2; do
+  for v in project project-v2 project-pred project-none project-none-v2 wasm wasm-v2 wasm-none wasm-none-v2 project-none-secp; do
     f="$VARIANTS/signing-key-probe-$v.wasm"
     if [[ -f "$f" ]]; then
       h=$(sha_of "$f")
@@ -340,19 +348,21 @@ fi
 
 log "build the probe"
 (cd "$PROBE_DIR" && ./build.sh >/dev/null) || { echo "✗ $PROBE_DIR/build.sh failed" >&2; exit 1; }
-for v in project project-v2 project-pred project-none wasm wasm-v2; do
+for v in project project-v2 project-pred project-none project-none-v2 wasm wasm-v2 wasm-none wasm-none-v2 project-none-secp; do
   set_for hash "$v" "$(sha_of "$VARIANTS/signing-key-probe-$v.wasm")"
   note "$v sha256 $(get_for hash "$v")"
 done
 
 log "upload to FastFS"
-for v in project project-v2 project-pred project-none wasm wasm-v2; do
+for v in project project-v2 project-pred project-none project-none-v2 wasm wasm-v2 wasm-none wasm-none-v2 project-none-secp; do
   url=$(fastfs_upload "$VARIANTS/signing-key-probe-$v.wasm" "$(get_for hash "$v")") || { echo "✗ upload of $v never served its bytes" >&2; exit 1; }
   set_for url "$v" "$url"
   note "$v at $url"
 done
-H_P=$(get_for hash project); H_P2=$(get_for hash project-v2); H_PP=$(get_for hash project-pred); H_PN=$(get_for hash project-none); H_W=$(get_for hash wasm); H_W2=$(get_for hash wasm-v2)
+H_P=$(get_for hash project); H_P2=$(get_for hash project-v2); H_PP=$(get_for hash project-pred); H_PN=$(get_for hash project-none); H_PN2=$(get_for hash project-none-v2); H_W=$(get_for hash wasm); H_W2=$(get_for hash wasm-v2)
 U_P=$(get_for url project); U_W=$(get_for url wasm); U_W2=$(get_for url wasm-v2)
+H_WN=$(get_for hash wasm-none); H_WN2=$(get_for hash wasm-none-v2); H_PNS=$(get_for hash project-none-secp)
+U_WN=$(get_for url wasm-none); U_WN2=$(get_for url wasm-none-v2); U_PNS=$(get_for url project-none-secp)
 
 log "publish $PROJECT"
 if [[ -z "$(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{project_id:$p}')" | jq -r '.project_id // empty' 2>/dev/null)" ]]; then
@@ -362,7 +372,7 @@ if [[ -z "$(view "$CONTRACT_ID" get_project "$(jq -nc --arg p "$PROJECT" '{proje
 fi
 # project v1 active; v2, the predecessor build, the no-caller build and the wasm build as inactive
 # versions of the same project.
-for v in project project-v2 project-pred project-none wasm; do
+for v in project project-v2 project-pred project-none project-none-v2 wasm; do
   [[ -n "$(version_on_chain "$(get_for hash "$v")")" ]] && continue
   active=false; [[ "$v" == project ]] && active=true
   out=$(call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$(get_for url "$v")" "$(get_for hash "$v")")" --argjson a "$active" \
@@ -370,7 +380,7 @@ for v in project project-v2 project-pred project-none wasm; do
   grep -q 'succeeded' <<<"$out" || { echo "✗ add_version $v failed: $(near_why "$out")" >&2; exit 1; }
   sleep 4
 done
-for v in project project-v2 project-pred project-none wasm; do
+for v in project project-v2 project-pred project-none project-none-v2 wasm; do
   [[ "$(version_on_chain "$(get_for hash "$v")")" == "WasmUrl" ]] || { echo "✗ $(get_for hash "$v") ($v) is not a WasmUrl version of $PROJECT" >&2; exit 1; }
 done
 call "$PARENT" set_active_version "$(jq -nc --arg n "$PROJECT_NAME" --arg v "$H_P" '{project_name:$n, version_key:$v}')" '0 NEAR' >/dev/null
@@ -639,9 +649,59 @@ if [[ "$RUN_OK" == true && "$(out_field .status)" == err && "$(out_field .messag
 else
   fail "S23 sign-nep413 with the no-caller key answered $(out_field .status): $(head -c 200 <<<"$RUN_OUT$RUN_ERR")"
 fi
+run_src "$PARENT" "$(project_src "$H_PN2")" '{"operation":"all_public_keys"}'
+ran_ok "S23 v2 all_public_keys" && { [[ "$(out_field .build)" == "signing-key-probe build 2" && -n "$NONE_PK" && "$(out_field .keys.alpha.public_key)" == "$NONE_PK" ]] \
+  && pass "S23 a second version of the project (${H_PN2:0:12}) holds the same no-caller key" \
+  || fail "S23 v2 ($(out_field .build)) holds $(out_field .keys.alpha.public_key), not $NONE_PK"; }
+run_src "$CALLER2" "$(project_src "$H_PN")" '{"operation":"attacks"}'
+if ran_ok "S23 attacks"; then
+  unexpected=$(jq -r '.results[] | select(
+      (.name == "message_at_cap" or .name == "determinism") and .status != "ok"
+      or ((.name | test("^(vault_(missing|wrong)_when_declared|secp_message_not_32|nep413_wrong_type)$")) and .status != "n/a")
+      or ((.name | test("^(message_at_cap|determinism|vault_missing_when_declared|vault_wrong_when_declared|secp_message_not_32|nep413_wrong_type)$") | not) and .status != "err")
+    ) | "\(.name)=\(.status)"' <<<"$RUN_OUT" 2>/dev/null | tr '\n' ' ')
+  [[ -z "$unexpected" ]] && pass "S23 every attack on the no-caller key is an err, at the cap and determinism ok" \
+    || fail "S23 attacks on the no-caller key: $unexpected"
+fi
+if [[ "$RELAY_READY" == true ]]; then
+  run_relayed "$PARENT" "$(project_src "$H_PN")" '{"operation":"all_public_keys"}'
+  ran_ok "S23 relayed all_public_keys" && { [[ -n "$NONE_PK" && "$(out_field .keys.alpha.public_key)" == "$NONE_PK" ]] \
+    && pass "S23 relayed through $RELAY_CONTRACT, the same no-caller key: no account moves it" \
+    || fail "S23 relayed, the no-caller key is $(out_field .keys.alpha.public_key), not $NONE_PK"; }
+else
+  skip "S23 relayed through a contract — $RELAY_WHY"
+fi
 # Beside it, the signer keys of the project still differ per caller (S3).
 [[ -n "${OTHER_ALPHA:-}" && "$OTHER_ALPHA" != "$ALPHA" ]] && pass "S23 and the signer keys still differ per caller" \
   || fail "S23 the signer keys no longer differ per caller ($ALPHA / ${OTHER_ALPHA:-none})"
+
+# ── S25 a wasm key of no caller ─────────────────────────────────────────────
+
+log "S25 a wasm key of no caller: one per build, whoever runs it"
+WNONE=""
+run_src "$PARENT" "$(wasm_src "$U_WN" "$H_WN")" '{"operation":"all_public_keys"}'
+if ran_ok "S25 direct all_public_keys"; then
+  remember_keys
+  WNONE=$(out_field .keys.code.public_key)
+  [[ "$WNONE" =~ ^[0-9a-f]{64}$ && "$WNONE" != "$CODE" && "$WNONE" != "$NONE_PK" ]] \
+    && pass "S25 the build's no-caller key is neither $PARENT's wasm key nor the project's no-caller key" \
+    || fail "S25 the wasm no-caller key is '$WNONE' (signer wasm key $CODE, project no-caller key $NONE_PK)"
+fi
+run_src "$CALLER2" "$(wasm_src "$U_WN" "$H_WN")" "$(jq -nc --arg m "$MSG_HEX" '{operation:"sign",path:"code",message_hex:$m}')"
+ran_ok "S25 $CALLER2 sign" && { remember_keys
+  [[ -n "$WNONE" && "$(out_field .public_key)" == "$WNONE" && "$(verify_local "$WNONE" "$MSG_HEX" "$(out_field .signature)")" == ok ]] \
+    && pass "S25 $CALLER2 signs with the same key, verified here" \
+    || fail "S25 $CALLER2's wasm no-caller key is $(out_field .public_key), not $WNONE, or its signature does not verify"; }
+run_src "$PARENT" "$(wasm_src "$U_WN2" "$H_WN2")" '{"operation":"all_public_keys"}'
+ran_ok "S25 another build" && { remember_keys
+  [[ -n "$WNONE" && "$(out_field .keys.code.public_key)" != "$WNONE" ]] && pass "S25 another build, another no-caller key" \
+    || fail "S25 two builds, one no-caller key"; }
+
+# ── S26 a secp256k1 key of no caller ────────────────────────────────────────
+
+log "S26 a secp256k1 key of no caller is refused before the run starts"
+run_src "$PARENT" "$(wasm_src "$U_PNS" "$H_PNS")" '{"operation":"all_public_keys"}'
+refused_without_keys "S26 the secp256k1 no-caller build" 'of no caller'
 
 # ── S24 the existing keys did not move ──────────────────────────────────────
 #

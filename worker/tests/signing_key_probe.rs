@@ -641,6 +641,29 @@ async fn a_key_of_no_caller_signs_and_the_host_makes_no_nep413_signature_with_it
     .await;
     assert_eq!(host["status"], "err", "{host}");
     assert!(host["message"].as_str().unwrap_or_default().contains("of no caller"), "{host}");
+
+    // Every attack is still an answer on a key of no caller: a vault it does
+    // not declare, a path it does not declare, a message over the cap.
+    let attacks = answer(&wasm, keys(), json!({ "operation": "attacks" })).await;
+    let results = attacks["results"].as_array().unwrap();
+    for one in results {
+        let (name, status) = (one["name"].as_str().unwrap(), one["status"].as_str().unwrap());
+        let want = match name {
+            "message_at_cap" | "determinism" => "ok",
+            "vault_missing_when_declared" | "vault_wrong_when_declared" | "secp_message_not_32" | "nep413_wrong_type" => "n/a",
+            _ => "err",
+        };
+        assert_eq!(status, want, "{name}: {one}");
+    }
+
+    // The same declaration under bind wasm parses, and v2 is another build;
+    // a secp256k1 key of no caller does not read at all.
+    for variant in ["project-none-v2", "wasm-none", "wasm-none-v2"] {
+        let m = offchainvm_worker::connector_manifest::manifest_from_wasm(&probe(variant)).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(m.signing_keys.unwrap()).unwrap()[0]["caller"], "none", "{variant}");
+    }
+    let e = offchainvm_worker::connector_manifest::manifest_from_wasm(&probe("project-none-secp")).unwrap_err();
+    assert!(e.contains("of no caller") && e.contains("secp256k1"), "{e}");
 }
 
 #[tokio::test]

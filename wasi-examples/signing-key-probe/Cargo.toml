@@ -13,7 +13,8 @@ path = "src/main.rs"
 # Which manifest the build embeds — exactly one of `project`, `project-pred`,
 # `wasm`, `project-vault`, `project-secp`, `wasm-secp`, `encryption`,
 # `encryption-storage`, `encryption-storage-pred`, `encryption-wasm`, `encryption-vault`,
-# `encryption-pred`, `encryption-typed`, `project-none`, `encryption-none`.
+# `encryption-pred`, `encryption-typed`, `project-none`, `wasm-none`, `project-none-secp`,
+# `encryption-none`.
 # `project` is the default, so a plain `cargo build`, and a build of the
 # repository on the platform (which passes no features), embeds it.
 default = ["project"]
@@ -22,6 +23,10 @@ project = []
 project-pred = []
 # A signing key with `caller: "none"`, bind project: one key for every caller.
 project-none = []
+# The same with bind wasm: one key for every caller of this build.
+wasm-none = []
+# A secp256k1 key with `caller: "none"`: refused before it runs.
+project-none-secp = []
 wasm = []
 project-vault = []
 # The secp256k1 builds: a secp256k1 key beside an ed25519 one on a project
