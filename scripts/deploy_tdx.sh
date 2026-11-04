@@ -12,7 +12,7 @@
 #
 # Required:
 #   --version <ver>     release, e.g. 0.1.35
-#   --node <ssh>        SSH target for the TDX node (lands as root/sudoer), e.g. root@173.237.9.76
+#   --node <ssh>        SSH target for the TDX node (lands as root/sudoer), e.g. root@$DAL_HOST
 #   --execute-excludes  worker only: routes this node must not run, e.g.
 #                       "connectors.outlayer.near/polymarket:order". Omit it and the
 #                       per-node table in this script decides (see node_excludes).
@@ -34,8 +34,9 @@
 #                       instance when [instance-name] is omitted.
 #   --kms-url <url>     deploy against this KMS instead of the node's default (KMS v1):
 #                       https://kms-v2.<site>.dstack.outlayer.ai:11102 for KMS v2. Changes the
-#                       measurements (RTMR3 carries the KMS), approved like any other.
-#   --dry-run           show what would happen; no deploy, no tx
+#                       measurements (RTMR3 carries the KMS), approved like any other. The
+#                       <site> must be the node's own (see node_kms_site); refused otherwise.
+#   --dry-run          show what would happen; no deploy, no tx
 #
 # The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
 # compose file, the env-file layout and the node-side deploy_tdx.sh are read there. This script
@@ -58,9 +59,9 @@
 #           Owner + zavodil keys stay on the Mac.
 #
 # Examples:
-#   ./scripts/deploy_tdx.sh worker   testnet --version 0.1.35 --node root@173.237.9.76
-#   ./scripts/deploy_tdx.sh worker   testnet worker-b --version 0.1.35 --node root@173.237.9.76
-#   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@173.237.9.76
+#   ./scripts/deploy_tdx.sh worker   testnet --version 0.1.35 --node root@$DAL_HOST
+#   ./scripts/deploy_tdx.sh worker   testnet worker-b --version 0.1.35 --node root@$DAL_HOST
+#   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@$DAL_HOST
 set -euo pipefail
 
 DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""; KMS_URL=""
@@ -93,7 +94,13 @@ COMPONENT="${POS[0]:-}"; NETWORK="${POS[1]:-testnet}"; INSTANCE_NAME="${POS[2]:-
 case "$COMPONENT" in worker|keystore) ;; *) echo "component must be worker|keystore (got '$COMPONENT')" >&2; exit 1;; esac
 case "$NETWORK" in testnet|mainnet) ;; *) echo "network must be testnet|mainnet (got '$NETWORK')" >&2; exit 1;; esac
 [ -n "$DEPLOY_VERSION" ] || { echo "--version <ver> required (e.g. --version 0.1.35)" >&2; exit 1; }
-[ -n "$NODE" ] || { echo "--node <ssh-target> required (e.g. --node root@173.237.9.76)" >&2; exit 1; }
+[ -n "$NODE" ] || { echo "--node <ssh-target> required (e.g. --node root@<node-ip>)" >&2; exit 1; }
+
+# The node hosts (DAL_HOST, AMS_HOST) live in the gitignored .env.nodes at the repo root.
+ENV_NODES="$(cd "$(dirname "$0")/.." && pwd)/.env.nodes"
+[ -f "$ENV_NODES" ] && { set -a; source "$ENV_NODES"; set +a; }
+: "${DAL_HOST:?DAL_HOST unset — put it in .env.nodes at the repo root}"
+: "${AMS_HOST:?AMS_HOST unset — put it in .env.nodes at the repo root}"
 
 # ---------------------------------------------------------------------------
 # Routes a node cannot run, by node.
@@ -126,13 +133,45 @@ node_excludes() {
     # behave the same as from Europe). Only the operation that places an order
     # is excluded — excluding a read would make this node wait for another one
     # to answer something it can answer itself.
-    173.237.9.76) echo "$pm:order" ;;
+    "$DAL_HOST") echo "$pm:order" ;;
     # Haarlem — NL. Nothing known to refuse it.
-    23.109.254.164) echo "none" ;;
+    "$AMS_HOST") echo "none" ;;
     # A node nobody has measured: left alone rather than guessed at.
     *) echo "" ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# The KMS site a node belongs to, keyed like node_excludes by the HOST of `--node`.
+#
+# A CVM reaches only its own node's KMS, whatever name it is given: every kms-v2
+# name resolves to the host there, and the certificate that answers carries only
+# that node's name. With another site's URL dstack-prepare fails on the certificate
+# and the guest reboots, the vmm starts it again, and so on forever. The worker
+# never starts, so no heartbeat or chain transaction shows the loop. A new node
+# needs its row here; a node without one is not checked.
+node_kms_site() {
+  case "${1#*@}" in
+    "$DAL_HOST") echo "dal-01" ;;
+    "$AMS_HOST") echo "ams-01" ;;
+    *) echo "" ;;
+  esac
+}
+
+if [ -n "$KMS_URL" ]; then
+  KMS_HOST="${KMS_URL#*://}"; KMS_HOST="${KMS_HOST%%[:/]*}"
+  case "$KMS_HOST" in
+    kms-v2.*.dstack.outlayer.ai)
+      KMS_SITE="${KMS_HOST#kms-v2.}"; KMS_SITE="${KMS_SITE%.dstack.outlayer.ai}"
+      NODE_SITE="$(node_kms_site "$NODE")"
+      if [ -n "$NODE_SITE" ] && [ "$KMS_SITE" != "$NODE_SITE" ]; then
+        echo "--kms-url is the KMS of $KMS_SITE, but --node $NODE is $NODE_SITE: the CVM would reboot forever." >&2
+        echo "Use --kms-url https://kms-v2.$NODE_SITE.dstack.outlayer.ai:11102, or the --node of $KMS_SITE." >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
 
 VER="${DEPLOY_VERSION#v}"
 SUFFIX=$([ "$NETWORK" = mainnet ] && echo near || echo testnet)

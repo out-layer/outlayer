@@ -32,10 +32,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TREE="$HERE/../deploy/self-hosted-tdx"
 
+# The node hosts (DAL_HOST, AMS_HOST) live in the gitignored .env.nodes at the repo root.
+ENV_NODES="$HERE/../.env.nodes"
+[ -f "$ENV_NODES" ] && { set -a; source "$ENV_NODES"; set +a; }
+: "${DAL_HOST:?DAL_HOST unset — put it in .env.nodes at the repo root}"
+: "${AMS_HOST:?AMS_HOST unset — put it in .env.nodes at the repo root}"
+
 # The nodes and their gateway domains (40-deploy-gateway.sh SRV_DOMAIN of each node).
 NODES=(
-  "dal 173.237.9.76 dstack.outlayer.ai"
-  "ams 23.109.254.164 ams-01.dstack.outlayer.ai"
+  "dal $DAL_HOST dstack.outlayer.ai"
+  "ams $AMS_HOST ams-01.dstack.outlayer.ai"
 )
 
 NETWORK=""; APPLY=false; UP=false; WANT_VERSION=""; ALL=false

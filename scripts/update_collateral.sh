@@ -21,7 +21,7 @@
 #     QuoteCollateralV3 + accepts the self-signed local PCCS). `--hex` is a FLAG; the arg is a quote
 #     FILE (not the hex string). A reusable platform quote is saved at /home/outlayer/platform-quote.hex
 #     (any TDX quote from THIS platform works — the collateral is per-FMSPC, not per-quote):
-#       ssh root@173.237.9.76
+#       ssh root@<node>
 #       su - outlayer -c 'cd /tmp && PCCS_URL=https://localhost:8081 \
 #         /home/outlayer/dcap-qvl/cli/target/release/dcap-qvl verify --hex /home/outlayer/platform-quote.hex'
 #       # prints "Quote verified" (status UpToDate) + writes /tmp/our_collateral.json

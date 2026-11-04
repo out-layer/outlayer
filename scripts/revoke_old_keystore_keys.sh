@@ -64,6 +64,12 @@ esac
 # The keyed RPC from the repo .env when present: the script reads every proposal on the DAO, and
 # the public host rate-limits that mid-run.
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# The node hosts (DAL_HOST, AMS_HOST) live in the gitignored .env.nodes at the repo root.
+ENV_NODES="$HERE/../.env.nodes"
+[ -f "$ENV_NODES" ] && { set -a; source "$ENV_NODES"; set +a; }
+: "${DAL_HOST:?DAL_HOST unset — put it in .env.nodes at the repo root}"
+: "${AMS_HOST:?AMS_HOST unset — put it in .env.nodes at the repo root}"
 if [ -f "$HERE/../.env" ]; then
   keyed="$(grep -E "^${RPC_VAR}=" "$HERE/../.env" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
   [ -z "$keyed" ] || RPC="$keyed"
@@ -79,7 +85,7 @@ KEEP_VARS="KEEP_DAL KEEP_AMS"
 # unreachable node, a refusal or a line for another site stops the run — a node that did not
 # answer would otherwise have its live keystore revoked. A variable already set wins (a node
 # asked by hand, or a deliberate value). `ssh -n`: the confirmation prompt below reads stdin.
-node_of() { case "$1" in KEEP_DAL) echo 173.237.9.76 ;; KEEP_AMS) echo 23.109.254.164 ;; esac; }
+node_of() { case "$1" in KEEP_DAL) echo "$DAL_HOST" ;; KEEP_AMS) echo "$AMS_HOST" ;; esac; }
 for var in $KEEP_VARS; do
   [ -z "${!var+x}" ] || continue
   host="$(node_of "$var")"
