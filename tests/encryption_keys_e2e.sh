@@ -200,8 +200,18 @@ signer_flag() { [[ -f "$HOME/.near-credentials/$NETWORK/$1.json" ]] && echo with
 # One contract call, its whole transcript on stdout — the logs and the return
 # value included, which is where a run's event and answer are read from.
 call_on() { # call_on <signer> <receiver> <method> <args-json> <deposit>
-  near contract call-function as-transaction "$2" "$3" json-args "$4" \
-    prepaid-gas '300.0 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1
+  local out attempt
+  # An RPC node behind the one near-cli read from refuses the transaction —
+  # `Transaction has expired`, or a nonce it has not caught up with. Refused,
+  # never run; a new one has a new hash and a new nonce.
+  for attempt in 1 2 3; do
+    out=$(near contract call-function as-transaction "$2" "$3" json-args "$4" \
+      prepaid-gas '300.0 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1)
+    grep -qE 'Transaction has expired|Transaction nonce .* must be' <<<"$out" || break
+    note "$3 by $1: an RPC node refused the transaction as stale (attempt $attempt)"
+    sleep 3
+  done
+  printf '%s\n' "$out"
 }
 call() { call_on "$1" "$CONTRACT_ID" "$2" "$3" "$4"; } # call <signer> <method> <args-json> <deposit>
 

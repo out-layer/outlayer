@@ -56,7 +56,15 @@
 #                       inside the 30 s a bare entry has, so only the entry's
 #                       8 s can have ended it. Judged on `http_error` naming a
 #                       timeout; a completed fetch here means the entry's time
-#                       is not applied
+#                       is not applied, and one ended before 8 s by the wall
+#                       clock means something else ended it; with ADMIN_TOKEN the
+#                       egress audit must record the 8 s the request was given
+#   O11 a row naming OUTLAYER_SECRETS_OWNER is refused at the store
+#   O12 `env` on a row of CALLER's: OUTLAYER_SECRETS_ROWS names the owner,
+#       profile and key; _OWNER, _PROFILE follow; the value appears nowhere
+#   O13 a named row that does not exist: all three variables absent, not blank
+#   O14 two rows on this project, which does not declare `secrets_refs`: refused
+#   O15 the door: both fields, a repeated row, an empty list — each 400
 #
 # Needs: PAYMENT_KEY — a funded payment key; CALLER (O8 only) — an account with
 # a stablecoin balance INSIDE the contract and NEAR for the compute deposit.
@@ -309,22 +317,119 @@ fi
 
 # ── O9 / O10 a host entry's own request time ─────────────────────────────────
 log "O9 timed_fetch_within — a 4 s answer under an 8 s entry completes"
+STARTED=$(date +%s)
 call timed_fetch_within >/dev/null
-if [[ "$(out_field ok)" == "true" && "$(out_field http_status)" == "200" ]]; then
-  pass "O9 completed (HTTP $(out_field http_status))"
+TOOK=$(( $(date +%s) - STARTED ))
+if [[ "$(out_field ok)" == "true" && "$(out_field http_status)" == "200" && "$TOOK" -ge 4 ]]; then
+  pass "O9 completed (HTTP $(out_field http_status)) after ${TOOK}s: the host really took its 4 s"
 else
   fail "O9 a 4 s answer did not complete under an 8 s entry: $(head -c 200 <<<"$BODY")"
 fi
 
 log "O10 timed_fetch_beyond — a 10 s answer under the same entry times out"
+STARTED=$(date +%s)
 call timed_fetch_beyond >/dev/null
+TOOK=$(( $(date +%s) - STARTED ))
 TIMED_ERR=$(out_field http_error)
 if [[ "$(out_field ok)" == "true" ]]; then
   fail "O10 A 10 s ANSWER COMPLETED under an 8 s entry — the entry's time is not applied (HTTP $(out_field http_status))"
+elif [[ "$TIMED_ERR" == *[Tt]imeout* && "$TOOK" -ge 8 ]]; then
+  pass "O10 timed out after ${TOOK}s, no sooner than the entry's 8 s ($(head -c 80 <<<"$TIMED_ERR"))"
 elif [[ "$TIMED_ERR" == *[Tt]imeout* ]]; then
-  pass "O10 timed out at the entry's time, not the 30 s default ($(head -c 80 <<<"$TIMED_ERR"))"
+  fail "O10 timed out after ${TOOK}s, before the entry's 8 s: something else ended it ($(head -c 120 <<<"$TIMED_ERR"))"
 else
   fail "O10 neither completed nor timed out: $(head -c 200 <<<"$BODY")"
+fi
+
+# The audit trail says the same, from the worker: the time this request was given.
+if [[ -n "${ADMIN_TOKEN:-}" ]]; then
+  GIVEN=""
+  for _ in 1 2 3 4 5 6; do
+    GIVEN=$(printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_TOKEN" | curl -s -m 30 -K - \
+      "$COORDINATOR_URL/admin/egress-audit?project_id=$PROJECT&host=httpbin.org&limit=1" | jq -r '.attempts[0].timeout_secs // empty' 2>/dev/null)
+    [[ -n "$GIVEN" ]] && break
+    sleep 5
+  done
+  [[ "$GIVEN" == 8 ]] && pass "O10 the egress audit records the 8 s the request was given" \
+    || fail "O10 the egress audit records '${GIVEN:-nothing}' for httpbin.org, not 8"
+else
+  skip "O10 the egress audit's time — set ADMIN_TOKEN"
+fi
+
+# ── the secret rows a run is told of ─────────────────────────────────────────
+#
+# Stored as CALLER, through the CLI from a home of its own, and deleted at the end.
+rows_call() { # rows_call <body-members-json> — env op with these members in the body
+  local out; out=$(mktemp -t proberows.XXXXXX)
+  RC=$(curl -s -o "$out" -w '%{http_code}' -m 120 -X POST "$COORDINATOR_URL/call/$PROJECT" \
+        -H "X-Payment-Key: $PAYMENT_KEY" -H "X-Attached-Deposit: $DEPOSIT" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --argjson m "$1" '{input:{operation:"env"}} + $m')")
+  BODY="$(tr -d '\n' < "$out")"; rm -f "$out"
+}
+seen_var() { jq -r --arg k "$1" '.output.system_env[]? | select(.key == $k) | if .found then (.value // "") else "ABSENT" end' <<<"$BODY" 2>/dev/null; }
+CALLER_KEY_FILE="$HOME/.near-credentials/$NETWORK/$CALLER.json"
+if [[ ! -r "$CALLER_KEY_FILE" ]]; then
+  skip "O11–O15 need $CALLER's key file: the row is stored with it"
+else
+  ROWS_HOME=$(mktemp -d -t proberows_home.XXXXXX); chmod 700 "$ROWS_HOME"; mkdir -p "$ROWS_HOME/$NETWORK"
+  ( umask 077; jq --arg a "$CALLER" --arg c "$CONTRACT_ID" '{account_id:$a, public_key, private_key, contract_id:$c, auth_type:"near_key"}' "$CALLER_KEY_FILE" > "$ROWS_HOME/$NETWORK/credentials.json" )
+  ROW_PROFILE="ops-rows"; SENTINEL="sentinel-$(date +%s)-value"
+  ACCESS="whitelist:$CALLER"
+  ROW_ACCESSOR=$(jq -nc --arg p "$PROJECT" '{Project:{project_id:$p}}')
+  trap 'near --quiet contract call-function as-transaction "$CONTRACT_ID" delete_secrets json-args "$(jq -nc --argjson a "$ROW_ACCESSOR" --arg p "$ROW_PROFILE" "{accessor:\$a, profile:\$p}")" prepaid-gas "30.0 Tgas" attached-deposit "0 NEAR" sign-as "$CALLER" network-config "$NETWORK" sign-with-legacy-keychain send >/dev/null 2>&1; rm -rf "$ROWS_HOME"' EXIT
+
+  log "O11 a reserved name cannot be stored in a row"
+  out=$(OUTLAYER_HOME="$ROWS_HOME" OUTLAYER_NETWORK="$NETWORK" outlayer secrets set '{"OUTLAYER_SECRETS_OWNER":"somebody.else"}' --project "$PROJECT" --profile "$ROW_PROFILE-forged" --access "$ACCESS" 2>&1)
+  # Judged on the keystore's own words, and on the chain: a CLI that failed for
+  # any other reason must not read as this refusal.
+  if grep -q 'reserved system keywords as secret keys: OUTLAYER_SECRETS_OWNER' <<<"$out" \
+     && [[ "$(near --quiet contract call-function as-read-only "$CONTRACT_ID" get_secrets json-args "$(jq -nc --argjson a "$ROW_ACCESSOR" --arg p "$ROW_PROFILE-forged" --arg o "$CALLER" '{accessor:$a, profile:$p, owner:$o}')" network-config "$NETWORK" now 2>/dev/null | tail -1)" == null ]]; then
+    pass "O11 the keystore refuses a row that would state its own owner, and no such row is on chain"
+  else
+    fail "O11 a row named OUTLAYER_SECRETS_OWNER: $(near_why "$out" | head -c 200)"
+  fi
+
+  log "O12 a row that opened is told by owner and names, never by value"
+  out=$(OUTLAYER_HOME="$ROWS_HOME" OUTLAYER_NETWORK="$NETWORK" outlayer secrets set "$(jq -nc --arg v "$SENTINEL" '{OPS_ROW_A:$v}')" --project "$PROJECT" --profile "$ROW_PROFILE" --access "$ACCESS" 2>&1) \
+    || fail "O12 the row could not be stored: $(near_why "$out" | head -c 160)"
+  sleep 4
+  ROW_REF=$(jq -nc --arg o "$CALLER" --arg p "$ROW_PROFILE" '{account_id:$o, profile:$p}')
+  rows_call "$(jq -nc --argjson r "$ROW_REF" '{secrets_ref:$r}')"
+  WANT=$(jq -nc --arg o "$CALLER" --arg p "$ROW_PROFILE" '[{owner:$o, profile:$p, keys:["OPS_ROW_A"]}]')
+  if [[ "$(seen_var OUTLAYER_SECRETS_ROWS | jq -cS . 2>/dev/null)" == "$(jq -cS . <<<"$WANT")" ]]; then
+    pass "O12 OUTLAYER_SECRETS_ROWS names the row's owner, profile and key"
+  else
+    fail "O12 OUTLAYER_SECRETS_ROWS is '$(seen_var OUTLAYER_SECRETS_ROWS | head -c 200)', not $WANT"
+  fi
+  [[ "$(seen_var OUTLAYER_SECRETS_OWNER)/$(seen_var OUTLAYER_SECRETS_PROFILE)" == "$CALLER/$ROW_PROFILE" ]] \
+    && pass "O12 and _OWNER, _PROFILE are the first row's" \
+    || fail "O12 _OWNER/_PROFILE are '$(seen_var OUTLAYER_SECRETS_OWNER)/$(seen_var OUTLAYER_SECRETS_PROFILE)'"
+  grep -qF "$SENTINEL" <<<"$BODY" && fail "O12 THE VALUE OF THE ROW'S VARIABLE IS IN THE ANSWER" || pass "O12 and the value appears nowhere in the answer"
+
+  log "O13 a named row that does not exist tells the guest of no row"
+  rows_call "$(jq -nc --arg o "$CALLER" '{secrets_ref:{account_id:$o, profile:"ops-rows-absent"}}')"
+  if [[ "$(jq -r '.output.ok // empty' <<<"$BODY")" == true \
+     && "$(seen_var OUTLAYER_SECRETS_ROWS)/$(seen_var OUTLAYER_SECRETS_OWNER)/$(seen_var OUTLAYER_SECRETS_PROFILE)" == "ABSENT/ABSENT/ABSENT" ]]; then
+    pass "O13 all three variables are absent, not blank"
+  else
+    fail "O13 with no such row: rows='$(seen_var OUTLAYER_SECRETS_ROWS)' owner='$(seen_var OUTLAYER_SECRETS_OWNER)': $(head -c 160 <<<"$BODY")"
+  fi
+
+  log "O14 several rows on a project that did not declare them are refused"
+  rows_call "$(jq -nc --argjson r "$ROW_REF" --arg o "$CALLER" '{secrets_refs:[$r, {account_id:$o, profile:"ops-rows-absent"}]}')"
+  if [[ "$(jq -r '.status // empty' <<<"$BODY")" != completed && "$BODY" == *"does not declare"* && "$BODY" == *secrets_refs* ]]; then
+    pass "O14 refused, naming the manifest's secrets_refs"
+  else
+    fail "O14 two rows on a project without the declaration: HTTP $RC $(head -c 240 <<<"$BODY")"
+  fi
+
+  log "O15 a list the door cannot take"
+  rows_call "$(jq -nc --argjson r "$ROW_REF" '{secrets_ref:$r, secrets_refs:[$r]}')"
+  [[ "$RC" == 400 && "$BODY" == *either* ]] && pass "O15 secrets_ref beside secrets_refs: 400" || fail "O15 both fields: HTTP $RC $(head -c 160 <<<"$BODY")"
+  rows_call "$(jq -nc --argjson r "$ROW_REF" '{secrets_refs:[$r, $r]}')"
+  [[ "$RC" == 400 && "$BODY" == *twice* ]] && pass "O15 a row named twice: 400" || fail "O15 a repeated row: HTTP $RC $(head -c 160 <<<"$BODY")"
+  rows_call '{"secrets_refs":[]}'
+  [[ "$RC" == 400 && "$BODY" == *"no row"* ]] && pass "O15 an empty list: 400" || fail "O15 an empty list: HTTP $RC $(head -c 160 <<<"$BODY")"
 fi
 
 verdict "connector-probe operations"

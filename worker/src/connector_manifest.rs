@@ -1031,8 +1031,11 @@ mod tests {
             match ProjectManifest::read(&bytes) {
                 Ok(_) => {}
                 // The probe's deliberately refused variants: a `type` on an
-                // encryption key, and an unknown top-level member.
+                // encryption key, an encryption key of no caller, a secp256k1 key of
+                // no caller, and an unknown top-level member.
                 Err(e) if file.ends_with("encryption-typed.json") => assert!(e.contains("`type`"), "{e}"),
+                Err(e) if file.ends_with("encryption-none.json") => assert!(e.contains("unknown variant `none`"), "{e}"),
+                Err(e) if file.ends_with("project-none-secp.json") => assert!(e.contains("a key of no caller is ed25519"), "{e}"),
                 Err(e) if file.ends_with("project-misspelled.json") => assert!(e.contains("`storage_acount`"), "{e}"),
                 Err(e) if file.ends_with("tasks-direct-deny.json") => assert!(e.contains("declares tasks"), "{e}"),
                 Err(e) => panic!("{}: {e}", file.display()),

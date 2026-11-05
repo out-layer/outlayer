@@ -115,6 +115,10 @@
 #   R5   five rows, as many as a call may name, open together and the task
 #        is the second owner's
 #   R6   six rows are refused at the door (400, "at most")
+#   R5   also: the attestation names all five; a missing fifth row refuses
+#   R7   a row that admits only its owner refuses the run, naming the row, and
+#        no task opens through it
+#   R8   the first row missing, a second present: refused
 #   A2   another owner's session: the first owner's task by its id is
 #        task_not_found, and is in no list of theirs
 #   A5   a second agent of the same owner reads, cancels and deletes nothing
@@ -185,10 +189,10 @@
 # A row whose fixture the environment does not supply is a SKIP:
 #   OWNER_B              a second owner, e.g. outlayer-bob.testnet; its key
 #                        file is OWNER_B_KEY_FILE, or the one in
-#                        ~/.near-credentials/<network>/ (A2, R1–R6: the suite
-#                        stores five rows of theirs for the probe, `tasks-probe`,
-#                        `tasks-probe-clash` and `tasks-probe-r3` to `-r5`, and
-#                        deletes them)
+#                        ~/.near-credentials/<network>/ (A2, R1–R8: the suite
+#                        stores six rows of theirs for the probe, `tasks-probe`,
+#                        `tasks-probe-clash`, `-noadmit` and `tasks-probe-r3` to
+#                        `-r5`, and deletes them)
 #   AGENT2_PAYMENT_KEY, AGENT2_ACCOUNT   a second agent wallet (A5, L2, L1, N4)
 #   OWNER_PAYMENT_KEY    a payment key of the owner's own account (A7, L1: it
 #                        prepares the twentieth task, and the owner approves it)
@@ -409,7 +413,21 @@ prepare_as() {
   [[ "$(said .output.status)" == "awaiting_owner" && -n "$TASK" ]]
 }
 # prepare <input-json> — the agent prepares.
-prepare() { prepare_as AGENT_PAYMENT_KEY "$1"; }
+# A row that changes the store through PSQL_CMD reads a database that changed
+# nothing as the product's failure, or worse, as its success. So the first task
+# this suite opens must be there: a PSQL_CMD aimed at any other database stops
+# the suite here, by name.
+DB_IS_THIS_STACK=false
+db_is_this_stack() {
+  [[ -n "${PSQL_CMD:-}" && "$DB_IS_THIS_STACK" == false && -n "${TASK:-}" ]] || return 0
+  if [[ "$(sql "SELECT count(*) FROM owner_tasks WHERE id = '$TASK'")" == 1 ]]; then
+    DB_IS_THIS_STACK=true
+  else
+    echo "✗ PSQL_CMD does not reach this stack's database: task $TASK, just opened, is not in it" >&2
+    exit 1
+  fi
+}
+prepare() { prepare_as AGENT_PAYMENT_KEY "$1" || return 1; db_is_this_stack; }
 # fill <preparer> <count> <title> — that many tasks of one preparer; true when
 # every one opened.
 fill() {
@@ -426,7 +444,7 @@ fill() {
 store_as() {
   local account=$1 key_file=$2 home="$STATE_DIR/home-$1" before out i after
   mkdir -p "$home/$NETWORK" && chmod 700 "$home"
-  jq --arg c "$CONTRACT_ID" '{account_id, public_key, private_key, contract_id:$c, auth_type:"near_key"}' "$key_file" \
+  jq --arg a "$account" --arg c "$CONTRACT_ID" '{account_id:$a, public_key, private_key, contract_id:$c, auth_type:"near_key"}' "$key_file" \
     > "$home/$NETWORK/credentials.json" && chmod 600 "$home/$NETWORK/credentials.json"
   before=$(jq -r '.updated_at // 0' <<<"$(row_of_owner "$3" "$4" "$account")")
   out=$(OUTLAYER_HOME="$home" OUTLAYER_NETWORK="$NETWORK" "$OUTLAYER_BIN" secrets set "$5" --project "$3" --profile "$4" --access "$6" 2>&1) \
@@ -1656,17 +1674,19 @@ if want R1; then
     skip "R1 needs a second owner, and OWNER_B is the owner under test"
   elif [[ ! -r "$OWNER_B_KEY_FILE" ]]; then
     skip "R1 needs the key file of $OWNER_B (OWNER_B_KEY_FILE, or ~/.near-credentials/$NETWORK/): its row is stored and its approval signed with it"
-  elif ! store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$PROFILE" '{}' "$(whitelist "$OWNER_B" "$AGENT_ACCOUNT")"; then
+  elif ! store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$PROFILE" '{}' "whitelist:$OWNER_B,$AGENT_ACCOUNT"; then
     fail "R1 the second owner's row could not be stored"
   else
     B_ROWS="$PROFILE"
+    # Signed in first: a task is sealed to the devices in force when it opens.
+    owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" sign-in other
+    B_SIGNED_IN=$(own .status)
     # An empty row: the owner's consent to be asked, and nothing in it.
     agent "$(jq -nc --arg o "$OWNER_B" '{operation:"prepare", title:"Escalated to the officer", body:"Rank these candidates", for:$o}')" "$B_REF"
     B_TASK=$(said .output.task_id); B_HASH=$(said .output.task_hash)
     if [[ "$(said .output.status)" == "awaiting_owner" && -n "$B_TASK" ]]; then
       pass "R1 awaiting_owner, task $B_TASK, opened for $OWNER_B"
-      owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" sign-in other
-      if [[ "$(own .status)" == "200" ]]; then
+      if [[ "$B_SIGNED_IN" == "200" ]]; then
         owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" list other waiting
         B_ROW=$(jq -c --arg t "$B_TASK" '.tasks[]? | select(.id == $t)' <<<"$OWN" 2>/dev/null)
         if [[ -n "$B_ROW" && "$(jq -r .read.hash <<<"$B_ROW")" == "$B_HASH" ]]; then
@@ -1683,7 +1703,7 @@ if want R1; then
           || fail "R1 the task is listed to $PARENT, whose task it is not"
 
         log "R2 the second owner approves; the preparer's run names their row first"
-        owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" approve "$B_TASK" "$B_HASH" - - other
+        owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" approve "$B_TASK" - - other
         if [[ "$(own .status)" == "200" && "$(own .state)" == "approved" && -n "$(own .run)" ]]; then
           B_RUN=$(own .run)
           B_ENDED=""
@@ -1710,7 +1730,7 @@ if want R1; then
         fi
         owner_as "$OWNER_B" "$OWNER_B_KEY_FILE" sign-out other
       else
-        fail "R1 $OWNER_B could not sign in: $(own .status) $(own .failed | head -c 160)"
+        fail "R1 $OWNER_B could not sign in: $B_SIGNED_IN"
       fi
     else
       fail "R1 prepare for $OWNER_B answered success=$(said .success) error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
@@ -1722,7 +1742,7 @@ if want R1; then
 
     log "R4 a variable the two rows set differently"
     CLASH="$PROFILE-clash"
-    if store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$CLASH" "$(jq -nc '{TASKS_PROBE_POLICY:"{\"v\":2}"}')" "$(whitelist "$OWNER_B" "$AGENT_ACCOUNT")"; then
+    if store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$CLASH" "$(jq -nc '{TASKS_PROBE_POLICY:"{\"v\":2}"}')" "whitelist:$OWNER_B,$AGENT_ACCOUNT"; then
       B_ROWS="$B_ROWS $CLASH"
       agent '{"operation":"prepare","title":"Two policies"}' "$PARENT/$PROFILE,$OWNER_B/$CLASH"
       if [[ "$RUN_OK" != true && "$(said .error)$RUN_ERR" == *"two of the secret rows"* ]]; then
@@ -1746,7 +1766,7 @@ if want R1; then
     R5_REF="$PARENT/$PROFILE,$OWNER_B/$PROFILE"
     R5_STORED=true
     for n in 3 4 5; do
-      if store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$PROFILE-r$n" '{}' "$(whitelist "$OWNER_B" "$AGENT_ACCOUNT")"; then
+      if store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$PROFILE-r$n" '{}' "whitelist:$OWNER_B,$AGENT_ACCOUNT"; then
         B_ROWS="$B_ROWS $PROFILE-r$n"; R5_REF="$R5_REF,$OWNER_B/$PROFILE-r$n"
       else
         R5_STORED=false; break
@@ -1754,12 +1774,25 @@ if want R1; then
     done
     if [[ "$R5_STORED" == true ]]; then
       agent "$(jq -nc --arg o "$OWNER_B" '{operation:"prepare", title:"Five rows", for:$o}')" "$R5_REF"
-      R5_TASK=$(said .output.task_id)
+      R5_TASK=$(said .output.task_id); R5_CALL=$(jq -r '.call_id // ""' <<<"$ANS" 2>/dev/null)
       if [[ "$(said .output.status)" == "awaiting_owner" && -n "$R5_TASK" ]]; then
         pass "R5 five rows opened together; the task is $OWNER_B's"
+        # That the run took the five, and did not ignore the last three: the
+        # attestation says so, in the order named.
+        ATT=$(attestation_of_run "$R5_CALL")
+        [[ -n "$ATT" && "$(jq -r '.secrets_ref // ""' <<<"$ATT")" == "$R5_REF" ]] \
+          && pass "R5 the attestation names all five rows, in the order named" \
+          || fail "R5 the attested secrets_ref is '$(jq -r '.secrets_ref // ""' <<<"${ATT:-{\}}")', not $R5_REF"
         https_as AGENT_PAYMENT_KEY "$R5_REF" "$(jq -nc --arg t "$R5_TASK" '{operation:"task_cancel", task_id:$t}')"
       else
         fail "R5 five rows: success=$(said .success) error='$(said .error | head -c 200)' run=$RUN_OK/$RUN_ERR"
+      fi
+      log "R5 and each of the rows counts: the last one missing refuses the run"
+      agent '{"operation":"tasks"}' "$PARENT/$PROFILE,$OWNER_B/$PROFILE,$OWNER_B/$PROFILE-r3,$OWNER_B/$PROFILE-r4,$OWNER_B/$PROFILE-nosuch"
+      if [[ "$RUN_OK" != true && "$RUN_ERR$(said .error)" == *"does not exist"* && "$RUN_ERR$(said .error)" == *"$PROFILE-nosuch"* ]]; then
+        pass "R5 refused, naming the row: $(head -c 120 <<<"$RUN_ERR$(said .error)")"
+      else
+        fail "R5 a missing fifth row: success=$(said .success) run=$RUN_OK/$RUN_ERR"
       fi
       log "R6 one row more than a call may name is refused at the door"
       https_as AGENT_PAYMENT_KEY "$R5_REF,$OWNER_B/$PROFILE-r6" '{"operation":"tasks"}'
@@ -1770,6 +1803,32 @@ if want R1; then
       fi
     else
       fail "R5 the second owner's extra rows could not be stored"
+    fi
+
+    log "R7 a row that does not admit the caller refuses the run, whoever else admits it"
+    NOADMIT="$PROFILE-noadmit"
+    if store_as "$OWNER_B" "$OWNER_B_KEY_FILE" "$TASKS_PROBE" "$NOADMIT" '{}' "whitelist:$OWNER_B"; then
+      B_ROWS="$B_ROWS $NOADMIT"
+      agent '{"operation":"tasks"}' "$PARENT/$PROFILE,$OWNER_B/$NOADMIT"
+      if [[ "$RUN_OK" != true && "$RUN_ERR$(said .error)" == *[Aa]ccess* && "$RUN_ERR$(said .error)" == *"$NOADMIT"* ]]; then
+        pass "R7 refused, naming the row: $(head -c 140 <<<"$RUN_ERR$(said .error)")"
+      else
+        fail "R7 a row that admits only its owner: success=$(said .success) run=$RUN_OK/$RUN_ERR"
+      fi
+      # The same row asked by its owner's rule: the task opened for an account
+      # in that row cannot have come through it.
+      agent "$(jq -nc --arg o "$OWNER_B" '{operation:"prepare", title:"Through a row that refused", for:$o}')" "$PARENT/$PROFILE,$OWNER_B/$NOADMIT"
+      [[ -z "$(said .output.task_id)" ]] && pass "R7 and no task was opened through it" || fail "R7 a task opened through a row that refused: $(said .output.task_id)"
+    else
+      fail "R7 the row could not be stored"
+    fi
+
+    log "R8 the first row missing refuses the run: a row must exist for others to join"
+    agent '{"operation":"tasks"}' "$PARENT/$PROFILE-nosuch,$OWNER_B/$PROFILE"
+    if [[ "$RUN_OK" != true && "$RUN_ERR$(said .error)" == *"must exist"* ]]; then
+      pass "R8 refused: $(head -c 120 <<<"$RUN_ERR$(said .error)")"
+    else
+      fail "R8 a missing first row with a second: success=$(said .success) run=$RUN_OK/$RUN_ERR"
     fi
   fi
 fi

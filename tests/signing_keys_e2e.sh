@@ -147,8 +147,18 @@ signer_flag() { [[ -f "$HOME/.near-credentials/$NETWORK/$1.json" ]] && echo with
 # One contract call, its whole transcript on stdout — the logs and the return
 # value included, which is where a run's event and answer are read from.
 call_on() { # call_on <signer> <receiver> <method> <args-json> <deposit>
-  near contract call-function as-transaction "$2" "$3" json-args "$4" \
-    prepaid-gas '300.0 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1
+  local out attempt
+  # An RPC node behind the one near-cli read from refuses the transaction —
+  # `Transaction has expired`, or a nonce it has not caught up with. Refused,
+  # never run; a new one has a new hash and a new nonce.
+  for attempt in 1 2 3; do
+    out=$(near contract call-function as-transaction "$2" "$3" json-args "$4" \
+      prepaid-gas '300.0 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" "sign-$(signer_flag "$1")" send 2>&1)
+    grep -qE 'Transaction has expired|Transaction nonce .* must be' <<<"$out" || break
+    note "$3 by $1: an RPC node refused the transaction as stale (attempt $attempt)"
+    sleep 3
+  done
+  printf '%s\n' "$out"
 }
 call() { call_on "$1" "$CONTRACT_ID" "$2" "$3" "$4"; } # call <signer> <method> <args-json> <deposit>
 
@@ -638,10 +648,19 @@ run_src "$CALLER2" "$(project_src "$H_PN")" '{"operation":"all_public_keys"}'
 ran_ok "S23 $CALLER2 all_public_keys" && { [[ -n "$NONE_PK" && "$(out_field .keys.alpha.public_key)" == "$NONE_PK" ]] \
   && pass "S23 $CALLER2 gets the same key: the project's, whoever calls" \
   || fail "S23 two callers, two no-caller keys: $NONE_PK and $(out_field .keys.alpha.public_key)"; }
-run_src "$PARENT" "$(project_src "$H_PN")" "$(jq -nc --arg m "$MSG_HEX" '{operation:"sign",path:"alpha",message_hex:$m}')"
-ran_ok "S23 sign" && { [[ -n "$NONE_PK" && "$(verify_local "$NONE_PK" "$MSG_HEX" "$(out_field .signature)")" == ok ]] \
-  && pass "S23 the no-caller key signs, verified here, and again on a second run" \
-  || fail "S23 the no-caller signature does not verify under '$NONE_PK'"; }
+# The point of the key: what $CALLER2's run signs verifies under the key pinned
+# from $PARENT's run, and under nothing else.
+run_src "$CALLER2" "$(project_src "$H_PN")" "$(jq -nc --arg m "$MSG_HEX" '{operation:"sign",path:"alpha",message_hex:$m}')"
+if ran_ok "S23 sign"; then
+  NONE_SIG=$(out_field .signature)
+  [[ -n "$NONE_PK" && "$(verify_local "$NONE_PK" "$MSG_HEX" "$NONE_SIG")" == ok ]] \
+    && pass "S23 $CALLER2's signature verifies here under the key pinned from $PARENT's run" \
+    || fail "S23 $CALLER2's signature does not verify under '$NONE_PK'"
+  [[ "$(verify_local "$NONE_PK" "${MSG_HEX}00" "$NONE_SIG")" == bad ]] && pass "S23 and not over another message" \
+    || fail "S23 a changed message verifies under the no-caller key"
+  [[ "$(verify_local "$ALPHA" "$MSG_HEX" "$NONE_SIG")" == bad ]] && pass "S23 and not under $PARENT's signer key" \
+    || fail "S23 $PARENT's signer key verifies the no-caller signature"
+fi
 run_src "$PARENT" "$(project_src "$H_PN")" "$(jq -nc --arg n "$(printf '%064x' 7)" \
   '{operation:"host_nep413",path:"alpha",message:"Login to example.com",recipient:"example.com",nonce_hex:$n}')"
 if [[ "$RUN_OK" == true && "$(out_field .status)" == err && "$(out_field .message)" == *"of no caller"* ]]; then
@@ -660,8 +679,9 @@ if ran_ok "S23 attacks"; then
       or ((.name | test("^(vault_(missing|wrong)_when_declared|secp_message_not_32|nep413_wrong_type)$")) and .status != "n/a")
       or ((.name | test("^(message_at_cap|determinism|vault_missing_when_declared|vault_wrong_when_declared|secp_message_not_32|nep413_wrong_type)$") | not) and .status != "err")
     ) | "\(.name)=\(.status)"' <<<"$RUN_OUT" 2>/dev/null | tr '\n' ' ')
-  [[ -z "$unexpected" ]] && pass "S23 every attack on the no-caller key is an err, at the cap and determinism ok" \
-    || fail "S23 attacks on the no-caller key: $unexpected"
+  attacked=$(jq '.results | length' <<<"$RUN_OUT" 2>/dev/null)
+  [[ -z "$unexpected" && "${attacked:-0}" -ge 10 ]] && pass "S23 $attacked attacks on the no-caller key: each refusal an err, at the cap and determinism ok" \
+    || fail "S23 attacks on the no-caller key: ${attacked:-0} answered; unexpected: $unexpected"
 fi
 if [[ "$RELAY_READY" == true ]]; then
   run_relayed "$PARENT" "$(project_src "$H_PN")" '{"operation":"all_public_keys"}'
@@ -694,8 +714,9 @@ ran_ok "S25 $CALLER2 sign" && { remember_keys
     || fail "S25 $CALLER2's wasm no-caller key is $(out_field .public_key), not $WNONE, or its signature does not verify"; }
 run_src "$PARENT" "$(wasm_src "$U_WN2" "$H_WN2")" '{"operation":"all_public_keys"}'
 ran_ok "S25 another build" && { remember_keys
-  [[ -n "$WNONE" && "$(out_field .keys.code.public_key)" != "$WNONE" ]] && pass "S25 another build, another no-caller key" \
-    || fail "S25 two builds, one no-caller key"; }
+  [[ -n "$WNONE" && "$(out_field .keys.code.public_key)" =~ ^[0-9a-f]{64}$ && "$(out_field .keys.code.public_key)" != "$WNONE" ]] \
+    && pass "S25 another build, another no-caller key" \
+    || fail "S25 the other build's key is '$(out_field .keys.code.public_key)', this build's '$WNONE'"; }
 
 # ── S26 a secp256k1 key of no caller ────────────────────────────────────────
 
@@ -715,7 +736,9 @@ if [[ -z "${SIGNING_BASELINE:-}" ]]; then
 else
   NOW_KEYS=$(jq -nc --arg a "$ALPHA" --arg b "$BETA" --arg o "${OTHER_ALPHA:-}" --arg c "$CODE" --arg p "${PRED:-}" \
     '{signer_alpha:$a, signer_beta:$b, caller2_alpha:$o, wasm_code:$c, predecessor_alpha:$p}')
-  if [[ ! -s "$SIGNING_BASELINE" ]]; then
+  if ! jq -e 'all(.[]; test("^[0-9a-f]{64}$"))' <<<"$NOW_KEYS" >/dev/null; then
+    fail "S24 this run did not read all five keys, so there is nothing to compare: $NOW_KEYS"
+  elif [[ ! -s "$SIGNING_BASELINE" ]]; then
     printf '%s\n' "$NOW_KEYS" > "$SIGNING_BASELINE"
     note "S24 baseline written to $SIGNING_BASELINE: run again after the deploy"
   elif [[ "$(jq -cS . "$SIGNING_BASELINE")" == "$(jq -cS . <<<"$NOW_KEYS")" ]]; then
@@ -827,7 +850,7 @@ if [[ "$SECP_READY" == true ]]; then
   run_src "$CALLER2" "$(project_src "$H_PS")" '{"operation":"public_key","path":"evm"}'
   if ran_ok "S15 public_key evm as CALLER2"; then
     remember_keys
-    [[ -n "$EVM_PK" && "$(out_field .public_key)" != "$EVM_PK" ]] && pass "S15 $CALLER2 gets another evm key" || fail "S15 $CALLER2's evm key is $PARENT's"
+    [[ -n "$EVM_PK" && "$(out_field .public_key)" =~ ^[0-9a-f]{128}$ && "$(out_field .public_key)" != "$EVM_PK" ]] && pass "S15 $CALLER2 gets another evm key" || fail "S15 $CALLER2's evm key is '$(out_field .public_key)', $PARENT's is $EVM_PK"
   fi
   skip "S15 a second project version keeping evm: needs a second secp256k1 project build (not built); S5 covers the rule for ed25519"
 
