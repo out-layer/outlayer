@@ -28,6 +28,12 @@
 #                                         own (swap / cross_chain_withdraw do not stand in), `to` still
 #                                         gated; then a funded order at 3x spot rests, is read, is
 #                                         cancelled through cancel-all, and refunds in full.
+#   T17F confidential order  [MAINNET]   — a limit order funded from the CONFIDENTIAL balance
+#                                         (`deposit_type: confidential_intents`): mixed routing is 400,
+#                                         an empty confidential balance is insufficient_balance (no
+#                                         money); with T17F_MONEY=1 a shielded order rests at 3x spot,
+#                                         reports its deposit, is cancelled, refunds to the
+#                                         confidential balance, and is unshielded back.
 #
 # ── Test classes (what each needs) ────────────────────────────────────────────
 #   [MAINNET] NEAR Intents (regular + confidential) are MAINNET-ONLY — there are no testnet solvers and
@@ -1566,6 +1572,191 @@ if want T17 && intents_mainnet T17; then
     if [[ "$LO_AFTER" == "$LO_BEFORE" ]]; then pass "T17d refund came home in full (intents wNEAR $LO_BEFORE → $LO_AFTER)"
     else fail "T17d intents wNEAR before=$LO_BEFORE after=$LO_AFTER — the refund is not whole"; fi
     return_test_funds; MONEY=false
+  fi
+fi
+
+# ════════════════════════════════════════════════════════════════════════════════
+# T17F — limit order funded from the CONFIDENTIAL balance  [MAINNET]  (no money) + [FUNDS, T17F_MONEY=1]
+#       `deposit_type: "confidential_intents"` is one mode taken whole: funded from the confidential
+#       balance, paid out to it, refunded to it, on the confidential upstream under the wallet's own
+#       per-account JWT. The probes that cost nothing run on every mainnet pass; the one that moves
+#       value runs only with T17F_MONEY=1 (it shields ~0.15 USD of wNEAR and brings it back).
+#         17f-1  deposit_type=confidential_intents + recipient_type=intents → 400 (mixed routing is not
+#                offered); nothing is created upstream — the refusal precedes every upstream call
+#         17f-2  deposit_type=confidential_intents on a wallet whose confidential balance is empty →
+#                400 insufficient_balance naming the CONFIDENTIAL balance: the balance was read on the
+#                confidential upstream under the wallet's own JWT before anything was created
+#         17f-3  [FUNDS] shield wNEAR → order at 3x spot (cannot fill) → deposited_amount reported →
+#                cancel → is_payout_status_final with payouts.refund → the confidential balance is back
+#                to what it was before the order → unshield → public sweep returns the rest
+#         17f-4  [T17F_MONEY=1, gas and a policy deposit] a frozen fresh wallet: a transfer is 403
+#                wallet_frozen, its confidential balance is 200 (the per-account JWT minted under the
+#                freeze, the proof a cancel of a confidential order runs on)
+#       GATE: /wallet/v1/confidential/balance → 503 means confidential is not configured here → SKIP.
+# ════════════════════════════════════════════════════════════════════════════════
+if want T17F && intents_mainnet T17F; then
+  log "T17F confidential limit order — mixed routing refused, empty confidential balance refused by name"
+  post GET "/wallet/v1/confidential/balance?token=nep141%3A$WNEAR" "t17fprobe-$(date +%s)"
+  if [[ "$HTTP" == "503" ]]; then
+    note "T17F skipped — OutLayer /wallet/v1/confidential/* → 503 (confidential not configured on this deployment)"
+  else
+    USDC_NEAR="nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
+    LO_SPOT=$(curl -s --max-time 20 https://1click.chaindefuser.com/v0/tokens | jq -r '[.[] | select(.assetId=="nep141:wrap.near")][0].price // empty')
+    if [[ -z "$LO_SPOT" ]]; then
+      note "T17F SKIPPED — could not read the wNEAR price from the 1Click catalog (a fixed price could fill)"
+    else
+      LO_PRICE=$(python3 -c "print(round(float('$LO_SPOT')*3, 2))")
+      LO_QTY=$(python3 -c "print(int(0.15/float('$LO_SPOT')*10**24))")
+      clo_body() { jq -nc --arg b "nep141:$WNEAR" --arg q "$USDC_NEAR" --arg n "$LO_QTY" --arg p "$LO_PRICE" \
+        '{base_asset:$b, quote_asset:$q, side:"sell", quantity:$n, price:$p, deposit_type:"confidential_intents"}'; }
+      cf_bal17() {
+        local seed=$1 token=$2 enc; enc=$(printf '%s' "$token" | sed 's/:/%3A/g')
+        post GET "/wallet/v1/confidential/balance?token=$enc" "$seed"
+        [[ "$HTTP" == "200" ]] && echo "$BODY" | jq -r '.balance // "0"' || echo "0"
+      }
+
+      # 17f-1: mixed routing. No policy on the wallet: the refusal is the request's shape, and it
+      # comes before the policy, the balance and the upstream.
+      SEED="t17f1-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
+      post POST /wallet/v1/limit-orders "$SEED" "$(clo_body | jq -c '. + {recipient_type:"intents"}')"
+      if [[ "$HTTP" == "400" ]] && echo "$BODY" | grep -qi "mixed routing"; then pass "T17F-1 confidential funding + public payout → 400 mixed routing: $(echo "$BODY"|head -c120)"
+      else fail "T17F-1 mixed routing must be refused with 400, got $HTTP: $BODY"; fi
+      post POST /wallet/v1/limit-orders "$SEED" "$(clo_body | jq -c '. + {recipient_type:"destination_chain", recipient:"0x000000000000000000000000000000000000dEaD"}')"
+      if [[ "$HTTP" == "400" ]] && echo "$BODY" | grep -qi "mixed routing"; then pass "T17F-1 confidential funding + destination_chain payout → 400 mixed routing"
+      else fail "T17F-1 mixed routing (destination_chain) must be refused with 400, got $HTTP: $BODY"; fi
+      post GET "/wallet/v1/limit-orders?open=true" "$SEED"
+      if [[ "$HTTP" == "200" && "$(echo "$BODY" | jq 'length')" == "0" ]]; then pass "T17F-1 nothing was created"
+      else fail "T17F-1 a refused request left an order behind ($HTTP): $(echo "$BODY"|head -c200)"; fi
+
+      # 17f-2: an empty confidential balance, read on the confidential upstream under this wallet's
+      # own JWT, is refused by name before anything exists upstream.
+      post POST /wallet/v1/limit-orders "$SEED" "$(clo_body)"
+      if [[ "$HTTP" == "400" && "$(echo "$BODY" | jq -r '.error // ""')" == "insufficient_balance" ]] && echo "$BODY" | grep -qi "confidential balance"; then
+        pass "T17F-2 empty confidential balance → insufficient_balance naming the confidential balance: $(echo "$BODY" | jq -r '.message' | head -c160)"
+      else fail "T17F-2 expected 400 insufficient_balance about the confidential balance, got $HTTP: $BODY"; fi
+      post GET "/wallet/v1/limit-orders?open=true" "$SEED"
+      if [[ "$HTTP" == "200" && "$(echo "$BODY" | jq 'length')" == "0" ]]; then pass "T17F-2 nothing was created"
+      else fail "T17F-2 a refused request left an order behind ($HTTP): $(echo "$BODY"|head -c200)"; fi
+
+      if [[ "${T17F_MONEY:-}" != "1" ]]; then
+        note "T17F-3 skipped — set T17F_MONEY=1 to shield ~0.15 USD of wNEAR and rest a confidential order"
+      else
+        log "T17F-3 [FUNDS] confidential order rests at $LO_PRICE USDC/NEAR (3x spot $LO_SPOT) → deposit seen → cancel → refund to the confidential balance → unshield"
+        MONEY=true; CUR_TEST=T17F
+        SEED="t17f3-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
+        # The order's quantity plus native headroom for the calls that follow, as in T17d, and a
+        # little more for the shield's own round trip.
+        LO_FUND=$(python3 -c "print(f'{int(\"$LO_QTY\")/10**24 + 0.22:.5f}')")
+        fund_near "$ADDR" "$LO_FUND NEAR" || warn "T17F-3 funding"
+        for _ in $(seq 1 6); do curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$ADDR\"}}" | jq -e '.result.amount' >/dev/null && break; sleep 2; done
+        post POST /wallet/v1/storage-deposit "$SEED" "$(jq -nc --arg t "$WNEAR" '{token:$t}')"; assert_funded "T17F-3 storage-deposit"
+        post POST /wallet/v1/call "$SEED" "$(jq -nc --arg t "$WNEAR" --arg d "$LO_QTY" '{receiver_id:$t, method_name:"near_deposit", args:{}, gas:"30000000000000", deposit:$d}')"; assert_funded "T17F-3 near_deposit"
+        post POST /wallet/v1/intents/deposit "$SEED" "$(jq -nc --arg t "nep141:$WNEAR" --arg d "$LO_QTY" '{token:$t, amount:$d}')"; assert_funded "T17F-3 intents deposit"
+        sleep 4
+        CF_BASE=$(cf_bal17 "$SEED" "nep141:$WNEAR")
+        post POST /wallet/v1/confidential/shield "$SEED" "$(jq -nc --arg t "nep141:$WNEAR" --arg a "$LO_QTY" '{token:$t, amount:$a}')"
+        if [[ "$HTTP" != "200" ]]; then fail "T17F-3 shield failed ($HTTP): $BODY"; fi
+        CF_FUNDED=""
+        for _ in $(seq 1 45); do
+          CF_NOW=$(cf_bal17 "$SEED" "nep141:$WNEAR")
+          [[ "$(python3 -c "print(int('$CF_NOW') >= int('$CF_BASE') + int('$LO_QTY'))")" == "True" ]] && { CF_FUNDED=yes; break; }
+          sleep 4
+        done
+        if [[ -n "$CF_FUNDED" ]]; then pass "T17F-3 confidential balance holds the shielded wNEAR ($CF_NOW)"
+        else fail "T17F-3 the shield never showed on the confidential balance (now $CF_NOW, base $CF_BASE)"; fi
+        CF_BEFORE_ORDER="$CF_NOW"
+
+        post POST /wallet/v1/limit-orders "$SEED" "$(clo_body)"
+        if [[ "$HTTP" != "200" ]]; then fail "T17F-3 create failed ($HTTP): $BODY"; fi
+        CLO_ID=$(echo "$BODY" | jq -r '.order_id // empty')
+        if [[ -n "$CLO_ID" ]]; then pass "T17F-3 confidential order created and funded: $CLO_ID (intent=$(echo "$BODY" | jq -r '.transfer_intent_hash // "?"'))"
+        else fail "T17F-3 no order_id in: $(echo "$BODY"|head -c200)"; fi
+        # A `processing` answer is the funding not yet confirmed, not an error: follow the request
+        # to `success`, then read the order — the type check below needs the order, not the answer.
+        if [[ "$(echo "$BODY" | jq -r '.status // empty')" == "processing" ]]; then
+          CLO_RID=$(echo "$BODY" | jq -r '.request_id'); CLO_ST=""
+          for _ in $(seq 1 30); do
+            post GET "/wallet/v1/requests/$CLO_RID" "$SEED"; CLO_ST=$(echo "$BODY" | jq -r '.status // empty')
+            [[ "$CLO_ST" == "success" || "$CLO_ST" == "failed" ]] && break; sleep 4
+          done
+          if [[ "$CLO_ST" == "success" ]]; then pass "T17F-3 funding confirmed after the create answered processing (rid=$CLO_RID)"
+          else fail "T17F-3 funding did not settle after processing (status '$CLO_ST', rid=$CLO_RID)"; fi
+          post GET "/wallet/v1/limit-orders/$CLO_ID" "$SEED"
+        fi
+        if [[ "$(echo "$BODY" | jq -r '.deposit_type')" == "confidential_intents" && "$(echo "$BODY" | jq -r '.refund_type')" == "confidential_intents" && "$(echo "$BODY" | jq -r '.recipient_type')" == "confidential_intents" ]]; then
+          pass "T17F-3 the order is routed whole on the confidential shard (deposit/refund/recipient types)"
+        else fail "T17F-3 the echo is not all-confidential: $(echo "$BODY" | jq -c '{deposit_type,refund_type,recipient_type}')"; fi
+        CF_DURING=$(cf_bal17 "$SEED" "nep141:$WNEAR")
+        if [[ "$(python3 -c "print(int('$CF_DURING') < int('$CF_BEFORE_ORDER'))")" == "True" ]]; then pass "T17F-3 the confidential balance paid for the order ($CF_BEFORE_ORDER → $CF_DURING)"
+        else note "T17F-3 confidential balance not yet lower after the create ($CF_BEFORE_ORDER → $CF_DURING); the deposit read below is authoritative"; fi
+
+        CLO_OPEN=""
+        for _ in $(seq 1 10); do
+          post GET "/wallet/v1/limit-orders/$CLO_ID" "$SEED"
+          if [[ "$(echo "$BODY" | jq -r '.deposited_amount')" == "$LO_QTY" && "$(echo "$BODY" | jq -r '.fill_status')" == "open" ]]; then CLO_OPEN=yes; break; fi
+          sleep 3
+        done
+        if [[ -n "$CLO_OPEN" ]]; then pass "T17F-3 order is open with the full deposit (read under the wallet's own JWT)"
+        else fail "T17F-3 order never reported the deposit: $(echo "$BODY"|head -c200)"; fi
+
+        post POST "/wallet/v1/limit-orders/$CLO_ID/cancel" "$SEED" '{}'
+        if [[ "$HTTP" == "200" ]]; then pass "T17F-3 cancel accepted: fill_status=$(echo "$BODY" | jq -r '.fill_status')"
+        else fail "T17F-3 cancel failed ($HTTP): $BODY"; fi
+        CLO_DONE=""
+        for _ in $(seq 1 20); do
+          post GET "/wallet/v1/limit-orders/$CLO_ID" "$SEED"
+          if [[ "$(echo "$BODY" | jq -r '.is_payout_status_final')" == "true" ]]; then CLO_DONE=yes; break; fi
+          sleep 4
+        done
+        if [[ -n "$CLO_DONE" && "$(echo "$BODY" | jq -r '.fill_status')" == "canceled" && "$(echo "$BODY" | jq -r '.payouts.refund | type')" == "object" ]]; then
+          pass "T17F-3 order finished as canceled with a refund leg: $(echo "$BODY" | jq -c '.payouts.refund')"
+        else fail "T17F-3 order did not finish as canceled with a refund: $(echo "$BODY"|head -c240)"; fi
+        CF_REFUNDED=""
+        for _ in $(seq 1 15); do
+          CF_AFTER=$(cf_bal17 "$SEED" "nep141:$WNEAR")
+          [[ "$CF_AFTER" == "$CF_BEFORE_ORDER" ]] && { CF_REFUNDED=yes; break; }
+          sleep 4
+        done
+        if [[ -n "$CF_REFUNDED" ]]; then pass "T17F-3 refund came home to the confidential balance in full ($CF_BEFORE_ORDER → $CF_AFTER)"
+        else fail "T17F-3 confidential wNEAR before=$CF_BEFORE_ORDER after=$CF_AFTER — the refund is not whole"; fi
+
+        # Back to the public side, where the sweep can reach it.
+        post POST /wallet/v1/confidential/unshield "$SEED" "$(jq -nc --arg t "nep141:$WNEAR" --arg a "$CF_AFTER" '{token:$t, amount:$a}')"
+        if [[ "$HTTP" == "200" ]]; then pass "T17F-3 unshield submitted (rid=$(echo "$BODY" | jq -r '.request_id // "?"'))"
+        else fail "T17F-3 unshield failed ($HTTP): $BODY"; fi
+        for _ in $(seq 1 30); do
+          CF_END=$(cf_bal17 "$SEED" "nep141:$WNEAR")
+          [[ "$CF_END" == "$CF_BASE" ]] && break
+          sleep 4
+        done
+        [[ "$CF_END" == "$CF_BASE" ]] && pass "T17F-3 confidential balance back to baseline ($CF_END)" || note "T17F-3 confidential balance still $CF_END (baseline $CF_BASE); verify_all_drained flags any residual"
+        return_test_funds; MONEY=false
+
+        # 17f-4: a frozen wallet still gets the per-account JWT its confidential orders are cancelled
+        # under. A fresh wallet has no cached JWT, so its first confidential read has to mint one
+        # under the freeze; the transfer beside it shows the freeze is in force.
+        log "T17F-4 a frozen wallet mints the per-account JWT, and still signs nothing that moves funds"
+        SEED="t17f4-$(date +%s)"; read -r WID ADDR < <(new_subwallet "$SEED")
+        if store_policy "$SEED" "$WID" '{"rules":{}}' && near_tty "near contract call-function as-transaction \"$CONTRACT_ID\" freeze_wallet json-args '$(jq -nc --arg pk "ed25519:$ADDR" '{wallet_pubkey:$pk}')' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as \"$PARENT\" network-config \"$NETWORK\" sign-with-keychain send"; then
+          FROZE=""
+          for _ in $(seq 1 10); do
+            sleep 6
+            post POST /wallet/v1/transfer "$SEED" "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"1"}')"
+            [[ "$HTTP" == "403" && "$(echo "$BODY" | jq -r '.error // ""')" == "wallet_frozen" ]] && { FROZE=yes; break; }
+          done
+          if [[ -n "$FROZE" ]]; then pass "T17F-4 the freeze is in force: a transfer answers 403 wallet_frozen"
+          else fail "T17F-4 the wallet is not frozen 60 s after freeze_wallet (last answer $HTTP: $(echo "$BODY"|head -c200))"; fi
+          post GET "/wallet/v1/confidential/balance?token=nep141%3A$WNEAR" "$SEED"
+          if [[ "$HTTP" == "200" ]]; then pass "T17F-4 the frozen wallet minted its per-account JWT and read its confidential balance"
+          else fail "T17F-4 a frozen wallet must still mint its per-account JWT, got $HTTP: $(echo "$BODY"|head -c200)"; fi
+          near_tty "near contract call-function as-transaction \"$CONTRACT_ID\" unfreeze_wallet json-args '$(jq -nc --arg pk "ed25519:$ADDR" '{wallet_pubkey:$pk}')' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as \"$PARENT\" network-config \"$NETWORK\" sign-with-keychain send" \
+            || warn "T17F-4 unfreeze_wallet failed for $ADDR"
+          reclaim_policy "$ADDR"
+        else
+          fail "T17F-4 could not store a policy and freeze the wallet"
+        fi
+      fi
+    fi
   fi
 fi
 
