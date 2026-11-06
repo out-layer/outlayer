@@ -420,16 +420,31 @@ store_policy() {
   sg=$(printf '%s\n' "$hdr" | curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" --max-time 60 \
     -H @- -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg ed "$encb64" --arg c "$PARENT" '{encrypted_data:$ed, caller:$c}')")
+  # A locked policy on chain: its approvers decide, nothing was signed. The
+  # caller gets the approval to vote on and the request that will carry the
+  # signature, and 2 — not a failure, not a store.
+  if [[ "$(jq -r '.status // empty' <<<"$sg")" == pending_approval ]]; then
+    POLICY_APPROVAL_ID=$(jq -r '.approval_id' <<<"$sg")
+    POLICY_REQUEST_ID=$(jq -r '.request_id' <<<"$sg")
+    POLICY_REQUEST_HASH=$(jq -r '.request_hash' <<<"$sg")
+    POLICY_ENC="$encb64"
+    return 2
+  fi
   sig_hex=$(jq -r '.signature_hex // empty' <<<"$sg")
+  POLICY_VERSION=$(jq -r '.version // empty' <<<"$sg")
+  POLICY_LOCKED=$(jq -r '.locked // empty' <<<"$sg")
+  POLICY_VALID_UNTIL=$(jq -r '.valid_until // empty' <<<"$sg")
   pub_hex=$(jq -r '.public_key_hex // empty' <<<"$sg")
   [[ -n "$sig_hex" ]] || { warn "sign-policy failed: $(head -c 200 <<<"$sg")"; return 1; }
+  # The signed write, for a suite that files it again on purpose.
+  POLICY_SIG="$sig_hex"; POLICY_ENC="$encb64"
   # Side effect on purpose: this is the only place the wallet's own public key
   # is revealed, and `freeze_wallet` needs it. Asking for it separately means a
   # second sign-policy call, which the keystore refuses without a genuine
   # ciphertext to attest.
   WALLET_PUBKEY="ed25519:$pub_hex"
-  store_args=$(jq -nc --arg pk "ed25519:$pub_hex" --arg ed "$encb64" --arg sg "$sig_hex" \
-    '{wallet_pubkey:$pk, encrypted_data:$ed, wallet_signature:$sg}')
+  store_args=$(jq -nc --arg pk "ed25519:$pub_hex" --arg ed "$encb64" --argjson v "${POLICY_VERSION:-0}" --argjson l "${POLICY_LOCKED:-false}" --argjson u "${POLICY_VALID_UNTIL:-0}" --arg sg "$sig_hex" \
+    '{wallet_pubkey:$pk, encrypted_data:$ed, wallet_signature:$sg, version:$v, locked:$l, valid_until:$u}')
   # Retried once: several suites store policies back to back from the same
   # key, and a swallowed nonce collision would otherwise leave the NEXT case
   # judged against the PREVIOUS policy — the worst possible failure, because it
@@ -449,6 +464,8 @@ store_policy() {
 }
 
 WALLET_PUBKEY=""
+POLICY_VERSION=""; POLICY_LOCKED=""; POLICY_VALID_UNTIL=""; POLICY_SIG=""; POLICY_ENC=""
+POLICY_APPROVAL_ID=""; POLICY_REQUEST_ID=""; POLICY_REQUEST_HASH=""
 
 # ── wallets ──────────────────────────────────────────────────────────────────
 

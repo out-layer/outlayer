@@ -172,10 +172,13 @@ store_policy() { # store_policy <policy-json>
     -H "$(AUTH)" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg ed "$encb64" --arg c "$PARENT" '{encrypted_data:$ed, caller:$c}')")
   sig_hex=$(jq -r '.signature_hex // empty' <<<"$sg")
+  POLICY_VERSION=$(jq -r '.version // empty' <<<"$sg")
+  POLICY_LOCKED=$(jq -r '.locked // empty' <<<"$sg")
+  POLICY_VALID_UNTIL=$(jq -r '.valid_until // empty' <<<"$sg")
   pub_hex=$(jq -r '.public_key_hex // empty' <<<"$sg")
   [[ -n "$sig_hex" ]] || { warn "sign-policy failed: $(head -c 200 <<<"$sg")"; return 1; }
-  store_args=$(jq -nc --arg pk "ed25519:$pub_hex" --arg ed "$encb64" --arg sg "$sig_hex" \
-    '{wallet_pubkey:$pk, encrypted_data:$ed, wallet_signature:$sg}')
+  store_args=$(jq -nc --arg pk "ed25519:$pub_hex" --arg ed "$encb64" --argjson v "${POLICY_VERSION:-0}" --argjson l "${POLICY_LOCKED:-false}" --argjson u "${POLICY_VALID_UNTIL:-0}" --arg sg "$sig_hex" \
+    '{wallet_pubkey:$pk, encrypted_data:$ed, wallet_signature:$sg, version:$v, locked:$l, valid_until:$u}')
   out=$(near --quiet contract call-function as-transaction "$CONTRACT_ID" store_wallet_policy \
     json-args "$store_args" prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \
     sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send 2>&1) || rc=$?

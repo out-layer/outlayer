@@ -121,8 +121,16 @@ Two facts about the policy matter more than any other on this page:
 - **The account that first stores a policy becomes its controller.** Only
   that account can update it, delete it, freeze the wallet, or unfreeze
   it. The signature we produce for a policy write is bound to the exact
-  account that will send the transaction, so the controller cannot be set
-  to someone else by mistake or by us.
+  account that will send the transaction and to the policy's version, so
+  the controller cannot be set to someone else by mistake or by us, and a
+  signature is good for one write.
+- **A locked policy is changed only with its approvers' quorum.** A policy
+  with `approval.locked` makes every later write — including the one that
+  clears the lock — and every delete wait for the votes of the approvers it
+  names, counted against its threshold, inside the enclave. The controller
+  alone can set the lock, as a tightening, and cannot lift it; freezing stays
+  the controller's alone. So an organisation whose wallet is governed two of
+  two cannot have one controller rewrite the policy to one of one.
 - **A wallet with no policy is unrestricted.** Registration does not
   create rules. Until a policy is stored, whoever holds the API key can
   move the balance within the limits of the primitives enabled by

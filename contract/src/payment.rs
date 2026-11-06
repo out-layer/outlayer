@@ -430,6 +430,10 @@ pub enum SystemEvent {
         owner: AccountId,
         encrypted_data: String,
         frozen: bool,
+        /// The version this write stored, and whether the policy is now locked
+        /// (its next write and its delete need the approvers' quorum).
+        version: u64,
+        locked: bool,
     },
     /// Wallet policy deleted — worker should remove authorized keys
     WalletPolicyDeleted {

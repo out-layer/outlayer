@@ -174,6 +174,9 @@ SIGN_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg ed "$ENCRYPTED_B64" --arg c "$PARENT" '{encrypted_data: $ed, caller: $c}')")
 SIG_HEX=$(echo "$SIGN_RESP" | jq -r '.signature_hex // empty')
+POLICY_VERSION=$(echo "$SIGN_RESP" | jq -r '.version // empty')
+POLICY_LOCKED=$(echo "$SIGN_RESP" | jq -r '.locked // empty')
+POLICY_VALID_UNTIL=$(echo "$SIGN_RESP" | jq -r '.valid_until // empty')
 if [[ -n "$SIG_HEX" && "$SIG_HEX" != "null" ]]; then
   pass "policy encrypted+signed under wk_ wallet"
 else
@@ -181,8 +184,8 @@ else
 fi
 
 log "3.1 store_wallet_policy on $CONTRACT_ID"
-STORE_ARGS=$(jq -nc --arg pk "$WALLET_PUBKEY_HEX" --arg ed "$ENCRYPTED_B64" --arg sg "$SIG_HEX" \
-  '{wallet_pubkey: $pk, encrypted_data: $ed, wallet_signature: $sg}')
+STORE_ARGS=$(jq -nc --arg pk "$WALLET_PUBKEY_HEX" --arg ed "$ENCRYPTED_B64" --argjson v "${POLICY_VERSION:-0}" --argjson l "${POLICY_LOCKED:-false}" --argjson u "${POLICY_VALID_UNTIL:-0}" --arg sg "$SIG_HEX" \
+  '{wallet_pubkey: $pk, encrypted_data: $ed, wallet_signature: $sg, version:$v, locked:$l, valid_until:$u}')
 near_tty "near contract call-function as-transaction $CONTRACT_ID store_wallet_policy \\
   json-args '$STORE_ARGS' \\
   prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \\

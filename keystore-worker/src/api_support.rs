@@ -761,6 +761,11 @@ pub struct WalletSignPolicyRequest {
     /// which is what stops a signature lifted off the chain being filed by a
     /// stranger.
     pub caller: String,
+    /// The current policy's approvers' votes over `Op::PolicyUpdate` — required
+    /// when the policy on chain is LOCKED (`approval.locked`), ignored otherwise.
+    /// Verified here against the on-chain policy; the coordinator only carries them.
+    #[serde(default)]
+    pub approval_info: Option<ApprovalInfo>,
 }
 
 /// Request for POST /wallet/sign-secret-store.
@@ -841,6 +846,22 @@ pub struct SignSecretDeleteResponse {
 pub struct WalletSignPolicyResponse {
     pub signature_hex: String,  // ed25519 signature (64 bytes hex)
     pub public_key_hex: String, // ed25519 public key (32 bytes hex)
+    /// The version `store_wallet_policy` must be called with: the one on chain
+    /// plus one. Inside the signature.
+    pub version: u64,
+    /// The new policy's `approval.locked`, read from the plaintext and signed;
+    /// `store_wallet_policy` must be called with exactly this.
+    pub locked: bool,
+    /// Unix seconds after which the contract refuses this signature. Signed;
+    /// `store_wallet_policy` must be called with exactly this.
+    pub valid_until: u64,
+    /// `sha256` of the new policy's canonical plaintext — what a locked
+    /// policy's approvers vote on.
+    pub policy_hash: String,
+    /// The `Op::PolicyUpdate` hash the votes were verified over; present only
+    /// when the policy on chain was locked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_hash: Option<String>,
 }
 
 /// A single approver's NEP-413 signature over `approve:{approval_id}:{wallet_pubkey}:{request_hash}`.

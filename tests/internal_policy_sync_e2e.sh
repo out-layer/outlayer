@@ -157,11 +157,14 @@ prepare_and_store_policy() {
     -d "$(jq -nc --arg ed "$enc_b64" --arg c "$PARENT" '{encrypted_data: $ed, caller: $c}')")
   local sig_hex
   sig_hex=$(echo "$sig_resp" | jq -r '.signature_hex // empty')
+  POLICY_VERSION=$(echo "$sig_resp" | jq -r '.version // empty')
+  POLICY_LOCKED=$(echo "$sig_resp" | jq -r '.locked // empty')
+  POLICY_VALID_UNTIL=$(echo "$sig_resp" | jq -r '.valid_until // empty')
   [[ -n "$sig_hex" && "$sig_hex" != "null" ]] || { echo "sign-policy FAIL: $sig_resp" >&2; return 1; }
 
   local store_args
-  store_args=$(jq -nc --arg pk "$wallet_pub" --arg ed "$enc_b64" --arg sg "$sig_hex" \
-    '{wallet_pubkey: $pk, encrypted_data: $ed, wallet_signature: $sg}')
+  store_args=$(jq -nc --arg pk "$wallet_pub" --arg ed "$enc_b64" --argjson v "${POLICY_VERSION:-0}" --argjson l "${POLICY_LOCKED:-false}" --argjson u "${POLICY_VALID_UNTIL:-0}" --arg sg "$sig_hex" \
+    '{wallet_pubkey: $pk, encrypted_data: $ed, wallet_signature: $sg, version:$v, locked:$l, valid_until:$u}')
   near_tty "near contract call-function as-transaction $CONTRACT_ID store_wallet_policy \\
     json-args '$store_args' \\
     prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \\

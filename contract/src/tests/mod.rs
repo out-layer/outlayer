@@ -2212,14 +2212,26 @@ mod store_wallet_policy_tests {
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
 
+    /// A deadline every test context is before (2100-01-01).
+    const VALID_UNTIL: u64 = 4_102_444_800;
+
     fn wallet() -> (SigningKey, String) {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let pubkey_hex = hex::encode(signing.verifying_key().to_bytes());
         (signing, format!("ed25519:{}", pubkey_hex))
     }
 
-    fn sign_policy(signing: &SigningKey, pubkey: &str, data: &str, caller: &AccountId) -> String {
-        let message = crate::wallet::policy_store_message(pubkey, data, caller);
+    /// The keystore's signature for one write: `version` is the one the write
+    /// stores, `locked` the new policy's flag as the keystore read it.
+    fn sign_policy(
+        signing: &SigningKey,
+        pubkey: &str,
+        data: &str,
+        caller: &AccountId,
+        version: u64,
+        locked: bool,
+    ) -> String {
+        let message = crate::wallet::policy_store_message(pubkey, version, locked, VALID_UNTIL, data, caller);
         let mut hasher = Sha256::new();
         hasher.update(message.as_bytes());
         let hash: [u8; 32] = hasher.finalize().into();
@@ -2232,9 +2244,25 @@ mod store_wallet_policy_tests {
         pubkey: &str,
         data: &str,
         signature: String,
+        version: u64,
+        locked: bool,
     ) {
         testing_env!(get_context(caller, NearToken::from_near(1)).build());
-        contract.store_wallet_policy(pubkey.to_string(), data.to_string(), signature, None);
+        contract.store_wallet_policy(pubkey.to_string(), data.to_string(), signature, version, locked, VALID_UNTIL, None);
+    }
+
+    /// Sign and store in one go, as the honest path does.
+    fn write(
+        contract: &mut Contract,
+        signing: &SigningKey,
+        pubkey: &str,
+        data: &str,
+        caller: &AccountId,
+        version: u64,
+        locked: bool,
+    ) {
+        let sig = sign_policy(signing, pubkey, data, caller, version, locked);
+        store(contract, caller.clone(), pubkey, data, sig, version, locked);
     }
 
     /// Byte for byte, so the keystore's copy has something to be compared
@@ -2244,8 +2272,12 @@ mod store_wallet_policy_tests {
     fn the_policy_store_message_format_is_pinned() {
         let caller: AccountId = "alice.near".parse().unwrap();
         assert_eq!(
-            crate::wallet::policy_store_message("ed25519:ab", "Y2lwaGVy", &caller),
-            "store_wallet_policy:v1:ed25519:ab:8:Y2lwaGVy:alice.near"
+            crate::wallet::policy_store_message("ed25519:ab", 3, true, 1_700_000_000, "Y2lwaGVy", &caller),
+            "store_wallet_policy:v2:ed25519:ab:3:1:1700000000:8:Y2lwaGVy:alice.near"
+        );
+        assert_eq!(
+            crate::wallet::policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "Y2lwaGVy", &caller),
+            "store_wallet_policy:v2:ed25519:ab:1:0:1700000000:8:Y2lwaGVy:alice.near"
         );
     }
 
@@ -2257,8 +2289,8 @@ mod store_wallet_policy_tests {
     #[test]
     fn the_policy_preimage_cannot_be_a_transaction() {
         let caller: AccountId = "alice.near".parse().unwrap();
-        let message = crate::wallet::policy_store_message("ed25519:ab", "data", &caller);
-        assert!(message.starts_with("store_wallet_policy:v1:"));
+        let message = crate::wallet::policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "data", &caller);
+        assert!(message.starts_with("store_wallet_policy:v2:"));
         let first = u32::from_le_bytes(message.as_bytes()[..4].try_into().unwrap());
         assert!(first > 64, "no account id is that long, so this is not a tx");
     }
@@ -2291,7 +2323,7 @@ mod store_wallet_policy_tests {
         let signature = hex::encode(signing.sign(&hash).to_bytes());
 
         // A stranger files the lifted pair as a policy.
-        store(&mut contract, accounts(3), &pubkey, &lifted, signature);
+        store(&mut contract, accounts(3), &pubkey, &lifted, signature, 1, false);
     }
 
     /// A policy signature is good for ONE sender.
@@ -2304,9 +2336,9 @@ mod store_wallet_policy_tests {
     fn a_policy_signature_cannot_be_sent_by_another_account() {
         let mut contract = setup_contract();
         let (signing, pubkey) = wallet();
-        let signature = sign_policy(&signing, &pubkey, "Y2lwaGVy", &accounts(2));
+        let signature = sign_policy(&signing, &pubkey, "Y2lwaGVy", &accounts(2), 1, false);
 
-        store(&mut contract, accounts(3), &pubkey, "Y2lwaGVy", signature);
+        store(&mut contract, accounts(3), &pubkey, "Y2lwaGVy", signature, 1, false);
     }
 
     /// And the honest path still works: the account named in the signature
@@ -2315,9 +2347,9 @@ mod store_wallet_policy_tests {
     fn the_named_caller_stores_the_policy_it_signed_for() {
         let mut contract = setup_contract();
         let (signing, pubkey) = wallet();
-        let signature = sign_policy(&signing, &pubkey, "Y2lwaGVy", &accounts(2));
+        let signature = sign_policy(&signing, &pubkey, "Y2lwaGVy", &accounts(2), 1, false);
 
-        store(&mut contract, accounts(2), &pubkey, "Y2lwaGVy", signature);
+        store(&mut contract, accounts(2), &pubkey, "Y2lwaGVy", signature, 1, false);
 
         assert!(contract.has_wallet_policy(pubkey));
     }
@@ -2337,12 +2369,12 @@ mod store_wallet_policy_tests {
         let (signing, pubkey) = wallet();
         let owner = accounts(2);
 
-        let first = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner);
-        store(&mut contract, owner.clone(), &pubkey, "Y2lwaGVy", first);
+        let first = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        store(&mut contract, owner.clone(), &pubkey, "Y2lwaGVy", first, 1, false);
         let before = contract.get_wallet_policy(pubkey.clone()).expect("stored");
 
-        let second = sign_policy(&signing, &pubkey, "bmV3ZXI=", &owner);
-        store(&mut contract, owner.clone(), &pubkey, "bmV3ZXI=", second);
+        let second = sign_policy(&signing, &pubkey, "bmV3ZXI=", &owner, 2, false);
+        store(&mut contract, owner.clone(), &pubkey, "bmV3ZXI=", second, 2, false);
         let after = contract.get_wallet_policy(pubkey.clone()).expect("still there");
 
         assert_eq!(after.encrypted_data, "bmV3ZXI=", "the new blob must be stored");
@@ -2369,13 +2401,13 @@ mod store_wallet_policy_tests {
         let owner = accounts(2);
         let stranger = accounts(3);
 
-        let first = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner);
-        store(&mut contract, owner, &pubkey, "Y2lwaGVy", first);
+        let first = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        store(&mut contract, owner, &pubkey, "Y2lwaGVy", first, 1, false);
 
         // Signed FOR the stranger, so the signature itself is valid — what
         // stops them is the controller rule.
-        let theirs = sign_policy(&signing, &pubkey, "dGhlaXJz", &stranger);
-        store(&mut contract, stranger, &pubkey, "dGhlaXJz", theirs);
+        let theirs = sign_policy(&signing, &pubkey, "dGhlaXJz", &stranger, 2, false);
+        store(&mut contract, stranger, &pubkey, "dGhlaXJz", theirs, 2, false);
     }
 
     /// A freeze survives a policy edit.
@@ -2393,16 +2425,16 @@ mod store_wallet_policy_tests {
         let (signing, pubkey) = wallet();
         let owner = accounts(2);
 
-        let first = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner);
-        store(&mut contract, owner.clone(), &pubkey, "Y2lwaGVy", first);
+        let first = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        store(&mut contract, owner.clone(), &pubkey, "Y2lwaGVy", first, 1, false);
 
         testing_env!(get_context(owner.clone(), NearToken::from_near(0)).build());
         contract.freeze_wallet(pubkey.clone());
         assert!(contract.get_wallet_policy(pubkey.clone()).unwrap().frozen);
 
         // The controller tightens the policy while the wallet is frozen.
-        let second = sign_policy(&signing, &pubkey, "dGlnaHRlcg==", &owner);
-        store(&mut contract, owner.clone(), &pubkey, "dGlnaHRlcg==", second);
+        let second = sign_policy(&signing, &pubkey, "dGlnaHRlcg==", &owner, 2, false);
+        store(&mut contract, owner.clone(), &pubkey, "dGlnaHRlcg==", second, 2, false);
 
         let after = contract.get_wallet_policy(pubkey.clone()).unwrap();
         assert_eq!(after.encrypted_data, "dGlnaHRlcg==", "the edit must land");
@@ -2431,8 +2463,8 @@ mod store_wallet_policy_tests {
         let shouted = pubkey.to_uppercase().replace("ED25519:", "ed25519:");
         assert_ne!(shouted, pubkey, "the fixture must actually differ in case");
 
-        let sig = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner);
-        store(&mut contract, owner.clone(), &pubkey, "Y2lwaGVy", sig);
+        let sig = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        store(&mut contract, owner.clone(), &pubkey, "Y2lwaGVy", sig, 1, false);
 
         testing_env!(get_context(owner.clone(), NearToken::from_near(0)).build());
         contract.freeze_wallet(shouted.clone());
@@ -2454,8 +2486,8 @@ mod store_wallet_policy_tests {
         let (signing, pubkey) = wallet();
         let owner = accounts(2);
 
-        let sig = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner);
-        store(&mut contract, owner, &pubkey, "Y2lwaGVy", sig);
+        let sig = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        store(&mut contract, owner, &pubkey, "Y2lwaGVy", sig, 1, false);
 
         assert!(!contract.get_wallet_policy(pubkey).unwrap().frozen);
     }
@@ -2465,13 +2497,244 @@ mod store_wallet_policy_tests {
     #[test]
     fn the_length_prefix_keeps_two_blobs_apart() {
         let caller: AccountId = "alice.near".parse().unwrap();
-        let a = crate::wallet::policy_store_message("ed25519:ab", "x:y", &caller);
-        let b = crate::wallet::policy_store_message("ed25519:ab", "x", &caller);
+        let a = crate::wallet::policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "x:y", &caller);
+        let b = crate::wallet::policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "x", &caller);
         assert_ne!(a, b);
         assert!(a.contains(":3:x:y:"), "{a}");
         assert!(b.contains(":1:x:"), "{b}");
     }
+
+    // ----- version and lock -----
+
+    /// A first policy is version 1 and nothing else: 0 is not a version a write
+    /// can store, and 2 would skip one.
+    #[test]
+    #[should_panic(expected = "policy version is 0, this signature was made for 2")]
+    fn a_first_policy_cannot_claim_version_two() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        write(&mut contract, &signing, &pubkey, "Y2lwaGVy", &accounts(2), 2, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "policy version is 0, this signature was made for 0")]
+    fn a_first_policy_cannot_claim_version_zero() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        write(&mut contract, &signing, &pubkey, "Y2lwaGVy", &accounts(2), 0, false);
+    }
+
+    /// The version is checked before the signature, in words that say what
+    /// happened: the policy moved on, sign again.
+    #[test]
+    #[should_panic(expected = "policy version is 1, this signature was made for 1")]
+    fn a_signature_is_good_for_one_write() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        let sig = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        store(&mut contract, owner.clone(), &pubkey, "Y2lwaGVy", sig.clone(), 1, false);
+        // The same (blob, signature) pair, filed again by the same account.
+        store(&mut contract, owner, &pubkey, "Y2lwaGVy", sig, 1, false);
+    }
+
+    /// The version is SIGNED: a signature made for version 1 presented with
+    /// the right version argument is still not a signature over this write.
+    #[test]
+    #[should_panic(expected = "Invalid Ed25519 wallet signature")]
+    fn a_stale_signature_cannot_be_relabelled_with_the_right_version() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        write(&mut contract, &signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        let stale = sign_policy(&signing, &pubkey, "bmV3ZXI=", &owner, 1, false);
+        store(&mut contract, owner, &pubkey, "bmV3ZXI=", stale, 2, false);
+    }
+
+    /// The lock is SIGNED: the contract learns it from the argument, and the
+    /// argument must be what the keystore signed.
+    #[test]
+    #[should_panic(expected = "Invalid Ed25519 wallet signature")]
+    fn the_lock_argument_must_match_the_signed_lock() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        let unlocked = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        store(&mut contract, owner, &pubkey, "Y2lwaGVy", unlocked, 1, true);
+    }
+
+    /// The old message format is gone: a `v1` signature verifies nothing.
+    #[test]
+    #[should_panic(expected = "Invalid Ed25519 wallet signature")]
+    fn a_v1_signature_is_refused() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        let v1 = format!("store_wallet_policy:v1:{}:{}:{}:{}", pubkey, "Y2lwaGVy".len(), "Y2lwaGVy", owner);
+        let _ = VALID_UNTIL;
+        let hash: [u8; 32] = Sha256::digest(v1.as_bytes()).into();
+        let sig = hex::encode(signing.sign(&hash).to_bytes());
+        store(&mut contract, owner, &pubkey, "Y2lwaGVy", sig, 1, false);
+    }
+
+    /// Each write stores its version and its lock, and the views show both.
+    #[test]
+    fn a_write_stores_its_version_and_lock() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+
+        write(&mut contract, &signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        let v = contract.get_wallet_policy(pubkey.clone()).unwrap();
+        assert_eq!((v.version, v.locked), (1, false));
+
+        write(&mut contract, &signing, &pubkey, "bG9ja2Vk", &owner, 2, true);
+        let v = contract.get_wallet_policy(pubkey.clone()).unwrap();
+        assert_eq!((v.version, v.locked), (2, true));
+        assert_eq!(v.encrypted_data, "bG9ja2Vk");
+        let listed = contract.get_wallet_policies_by_owner(owner.clone());
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].version, listed[0].locked), (2, true));
+
+        // Unlocking is a write like any other: the keystore signed it with the
+        // quorum, the contract stores what was signed.
+        write(&mut contract, &signing, &pubkey, "b3Blbg==", &owner, 3, false);
+        let v = contract.get_wallet_policy(pubkey).unwrap();
+        assert_eq!((v.version, v.locked), (3, false));
+    }
+
+    /// A locked policy is not deleted: that would be the one write past the
+    /// approvers.
+    #[test]
+    #[should_panic(expected = "policy is locked: store an unlocked policy with the approvers' quorum first")]
+    fn a_locked_policy_cannot_be_deleted() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        write(&mut contract, &signing, &pubkey, "bG9ja2Vk", &owner, 1, true);
+        testing_env!(get_context(owner, NearToken::from_near(0)).build());
+        contract.delete_wallet_policy(pubkey);
+    }
+
+    /// Unlock under the quorum, then delete; the version record goes with the
+    /// policy, so a policy created again under the key starts at version 1.
+    #[test]
+    fn an_unlocked_policy_deletes_and_takes_its_version_with_it() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        write(&mut contract, &signing, &pubkey, "bG9ja2Vk", &owner, 1, true);
+        write(&mut contract, &signing, &pubkey, "b3Blbg==", &owner, 2, false);
+
+        testing_env!(get_context(owner.clone(), NearToken::from_near(0)).build());
+        contract.delete_wallet_policy(pubkey.clone());
+        assert!(contract.get_wallet_policy(pubkey.clone()).is_none());
+
+        write(&mut contract, &signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        assert_eq!(contract.get_wallet_policy(pubkey).unwrap().version, 1);
+    }
+
+    /// Freezing is not a policy write: the lock does not reach it, in either
+    /// direction.
+    #[test]
+    fn a_lock_does_not_touch_freeze_or_thaw() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        write(&mut contract, &signing, &pubkey, "bG9ja2Vk", &owner, 1, true);
+
+        testing_env!(get_context(owner.clone(), NearToken::from_near(0)).build());
+        contract.freeze_wallet(pubkey.clone());
+        let v = contract.get_wallet_policy(pubkey.clone()).unwrap();
+        assert!(v.frozen && v.locked);
+
+        // A quorum-signed write lands on the frozen, locked wallet and keeps the freeze.
+        write(&mut contract, &signing, &pubkey, "dGlnaHRlcg==", &owner, 2, true);
+        let v = contract.get_wallet_policy(pubkey.clone()).unwrap();
+        assert!(v.frozen && v.locked && v.version == 2);
+
+        testing_env!(get_context(owner, NearToken::from_near(0)).build());
+        contract.unfreeze_wallet(pubkey.clone());
+        let v = contract.get_wallet_policy(pubkey).unwrap();
+        assert!(!v.frozen && v.locked);
+    }
+
+    /// The estimate is the charge, version record included: attaching exactly
+    /// it stores, one yocto less does not.
+    #[test]
+    fn the_estimate_covers_the_version_record() {
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        let cost = setup_contract()
+            .estimate_wallet_policy_cost(pubkey.clone(), "Y2lwaGVy".to_string(), None)
+            .0;
+
+        let mut exact = setup_contract();
+        let sig = sign_policy(&signing, &pubkey, "Y2lwaGVy", &owner, 1, false);
+        testing_env!(get_context(owner.clone(), NearToken::from_yoctonear(cost)).build());
+        exact.store_wallet_policy(pubkey.clone(), "Y2lwaGVy".to_string(), sig.clone(), 1, false, VALID_UNTIL, None);
+        assert_eq!(exact.get_wallet_policy(pubkey.clone()).unwrap().storage_deposit.0, cost);
+
+        let mut short = setup_contract();
+        testing_env!(get_context(owner, NearToken::from_yoctonear(cost - 1)).build());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            short.store_wallet_policy(pubkey.clone(), "Y2lwaGVy".to_string(), sig, 1, false, VALID_UNTIL, None);
+        }));
+        assert!(refused.is_err(), "one yocto short of the estimate must be refused");
+    }
+
+    // ----- the deadline -----
+
+    fn sign_until(signing: &SigningKey, pubkey: &str, data: &str, caller: &AccountId, valid_until: u64) -> String {
+        let message = crate::wallet::policy_store_message(pubkey, 1, false, valid_until, data, caller);
+        let hash: [u8; 32] = Sha256::digest(message.as_bytes()).into();
+        hex::encode(signing.sign(&hash).to_bytes())
+    }
+
+    /// A signature is filable up to and including its deadline, and told so
+    /// after it — before the cryptographic check.
+    #[test]
+    fn a_signature_is_filable_until_its_deadline_and_not_after() {
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        let until = 1_700_000_000u64;
+        let sig = sign_until(&signing, &pubkey, "Y2lwaGVy", &owner, until);
+
+        // One second late, on an empty chain: refused for the deadline, in
+        // words, before the signature is looked at.
+        let mut contract = setup_contract();
+        let mut ctx = get_context(owner.clone(), NearToken::from_near(1));
+        ctx.block_timestamp((until + 1) * 1_000_000_000);
+        testing_env!(ctx.build());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.store_wallet_policy(pubkey.clone(), "Y2lwaGVy".to_string(), sig.clone(), 1, false, until, None);
+        }));
+        let msg = refused.expect_err("one second late must be refused");
+        let msg = msg.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("this policy signature expired at 1700000000"), "{msg}");
+        assert!(contract.get_wallet_policy(pubkey.clone()).is_none(), "nothing was stored");
+
+        // At the deadline itself: filed.
+        let mut ctx = get_context(owner.clone(), NearToken::from_near(1));
+        ctx.block_timestamp(until * 1_000_000_000);
+        testing_env!(ctx.build());
+        contract.store_wallet_policy(pubkey.clone(), "Y2lwaGVy".to_string(), sig, 1, false, until, None);
+        assert_eq!(contract.get_wallet_policy(pubkey).unwrap().version, 1);
+    }
+
+    /// The deadline is SIGNED: moving it with the argument is a bad signature.
+    #[test]
+    #[should_panic(expected = "Invalid Ed25519 wallet signature")]
+    fn the_deadline_argument_must_match_the_signed_deadline() {
+        let mut contract = setup_contract();
+        let (signing, pubkey) = wallet();
+        let owner = accounts(2);
+        let sig = sign_until(&signing, &pubkey, "Y2lwaGVy", &owner, 1_700_000_000);
+        testing_env!(get_context(owner, NearToken::from_near(1)).build());
+        contract.store_wallet_policy(pubkey, "Y2lwaGVy".to_string(), sig, 1, false, VALID_UNTIL, None);
+    }
 }
+
 
 mod project_transfer_event_tests {
     use crate::*;
@@ -3217,8 +3480,10 @@ mod storage_refund_to_tests {
         (signing.clone(), format!("ed25519:{}", hex::encode(signing.verifying_key().to_bytes())))
     }
 
-    fn sign(signing: &SigningKey, pubkey: &str, data: &str, caller: &AccountId) -> String {
-        let message = crate::wallet::policy_store_message(pubkey, data, caller);
+    const VALID_UNTIL: u64 = 4_102_444_800;
+
+    fn sign(signing: &SigningKey, pubkey: &str, data: &str, caller: &AccountId, version: u64) -> String {
+        let message = crate::wallet::policy_store_message(pubkey, version, false, VALID_UNTIL, data, caller);
         let hash: [u8; 32] = Sha256::digest(message.as_bytes()).into();
         hex::encode(signing.sign(&hash).to_bytes())
     }
@@ -3231,8 +3496,18 @@ mod storage_refund_to_tests {
         refund_to: Option<AccountId>,
     ) -> Vec<(AccountId, u128)> {
         let (signing, pubkey) = wallet();
+        // The version this write stores: whatever is there plus one.
+        let version = c.get_wallet_policy(pubkey.clone()).map(|v| v.version).unwrap_or(0) + 1;
         testing_env!(get_context(owner(), NearToken::from_yoctonear(deposit)).build());
-        c.store_wallet_policy(pubkey.clone(), data.to_string(), sign(&signing, &pubkey, data, &owner()), refund_to);
+        c.store_wallet_policy(
+            pubkey.clone(),
+            data.to_string(),
+            sign(&signing, &pubkey, data, &owner(), version),
+            version,
+            false,
+            VALID_UNTIL,
+            refund_to,
+        );
         transfers()
     }
 

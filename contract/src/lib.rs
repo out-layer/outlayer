@@ -129,6 +129,8 @@ enum StorageKey {
     StorageRefundTo,
     // Who agreed to take which project from whom (TransferAcceptance -> deposit)
     ProjectTransferAcceptances,
+    // A wallet policy's version and lock (wallet_pubkey -> PolicyMeta)
+    PolicyMeta,
 }
 
 /// Execution source - GitHub repo, pre-compiled WASM URL, or project reference
@@ -651,6 +653,11 @@ pub struct Contract {
     // `transfer_project`, dropped by `revoke_project_transfer`. See
     // `TransferAcceptance`.
     project_transfer_acceptances: LookupMap<TransferAcceptance, Balance>,
+
+    // A wallet policy's version and lock, beside the entry rather than in it
+    // so existing borsh entries read unchanged. Absent: version 0, unlocked.
+    // See `wallet::PolicyMeta`.
+    policy_meta: LookupMap<String, wallet::PolicyMeta>,
 }
 
 #[near_bindgen]
@@ -704,6 +711,7 @@ impl Contract {
             payment_key_nonce_floors: LookupMap::new(StorageKey::PaymentKeyNonceFloor),
             storage_refund_to: LookupMap::new(StorageKey::StorageRefundTo),
             project_transfer_acceptances: LookupMap::new(StorageKey::ProjectTransferAcceptances),
+            policy_meta: LookupMap::new(StorageKey::PolicyMeta),
         }
     }
 

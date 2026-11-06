@@ -19,6 +19,22 @@ pub struct WalletPolicyEntry {
     pub storage_deposit: Balance,
 }
 
+/// A policy's version and lock, kept beside the entry.
+///
+/// `version` counts the writes under this key: a `store_wallet_policy` must
+/// carry the current version plus one, which is what makes a stored signature
+/// good for exactly one write. `locked` is the new policy's `approval.locked`,
+/// as the keystore read it from the plaintext and signed it: while it is set,
+/// the keystore signs the next write only with the approvers' quorum, and the
+/// contract refuses a delete. Absent: `{0, false}` — a policy written before
+/// versions existed, or none at all.
+#[derive(Clone, Debug, Default)]
+#[near(serializers = [borsh, json])]
+pub struct PolicyMeta {
+    pub version: u64,
+    pub locked: bool,
+}
+
 /// What a refundable storage deposit is held for. Grows by variant: a new
 /// kind of sponsored storage is a new variant and an argument on its creating
 /// call, never a new map.
@@ -54,6 +70,10 @@ pub struct WalletPolicyView {
     pub storage_refund_to: Option<AccountId>,
     /// The storage deposit held for this policy now.
     pub storage_deposit: near_sdk::json_types::U128,
+    /// The version the next `store_wallet_policy` must exceed by one.
+    pub version: u64,
+    /// The next write needs the approvers' quorum, and a delete is refused.
+    pub locked: bool,
 }
 
 /// Lightweight view for listing wallets by owner
@@ -65,6 +85,8 @@ pub struct WalletPolicyListItem {
     pub frozen: bool,
     pub updated_at: u64,
     pub storage_refund_to: Option<AccountId>,
+    pub version: u64,
+    pub locked: bool,
 }
 
 /// Parse wallet pubkey string into (key_type, raw_bytes)
@@ -259,14 +281,33 @@ pub(crate) fn verify_wallet_signature(
 ///
 /// `encrypted_data` is length-prefixed, so it may hold anything at all without
 /// moving a boundary.
+///
+/// The VERSION, the LOCK and the DEADLINE are signed too. The version is the
+/// one this write stores — the current one plus one — so a signature is good
+/// for exactly one write and cannot be filed again after the policy moved on.
+/// The lock is the new policy's `approval.locked` as the keystore read it from
+/// the plaintext: the contract cannot open the blob, and this is how it learns,
+/// under the wallet's own signature, whether the next write needs the
+/// approvers' quorum. The deadline (`valid_until`, unix seconds) is when the
+/// signature stops being filable: a write the approvers released is good for a
+/// while, not for ever.
+///
+/// The keystore builds the same string (`keystore-worker/src/api.rs`); the two
+/// are pinned to one fixture by a test on each side.
 pub(crate) fn policy_store_message(
     wallet_pubkey: &str,
+    version: u64,
+    locked: bool,
+    valid_until: u64,
     encrypted_data: &str,
     caller: &AccountId,
 ) -> String {
     format!(
-        "store_wallet_policy:v1:{}:{}:{}:{}",
+        "store_wallet_policy:v2:{}:{}:{}:{}:{}:{}:{}",
         wallet_pubkey,
+        version,
+        u8::from(locked),
+        valid_until,
         encrypted_data.len(),
         encrypted_data,
         caller
@@ -283,10 +324,20 @@ impl Contract {
     /// If entry already exists, caller must be the same controller (owner).
     /// Requires attached storage deposit.
     ///
+    /// `version` must be the stored version plus one (a first policy: 1), and
+    /// `valid_until` must not have passed; both are checked before the
+    /// signature so a stale signature is told apart from a bad one. While the
+    /// stored policy is LOCKED, the keystore signs this message only with the
+    /// approvers' quorum (`sign-policy`); the contract itself checks nothing
+    /// about the lock here — the signature is the proof.
+    ///
     /// # Arguments
     /// * `wallet_pubkey` - "ed25519:<hex32>" or "secp256k1:<hex33>"
     /// * `encrypted_data` - Policy encrypted by keystore
     /// * `wallet_signature` - Hex-encoded signature proving API key ownership
+    /// * `version` - The version this write stores: the current one plus one
+    /// * `locked` - The new policy's `approval.locked`, as the keystore signed it
+    /// * `valid_until` - Unix seconds after which this signature is not filable
     /// * `storage_refund_to` - Who the storage deposit goes back to on a shrink
     ///   or a delete, for a sponsor that pays it. Set only when the policy is
     ///   CREATED; on an update it must be absent (the beneficiary changes it
@@ -298,6 +349,9 @@ impl Contract {
         wallet_pubkey: String,
         encrypted_data: String,
         wallet_signature: String,
+        version: u64,
+        locked: bool,
+        valid_until: u64,
         storage_refund_to: Option<AccountId>,
     ) {
         self.assert_not_paused();
@@ -334,10 +388,35 @@ impl Contract {
         // value by construction.
         let wallet_pubkey = canonical_wallet_pubkey(&wallet_pubkey);
 
+        // The version first, in plain words: a signature made for an earlier
+        // version fails the cryptographic check below just the same, but
+        // "invalid signature" sends the owner to the keystore when what
+        // happened is that the policy moved on under them.
+        let meta = self.policy_meta.get(&wallet_pubkey).unwrap_or_default();
+        let expected = meta.version + 1;
+        assert!(
+            version == expected,
+            "policy version is {}, this signature was made for {}: sign the policy again",
+            meta.version,
+            version
+        );
+        // The deadline too, in plain words: a signature the approvers released
+        // is good for a while, and one filed after that is told so.
+        let now = env::block_timestamp() / 1_000_000_000;
+        assert!(
+            now <= valid_until,
+            "this policy signature expired at {} (unix seconds; now {}): sign the policy again",
+            valid_until,
+            now
+        );
+
         // Verify wallet signature on-chain, over a message that names this
         // caller — see `policy_store_message` for why the bare hash was unsafe.
         let mut hasher = Sha256::new();
-        hasher.update(policy_store_message(&wallet_pubkey, &encrypted_data, &caller).as_bytes());
+        hasher.update(
+            policy_store_message(&wallet_pubkey, version, locked, valid_until, &encrypted_data, &caller)
+                .as_bytes(),
+        );
         let message_hash: [u8; 32] = hasher.finalize().into();
 
         verify_wallet_signature(&wallet_pubkey, &message_hash, &wallet_signature);
@@ -443,6 +522,7 @@ impl Contract {
         };
 
         self.wallet_policies.insert(&wallet_pubkey, &entry);
+        self.policy_meta.insert(&wallet_pubkey, &PolicyMeta { version, locked });
 
         // Add to owner index (new entries only — updates keep the same owner)
         if is_new {
@@ -463,6 +543,8 @@ impl Contract {
             owner: caller,
             encrypted_data: entry.encrypted_data.clone(),
             frozen: entry.frozen,
+            version,
+            locked,
         });
     }
 
@@ -508,9 +590,8 @@ impl Contract {
 
     /// Unfreeze wallet (controller-only, NO wallet signature required)
     ///
-    /// Only the controller (caller == entry.owner) can unfreeze.
-    /// If admin_quorum is set in policy, keystore will additionally verify
-    /// quorum approval during check-policy.
+    /// Only the controller (caller == entry.owner) can unfreeze. A lock on the
+    /// policy does not reach here: freezing and thawing are not policy writes.
     pub fn unfreeze_wallet(&mut self, wallet_pubkey: String) {
         self.assert_not_paused();
 
@@ -545,7 +626,9 @@ impl Contract {
 
     /// Delete wallet policy and refund storage deposit
     ///
-    /// Only the controller can delete.
+    /// Only the controller can delete, and not while the policy is locked: a
+    /// delete would be the one write past the approvers. The way out is a
+    /// write with `locked: false` under their quorum, then this.
     pub fn delete_wallet_policy(&mut self, wallet_pubkey: String) {
         let wallet_pubkey = canonical_wallet_pubkey(&wallet_pubkey);
         let caller = env::predecessor_account_id();
@@ -559,8 +642,13 @@ impl Contract {
             "Only the controller ({}) can delete this wallet policy",
             entry.owner
         );
+        assert!(
+            !self.policy_meta.get(&wallet_pubkey).unwrap_or_default().locked,
+            "policy is locked: store an unlocked policy with the approvers' quorum first"
+        );
 
         self.wallet_policies.remove(&wallet_pubkey);
+        self.policy_meta.remove(&wallet_pubkey);
 
         // Remove from owner index
         if let Some(mut owner_set) = self.wallet_owner_index.get(&caller) {
@@ -642,15 +730,20 @@ impl Contract {
     /// Keystore decrypts encrypted_data for policy rules
     pub fn get_wallet_policy(&self, wallet_pubkey: String) -> Option<WalletPolicyView> {
         let wallet_pubkey = lookup_wallet_pubkey(&wallet_pubkey);
-        self.wallet_policies.get(&wallet_pubkey).map(|entry| WalletPolicyView {
-            owner: entry.owner,
-            encrypted_data: entry.encrypted_data,
-            frozen: entry.frozen,
-            updated_at: entry.updated_at,
-            storage_refund_to: self
-                .storage_refund_to
-                .get(&StorageItem::WalletPolicy { wallet_pubkey: wallet_pubkey.clone() }),
-            storage_deposit: near_sdk::json_types::U128(entry.storage_deposit),
+        self.wallet_policies.get(&wallet_pubkey).map(|entry| {
+            let meta = self.policy_meta.get(&wallet_pubkey).unwrap_or_default();
+            WalletPolicyView {
+                owner: entry.owner,
+                encrypted_data: entry.encrypted_data,
+                frozen: entry.frozen,
+                updated_at: entry.updated_at,
+                storage_refund_to: self
+                    .storage_refund_to
+                    .get(&StorageItem::WalletPolicy { wallet_pubkey: wallet_pubkey.clone() }),
+                storage_deposit: near_sdk::json_types::U128(entry.storage_deposit),
+                version: meta.version,
+                locked: meta.locked,
+            }
         })
     }
 
@@ -666,12 +759,15 @@ impl Contract {
                     let storage_refund_to = self
                         .storage_refund_to
                         .get(&StorageItem::WalletPolicy { wallet_pubkey: wallet_pubkey.clone() });
+                    let meta = self.policy_meta.get(&wallet_pubkey).unwrap_or_default();
                     WalletPolicyListItem {
                         wallet_pubkey,
                         owner: entry.owner,
                         frozen: entry.frozen,
                         updated_at: entry.updated_at,
                         storage_refund_to,
+                        version: meta.version,
+                        locked: meta.locked,
                     }
                 })
             })
@@ -697,8 +793,8 @@ impl Contract {
 }
 
 impl Contract {
-    /// Calculate storage size for wallet policy entry, and the beneficiary's
-    /// record when there is one.
+    /// Calculate storage size for wallet policy entry, its version-and-lock
+    /// record, and the beneficiary's record when there is one.
     fn calculate_wallet_policy_storage_size(
         &self,
         wallet_pubkey: &str,
@@ -732,7 +828,10 @@ impl Contract {
             0
         };
 
-        BASE_OVERHEAD + key_size + value_size + beneficiary
+        // The policy's `PolicyMeta`: its map entry, the same key, a u64 and a bool.
+        let meta = BASE_OVERHEAD + key_size + 8 + 1;
+
+        BASE_OVERHEAD + key_size + value_size + meta + beneficiary
     }
 }
 

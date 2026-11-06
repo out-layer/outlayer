@@ -58,6 +58,9 @@ prep() {
     -H "$(AUTH_FOR "$seed")" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg ed "$ENC" --arg c "$PARENT" '{encrypted_data:$ed, caller:$c}')")
   SIG=$(jq -r '.signature_hex // empty' <<<"$sg")
+  POLICY_VERSION=$(jq -r '.version // empty' <<<"$sg")
+  POLICY_LOCKED=$(jq -r '.locked // empty' <<<"$sg")
+  POLICY_VALID_UNTIL=$(jq -r '.valid_until // empty' <<<"$sg")
   WPK="ed25519:$(jq -r '.public_key_hex // empty' <<<"$sg")"
   [[ -n "$SIG" ]] || { warn "sign-policy failed: $(head -c 200 <<<"$sg")"; return 1; }
 }
@@ -81,8 +84,11 @@ refunds() {
 
 store() { # store <deposit> [refund_to]
   local args
+  # `prep` signed this blob at the version the chain holds plus one; the call
+  # carries that version and the signed lock, both inside the signature.
   args=$(jq -nc --arg k "$WPK" --arg e "$ENC" --arg s "$SIG" --arg r "${2:-}" \
-    '{wallet_pubkey:$k, encrypted_data:$e, wallet_signature:$s} + (if $r == "" then {} else {storage_refund_to:$r} end)')
+    --argjson v "${POLICY_VERSION:-0}" --argjson l "${POLICY_LOCKED:-false}" --argjson u "${POLICY_VALID_UNTIL:-0}" \
+    '{wallet_pubkey:$k, encrypted_data:$e, wallet_signature:$s, version:$v, locked:$l, valid_until:$u} + (if $r == "" then {} else {storage_refund_to:$r} end)')
   tx "$PARENT" store_wallet_policy "$args" "$1"
 }
 set_to() { # set_to <caller> <account>

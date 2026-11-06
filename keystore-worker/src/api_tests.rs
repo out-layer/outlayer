@@ -2314,17 +2314,17 @@ mod signing_oracle_tests {
     }
 
     /// The policy message, byte for byte, as `contract/src/wallet.rs` rebuilds
-    /// it.
-    ///
-    /// This one is newer than the others and was added to close a hole rather
-    /// than to describe one: the contract used to verify a policy signature
-    /// over the BARE `sha256(encrypted_data)`, which any other signature of
-    /// this wallet satisfied.
+    /// it: domain, wallet key, the version this write stores, the new policy's
+    /// lock, the length-prefixed blob, the sender.
     #[test]
     fn the_policy_store_message_format_is_pinned() {
         assert_eq!(
-            policy_store_message("ed25519:ab", "Y2lwaGVy", "alice.near"),
-            "store_wallet_policy:v1:ed25519:ab:8:Y2lwaGVy:alice.near"
+            policy_store_message("ed25519:ab", 3, true, 1_700_000_000, "Y2lwaGVy", "alice.near"),
+            "store_wallet_policy:v2:ed25519:ab:3:1:1700000000:8:Y2lwaGVy:alice.near"
+        );
+        assert_eq!(
+            policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "Y2lwaGVy", "alice.near"),
+            "store_wallet_policy:v2:ed25519:ab:1:0:1700000000:8:Y2lwaGVy:alice.near"
         );
     }
 
@@ -2336,7 +2336,7 @@ mod signing_oracle_tests {
     /// their remaining fields line up.
     #[test]
     fn the_three_domains_are_distinct() {
-        let policy = policy_store_message("ed25519:ab", "cipher", "alice.near");
+        let policy = policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "cipher", "alice.near");
         let store = secret_store_message(
             "ed25519:ab",
             "a.near/p",
@@ -2348,7 +2348,7 @@ mod signing_oracle_tests {
         );
         let delete = secret_delete_message("ed25519:ab", "a.near/p", "agent", "alice.near");
 
-        assert!(policy.starts_with("store_wallet_policy:v1:"));
+        assert!(policy.starts_with("store_wallet_policy:v2:"));
         assert!(store.starts_with("store_secrets_for:v1:"));
         assert!(delete.starts_with("delete_agent_secret:v1:"));
         assert!(
@@ -2361,11 +2361,14 @@ mod signing_oracle_tests {
     /// that may send it.
     #[test]
     fn changing_any_policy_field_changes_the_message() {
-        let base = policy_store_message("ed25519:ab", "cipher", "alice.near");
+        let base = policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "cipher", "alice.near");
         for other in [
-            policy_store_message("ed25519:cd", "cipher", "alice.near"),
-            policy_store_message("ed25519:ab", "other", "alice.near"),
-            policy_store_message("ed25519:ab", "cipher", "thief.near"),
+            policy_store_message("ed25519:cd", 1, false, 1_700_000_000, "cipher", "alice.near"),
+            policy_store_message("ed25519:ab", 2, false, 1_700_000_000, "cipher", "alice.near"),
+            policy_store_message("ed25519:ab", 1, true, 1_700_000_000, "cipher", "alice.near"),
+            policy_store_message("ed25519:ab", 1, false, 1_700_000_001, "cipher", "alice.near"),
+            policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "other", "alice.near"),
+            policy_store_message("ed25519:ab", 1, false, 1_700_000_000, "cipher", "thief.near"),
         ] {
             assert_ne!(base, other, "a changed argument must change the message");
         }
@@ -6221,5 +6224,380 @@ mod payment_check_multisig_tests {
             .await
             .expect("no threshold: the capability decides");
         assert!(resp.signature_base58.is_some());
+    }
+}
+
+/// A locked policy (`approval.locked`) is changed only with its approvers'
+/// votes: `sign-policy` reads the policy on chain, and when it is locked signs
+/// the contract's message only over a quorum of votes on `Op::PolicyUpdate` —
+/// the wallet, the new policy's hash, the next version, its own lock, the
+/// sender. Approvers and threshold come from the chain; the hash from the blob;
+/// nothing from the request. `wallet/sign` never signs a policy update at all.
+mod policy_lock_tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::Json;
+    use ed25519_dalek::{Signer, Verifier};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use shared_tee_helpers::wallet_policy::{policy_canonical_hash_hex, request_hash, Op};
+    use std::sync::{Arc, Mutex};
+
+    const WALLET_ID: &str = "policy-lock-wallet";
+    const APPROVAL_ID: &str = "pl-approval";
+    const CALLER: &str = "owner.testnet";
+
+    /// The policy on chain: one approver, threshold 1, locked.
+    fn current_locked() -> serde_json::Value {
+        json!({
+            "version": 1, "frozen": false,
+            "approval": { "threshold": { "required": 1 }, "approvers": [{ "id": "a.testnet" }], "locked": true }
+        })
+    }
+
+    /// What the owner wants instead: no approval block at all.
+    fn new_open() -> serde_json::Value {
+        json!({ "version": 1, "frozen": false, "rules": { "transaction_types": ["transfer"] }, "admin_quorum": null })
+    }
+
+    struct Chain {
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// What every contract wallet's `w_resolve_auth` resolves to.
+        resolve_to: Arc<Mutex<String>>,
+    }
+
+    /// A chain holding `current` for the wallet — `(policy, version, locked,
+    /// frozen)`, encrypted the way the contract stores it — or nothing.
+    /// `view_access_key` answers FullAccess for any key; every contract wallet
+    /// allows signatures and resolves to `resolve_to`.
+    async fn chain(current: Option<(serde_json::Value, u64, bool, bool)>) -> (AppState, Chain) {
+        let keystore = crate::crypto::Keystore::generate();
+        let view = current.map(|(policy, version, locked, frozen)| {
+            let encrypted = keystore
+                .encrypt(None, &format!("wallet-policy:{WALLET_ID}"), policy.to_string().as_bytes())
+                .expect("the policy encrypts under the wallet's seed");
+            json!({
+                "owner": "owner.testnet", "frozen": frozen, "updated_at": 0,
+                "encrypted_data": base64::encode(encrypted), "version": version, "locked": locked,
+            })
+            .to_string()
+        });
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolve_to: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let (log, resolve) = (seen.clone(), resolve_to.clone());
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let (view, log, resolve) = (view.clone(), log.clone(), resolve.clone());
+                async move {
+                    let params = body["params"].clone();
+                    log.lock().unwrap().push(params.clone());
+                    let id = body["id"].clone();
+                    if params["request_type"] == "view_access_key" {
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "nonce": 1, "permission": "FullAccess", "block_height": 9, "block_hash": "11111111111111111111111111111111"}}));
+                    }
+                    let bytes = match params["method_name"].as_str().unwrap_or_default() {
+                        "get_wallet_policy" => view.unwrap_or_else(|| "null".to_string()),
+                        "w_is_signature_allowed" => "true".to_string(),
+                        "w_resolve_auth" => json!({"payload": resolve.lock().unwrap().clone()}).to_string(),
+                        other => panic!("the chain was asked for {other}"),
+                    };
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "block_hash": "11111111111111111111111111111111", "block_height": 9, "logs": [], "result": bytes.into_bytes()}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: url.clone(),
+            offchainvm_contract_id: "outlayer.test".into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
+        (AppState::new(keystore, config, Some(near_client)), Chain { seen, resolve_to })
+    }
+
+    /// The new policy, encrypted under the wallet's policy seed as `encrypt-policy` does.
+    async fn blob(state: &AppState, policy: &serde_json::Value) -> String {
+        let keystore = state.keystore.read().await;
+        base64::encode(
+            keystore
+                .encrypt(None, &format!("wallet-policy:{WALLET_ID}"), policy.to_string().as_bytes())
+                .expect("encrypts"),
+        )
+    }
+
+    async fn pubkey(state: &AppState) -> String {
+        derive_wallet_ed25519_pubkey(state, None, WALLET_ID).await.expect("wallet pubkey")
+    }
+
+    fn request(blob: &str, approval_info: Option<serde_json::Value>) -> WalletSignPolicyRequest {
+        serde_json::from_value(json!({
+            "wallet_id": WALLET_ID, "encrypted_data": blob, "caller": CALLER, "approval_info": approval_info,
+        }))
+        .expect("a sign-policy request")
+    }
+
+    fn update_op(pubkey: &str, policy: &serde_json::Value, version: u64, caller: &str) -> Op {
+        Op::PolicyUpdate {
+            wallet_pubkey: pubkey.to_string(),
+            policy_hash: policy_canonical_hash_hex(policy),
+            version,
+            locked: policy["approval"]["locked"].as_bool().unwrap_or(false),
+            caller: caller.to_string(),
+        }
+    }
+
+    /// One NEP-413 YES vote over `hash` for this wallet, by `approver` with `key`.
+    fn vote(pubkey: &str, hash: &str, approver: &str, key: [u8; 32]) -> serde_json::Value {
+        let message = approval_vote_message(VoteVerb::Approve, APPROVAL_ID, pubkey, hash);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+        let nonce = [9u8; 32];
+        let payload = Nep413Payload { message, nonce, recipient: "outlayer.test".to_string(), callback_url: None };
+        let mut to_hash = NEP413_TAG.to_le_bytes().to_vec();
+        to_hash.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let sig = sk.sign(&Sha256::digest(&to_hash));
+        json!({
+            "approval_id": APPROVAL_ID, "recipient": "outlayer.test",
+            "approvals": [{
+                "approver_id": approver,
+                "public_key": format!("ed25519:{}", bs58::encode(sk.verifying_key().to_bytes()).into_string()),
+                "signature": base64::encode(sig.to_bytes()),
+                "nonce": base64::encode(nonce),
+            }],
+            "rejections": [],
+        })
+    }
+
+    async fn sign(state: &AppState, req: WalletSignPolicyRequest) -> Result<WalletSignPolicyResponse, ApiError> {
+        wallet_sign_policy_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(req))
+            .await
+            .map(|Json(r)| r)
+    }
+
+    /// The signature verifies over exactly the contract's `v2` message, with
+    /// the deadline the answer carries — a week out, give or take the test.
+    fn assert_signed_over(resp: &WalletSignPolicyResponse, blob: &str, version: u64, locked: bool) {
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(
+            &hex::decode(&resp.public_key_hex).unwrap().try_into().unwrap(),
+        )
+        .unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&hex::decode(&resp.signature_hex).unwrap().try_into().unwrap());
+        let message = policy_store_message(
+            &format!("ed25519:{}", resp.public_key_hex), version, locked, resp.valid_until, blob, CALLER,
+        );
+        vk.verify(&Sha256::digest(message.as_bytes()), &sig).expect("the v2 message is what was signed");
+        assert_eq!((resp.version, resp.locked), (version, locked));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let expected = now + POLICY_SIGNATURE_TTL_SECS;
+        assert!(
+            resp.valid_until + 60 >= expected && resp.valid_until <= expected + 60,
+            "valid_until {} is not a week out ({expected})",
+            resp.valid_until
+        );
+    }
+
+    fn asked_for(chain: &Chain, method: &str) -> usize {
+        chain.seen.lock().unwrap().iter().filter(|p| p["method_name"] == method).count()
+    }
+
+    #[tokio::test]
+    async fn a_first_policy_is_signed_without_votes_as_version_one() {
+        let (state, chain) = chain(None).await;
+        let data = blob(&state, &new_open()).await;
+        let resp = sign(&state, request(&data, None)).await.expect("nothing on chain: no lock");
+        assert_signed_over(&resp, &data, 1, false);
+        assert_eq!(resp.policy_hash, policy_canonical_hash_hex(&new_open()));
+        assert!(resp.request_hash.is_none(), "no lock, no vote hash");
+        assert_eq!(asked_for(&chain, "get_wallet_policy"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unlocked_policy_is_replaced_without_votes_at_the_next_version() {
+        let mut unlocked = current_locked();
+        unlocked["approval"]["locked"] = json!(false);
+        let (state, chain) = chain(Some((unlocked, 4, false, false))).await;
+        let data = blob(&state, &new_open()).await;
+        let resp = sign(&state, request(&data, None)).await.expect("unlocked: the owner alone");
+        assert_signed_over(&resp, &data, 5, false);
+        assert_eq!(asked_for(&chain, "w_resolve_auth"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_locked_policy_is_not_signed_without_the_votes() {
+        let (state, _) = chain(Some((current_locked(), 1, true, false))).await;
+        let data = blob(&state, &new_open()).await;
+        let err = sign(&state, request(&data, None)).await.expect_err("locked: the approvers decide");
+        assert!(
+            matches!(&err, ApiError::Forbidden(m) if m.starts_with("policy is locked: 1 approval(s) of its approvers are required")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vote_by_a_stranger_does_not_lift_the_lock() {
+        let (state, _) = chain(Some((current_locked(), 1, true, false))).await;
+        let data = blob(&state, &new_open()).await;
+        let pk = pubkey(&state).await;
+        let hash = request_hash(&update_op(&pk, &new_open(), 2, CALLER));
+        let err = sign(&state, request(&data, Some(vote(&pk, &hash, "b.testnet", [6u8; 32]))))
+            .await
+            .expect_err("b.testnet is not an approver");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.starts_with("policy is locked")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn the_quorum_signs_the_next_version_with_the_new_lock() {
+        let (state, chain) = chain(Some((current_locked(), 1, true, false))).await;
+        let data = blob(&state, &new_open()).await;
+        let pk = pubkey(&state).await;
+        let hash = request_hash(&update_op(&pk, &new_open(), 2, CALLER));
+        let resp = sign(&state, request(&data, Some(vote(&pk, &hash, "a.testnet", [5u8; 32]))))
+            .await
+            .expect("one vote meets the threshold of one");
+        assert_signed_over(&resp, &data, 2, false);
+        assert_eq!(resp.request_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(resp.policy_hash, policy_canonical_hash_hex(&new_open()));
+        assert_eq!(asked_for(&chain, "get_wallet_policy"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_vote_over_another_policy_does_not_count() {
+        let (state, _) = chain(Some((current_locked(), 1, true, false))).await;
+        let pk = pubkey(&state).await;
+        // The approvers voted on `new_open`; the owner files a different blob.
+        let mut other = new_open();
+        other["rules"]["transaction_types"] = json!(["transfer", "withdraw"]);
+        let data = blob(&state, &other).await;
+        let voted = request_hash(&update_op(&pk, &new_open(), 2, CALLER));
+        let err = sign(&state, request(&data, Some(vote(&pk, &voted, "a.testnet", [5u8; 32]))))
+            .await
+            .expect_err("the blob is not what was voted on");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.starts_with("policy is locked")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_vote_for_another_sender_or_version_does_not_count() {
+        let (state, _) = chain(Some((current_locked(), 1, true, false))).await;
+        let data = blob(&state, &new_open()).await;
+        let pk = pubkey(&state).await;
+        for (version, caller) in [(2, "thief.testnet"), (3, CALLER), (1, CALLER)] {
+            let voted = request_hash(&update_op(&pk, &new_open(), version, caller));
+            let err = sign(&state, request(&data, Some(vote(&pk, &voted, "a.testnet", [5u8; 32]))))
+                .await
+                .expect_err("a vote over version {version} for {caller} is not this write");
+            assert!(matches!(&err, ApiError::Forbidden(m) if m.starts_with("policy is locked")), "{err:?}");
+        }
+    }
+
+    /// The lock is refused on its own terms before the chain is read: a lock
+    /// nobody could lift is never stored.
+    #[tokio::test]
+    async fn a_lock_nobody_could_lift_is_refused_before_the_chain_is_read() {
+        let (state, chain) = chain(None).await;
+        let mut bad = current_locked();
+        bad["approval"]["threshold"] = json!(3);
+        bad["approval"]["approvers"] = json!([{ "id": "a.testnet" }, { "id": "b.testnet" }]);
+        let data = blob(&state, &bad).await;
+        let err = sign(&state, request(&data, None)).await.expect_err("threshold 3 of 2");
+        assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("never be lifted")), "{err:?}");
+        assert_eq!(asked_for(&chain, "get_wallet_policy"), 0, "refused before any read");
+
+        let mut no_approvers = current_locked();
+        no_approvers["approval"]["approvers"] = json!([]);
+        let data2 = blob(&state, &no_approvers).await;
+        let err = sign(&state, request(&data2, None)).await.expect_err("nobody to lift it");
+        assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("approvers")), "{err:?}");
+    }
+
+    /// Locking is a tightening the owner does alone — and the signed lock is
+    /// the new policy's, read from the plaintext, not anything in the request.
+    #[tokio::test]
+    async fn the_owner_alone_locks_an_unlocked_policy() {
+        let (state, _) = chain(Some((new_open(), 1, false, false))).await;
+        let data = blob(&state, &current_locked()).await;
+        let resp = sign(&state, request(&data, None)).await.expect("tightening needs no quorum");
+        assert_signed_over(&resp, &data, 2, true);
+    }
+
+    /// A contract-wallet approver (no keys; its own contract resolves the vote)
+    /// counts toward the lock's quorum like a key-holding one.
+    #[tokio::test]
+    async fn a_contract_wallet_approver_lifts_the_lock() {
+        let mut current = current_locked();
+        current["approval"]["approvers"] = json!([{ "id": "wallet.testnet" }]);
+        let (state, chain) = chain(Some((current, 1, true, false))).await;
+        let data = blob(&state, &new_open()).await;
+        let pk = pubkey(&state).await;
+        let hash = request_hash(&update_op(&pk, &new_open(), 2, CALLER));
+        *chain.resolve_to.lock().unwrap() = approval_vote_message(VoteVerb::Approve, APPROVAL_ID, &pk, &hash);
+        let ballot = json!({
+            "approval_id": APPROVAL_ID, "recipient": "outlayer.test", "approvals": [],
+            "contract_approvals": [{ "approver_id": "wallet.testnet", "shape": "nep641", "authorization": "good-approve" }],
+        });
+        let resp = sign(&state, request(&data, Some(ballot))).await.expect("the wallet's resolution counts");
+        assert_signed_over(&resp, &data, 2, false);
+        assert_eq!(asked_for(&chain, "w_resolve_auth"), 1);
+    }
+
+    /// A freeze does not block the policy edit that follows it: the frozen,
+    /// locked policy is still read with its approvers, and their quorum signs.
+    #[tokio::test]
+    async fn a_frozen_locked_policy_is_still_changed_by_its_quorum() {
+        let (state, _) = chain(Some((current_locked(), 1, true, true))).await;
+        let data = blob(&state, &new_open()).await;
+        let pk = pubkey(&state).await;
+        let hash = request_hash(&update_op(&pk, &new_open(), 2, CALLER));
+        let resp = sign(&state, request(&data, Some(vote(&pk, &hash, "a.testnet", [5u8; 32]))))
+            .await
+            .expect("frozen is not a reason to refuse the quorum");
+        assert_signed_over(&resp, &data, 2, false);
+
+        // And without the votes a frozen locked policy is as locked as any.
+        let err = sign(&state, request(&data, None)).await.expect_err("still locked");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.starts_with("policy is locked")), "{err:?}");
+    }
+
+    /// `wallet/sign` refuses a policy update before touching the chain: the RPC
+    /// here is dead, and a read would answer InternalError, not BadRequest.
+    #[tokio::test]
+    async fn wallet_sign_refuses_a_policy_update_before_any_read() {
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: "http://127.0.0.1:1".into(),
+            offchainvm_contract_id: "outlayer.test".into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let near_client = crate::near::NearClient::new("http://127.0.0.1:1", "outlayer.test").unwrap();
+        let state = AppState::new(crate::crypto::Keystore::generate(), config, Some(near_client));
+        let req: WalletSignRequest = serde_json::from_value(json!({
+            "wallet_id": WALLET_ID,
+            "op": { "kind": "policy_update", "wallet_pubkey": "ed25519:ab", "policy_hash": "cd",
+                    "version": 2, "locked": false, "caller": CALLER },
+        }))
+        .expect("a sign request");
+        let err = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(req))
+            .await
+            .expect_err("not an operation the wallet signs");
+        assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("sign-policy")), "{err:?}");
     }
 }

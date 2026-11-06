@@ -243,7 +243,7 @@ near call outlayer.testnet set_pricing '{"base_fee": "1000000000000000000000"}' 
 | `get_priced_projects(from_index?, limit?)` / `get_priced_project_count()` | Priced project ids (default 100, at most 500 per page) |
 | `get_developer_earnings(account_id)` | Stablecoin earned and not withdrawn |
 | `get_user_stablecoin_balance(account_id)` | Stablecoin available for `attached_usd` |
-| `get_storage_version()` | The state layout the code expects (`"11"`) |
+| `get_storage_version()` | The state layout the code expects (`"12"`) |
 
 ```bash
 near view outlayer.testnet get_request '{"request_id": 123}'
@@ -359,14 +359,26 @@ the on-chain entry before it signs. The account that sends
 
 #### `store_wallet_policy` (payable)
 
-`store_wallet_policy(wallet_pubkey, encrypted_data, wallet_signature, storage_refund_to?)`.
+`store_wallet_policy(wallet_pubkey, encrypted_data, wallet_signature, version, locked, valid_until, storage_refund_to?)`.
 Create or update a policy. `wallet_pubkey` is `ed25519:<hex32>` or
 `secp256k1:<hex33>`; `encrypted_data` is at most 100 KB. Needs a signature by
 the wallet's own key over
-`sha256("store_wallet_policy:v1:{wallet_pubkey}:{len}:{encrypted_data}:{caller}")`
+`sha256("store_wallet_policy:v2:{wallet_pubkey}:{version}:{locked 0|1}:{valid_until}:{len}:{encrypted_data}:{caller}")`
 (the keystore makes it) and a storage deposit (`estimate_wallet_policy_cost`).
 An update must come from the same controller and keeps the frozen flag. Emits
-`WalletPolicyUpdated { wallet_pubkey, owner, encrypted_data, frozen }`.
+`WalletPolicyUpdated { wallet_pubkey, owner, encrypted_data, frozen, version, locked }`.
+
+`version` is the stored version plus one (a first policy: 1), checked before
+the signature — a stale one fails with `policy version is N, this signature
+was made for M` — so a signature is good for exactly one write. `valid_until`
+(unix seconds, seven days from signing) is checked the same way — `this policy
+signature expired at T` — so a signature is good for a while, not for ever.
+`locked` is the new policy's `approval.locked` as the keystore read it from
+the plaintext. All three come from the keystore's `sign-policy` answer and are
+inside the signature. The contract keeps them beside the entry (`policy_meta`, absent =
+version 0, unlocked). **While the stored policy is locked**, the keystore
+signs the next write only with the policy's approvers' quorum, and the
+contract refuses `delete_wallet_policy`; freezing and thawing are untouched.
 
 `storage_refund_to` (optional) names who the storage deposit goes back to —
 for a sponsor that pays it while the owner signs. It is set only when the
@@ -383,7 +395,8 @@ relayer cannot change it.
 ```bash
 near contract call-function as-transaction outlayer.testnet store_wallet_policy json-args '{
   "wallet_pubkey": "ed25519:<hex>", "encrypted_data": "<base64>",
-  "wallet_signature": "<hex>", "storage_refund_to": "sponsor.testnet"
+  "wallet_signature": "<hex>", "version": 1, "locked": false, "valid_until": 1700000000,
+  "storage_refund_to": "sponsor.testnet"
 }' prepaid-gas '100.0 Tgas' attached-deposit '0.05 NEAR' sign-as owner.testnet network-config testnet sign-with-keychain send
 ```
 
@@ -404,9 +417,11 @@ contract cannot check this in advance.
 
 #### `delete_wallet_policy`
 
-Controller only. Returns the whole deposit to the beneficiary when one is set,
-otherwise to the caller, and drops the beneficiary: a policy created again
-under the key starts without one. The `WalletPolicyDeleted` event carries
+Controller only, and refused while the policy is locked (`policy is locked:
+store an unlocked policy with the approvers' quorum first`). Returns the whole
+deposit to the beneficiary when one is set, otherwise to the caller, and drops
+the beneficiary and the version record: a policy created again under the key
+starts without one, at version 1. The `WalletPolicyDeleted` event carries
 `refunded_to`.
 
 #### `freeze_wallet` / `unfreeze_wallet`
@@ -416,8 +431,8 @@ agent key. Emit `WalletFrozenChanged { wallet_pubkey, owner, frozen }`.
 
 #### Views
 
-- `get_wallet_policy(wallet_pubkey)` → `{owner, encrypted_data, frozen, updated_at, storage_refund_to, storage_deposit}` or `null`. A sponsor checks `storage_refund_to` before it pays.
-- `get_wallet_policies_by_owner(owner)` → `[{wallet_pubkey, owner, frozen, updated_at, storage_refund_to}]`.
+- `get_wallet_policy(wallet_pubkey)` → `{owner, encrypted_data, frozen, updated_at, storage_refund_to, storage_deposit, version, locked}` or `null`. A sponsor checks `storage_refund_to` before it pays; `version` is what the next write must exceed by one.
+- `get_wallet_policies_by_owner(owner)` → `[{wallet_pubkey, owner, frozen, updated_at, storage_refund_to, version, locked}]`.
 - `has_wallet_policy(wallet_pubkey)` → `bool`.
 - `estimate_wallet_policy_cost(wallet_pubkey, encrypted_data, storage_refund_to?)` → yoctoNEAR as a string; with `storage_refund_to` it includes the beneficiary's record, as the store will charge it.
 

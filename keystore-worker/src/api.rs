@@ -4158,15 +4158,41 @@ fn secret_store_message(
 /// making a stranger the controller of somebody else's policy slot. Without the
 /// CALLER, a genuine policy signature could be lifted and replayed by whoever
 /// saw it first.
-fn policy_store_message(wallet_pubkey: &str, encrypted_data: &str, caller: &str) -> String {
+///
+/// The VERSION, the LOCK and the DEADLINE are signed too. The version is the
+/// one this write stores (the chain's plus one), so a signature is good for
+/// exactly one write. The lock is the new policy's `approval.locked` as read
+/// from the plaintext: the contract cannot open the blob, and this is how it
+/// learns, under the wallet's own signature, that the next write needs the
+/// approvers' quorum. The deadline (unix seconds) is when the signature stops
+/// being filable: [`POLICY_SIGNATURE_TTL_SECS`] from signing.
+fn policy_store_message(
+    wallet_pubkey: &str,
+    version: u64,
+    locked: bool,
+    valid_until: u64,
+    encrypted_data: &str,
+    caller: &str,
+) -> String {
     format!(
-        "store_wallet_policy:v1:{}:{}:{}:{}",
+        "store_wallet_policy:v2:{}:{}:{}:{}:{}:{}:{}",
         wallet_pubkey,
+        version,
+        u8::from(locked),
+        valid_until,
         encrypted_data.len(),
         encrypted_data,
         caller
     )
 }
+
+/// How long a policy signature is filable on chain, from the moment it is
+/// made. A write a locked policy's approvers released is good for a while,
+/// not for ever: they approved a change to the policy as it stood, and what
+/// they approved should land while that is still what they meant. A week
+/// covers an owner who picks the signature up after the votes without
+/// turning an old approval into a standing one.
+const POLICY_SIGNATURE_TTL_SECS: u64 = 7 * 86_400;
 
 /// The exact string the contract rebuilds and verifies in `delete_agent_secret`.
 ///
@@ -4446,9 +4472,17 @@ async fn wallet_sign_secret_delete_handler(
 /// Sign encrypted policy data so the NEAR contract can verify wallet ownership.
 ///
 /// The contract's `store_wallet_policy` requires a signature over
-/// [`policy_store_message`] — domain, wallet key, the blob, and the account
-/// that will send the call. This endpoint produces it with the wallet's derived
-/// key.
+/// [`policy_store_message`] — domain, wallet key, version, lock, the blob, and
+/// the account that will send the call. This endpoint produces it with the
+/// wallet's derived key.
+///
+/// THE LOCK IS ENFORCED HERE. When the policy on chain carries
+/// `approval.locked`, this signature is the only thing standing between the
+/// controller and a policy of their own choosing — so it is produced only over
+/// the current policy's approvers' votes, counted against the current policy's
+/// threshold, over `Op::PolicyUpdate` built from the chain (version) and from
+/// the decrypted blob (its hash, its own lock). Nothing in the request is
+/// trusted for any of it: the coordinator carries the votes and nothing else.
 async fn wallet_sign_policy_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -4510,22 +4544,28 @@ async fn wallet_sign_policy_handler(
                  (only a genuine policy ciphertext may be attested)".to_string(),
             )
         })?;
-    // Defence-in-depth: the plaintext must be a well-formed policy.
-    serde_json::from_slice::<shared_tee_helpers::wallet_policy::Policy>(&decrypted).map_err(|e| {
+    // Defence-in-depth: the plaintext must be a well-formed policy. Parsed to a
+    // Value first — the hash below is of the canonical form of the WHOLE
+    // document, unknown fields included — and to a `Policy` from that.
+    let new_plain: serde_json::Value = serde_json::from_slice(&decrypted).map_err(|e| {
         ApiError::Forbidden(format!(
-            "decrypted policy did not parse as a Policy — refusing to sign: {}",
+            "decrypted policy did not parse as JSON — refusing to sign: {}",
             e
         ))
     })?;
+    let new_policy: shared_tee_helpers::wallet_policy::Policy =
+        serde_json::from_value(new_plain.clone()).map_err(|e| {
+            ApiError::Forbidden(format!(
+                "decrypted policy did not parse as a Policy — refusing to sign: {}",
+                e
+            ))
+        })?;
+    // A lock nobody could lift is refused before anything is read from the
+    // chain: the policy asking for it is wrong on its own terms.
+    shared_tee_helpers::wallet_policy::lock_is_satisfiable(&new_policy).map_err(ApiError::BadRequest)?;
+    let locked_new = new_policy.approval.as_ref().and_then(|a| a.locked).unwrap_or(false);
+    let policy_hash = shared_tee_helpers::wallet_policy::policy_canonical_hash_hex(&new_plain);
 
-    // 2. Sign the message the CONTRACT rebuilds — domain first, caller last.
-    //
-    //    It used to be the bare `sha256(encrypted_data)`, which the decrypt
-    //    above made safe to produce but did not make safe to HOLD: every wallet
-    //    signature in this system has that shape, and the strings are public,
-    //    so any signature from any verb could be filed here as a policy. The
-    //    domain stops that; the caller stops the resulting signature being
-    //    usable by anyone but the account it was made for.
     let seed = wallet_seed(&req.wallet_id, "near");
     let policy_pubkey = {
         let vk = keystore
@@ -4533,7 +4573,75 @@ async fn wallet_sign_policy_handler(
             .map_err(|e| ApiError::InternalError(format!("Failed to derive public key: {}", e)))?;
         format!("ed25519:{}", hex::encode(vk.as_bytes()))
     };
-    let message = policy_store_message(&policy_pubkey, &req.encrypted_data, req.caller.trim());
+    drop(keystore);
+
+    // 2. The policy on chain: its version, and whether it is locked. Read with
+    //    the loader that decrypts a FROZEN policy too — a freeze is the
+    //    controller's emergency stop and the policy edit that follows it must
+    //    not be blocked by the freeze itself.
+    let (current, meta) =
+        load_wallet_policy_for_update(&state, &req.wallet_id, &policy_pubkey, customer.as_ref())
+            .await?;
+    let version = meta.version + 1;
+    let caller = req.caller.trim();
+
+    // 3. The lock. Approvers and threshold come from the CURRENT policy on
+    //    chain and nowhere else; the op they voted on is rebuilt from the chain
+    //    and the blob, so a vote over a different policy, version, lock or
+    //    sender does not count.
+    let mut request_hash = None;
+    if meta.locked {
+        let current = current.ok_or_else(|| {
+            ApiError::InternalError(
+                "the chain marks this policy locked but holds no policy to lock — this needs an operator"
+                    .to_string(),
+            )
+        })?;
+        let threshold = current
+            .approval
+            .as_ref()
+            .and_then(|a| a.threshold.as_ref())
+            .map(|t| t.required())
+            .ok_or_else(|| {
+                ApiError::Forbidden(
+                    "policy is locked but names no approval threshold, so no quorum can lift it — \
+                     this needs an operator"
+                        .to_string(),
+                )
+            })?
+            .max(1) as usize;
+        let op = shared_tee_helpers::wallet_policy::Op::PolicyUpdate {
+            wallet_pubkey: policy_pubkey.clone(),
+            policy_hash: policy_hash.clone(),
+            version,
+            locked: locked_new,
+            caller: caller.to_string(),
+        };
+        let hash = shared_tee_helpers::wallet_policy::request_hash(&op);
+        verify_approvals(&state, &current, &policy_pubkey, &hash, req.approval_info.as_ref(), threshold)
+            .await
+            .map_err(|e| match e {
+                ApiError::Forbidden(m) => ApiError::Forbidden(format!(
+                    "policy is locked: {} approval(s) of its approvers are required to change it. {}",
+                    threshold, m
+                )),
+                other => other,
+            })?;
+        request_hash = Some(hash);
+    }
+
+    // 4. Sign the message the CONTRACT rebuilds — domain first, caller last.
+    //    The domain stops any other signature of this wallet being filed as a
+    //    policy; the caller stops the resulting signature being usable by
+    //    anyone but the account it was made for; the version makes it good for
+    //    one write; the deadline makes it good for a while.
+    let valid_until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        + POLICY_SIGNATURE_TTL_SECS;
+    let message =
+        policy_store_message(&policy_pubkey, version, locked_new, valid_until, &req.encrypted_data, caller);
     let message_hash = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -4541,6 +4649,7 @@ async fn wallet_sign_policy_handler(
         hasher.finalize()
     };
 
+    let keystore = state.keystore.read().await;
     let signature = keystore.sign(customer.as_ref(), &seed, &message_hash).map_err(|e| {
         ApiError::InternalError(format!("Signing failed: {}", e))
     })?;
@@ -4557,6 +4666,11 @@ async fn wallet_sign_policy_handler(
     Ok(Json(WalletSignPolicyResponse {
         signature_hex: hex::encode(signature.to_bytes()),
         public_key_hex,
+        version,
+        locked: locked_new,
+        valid_until,
+        policy_hash,
+        request_hash,
     }))
 }
 
@@ -4841,6 +4955,82 @@ async fn derive_wallet_ed25519_pubkey(
         .get_public_key_for_seed(customer, &near_seed)
         .map_err(|e| ApiError::InternalError(format!("Failed to derive wallet pubkey: {}", e)))?;
     Ok(format!("ed25519:{}", hex::encode(ed25519_vk.as_bytes())))
+}
+
+/// A policy's version and lock as the contract's `get_wallet_policy` shows them.
+/// Absent fields read as `{0, false}`: no policy, or one from before versions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PolicyMeta {
+    version: u64,
+    locked: bool,
+}
+
+/// The policy on chain as `sign-policy` needs it: decrypted WHATEVER its frozen
+/// flag, with its version and lock.
+///
+/// Not [`load_wallet_policy`], and deliberately so. That loader answers a
+/// frozen wallet with a stand-in that carries no approval block, which is right
+/// for every operation that moves money — nothing is signed under a freeze — and
+/// wrong here: a freeze is the controller's emergency stop, the policy edit is
+/// the move that usually follows it, and under a lock that edit needs the
+/// approvers named in the real policy. `frozen` is still reported on the
+/// returned policy for anyone who asks.
+async fn load_wallet_policy_for_update(
+    state: &AppState,
+    wallet_id: &str,
+    wallet_pubkey: &str,
+    customer: Option<&near_primitives::types::AccountId>,
+) -> Result<(Option<shared_tee_helpers::wallet_policy::Policy>, PolicyMeta), ApiError> {
+    let near_client = state.near_client.as_ref().ok_or_else(|| {
+        ApiError::InternalError("NEAR client not configured".to_string())
+    })?;
+    let Some(view) = near_client
+        .get_wallet_policy(wallet_pubkey)
+        .await
+        .map_err(|e| ApiError::InternalError(format!("Failed to fetch wallet policy: {}", e)))?
+    else {
+        return Ok((None, PolicyMeta::default()));
+    };
+
+    // Present but unreadable is a schema mismatch, not a value; absent is a
+    // policy from before the field existed.
+    let schema = |field: &str| {
+        ApiError::BadRequest(format!(
+            "this wallet's policy {field} could not be read from the chain, so nothing will be \
+             signed. This is a schema mismatch between the contract and this build, not a \
+             setting — it needs an operator, not a re-save"
+        ))
+    };
+    let version = match view.get("version") {
+        Some(v) => v.as_u64().ok_or_else(|| schema("version"))?,
+        None => 0,
+    };
+    let locked = match view.get("locked") {
+        Some(v) => v.as_bool().ok_or_else(|| schema("lock"))?,
+        None => false,
+    };
+    let frozen = match view.get("frozen") {
+        Some(v) => v.as_bool().ok_or_else(|| schema("freeze state"))?,
+        None => false,
+    };
+
+    let encrypted_data_b64 = view
+        .get("encrypted_data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::InternalError("Missing encrypted_data in policy".to_string()))?;
+    let seed = format!("wallet-policy:{}", wallet_id);
+    let decrypted = {
+        let keystore = state.keystore.read().await;
+        let encrypted_bytes = base64::decode(encrypted_data_b64)
+            .map_err(|e| ApiError::InternalError(format!("Invalid base64: {}", e)))?;
+        keystore
+            .decrypt(customer, &seed, &encrypted_bytes)
+            .map_err(|e| ApiError::InternalError(format!("Policy decryption failed: {}", e)))?
+    };
+    let mut policy: shared_tee_helpers::wallet_policy::Policy = serde_json::from_slice(&decrypted)
+        .map_err(|e| ApiError::InternalError(format!("Policy parse failed: {}", e)))?;
+    policy.frozen = policy.frozen || frozen;
+    Ok((Some(policy), PolicyMeta { version, locked }))
 }
 
 async fn load_wallet_policy(
@@ -5221,6 +5411,16 @@ async fn wallet_sign_handler(
         return Err(ApiError::Unauthorized("Keystore not ready.".to_string()));
     }
     validate_wallet_id(&req.wallet_id)?;
+    // A policy update is what a locked policy's approvers vote on; the votes are
+    // checked by `sign-policy`, which then signs the contract's own message.
+    // Nothing here applies to it — not the policy, not a capability, not the
+    // threshold — so it is refused before any of them is read.
+    if let shared_tee_helpers::wallet_policy::Op::PolicyUpdate { .. } = &req.op {
+        return Err(ApiError::BadRequest(
+            "policy_update is signed by sign-policy with the approvers' votes, not by wallet/sign"
+                .to_string(),
+        ));
+    }
     let customer = extract_customer_from_header(&headers)?;
     state
         .ensure_customer_loaded(customer.as_ref())
@@ -5315,6 +5515,12 @@ async fn wallet_sign_handler(
             sign_hash_pinned(&state, customer.as_ref(), &req, policy.as_ref(), request_hash).await
         }
         BindMode::Trusted => sign_trusted(&state, customer.as_ref(), &req, request_hash).await,
+        // Unreachable: refused at the top of this handler. Kept total so a new
+        // kind cannot fall through to a signature.
+        BindMode::PolicyUpdate => Err(ApiError::BadRequest(
+            "policy_update is signed by sign-policy with the approvers' votes, not by wallet/sign"
+                .to_string(),
+        )),
     }
 }
 

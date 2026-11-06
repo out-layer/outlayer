@@ -446,9 +446,12 @@ if [[ -z "$ONLY" || "$ONLY" == wallet ]]; then
       [[ -n "$encb64" ]] || { warn "encrypt-policy → HTTP $HTTP: $(short)"; return 1; }
       wapi "$SEED" POST /wallet/v1/sign-policy "$(jq -nc --arg e "$encb64" --arg c "$WALLET_OWNER" '{encrypted_data:$e, caller:$c}')"
       sig=$(jq -r '.signature_hex // empty' <<<"$BODY" 2>/dev/null); pub=$(jq -r '.public_key_hex // empty' <<<"$BODY" 2>/dev/null)
+      POLICY_VERSION=$(jq -r '.version // empty' <<<"$BODY" 2>/dev/null)
+      POLICY_LOCKED=$(jq -r '.locked // empty' <<<"$BODY" 2>/dev/null)
+      POLICY_VALID_UNTIL=$(jq -r '.valid_until // empty' <<<"$BODY" 2>/dev/null)
       [[ -n "$sig" && -n "$pub" ]] || { warn "sign-policy → HTTP $HTTP: $(short)"; return 1; }
       PUBKEY="ed25519:$pub"
-      args=$(jq -nc --arg k "$PUBKEY" --arg e "$encb64" --arg s "$sig" '{wallet_pubkey:$k, encrypted_data:$e, wallet_signature:$s}')
+      args=$(jq -nc --arg k "$PUBKEY" --arg e "$encb64" --argjson v "${POLICY_VERSION:-0}" --argjson l "${POLICY_LOCKED:-false}" --argjson u "${POLICY_VALID_UNTIL:-0}" --arg s "$sig" '{wallet_pubkey:$k, encrypted_data:$e, wallet_signature:$s, version:$v, locked:$l, valid_until:$u}')
       out=$(call "$WALLET_OWNER" "$CONTRACT_ID" store_wallet_policy "$args" '0.1 NEAR')
       STORE_TX=$(tx_of "$out")
       succeeded "$out" || { warn "store_wallet_policy: $(why_of "$out")"; return 1; }
