@@ -79,6 +79,10 @@ A wallet bound to a per-customer vault derives its check keys from the vault's m
 
 Under a stored policy, creating a check needs `capabilities.payment_check.allowed = true` (default-DENY), and the check's token and amount are held to the policy's per-transaction limit. A check routes funds to whoever holds its key, so a recipient whitelist cannot gate it; the capability is the gate. A wallet with no policy can create checks freely.
 
+A check moves money, so it is held to the wallet's approval rules like a transfer or a swap: `approval.threshold` applies, `approval.excluded_types: ["payment_check"]` lifts it, and `capabilities.payment_check.requires_approval` demands it on its own. On a wallet that requires approval the create reserves the check `pending_approval`, hands over its key (the account is fixed by the check's counter and holds nothing yet), and opens an approval over the check's token and amount; once the threshold is met the coordinator derives the key again, checks the account is the one reserved, and funds the check with the approvers' votes forwarded to the keystore, which verifies them before signing. A veto, an approval that expires unmet (24 hours), or the check's own `expires_at` passing while it waits, ends the check `failed` — an expired check is never funded. A claim or reclaim of a check still `pending_approval` is refused. `batch-create` on such a wallet is refused whole (`403 policy_denied`): one check, one approval.
+
+Each create counts as one `custody:payment_check` operation against the wallet's ceiling (`429 operation_limit_reached`, nothing reserved); a claim or a reclaim is signed by the check's own key, goes through no policy, and is not counted.
+
 The create message is supplied by the coordinator, not built by the enclave: see [Limits we state plainly](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md#11-limits-we-state-plainly).
 
 ## API Reference
@@ -128,6 +132,8 @@ Create a new payment check.
 
 `status` is `unclaimed` once the funding transfer has executed, or `creating` with a `poll_url` while it is unconfirmed. The `check_key` is in both answers: keep it, and do not create the check again. A `creating` check ends `unclaimed`, or `failed` if the funding never executed (nothing moved).
 
+On a wallet whose policy requires approval, `status` is `pending_approval` with `approval_id`, `required`, `approved`, `request_hash` and a `poll_url`; the `check_key` is in that answer too. The check is funded once the approvers meet the threshold and then reads `unclaimed`; a veto or an unmet approval ends it `failed`.
+
 ### POST /batch-create
 
 Create up to 10 checks in one call, each with its own key and ephemeral account.
@@ -152,7 +158,7 @@ Create up to 10 checks in one call, each with its own key and ephemeral account.
 }
 ```
 
-If the batch stops before its last check, the response carries `error`: the checks listed were created, the rest were not.
+If the batch stops before its last check, the response carries `error`: the checks listed were created, the rest were not. Each check is decided by the policy, and counted, before any is reserved; a wallet whose policy requires approval gets no batch (`403 policy_denied`).
 
 ### POST /claim
 
@@ -185,7 +191,7 @@ Claim funds from a check into the caller's wallet. Supports partial claims.
 }
 ```
 
-`status` is `claimed` / `partially_claimed`, or `processing` with a `poll_url` (and no `remaining` / `claimed_at`) while the transfer is unconfirmed. A claim is refused after the check's expiry, while the check is still being funded or another leg is in flight, and once it is fully claimed or reclaimed. Only checks created through OutLayer can be claimed.
+`status` is `claimed` / `partially_claimed`, or `processing` with a `poll_url` (and no `remaining` / `claimed_at`) while the transfer is unconfirmed. A claim is refused after the check's expiry, while the check is still awaiting its owner's approval or being funded, while another leg is in flight, and once it is fully claimed or reclaimed. Only checks created through OutLayer can be claimed.
 
 ### POST /reclaim
 
@@ -246,7 +252,7 @@ List the checks created by the authenticated wallet.
 
 | Param | Required | Description |
 |-------|----------|-------------|
-| `status` | no | Filter: `creating`, `unclaimed`, `claiming`, `partially_claimed`, `claimed`, `reclaiming`, `partially_reclaimed`, `reclaimed`, `failed`, `expired` |
+| `status` | no | Filter: `pending_approval`, `creating`, `unclaimed`, `claiming`, `partially_claimed`, `claimed`, `reclaiming`, `partially_reclaimed`, `reclaimed`, `failed`, `expired` |
 | `limit` | no | Max results (default 50, max 100) |
 | `offset` | no | Pagination offset (default 0) |
 
@@ -279,6 +285,9 @@ Read a check's balance using its `check_key`, to verify it before claiming. Any 
 ```
                     create
                       |
+         (approval    v
+          threshold) [pending_approval] ---- vetoed / approval expired ---> [failed]
+                      |  threshold met
                       v
                   [creating] ---- funding never executed ---> [failed]
                       |
@@ -295,6 +304,7 @@ Read a check's balance using its `check_key`, to verify it before claiming. Any 
 ```
 
 **Statuses:**
+- `pending_approval` — the wallet's approvers have not met the threshold; the account is empty
 - `creating` — funding transfer not confirmed yet
 - `unclaimed` — funds locked, waiting to be claimed
 - `claiming` / `reclaiming` — a claim or reclaim is in flight; another waits for it
@@ -302,7 +312,7 @@ Read a check's balance using its `check_key`, to verify it before claiming. Any 
 - `partially_reclaimed` — some funds reclaimed by the sender
 - `claimed` — the balance reached zero through a claim
 - `reclaimed` — the balance reached zero through a reclaim
-- `failed` — the funding never executed; nothing moved
+- `failed` — the funding never executed, was vetoed, or its approval expired unmet; nothing moved
 - `expired` — reported for an `unclaimed` check past its expiry
 
 **Expiry:** if `expires_in` is set, the check cannot be claimed after expiry. The funds stay in the ephemeral account until the sender reclaims them; expiry does not return them by itself.
@@ -312,7 +322,7 @@ Read a check's balance using its `check_key`, to verify it before claiming. Any 
 | Threat | Mitigation |
 |--------|------------|
 | check_key intercepted in transit | Use encrypted channels (HTTPS, E2E messaging). A leaked key lets anyone with an OutLayer wallet claim the funds. |
-| Sender's API key compromised | The API key can be revoked. Under a policy, checks need the `payment_check` capability and stay within the per-transaction limit. |
+| Sender's API key compromised | The API key can be revoked. Under a policy, checks need the `payment_check` capability, stay within the per-transaction limit, and on a wallet with an approval threshold wait for the approvers. |
 | Replay of claim/reclaim | Each intent has a random nonce and a 5-minute deadline; `intents.near` rejects a reused nonce. Amounts are tracked under a row lock. |
 | Ephemeral key collision | Per-wallet counter, incremented atomically in the database; a counter value is never reused. |
 | Funds stuck in ephemeral account | The sender can always reclaim — the keystore derives the ephemeral key again from the same path. |

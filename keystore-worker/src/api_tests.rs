@@ -6076,3 +6076,150 @@ mod contract_vote_tests {
         assert_eq!(args["purpose"], "PROVE_OWNERSHIP");
     }
 }
+
+/// A payment check on a wallet with an approval threshold is signed over the
+/// approvers' votes, like every other operation that moves money: no ballot,
+/// no signature; the threshold met, the coordinator's transfer-to-ephemeral
+/// artifact is signed. Without a threshold the capability alone decides.
+mod payment_check_multisig_tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::Json;
+    use serde_json::json;
+
+    const WALLET_ID: &str = "pc-multisig-wallet";
+    const APPROVAL_ID: &str = "pc-approval";
+
+    fn check_op() -> shared_tee_helpers::wallet_policy::Op {
+        shared_tee_helpers::wallet_policy::Op::PaymentCheck { amount: "1000".into(), token: "nep141:usdc.near".into() }
+    }
+
+    fn multisig_policy() -> serde_json::Value {
+        json!({
+            "approval": { "threshold": { "required": 1 }, "approvers": [{ "id": "a.testnet", "role": "admin" }] },
+            "capabilities": { "payment_check": { "allowed": true } }
+        })
+    }
+
+    /// A chain holding `policy` for the wallet, encrypted the way the contract
+    /// stores it; `view_access_key` answers FullAccess for any key.
+    async fn chain_with_policy(policy: serde_json::Value) -> AppState {
+        let keystore = crate::crypto::Keystore::generate();
+        let encrypted = keystore
+            .encrypt(None, &format!("wallet-policy:{WALLET_ID}"), policy.to_string().as_bytes())
+            .expect("the policy encrypts under the wallet's seed");
+        let encrypted_b64 = base64::encode(encrypted);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let encrypted_b64 = encrypted_b64.clone();
+                async move {
+                    let params = body["params"].clone();
+                    let id = body["id"].clone();
+                    if params["request_type"] == "view_access_key" {
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "nonce": 1, "permission": "FullAccess", "block_height": 9,
+                            "block_hash": "11111111111111111111111111111111"}}));
+                    }
+                    assert_eq!(params["method_name"], "get_wallet_policy", "the chain is asked only for the policy: {params}");
+                    let view = json!({ "frozen": false, "encrypted_data": encrypted_b64 }).to_string();
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "block_hash": "11111111111111111111111111111111", "block_height": 9, "logs": [],
+                        "result": view.into_bytes()}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: url.clone(),
+            offchainvm_contract_id: "outlayer.test".into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
+        AppState::new(keystore, config, Some(near_client))
+    }
+
+    /// The coordinator's sign request for a check's funding transfer: a Trusted
+    /// op with the transfer artifact, and the ballot when it has one.
+    fn sign_request(approval_info: Option<serde_json::Value>) -> WalletSignRequest {
+        serde_json::from_value(json!({
+            "wallet_id": WALLET_ID,
+            "op": check_op(),
+            "approval_info": approval_info,
+            "artifact": {
+                "message": json!({ "signer_id": "w", "deadline": "2099-01-01T00:00:00.000Z", "intents": [] }).to_string(),
+                "nonce_base64": base64::encode([7u8; 32]),
+                "recipient": "intents.near",
+            },
+        }))
+        .expect("a sign request")
+    }
+
+    /// One approver's YES over exactly this check, as the dashboard signs it.
+    async fn ballot(state: &AppState) -> serde_json::Value {
+        use ed25519_dalek::Signer;
+        use sha2::{Digest, Sha256};
+        let wallet_pubkey = derive_wallet_ed25519_pubkey(state, None, WALLET_ID).await.expect("wallet pubkey");
+        let request_hash = shared_tee_helpers::wallet_policy::request_hash(&check_op());
+        let message = approval_vote_message(VoteVerb::Approve, APPROVAL_ID, &wallet_pubkey, &request_hash);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let nonce = [9u8; 32];
+        let payload = Nep413Payload { message, nonce, recipient: "outlayer.test".to_string(), callback_url: None };
+        let mut to_hash = NEP413_TAG.to_le_bytes().to_vec();
+        to_hash.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let sig = sk.sign(&Sha256::digest(&to_hash));
+        json!({
+            "approval_id": APPROVAL_ID,
+            "recipient": "outlayer.test",
+            "approvals": [{
+                "approver_id": "a.testnet",
+                "public_key": format!("ed25519:{}", bs58::encode(sk.verifying_key().to_bytes()).into_string()),
+                "signature": base64::encode(sig.to_bytes()),
+                "nonce": base64::encode(nonce),
+            }],
+            "rejections": [],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_check_on_a_multisig_wallet_is_not_signed_without_the_votes() {
+        let state = chain_with_policy(multisig_policy()).await;
+        let err = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(None)))
+            .await
+            .expect_err("a payment check on a wallet with a threshold needs the approvers");
+        assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("multisig approval")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_check_on_a_multisig_wallet_is_signed_once_the_threshold_is_met() {
+        let state = chain_with_policy(multisig_policy()).await;
+        let ballot = ballot(&state).await;
+        let Json(resp) = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(Some(ballot))))
+            .await
+            .expect("the approved check is signed");
+        assert_eq!(resp.request_hash, shared_tee_helpers::wallet_policy::request_hash(&check_op()));
+        assert!(resp.signature_base58.is_some(), "the transfer artifact is signed");
+        assert_eq!(resp.recipient.as_deref(), Some("intents.near"));
+    }
+
+    #[tokio::test]
+    async fn a_check_on_a_wallet_without_a_threshold_is_signed_by_its_capability_alone() {
+        let state = chain_with_policy(json!({ "capabilities": { "payment_check": { "allowed": true } } })).await;
+        let Json(resp) = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(None)))
+            .await
+            .expect("no threshold: the capability decides");
+        assert!(resp.signature_base58.is_some());
+    }
+}

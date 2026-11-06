@@ -15,6 +15,8 @@
 #   T10 cross_chain_withdraw under MULTISIG [MAINNET] — NEW: Trusted cross-chain bridge-out on a multisig
 #                                         wallet returns pending_approval; after the threshold it leaves
 #                                         pending_approval (keystore signs the approved op)
+#   T12m payment_check under MULTISIG [MAINNET][OPT-IN T12M=1] — create → pending_approval + check_key; the approver's
+#       YES funds it (unclaimed) and the recipient claims; a veto ends a second check failed; batch-create is refused 403
 #   T12 payment_check claim/reclaim/batch [MAINNET] — extends T3 (which only covers create's capability gate) with the
 #                                         real gasless value flow: CLAIM a check to a SECOND sub-wallet we
 #                                         control (ephemeral-key signed, not keystore) + assert the claimer's
@@ -137,6 +139,7 @@ if [[ "$APPLY" != true ]]; then
   warn "       T6 FT-withdraw→external[FUNDS][MAINNET] T8 swap default-DENY capability[POLICY][MAINNET]"
   warn "       T9 swap-under-multisig→pending_approval+execute[SIG][MAINNET] T10 cross_chain_withdraw-under-multisig[SIG][MAINNET]"
   warn "       T12 payment-check claim/reclaim/batch-create: real value moves between sub-wallets[FUNDS][MAINNET]"
+  warn "       T12m payment-check under multisig (OPT-IN: T12M=1): pending_approval → approve → claim; reject → failed; batch 403[FUNDS][SIG][MAINNET]"
   warn "[MAINNET] = NEAR Intents are mainnet-only (no testnet solvers; coordinator 503s on testnet)."
   warn "  On NETWORK=$NETWORK those 7 clean-SKIP. The testnet-runnable T1,T4,T5,T7,T11 live in unified_op_e2e.sh."
   warn "raw_sign + confidential are NOT testnet-coordinator-reachable — covered by crate unit tests (see header)."
@@ -931,6 +934,115 @@ if want T12 && intents_mainnet T12; then
     else fail "T12d peek should return 200 for a valid check_key, got $HTTP: $BODY"; fi
   fi
   return_test_funds; MONEY=false
+fi
+
+# ════════════════════════════════════════════════════════════════════════════════
+# T12m — payment_check under MULTISIG (opt-in: T12M=1)  [FUNDS][SIG]
+#        A check on a wallet with an approval threshold is funded only after the approvers, like
+#        every other operation that moves money:
+#          m1 create  → 200 pending_approval + approval_id + request_hash + check_key (the key comes
+#                       back at once; the account is empty); status reads pending_approval; a claim
+#                       by the recipient R is refused
+#          m2 approve → 2-of-2: APPROVER1's YES leaves it pending; PARENT's YES meets the threshold and
+#                       funds the check: status → unclaimed; R claims it → amount_claimed == the amount
+#          m3 reject  → a second check, vetoed by one approver: status → failed; R's claim is refused
+#          m4 batch   → batch-create on this wallet → 403 policy_denied, nothing created
+#        Needs APPROVER1 creds (signed locally, like T9/T10); PARENT is the second approver. Real
+#        money: two checks of the T12 amount move between sub-wallets we control. OPT-IN: set T12M=1
+#        (ONLY=T12m runs it alone).
+# ════════════════════════════════════════════════════════════════════════════════
+if [[ "${T12M:-0}" == "1" ]] && want T12m && intents_mainnet T12m; then
+  log "T12m [FUNDS][SIG] payment_check under MULTISIG — pending_approval, approve → funded → claimed, reject → failed, batch refused"
+  [[ -f "$CREDS_DIR/$APPROVER1.json" ]] || warn "T12m skipped — APPROVER1 creds required"
+  if [[ -f "$CREDS_DIR/$APPROVER1.json" ]]; then
+    MONEY=true; CUR_TEST=T12m
+    A1_PRIV=$(jq -r .private_key "$CREDS_DIR/$APPROVER1.json"); A1_PUB=$(jq -r .public_key "$CREDS_DIR/$APPROVER1.json")
+    P_PUB=$(jq -r .public_key "$CREDS_DIR/$PARENT.json")
+
+    # The T9/T10 vote: sign {vote}:{approval_id}:{wallet_pubkey}:{request_hash} (NEP-413) and POST it.
+    vote() {
+      local v=$1 aid=$2 h=$3 priv=$4 pub=$5 acct=$6 nonce sj sig wpk
+      wpk=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$aid" | jq -r '.wallet_pubkey // empty')
+      nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+      sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$priv" "$RECOVERY_BIN" sign-nep413 --message "$v:$aid:$wpk:$h" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+      sig=$(echo "$sj" | jq -r '.signature')
+      curl -sS -o /tmp/uop.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/$v/$aid" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg s "$sig" --arg pk "$pub" --arg ac "$acct" --arg nc "$nonce" '{signature:$s,public_key:$pk,account_id:$ac,nonce:$nc}')"
+    }
+    # The T12 funding dance: send NEAR, wait for the account, storage-register, wrap, deposit into intents.
+    t12m_fund_intents() {
+      local seed=$1 addr=$2 near_amount=$3 wrap_yocto=$4
+      fund_near "$addr" "$near_amount" || warn "T12m funding ($addr) failed"
+      for _ in $(seq 1 6); do curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$addr\"}}" | jq -e '.result.amount' >/dev/null && break; sleep 2; done
+      post POST /wallet/v1/storage-deposit "$seed" "$(jq -nc --arg t "$WNEAR" '{token:$t}')"; note "T12m storage-deposit ($addr): $HTTP"; assert_funded "T12m storage-deposit ($addr)"
+      post POST /wallet/v1/call "$seed" "$(jq -nc --arg t "$WNEAR" --arg d "$wrap_yocto" '{receiver_id:$t, method_name:"near_deposit", args:{}, gas:"30000000000000", deposit:$d}')"; note "T12m wrap near_deposit ($addr): $HTTP"; assert_funded "T12m wrap near_deposit ($addr)"
+      post POST /wallet/v1/intents/deposit "$seed" "$(jq -nc --arg t "nep141:$WNEAR" --arg a "$wrap_yocto" '{token:$t, amount:$a}')"; note "T12m intents deposit ($addr): $HTTP $(echo "$BODY"|head -c100)"; assert_funded "T12m intents deposit ($addr)"
+      sleep 4
+    }
+    # The check's status as the creator reads it ("" when the read fails).
+    chk_status() { post GET "/wallet/v1/payment-check/status?check_id=$2" "$1"; [[ "$HTTP" == "200" ]] && echo "$BODY" | jq -r '.status // empty' || echo ""; }
+
+    M_TOKEN="nep141:$WNEAR"; M_AMT="2000000000000000000000"
+    # Capability ON + per-transaction cap (as T12) + a 2-of-2 threshold: APPROVER1 and PARENT.
+    MP_POL=$(jq -nc --arg t "$M_TOKEN" --arg a "$APPROVER1" --arg ap "$A1_PUB" --arg p "$PARENT" --arg pp "$P_PUB" '{rules:{transaction_types:["payment_check"], limits:{per_transaction:{($t):"100000000000000000000000"}}}, capabilities:{payment_check:{allowed:true}}, approval:{threshold:{required:2}, approvers:[{id:$a,pubkey:$ap},{id:$p,pubkey:$pp}]}}')
+    MSEED="t12m-c-$(date +%s)"; read -r MWID MADDR < <(new_subwallet "$MSEED")    # creator (multisig)
+    MRSEED="t12m-r-$(date +%s)"; read -r _ _ < <(new_subwallet "$MRSEED")        # recipient
+    t12m_fund_intents "$MSEED" "$MADDR" "0.04 NEAR" "5000000000000000000000"      # covers two checks of M_AMT
+    store_policy "$MSEED" "$MWID" "$MP_POL" || fail "T12m store_policy"
+
+    # ── m1: create → pending_approval, key handed over, claim refused meanwhile ──
+    post POST /wallet/v1/payment-check/create "$MSEED" "$(jq -nc --arg t "$M_TOKEN" --arg a "$M_AMT" '{token:$t, amount:$a, memo:"t12m-approve"}')"
+    M_ST=$(echo "$BODY" | jq -r '.status // empty'); M_AID=$(echo "$BODY" | jq -r '.approval_id // empty'); M_RH=$(echo "$BODY" | jq -r '.request_hash // empty')
+    M_ID=$(echo "$BODY" | jq -r '.check_id // empty'); M_KEY=$(echo "$BODY" | jq -r '.check_key // empty')
+    M_REQ=$(echo "$BODY" | jq -r '.required // empty')
+    if [[ "$HTTP" == "200" && "$M_ST" == "pending_approval" && "$M_REQ" == "2" && -n "$M_AID" && -n "$M_RH" && -n "$M_KEY" ]]; then
+      pass "T12m1 create on a multisig wallet → pending_approval (approval_id=$M_AID, required=2, request_hash + check_key present)"
+    else fail "T12m1 create must answer 200 pending_approval + approval_id + request_hash + check_key, got $HTTP status='$M_ST': $(echo "$BODY"|head -c200)"; fi
+    S=$(chk_status "$MSEED" "$M_ID")
+    [[ "$S" == "pending_approval" ]] && pass "T12m1 status reads pending_approval" || fail "T12m1 status should read pending_approval, got '$S'"
+    post POST /wallet/v1/payment-check/claim "$MRSEED" "$(jq -nc --arg k "$M_KEY" '{check_key:$k}')"
+    [[ "$HTTP" == "400" ]] && pass "T12m1 a claim before the approval is refused (400): $(echo "$BODY"|jq -r '.message // empty'|head -c100)" \
+      || fail "T12m1 a claim before the approval must be refused 400, got $HTTP: $(echo "$BODY"|head -c160)"
+
+    # ── m2: two YES votes fund the check; the recipient claims it ──
+    C=$(vote approve "$M_AID" "$M_RH" "$A1_PRIV" "$A1_PUB" "$APPROVER1"); note "T12m2 /approve ($APPROVER1) HTTP $C: $(cat /tmp/uop.body | head -c160)"
+    [[ "$C" == "200" && "$(jq -r '.status // empty' /tmp/uop.body)" == "pending" ]] && pass "T12m2 first YES accepted; the approval stays pending (1 of 2)" \
+      || fail "T12m2 the first /approve should be accepted and leave the approval pending, got HTTP $C: $(cat /tmp/uop.body | head -c160)"
+    sleep 2; S=$(chk_status "$MSEED" "$M_ID")
+    [[ "$S" == "pending_approval" ]] && pass "T12m2 one vote funds nothing (status=pending_approval)" || fail "T12m2 one vote must not fund the check, got '$S'"
+    C=$(vote approve "$M_AID" "$M_RH" "$PARENT_PRIVKEY" "$P_PUB" "$PARENT"); note "T12m2 /approve ($PARENT) HTTP $C: $(cat /tmp/uop.body | head -c160)"
+    [[ "$C" == "200" ]] && pass "T12m2 second YES accepted — threshold met" || fail "T12m2 the second /approve should be accepted, got HTTP $C: $(cat /tmp/uop.body | head -c160)"
+    S=""; for _ in $(seq 1 20); do sleep 3; S=$(chk_status "$MSEED" "$M_ID"); [[ "$S" == "unclaimed" || "$S" == "failed" ]] && break; done
+    [[ "$S" == "unclaimed" ]] && pass "T12m2 the approved check was funded (status=unclaimed)" || fail "T12m2 the check should read unclaimed after the threshold, got '$S'"
+    post POST /wallet/v1/payment-check/claim "$MRSEED" "$(jq -nc --arg k "$M_KEY" '{check_key:$k}')"
+    AC=$(echo "$BODY" | jq -r '.amount_claimed // empty')
+    [[ "$HTTP" == "200" && "$AC" == "$M_AMT" ]] && pass "T12m2 claimed by the recipient (amount_claimed=$AC)" \
+      || fail "T12m2 the claim should succeed with amount_claimed=$M_AMT, got $HTTP: $(echo "$BODY"|head -c160)"
+
+    # ── m3: a vetoed check is never funded ──
+    post POST /wallet/v1/payment-check/create "$MSEED" "$(jq -nc --arg t "$M_TOKEN" --arg a "$M_AMT" '{token:$t, amount:$a, memo:"t12m-reject"}')"
+    N_ST=$(echo "$BODY" | jq -r '.status // empty'); N_AID=$(echo "$BODY" | jq -r '.approval_id // empty'); N_RH=$(echo "$BODY" | jq -r '.request_hash // empty')
+    N_ID=$(echo "$BODY" | jq -r '.check_id // empty'); N_KEY=$(echo "$BODY" | jq -r '.check_key // empty')
+    [[ "$HTTP" == "200" && "$N_ST" == "pending_approval" && -n "$N_AID" ]] && pass "T12m3 second check → pending_approval (approval_id=$N_AID)" \
+      || fail "T12m3 second create must answer pending_approval, got $HTTP status='$N_ST': $(echo "$BODY"|head -c200)"
+    C=$(vote reject "$N_AID" "$N_RH" "$A1_PRIV" "$A1_PUB" "$APPROVER1"); note "T12m3 /reject ($APPROVER1) HTTP $C: $(cat /tmp/uop.body | head -c160)"
+    [[ "$C" == "200" && "$(jq -r '.status // empty' /tmp/uop.body)" == "rejected" ]] && pass "T12m3 one approver's veto decides (rejected)" \
+      || fail "T12m3 /reject should veto, got HTTP $C: $(cat /tmp/uop.body | head -c160)"
+    S=$(chk_status "$MSEED" "$N_ID")
+    [[ "$S" == "failed" ]] && pass "T12m3 the vetoed check reads failed" || fail "T12m3 the vetoed check should read failed, got '$S'"
+    post POST /wallet/v1/payment-check/claim "$MRSEED" "$(jq -nc --arg k "$N_KEY" '{check_key:$k}')"
+    [[ "$HTTP" == "400" ]] && pass "T12m3 a claim of the vetoed check is refused (400): $(echo "$BODY"|jq -r '.message // empty'|head -c100)" \
+      || fail "T12m3 a claim of the vetoed check must be refused 400, got $HTTP: $(echo "$BODY"|head -c160)"
+
+    # ── m4: no batch on a wallet whose policy requires approval ──
+    post POST /wallet/v1/payment-check/batch-create "$MSEED" "$(jq -nc --arg t "$M_TOKEN" --arg a "$M_AMT" '{checks:[{token:$t, amount:$a, memo:"t12m-b1"}, {token:$t, amount:$a, memo:"t12m-b2"}]}')"
+    [[ "$HTTP" == "403" && "$(echo "$BODY" | jq -r '.error // empty')" == "policy_denied" ]] && pass "T12m4 batch-create refused 403 policy_denied: $(echo "$BODY"|jq -r '.message // empty'|head -c120)" \
+      || fail "T12m4 batch-create on a multisig wallet must be refused 403 policy_denied, got $HTTP: $(echo "$BODY"|head -c160)"
+    post GET "/wallet/v1/payment-check/list?limit=10" "$MSEED"
+    NCHK=$(echo "$BODY" | jq -r '.checks | length')
+    [[ "$HTTP" == "200" && "$NCHK" == "2" ]] && pass "T12m4 the wallet still lists its two checks (the batch created none)" || fail "T12m4 expected 2 checks listed, got $HTTP n=$NCHK: $(echo "$BODY"|head -c160)"
+    return_test_funds; MONEY=false
+  fi
 fi
 
 # ════════════════════════════════════════════════════════════════════════════════
