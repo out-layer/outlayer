@@ -20,10 +20,13 @@
 #   L10 the owner alone re-locks (version 3)
 #   L11 a reject by one approver ends the write: rejected, no signature
 #   L12 three writes held over the same version: A and B gather their quorum
-#       and are both signed; A stores, B is refused on chain (version); C
-#       gathers its quorum AFTER A stored and fails on the coordinator with
-#       the keystore's words (the chain moved on)
-#   L13 the unlocked policy deletes
+#       and are both signed; A (still locked, same approvers) stores, B is
+#       refused on chain (version); C gathers its quorum AFTER A stored and
+#       fails on the coordinator with the keystore's words (the chain moved
+#       on). A keeps the lock on purpose: had A unlocked the policy, C's
+#       approvers would no longer be approvers and their votes would be
+#       refused at the door, never reaching the keystore
+#   L13 the quorum unlocks the policy (version 5) and it deletes
 #
 # Not here: the keystore's direct refusals (unit-tested, keystore
 # `policy_lock_tests`), approval expiry (needs the database), a contract-wallet
@@ -118,6 +121,8 @@ LOCKED=$(jq -nc --arg a "$APPROVER" --arg b "$APPROVER2" \
 OPEN='{"rules":{"transaction_types":["transfer"]}}'
 OPEN_B='{"rules":{"transaction_types":["transfer","call"]}}'
 OPEN_C='{"rules":{"transaction_types":["transfer","delete"]}}'
+# Locked like LOCKED, other rules: a write that keeps the approvers in office.
+LOCKED_B=$(jq -c '.rules.transaction_types = ["transfer","call"]' <<<"$LOCKED")
 
 # ── L0 ───────────────────────────────────────────────────────────────────────
 log "L0 storage version"
@@ -189,9 +194,9 @@ if [[ -n "${AID:-}" ]]; then
   wait_request "$RID"
   if [[ "$ST" == success ]]; then
     pass "L7 the signature is on the request"
-    WRITE=$(jq -c '.result_data' <<<"$BODY")
+    WRITE=$(jq -c '.result' <<<"$BODY")
     [[ "$(jq -r .version <<<"$WRITE")" == 2 && "$(jq -r .locked <<<"$WRITE")" == false ]] && pass "L7 signed version 2, unlocked" \
-      || fail "L7 result_data $(jq -c '{version,locked}' <<<"$WRITE")"
+      || fail "L7 result $(jq -c '{version,locked}' <<<"$WRITE")"
     store_write "$WRITE"
     if landed "L7 the owner stores the approved policy"; then
       meta_is L7 2 false true
@@ -203,7 +208,7 @@ if [[ -n "${AID:-}" ]]; then
       refused L8 "policy version is 2"
     fi
   else
-    fail "L7 request ended $ST: $(jq -c '.result_data // .result' <<<"$BODY" | head -c 200)"
+    fail "L7 request ended $ST: $(jq -c '.result' <<<"$BODY" | head -c 200)"
   fi
 fi
 
@@ -223,37 +228,54 @@ if hold L11 "$OPEN"; then
   [[ "$(jq -r .status <<<"$BODY")" == rejected ]] && pass "L11 approval rejected at once" || fail "L11 status $(jq -r .status <<<"$BODY")"
   wait_request "$RID"
   [[ "$ST" == rejected ]] && pass "L11 request rejected" || fail "L11 request $ST"
-  [[ "$(jq -r '.result_data.wallet_signature // empty' <<<"$BODY")" == "" ]] && pass "L11 no signature" || fail "L11 a signature was issued"
+  [[ "$(jq -r '.result.wallet_signature // empty' <<<"$BODY")" == "" ]] && pass "L11 no signature" || fail "L11 a signature was issued"
   meta_is L11 3 true
 fi
 
 # ── L12 ──────────────────────────────────────────────────────────────────────
 log "L12 three writes over version 4"
-hold "L12 A" "$OPEN";   A_AID=$AID; A_RID=$RID; A_HASH=$RHASH
-hold "L12 B" "$OPEN_B"; B_AID=$AID; B_RID=$RID; B_HASH=$RHASH
-hold "L12 C" "$OPEN_C"; C_AID=$AID; C_RID=$RID; C_HASH=$RHASH
-quorum() { AID=$1; RHASH=$2; vote approve "$APPROVER"; vote approve "$APPROVER2"; }
+hold "L12 A" "$LOCKED_B"; A_AID=$AID; A_RID=$RID; A_HASH=$RHASH
+hold "L12 B" "$OPEN_B";   B_AID=$AID; B_RID=$RID; B_HASH=$RHASH
+hold "L12 C" "$OPEN_C";   C_AID=$AID; C_RID=$RID; C_HASH=$RHASH
+# quorum <desc> <aid> <hash> — both approvers vote YES; a vote the coordinator
+# refuses is a failure here, not a silent miss.
+quorum() {
+  local desc=$1 who; AID=$2; RHASH=$3
+  for who in "$APPROVER" "$APPROVER2"; do
+    vote approve "$who"
+    [[ "$HTTP" == 200 ]] || fail "$desc vote by $who → HTTP $HTTP: $(head -c 160 <<<"$BODY")"
+  done
+}
 if [[ -n "${A_AID:-}" && -n "${B_AID:-}" && -n "${C_AID:-}" ]]; then
-  quorum "$A_AID" "$A_HASH"; wait_request "$A_RID"; A_ST=$ST; A_WRITE=$(jq -c '.result_data' <<<"$BODY")
-  quorum "$B_AID" "$B_HASH"; wait_request "$B_RID"; B_ST=$ST; B_WRITE=$(jq -c '.result_data' <<<"$BODY")
+  quorum "L12 A" "$A_AID" "$A_HASH"; wait_request "$A_RID"; A_ST=$ST; A_WRITE=$(jq -c '.result' <<<"$BODY")
+  quorum "L12 B" "$B_AID" "$B_HASH"; wait_request "$B_RID"; B_ST=$ST; B_WRITE=$(jq -c '.result' <<<"$BODY")
   [[ "$A_ST" == success && "$B_ST" == success ]] && pass "L12 A and B both signed before either stored" \
     || fail "L12 A $A_ST, B $B_ST"
   store_write "$A_WRITE"
-  landed "L12 A stores (version 4)" && meta_is "L12 A" 4 false
+  landed "L12 A stores (version 4, still locked)" && meta_is "L12 A" 4 true
   store_write "$B_WRITE"
   refused "L12 B after A" "policy version is 4"
 
-  quorum "$C_AID" "$C_HASH"; wait_request "$C_RID"
+  quorum "L12 C" "$C_AID" "$C_HASH"; wait_request "$C_RID"
   if [[ "$ST" == failed ]]; then
-    pass "L12 C, voted after A stored, failed: $(jq -r '.result_data.error' <<<"$BODY" | head -c 160)"
+    pass "L12 C, voted after A stored, failed: $(jq -r '.result.error' <<<"$BODY" | head -c 160)"
   else
     fail "L12 C ended $ST, expected failed (the chain moved on under it)"
   fi
-  meta_is "L12 end" 4 false
+  meta_is "L12 end" 4 true
 fi
 
 # ── L13 ──────────────────────────────────────────────────────────────────────
-log "L13 the unlocked policy deletes"
+log "L13 the quorum unlocks, then the policy deletes"
+if hold "L13" "$OPEN"; then
+  quorum "L13" "$AID" "$RHASH"; wait_request "$RID"
+  if [[ "$ST" == success ]]; then
+    store_write "$(jq -c '.result' <<<"$BODY")"
+    landed "L13 unlocked (version 5)" && meta_is "L13" 5 false
+  else
+    fail "L13 unlock ended $ST: $(jq -c '.result' <<<"$BODY" | head -c 200)"
+  fi
+fi
 call "$PARENT" delete_wallet_policy "$(jq -nc --arg k "$WALLET_PUBKEY" '{wallet_pubkey:$k}')" '0 NEAR'
 landed "L13 deleted" && { [[ "$(meta)" == null ]] && pass "L13 gone from the chain" || fail "L13 still on chain: $(meta | head -c 120)"; }
 
