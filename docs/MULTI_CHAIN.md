@@ -9,7 +9,7 @@ Agent Custody lets AI agents hold and manage funds through TEE-held wallets with
 | Key (keystore) | ed25519 | secp256k1 (one shared address across all EVM chains) | ed25519 (base58 address) |
 | Signing (keystore) | ed25519 | ECDSA secp256k1 (keccak256 + sign; EIP-712 / EIP-191 / raw-tx hash) | ed25519 over the raw serialized message (no digest step) |
 | Derivation seed | `wallet:{id}:near` | `wallet:{id}:evm` (shared by every EVM chain); a sub-key is `subkey:{id}:evm:{sub_path}` | `wallet:{id}:solana` (the `sol` alias canonicalizes to it) |
-| API | transfer, call, delete, storage-deposit, intents deposit / withdraw / transfer / swap, payment checks, confidential intents, limit orders | `evm/sign-typed-data`, `evm/sign-message`, `evm/sign-transaction` (signing only — no build/broadcast) | `solana/sign-message`, `solana/sign-transaction` (signing only — no build/broadcast) |
+| API | transfer, call, delete, storage-deposit, intents deposit / withdraw / transfer / swap / storage-deposit, payment checks, confidential intents, limit orders | `evm/sign-typed-data`, `evm/sign-message`, `evm/sign-transaction` (signing only — no build/broadcast) | `solana/sign-message`, `solana/sign-transaction` (signing only — no build/broadcast) |
 | Policy (keystore) | all rules | `evm_sign` capability (default-DENY under a policy) + `raw_tx` sub-flag (default-OFF) | `solana_sign` capability — same model as `evm_sign` |
 
 Each seed is HMAC-SHA256'd with the wallet's master secret inside the keystore enclave. Nothing is stored: every address is derived on request from the `wallet_id`.
@@ -92,7 +92,7 @@ Same model as `evm_sign`, evaluated by `solana_sign_decision` in `shared-tee-hel
 
 **Caveat:** a signed Solana transaction message is itself fund-moving, so `solana_sign` + `raw_tx` grants full authority over whatever sits on the wallet's Solana address. No Solana signing path can move the wallet's NEAR Intents balance.
 
-**`raw_sign`:** the keystore also accepts a hash-pinned `raw` operation that blind-signs bytes with the wallet's NEAR or Solana ed25519 key (EVM is refused; `sol` canonicalizes to `solana`), gated by the separate default-DENY `raw_sign` capability with an optional per-chain list. The public API exposes no route that builds it.
+**`raw_sign`:** the keystore also accepts a hash-pinned `raw` operation that blind-signs bytes with the wallet's NEAR or Solana ed25519 key (EVM is refused; `sol` canonicalizes to `solana`), gated by the separate default-DENY `raw_sign` capability with an optional per-chain list. The NEAR key is signed for only when the list names `near`, with or without a policy: a raw NEAR signature is any NEAR transaction. The public API exposes no route that builds it.
 
 ## Checklist: Adding another chain
 

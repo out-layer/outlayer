@@ -5216,6 +5216,73 @@ fn build_transfer_intent_message(
     .to_string()
 }
 
+/// Build the NEP-413 intent message that registers `account_id` on the NEP-141
+/// contract `contract_id`, paid with `amount` yoctoNEAR of the signer's wNEAR inside
+/// `intents.near` — the defuse `storage_deposit` intent (`contract_id`,
+/// `deposit_for_account_id`, `amount`; verified against `near/intents`
+/// `core/src/intents/tokens.rs`).
+fn build_storage_deposit_intent_message(
+    signer_id: &str,
+    contract_id: &str,
+    account_id: &str,
+    amount: &str,
+    deadline: &str,
+) -> String {
+    serde_json::json!({
+        "signer_id": signer_id,
+        "deadline": deadline,
+        "intents": [{
+            "intent": "storage_deposit",
+            "contract_id": contract_id,
+            "deposit_for_account_id": account_id,
+            "amount": amount
+        }]
+    })
+    .to_string()
+}
+
+/// Whether a `storage_deposit` intent for these chain answers loses nothing.
+///
+/// `intents.near` never refunds the wNEAR it unwraps for a storage deposit: the
+/// token contract sends a deposit for an account already registered, and anything
+/// above its minimum, back to its caller — `intents.near`, not the wallet. So the
+/// amount is the contract's `storage_balance_bounds().min` exactly, and the account
+/// has no storage yet. `bounds` and `balance` are the two views' answers as read.
+///
+/// Both answers come from a contract the CALLER named, so neither bounds the
+/// spend: a contract of the agent's own answers any `min` and keeps the deposit.
+/// The amount is held to the crate's ceiling first, whatever the contract says.
+fn storage_deposit_loses_nothing(
+    contract_id: &str,
+    account_id: &str,
+    amount: &str,
+    bounds: &serde_json::Value,
+    balance: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let min = bounds
+        .get("min")
+        .and_then(|m| m.as_str())
+        .and_then(|m| m.parse::<u128>().ok())
+        .ok_or_else(|| {
+            ApiError::InternalError(format!("storage_balance_bounds on {contract_id} answered no minimum: {bounds}"))
+        })?;
+    let amount = shared_tee_helpers::wallet_policy::intents_storage_deposit_amount(amount)
+        .map_err(ApiError::BadRequest)?;
+    if amount != min {
+        return Err(ApiError::BadRequest(format!(
+            "the storage deposit on {contract_id} is {min} yoctoNEAR and this op pays {amount}; \
+             intents.near keeps any difference"
+        )));
+    }
+    if !balance.is_null() {
+        return Err(ApiError::BadRequest(format!(
+            "{account_id} is already registered on {contract_id}; a storage deposit for it would \
+             go to intents.near, not back to this wallet"
+        )));
+    }
+    Ok(())
+}
+
 /// Default-DENY allowlist for `sign_message` recipients. Under a policy, the recipient
 /// must appear in `capabilities.sign_message.allowed_recipients`; anything else is
 /// refused so an auth signature can never target a fund-moving verifier (named or
@@ -5572,6 +5639,16 @@ async fn sign_built(
             gas,
             deposit,
             } => {
+            // SECURITY: a gate-only method is evaluated by the policy and never
+            // signed; the policy lets it through only because it is not one.
+            // See `shared_tee_helpers::wallet_policy::GATE_ONLY_INTENTS_METHODS`.
+            if shared_tee_helpers::wallet_policy::is_intents_contract(to)
+                && shared_tee_helpers::wallet_policy::GATE_ONLY_INTENTS_METHODS.contains(&method.as_str())
+            {
+                return Err(ApiError::Forbidden(format!(
+                    "'{method}' on '{to}' is a policy question, never a transaction"
+                )));
+            }
             let to = to.clone();
             let method = method.clone();
             let args = base64::decode(args_base64)
@@ -5665,6 +5742,59 @@ async fn sign_built(
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
             // Same verifier as withdraw: intents.near (mainnet-only). The NEP-413 recipient is
             // bound into the signature and must match the verifier the intent executes against.
+            let recipient = "intents.near".to_string();
+            let (signature_base58, public_key) =
+                sign_nep413(state, customer, &req.wallet_id, &message, nonce, &recipient).await?;
+            let mut resp = WalletSignResponse::new(request_hash);
+            resp.signature_base58 = Some(signature_base58);
+            resp.public_key = Some(public_key);
+            resp.message = Some(message);
+            resp.nonce_base64 = Some(base64::encode(nonce));
+            resp.recipient = Some(recipient);
+            Ok(Json(resp))
+        }
+        Op::IntentsStorageDeposit { contract_id, account_id, amount } => {
+            // Built like the transfer above. Before signing, the token contract is asked
+            // what the deposit is and whether the account already has one: the wNEAR this
+            // intent spends is never refunded, so a wrong amount or a registered account
+            // is refused here rather than given to intents.near.
+            let contract = AccountId::from_str(contract_id)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid contract_id: {}", e)))?;
+            AccountId::from_str(account_id)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid account_id: {}", e)))?;
+            let near_client = state.near_client.as_ref().ok_or_else(|| {
+                ApiError::InternalError("NEAR client not configured".to_string())
+            })?;
+            let bounds = near_client
+                .view_call_json(&contract, "storage_balance_bounds", serde_json::json!({}))
+                .await
+                .map_err(|e| {
+                    ApiError::InternalError(format!(
+                        "storage_balance_bounds on {contract_id}: {}",
+                        crate::signing_keys::bounded(&format!("{e:#}"), crate::signing_keys::MOST_QUOTED_ERROR)
+                    ))
+                })?;
+            let balance = near_client
+                .view_call_json(&contract, "storage_balance_of", serde_json::json!({ "account_id": account_id }))
+                .await
+                .map_err(|e| {
+                    ApiError::InternalError(format!(
+                        "storage_balance_of on {contract_id}: {}",
+                        crate::signing_keys::bounded(&format!("{e:#}"), crate::signing_keys::MOST_QUOTED_ERROR)
+                    ))
+                })?;
+            storage_deposit_loses_nothing(contract_id, account_id, amount, &bounds, &balance)?;
+
+            let signer_id = wallet_implicit_account(state, customer, &req.wallet_id).await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let deadline = unix_to_iso8601(now + 300);
+            let message =
+                build_storage_deposit_intent_message(&signer_id, contract_id, account_id, amount, &deadline);
+            let mut nonce = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
             let recipient = "intents.near".to_string();
             let (signature_base58, public_key) =
                 sign_nep413(state, customer, &req.wallet_id, &message, nonce, &recipient).await?;
@@ -6037,6 +6167,10 @@ fn policy_to_judge_by(
             // `chain_sign_decision` denies a raw transaction unless `raw_tx`
             // is explicitly true.
             capabilities: Some(shared_tee_helpers::wallet_policy::Capabilities {
+                // SECURITY: opened WITHOUT a `chains` list on purpose, which opens
+                // every chain but near: a raw signature by the NEAR key is any NEAR
+                // transaction (a call to intents.near included). Never add a list
+                // naming near here. See `raw_sign_names_near` in the crate.
                 raw_sign: open(),
                 confidential: open(),
                 payment_check: open(),
@@ -6046,6 +6180,12 @@ fn policy_to_judge_by(
                 sign_message: None,
                 evm_sign: None,
                 solana_sign: None,
+                // SECURITY — NEVER OPEN THIS HERE. A wallet with no policy may
+                // `call` any contract but the intents contract: a call there acts
+                // as the wallet's intents account and can add a key that signs
+                // for it forever, past any policy or freeze set later. See the
+                // block at `shared_tee_helpers::wallet_policy::INTENTS_CONTRACTS`.
+                intents_call: None,
             }),
             ..Default::default()
         });

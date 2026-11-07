@@ -496,6 +496,67 @@ mod wallet_sign_tests {
         assert_eq!(v2["intents"][0]["tokens"]["nep141:usdt.near"], "5");
     }
 
+    /// The defuse `storage_deposit` intent, byte for byte: its field names are the
+    /// contract's (`deposit_for_account_id`, not `account_id`), and nothing else rides
+    /// in the intent.
+    #[test]
+    fn built_storage_deposit_message_is_the_defuse_intent() {
+        let msg = build_storage_deposit_intent_message(
+            "signer.near",
+            "usdc.near",
+            "fresh.near",
+            "1250000000000000000000",
+            "2026-11-07T12:05:00.000Z",
+        );
+        assert_eq!(
+            msg,
+            r#"{"deadline":"2026-11-07T12:05:00.000Z","intents":[{"amount":"1250000000000000000000","contract_id":"usdc.near","deposit_for_account_id":"fresh.near","intent":"storage_deposit"}],"signer_id":"signer.near"}"#
+        );
+    }
+
+    /// The wNEAR a storage deposit spends is never refunded to the wallet, so the
+    /// keystore signs only the contract's minimum, for an account with no storage.
+    #[test]
+    fn a_storage_deposit_is_signed_only_when_it_loses_nothing() {
+        let bounds = serde_json::json!({"min": "1250000000000000000000", "max": "1250000000000000000000"});
+        let none = serde_json::Value::Null;
+        let ok = storage_deposit_loses_nothing("usdc.near", "fresh.near", "1250000000000000000000", &bounds, &none);
+        assert!(ok.is_ok());
+
+        for amount in ["1249999999999999999999", "1"] {
+            match storage_deposit_loses_nothing("usdc.near", "fresh.near", amount, &bounds, &none) {
+                Err(ApiError::BadRequest(m)) => assert!(m.contains("is 1250000000000000000000 yoctoNEAR"), "{m}"),
+                other => panic!("amount {amount} was not refused: {:?}", other.err().map(|e| format!("{e:?}"))),
+            }
+        }
+
+        let registered = serde_json::json!({"total": "1250000000000000000000", "available": "0"});
+        match storage_deposit_loses_nothing("usdc.near", "fresh.near", "1250000000000000000000", &bounds, &registered) {
+            Err(ApiError::BadRequest(m)) => assert!(m.contains("already registered"), "{m}"),
+            other => panic!("a registered account was not refused: {:?}", other.err().map(|e| format!("{e:?}"))),
+        }
+
+        // The contract is the caller's: a minimum above the ceiling, or of zero, is
+        // refused whatever the contract answers, even when the op matches it.
+        let greedy = serde_json::json!({"min": "1000000000000000000000000000"});
+        match storage_deposit_loses_nothing("mine.near", "fresh.near", "1000000000000000000000000000", &greedy, &none) {
+            Err(ApiError::BadRequest(m)) => assert!(m.contains("above the"), "{m}"),
+            other => panic!("a deposit above the ceiling was not refused: {:?}", other.err().map(|e| format!("{e:?}"))),
+        }
+        let free = serde_json::json!({"min": "0"});
+        assert!(matches!(
+            storage_deposit_loses_nothing("usdc.near", "fresh.near", "0", &free, &none),
+            Err(ApiError::BadRequest(_))
+        ));
+
+        // A contract that answers no minimum is not a contract we can pay safely.
+        let odd = serde_json::json!({"max": "1"});
+        assert!(matches!(
+            storage_deposit_loses_nothing("usdc.near", "fresh.near", "1", &odd, &none),
+            Err(ApiError::InternalError(_))
+        ));
+    }
+
     #[test]
     fn iso8601_matches_known_timestamps() {
         assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00.000Z");
@@ -3114,7 +3175,9 @@ mod a_wallet_with_no_policy_is_unrestricted {
     fn opt_in_ops() -> Vec<Op> {
         vec![
             Op::PaymentCheck { amount: "1".into(), token: "near".into() },
-            Op::Raw { chain: "near".into(), payload_hash: "00".into(), label: None },
+            // Raw signing is open on solana; on near it is not, with or without a
+            // policy (SECURITY: `a_wallet_with_no_policy_cannot_raw_sign_with_its_near_key`).
+            Op::Raw { chain: "solana".into(), payload_hash: "00".into(), label: None },
             Op::Confidential {
                 flow: "transfer".into(),
                 to: None,
@@ -3215,6 +3278,44 @@ mod a_wallet_with_no_policy_is_unrestricted {
             }
             other => panic!("a wallet with no policy handed its lane to a stranger: {other:?}"),
         }
+    }
+
+    /// SECURITY: a wallet with no policy calls any contract but the intents
+    /// contract. A call there acts as the wallet's intents account (`add_public_key`
+    /// would hand it over for good), so the stand-in for an absent policy must
+    /// never open `intents_call`. Any other contract stays callable.
+    #[test]
+    fn a_wallet_with_no_policy_cannot_call_the_intents_contract() {
+        let call = |to: &str, method: &str| Op::Call {
+            to: to.into(),
+            method: method.into(),
+            args_base64: "e30=".into(),
+            gas: "30000000000000".into(),
+            deposit: "1".into(),
+        };
+        for method in ["add_public_key", "ft_withdraw", "mt_transfer"] {
+            match evaluate(&policy_to_judge_by(None), &call("intents.near", method), None, NOW) {
+                Decision::Deny { reason } => assert!(reason.contains("intents_call"), "{reason}"),
+                other => panic!("a wallet with no policy may call intents.near {method}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            evaluate(&policy_to_judge_by(None), &call("usdc.near", "ft_transfer"), None, NOW),
+            Decision::Allow
+        ));
+    }
+
+    /// SECURITY: a wallet with no policy raw-signs on solana but not with its NEAR
+    /// key — a raw NEAR signature is any NEAR transaction, the intents fence
+    /// included. The stand-in must never name near.
+    #[test]
+    fn a_wallet_with_no_policy_cannot_raw_sign_with_its_near_key() {
+        let raw = |chain: &str| Op::Raw { chain: chain.into(), payload_hash: "ab".repeat(32), label: None };
+        match evaluate(&policy_to_judge_by(None), &raw("near"), None, NOW) {
+            Decision::Deny { reason } => assert!(reason.contains("raw_sign.chains"), "{reason}"),
+            other => panic!("a wallet with no policy raw-signs with its NEAR key: {other:?}"),
+        }
+        assert!(matches!(evaluate(&policy_to_judge_by(None), &raw("solana"), None, NOW), Decision::Allow));
     }
 }
 
