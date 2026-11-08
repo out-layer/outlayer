@@ -189,7 +189,7 @@ If this prints the `near_account_id` you saved for that `wallet_id`, the master 
 
 ### Auto-discovery of `derivation_path`
 
-`--from-chain` reads `GET <nearblocks-url>/v1/account/<vault>/txns?per_page=20` and takes the newest transaction whose predecessor is the vault and whose action calls `request_master` (the vault's MPC proxy, which is how the keystore derives) or `request_app_private_key`, then reads `request.derivation_path` from its arguments. It looks at those 20 transactions only and does not check whether the transaction succeeded.
+`--from-chain` reads the vault's transactions from NEARblocks API v3, newest first (`GET <nearblocks-url>/v3/accounts/<vault>/txns?limit=25`, following the `meta.next_page` cursor for up to 20 pages), takes the newest one the vault signed whose action calls `request_master` (the vault's MPC proxy, which is how the keystore derives) or `request_app_private_key`, and reads `request.derivation_path` from its arguments on the detail endpoint (`GET <nearblocks-url>/v3/txns/<hash>`). It does not check whether the transaction succeeded.
 
 If it finds nothing, take the hash of any `request_master` transaction from the vault's history (any NEAR explorer) and read the path from an RPC node — an archival one if the transaction is old:
 

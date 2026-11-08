@@ -1604,86 +1604,126 @@ fn derive_strong_key(
     Ok(okm)
 }
 
-/// Query NEARblocks for the most recent `request_app_private_key`
-/// receipt FROM `vault_id` to MPC, decode its args, and pull out the
-/// `derivation_path` field.
+/// The methods whose arguments carry the vault's CKD request: the vault's own
+/// proxy `request_master` and a direct `request_app_private_key`. Both take
+/// `{ request: { derivation_path, app_public_key, domain_id } }`.
+const CKD_METHODS: &[&str] = &["request_master", "request_app_private_key"];
+
+/// How many pages of the vault's transactions to walk, newest first, before
+/// giving up: the CKD request is one of a vault's first transactions, and a
+/// vault with more history than this is told to pass `--derivation-path`.
+const NEARBLOCKS_MAX_PAGES: usize = 20;
+
+/// From one page of NEARblocks v3 `/v3/accounts/{vault}/txns`: the hashes of the
+/// transactions the vault signed that call a CKD method, newest first, and the
+/// cursor of the next page. List items carry `actions[{action, method}]` only;
+/// the arguments are on the detail endpoint.
+fn ckd_candidates(page: &serde_json::Value, vault_id: &str) -> Result<(Vec<String>, Option<String>)> {
+    if let Some(errors) = page.get("errors").filter(|e| !e.is_null()) {
+        return Err(anyhow!("NEARblocks refused the transaction list: {errors}"));
+    }
+    let data = page
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow!("NEARblocks: no data array in the transaction list"))?;
+    let hashes = data
+        .iter()
+        .filter(|t| t.get("signer_account_id").and_then(|v| v.as_str()) == Some(vault_id))
+        .filter(|t| {
+            t.get("actions").and_then(|a| a.as_array()).is_some_and(|actions| {
+                actions.iter().any(|a| {
+                    a.get("method").and_then(|m| m.as_str()).is_some_and(|m| CKD_METHODS.contains(&m))
+                })
+            })
+        })
+        .filter_map(|t| t.get("transaction_hash").and_then(|h| h.as_str()).map(str::to_string))
+        .collect();
+    let next = page
+        .get("meta")
+        .and_then(|m| m.get("next_page"))
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    Ok((hashes, next))
+}
+
+/// From NEARblocks v3 `/v3/txns/{hash}`: the `derivation_path` of its CKD call.
+/// The arguments come as `args.args_json` (JSON) or `args.args_base64`.
+fn derivation_path_from_detail(detail: &serde_json::Value) -> Result<Option<String>> {
+    if let Some(errors) = detail.get("errors").filter(|e| !e.is_null()) {
+        return Err(anyhow!("NEARblocks refused the transaction detail: {errors}"));
+    }
+    let tx = match detail.get("data") {
+        Some(serde_json::Value::Array(items)) => items.first(),
+        Some(v @ serde_json::Value::Object(_)) => Some(v),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow!("NEARblocks: no transaction in the detail answer"))?;
+    let Some(actions) = tx.get("actions").and_then(|a| a.as_array()) else { return Ok(None) };
+    for a in actions {
+        let method = a.get("method").and_then(|m| m.as_str());
+        if !method.is_some_and(|m| CKD_METHODS.contains(&m)) {
+            continue;
+        }
+        let args = a.get("args").ok_or_else(|| anyhow!("{} call carries no args", method.unwrap_or("CKD")))?;
+        let json = match (args.get("args_json").filter(|v| !v.is_null()), args.get("args_base64").and_then(|v| v.as_str())) {
+            (Some(j), _) => j.clone(),
+            (None, Some(b64)) => {
+                let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .context("args_base64 is not base64")?;
+                serde_json::from_slice(&raw).context("args_base64 is not JSON")?
+            }
+            (None, None) => return Err(anyhow!("{} call carries neither args_json nor args_base64", method.unwrap_or("CKD"))),
+        };
+        let path = json
+            .get("request")
+            .and_then(|r| r.get("derivation_path"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("args missing request.derivation_path"))?;
+        return Ok(Some(path.to_string()));
+    }
+    Ok(None)
+}
+
+async fn nearblocks_get(url: &str) -> Result<serde_json::Value> {
+    let resp = reqwest::get(url).await.context("query NEARblocks")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.context("parse NEARblocks JSON")?;
+    if !status.is_success() {
+        return Err(anyhow!("NEARblocks answered HTTP {status}: {}", body.get("errors").unwrap_or(&body)));
+    }
+    Ok(body)
+}
+
+/// Find the vault's most recent CKD request on NEARblocks (API v3) and return
+/// its `derivation_path`: walk the vault's transactions newest first for one it
+/// signed calling `request_master` / `request_app_private_key`, then read that
+/// transaction's arguments from the detail endpoint.
 async fn fetch_derivation_path_from_chain(
     nearblocks_url: &str,
     vault_id: &AccountId,
 ) -> Result<String> {
-    let url = format!(
-        "{}/v1/account/{}/txns?per_page=20",
-        nearblocks_url, vault_id
-    );
-    let body: serde_json::Value = reqwest::get(&url)
-        .await
-        .context("query NEARblocks")?
-        .json()
-        .await
-        .context("parse NEARblocks JSON")?;
-
-    let txns = body
-        .get("txns")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("NEARblocks: no txns array in response"))?;
-
-    for t in txns {
-        if t.get("predecessor_account_id").and_then(|v| v.as_str()) != Some(vault_id.as_str()) {
-            continue;
+    let base = nearblocks_url.trim_end_matches('/');
+    let mut next: Option<String> = None;
+    for _ in 0..NEARBLOCKS_MAX_PAGES {
+        // The cursor is opaque base64 (`+`, `/`, `=`): it goes in as an encoded
+        // query value, never pasted into the string.
+        let mut params: Vec<(&str, &str)> = vec![("limit", "25")];
+        if let Some(cursor) = &next {
+            params.push(("next", cursor));
         }
-        let actions = t.get("actions").and_then(|v| v.as_array());
-        let Some(actions) = actions else { continue };
-        for a in actions {
-            // Both `request_master` (the vault's proxy method) and
-            // direct `request_app_private_key` carry the same args
-            // shape — `{ request: { derivation_path, app_public_key,
-            // domain_id } }` — so accept either. NEARblocks' txns
-            // endpoint surfaces direct txs to/from the account but
-            // not always cross-contract receipts; the proxy's outer
-            // tx (vault → vault) is reliably listed and has the same
-            // payload.
-            //
-            // NEARblocks v1 (testnet, mid-2026) returns the action as
-            // flat `{action, method, args}` strings — not the older
-            // nested `{method: {method_name, args}}` shape. We try
-            // the flat form first and fall back to nested so this
-            // tool keeps working if the API rolls back.
-            let method = a
-                .get("method")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    a.get("method")
-                        .and_then(|m| m.get("method_name"))
-                        .and_then(|v| v.as_str())
-                });
-            if method != Some("request_app_private_key") && method != Some("request_master") {
-                continue;
+        let url = reqwest::Url::parse_with_params(&format!("{base}/v3/accounts/{vault_id}/txns"), &params)
+            .context("build the NEARblocks URL")?;
+        let (hashes, cursor) = ckd_candidates(&nearblocks_get(url.as_str()).await?, vault_id.as_str())?;
+        for hash in hashes {
+            let detail = nearblocks_get(&format!("{base}/v3/txns/{hash}")).await?;
+            if let Some(path) = derivation_path_from_detail(&detail)? {
+                return Ok(path);
             }
-            // Same flat/nested duality for `args`. The flat form
-            // returns plain JSON; the legacy nested form returns
-            // base64. Detect by trying base64 first and falling back
-            // to a raw parse — both branches end with the same
-            // `serde_json::Value`.
-            let args_raw = a
-                .get("args")
-                .and_then(|v| v.as_str())
-                .or_else(|| a.get("method").and_then(|m| m.get("args")).and_then(|v| v.as_str()))
-                .ok_or_else(|| anyhow!("request_app_private_key receipt missing args"))?;
-            let json: serde_json::Value = match base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                args_raw,
-            ) {
-                Ok(decoded) => serde_json::from_slice(&decoded)
-                    .context("parse args JSON (base64 branch)")?,
-                Err(_) => serde_json::from_str(args_raw)
-                    .context("parse args JSON (plaintext branch)")?,
-            };
-            let path = json
-                .get("request")
-                .and_then(|r| r.get("derivation_path"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("args missing request.derivation_path"))?;
-            return Ok(path.to_string());
+        }
+        match cursor {
+            Some(c) => next = Some(c),
+            None => break,
         }
     }
 
@@ -1691,4 +1731,80 @@ async fn fetch_derivation_path_from_chain(
         "no past request_app_private_key tx found for {} on NEARblocks — submit at least one CKD call before this tool can auto-discover the path, or pass --derivation-path explicitly",
         vault_id
     ))
+}
+
+
+#[cfg(test)]
+mod nearblocks_v3_tests {
+    use super::*;
+
+    const VAULT: &str = "thr-1794084431.outlayer-alice.testnet";
+
+    /// A page of `/v3/accounts/{vault}/txns`, as NEARblocks answered it on
+    /// 2026-11-08 (trimmed): list items carry `{action, method}` only.
+    fn list_page() -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                { "transaction_hash": "CgCS8N1ysjGvgsaX6RqrEMha8vnXZkGoAzpsnQudSM9u",
+                  "signer_account_id": VAULT, "receiver_account_id": VAULT,
+                  "actions": [{ "action": "FUNCTION_CALL", "method": "request_master" }] },
+                { "transaction_hash": "56zAceJeCWycZq3DgtbRwMbwyTqTki9num7YXNNhWDGu",
+                  "signer_account_id": "outlayer-alice.testnet", "receiver_account_id": VAULT,
+                  "actions": [{ "action": "CREATE_ACCOUNT", "method": null }, { "action": "FUNCTION_CALL", "method": "new" }] },
+                { "transaction_hash": "someone-elses",
+                  "signer_account_id": "stranger.testnet", "receiver_account_id": VAULT,
+                  "actions": [{ "action": "FUNCTION_CALL", "method": "request_master" }] }
+            ],
+            "meta": { "next_page": "eyJpbmRleCI6MCwic2hhcmQiOjV9+/==" }
+        })
+    }
+
+    /// `/v3/txns/{hash}` for that call (trimmed): the arguments live here.
+    fn detail() -> serde_json::Value {
+        serde_json::json!({ "data": {
+            "transaction_hash": "CgCS8N1ysjGvgsaX6RqrEMha8vnXZkGoAzpsnQudSM9u",
+            "actions": [{ "action": "FUNCTION_CALL", "method": "request_master", "args": {
+                "gas": 300000000000000u64, "deposit": "0", "method_name": "request_master", "args_base64": null,
+                "args_json": { "request": { "domain_id": 2,
+                    "app_public_key": "bls12381g1:7Xzt5jS6bdMKC8ivkFDKhZ3raqmkHwiUTivUjRaG8pDcXHfnqjoaRpasH5dHFVSxcv",
+                    "derivation_path": "842ff45d5fdbb8ca3279a81f6cd1ba3b3e5253386517771deeb92f68e4718128" } } } }]
+        } })
+    }
+
+    #[test]
+    fn the_list_names_only_the_vaults_own_ckd_calls_and_the_next_cursor() {
+        let (hashes, next) = ckd_candidates(&list_page(), VAULT).unwrap();
+        assert_eq!(hashes, vec!["CgCS8N1ysjGvgsaX6RqrEMha8vnXZkGoAzpsnQudSM9u".to_string()], "a stranger's call is not the vault's");
+        assert_eq!(next.as_deref(), Some("eyJpbmRleCI6MCwic2hhcmQiOjV9+/=="));
+        let last = serde_json::json!({ "data": [], "meta": {} });
+        assert_eq!(ckd_candidates(&last, VAULT).unwrap(), (vec![], None));
+        let refused = serde_json::json!({ "data": null, "errors": [{ "message": "API v1 was retired" }] });
+        assert!(ckd_candidates(&refused, VAULT).unwrap_err().to_string().contains("retired"));
+    }
+
+    #[test]
+    fn the_detail_yields_the_derivation_path_from_json_or_base64_args() {
+        assert_eq!(
+            derivation_path_from_detail(&detail()).unwrap().as_deref(),
+            Some("842ff45d5fdbb8ca3279a81f6cd1ba3b3e5253386517771deeb92f68e4718128")
+        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+            br#"{"request":{"derivation_path":"abc"}}"#);
+        let as_base64 = serde_json::json!({ "data": [{ "actions": [{ "method": "request_app_private_key",
+            "args": { "args_json": null, "args_base64": b64 } }] }] });
+        assert_eq!(derivation_path_from_detail(&as_base64).unwrap().as_deref(), Some("abc"));
+        let other = serde_json::json!({ "data": { "actions": [{ "method": "new", "args": {} }] } });
+        assert_eq!(derivation_path_from_detail(&other).unwrap(), None);
+        let no_path = serde_json::json!({ "data": { "actions": [{ "method": "request_master", "args": { "args_json": { "request": {} } } }] } });
+        assert!(derivation_path_from_detail(&no_path).is_err());
+    }
+
+    /// The live API, read only: `cargo test -- --ignored nearblocks_live`.
+    #[tokio::test]
+    #[ignore]
+    async fn nearblocks_live_testnet_vault_resolves_its_derivation_path() {
+        let vault: AccountId = VAULT.parse().unwrap();
+        let path = fetch_derivation_path_from_chain("https://api-testnet.nearblocks.io", &vault).await.unwrap();
+        assert_eq!(path, "842ff45d5fdbb8ca3279a81f6cd1ba3b3e5253386517771deeb92f68e4718128");
+    }
 }
