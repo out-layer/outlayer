@@ -1370,7 +1370,7 @@ async fn main() -> Result<()> {
     let signer = InMemorySigner::from_secret_key(cli.vault_id.clone(), secret_key);
 
     let derivation_path = if cli.from_chain {
-        let path = fetch_derivation_path_from_chain(&cli.nearblocks_url, &cli.vault_id)
+        let path = fetch_derivation_path_from_chain(&cli.nearblocks_url, &cli.vault_id, &cli.mpc_contract)
             .await
             .context(
                 "could not auto-discover derivation_path from chain — pass --derivation-path manually",
@@ -1615,10 +1615,13 @@ const CKD_METHODS: &[&str] = &["request_master", "request_app_private_key"];
 const NEARBLOCKS_MAX_PAGES: usize = 20;
 
 /// From one page of NEARblocks v3 `/v3/accounts/{vault}/txns`: the hashes of the
-/// transactions the vault signed that call a CKD method, newest first, and the
-/// cursor of the next page. List items carry `actions[{action, method}]` only;
-/// the arguments are on the detail endpoint.
-fn ckd_candidates(page: &serde_json::Value, vault_id: &str) -> Result<(Vec<String>, Option<String>)> {
+/// transactions that can carry the vault's CKD request, newest first, and the
+/// cursor of the next page. A candidate is signed by the vault, SUCCEEDED, and
+/// calls `request_master` on the vault itself (its MPC proxy) or
+/// `request_app_private_key` on the MPC contract — so a failed call, or a
+/// look-alike method on another contract, cannot supply a path. List items carry
+/// `actions[{action, method}]` only; the arguments are on the detail endpoint.
+fn ckd_candidates(page: &serde_json::Value, vault_id: &str, mpc_contract: &str) -> Result<(Vec<String>, Option<String>)> {
     if let Some(errors) = page.get("errors").filter(|e| !e.is_null()) {
         return Err(anyhow!("NEARblocks refused the transaction list: {errors}"));
     }
@@ -1629,10 +1632,14 @@ fn ckd_candidates(page: &serde_json::Value, vault_id: &str) -> Result<(Vec<Strin
     let hashes = data
         .iter()
         .filter(|t| t.get("signer_account_id").and_then(|v| v.as_str()) == Some(vault_id))
+        .filter(|t| t.get("outcomes").and_then(|o| o.get("status")).and_then(|s| s.as_bool()) == Some(true))
         .filter(|t| {
+            let receiver = t.get("receiver_account_id").and_then(|v| v.as_str());
             t.get("actions").and_then(|a| a.as_array()).is_some_and(|actions| {
-                actions.iter().any(|a| {
-                    a.get("method").and_then(|m| m.as_str()).is_some_and(|m| CKD_METHODS.contains(&m))
+                actions.iter().any(|a| match a.get("method").and_then(|m| m.as_str()) {
+                    Some("request_master") => receiver == Some(vault_id),
+                    Some("request_app_private_key") => receiver == Some(mpc_contract),
+                    _ => false,
                 })
             })
         })
@@ -1653,12 +1660,17 @@ fn derivation_path_from_detail(detail: &serde_json::Value) -> Result<Option<Stri
     if let Some(errors) = detail.get("errors").filter(|e| !e.is_null()) {
         return Err(anyhow!("NEARblocks refused the transaction detail: {errors}"));
     }
+    // `{"data": null}` is how NEARblocks answers a hash its detail index does not
+    // have (yet): not this transaction, so the next candidate is tried.
     let tx = match detail.get("data") {
-        Some(serde_json::Value::Array(items)) => items.first(),
-        Some(v @ serde_json::Value::Object(_)) => Some(v),
-        _ => None,
-    }
-    .ok_or_else(|| anyhow!("NEARblocks: no transaction in the detail answer"))?;
+        Some(serde_json::Value::Array(items)) => match items.first() {
+            Some(t) => t,
+            None => return Ok(None),
+        },
+        Some(v @ serde_json::Value::Object(_)) => v,
+        Some(serde_json::Value::Null) | None => return Ok(None),
+        Some(other) => return Err(anyhow!("NEARblocks: the detail answer's data is not a transaction: {other}")),
+    };
     let Some(actions) = tx.get("actions").and_then(|a| a.as_array()) else { return Ok(None) };
     for a in actions {
         let method = a.get("method").and_then(|m| m.as_str());
@@ -1685,23 +1697,32 @@ fn derivation_path_from_detail(detail: &serde_json::Value) -> Result<Option<Stri
     Ok(None)
 }
 
+/// GET a NEARblocks URL. The status is read before the body: a rate limit or a
+/// gateway error answers in HTML, and the HTTP code is what tells the user why.
 async fn nearblocks_get(url: &str) -> Result<serde_json::Value> {
     let resp = reqwest::get(url).await.context("query NEARblocks")?;
     let status = resp.status();
-    let body: serde_json::Value = resp.json().await.context("parse NEARblocks JSON")?;
+    let text = resp.text().await.context("read the NEARblocks answer")?;
     if !status.is_success() {
-        return Err(anyhow!("NEARblocks answered HTTP {status}: {}", body.get("errors").unwrap_or(&body)));
+        let said = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("errors").cloned())
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| text.chars().take(200).collect());
+        return Err(anyhow!("NEARblocks answered HTTP {status}: {said}"));
     }
-    Ok(body)
+    serde_json::from_str(&text).with_context(|| format!("NEARblocks answered HTTP {status} with a body that is not JSON"))
 }
 
 /// Find the vault's most recent CKD request on NEARblocks (API v3) and return
 /// its `derivation_path`: walk the vault's transactions newest first for one it
-/// signed calling `request_master` / `request_app_private_key`, then read that
-/// transaction's arguments from the detail endpoint.
+/// signed, that succeeded, calling `request_master` on itself or
+/// `request_app_private_key` on `mpc_contract`, then read that transaction's
+/// arguments from the detail endpoint.
 async fn fetch_derivation_path_from_chain(
     nearblocks_url: &str,
     vault_id: &AccountId,
+    mpc_contract: &AccountId,
 ) -> Result<String> {
     let base = nearblocks_url.trim_end_matches('/');
     let mut next: Option<String> = None;
@@ -1714,7 +1735,8 @@ async fn fetch_derivation_path_from_chain(
         }
         let url = reqwest::Url::parse_with_params(&format!("{base}/v3/accounts/{vault_id}/txns"), &params)
             .context("build the NEARblocks URL")?;
-        let (hashes, cursor) = ckd_candidates(&nearblocks_get(url.as_str()).await?, vault_id.as_str())?;
+        let (hashes, cursor) =
+            ckd_candidates(&nearblocks_get(url.as_str()).await?, vault_id.as_str(), mpc_contract.as_str())?;
         for hash in hashes {
             let detail = nearblocks_get(&format!("{base}/v3/txns/{hash}")).await?;
             if let Some(path) = derivation_path_from_detail(&detail)? {
@@ -1739,20 +1761,33 @@ mod nearblocks_v3_tests {
     use super::*;
 
     const VAULT: &str = "thr-1794084431.outlayer-alice.testnet";
+    const MPC: &str = "v1.signer-prod.testnet";
 
     /// A page of `/v3/accounts/{vault}/txns`, as NEARblocks answered it on
     /// 2026-11-08 (trimmed): list items carry `{action, method}` only.
     fn list_page() -> serde_json::Value {
         serde_json::json!({
             "data": [
-                { "transaction_hash": "CgCS8N1ysjGvgsaX6RqrEMha8vnXZkGoAzpsnQudSM9u",
-                  "signer_account_id": VAULT, "receiver_account_id": VAULT,
+                { "transaction_hash": "failed-newer",
+                  "signer_account_id": VAULT, "receiver_account_id": VAULT, "outcomes": { "status": false },
                   "actions": [{ "action": "FUNCTION_CALL", "method": "request_master" }] },
+                { "transaction_hash": "look-alike-elsewhere",
+                  "signer_account_id": VAULT, "receiver_account_id": "attacker.testnet", "outcomes": { "status": true },
+                  "actions": [{ "action": "FUNCTION_CALL", "method": "request_master" }] },
+                { "transaction_hash": "CgCS8N1ysjGvgsaX6RqrEMha8vnXZkGoAzpsnQudSM9u",
+                  "signer_account_id": VAULT, "receiver_account_id": VAULT, "outcomes": { "status": true },
+                  "actions": [{ "action": "FUNCTION_CALL", "method": "request_master" }] },
+                { "transaction_hash": "direct-to-mpc",
+                  "signer_account_id": VAULT, "receiver_account_id": MPC, "outcomes": { "status": true },
+                  "actions": [{ "action": "FUNCTION_CALL", "method": "request_app_private_key" }] },
+                { "transaction_hash": "direct-to-someone-else",
+                  "signer_account_id": VAULT, "receiver_account_id": "attacker.testnet", "outcomes": { "status": true },
+                  "actions": [{ "action": "FUNCTION_CALL", "method": "request_app_private_key" }] },
                 { "transaction_hash": "56zAceJeCWycZq3DgtbRwMbwyTqTki9num7YXNNhWDGu",
                   "signer_account_id": "outlayer-alice.testnet", "receiver_account_id": VAULT,
                   "actions": [{ "action": "CREATE_ACCOUNT", "method": null }, { "action": "FUNCTION_CALL", "method": "new" }] },
                 { "transaction_hash": "someone-elses",
-                  "signer_account_id": "stranger.testnet", "receiver_account_id": VAULT,
+                  "signer_account_id": "stranger.testnet", "receiver_account_id": VAULT, "outcomes": { "status": true },
                   "actions": [{ "action": "FUNCTION_CALL", "method": "request_master" }] }
             ],
             "meta": { "next_page": "eyJpbmRleCI6MCwic2hhcmQiOjV9+/==" }
@@ -1772,14 +1807,18 @@ mod nearblocks_v3_tests {
     }
 
     #[test]
-    fn the_list_names_only_the_vaults_own_ckd_calls_and_the_next_cursor() {
-        let (hashes, next) = ckd_candidates(&list_page(), VAULT).unwrap();
-        assert_eq!(hashes, vec!["CgCS8N1ysjGvgsaX6RqrEMha8vnXZkGoAzpsnQudSM9u".to_string()], "a stranger's call is not the vault's");
+    fn the_list_names_only_the_vaults_own_successful_ckd_calls_and_the_next_cursor() {
+        let (hashes, next) = ckd_candidates(&list_page(), VAULT, MPC).unwrap();
+        assert_eq!(
+            hashes,
+            vec!["CgCS8N1ysjGvgsaX6RqrEMha8vnXZkGoAzpsnQudSM9u".to_string(), "direct-to-mpc".to_string()],
+            "a failed call, a look-alike on another contract and a stranger's call are not candidates"
+        );
         assert_eq!(next.as_deref(), Some("eyJpbmRleCI6MCwic2hhcmQiOjV9+/=="));
         let last = serde_json::json!({ "data": [], "meta": {} });
-        assert_eq!(ckd_candidates(&last, VAULT).unwrap(), (vec![], None));
+        assert_eq!(ckd_candidates(&last, VAULT, MPC).unwrap(), (vec![], None));
         let refused = serde_json::json!({ "data": null, "errors": [{ "message": "API v1 was retired" }] });
-        assert!(ckd_candidates(&refused, VAULT).unwrap_err().to_string().contains("retired"));
+        assert!(ckd_candidates(&refused, VAULT, MPC).unwrap_err().to_string().contains("retired"));
     }
 
     #[test]
@@ -1797,6 +1836,9 @@ mod nearblocks_v3_tests {
         assert_eq!(derivation_path_from_detail(&other).unwrap(), None);
         let no_path = serde_json::json!({ "data": { "actions": [{ "method": "request_master", "args": { "args_json": { "request": {} } } }] } });
         assert!(derivation_path_from_detail(&no_path).is_err());
+        // A hash the detail index does not have yet: skipped, not fatal.
+        assert_eq!(derivation_path_from_detail(&serde_json::json!({ "data": null })).unwrap(), None);
+        assert_eq!(derivation_path_from_detail(&serde_json::json!({ "data": [] })).unwrap(), None);
     }
 
     /// The live API, read only: `cargo test -- --ignored nearblocks_live`.
@@ -1804,7 +1846,8 @@ mod nearblocks_v3_tests {
     #[ignore]
     async fn nearblocks_live_testnet_vault_resolves_its_derivation_path() {
         let vault: AccountId = VAULT.parse().unwrap();
-        let path = fetch_derivation_path_from_chain("https://api-testnet.nearblocks.io", &vault).await.unwrap();
+        let mpc: AccountId = MPC.parse().unwrap();
+        let path = fetch_derivation_path_from_chain("https://api-testnet.nearblocks.io", &vault, &mpc).await.unwrap();
         assert_eq!(path, "842ff45d5fdbb8ca3279a81f6cd1ba3b3e5253386517771deeb92f68e4718128");
     }
 }
