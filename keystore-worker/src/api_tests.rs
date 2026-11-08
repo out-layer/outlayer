@@ -514,6 +514,61 @@ mod wallet_sign_tests {
         );
     }
 
+    /// SECURITY: a Trusted artifact is signed as one plain transfer of the op's own
+    /// token and amount from this wallet, or not at all — an `add_public_key` in it
+    /// least of all. And `sign_trusted` asks before it signs.
+    #[test]
+    fn a_trusted_artifact_is_signed_only_as_the_ops_own_transfer() {
+        let op = Op::Swap {
+            token_in: "nep141:usdc.near".into(),
+            amount_in: "100".into(),
+            token_out: "nep141:wrap.near".into(),
+            min_out: "1".into(),
+        };
+        let msg = |intents: serde_json::Value, signer: &str| {
+            serde_json::json!({"signer_id": signer, "deadline": "2026-11-08T12:00:00Z", "intents": intents}).to_string()
+        };
+        let transfer = serde_json::json!([{"intent":"transfer","receiver_id":"dep.near","tokens":{"nep141:usdc.near":"100"}}]);
+        assert!(trusted_artifact_refusal(&msg(transfer.clone(), "me"), &op, "me").is_ok());
+        for (why, m) in [
+            ("add_public_key", msg(serde_json::json!([{"intent":"add_public_key","public_key":"ed25519:x"}]), "me")),
+            ("another signer", msg(transfer.clone(), "them")),
+            ("more than the op", msg(serde_json::json!([{"intent":"transfer","receiver_id":"dep.near","tokens":{"nep141:usdc.near":"101"}}]), "me")),
+            ("another token", msg(serde_json::json!([{"intent":"transfer","receiver_id":"dep.near","tokens":{"nep141:btc.near":"100"}}]), "me")),
+            ("not JSON", "transfer 100".to_string()),
+        ] {
+            match trusted_artifact_refusal(&m, &op, "me") {
+                Err(ApiError::Forbidden(text)) => assert!(text.contains("trusted op artifact refused"), "{text}"),
+                other => panic!("{why} would be signed: {:?}", other.err().map(|e| format!("{e:?}"))),
+            }
+        }
+        let src = include_str!("api.rs");
+        let body = &src[src.find("async fn sign_trusted(").expect("sign_trusted")..];
+        let before_signing = &body[..body.find("sign_nep413(").expect("signs")];
+        assert!(before_signing.contains("trusted_artifact_refusal(message, &req.op, &signer)?"),
+            "sign_trusted no longer holds the artifact to the op before signing");
+    }
+
+    /// SECURITY: the gate-only exemption lets a deposit quote through the policy;
+    /// signing it is refused, so the exemption is never a way to a real call. And
+    /// `sign_built` asks before it builds a call transaction.
+    #[test]
+    fn a_gate_only_intents_call_is_never_signed() {
+        for to in ["intents.near", "intents.far", "INTENTS.NEAR"] {
+            assert!(
+                matches!(refuse_gate_only_call(to, "cross_chain_deposit"), Err(ApiError::Forbidden(_))),
+                "{to} cross_chain_deposit would be signed"
+            );
+        }
+        assert!(refuse_gate_only_call("intents.near", "ft_withdraw").is_ok(), "the policy, not this, refuses real methods");
+        assert!(refuse_gate_only_call("usdc.near", "cross_chain_deposit").is_ok());
+        let src = include_str!("api.rs");
+        let body = &src[src.find("async fn sign_built(").expect("sign_built")..];
+        let call_arm = &body[body.find("Op::Call {").expect("the Op::Call arm")..];
+        let call_arm = &call_arm[..call_arm.find("sign_near_transaction(").expect("signs a transaction")];
+        assert!(call_arm.contains("refuse_gate_only_call(to, method)?"), "sign_built no longer refuses a gate-only call before signing");
+    }
+
     /// The wNEAR a storage deposit spends is never refunded to the wallet, so the
     /// keystore signs only the contract's minimum, for an account with no storage.
     #[test]
@@ -6255,15 +6310,27 @@ mod payment_check_multisig_tests {
         AppState::new(keystore, config, Some(near_client))
     }
 
+    /// The check's funding transfer as the coordinator builds it: one transfer of
+    /// the op's token and amount, from the wallet's own account, to the check's key.
+    fn funding_transfer(signer: &str) -> serde_json::Value {
+        json!({ "signer_id": signer, "deadline": "2099-01-01T00:00:00.000Z",
+            "intents": [{ "intent": "transfer", "receiver_id": "check-key.near", "tokens": { "nep141:usdc.near": "1000" } }] })
+    }
+
+    /// The wallet's own account: the signer every Trusted transfer must name.
+    async fn signer(state: &AppState) -> String {
+        wallet_implicit_account(state, None, WALLET_ID).await.expect("the wallet's account")
+    }
+
     /// The coordinator's sign request for a check's funding transfer: a Trusted
     /// op with the transfer artifact, and the ballot when it has one.
-    fn sign_request(approval_info: Option<serde_json::Value>) -> WalletSignRequest {
+    fn sign_request(approval_info: Option<serde_json::Value>, message: serde_json::Value) -> WalletSignRequest {
         serde_json::from_value(json!({
             "wallet_id": WALLET_ID,
             "op": check_op(),
             "approval_info": approval_info,
             "artifact": {
-                "message": json!({ "signer_id": "w", "deadline": "2099-01-01T00:00:00.000Z", "intents": [] }).to_string(),
+                "message": message.to_string(),
                 "nonce_base64": base64::encode([7u8; 32]),
                 "recipient": "intents.near",
             },
@@ -6300,7 +6367,8 @@ mod payment_check_multisig_tests {
     #[tokio::test]
     async fn a_check_on_a_multisig_wallet_is_not_signed_without_the_votes() {
         let state = chain_with_policy(multisig_policy()).await;
-        let err = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(None)))
+        let message = funding_transfer(&signer(&state).await);
+        let err = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(None, message)))
             .await
             .expect_err("a payment check on a wallet with a threshold needs the approvers");
         assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("multisig approval")), "{err:?}");
@@ -6310,7 +6378,8 @@ mod payment_check_multisig_tests {
     async fn a_check_on_a_multisig_wallet_is_signed_once_the_threshold_is_met() {
         let state = chain_with_policy(multisig_policy()).await;
         let ballot = ballot(&state).await;
-        let Json(resp) = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(Some(ballot))))
+        let message = funding_transfer(&signer(&state).await);
+        let Json(resp) = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(Some(ballot), message)))
             .await
             .expect("the approved check is signed");
         assert_eq!(resp.request_hash, shared_tee_helpers::wallet_policy::request_hash(&check_op()));
@@ -6321,10 +6390,36 @@ mod payment_check_multisig_tests {
     #[tokio::test]
     async fn a_check_on_a_wallet_without_a_threshold_is_signed_by_its_capability_alone() {
         let state = chain_with_policy(json!({ "capabilities": { "payment_check": { "allowed": true } } })).await;
-        let Json(resp) = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(None)))
+        let message = funding_transfer(&signer(&state).await);
+        let Json(resp) = wallet_sign_handler(State(state), axum::http::HeaderMap::new(), Json(sign_request(None, message)))
             .await
             .expect("no threshold: the capability decides");
         assert!(resp.signature_base58.is_some());
+    }
+
+    /// SECURITY, through the whole handler: an artifact that adds a key, or moves
+    /// more than the op, or names another signer, is refused — the policy allows
+    /// the check, the artifact is what is wrong.
+    #[tokio::test]
+    async fn a_check_artifact_other_than_its_transfer_is_never_signed() {
+        let state = chain_with_policy(json!({ "capabilities": { "payment_check": { "allowed": true } } })).await;
+        let me = signer(&state).await;
+        let with = |intents: serde_json::Value, signer: &str| {
+            json!({ "signer_id": signer, "deadline": "2099-01-01T00:00:00.000Z", "intents": intents })
+        };
+        for (why, message) in [
+            ("an added key", with(json!([{ "intent": "add_public_key", "public_key": "ed25519:DcA2MzgpJbrUATQLLceocVckhhAqrkingax4oJ9kZ847" }]), &me)),
+            ("a key beside the transfer", with(json!([
+                { "intent": "transfer", "receiver_id": "check-key.near", "tokens": { "nep141:usdc.near": "1000" } },
+                { "intent": "add_public_key", "public_key": "ed25519:DcA2MzgpJbrUATQLLceocVckhhAqrkingax4oJ9kZ847" }]), &me)),
+            ("more than the check", with(json!([{ "intent": "transfer", "receiver_id": "x.near", "tokens": { "nep141:usdc.near": "1001" } }]), &me)),
+            ("another signer", funding_transfer("someone-else.near")),
+        ] {
+            let err = wallet_sign_handler(State(state.clone()), axum::http::HeaderMap::new(), Json(sign_request(None, message)))
+                .await
+                .expect_err(why);
+            assert!(matches!(&err, ApiError::Forbidden(m) if m.contains("trusted op artifact refused")), "{why}: {err:?}");
+        }
     }
 }
 

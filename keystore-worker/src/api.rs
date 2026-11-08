@@ -5216,6 +5216,42 @@ fn build_transfer_intent_message(
     .to_string()
 }
 
+/// SECURITY: a Trusted artifact's message is signed only when it is one plain transfer
+/// that fits the op (`parse_trusted_transfer`, `trusted_transfer_fits_op`); anything
+/// else is refused in words, before the key is touched.
+fn trusted_artifact_refusal(
+    message: &str,
+    op: &shared_tee_helpers::wallet_policy::Op,
+    signer: &str,
+) -> Result<(), ApiError> {
+    use shared_tee_helpers::wallet_policy::{parse_trusted_transfer, trusted_transfer_fits_op};
+    parse_trusted_transfer(message)
+        .and_then(|t| trusted_transfer_fits_op(&t, op, signer))
+        .map_err(|why| {
+            ApiError::Forbidden(format!(
+                "trusted op artifact refused: {} — a {} is signed only as one transfer from this wallet in its own token and amount",
+                crate::signing_keys::bounded(&why, crate::signing_keys::MOST_QUOTED_ERROR),
+                op.primary_type()
+            ))
+        })
+}
+
+/// SECURITY: refuse to sign an `Op::Call` to the intents contract whose method is in
+/// `GATE_ONLY_INTENTS_METHODS`. The policy lets such an op through because the
+/// coordinator only EVALUATES it (a deposit quote); a signature for it is never
+/// wanted, and refusing here is what keeps the exemption from being a way in. See
+/// the block at `shared_tee_helpers::wallet_policy::INTENTS_CONTRACTS`.
+fn refuse_gate_only_call(to: &str, method: &str) -> Result<(), ApiError> {
+    if shared_tee_helpers::wallet_policy::is_intents_contract(to)
+        && shared_tee_helpers::wallet_policy::GATE_ONLY_INTENTS_METHODS.contains(&method)
+    {
+        return Err(ApiError::Forbidden(format!(
+            "'{method}' on '{to}' is a policy question, never a transaction"
+        )));
+    }
+    Ok(())
+}
+
 /// Build the NEP-413 intent message that registers `account_id` on the NEP-141
 /// contract `contract_id`, paid with `amount` yoctoNEAR of the signer's wNEAR inside
 /// `intents.near` — the defuse `storage_deposit` intent (`contract_id`,
@@ -5641,14 +5677,7 @@ async fn sign_built(
             } => {
             // SECURITY: a gate-only method is evaluated by the policy and never
             // signed; the policy lets it through only because it is not one.
-            // See `shared_tee_helpers::wallet_policy::GATE_ONLY_INTENTS_METHODS`.
-            if shared_tee_helpers::wallet_policy::is_intents_contract(to)
-                && shared_tee_helpers::wallet_policy::GATE_ONLY_INTENTS_METHODS.contains(&method.as_str())
-            {
-                return Err(ApiError::Forbidden(format!(
-                    "'{method}' on '{to}' is a policy question, never a transaction"
-                )));
-            }
+            refuse_gate_only_call(to, method)?;
             let to = to.clone();
             let method = method.clone();
             let args = base64::decode(args_base64)
@@ -6115,6 +6144,19 @@ async fn sign_trusted(
         )));
     }
     let nonce: [u8; 32] = nonce_bytes.try_into().unwrap();
+    // SECURITY: the message is not ours, and the intents contract executes every
+    // intent in it. It is signed only as ONE plain transfer, from this wallet, in
+    // the op's token, within the op's amount — never an `add_public_key` or any
+    // other intent that would hand the account over. See the block above
+    // `TRUSTED_TRANSFER_FIELDS` in shared-tee-helpers.
+    // The COORDINATOR holds the same message to the same shape (it reads the same
+    // `parse_trusted_transfer`) and, for 1Click's messages, to the quote's deposit
+    // address and exact amount, which only it knows: `FundingIntent::is_exactly`
+    // in outlayer-coordinator src/wallet/limit_order_handlers.rs and
+    // `held_to_the_quote` in src/wallet/confidential/handlers.rs. A shape change is
+    // made in the crate; a change to what is checked here is mirrored there.
+    let signer = wallet_implicit_account(state, customer, &req.wallet_id).await?;
+    trusted_artifact_refusal(message, &req.op, &signer)?;
     let (signature_base58, public_key) =
         sign_nep413(state, customer, &req.wallet_id, message, nonce, recipient).await?;
     let mut resp = WalletSignResponse::new(request_hash);
