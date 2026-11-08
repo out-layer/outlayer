@@ -21,18 +21,18 @@
 #
 # Also covers (the negative scenarios):
 #   A. Non-approver tries to approve → 4xx
-#   B. /reject/:id by approver → wallet_requests.status = 'rejected', no on-chain tx
+#   B. /reject/:id with the approver's signed vote → rejected, no on-chain tx
 #
 # Required env (same as bearer_near_recovery_e2e.sh):
 #   PARENT          NEAR account that owns the vault (logged into outlayer-cli)
 #   MPC_PUBLIC_KEY  bls12381g2:base58
 #   APPROVER        NEAR account that will be in the approvers list
 #                   (must have credentials in ~/.near-credentials/$NETWORK)
-#                   Default: zavodil.testnet
+#                   Default: outlayer-bob.testnet
 #
 # Run:
-#   MPC_PUBLIC_KEY=bls12381g2:... PARENT=zavodil2.testnet \
-#       APPROVER=zavodil.testnet \
+#   MPC_PUBLIC_KEY=bls12381g2:... PARENT=outlayer-alice.testnet \
+#       APPROVER=outlayer-bob.testnet \
 #       ./tests/approval_flow_e2e.sh --apply
 
 set -euo pipefail
@@ -43,8 +43,9 @@ APPLY=false
 
 NETWORK="${NETWORK:-testnet}"
 PARENT="${PARENT:-}"
-APPROVER="${APPROVER:-zavodil.testnet}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+APPROVER="${APPROVER:-outlayer-bob.testnet}"
+# The keyed FastNEAR RPC (tests/lib/rpc.sh): an RPC_URL in the environment wins.
+source "$SCRIPT_DIR/../lib/rpc.sh"
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 
 case "$NETWORK" in
@@ -86,9 +87,9 @@ if [[ "$APPLY" != true ]]; then
   exit 0
 fi
 
-RECOVERY_BIN="$SCRIPT_DIR/../scripts/customer-recovery/target/release/customer-recovery"
+RECOVERY_BIN="$SCRIPT_DIR/../../scripts/customer-recovery/target/release/customer-recovery"
 log "Building customer-recovery (need sign-nep413 + sign-bearer-near)"
-(cd "$SCRIPT_DIR/../scripts/customer-recovery" && cargo build --release --quiet) || \
+(cd "$SCRIPT_DIR/../../scripts/customer-recovery" && cargo build --release --quiet) || \
   fail "customer-recovery build failed"
 
 WHOAMI=$(outlayer whoami 2>/dev/null | awk -F': *' '/^Account:/{print $2; exit}')
@@ -120,8 +121,7 @@ SEED="apr-user-$(date +%s)-$$"
 log "2. Mint sub-wallet via Bearer near: (seed=$SEED, vault=$VAULT_ID)"
 mk_token() {
   local sd=$1 vid=$2
-  "$RECOVERY_BIN" sign-bearer-near \
-    --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$sd" \
+  CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$sd" \
     ${vid:+--vault-id "$vid"}
 }
 
@@ -135,15 +135,17 @@ WALLET_ID=$(echo "$ADDR_RESP"  | jq -r '.wallet_id')
 pass "sub-wallet $WALLET_ID  addr=$SUB_ADDR  pub=$SUB_PUB"
 
 log "3. Fund sub-wallet ($SUB_ADDR) with 0.05 NEAR from $PARENT"
-near_tty "near tokens $PARENT send-near $SUB_ADDR '0.05 NEAR' \\
+near_tty "near --quiet tokens $PARENT send-near $SUB_ADDR '0.05 NEAR' \\
   network-config $NETWORK sign-with-keychain send" || \
   fail "funding sub-wallet failed"
+VISIBLE=false
 for _ in 1 2 3 4 5 6; do
   if curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$SUB_ADDR\"}}" \
-    | jq -e '.result.amount' >/dev/null; then break; fi
-  sleep 2
+    | jq -e '.result.amount' >/dev/null; then VISIBLE=true; break; fi
+  sleep 2   # the funding transfer lands a block or two after near-cli returns
 done
+$VISIBLE || fail "sub-wallet $SUB_ADDR never appeared on chain — the funding did not land"
 pass "sub-wallet visible on chain"
 
 # ─── 4. Build + encrypt + sign + store policy ─────────────────────
@@ -271,8 +273,7 @@ APPROVE_MSG="approve:$APPROVAL_ID:$WALLET_PUBKEY:$REQUEST_HASH"
 NONCE_B64=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
 
 log "6.1 Approver ($APPROVER) signs NEP-413 message"
-APPROVER_SIG_JSON=$("$RECOVERY_BIN" sign-nep413 \
-  --private-key "$APPROVER_PRIVKEY" \
+APPROVER_SIG_JSON=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$APPROVER_PRIVKEY" "$RECOVERY_BIN" sign-nep413 \
   --message "$APPROVE_MSG" \
   --recipient "$CONTRACT_ID" \
   --nonce-base64 "$NONCE_B64")
@@ -354,8 +355,7 @@ WPK2=$(echo "$DETAILS2" | jq -r '.wallet_pubkey // empty')
 MSG2="approve:$APPROVAL_2:$WPK2:$HASH2"
 NONCE2=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
 
-PARENT_SIG_JSON=$("$RECOVERY_BIN" sign-nep413 \
-  --private-key "$PARENT_PRIVKEY" \
+PARENT_SIG_JSON=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-nep413 \
   --message "$MSG2" --recipient "$CONTRACT_ID" --nonce-base64 "$NONCE2")
 PARENT_SIG=$(echo "$PARENT_SIG_JSON" | jq -r '.signature')
 PARENT_PUB=$(echo "$PARENT_SIG_JSON" | jq -r '.public_key')
@@ -375,66 +375,57 @@ fi
 
 # ─── 9. Reject path ───────────────────────────────────────────────
 #
-# `/reject` uses standard `authenticate()` then reads
-# `body.approver_account` to identify which approver is rejecting.
-# The approver authenticates via Bearer near: (signing with their own
-# NEAR private key + any seed). Their NEAR account_id is asserted via
-# the access-key check inside `extract_near_bearer_auth`, then we
-# pass `approver_account` in the body so the handler matches it
-# against the policy's approvers list.
+# A reject is a vote: the approver signs NEP-413 over
+# `reject:<approval_id>:<wallet_pubkey>:<request_hash>` (recipient: the
+# contract), exactly as an approve is signed, and the coordinator admits it only
+# from an approver of the policy. APPROVAL_2 is still pending: step 8's vote on
+# it came from a non-approver and was refused.
 
-log "9. Approver REJECTS the approval — Bearer near: from approver + approver_account in body"
-APPROVER_SEED="reject-$(date +%s)"
-APPROVER_BEARER=$("$RECOVERY_BIN" sign-bearer-near \
-  --private-key "$APPROVER_PRIVKEY" \
-  --account-id "$APPROVER" \
-  --seed "$APPROVER_SEED")
-
+log "9. Approver REJECTS approval $APPROVAL_2 with a signed vote"
+REJ_NONCE=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+REJ_SIG_JSON=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$APPROVER_PRIVKEY" "$RECOVERY_BIN" sign-nep413 \
+  --message "reject:$APPROVAL_2:$WPK2:$HASH2" --recipient "$CONTRACT_ID" --nonce-base64 "$REJ_NONCE")
+REJ_SIG=$(echo "$REJ_SIG_JSON" | jq -r '.signature')
 REJECT_HTTP=$(curl -sS -o /tmp/apr_reject.body -w '%{http_code}' -X POST \
   "$COORDINATOR_URL/wallet/v1/reject/$APPROVAL_2" \
-  -H "Authorization: Bearer near:$APPROVER_BEARER" \
   -H 'Content-Type: application/json' \
-  -d "$(jq -nc --arg ac "$APPROVER" '{approver_account: $ac}')")
+  -d "$(jq -nc --arg sig "$REJ_SIG" --arg pk "$APPROVER_PUBKEY" --arg ac "$APPROVER" --arg nc "$REJ_NONCE" \
+       '{signature:$sig, public_key:$pk, account_id:$ac, nonce:$nc}')")
 REJECT_BODY=$(cat /tmp/apr_reject.body)
 echo "  HTTP $REJECT_HTTP body=$REJECT_BODY" >&2
 [[ "$REJECT_HTTP" == "200" ]] || \
   fail "/reject failed: HTTP $REJECT_HTTP body=$REJECT_BODY"
-pass "/reject accepted (HTTP 200) — approver rejected via Bearer near: auth"
+pass "/reject accepted (HTTP 200) — the approver's signed vote"
 
-# ─── 9.1 Non-approver tries to reject — must 4xx ──────────────────
+# ─── 9.1 Non-approver tries to reject — 403 not_approver ──────────
 #
-# Mirror the /approve negative test (Section 8): a Bearer near: caller
-# who is NOT in the policy's approvers list (here: PARENT itself, who
-# is vault.parent but not an approver) must be rejected by /reject too.
+# The mirror of step 8: PARENT signs a well-formed reject over a fresh
+# approval it is not an approver of. It is refused at the door.
 
-log "9.1 Negative: PARENT ($PARENT) is NOT an approver — /reject must reject"
-# Need a fresh approval — the one above is consumed.
+log "9.1 Negative: PARENT ($PARENT) is NOT an approver — its signed reject is refused"
 T3_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/transfer" \
   -H "Authorization: Bearer near:$(mk_token "$SEED" "$VAULT_ID")" \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg to "$PARENT" '{chain: "near", receiver_id: $to, amount: "3000000000000000000000"}')")
 APPROVAL_3=$(echo "$T3_RESP" | jq -r '.approval_id // .approval.id // empty')
 [[ -n "$APPROVAL_3" && "$APPROVAL_3" != "null" ]] || fail "third transfer didn't queue approval: $T3_RESP"
-
-# PARENT signs Bearer near: as themselves and tries to reject claiming to be the approver.
-# The policy lists APPROVER, not PARENT, so /reject must refuse.
-PARENT_SEED="reject-neg-$(date +%s)"
-PARENT_BEARER=$("$RECOVERY_BIN" sign-bearer-near \
-  --private-key "$PARENT_PRIVKEY" \
-  --account-id "$PARENT" \
-  --seed "$PARENT_SEED")
-
+DETAILS3=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$APPROVAL_3")
+HASH3=$(echo "$DETAILS3" | jq -r '.request_hash')
+WPK3=$(echo "$DETAILS3" | jq -r '.wallet_pubkey // empty')
+NEG_NONCE=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+NEG_SIG_JSON=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-nep413 \
+  --message "reject:$APPROVAL_3:$WPK3:$HASH3" --recipient "$CONTRACT_ID" --nonce-base64 "$NEG_NONCE")
 NEG_HTTP=$(curl -sS -o /tmp/apr_reject_neg.body -w '%{http_code}' -X POST \
   "$COORDINATOR_URL/wallet/v1/reject/$APPROVAL_3" \
-  -H "Authorization: Bearer near:$PARENT_BEARER" \
   -H 'Content-Type: application/json' \
-  -d "$(jq -nc --arg ac "$PARENT" '{approver_account: $ac}')")
+  -d "$(jq -nc --arg sig "$(echo "$NEG_SIG_JSON" | jq -r '.signature')" --arg pk "$(echo "$NEG_SIG_JSON" | jq -r '.public_key')" \
+       --arg ac "$PARENT" --arg nc "$NEG_NONCE" '{signature:$sig, public_key:$pk, account_id:$ac, nonce:$nc}')")
 NEG_BODY=$(cat /tmp/apr_reject_neg.body)
 echo "  HTTP $NEG_HTTP body=$NEG_BODY" >&2
-if [[ "$NEG_HTTP" =~ ^4 ]]; then
-  pass "non-approver /reject correctly refused (HTTP $NEG_HTTP)"
+if [[ "$NEG_HTTP" == 403 && "$(jq -r '.error // ""' <<<"$NEG_BODY" 2>/dev/null)" == not_approver ]]; then
+  pass "non-approver /reject refused (403 not_approver)"
 else
-  fail "non-approver /reject should be 4xx; got HTTP $NEG_HTTP body=$NEG_BODY"
+  fail "non-approver /reject should be 403 not_approver; got HTTP $NEG_HTTP body=$NEG_BODY"
 fi
 
 echo
@@ -446,6 +437,6 @@ pass "  - approver NEP-413 sig accepted (WF-3 fix: approve handler decrypted pol
 pass "  - background worker signed tx with sub-wallet's vault-derived key (WF-3 fix in resolver path)"
 pass "  - on-chain tx signer_id == sub-wallet (end-to-end vault scope preserved)"
 pass "  - non-approver rejected (4xx)"
-pass "  - /reject by Bearer-near approver accepted (HTTP 200)"
-pass "  - /reject by non-approver refused (4xx)"
+pass "  - /reject by the approver's signed vote accepted (HTTP 200)"
+pass "  - /reject by a non-approver refused (403 not_approver)"
 warn "Cleanup (optional): $VAULT_ID has 0.1 NEAR locked + on-chain policy storage stake."

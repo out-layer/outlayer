@@ -17,10 +17,10 @@
 #   N1  reject with a signature over ANOTHER request's hash is refused — the
 #       vote is bound to the operation, not just to the approval id
 #   N2  reject with no signature, and with a corrupt one, are refused
-#   N3  reject from a STRANGER over a well-formed message is stored (200):
-#       the coordinator takes the vote from anyone by design and the KEYSTORE
-#       honours a veto only from a real approver. Pins the documented split, so
-#       that "anyone can reject" and "anyone can veto" stay different claims
+#   N3  reject from a STRANGER over a well-formed message is refused at the door
+#       (403 not_approver): the coordinator admits a vote only from an approver
+#       of the policy, and the keystore checks the same again before it acts on
+#       one. A well-formed signature is not a vote by itself
 #   N4  /internal/wallet-policy-delete without the internal token is refused,
 #       and so is a wrong token
 #   N5  /internal/wallet-frozen-change, same
@@ -243,21 +243,22 @@ if [[ -n "$APPROVAL_ID" ]]; then
       || fail "N2 a corrupt signature answered $(code_of "$R"); expected 401"
   fi
 
-  # ── N3: the documented split ───────────────────────────────────────────────
-  # The coordinator stores a well-formed vote from ANYONE; only the keystore
-  # decides whose veto counts, because only it can read the approver list. If
-  # this ever starts refusing, the split has quietly moved — and if the
-  # keystore's half moves instead, anyone can silence anyone.
-  log "N3 a well-formed rejection from a non-approver is STORED, not judged"
+  # ── N3: a stranger's well-formed vote is not a vote ──────────────────────────
+  # The coordinator reads the policy's approvers before it records a vote, so a
+  # stranger's rejection never reaches the ballot — otherwise anyone could
+  # silence anyone by filing vetoes. The keystore checks the approver again.
+  log "N3 a well-formed rejection from a non-approver is refused, nothing stored"
   if ! sign_reject "$APPROVAL_ID" "$WALLET_PUBKEY" "$REQUEST_HASH"; then
     fail "N3 could not sign — the probe never reached the endpoint"
     R="000 {}"
   else
     R=$(req POST "/wallet/v1/reject/$APPROVAL_ID" "" "$(reject_body "$REJ_SIG")")
   fi
-  [[ "$(code_of "$R")" == 2?? ]] \
-    && pass "N3 stored (HTTP $(code_of "$R")) — the keystore is what honours or ignores it" \
-    || fail "N3 a well-formed vote was refused (HTTP $(code_of "$R")): $(head -c 200 <<<"$(body_of "$R")")"
+  if [[ "$(code_of "$R")" == 403 && "$(jq -r '.error // ""' <<<"$(body_of "$R")" 2>/dev/null)" == not_approver ]]; then
+    pass "N3 refused 403 not_approver"
+  else
+    fail "N3 a stranger's vote was not refused as not_approver (HTTP $(code_of "$R")): $(head -c 200 <<<"$(body_of "$R")")"
+  fi
 fi
 
 # ── N4/N5: the internal endpoints are not public ─────────────────────────────

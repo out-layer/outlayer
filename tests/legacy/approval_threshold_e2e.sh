@@ -19,13 +19,13 @@
 #
 # Required env:
 #   PARENT      vault owner, logged into outlayer-cli (NOT an approver)
-#   APPROVER1   first approver  (creds in ~/.near-credentials/$NETWORK) [default zavodil.testnet]
+#   APPROVER1   first approver  (creds in ~/.near-credentials/$NETWORK) [default outlayer-bob.testnet]
 #   APPROVER2   second approver (creds in ~/.near-credentials/$NETWORK) [REQUIRED, != PARENT/APPROVER1]
 #   MPC_PUBLIC_KEY  bls12381g2:base58 (for `outlayer vault init`)
 #
 # Run:
-#   MPC_PUBLIC_KEY=bls12381g2:... PARENT=zavodil2.testnet \
-#     APPROVER1=zavodil.testnet APPROVER2=t1.zavodil3.testnet \
+#   MPC_PUBLIC_KEY=bls12381g2:... PARENT=outlayer-alice.testnet \
+#     APPROVER1=outlayer-bob.testnet APPROVER2=outlayer-carol.testnet \
 #     ./tests/approval_threshold_e2e.sh --apply
 
 set -euo pipefail
@@ -36,9 +36,10 @@ APPLY=false
 
 NETWORK="${NETWORK:-testnet}"
 PARENT="${PARENT:-}"
-APPROVER1="${APPROVER1:-zavodil.testnet}"
+APPROVER1="${APPROVER1:-outlayer-bob.testnet}"
 APPROVER2="${APPROVER2:-}"
-RPC_URL="${RPC_URL:-https://rpc.${NETWORK}.fastnear.com}"
+# The keyed FastNEAR RPC (tests/lib/rpc.sh): an RPC_URL in the environment wins.
+source "$SCRIPT_DIR/../lib/rpc.sh"
 CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 COORDINATOR_URL="${COORDINATOR_URL:-https://testnet-api.outlayer.ai}"
 
@@ -75,9 +76,9 @@ if [[ "$APPLY" != true ]]; then
   exit 0
 fi
 
-RECOVERY_BIN="$SCRIPT_DIR/../scripts/customer-recovery/target/release/customer-recovery"
+RECOVERY_BIN="$SCRIPT_DIR/../../scripts/customer-recovery/target/release/customer-recovery"
 log "Building customer-recovery (sign-nep413 + sign-bearer-near)"
-(cd "$SCRIPT_DIR/../scripts/customer-recovery" && cargo build --release --quiet) || fail "build failed"
+(cd "$SCRIPT_DIR/../../scripts/customer-recovery" && cargo build --release --quiet) || fail "build failed"
 
 WHOAMI=$(outlayer whoami 2>/dev/null | awk -F': *' '/^Account:/{print $2; exit}')
 [[ "$WHOAMI" == "$PARENT" ]] || fail "outlayer logged in as '$WHOAMI', not '$PARENT'"
@@ -102,7 +103,7 @@ fi
 pass "vault $VAULT_ID deployed"
 
 SEED="thr-user-$(date +%s)-$$"
-mk_token() { "$RECOVERY_BIN" sign-bearer-near --private-key "$PARENT_PRIVKEY" --account-id "$PARENT" --seed "$1" ${2:+--vault-id "$2"}; }
+mk_token() { CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1" ${2:+--vault-id "$2"}; }
 
 ADDR_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" \
   -H "Authorization: Bearer near:$(mk_token "$SEED" "$VAULT_ID")")
@@ -112,7 +113,7 @@ WALLET_ID=$(echo "$ADDR_RESP" | jq -r '.wallet_id')
 pass "sub-wallet $WALLET_ID  addr=$SUB_ADDR"
 
 log "2. Fund sub-wallet with 0.05 NEAR"
-near_tty "near tokens $PARENT send-near $SUB_ADDR '0.05 NEAR' network-config $NETWORK sign-with-keychain send" || fail "funding failed"
+near_tty "near --quiet tokens $PARENT send-near $SUB_ADDR '0.05 NEAR' network-config $NETWORK sign-with-keychain send" || fail "funding failed"
 for _ in 1 2 3 4 5 6; do
   curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$SUB_ADDR\"}}" \
@@ -168,7 +169,7 @@ approve_with() {
   local acct=$1 priv=$2 pub=$3
   local msg="approve:$APPROVAL_ID:$WALLET_PUBKEY:$REQUEST_HASH"
   local nonce; nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-  local sj; sj=$("$RECOVERY_BIN" sign-nep413 --private-key "$priv" --message "$msg" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
+  local sj; sj=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$priv" "$RECOVERY_BIN" sign-nep413 --message "$msg" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce")
   local sig; sig=$(echo "$sj" | jq -r '.signature')
   curl -sS -o /tmp/thr_approve.body -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/approve/$APPROVAL_ID" \
     -H 'Content-Type: application/json' \

@@ -8,6 +8,12 @@
 #      already_registered, no amount, nothing paid
 #   S3 a withdraw dry-run to a fresh implicit account → storage_not_registered,
 #      and the message names both registering calls with the receiver
+#   S5 the REAL withdraw of 1 unit to that fresh account → 400
+#      storage_not_registered naming both registering calls; refused before
+#      anything is signed, so nothing moves
+#   S6 a native withdraw of 1 yoctoNEAR to a named account that does not exist →
+#      400 recipient_not_found (needs 1 yocto of wNEAR in intents: the native path
+#      reads the balance before the recipient). Refused before signing
 #   S4 [MONEY, SD_MONEY=1] a fresh implicit account is registered on USDC:
 #      success (or processing, polled to success), the amount is the token's
 #      storage_balance_bounds().min, the chain shows the registration, the
@@ -37,6 +43,7 @@ source "$HERE/lib/rpc.sh"
 
 PASS=0; FAIL=0
 pass() { echo "  ✓ $*"; PASS=$((PASS + 1)); }
+skip() { echo "  ∅ $*"; }
 fail() { echo "  ✗ $*"; FAIL=$((FAIL + 1)); }
 log()  { echo; echo "── $*"; }
 
@@ -92,6 +99,27 @@ if [[ "$(jq -r .reason <<<"$BODY")" == storage_not_registered ]]; then
 else
   fail "S3 HTTP $HTTP $(head -c 200 <<<"$BODY")"
 fi
+
+# ── S5, S6: the real withdraw answers the dry-run's names ────────────────────
+log "S5 the real withdraw to the unregistered account"
+post /wallet/v1/intents/withdraw "$(jq -nc --arg t "$TOKEN" --arg to "$FRESH" '{to:$to,amount:"1",token:$t,chain:"near"}')"
+if [[ "$HTTP" == 400 && "$(jq -r .error <<<"$BODY")" == storage_not_registered ]]; then
+  pass "S5 400 storage_not_registered"
+  msg=$(jq -r .message <<<"$BODY")
+  [[ "$msg" == *"POST /wallet/v1/intents/storage-deposit"* && "$msg" == *"POST /wallet/v1/storage-deposit"* && "$msg" == *"\"account_id\":\"$FRESH\""* ]] \
+    && pass "S5 the refusal names both calls with the receiver" || fail "S5 message: $msg"
+else
+  fail "S5 expected 400 storage_not_registered, got HTTP $HTTP: $(head -c 200 <<<"$BODY")"
+fi
+
+NOBODY="nobody-$(openssl rand -hex 6).near"
+log "S6 a native withdraw to $NOBODY, which does not exist"
+post /wallet/v1/intents/withdraw "$(jq -nc --arg to "$NOBODY" '{to:$to,amount:"1",token:"near",chain:"near"}')"
+case "$HTTP $(jq -r .error <<<"$BODY")" in
+  "400 recipient_not_found") pass "S6 400 recipient_not_found" ;;
+  "400 insufficient_balance") skip "S6 the wallet holds no wNEAR in intents; the native path reads the balance first" ;;
+  *) fail "S6 expected 400 recipient_not_found, got HTTP $HTTP: $(head -c 200 <<<"$BODY")" ;;
+esac
 
 # ── S4 ───────────────────────────────────────────────────────────────────────
 if [[ "${SD_MONEY:-}" != 1 ]]; then
