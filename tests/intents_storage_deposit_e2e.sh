@@ -10,10 +10,12 @@
 #      and the message names both registering calls with the receiver
 #   S5 the REAL withdraw of 1 unit to that fresh account → 400
 #      storage_not_registered naming both registering calls; refused before
-#      anything is signed, so nothing moves
+#      anything is signed, so nothing moves. If the check were broken, 1 unit of
+#      the token would go to an account nobody holds — the worst this costs
 #   S6 a native withdraw of 1 yoctoNEAR to a named account that does not exist →
 #      400 recipient_not_found (needs 1 yocto of wNEAR in intents: the native path
-#      reads the balance before the recipient). Refused before signing
+#      reads the balance before the recipient). Refused before signing; if the
+#      check were broken, 1 yoctoNEAR would be burned
 #   S4 [MONEY, SD_MONEY=1] a fresh implicit account is registered on USDC:
 #      success (or processing, polled to success), the amount is the token's
 #      storage_balance_bounds().min, the chain shows the registration, the

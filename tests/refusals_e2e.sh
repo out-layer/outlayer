@@ -247,7 +247,7 @@ if [[ -n "$APPROVAL_ID" ]]; then
   # The coordinator reads the policy's approvers before it records a vote, so a
   # stranger's rejection never reaches the ballot — otherwise anyone could
   # silence anyone by filing vetoes. The keystore checks the approver again.
-  log "N3 a well-formed rejection from a non-approver is refused, nothing stored"
+  log "N3 a well-formed rejection from a non-approver is refused at the door"
   if ! sign_reject "$APPROVAL_ID" "$WALLET_PUBKEY" "$REQUEST_HASH"; then
     fail "N3 could not sign — the probe never reached the endpoint"
     R="000 {}"
