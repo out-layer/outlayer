@@ -542,6 +542,23 @@ mod wallet_sign_tests {
                 other => panic!("{why} would be signed: {:?}", other.err().map(|e| format!("{e:?}"))),
             }
         }
+        // A spend from the confidential balance: the unshield 1Click generated on
+        // mainnet names USDC as its IMT token on the confidential chain.
+        let usdc = "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
+        let unshield = Op::Confidential {
+            flow: "unshield".into(), to: None, amount: "100000".into(), token: usdc.into(),
+            chain: None, token_out: None, min_amount_out: None,
+        };
+        let imt = |treasury: &str| {
+            msg(serde_json::json!([{"intent":"transfer","receiver_id":"dep.near",
+                "tokens":{format!("imt:{treasury}:{usdc}"):"100000"}}]), "me")
+        };
+        assert!(trusted_artifact_refusal(&imt("51e8f94d77b5e90dc9852ca6113771e11e8382ce69473a75e313e41665de7cbe"), &unshield, "me").is_ok());
+        assert!(matches!(
+            trusted_artifact_refusal(&imt("0000000000000000000000000000000000000000000000000000000000000000"), &unshield, "me"),
+            Err(ApiError::Forbidden(_))
+        ), "another treasury's token would be signed");
+
         let src = include_str!("api.rs");
         let body = &src[src.find("async fn sign_trusted(").expect("sign_trusted")..];
         let before_signing = &body[..body.find("sign_nep413(").expect("signs")];
