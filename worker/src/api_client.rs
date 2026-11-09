@@ -446,6 +446,20 @@ pub const RELAY_RETRY_DELAYS: [Duration; 7] = [
     Duration::from_secs(32),
 ];
 
+/// The pauses between the attempts of the top-up creditable check
+/// (`ApiClient::top_up_creditable`): six attempts within about half a
+/// minute, well inside the contract's yield window (200 blocks), so a short
+/// coordinator blip does not turn a NEAR top-up into a return to the swap
+/// account. A `creditable: false` is an answer, not a failure, and is not
+/// retried.
+pub const CREDITABLE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+
 /// How long one attempt of an event relay [`retry_relay`] repeats may take:
 /// with the pauses, a coordinator that hangs holds the scan three minutes at
 /// most.
@@ -1954,6 +1968,172 @@ impl ApiClient {
         }
     }
 
+    /// Whether the coordinator would credit a top-up on `(owner, nonce)`.
+    ///
+    /// Asked BEFORE the top-up is resumed on chain. A row the chain closed
+    /// (a close or delete whose chain half did not land, or landed after
+    /// this top-up was admitted) is not credited there — so the top-up is
+    /// resumed with an error instead and the contract returns it to the
+    /// payer: nothing is accepted on chain that the coordinator cannot hold.
+    /// `Err` is the transport or the coordinator itself.
+    pub async fn top_up_creditable(&self, owner: &str, nonce: u32) -> Result<(bool, String)> {
+        let url = format!("{}/payment-keys/creditable", self.base_url);
+
+        #[derive(Serialize)]
+        struct Req<'a> {
+            owner: &'a str,
+            nonce: u32,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            creditable: bool,
+            reason: String,
+        }
+
+        let response = self.add_auth_headers(self.client.post(&url))
+            .json(&Req { owner, nonce })
+            .send()
+            .await
+            .context("Failed to ask the coordinator whether the top-up is creditable")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text: String = response.text().await.unwrap_or_default().chars().take(512).collect();
+            anyhow::bail!("creditable check failed ({}): {}", status, text)
+        }
+        let r: Resp = response.json().await.context("Failed to parse the creditable answer")?;
+        Ok((r.creditable, r.reason.chars().take(512).collect()))
+    }
+
+    /// Create a RefundPaymentKey task in the coordinator queue.
+    ///
+    /// Called by the event monitor when a `RefundPaymentKey` event is detected.
+    /// A worker will poll the task, ask the coordinator for the quote and
+    /// resume the claim's yield with it.
+    pub async fn create_refund_payment_key_task(
+        &self,
+        params: RefundPaymentKeyTaskData,
+    ) -> Result<Option<i64>> {
+        let url = format!("{}/payment-keys/refund-task/create", self.base_url);
+
+        #[derive(Serialize)]
+        struct CreateRefundTaskRequest {
+            data_id: String,
+            owner: String,
+            nonce: u32,
+        }
+
+        #[derive(Deserialize)]
+        struct CreateRefundTaskResponse {
+            task_id: i64,
+            created: bool,
+        }
+
+        let request = CreateRefundTaskRequest {
+            data_id: params.data_id.clone(),
+            owner: params.owner,
+            nonce: params.nonce,
+        };
+
+        tracing::info!(
+            "📝 Creating RefundPaymentKey task: data_id={} owner={} nonce={}",
+            &params.data_id[..8.min(params.data_id.len())],
+            request.owner,
+            request.nonce
+        );
+
+        let response = self.add_auth_headers(self.client.post(&url))
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to create refund payment key task")?;
+
+        if !response.status().is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("Create refund task failed: {}", error_text)
+        }
+
+        let result: CreateRefundTaskResponse = response.json().await?;
+        if result.created {
+            Ok(Some(result.task_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Ask the coordinator what a closed payment key has left.
+    ///
+    /// `POST /payment-keys/refund-quote`. A 2xx is the quote; a 4xx is the
+    /// coordinator's refusal, carried as `RefundQuote::Refused` with its
+    /// sentence (a live key, money still in flight, no such key) — the
+    /// contract keeps the key closing on it. Anything else is an error of the
+    /// transport or the coordinator itself.
+    pub async fn refund_quote(&self, owner: &str, nonce: u32) -> Result<RefundQuote> {
+        let url = format!("{}/payment-keys/refund-quote", self.base_url);
+
+        #[derive(Serialize)]
+        struct RefundQuoteRequest<'a> {
+            owner: &'a str,
+            nonce: u32,
+        }
+
+        #[derive(Deserialize)]
+        struct RefundQuoteResponse {
+            amount_usd: String,
+            repeated: bool,
+        }
+
+        tracing::info!("💱 Asking the coordinator for a refund quote: owner={} nonce={}", owner, nonce);
+
+        let response = self.add_auth_headers(self.client.post(&url))
+            .json(&RefundQuoteRequest { owner, nonce })
+            .send()
+            .await
+            .context("Failed to ask the coordinator for a refund quote")?;
+
+        let status = response.status();
+        if status.is_client_error() {
+            // The sentence is relayed into the contract's `Error { message }`
+            // and logged there: bounded, because a log line past the chain's
+            // limit would panic the callback that keeps the key closing.
+            let why: String = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "refused without a reason".to_string())
+                .chars()
+                .take(1024)
+                .collect();
+            tracing::warn!("Refund quote refused ({}): owner={} nonce={} {}", status, owner, nonce, why);
+            return Ok(RefundQuote::Refused(why));
+        }
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("Refund quote failed ({}): {}", status, error_text)
+        }
+
+        let quote: RefundQuoteResponse = response
+            .json()
+            .await
+            .context("Failed to parse the refund quote")?;
+        // A decimal string of minimal units that fits a u128, or nothing goes
+        // to the chain.
+        let amount: u128 = quote
+            .amount_usd
+            .parse()
+            .with_context(|| format!("Refund quote is not an amount: {:?}", quote.amount_usd))?;
+        let quote = RefundQuoteResponse { amount_usd: amount.to_string(), ..quote };
+        tracing::info!(
+            "✅ Refund quote: owner={} nonce={} amount={}{}",
+            owner, nonce, quote.amount_usd, if quote.repeated { " (repeated)" } else { "" }
+        );
+        Ok(RefundQuote::Amount(quote.amount_usd))
+    }
+
     /// Notify coordinator that a wallet policy was created/updated on-chain.
     /// Coordinator will decrypt via keystore and sync authorized key hashes.
     /// Tell the coordinator a subscription was bought and paid for on chain.
@@ -2289,6 +2469,12 @@ impl ApiClient {
                         payload.task_id, payload.project_id, payload.project_uuid
                     );
                 }
+                SystemCallbackTask::RefundPaymentKey(payload) => {
+                    tracing::info!(
+                        "📥 System callback: RefundPaymentKey task_id={} owner={} nonce={}",
+                        payload.task_id, payload.owner, payload.nonce
+                    );
+                }
             }
         }
 
@@ -2614,6 +2800,9 @@ pub enum SystemCallbackTask {
     DeletePaymentKey(DeletePaymentKeyPayload),
     /// Project Storage Cleanup - clear compiled WASM and storage for deleted project
     ProjectStorageCleanup(ProjectStorageCleanupPayload),
+    /// A closed payment key's refund claim: ask the coordinator for the quote,
+    /// relay it to the contract. No keystore needed.
+    RefundPaymentKey(RefundPaymentKeyPayload),
 }
 
 /// TopUp task payload from unified queue
@@ -2645,6 +2834,37 @@ pub struct ProjectStorageCleanupPayload {
     pub project_id: String,
     pub project_uuid: String,
     pub created_at: i64,
+}
+
+/// RefundPaymentKey task payload from unified queue
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundPaymentKeyPayload {
+    pub task_id: i64,
+    pub data_id: String,
+    pub owner: String,
+    pub nonce: u32,
+    pub created_at: i64,
+}
+
+/// Data for a RefundPaymentKey task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundPaymentKeyTaskData {
+    /// data_id for yield/resume (hex encoded)
+    pub data_id: String,
+    pub owner: String,
+    pub nonce: u32,
+}
+
+/// The coordinator's answer to a refund quote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefundQuote {
+    /// What the key has left, in stablecoin minimal units, as a decimal
+    /// string: relayed to the contract, which pays at most its cap of it.
+    Amount(String),
+    /// The coordinator would not quote (the key is live, or money is still in
+    /// flight on it): the sentence, relayed to the contract as the claim's
+    /// error so the key stays closing for the owner to claim again.
+    Refused(String),
 }
 
 /// Request to store task attestation in coordinator

@@ -58,6 +58,7 @@ pub enum ContractEvent {
     ProjectTransferred(ProjectTransferredEvent),
     TopUpPaymentKey(TopUpPaymentKeyEvent),
     DeletePaymentKey(DeletePaymentKeyEvent),
+    RefundPaymentKey(RefundPaymentKeyEvent),
     WalletPolicyUpdated(WalletPolicyUpdatedEvent),
     WalletPolicyDeleted(WalletPolicyDeletedEvent),
     WalletFrozenChanged(WalletFrozenChangedEvent),
@@ -74,9 +75,19 @@ pub struct TopUpPaymentKeyEvent {
     pub encrypted_data: String,     // Current encrypted secret (base64)
 }
 
-/// DeletePaymentKey event data from SystemEvent
+/// DeletePaymentKey event data from SystemEvent. Emitted by `delete_payment_key`
+/// and by `close_payment_key`: the worker's work is the same for both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeletePaymentKeyEvent {
+    pub data_id: Vec<u8>,          // CryptoHash for yield/resume
+    pub owner: String,              // Payment Key owner
+    pub nonce: u32,                 // Payment Key nonce (profile)
+}
+
+/// RefundPaymentKey event data from SystemEvent: a closed key's owner claimed
+/// its refund; the worker asks the coordinator for the quote and resumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundPaymentKeyEvent {
     pub data_id: Vec<u8>,          // CryptoHash for yield/resume
     pub owner: String,              // Payment Key owner
     pub nonce: u32,                 // Payment Key nonce (profile)
@@ -678,6 +689,15 @@ fn relay_decision(event: &ContractEvent, delivery: Delivery, age: Age) -> Relay 
         ContractEvent::DeletePaymentKey(_) => match age.is_late() {
             Some(false) => Relay::AsIs,
             Some(true) => Relay::Drop("older than the yield window allows; the contract keeps the key — delete it again"),
+            None => Relay::Later("the chain tip could not be read to tell whether its yield is still open"),
+        },
+        // A yield too, and the quote ZEROES the key's balance in the
+        // coordinator: a quote whose yield is gone would leave the money
+        // nowhere. Late: dropped, the key stays closing, the owner claims
+        // again and the quote is given then.
+        ContractEvent::RefundPaymentKey(_) => match age.is_late() {
+            Some(false) => Relay::AsIs,
+            Some(true) => Relay::Drop("older than the yield window allows; the contract keeps the key closing — claim again"),
             None => Relay::Later("the chain tip could not be read to tell whether its yield is still open"),
         },
         // Values the coordinator applies as they come.
@@ -1539,6 +1559,11 @@ impl EventMonitor {
                     error!("Failed to handle delete_payment_key event: {}", e);
                 }
             }
+            ContractEvent::RefundPaymentKey(refund_event) => {
+                if let Err(e) = self.handle_refund_payment_key(refund_event).await {
+                    error!("Failed to handle refund_payment_key event: {}", e);
+                }
+            }
             ContractEvent::WalletPolicyUpdated(event) => {
                 if let Err(e) = self.handle_wallet_policy_updated(event).await {
                     error!("Failed to handle wallet_policy_updated event: {}", e);
@@ -1933,6 +1958,16 @@ impl EventMonitor {
                     );
 
                     Some(ContractEvent::DeletePaymentKey(event_data))
+                } else if let Some(refund_data) = system_event.get("RefundPaymentKey") {
+                    let event_data: RefundPaymentKeyEvent =
+                        serde_json::from_value(refund_data.clone()).ok()?;
+
+                    info!(
+                        "✅ Found system_event RefundPaymentKey at block {}: owner={} nonce={}",
+                        block_height, event_data.owner, event_data.nonce
+                    );
+
+                    Some(ContractEvent::RefundPaymentKey(event_data))
                 } else if let Some(cleanup_data) = system_event.get("ProjectStorageCleanup") {
                     let mut event_data: ProjectStorageCleanupEvent =
                         serde_json::from_value(cleanup_data.clone()).ok()?;
@@ -2347,6 +2382,50 @@ impl EventMonitor {
             Err(e) => {
                 error!(
                     "❌ Failed to create TopUp task: {}. data_id={} owner={}",
+                    e, data_id_hex, event.owner
+                );
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle RefundPaymentKey event by creating task in coordinator
+    ///
+    /// The worker will pick up this task and:
+    /// 1. Ask the coordinator for the key's refund quote
+    /// 2. Resume the claim through resume_delete_payment_key with the quote
+    async fn handle_refund_payment_key(&self, event: RefundPaymentKeyEvent) -> Result<()> {
+        info!(
+            "💸 Processing RefundPaymentKey event: owner={} nonce={}",
+            event.owner, event.nonce
+        );
+
+        let data_id_hex = hex::encode(&event.data_id);
+
+        let params = crate::api_client::RefundPaymentKeyTaskData {
+            data_id: data_id_hex.clone(),
+            owner: event.owner.clone(),
+            nonce: event.nonce,
+        };
+
+        match self.api_client.create_refund_payment_key_task(params).await {
+            Ok(Some(task_id)) => {
+                info!(
+                    "✅ RefundPaymentKey task created: task_id={} data_id={} owner={}",
+                    task_id, data_id_hex, event.owner
+                );
+            }
+            Ok(None) => {
+                info!(
+                    "ℹ️  RefundPaymentKey task already exists (duplicate): data_id={}",
+                    data_id_hex
+                );
+            }
+            Err(e) => {
+                error!(
+                    "❌ Failed to create RefundPaymentKey task: {}. data_id={} owner={}",
                     e, data_id_hex, event.owner
                 );
                 return Err(e);
@@ -3589,6 +3668,10 @@ mod late_and_out_of_order {
         ContractEvent::DeletePaymentKey(DeletePaymentKeyEvent { data_id: vec![2; 32], owner: OWNER.to_string(), nonce: 3 })
     }
 
+    fn refund() -> ContractEvent {
+        ContractEvent::RefundPaymentKey(RefundPaymentKeyEvent { data_id: vec![3; 32], owner: OWNER.to_string(), nonce: 3 })
+    }
+
     fn wallet_events() -> Vec<ContractEvent> {
         vec![
             ContractEvent::WalletPolicyUpdated(WalletPolicyUpdatedEvent {
@@ -3669,6 +3752,10 @@ mod late_and_out_of_order {
             assert_eq!(relay_decision(&delete(), delivery, ON_TIME), Relay::AsIs);
             assert!(matches!(relay_decision(&delete(), delivery, LATE), Relay::Drop(_)));
             assert!(matches!(relay_decision(&delete(), delivery, Age::Unknown), Relay::Later(_)));
+            // A refund claim is a yield like a delete, and its quote moves money.
+            assert_eq!(relay_decision(&refund(), delivery, ON_TIME), Relay::AsIs);
+            assert!(matches!(relay_decision(&refund(), delivery, LATE), Relay::Drop(_)));
+            assert!(matches!(relay_decision(&refund(), delivery, Age::Unknown), Relay::Later(_)));
         }
     }
 

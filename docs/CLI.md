@@ -273,7 +273,9 @@ Payment keys pay for HTTPS API calls.
 | `outlayer keys list` | List keys with balances |
 | `outlayer keys balance <nonce>` | Balance, spent, reserved, initial |
 | `outlayer keys topup <nonce> --usd <amount>` | Top up with the stablecoin (any network) |
-| `outlayer keys delete <nonce>` | Delete key: the storage deposit is refunded, the remaining balance is forfeited |
+| `outlayer keys close <nonce>` | Stop the key and start its refund: no new calls, a 24 h settlement wait, then `keys claim` |
+| `outlayer keys claim <nonce>` | Claim a closed key's refund: the unspent stablecoin deposited on chain after the ledger's release comes back to the owner, the key is deleted and its storage deposit refunded |
+| `outlayer keys delete <nonce>` | Delete key: the storage deposit is refunded, the remaining balance is forfeited (use `keys close` to get it back) |
 | `outlayer keys trial-key [--api-key wk_...]` | Print a custody wallet's nonce-0 key (trial or sponsored); it is derived, so it is read again rather than stored |
 | `outlayer redeem <spn_...> [--api-key wk_...] [--payment-key owner:0:key]` | Redeem a sponsor code: a subscription on the wallet's nonce-0 key, paid by the sponsor; stdout is the key. `--payment-key` sends a nonce-0 key issued at random, which cannot be read again, as the proof that binds it; the answer is the derived key that replaces it |
 

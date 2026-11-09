@@ -424,9 +424,13 @@ that does not exist, fails the transfer — which returns the money.
 
 `top_up_payment_key_with_token` exists in the contract ABI but is disabled: it panics.
 
-### Deleting Payment Keys
+### Deleting and refunding Payment Keys
 
-`delete_payment_key(nonce)` — yield/resume flow. Coordinator deletes key data and returns remaining balance.
+`delete_payment_key(nonce)` — yield/resume flow. The coordinator soft-deletes the key, the contract removes the secret and refunds its storage deposit. The remaining balance is forfeited.
+
+`close_payment_key(nonce)` → 24 h → `claim_payment_key_refund(nonce)` — the refund path. The close stops the key (the same coordinator soft-delete) and marks it closing on chain; the claim yields for the coordinator's quote of what is left (`POST /payment-keys/refund-quote`, refused while anything is reserved or pending on the key; grants are spent first and never refunded) and the contract pays `min(quoted, cap)`, where the cap is the contract's own ledger of the stablecoin top-ups it accepted on the key minus what it already refunded. Nothing the chain did not see deposited — a grant, a sponsor code, a trial — can leave it. Keys from before the ledger start at zero: only later deposits are refundable. Views: `get_payment_key_refund_ledger`, `get_closing_payment_key_count`.
+
+`withdraw_balance(amount)` — the `deposit_balance` stablecoin balance back to its owner: debit, `ft_transfer`, credit back on failure; one in flight per account.
 
 ### HTTPS API
 

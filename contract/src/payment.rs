@@ -381,6 +381,12 @@ pub enum TopUpResult {
 }
 
 /// Result of delete operation (sent via yield/resume)
+///
+/// Also the answer to a close and to a refund claim: the three yields are all
+/// resumed through `resume_delete_payment_key`, because that is the method the
+/// workers' access keys are scoped to (register-contract) — a new resume
+/// method would need every worker re-registered. Each callback accepts the
+/// variants that answer ITS question and logs the others without acting.
 #[derive(Clone, Debug)]
 #[near(serializers = [borsh, json])]
 pub enum DeletePaymentKeyResult {
@@ -388,6 +394,9 @@ pub enum DeletePaymentKeyResult {
     Success,
     /// Error - contains error message
     Error { message: String },
+    /// The coordinator's quote of what a closed key has left, for a refund
+    /// claim. The contract pays at most its own cap of it.
+    Refund { amount: U128 },
 }
 
 /// Gas for on_delete_payment_key_response callback
@@ -405,8 +414,18 @@ pub enum SystemEvent {
         amount: U128,
         encrypted_data: String, // current encrypted secret (base64)
     },
-    /// Payment Key delete request
+    /// Payment Key delete request. Also emitted by `close_payment_key`: the
+    /// worker's work is the same (soft-delete in the coordinator, resume), only
+    /// the yield's callback differs.
     DeletePaymentKey {
+        data_id: CryptoHash,
+        owner: AccountId,
+        nonce: u32,
+    },
+    /// A closed payment key's owner claims its refund: the worker asks the
+    /// coordinator what the key has left and resumes with
+    /// `DeletePaymentKeyResult::Refund` or `Error`.
+    RefundPaymentKey {
         data_id: CryptoHash,
         owner: AccountId,
         nonce: u32,
@@ -574,6 +593,12 @@ impl Contract {
 
     /// Callback after worker processes top-up via yield/resume
     /// Returns U128 - amount to refund (0 = accept all, amount = refund all)
+    ///
+    /// Money that cannot land on the key goes back to whoever sent it, by
+    /// NEP-141 — the one return rule, with no case analysis on who the sender
+    /// was. A NEAR top-up is delivered by the swap account, so a key that
+    /// closes while its swap is in progress sends the stablecoin back there;
+    /// the site, the CLI and the docs say so, and the contract stays simple.
     #[private]
     pub fn on_top_up_response(
         &mut self,
@@ -582,6 +607,9 @@ impl Contract {
         amount: U128, // amount to refund on error
         #[callback_result] result: Result<TopUpResult, PromiseError>,
     ) -> U128 {
+        // First, in every branch: this top-up is no longer in flight, and the
+        // key may be closed or deleted again.
+        self.note_top_up_settled(&owner, nonce);
         match result {
             Ok(TopUpResult::Success { new_encrypted_data }) => {
                 // Build secret key
@@ -590,6 +618,20 @@ impl Contract {
                     profile: nonce.to_string(),
                     owner: owner.clone(),
                 };
+
+                // A key that closed while this top-up was in flight takes no
+                // money: the coordinator has stopped reading its row, and the
+                // refund is capped to what the chain counted — so the tokens go
+                // back to the payer here rather than being counted anywhere.
+                if self.payment_key_is_closing(&owner, nonce) {
+                    log!(
+                        "TopUp refused: payment key is closing: owner={}, nonce={}, amount={} returned",
+                        owner,
+                        nonce,
+                        amount.0
+                    );
+                    return amount;
+                }
 
                 // Get existing profile to preserve metadata
                 if let Some(mut profile) = self.secrets_storage.get(&secret_key) {
@@ -607,6 +649,10 @@ impl Contract {
 
                     // Save updated profile
                     self.secrets_storage.insert(&secret_key, &profile);
+
+                    // The chain's own count of what this owner deposited on the
+                    // key — the cap on any later refund of it.
+                    self.record_user_funded(&owner, nonce, amount.0);
 
                     log!(
                         "Payment key topped up: owner={}, nonce={}, amount={}",
@@ -702,11 +748,8 @@ impl Contract {
     pub fn delete_payment_key(&mut self, nonce: u32) {
         let caller = env::predecessor_account_id();
 
-        // Require 1 yoctoNEAR for security (prevent accidental calls)
-        assert!(
-            env::attached_deposit().as_yoctonear() >= 1,
-            "Requires attached deposit of at least 1 yoctoNEAR"
-        );
+        // Exactly 1 yoctoNEAR: a wallet's confirmation, and nothing kept.
+        near_sdk::assert_one_yocto();
 
         // Build secret key for Payment Key
         let secret_key = SecretKey {
@@ -722,6 +765,10 @@ impl Contract {
             caller,
             nonce
         );
+        // Not while a top-up is still to be answered, nor while another close
+        // or delete is: see `refunds::KeyFlight`.
+        self.assert_no_top_up_in_flight(&caller, nonce);
+        self.assert_no_other_close_pending(&caller, nonce);
 
         // Create callback data
         let callback_data = json!({
@@ -743,6 +790,9 @@ impl Contract {
             .expect("Failed to read data_id")
             .try_into()
             .expect("Invalid data_id");
+
+        // No top-up lands until this is answered.
+        self.note_close_pending(&caller, nonce);
 
         // Emit event for worker to process
         self.emit_system_event(SystemEvent::DeletePaymentKey {
@@ -769,6 +819,9 @@ impl Contract {
         nonce: u32,
         #[callback_result] result: Result<DeletePaymentKeyResult, PromiseError>,
     ) {
+        // First, in every branch: the delete is answered, top-ups are
+        // admitted again (a deleted key refuses them for want of a secret).
+        self.note_close_settled(&owner, nonce);
         match result {
             Ok(DeletePaymentKeyResult::Success) => {
                 // Build secret key
@@ -786,12 +839,21 @@ impl Contract {
 
                 // Delete secret from contract storage (refunds storage deposit)
                 // A payment key is owned by the account that created it, and the
-                // storage deposit goes back to that same account.
-                self.delete_secrets_internal(secret_key, &owner, &owner);
+                // storage deposit goes back to that same account. A refund claim
+                // answered first has already retired the secret: nothing to do.
+                if self.secrets_storage.get(&secret_key).is_some() {
+                    self.delete_secrets_internal(secret_key, &owner, &owner);
+                } else {
+                    log!("Payment key secret already gone: owner={}, nonce={}", owner, nonce);
+                }
 
                 // Its nonce stays used. A key created before the floor existed
                 // has no entry yet; this is where it gets one.
                 self.raise_payment_key_nonce_floor(&owner, nonce);
+
+                // A delete forfeits the balance: the ledger goes with the key,
+                // and a closing key deleted this way leaves the closing count.
+                self.remove_refund_ledger(&owner, nonce);
 
                 log!(
                     "Payment key deleted: owner={}, nonce={}",
@@ -807,6 +869,14 @@ impl Contract {
                     message
                 );
                 // Don't delete on error - key remains valid
+            }
+            Ok(DeletePaymentKeyResult::Refund { amount }) => {
+                log!(
+                    "DeletePaymentKey answered with a refund amount ({}): not a delete answer; the key stays: owner={}, nonce={}",
+                    amount.0,
+                    owner,
+                    nonce
+                );
             }
             Err(_) => {
                 log!(
@@ -929,6 +999,7 @@ impl Contract {
             self.secrets_storage.get(&secret_key).is_some(),
             "Payment key not found. Create it first with store_secrets()"
         );
+        self.assert_payment_key_not_closing(&caller, nonce);
 
         // Verify we have enough reserved for ft_transfer (1 yocto) + base_fee
         let ft_transfer_deposit: u128 = 1;
@@ -1163,6 +1234,15 @@ impl Contract {
     /// Handle stablecoin deposit to user's balance
     /// Used for attached_usd payments to project developers
     fn handle_deposit_balance(&mut self, sender_id: AccountId, amount: U128) {
+        // The same floor as a key top-up. Below it a deposit buys a map entry
+        // at the contract's storage cost and nothing a call could spend;
+        // refusing returns the whole transfer through NEP-141.
+        assert!(
+            amount.0 >= MIN_TOP_UP_AMOUNT,
+            "Minimum deposit is $0.01 ({} minimal units)",
+            MIN_TOP_UP_AMOUNT
+        );
+
         // Add to user's stablecoin balance
         let current = self.user_stablecoin_balances.get(&sender_id).unwrap_or(0);
         self.user_stablecoin_balances.insert(&sender_id, &(current + amount.0));
@@ -1180,10 +1260,16 @@ impl Contract {
         keep_everything();
     }
 
-    /// Handle Payment Key top-up with yield/resume
+    /// Handle Payment Key top-up with yield/resume.
+    ///
+    /// A top-up that cannot land — no such key, a closing key — is refused by
+    /// a panic, and NEP-141 returns the transfer to its sender. That is the
+    /// whole return rule: a top-up somebody else delivers for the owner (the
+    /// swap account of a NEAR top-up) goes back to that sender, and the
+    /// owner is told not to close a key with a top-up in progress.
     fn handle_top_up(
         &mut self,
-        sender_id: AccountId,
+        owner: AccountId,
         amount: U128,
         nonce: u32,
     ) {
@@ -1198,16 +1284,21 @@ impl Contract {
         let secret_key = SecretKey {
             accessor: SecretAccessor::System(SystemSecretType::PaymentKey),
             profile: nonce.to_string(),
-            owner: sender_id.clone(),
+            owner: owner.clone(),
         };
 
         // Get existing secret
         let secret_profile = self.secrets_storage.get(&secret_key)
             .expect("Payment key not found. Create it first with store_secrets()");
 
+        // A closing key takes no money, nor one whose close or delete is
+        // waiting for its answer; the refusal returns the transfer.
+        self.assert_payment_key_not_closing(&owner, nonce);
+        self.assert_no_close_pending(&owner, nonce);
+
         // Create callback data
         let callback_data = json!({
-            "owner": sender_id,
+            "owner": owner,
             "nonce": nonce,
             "amount": amount,
         });
@@ -1227,10 +1318,14 @@ impl Contract {
             .try_into()
             .expect("Invalid data_id");
 
+        // In flight from here until the callback runs: the key is closed or
+        // deleted only once it has.
+        self.note_top_up_admitted(&owner, nonce);
+
         // Emit event for worker to process
         self.emit_system_event(SystemEvent::TopUpPaymentKey {
             data_id,
-            owner: sender_id.clone(),
+            owner: owner.clone(),
             nonce,
             amount,
             encrypted_data: secret_profile.encrypted_secrets,
@@ -1238,7 +1333,7 @@ impl Contract {
 
         log!(
             "TopUp requested: owner={}, nonce={}, amount={}",
-            sender_id,
+            owner,
             nonce,
             amount.0
         );

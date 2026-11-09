@@ -5,6 +5,9 @@ pub mod execution_tests;
 pub mod secrets_tests;
 
 #[cfg(test)]
+pub mod refund_tests;
+
+#[cfg(test)]
 use crate::*;
 #[cfg(test)]
 use near_sdk::test_utils::{accounts, VMContextBuilder};

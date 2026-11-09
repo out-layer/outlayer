@@ -570,6 +570,17 @@ impl Contract {
         let accessor = canonical_accessor(accessor);
         let profile = canonical_profile(&accessor, profile);
 
+        // A payment key has a lifecycle this door knows nothing of: a
+        // coordinator row, a refund ledger, a closing count. Removed here it
+        // would leave the row live with a balance nobody can refund and the
+        // ledger stranded. Its two doors are `delete_payment_key` (balance
+        // forfeited) and `close_payment_key` (balance refunded).
+        assert!(
+            !matches!(accessor, SecretAccessor::System(_)),
+            "A payment key is not deleted here. Use delete_payment_key (its balance is \
+             forfeited) or close_payment_key (its balance is refunded)."
+        );
+
         let key = SecretKey {
             accessor: accessor.clone(),
             profile: profile.clone(),
@@ -2254,6 +2265,9 @@ impl Contract {
             let nonce: u32 = profile.parse()
                 .expect("PaymentKey profile must be a valid u32 nonce");
             self.raise_payment_key_nonce_floor(&owner, nonce);
+            // The chain's ledger of this key's money, at zero; its bytes are in
+            // the deposit just taken (`calculate_secret_storage_size`).
+            self.create_refund_ledger(&owner, nonce);
             self.emit_system_event(SystemEvent::TopUpPaymentKey {
                 data_id: [0u8; 32], // No yield promise - dummy data_id
                 owner: owner.clone(),
@@ -2395,7 +2409,17 @@ impl Contract {
             0
         };
 
-        BASE_STORAGE_OVERHEAD + key_size + value_size + index_overhead + binding_overhead
+        // A payment key carries its refund ledger entry
+        // (`payment_key_refund_ledger`), created with the key and dropped with
+        // it, so its bytes are in the key's deposit and come back with it.
+        let ledger_overhead = match &key.accessor {
+            SecretAccessor::System(SystemSecretType::PaymentKey) => {
+                crate::refunds::refund_ledger_entry_bytes(&key.owner)
+            }
+            _ => 0,
+        };
+
+        BASE_STORAGE_OVERHEAD + key_size + value_size + index_overhead + binding_overhead + ledger_overhead
     }
 }
 

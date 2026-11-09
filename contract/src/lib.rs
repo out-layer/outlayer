@@ -1,5 +1,5 @@
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
-use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
+use near_sdk::collections::{LookupMap, LookupSet, UnorderedMap, UnorderedSet};
 use near_sdk::json_types::U128;
 use near_sdk::serde::Serialize;
 use near_sdk::serde_json;
@@ -15,6 +15,7 @@ mod execution;
 mod migration;
 mod payment;
 mod projects;
+mod refunds;
 mod secrets;
 mod types;
 mod views;
@@ -131,6 +132,16 @@ enum StorageKey {
     ProjectTransferAcceptances,
     // A wallet policy's version and lock (wallet_pubkey -> PolicyMeta)
     PolicyMeta,
+    // What the chain has seen deposited on each payment key, what it has paid
+    // back, and whether the key is closing (PaymentKeyId -> RefundLedger)
+    PaymentKeyRefundLedger,
+    // Accounts with a `withdraw_balance` transfer in flight
+    Withdrawing,
+    // How many of an owner's payment keys are closing (owner -> count)
+    ClosingCounts,
+    // What is in flight on a payment key: open top-up yields, an open refund
+    // claim, the last claim's time (PaymentKeyId -> KeyFlight)
+    PaymentKeyFlight,
 }
 
 /// Execution source - GitHub repo, pre-compiled WASM URL, or project reference
@@ -658,6 +669,26 @@ pub struct Contract {
     // so existing borsh entries read unchanged. Absent: version 0, unlocked.
     // See `wallet::PolicyMeta`.
     policy_meta: LookupMap<String, wallet::PolicyMeta>,
+
+    // The contract's own ledger of each payment key's money: what its owner
+    // deposited on chain, what was paid back, and whether the key is closing.
+    // The cap on every refund — see `refunds::RefundLedger`. Absent: nothing
+    // deposited since the ledger exists, nothing refundable, not closing.
+    payment_key_refund_ledger: LookupMap<refunds::PaymentKeyId, refunds::RefundLedger>,
+
+    // Accounts with a `withdraw_balance` transfer in flight: one at a time per
+    // account, cleared by the transfer's callback.
+    withdrawing: LookupSet<AccountId>,
+
+    // How many payment keys each owner has closing at once; bounded by
+    // `refunds::MAX_CLOSING_KEYS_PER_OWNER`.
+    closing_counts: LookupMap<AccountId, u32>,
+
+    // What is in flight on a payment key: top-up yields not yet answered, a
+    // refund claim not yet answered, the last claim's time. A key is closed or
+    // deleted only with nothing in flight — see `refunds::KeyFlight`. Beside
+    // the ledger, not in it: borsh has no schema evolution.
+    payment_key_flight: LookupMap<refunds::PaymentKeyId, refunds::KeyFlight>,
 }
 
 #[near_bindgen]
@@ -712,6 +743,10 @@ impl Contract {
             storage_refund_to: LookupMap::new(StorageKey::StorageRefundTo),
             project_transfer_acceptances: LookupMap::new(StorageKey::ProjectTransferAcceptances),
             policy_meta: LookupMap::new(StorageKey::PolicyMeta),
+            payment_key_refund_ledger: LookupMap::new(StorageKey::PaymentKeyRefundLedger),
+            withdrawing: LookupSet::new(StorageKey::Withdrawing),
+            closing_counts: LookupMap::new(StorageKey::ClosingCounts),
+            payment_key_flight: LookupMap::new(StorageKey::PaymentKeyFlight),
         }
     }
 

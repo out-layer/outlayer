@@ -192,10 +192,14 @@ alone, to be followed by `resolve_execution`; worker keys are not scoped to it.
 #### `resume_topup` / `resume_delete_payment_key`
 
 `resume_topup(data_id, result)` and `resume_delete_payment_key(data_id, result)`
-— operator. Resume the yields of a payment-key top-up and delete; `data_id` is
-hex. `result` is `{"Success": {"new_encrypted_data"}}` / `{"Error": {"message"}}`
-for a top-up, `"Success"` / `{"Error": {"message"}}` for a delete. Both panic
-when no yield is waiting (it timed out and was settled, or was already
+— operator. Resume the yields of a payment-key top-up, and of a payment-key
+delete, close or refund claim; `data_id` is hex. `result` is `{"Success":
+{"new_encrypted_data"}}` / `{"Error": {"message"}}` for a top-up;
+`"Success"` / `{"Error": {"message"}}` for a delete or a close; `{"Refund":
+{"amount": "<minimal units>"}}` / `{"Error": {"message"}}` for a refund claim
+(the contract pays at most its own cap of `amount`). Each callback acts only
+on the variants that answer its question and logs the others. Both methods
+panic when no yield is waiting (it timed out and was settled, or was already
 resumed).
 
 ### Owner Functions
@@ -243,7 +247,11 @@ near call outlayer.testnet set_pricing '{"base_fee": "1000000000000000000000"}' 
 | `get_priced_projects(from_index?, limit?)` / `get_priced_project_count()` | Priced project ids (default 100, at most 500 per page) |
 | `get_developer_earnings(account_id)` | Stablecoin earned and not withdrawn |
 | `get_user_stablecoin_balance(account_id)` | Stablecoin available for `attached_usd` |
-| `get_storage_version()` | The state layout the code expects (`"12"`) |
+| `is_withdrawing(account)` | Whether a `withdraw_balance` transfer of the account is in flight |
+| `get_payment_key_refund_ledger(owner, nonce)` | `{user_funded, refunded, refundable_cap, closing_since?, claimable_at?}` — what the chain saw deposited on the key since the ledger exists, what it paid back, and the close clock; `null` for a pre-ledger key never topped up or closed since |
+| `get_closing_payment_key_count(owner)` | How many of the owner's keys are closing (at most 20) |
+| `get_payment_key_flight(owner, nonce)` | `{top_ups_in_flight, last_top_up_height, close_pending, claim_open, last_claim_at, next_claim_at?}` — top-up yields not yet answered (the key is closed or deleted only at zero), a close or delete not yet answered (the key takes no top-up until it is), and the claim in flight / cooldown; `null` when nothing is |
+| `get_storage_version()` | The state layout the code expects (`"13"`) |
 
 ```bash
 near view outlayer.testnet get_request '{"request_id": 123}'
@@ -255,11 +263,23 @@ The configured stablecoin arrives through NEP-141 `ft_transfer_call` to this
 contract; `ft_on_transfer` refuses any other token. `msg` is one of:
 
 - `{"action": "deposit_balance"}` — credits the sender's balance for
-  `attached_usd`.
+  `attached_usd` (at least 10000 = $0.01; less refuses the whole transfer).
 - `{"action": "top_up_payment_key", "nonce": N, "owner": "<optional>"}` — tops
   up a payment key (at least 10000 = $0.01; `owner` defaults to the sender).
   The worker re-encrypts the key's balance and resumes; a failure or a timeout
-  returns the tokens.
+  returns the tokens. A top-up that cannot land — no such key, a closing key,
+  a failure, a timeout — goes back to its SENDER, whoever that is: that is
+  the one return rule. A NEAR top-up is delivered by the swap account, so do
+  not close a key while a NEAR top-up of it is in progress — the swapped
+  stablecoin would go back to the swap account, not to you. While a top-up is
+  admitted and not yet answered the key can be neither closed nor deleted,
+  and while a close or a delete is not yet answered the key takes no top-up
+  (`get_payment_key_flight`): the two exclude each other both ways, so
+  whichever order the workers answer in, a top-up is never returned by the
+  chain and credited off chain. The worker also asks the coordinator, before
+  resuming a top-up, whether it will credit the key; a key the chain has
+  closed is answered no, and the top-up is resumed with an error and
+  returned to the payer.
 - `{"action": "buy_subscription", "nonce": N, "plan": P, "owner": "<optional>"}` —
   buys plan `P` for an existing key. A payment short of the plan, an unknown or
   withdrawn plan, or a missing key refuses the whole transfer; an overpayment
@@ -267,6 +287,14 @@ contract; `ft_on_transfer` refuses any other token. `msg` is one of:
 
 `withdraw_developer_earnings()` (payable, at least 1 yoctoNEAR) transfers the
 caller's whole earnings balance; the balance is restored if the transfer fails.
+
+`withdraw_balance(amount)` (payable, exactly 1 yoctoNEAR) transfers `amount`
+of the caller's stablecoin balance back to the caller: at least 10000 = $0.01,
+at most the balance, one transfer in flight per account (`is_withdrawing`).
+The balance is debited first and credited back if the transfer fails — the
+balance is already net of every pending request, so nothing can spend it in
+between. A caller not registered on the token sees the transfer fail and the
+balance restored; `storage_deposit` on the token, then withdraw again.
 
 ### Project Functions
 
@@ -660,11 +688,54 @@ floor entry is recorded when it is deleted. Its entry is paid once, by the
 owner's first key (included in `estimate_storage_cost`), and is not refunded:
 it outlives every key.
 
-- `delete_payment_key(nonce)` (payable, at least 1 yoctoNEAR) — yields until
+- `delete_payment_key(nonce)` (payable, exactly 1 yoctoNEAR) — yields until
   the worker has deleted the key in the coordinator (`DeletePaymentKey` event,
   `resume_delete_payment_key`), then removes the row and refunds its storage
-  deposit. The key's unspent balance is not returned. On an error or a timeout
-  the key stays.
+  deposit. The key's unspent balance is not returned: this is the "I do not
+  want the money" path; the refund path is `close_payment_key` below. Refused
+  while a top-up of the key is in flight ("retry once they have settled"). On
+  an error or a timeout the key stays. `delete_secrets` refuses a payment key:
+  these two are its only doors.
+
+#### Refund of a key's unspent balance
+
+Two transactions, because the amount is known only once every call in flight
+on the key has settled, and that can take longer than a yield lives.
+
+- `close_payment_key(nonce)` (payable, exactly 1 yoctoNEAR) — yields until
+  the worker has soft-deleted the key in the coordinator (the same
+  `DeletePaymentKey` event and task as a delete), then marks the key *closing*
+  on chain: from here it takes no calls and no top-up (`ft_on_transfer` and
+  `top_up_payment_key_with_near` refuse it), its nonce is used, and the secret
+  stays until the refund is claimed. Refused for a key already closing, while
+  a top-up of the key is in flight (the top-up's answer would return the money
+  while the coordinator credits it), while another close or delete of the key
+  is waiting for its answer, and once the owner has 20 keys closing.
+  On an error or a timeout the key stays live.
+- `claim_payment_key_refund(nonce)` (payable, exactly 1 yoctoNEAR) — accepted
+  24 h after the close (`claimable_at` in `get_payment_key_refund_ledger`),
+  one claim in flight at a time and a day between two claims of one key
+  (`next_claim_at` in `get_payment_key_flight`). Yields until the worker has
+  asked the coordinator what the key has left (`RefundPaymentKey` event; the
+  coordinator refuses while anything is still reserved or pending on the key,
+  and the key stays closing — claim again the next day). On a quote the
+  contract pays **`min(quoted, cap)`** — nothing below 10000 = $0.01 —
+  removes the secret and refunds its storage deposit; the value returned is
+  what was paid, in stablecoin minimal units. If the stablecoin transfer fails
+  (the owner is not registered on the token) the key is closing again from
+  its original close and the claim can be repeated after `storage_deposit`,
+  the next day.
+
+**The cap** is the contract's own ledger of the key: `user_funded`, the sum of
+the stablecoin top-ups `ft_on_transfer` accepted on the key (including the
+swapped amount of a NEAR top-up), minus `refunded`. The chain never sees a
+grant, a sponsor's gift or a trial — those are coordinator rows — so none of
+them can leave the contract whatever a worker or the coordinator reports; the
+coordinator also quotes grants-first on its side. A key that existed before the
+ledger did starts at zero: only deposits made after the ledger's release are
+refundable; a quote above the cap is logged (`refund capped`) and paid at the
+cap. The ledger entry's bytes are part of the key's storage deposit
+(`estimate_storage_cost`) and come back with it.
 - Top-up with the stablecoin: `ft_on_transfer` with `top_up_payment_key` (see
   [Stablecoin](#stablecoin-deposits-and-earnings)).
 - `top_up_payment_key_with_near(nonce, swap_contract_id)` (payable) — **mainnet
@@ -727,7 +798,8 @@ timeout).
 ### `system_event`
 
 `data` is `[{"<Variant>": {...}}]`, one of: `TopUpPaymentKey`,
-`DeletePaymentKey`, `SubscriptionPurchased`, `WalletPolicyUpdated`,
+`DeletePaymentKey` (a delete or a close), `RefundPaymentKey`,
+`SubscriptionPurchased`, `WalletPolicyUpdated`,
 `WalletPolicyDeleted`, `WalletFrozenChanged`, `StorageRefundToChanged`,
 `ProjectTransferred`, `ProjectTransferAccepted`, `ProjectTransferRevoked`,
 `ProjectStorageCleanup`.
@@ -763,8 +835,8 @@ full-access key, without a vote or a delay; see
 
 `get_storage_version` answers the state layout the code expects. A deploy that
 changes the layout calls `migrate` (private: signed by the contract account) in
-the same transaction; `migrate` reads the previous layout (`"10"`) and writes
-`"11"`, and fails on any other state. A deploy that keeps the layout calls
+the same transaction; `migrate` reads the previous layout (`"12"`) and writes
+`"13"`, and fails on any other state. A deploy that keeps the layout calls
 nothing.
 
 ```bash

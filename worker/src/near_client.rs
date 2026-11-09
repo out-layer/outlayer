@@ -993,6 +993,48 @@ impl NearClient {
         Ok(tx_hash)
     }
 
+    /// Resume a payment-key refund claim with the coordinator's quote.
+    ///
+    /// Through `resume_delete_payment_key`, the method the worker's access key
+    /// is scoped to: the contract's three payment-key yields (delete, close,
+    /// refund) all take `DeletePaymentKeyResult`, and the refund callback
+    /// reads the `Refund` variant. `amount` is a decimal string of stablecoin
+    /// minimal units; the contract pays at most its own cap of it.
+    ///
+    /// # Returns
+    /// * `Ok(tx_hash)` - Transaction hash
+    pub async fn resume_payment_key_refund(&self, data_id: &str, amount: &str) -> Result<String> {
+        info!("📤 Resuming PaymentKeyRefund: data_id={} amount={}", data_id, amount);
+
+        let args = json!({
+            "data_id": data_id,
+            "result": {
+                "Refund": {
+                    "amount": amount
+                }
+            }
+        });
+
+        let args_json = serde_json::to_string(&args)
+            .context("Failed to serialize resume_delete_payment_key args")?;
+
+        let outcome = self
+            .call_contract_method(
+                "resume_delete_payment_key",
+                args_json.into_bytes(),
+                100_000_000_000_000, // 100 TGas
+                0,                    // No deposit
+            )
+            .await
+            .context("Failed to call resume_delete_payment_key (refund)")?;
+        Self::require_taken("resume_delete_payment_key", &outcome)?;
+
+        let tx_hash = format!("{}", outcome.transaction_outcome.id);
+        info!("✅ PaymentKeyRefund resumed: data_id={} amount={} tx={}", data_id, amount, tx_hash);
+
+        Ok(tx_hash)
+    }
+
     /// Resume a DeletePaymentKey yield promise with error
     ///
     /// # Arguments

@@ -4031,6 +4031,53 @@ async fn run_contract_system_callbacks_handler(
                             payload.owner, payload.nonce, payload.amount
                         );
 
+                        // Before anything is resumed on chain: will the coordinator
+                        // credit this row? A row the chain closed will not, and a
+                        // top-up accepted on chain but credited nowhere is money
+                        // stuck in the contract. Refused here, the contract returns
+                        // it to the payer. A creation event (amount 0) has no yield
+                        // and registers the key: not asked.
+                        if payload.amount != "0" {
+                            // A transport failure is retried for about half a minute
+                            // (`CREDITABLE_RETRY_DELAYS`); a `false` is an answer.
+                            let verdict = api_client::retry_relay(
+                                "top-up creditable check",
+                                &api_client::CREDITABLE_RETRY_DELAYS,
+                                || api_client.top_up_creditable(&payload.owner, payload.nonce),
+                            )
+                            .await;
+                            let refusal = match verdict {
+                                Ok((true, _)) => None,
+                                Ok((false, why)) => {
+                                    warn!(
+                                        "TopUp not credited here, returning it to the payer: owner={} nonce={} amount={} — {}",
+                                        payload.owner, payload.nonce, payload.amount, why
+                                    );
+                                    Some(why)
+                                }
+                                Err(e) => {
+                                    // Not a refusal: the coordinator could not be asked. The
+                                    // top-up goes back to its sender — for a NEAR top-up that
+                                    // is the swap account, which needs reconciling — so this
+                                    // is an error, named in full.
+                                    error!(
+                                        "❌ TopUp returned to the payer because the coordinator could not say whether the key takes it (retried): owner={} nonce={} amount={} error={:#}",
+                                        payload.owner, payload.nonce, payload.amount, e
+                                    );
+                                    Some(format!("the coordinator could not say whether the key takes a top-up: {}", e))
+                                }
+                            };
+                            if let Some(why) = refusal {
+                                if let Err(e) = near_client.resume_topup_error(&payload.data_id, &why).await {
+                                    error!(
+                                        "❌ Failed to resume TopUp with error (the yield times out and refunds the payer): data_id={} error={:#}",
+                                        payload.data_id, e
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+
                         // TopUp requires keystore
                         if let Some(ref ks_client) = keystore_client {
                             // Convert payload to the format expected by process_topup_task
@@ -4068,8 +4115,12 @@ async fn run_contract_system_callbacks_handler(
                                         )
                                         .await
                                     {
+                                        // A 409 is the chain-closed row: the contract's callback
+                                        // returned the top-up to the payer, nothing is owed.
+                                        // Anything else is a top-up the chain kept and this
+                                        // side did not record — reconcile.
                                         error!(
-                                            "❌ TopUp taken on chain but NOT credited in the coordinator: owner={} nonce={} amount={} error={}",
+                                            "❌ TopUp resumed on chain but NOT credited in the coordinator (a 409 means the key is closed by the chain and the contract returned the top-up to the payer; anything else needs reconciling): owner={} nonce={} amount={} error={}",
                                             payload.owner, payload.nonce, payload.amount, e
                                         );
                                     }
@@ -4178,6 +4229,58 @@ async fn run_contract_system_callbacks_handler(
                             Err(e) => {
                                 error!(
                                     "❌ DeletePaymentKey: the coordinator deleted the key but the chain did not confirm the resume — unless that transaction still executes, the key stays on chain: owner={} nonce={} error={:#}",
+                                    payload.owner, payload.nonce, e
+                                );
+                            }
+                        }
+                    }
+
+                    // =================================================================
+                    // Refund a closed Payment Key - the coordinator's quote to the chain
+                    // =================================================================
+                    SystemCallbackTask::RefundPaymentKey(payload) => {
+                        info!(
+                            "💸 Processing RefundPaymentKey task: owner={} nonce={}",
+                            payload.owner, payload.nonce
+                        );
+
+                        // The quote, or the reason there is none. Either way the
+                        // yield is resumed: the contract pays at most its cap of
+                        // an amount, and keeps the key closing on an error so the
+                        // owner can claim again.
+                        let answer = api_client.refund_quote(&payload.owner, payload.nonce).await;
+                        let resumed = match answer {
+                            Ok(api_client::RefundQuote::Amount(amount)) => {
+                                near_client.resume_payment_key_refund(&payload.data_id, &amount).await
+                            }
+                            Ok(api_client::RefundQuote::Refused(why)) => {
+                                near_client
+                                    .resume_delete_payment_key_error(&payload.data_id, &why)
+                                    .await
+                            }
+                            Err(e) => {
+                                error!(
+                                    "❌ Refund quote failed: owner={} nonce={} error={:#}",
+                                    payload.owner, payload.nonce, e
+                                );
+                                near_client
+                                    .resume_delete_payment_key_error(
+                                        &payload.data_id,
+                                        &format!("the coordinator gave no refund quote: {}", e),
+                                    )
+                                    .await
+                            }
+                        };
+                        match resumed {
+                            Ok(tx_hash) => {
+                                info!(
+                                    "✅ RefundPaymentKey resumed: owner={} nonce={} tx={}",
+                                    payload.owner, payload.nonce, tx_hash
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "❌ RefundPaymentKey: the chain did not take the resume — the yield times out and the key stays closing; the owner claims again: owner={} nonce={} error={:#}",
                                     payload.owner, payload.nonce, e
                                 );
                             }

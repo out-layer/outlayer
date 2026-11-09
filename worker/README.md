@@ -70,8 +70,17 @@ yield window. What each event may do late or out of order is decided in
 |---|---|---|
 | `execution_requested` | run only if still pending at the final block | same |
 | top-up (amount > 0) | relayed; the chain refuses a late resume and nothing is credited | relayed |
+| top-up, before the resume | the worker asks `POST /payment-keys/creditable`; a key the chain has closed in the coordinator is resumed with an error (the contract returns the transfer to the payer), never credited nowhere | same |
 | payment key creation (amount 0) | relayed | relayed only if the key still exists at the final block |
-| `delete_payment_key` | not relayed: the contract keeps the key, the owner deletes again (an unknown tip: tried again) | same rule |
+| `delete_payment_key` / `close_payment_key` | not relayed: the contract keeps the key, the owner deletes or closes again (an unknown tip: tried again) | same rule |
+| `claim_payment_key_refund` | not relayed: the contract keeps the key closing, the owner claims again (an unknown tip: tried again) | same rule |
+
+The three payment-key yields — delete, close, refund claim — are all resumed
+through `resume_delete_payment_key`, the one method the worker's access key on
+the operator account is scoped to (`register-contract`): the `data_id` names
+the yield, and each callback acts only on the `DeletePaymentKeyResult`
+variants that answer its question (`Success` / `Error` for a delete or a
+close, `Refund { amount }` / `Error` for a claim).
 | wallet policy / freeze | relayed | the wallet's state at the final block is relayed, not the event's |
 | subscription purchase, project cleanup, project transfer | relayed | relayed |
 

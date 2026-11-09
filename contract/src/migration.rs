@@ -12,16 +12,21 @@
 //! * v9 → v10: add `storage_refund_to`. (Run.)
 //! * v10 → v11: add `project_transfer_acceptances` — who agreed to take
 //!   which project from whom. (Run.)
-//! * **v11 → v12 (current): add `policy_meta` — a wallet policy's version
-//!   and lock (`approval.locked`), beside the entry.**
+//! * v11 → v12: add `policy_meta` — a wallet policy's version and lock.
+//!   (Run.)
+//! * **v12 → v13 (current): add `payment_key_refund_ledger`, `withdrawing`,
+//!   `closing_counts` and `payment_key_flight` — what each payment key's
+//!   owner deposited on chain and had back, the accounts with a balance
+//!   withdrawal in flight, how many keys each owner has closing, and what is
+//!   in flight on each key.**
 //!
-//! **`ContractV11` mirrors what is DEPLOYED, not this working tree minus
-//! the new field.** Check it against `git show HEAD:` before touching
+//! **`ContractV12` mirrors what is DEPLOYED, not this working tree minus
+//! the new fields.** Check it against `git show HEAD:` before touching
 //! it. The two are the same only when the previous migration is already
 //! committed, and it is the DEPLOYED shape that `state_read` will be
 //! handed.
 //!
-//! Versions ≤ v11 are historical. Production deployments must be on v11
+//! Versions ≤ v12 are historical. Production deployments must be on v12
 //! before calling this migration; an earlier-version deployment must
 //! first run the prior migrations from an earlier code revision.
 //!
@@ -31,13 +36,14 @@
 
 use crate::*;
 use near_sdk::borsh::BorshDeserialize;
-use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
+use near_sdk::collections::{LookupMap, LookupSet, UnorderedMap, UnorderedSet};
 
-/// Contract state as DEPLOYED at v11 — the last shape any chain has held.
+/// Contract state as DEPLOYED at v12 — the last shape any chain has held.
 ///
-/// Mirrors `Contract` as it was before `policy_meta` existed; every field carries over verbatim. Check it against
-/// `git show HEAD:contract/src/lib.rs`, not against the struct in this working
-/// tree: the two differ by exactly the field this migration adds.
+/// Mirrors `Contract` as it was before the refund ledger existed; every field
+/// carries over verbatim. Check it against `git show HEAD:contract/src/lib.rs`,
+/// not against the struct in this working tree: the two differ by exactly the
+/// fields this migration adds.
 ///
 /// A new field means a new state SHAPE, and borsh reads by position — so a
 /// deploy without this migration would read the old bytes into the new struct
@@ -46,7 +52,7 @@ use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
 #[cfg_attr(test, derive(near_sdk::borsh::BorshSerialize))]
 #[borsh(crate = "near_sdk::borsh")]
 #[allow(dead_code)] // fields needed for borsh deserialisation only
-pub struct ContractV11 {
+pub struct ContractV12 {
     owner_id: AccountId,
     operator_id: AccountId,
     paused: bool,
@@ -97,62 +103,71 @@ pub struct ContractV11 {
     storage_refund_to: LookupMap<wallet::StorageItem, AccountId>,
 
     project_transfer_acceptances: LookupMap<TransferAcceptance, Balance>,
+
+    policy_meta: LookupMap<String, wallet::PolicyMeta>,
 }
 
 #[near_bindgen]
 impl Contract {
-    /// Migrate from v11 to v12: add the policy version-and-lock map.
+    /// Migrate from v12 to v13: add the payment-key refund ledger, the
+    /// withdrawal in-flight set, the per-owner closing count and the per-key
+    /// in-flight record.
     ///
-    /// The map starts EMPTY: every existing policy reads as version 0 and
-    /// unlocked, so its next write carries version 1 and needs no quorum.
+    /// All four start EMPTY, and that is the rule, not a shortcut: a key
+    /// that existed before the ledger has `user_funded = 0`, so only deposits
+    /// made after this release are refundable (no backfill).
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let v11: ContractV11 = env::state_read().expect("failed to read v11 state");
+        let v12: ContractV12 = env::state_read().expect("failed to read v12 state");
 
         log!(
-            "Migrating contract v11 -> v12 (policy_meta): owner={}, total_executions={}",
-            v11.owner_id,
-            v11.total_executions
+            "Migrating contract v12 -> v13 (payment_key_refund_ledger, withdrawing, closing_counts, payment_key_flight): owner={}, total_executions={}",
+            v12.owner_id,
+            v12.total_executions
         );
 
         Self {
-            owner_id: v11.owner_id,
-            operator_id: v11.operator_id,
-            paused: v11.paused,
-            event_standard: v11.event_standard,
-            event_version: v11.event_version,
-            base_fee: v11.base_fee,
-            per_million_instructions_fee: v11.per_million_instructions_fee,
-            per_ms_fee: v11.per_ms_fee,
-            per_compile_ms_fee: v11.per_compile_ms_fee,
-            base_fee_usd: v11.base_fee_usd,
-            per_million_instructions_fee_usd: v11.per_million_instructions_fee_usd,
-            per_sec_fee_usd: v11.per_sec_fee_usd,
-            per_compile_ms_fee_usd: v11.per_compile_ms_fee_usd,
-            payment_token_contract: v11.payment_token_contract,
-            next_request_id: v11.next_request_id,
-            pending_requests: v11.pending_requests,
-            total_executions: v11.total_executions,
-            total_fees_collected: v11.total_fees_collected,
-            secrets_storage: v11.secrets_storage,
-            user_secrets_index: v11.user_secrets_index,
-            projects: v11.projects,
-            project_versions: v11.project_versions,
-            user_projects_index: v11.user_projects_index,
-            next_project_id: v11.next_project_id,
-            developer_earnings: v11.developer_earnings,
-            user_stablecoin_balances: v11.user_stablecoin_balances,
-            wallet_policies: v11.wallet_policies,
-            wallet_owner_index: v11.wallet_owner_index,
-            secret_vault_bindings: v11.secret_vault_bindings,
-            subscription_plans: v11.subscription_plans,
-            project_pricing: v11.project_pricing,
-            payment_key_nonce_floors: v11.payment_key_nonce_floors,
-            storage_refund_to: v11.storage_refund_to,
-            project_transfer_acceptances: v11.project_transfer_acceptances,
-            // ----- v12 -----
-            policy_meta: LookupMap::new(StorageKey::PolicyMeta),
+            owner_id: v12.owner_id,
+            operator_id: v12.operator_id,
+            paused: v12.paused,
+            event_standard: v12.event_standard,
+            event_version: v12.event_version,
+            base_fee: v12.base_fee,
+            per_million_instructions_fee: v12.per_million_instructions_fee,
+            per_ms_fee: v12.per_ms_fee,
+            per_compile_ms_fee: v12.per_compile_ms_fee,
+            base_fee_usd: v12.base_fee_usd,
+            per_million_instructions_fee_usd: v12.per_million_instructions_fee_usd,
+            per_sec_fee_usd: v12.per_sec_fee_usd,
+            per_compile_ms_fee_usd: v12.per_compile_ms_fee_usd,
+            payment_token_contract: v12.payment_token_contract,
+            next_request_id: v12.next_request_id,
+            pending_requests: v12.pending_requests,
+            total_executions: v12.total_executions,
+            total_fees_collected: v12.total_fees_collected,
+            secrets_storage: v12.secrets_storage,
+            user_secrets_index: v12.user_secrets_index,
+            projects: v12.projects,
+            project_versions: v12.project_versions,
+            user_projects_index: v12.user_projects_index,
+            next_project_id: v12.next_project_id,
+            developer_earnings: v12.developer_earnings,
+            user_stablecoin_balances: v12.user_stablecoin_balances,
+            wallet_policies: v12.wallet_policies,
+            wallet_owner_index: v12.wallet_owner_index,
+            secret_vault_bindings: v12.secret_vault_bindings,
+            subscription_plans: v12.subscription_plans,
+            project_pricing: v12.project_pricing,
+            payment_key_nonce_floors: v12.payment_key_nonce_floors,
+            storage_refund_to: v12.storage_refund_to,
+            project_transfer_acceptances: v12.project_transfer_acceptances,
+            policy_meta: v12.policy_meta,
+            // ----- v13 -----
+            payment_key_refund_ledger: LookupMap::new(StorageKey::PaymentKeyRefundLedger),
+            withdrawing: LookupSet::new(StorageKey::Withdrawing),
+            closing_counts: LookupMap::new(StorageKey::ClosingCounts),
+            payment_key_flight: LookupMap::new(StorageKey::PaymentKeyFlight),
         }
     }
 
@@ -160,7 +175,7 @@ impl Contract {
     /// `migrate()` advances the layout. Off-chain tooling reads this to
     /// decide whether a deploy needs a migration call.
     pub fn get_storage_version(&self) -> String {
-        "12".to_string()
+        "13".to_string()
     }
 }
 
@@ -191,14 +206,18 @@ mod tests {
         );
     }
 
-    /// A v11 chain: the contract as it stands, payment keys, a wallet policy
-    /// with a beneficiary and a project in storage, no acceptance map.
-    fn v11_state(nonces: &[u32], policy_key: &str) -> VMContextBuilder {
+    /// A v12 chain: the contract as it stands, payment keys, a wallet policy
+    /// with a beneficiary, a project and a stablecoin balance in storage, no
+    /// refund ledger.
+    fn v12_state(nonces: &[u32], policy_key: &str) -> VMContextBuilder {
         let mut b = ctx(accounts(1));
         testing_env!(b.build());
         let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
         for &n in nonces {
             store_key(&mut c, &mut b, n);
+            // A v12 key has no ledger entry: the map did not exist.
+            c.payment_key_refund_ledger
+                .remove(&refunds::PaymentKeyId { owner: accounts(1), nonce: n });
         }
         c.wallet_policies.insert(
             &policy_key.to_string(),
@@ -214,6 +233,7 @@ mod tests {
             &wallet::StorageItem::WalletPolicy { wallet_pubkey: policy_key.to_string() },
             &accounts(2),
         );
+        c.user_stablecoin_balances.insert(&accounts(1), &250_000);
         testing_env!(b.attached_deposit(NearToken::from_near(1)).build());
         c.create_project(
             "app".to_string(),
@@ -223,7 +243,7 @@ mod tests {
                 build_target: None,
             },
         );
-        let v11 = ContractV11 {
+        let v12 = ContractV12 {
             owner_id: c.owner_id,
             operator_id: c.operator_id,
             paused: c.paused,
@@ -258,21 +278,22 @@ mod tests {
             payment_key_nonce_floors: c.payment_key_nonce_floors,
             storage_refund_to: c.storage_refund_to,
             project_transfer_acceptances: c.project_transfer_acceptances,
+            policy_meta: c.policy_meta,
         };
-        env::state_write(&v11);
+        env::state_write(&v12);
         b
     }
 
-    /// Everything a v11 chain held reads on as before, and a project moves
-    /// only once somebody has accepted it.
+    /// Everything a v12 chain held reads on as before; a pre-ledger key has
+    /// nothing refundable, and a pre-ledger balance can be withdrawn.
     #[test]
-    fn a_v11_state_migrates_with_no_policy_meta() {
+    fn a_v12_state_migrates_with_an_empty_refund_ledger() {
         let key = format!("ed25519:{}", "ab".repeat(32));
-        let _b = v11_state(&[1, 2, 3], &key);
+        let _b = v12_state(&[1, 2, 3], &key);
         testing_env!(ctx(accounts(0)).build());
         let mut c = Contract::migrate();
 
-        assert_eq!(c.get_storage_version(), "12");
+        assert_eq!(c.get_storage_version(), "13");
         assert_eq!(c.owner_id, accounts(0));
         for n in 1..=3 {
             assert!(
@@ -280,56 +301,77 @@ mod tests {
                     .is_some(),
                 "key {n} survives the migration"
             );
+            assert!(
+                c.get_payment_key_refund_ledger(accounts(1), n).is_none(),
+                "a pre-ledger key has no ledger entry: nothing of it is refundable"
+            );
         }
-        assert_eq!(c.get_payment_key_nonce_floor(accounts(1)), 3, "the v11 floors carry over");
+        assert_eq!(c.get_payment_key_nonce_floor(accounts(1)), 3, "the v12 floors carry over");
+        assert_eq!(c.get_closing_payment_key_count(accounts(1)), 0);
+        assert!(!c.is_withdrawing(accounts(1)));
         let view = c.get_wallet_policy(key.clone()).expect("the policy survives");
         assert_eq!(view.owner, accounts(1));
         assert_eq!(view.storage_deposit.0, 7);
-        assert_eq!(view.storage_refund_to, Some(accounts(2)), "the v11 beneficiaries carry over");
-        // A policy from before versions existed: version 0, unlocked — its
-        // controller can still delete it, and its next write is version 1.
+        assert_eq!(view.storage_refund_to, Some(accounts(2)), "the v12 beneficiaries carry over");
         assert_eq!((view.version, view.locked), (0, false));
-        testing_env!(ctx(accounts(1)).build());
-        c.delete_wallet_policy(key.clone());
-        assert!(c.get_wallet_policy(key).is_none(), "an unlocked pre-v12 policy deletes as before");
         let project_id = format!("{}/app", accounts(1));
-        assert!(c.get_project(project_id.clone()).is_some(), "the project survives");
+        assert!(c.get_project(project_id).is_some(), "the project survives");
+        assert_eq!(
+            c.get_user_stablecoin_balance(accounts(1)).0,
+            250_000,
+            "the v12 stablecoin balance carries over"
+        );
 
-        // Nothing has been accepted yet, so nothing moves.
-        testing_env!(ctx(accounts(1)).build());
-        let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            c.transfer_project("app".to_string(), accounts(2));
-        }));
-        assert!(moved.is_err(), "a transfer with no acceptance is refused after the migration");
+        // The new maps work on the migrated state: a pre-ledger key can be
+        // closed (its ledger entry appears at zero), and the balance can be
+        // withdrawn once a token is configured.
+        testing_env!(ctx(accounts(0)).build());
+        c.on_close_payment_key_response(accounts(1), 2, Ok(payment::DeletePaymentKeyResult::Success));
+        let ledger = c.get_payment_key_refund_ledger(accounts(1), 2).expect("closing creates the entry");
+        assert_eq!((ledger.user_funded.0, ledger.refunded.0, ledger.refundable_cap.0), (0, 0, 0));
+        assert!(ledger.closing_since.is_some());
+        assert_eq!(c.get_closing_payment_key_count(accounts(1)), 1);
 
-        // The new map works on the migrated state: accept, then the v11
-        // project moves.
-        testing_env!(ctx(accounts(2)).attached_deposit(NearToken::from_near(1)).build());
-        c.accept_project_transfer(accounts(1), "app".to_string());
-        testing_env!(ctx(accounts(1)).build());
-        c.transfer_project("app".to_string(), accounts(2));
-        assert!(c.get_project(format!("{}/app", accounts(2))).is_some(), "the v11 project moved onto the acceptance");
-        assert!(c.get_project(project_id).is_none());
+        testing_env!(ctx(accounts(0)).build());
+        c.set_payment_token_contract(Some("usdc.test".parse().unwrap()));
+        testing_env!(ctx(accounts(1)).attached_deposit(NearToken::from_yoctonear(1)).build());
+        c.withdraw_balance(U128(100_000));
+        assert_eq!(c.get_user_stablecoin_balance(accounts(1)).0, 150_000);
+        assert!(c.is_withdrawing(accounts(1)));
     }
 
-    /// The deployed state itself, read through `ContractV11`. Runs when
-    /// `V11_STATE_FILE` names a file holding the raw `STATE` value of a live
+    /// `ContractV12` is HEAD's `Contract`, field for field: a drift here is
+    /// a migration that reads the deployed bytes into the wrong shape.
+    #[test]
+    fn contract_v12_mirrors_the_deployed_shape() {
+        let _b = v12_state(&[1], &format!("ed25519:{}", "cd".repeat(32)));
+        let bytes = env::storage_read(b"STATE").expect("state written");
+        assert!(
+            Contract::try_from_slice(&bytes).is_err(),
+            "a v12 STATE must not read as the v13 shape"
+        );
+        let v12 = ContractV12::try_from_slice(&bytes).expect("the v12 STATE reads as ContractV12");
+        assert_eq!(v12.owner_id, accounts(0));
+    }
+
+    /// The deployed state itself, read through `ContractV12`. Runs when
+    /// `V12_STATE_FILE` names a file holding the raw `STATE` value of a live
     /// contract (a `view_state` with prefix `STATE`); skipped otherwise.
     #[test]
-    fn a_deployed_state_reads_as_v11_and_migrates() {
-        let Ok(path) = std::env::var("V11_STATE_FILE") else { return };
-        let bytes = std::fs::read(&path).expect("read V11_STATE_FILE");
+    fn a_deployed_state_reads_as_v12_and_migrates() {
+        let Ok(path) = std::env::var("V12_STATE_FILE") else { return };
+        let bytes = std::fs::read(&path).expect("read V12_STATE_FILE");
         testing_env!(ctx(accounts(0)).build());
         assert!(
             Contract::try_from_slice(&bytes).is_err(),
-            "the deployed STATE already reads as the v12 shape — this migration is not for it"
+            "the deployed STATE already reads as the v13 shape — this migration is not for it"
         );
-        let v11 = ContractV11::try_from_slice(&bytes).expect("the deployed STATE is not the v11 shape");
-        let owner = v11.owner_id.clone();
-        env::state_write(&v11);
+        let v12 = ContractV12::try_from_slice(&bytes).expect("the deployed STATE is not the v12 shape");
+        let owner = v12.owner_id.clone();
+        env::state_write(&v12);
         let c = Contract::migrate();
         assert_eq!(c.owner_id, owner);
-        assert_eq!(c.get_storage_version(), "12");
-        println!("v11 state of {} bytes, owner {owner}, migrated", bytes.len());
+        assert_eq!(c.get_storage_version(), "13");
+        println!("v12 state of {} bytes, owner {owner}, migrated", bytes.len());
     }
 }

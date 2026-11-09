@@ -209,3 +209,16 @@ cd keystore-worker && cargo run          # Run keystore
 1. **Blockchain**: User deposits stablecoins → calls `request_execution(attached_usd)` → project owner earns
 2. **HTTPS**: User creates payment key → calls API with `X-Attached-Deposit` → project owner earns
 3. **Dashboard**: `/earnings` page shows balances and history from both sources
+
+## Money out stays simple
+A path that pays money out — a refund, a withdrawal, a return of a refused
+transfer — is one plain rule, the same for every caller, with no case
+analysis on who sent what or why it failed. A refused NEP-141 transfer goes
+back to its sender, whoever that is; a refund pays `min(reported, cap)` and
+nothing else; a withdrawal is debit, transfer, credit back. No path rescues
+a user's mistake (a top-up sent to a closing key, money delivered through a
+shared account) by routing it somewhere cleverer: every extra branch on a
+money path is a place to find a position that pays out, and a rule that
+rewards an error will be wrapped into a bug or an attack. The site, the CLI
+and the docs tell the user what will happen instead (decided by Vadim,
+2026-11-09, on the payment-key refund).
