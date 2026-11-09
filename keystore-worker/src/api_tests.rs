@@ -558,6 +558,15 @@ mod wallet_sign_tests {
             trusted_artifact_refusal(&imt("0000000000000000000000000000000000000000000000000000000000000000"), &unshield, "me"),
             Err(ApiError::Forbidden(_))
         ), "another treasury's token would be signed");
+        // The confidential balance leaves only under an op the `confidential`
+        // capability judged: never under a swap.
+        let swap_usdc = Op::Swap {
+            token_in: usdc.into(), amount_in: "100000".into(), token_out: "nep141:wrap.near".into(), min_out: "1".into(),
+        };
+        assert!(matches!(
+            trusted_artifact_refusal(&imt("51e8f94d77b5e90dc9852ca6113771e11e8382ce69473a75e313e41665de7cbe"), &swap_usdc, "me"),
+            Err(ApiError::Forbidden(_))
+        ), "a swap would spend the confidential balance");
 
         let src = include_str!("api.rs");
         let body = &src[src.find("async fn sign_trusted(").expect("sign_trusted")..];
