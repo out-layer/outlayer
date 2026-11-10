@@ -4157,15 +4157,17 @@ async fn run_contract_system_callbacks_handler(
                                     // Only resume with error if there's a real yield (amount > 0).
                                     // For amount=0 (PaymentKey creation), there's no yield to resume —
                                     // the data_id is a generated hash, not a real yield promise.
-                                    // Nor when the contract already said the yield is gone: its
-                                    // timeout callback has refunded the payer.
+                                    // Nor when the contract already said the yield is gone:
+                                    // another worker's resume took it (both relayed the
+                                    // event), or its timeout callback has refunded the payer.
+                                    // Which one, the contract's log says; neither needs us.
                                     let yield_gone = matches!(
                                         e.downcast_ref::<near_client::ChainRefused>().map(|r| &r.reason),
                                         Some(near_client::Refusal::NoYield(_))
                                     );
                                     if yield_gone {
                                         warn!(
-                                            "TopUp yield already settled by the contract (payer refunded); nothing credited: owner={} nonce={}",
+                                            "TopUp yield already gone on the contract (resumed already, or timed out and refunded); nothing credited here: owner={} nonce={}",
                                             payload.owner, payload.nonce
                                         );
                                     } else if payload.amount != "0" {
