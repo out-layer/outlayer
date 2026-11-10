@@ -39,7 +39,7 @@ COPY worker/wit ./wit
 RUN cargo build --release --locked --bin offchainvm-worker
 
 # Stage 2: Minimal runtime image
-FROM alpine:3.19
+FROM alpine:3.22
 
 # Install runtime dependencies
 RUN apk add --no-cache \

@@ -30,7 +30,7 @@ echo ""
 # Create temporary dockerfile that just lists files
 TEMP_DOCKERFILE=$(mktemp)
 cat > "$TEMP_DOCKERFILE" << 'EOF'
-FROM alpine:3.19
+FROM alpine:3.22
 
 # Copy everything that would be copied in real build
 COPY Cargo.toml Cargo.lock /tmp/check/

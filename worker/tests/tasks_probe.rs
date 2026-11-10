@@ -509,7 +509,7 @@ fn answer(result: &ExecutionResult) -> Value {
 async fn the_agent_prepares_the_owner_reads_and_answers_and_the_agent_learns() {
     let world = World::start();
     let (prepared, report) = world
-        .run(AGENT, true, "run-a", json!({ "operation": "prepare", "title": "Send an email", "body": "Hello Bob", "life_seconds": 600 }))
+        .run(AGENT, true, "run-a", json!({ "operation": "prepare", "title": "Send an email", "body": "Hello Bob", "life_seconds": 900 }))
         .await;
     let prepared = answer(&prepared);
     assert_eq!(prepared["success"], true, "{prepared}");
