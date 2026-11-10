@@ -1862,33 +1862,29 @@ async fn handle_compile_job(
                         fastfs_receiver,
                     );
 
-                    // Build the FastFS URL (same format regardless of transaction success)
-                    let fastfs_url = format!(
-                        "https://{}.fastfs.io/{}/{}.wasm",
-                        signer.account_id,
-                        fastfs_receiver,
-                        checksum
-                    );
-
+                    // `Ok` is a transaction the chain executed — with a failed
+                    // status too, which is how a FastFS write always ends and
+                    // how the indexer still gets the file. `Err` is a
+                    // transaction the chain did not take: nothing is on FastFS
+                    // and no URL is reported; the executor then sends the WASM
+                    // checksum as the result and the compilation note names no
+                    // URL, instead of a URL that serves nothing.
                     match fastfs_client.upload_wasm(&wasm_bytes, &checksum).await {
                         Ok(url) => {
                             info!("✅ FastFS upload successful: {}", url);
+                            // The published URL goes into compilation_note; the
+                            // executor sends it to the contract for compile_only.
+                            info!("📤 Setting compile_result for executor: {}", url);
+                            published_url = Some(url.clone());
+                            compile_result_for_executor = Some(url);
                         }
-                        Err(_) => {
-                            // FastFS transaction "fails" but indexer picks up the file - this is expected
-                            // The info message was already logged in fastfs.rs
-                            info!("📁 FastFS URL: {}", fastfs_url);
+                        Err(e) => {
+                            error!(
+                                "❌ FastFS publish failed: the chain did not take the transaction, the file is NOT on FastFS and no URL is reported: {:#}",
+                                e
+                            );
                         }
                     }
-
-                    // Always save published URL for compilation_note
-                    published_url = Some(fastfs_url.clone());
-
-                    // Always pass the URL to executor via compile_result
-                    // For compile_only: executor sends URL to contract as result
-                    // For normal: executor uses URL in compilation_note
-                    info!("📤 Setting compile_result for executor: {}", fastfs_url);
-                    compile_result_for_executor = Some(fastfs_url);
                 } else {
                     warn!("⚠️ store_on_fastfs=true but FASTFS_RECEIVER not configured, skipping upload");
                 }

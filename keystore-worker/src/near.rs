@@ -887,43 +887,8 @@ impl NearClient {
         let args_bytes = serde_json::to_vec(&args)
             .context("Failed to serialize args for function call")?;
 
-        // Get nonce (with retry — same justification as in
-        // mpc_ckd::call_mpc_contract: a freshly-added access key may
-        // not be visible to the RPC node yet).
-        let mut nonce = 0u64;
-        let max_retries = 5;
-        for attempt in 1..=max_retries {
-            let access_key_query = methods::query::RpcQueryRequest {
-                block_reference: BlockReference::Finality(Finality::Final),
-                request: near_primitives::views::QueryRequest::ViewAccessKey {
-                    account_id: signer.account_id.clone(),
-                    public_key: signer.public_key.clone(),
-                },
-            };
-            match self.rpc_client.call(access_key_query).await {
-                Ok(response) => {
-                    if let QueryResponseKind::AccessKey(view) = response.kind {
-                        nonce = view.nonce + 1;
-                        break;
-                    } else {
-                        anyhow::bail!("Failed to get access key nonce");
-                    }
-                }
-                Err(e) if attempt < max_retries => {
-                    tracing::warn!(
-                        attempt,
-                        max_retries,
-                        "Access key not visible at RPC, retrying in 3s... ({e})"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::from(e))
-                        .context("Failed to query access key after retries")
-                }
-            }
-        }
-
+        // The block hash is a FINAL block's: every node behind a load-balanced
+        // RPC knows it (see `query_access_key`).
         let block = self
             .rpc_client
             .call(methods::block::RpcBlockRequest {
@@ -931,33 +896,88 @@ impl NearClient {
             })
             .await
             .context("Failed to get latest block")?;
-
-        let transaction_v0 = TransactionV0 {
-            signer_id: signer.account_id.clone(),
-            public_key: signer.public_key.clone(),
-            nonce,
-            receiver_id: receiver_id.clone(),
-            block_hash: block.header.hash,
-            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                method_name: method_name.to_string(),
-                args: args_bytes,
-                gas: Gas::from_gas(gas),
-                deposit: Balance::from_yoctonear(deposit),
-            }))],
+        // The callers hold `signer_nonce_lock`, so the only way to be refused
+        // for the nonce is the chain's own lag: `broadcast_tx_commit` returns
+        // once the previous transaction executed, and a read at Final may not
+        // carry its increment yet. The nonce is therefore read at optimistic
+        // finality, and one `InvalidNonce` is answered by one re-read and one
+        // more broadcast — the refused transaction never executed.
+        let mut nonce_refusals = 0u32;
+        let (tx_hash, outcome) = loop {
+            // The access-key read is retried: a freshly-added key may not be
+            // visible to the RPC node yet (same as mpc_ckd::call_mpc_contract).
+            let mut nonce = 0u64;
+            let max_retries = 5;
+            for attempt in 1..=max_retries {
+                let access_key_query = methods::query::RpcQueryRequest {
+                    block_reference: BlockReference::Finality(Finality::None),
+                    request: near_primitives::views::QueryRequest::ViewAccessKey {
+                        account_id: signer.account_id.clone(),
+                        public_key: signer.public_key.clone(),
+                    },
+                };
+                match self.rpc_client.call(access_key_query).await {
+                    Ok(response) => {
+                        if let QueryResponseKind::AccessKey(view) = response.kind {
+                            nonce = view.nonce + 1;
+                            break;
+                        } else {
+                            anyhow::bail!("Failed to get access key nonce");
+                        }
+                    }
+                    Err(e) if attempt < max_retries => {
+                        tracing::warn!(
+                            attempt,
+                            max_retries,
+                            "Access key not visible at RPC, retrying in 3s... ({e})"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e))
+                            .context("Failed to query access key after retries")
+                    }
+                }
+            }
+            let transaction_v0 = TransactionV0 {
+                signer_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+                nonce,
+                receiver_id: receiver_id.clone(),
+                block_hash: block.header.hash,
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: method_name.to_string(),
+                    args: args_bytes.clone(),
+                    gas: Gas::from_gas(gas),
+                    deposit: Balance::from_yoctonear(deposit),
+                }))],
+            };
+            let transaction = Transaction::V0(transaction_v0);
+            let tx_hash = transaction.get_hash_and_size().0;
+            let signature = signer.sign(tx_hash.as_ref());
+            let signed = near_primitives::transaction::SignedTransaction::new(signature, transaction);
+            let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                signed_transaction: signed,
+            };
+            match self.rpc_client_tx.call(request).await {
+                Ok(outcome) => break (tx_hash, outcome),
+                Err(e) if e.rpc().is_some_and(crate::mpc_ckd::is_invalid_nonce) && nonce_refusals < 1 => {
+                    nonce_refusals += 1;
+                    tracing::warn!(
+                        signer = %signer.account_id,
+                        receiver = %receiver_id,
+                        method = method_name,
+                        nonce,
+                        "{receiver_id}.{method_name} refused for its nonce; re-reading the nonce and broadcasting once more"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e))
+                        .with_context(|| format!("broadcast_tx_commit for {receiver_id}.{method_name}"))
+                }
+            }
         };
-        let transaction = Transaction::V0(transaction_v0);
-        let tx_hash = transaction.get_hash_and_size().0;
-        let signature = signer.sign(tx_hash.as_ref());
-        let signed = near_primitives::transaction::SignedTransaction::new(signature, transaction);
-
-        let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
-            signed_transaction: signed,
-        };
-        let outcome = self
-            .rpc_client_tx
-            .call(request)
-            .await
-            .with_context(|| format!("broadcast_tx_commit for {receiver_id}.{method_name}"))?;
 
         match &outcome.status {
             near_primitives::views::FinalExecutionStatus::SuccessValue(value) => {

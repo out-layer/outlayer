@@ -36,9 +36,13 @@
 #   R1  DELETE /admin/grant-keys on the money key → 404, untouched
 #   R2  DELETE on the grant key → 204: deleted, the unspent grant revoked —
 #       initial_balance − revoked, one payment_key_grant_revocations row
-#   R3  a $0.01 on-chain top-up revives the key with exactly $0.01 to spend,
-#       never the grant; it is still a grant key, so a purchase is still 403
-#   R4  DELETE again → 204, nothing more revoked, the owner's cent stays
+#   R3  a $0.01 on-chain top-up on the deleted key: the chain accepts it, the
+#       worker asks the coordinator, the coordinator refuses (a deleted key does
+#       not come back), the yield resumes with the error and the token returns
+#       the cent to its payer. The row stays deleted and untouched; the key
+#       authenticates nothing (purchase → 401). Without the pre-check the cent
+#       would be taken on chain and credited nowhere, or revive the row
+#   R4  DELETE again → 404, nothing more revoked, the row unchanged
 #   W1  a wallet minted for this run funds itself, creates a $0.01 key, the key
 #       is granted: purchase-info does not name it (it would name the newest
 #       key, and that key is a grant key)
@@ -143,6 +147,36 @@ top_up() { # top_up <nonce> <amount> — ft_transfer_call top_up_payment_key for
   call "$TOKEN" ft_transfer_call \
     "$(jq -nc --arg r "$CONTRACT_ID" --arg a "$2" --arg m "$(jq -nc --argjson n "$1" '{action:"top_up_payment_key", nonce:$n}')" \
        '{receiver_id:$r, amount:$a, msg:$m}')" '1 yoctoNEAR' '150.0 Tgas'
+}
+tx_logs() { # tx_logs <tx> — every log of KEY_OWNER's transaction's receipts, a JSON array
+  local r i
+  for i in 1 2 3 4 5 6; do
+    r=$(rpc_post "$(jq -nc --arg t "$1" --arg s "$KEY_OWNER" '{jsonrpc:"2.0",id:1,method:"tx",params:{tx_hash:$t,sender_account_id:$s,wait_until:"FINAL"}}')")
+    jq -e '.result' <<<"$r" >/dev/null 2>&1 && {
+      jq -c '[.result.transaction_outcome.outcome.logs[]?, .result.receipts_outcome[]?.outcome.logs[]?]' <<<"$r"; return 0; }
+    sleep 5
+  done
+  echo '[]'
+}
+has_log() { jq -e --arg s "$2" 'any(.[]; contains($s))' <<<"$1" >/dev/null 2>&1; }
+# wait_log <tx> <marker> [tries] — the transaction's logs once they carry the
+# marker (every 5 s, default 30 tries ≈ 2.5 min: the worker's pre-check on a
+# silent coordinator takes up to ~130 s). A yield's callback runs well after
+# the transaction has a `.result`: that result shows status Started and the
+# receipts so far, and the callback's log is not among them yet.
+wait_log() {
+  local i l
+  for i in $(seq 1 "${3:-30}"); do
+    l=$(tx_logs "$1"); has_log "$l" "$2" && { printf '%s' "$l"; return 0; }
+    sleep 5
+  done
+  printf '%s' "$l"; return 1
+}
+token_balance() { view "$TOKEN" ft_balance_of "$(jq -nc --arg a "$KEY_OWNER" '{account_id:$a}')" | tr -d '"'; }
+wait_eq() { # wait_eq <command…> — until the command's output equals $EXPECT (≤ 3 min)
+  local i v
+  for i in $(seq 1 30); do v=$("$@"); [[ "$v" == "$EXPECT" ]] && { printf '%s' "$v"; return 0; }; sleep 6; done
+  printf '%s' "$v"; return 1
 }
 
 # ── coordinator ──────────────────────────────────────────────────────────────
@@ -523,33 +557,39 @@ if want R2 && [[ -n "$G_NONCE" ]]; then
 fi
 
 if want R3 && [[ -n "$G_NONCE" ]]; then
-  log "R3 a cent revives the deleted key with the cent, not the grant"
-  R0=$(key_row "$KEY_OWNER" "$G_NONCE"); I0=$(field "$R0" 1); S0=$(field "$R0" 2)
-  out=$(top_up "$G_NONCE" "$CENT")
-  [[ -n "$(tx_of "$out")" ]] && note "top-up of $CENT sent ($(tx_of "$out"))" || fail "R3 the top-up was not sent: $(why_of "$out")"
-  if wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $G_NONCE AND deleted_at IS NULL" "$(( I0 + CENT ))" 30 >/dev/null; then
-    req_none GET "/public/payment-keys/$KEY_OWNER/$G_NONCE/balance"
-    AV=$(j .available)
-    [[ "$AV" == "$CENT" ]] \
-      && pass "R3 revived: initial_balance $I0 → $(( I0 + CENT )), available $AV — the cent, none of the grant" \
-      || fail "R3 revived with available '$AV' (expected $CENT): $(short)"
+  log "R3 a cent on the deleted key goes back to its payer; the key does not come back"
+  R0=$(key_row "$KEY_OWNER" "$G_NONCE"); T0=$(token_balance)
+  out=$(top_up "$G_NONCE" "$CENT"); tx=$(tx_of "$out")
+  if [[ -z "$tx" ]]; then
+    fail "R3 the top-up was not sent: $(why_of "$out")"
   else
-    fail "R3 the key is $(key_row "$KEY_OWNER" "$G_NONCE") after the top-up (expected live with initial $(( I0 + CENT )))"
+    note "top-up of $CENT sent ($tx)"
+    if LOGS=$(wait_log "$tx" "TopUp failed: owner=$KEY_OWNER, nonce=$G_NONCE"); then
+      pass "R3 the yield resumed with the coordinator's refusal: 'TopUp failed' logged, nothing credited"
+    else
+      fail "R3 no 'TopUp failed' in the transaction's logs within 2.5 min: $(short "$LOGS" 400)"
+    fi
+    EXPECT=$T0 wait_eq token_balance >/dev/null \
+      && pass "R3 the cent came back to $KEY_OWNER (token balance $T0 again)" \
+      || fail "R3 token balance $(token_balance) (expected $T0 back)"
+    [[ "$(key_row "$KEY_OWNER" "$G_NONCE")" == "$R0" ]] \
+      && pass "R3 the row stays deleted and untouched: $R0" \
+      || fail "R3 the row changed: $R0 → $(key_row "$KEY_OWNER" "$G_NONCE")"
+    PK_SECRET=$G_KEY; req_pk POST /subscription/purchase "$purchase_body"
+    [[ "$HTTP" == 401 ]] \
+      && pass "R3 the deleted key authenticates nothing: purchase → 401 $(j .reason)" \
+      || fail "R3 purchase on the deleted key → HTTP $HTTP $(j .reason) (expected 401)"
   fi
-  PK_SECRET=$G_KEY; req_pk POST /subscription/purchase "$purchase_body"
-  [[ "$HTTP" == 403 && "$(j .reason)" == grant_key_not_purchasable ]] \
-    && pass "R3 the revived key is still a grant key: purchase → 403" \
-    || fail "R3 purchase on the revived key → HTTP $HTTP $(j .reason)"
 fi
 
 if want R4 && [[ -n "$G_NONCE" ]]; then
-  log "R4 a second delete takes nothing more"
+  log "R4 a second delete finds no grant key and takes nothing more"
   R0=$(key_row "$KEY_OWNER" "$G_NONCE"); RV0=$(revoked_sum "$KEY_OWNER" "$G_NONCE"); N0=$(revoked_rows "$KEY_OWNER" "$G_NONCE")
   req_admin DELETE "/admin/grant-keys/$KEY_OWNER/$G_NONCE"
   R1=$(key_row "$KEY_OWNER" "$G_NONCE")
-  [[ "$HTTP" == 204 && "$(field "$R1" 5)" == t && "$(field "$R1" 1)" == "$(field "$R0" 1)" \
+  [[ "$HTTP" == 404 && "$R1" == "$R0" \
      && "$(revoked_sum "$KEY_OWNER" "$G_NONCE")" == "$RV0" && "$(revoked_rows "$KEY_OWNER" "$G_NONCE")" == "$N0" ]] \
-    && pass "R4 → 204: deleted, no new revocation, the owner's cent stays (initial $(field "$R1" 1), spent $(field "$R1" 2))" \
+    && pass "R4 → 404: the row unchanged ($R1), no new revocation" \
     || fail "R4 → HTTP $HTTP, key $R0 → $R1, revoked $RV0 → $(revoked_sum "$KEY_OWNER" "$G_NONCE")"
 fi
 

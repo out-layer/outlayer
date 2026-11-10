@@ -450,10 +450,15 @@ impl RpcProxy {
         // Convert args_json to bytes
         let args_bytes = args_json.as_bytes().to_vec();
 
-        // 1. Get access key for nonce
+        // 1. Get access key for nonce. Read at OPTIMISTIC finality: a guest
+        // that sends two transactions in one run would, at Final, read the
+        // nonce before its first transaction's increment is final and sign the
+        // same number twice — the chain refuses the second for its nonce. The
+        // block hash the transaction is signed against stays a final block's
+        // (step 2), one every node behind a load-balanced RPC knows.
         let access_key_params = json!({
             "request_type": "view_access_key",
-            "finality": "final",
+            "finality": "optimistic",
             "account_id": signer_id,
             "public_key": signer.public_key().to_string()
         });
@@ -565,10 +570,15 @@ impl RpcProxy {
         let amount: u128 = amount_yocto.parse()
             .map_err(|e| anyhow::anyhow!("Invalid amount '{}': {}", amount_yocto, e))?;
 
-        // 1. Get access key for nonce
+        // 1. Get access key for nonce. Read at OPTIMISTIC finality: a guest
+        // that sends two transactions in one run would, at Final, read the
+        // nonce before its first transaction's increment is final and sign the
+        // same number twice — the chain refuses the second for its nonce. The
+        // block hash the transaction is signed against stays a final block's
+        // (step 2), one every node behind a load-balanced RPC knows.
         let access_key_params = json!({
             "request_type": "view_access_key",
-            "finality": "final",
+            "finality": "optimistic",
             "account_id": signer_id,
             "public_key": signer.public_key().to_string()
         });

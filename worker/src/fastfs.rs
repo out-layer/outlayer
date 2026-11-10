@@ -163,35 +163,36 @@ impl FastFsClient {
             .await
             .context("Failed to broadcast FastFS transaction")?;
 
-        // Check if transaction succeeded
+        // The file travels in the transaction's arguments and the indexer
+        // reads it from the chain, so a transaction the chain EXECUTED is a
+        // publish whatever its status: there is no contract at the receiver,
+        // and the call "fails" every time. Only a transaction the chain did
+        // not take — refused before inclusion (`InvalidNonce`, `Expired`, a
+        // signer short of balance) or never answered — is a failed publish,
+        // and `?` above returns it as one: the file is not on FastFS then, and
+        // no URL may be reported.
+        let url = format!(
+            "https://{}.fastfs.io/{}/{}",
+            self.signer.account_id,
+            receiver_id,
+            relative_path
+        );
         match &outcome.status {
             near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {
-                let url = format!(
-                    "https://{}.fastfs.io/{}/{}",
-                    self.signer.account_id,
-                    receiver_id,
-                    relative_path
-                );
-
                 info!("✅ FastFS upload successful!");
-                info!("   Transaction: {}", outcome.transaction_outcome.id);
-                info!("   URL: {}", url);
-
-                Ok(url)
             }
             near_primitives::views::FinalExecutionStatus::Failure(err) => {
-                // Note: This is expected behavior! FastFS transaction "fails" because there's
-                // no contract deployed at fastfs.testnet/fastfs.near, but the indexer still
-                // picks up the data from the transaction and stores it.
-                info!("📁 FastFS transaction completed (indexer will pick up the file)");
+                info!("📁 FastFS transaction executed with a failed status, as expected (no contract at the receiver); the indexer picks the file up");
                 debug!("   Transaction status: {:?}", err);
-                anyhow::bail!("FastFS transaction status: {:?}", err)
             }
             status => {
                 warn!("⚠️ FastFS upload unexpected status: {:?}", status);
                 anyhow::bail!("FastFS transaction has unexpected status: {:?}", status)
             }
         }
+        info!("   Transaction: {}", outcome.transaction_outcome.id);
+        info!("   URL: {}", url);
+        Ok(url)
     }
 }
 

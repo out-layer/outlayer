@@ -211,7 +211,7 @@ fn is_not_enough_balance(
 /// broadcast — with several keystore instances this is another instance cold-loading the same vault
 /// (it signs `vault.request_master` with the same vault key). CKD is deterministic, so a fresh nonce
 /// and a second broadcast yield the same master.
-fn is_invalid_nonce(
+pub(crate) fn is_invalid_nonce(
     e: &near_jsonrpc_client::errors::JsonRpcError<
         near_jsonrpc_primitives::types::transactions::RpcTransactionError,
     >,

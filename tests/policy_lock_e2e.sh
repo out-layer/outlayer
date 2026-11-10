@@ -2,7 +2,7 @@
 #
 # A locked policy on testnet: the owner alone cannot change it.
 #
-#   L0  the contract is at storage version 12 (policy_meta exists)
+#   L0  the contract is at storage version 12 or later (policy_meta exists)
 #   L1  a 2-of-2 policy with `approval.locked` is stored by the owner alone —
 #       a tightening — and the chain shows version 1, locked
 #   L2  a lock nobody could lift (threshold 3 of 2) is refused by encrypt-policy
@@ -127,7 +127,7 @@ LOCKED_B=$(jq -c '.rules.transaction_types = ["transfer","call"]' <<<"$LOCKED")
 # ── L0 ───────────────────────────────────────────────────────────────────────
 log "L0 storage version"
 SV=$(near_view "$CONTRACT_ID" get_storage_version '{}' | jq -r .)
-[[ "$SV" == 12 ]] && pass "L0 contract storage version 12" || { fail "L0 storage version $SV — deploy the v12 contract first"; verdict "policy lock"; exit 1; }
+[[ "$SV" =~ ^[0-9]+$ ]] && (( SV >= 12 )) && pass "L0 contract storage version $SV (policy_meta since 12)" || { fail "L0 storage version $SV — deploy the v12 contract first"; verdict "policy lock"; exit 1; }
 
 # ── setup + L1 ───────────────────────────────────────────────────────────────
 SEED="lock-$(date +%s)-$$"

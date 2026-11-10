@@ -171,6 +171,7 @@ impl RpcProxy {
         self.call_method("query", params)
     }
 
+    #[allow(dead_code)]
     pub fn view_access_key(&self, account_id: &str, public_key: &str) -> Result<Value> {
         let params = json!({
             "request_type": "view_access_key",
@@ -181,7 +182,6 @@ impl RpcProxy {
         self.call_method("query", params)
     }
 
-    #[allow(dead_code)]
     pub fn block(&self, finality: Option<&str>, block_id: Option<Value>) -> Result<Value> {
         let params = if let Some(fin) = finality {
             json!({ "finality": fin })
@@ -208,25 +208,35 @@ impl RpcProxy {
         self.call_method("send_tx", params)
     }
 
-    /// Get access key info for nonce
+    /// The signer's nonce and the block to sign against. The nonce is read at
+    /// OPTIMISTIC finality: two transactions from one key in one run would, at
+    /// Final, read the same nonce and the chain would refuse the second. The
+    /// block hash is a FINAL block's, one every node behind a load-balanced
+    /// RPC knows.
     fn get_access_key_nonce(&self, account_id: &str, public_key: &str) -> Result<(Nonce, CryptoHash, BlockHeight)> {
-        let result = self.view_access_key(account_id, public_key)?;
+        let key = self.call_method("query", json!({
+            "request_type": "view_access_key",
+            "account_id": account_id,
+            "public_key": public_key,
+            "finality": "optimistic"
+        }))?;
 
-        let nonce = result
+        let nonce = key
             .get("result")
             .and_then(|r| r.get("nonce"))
             .and_then(|n| n.as_u64())
             .ok_or_else(|| anyhow::anyhow!("Failed to get nonce"))?;
 
-        let block_hash_str = result
-            .get("result")
-            .and_then(|r| r.get("block_hash"))
+        let block = self.block(Some("final"), None)?;
+        let header = block.get("result").and_then(|r| r.get("header"));
+
+        let block_hash_str = header
+            .and_then(|h| h.get("hash"))
             .and_then(|h| h.as_str())
             .ok_or_else(|| anyhow::anyhow!("Failed to get block_hash"))?;
 
-        let block_height = result
-            .get("result")
-            .and_then(|r| r.get("block_height"))
+        let block_height = header
+            .and_then(|h| h.get("height"))
             .and_then(|h| h.as_u64())
             .ok_or_else(|| anyhow::anyhow!("Failed to get block_height"))?;
 
