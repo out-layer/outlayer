@@ -127,6 +127,20 @@ tx_value() { # tx_value <tx> <sender> — the transaction's SuccessValue, decode
     | jq -r '.result.status.SuccessValue // empty' | base64 -d 2>/dev/null
 }
 has_log() { jq -e --arg s "$2" 'any(.[]; contains($s))' <<<"$1" >/dev/null 2>&1; }
+# A refusal inside ft_on_transfer is a FAILED receipt: its text is in the receipt's
+# status.Failure, not in a log. tx_failures <tx> <sender> — every failure text, one JSON array.
+tx_failures() {
+  local r i
+  for i in 1 2 3 4 5 6; do
+    r=$(rpc_post "$(jq -nc --arg t "$1" --arg s "$2" '{jsonrpc:"2.0",id:1,method:"tx",params:{tx_hash:$t,sender_account_id:$s,wait_until:"FINAL"}}')")
+    jq -e '.result' <<<"$r" >/dev/null 2>&1 && {
+      jq -c '[.result.receipts_outcome[]?.outcome.status.Failure? // empty | tojson]' <<<"$r"; return 0; }
+    sleep 5
+  done
+  echo '[]'
+}
+has_failure() { jq -e --arg s "$2" 'any(.[]; contains($s))' <<<"$1" >/dev/null 2>&1; }
+ledger_shape() { ledger "$1" | jq -c '{user_funded,refunded,refundable_cap,closing_since,claimable_at}' 2>/dev/null; }
 ledger() { view "$CONTRACT_ID" get_payment_key_refund_ledger "$(jq -nc --arg o "$KEY_OWNER" --argjson n "$1" '{owner:$o, nonce:$n}')"; }
 cap_of() { ledger "$1" | jq -c '.refundable_cap // empty'; }
 flight() { view "$CONTRACT_ID" get_payment_key_flight "$(jq -nc --arg o "$KEY_OWNER" --argjson n "$1" '{owner:$o, nonce:$n}')"; }
@@ -208,6 +222,8 @@ fi
 
 # ══ phase 1 ═══════════════════════════════════════════════════════════════════
 if [[ "$MODE" == apply ]]; then
+  # Keys of earlier runs may still be closing: counts are relative to now.
+  C0=$(closing_count); note "closing keys of $KEY_OWNER before this run: $C0"
   # ── W: the stablecoin balance ──
   log "W1 deposit_balance $AMOUNT"
   B0=$(user_balance); T0=$(token_balance)
@@ -243,8 +259,8 @@ if [[ "$MODE" == apply ]]; then
   out=$(ft_call 9999 '{"action":"deposit_balance"}')
   TX=$(tx_of "$out")
   if [[ -n "$TX" ]]; then
-    logs=$(tx_logs "$TX" "$KEY_OWNER")
-    has_log "$logs" "Minimum deposit is" && pass "W4 the contract refused the deposit" || fail "W4 no 'Minimum deposit' refusal in $TX"
+    fails=$(tx_failures "$TX" "$KEY_OWNER")
+    has_failure "$fails" "Minimum deposit is" && pass "W4 the contract refused the deposit (receipt failed with 'Minimum deposit')" || fail "W4 no 'Minimum deposit' refusal in $TX: $(short "$fails")"
     EXPECT=$T2; t=$(wait_eq token_balance) && pass "W4 token balance unchanged ($t): the transfer came back" || fail "W4 token balance '$t', expected $EXPECT"
   else
     fail "W4 the transfer was not sent: $(why_of "$out")"
@@ -256,9 +272,10 @@ if [[ "$MODE" == apply ]]; then
     fail "R1 no key: R2–R7 not run"
   else
     note "key nonce $NONCE (length ${#PK})"
+    # The CLI returns on the optimistic outcome; the view reads at final a few
+    # seconds later.
     EXPECT='{"user_funded":"0","refunded":"0","refundable_cap":"0","closing_since":null,"claimable_at":null}'
-    l=$(ledger "$NONCE" | jq -c '{user_funded,refunded,refundable_cap,closing_since,claimable_at}' 2>/dev/null)
-    [[ "$l" == "$EXPECT" ]] && pass "R1 a new key's ledger is zero and not closing" || fail "R1 ledger of the new key: $l"
+    l=$(wait_eq ledger_shape "$NONCE") && pass "R1 a new key's ledger is zero and not closing (created with the key)" || fail "R1 ledger of the new key: $l"
     if sql_alive; then
       wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $NONCE AND deleted_at IS NULL" 0 30 >/dev/null \
         && pass "R1 the coordinator registered the key" || fail "R1 no coordinator row for nonce $NONCE after 3 min"
@@ -268,10 +285,32 @@ if [[ "$MODE" == apply ]]; then
     out=$(ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)")
     TX=$(tx_of "$out")
     [[ -n "$TX" ]] && pass "R2 top-up sent ($TX)" || fail "R2 top-up not sent: $(why_of "$out")"
-    # Sent, not yet answered: the key cannot be closed meanwhile — or the
-    # worker was faster and the close goes through. Either way the chain, the
-    # ledger and the coordinator row must agree afterwards.
-    log "R2b close while the top-up may still be in flight"
+    EXPECT="\"$AMOUNT\""; c=$(wait_eq cap_of "$NONCE") \
+      && pass "R2 ledger refundable_cap $c, user_funded counted the top-up" || fail "R2 refundable_cap is '$c' (expected \"$AMOUNT\"): the top-up callback did not count"
+
+    log "R3 one HTTPS call with the key"
+    for i in 1 2 3 4 5 6; do
+      req_pk POST "/call/$PROJECT" '{"input":{"operation":"ping"}}'
+      [[ "$HTTP" == 200 ]] && break
+      sleep 10   # the coordinator credits the key after the worker's resume
+    done
+    [[ "$HTTP" == 200 ]] && pass "R3 call → 200 ($(jq -r '.status // empty' <<<"$BODY"))" || fail "R3 call → HTTP $HTTP: $(short)"
+    if sql_alive; then
+      for i in $(seq 1 20); do
+        n=$(q "SELECT count(*) FROM https_calls WHERE owner = '$KEY_OWNER' AND nonce = $NONCE AND status NOT IN ('completed','failed')"); [[ "$n" == 0 ]] && break; sleep 3
+      done
+      SPENT=$(q "SELECT COALESCE(spent::text,'0') FROM payment_key_balances WHERE owner = '$KEY_OWNER' AND nonce = $NONCE")
+      [[ -n "$SPENT" && "$SPENT" != 0 ]] && pass "R3 settled: spent $SPENT" || warn "R3 spent is '$SPENT' (a free ping?): the refund will be the whole top-up"
+    fi
+
+    # A second top-up, and a close sent right behind it: the key cannot be
+    # closed while the top-up is in flight — or the worker was faster and the
+    # close goes through. Either way the chain, the ledger and the coordinator
+    # row must agree afterwards.
+    log "R2b a second top-up, then close while it may still be in flight"
+    out=$(ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)")
+    TX=$(tx_of "$out")
+    [[ -n "$TX" ]] && pass "R2b second top-up sent ($TX)" || fail "R2b second top-up not sent: $(why_of "$out")"
     out=$(call "$KEY_OWNER" "$CONTRACT_ID" close_payment_key "$(jq -nc --argjson n "$NONCE" '{nonce:$n}')" '1 yoctoNEAR')
     if succeeded "$out"; then
       note "R2b the top-up had settled first: the close went through ($(tx_of "$out")) — R4 reads it as already closing"
@@ -283,23 +322,13 @@ if [[ "$MODE" == apply ]]; then
       fail "R2b close neither succeeded nor was refused as in flight: $(why_of "$out")"
       CLOSED_EARLY=false
     fi
-    EXPECT="\"$AMOUNT\""; c=$(wait_eq cap_of "$NONCE") \
-      && pass "R2 ledger refundable_cap $c, user_funded counted the top-up" || fail "R2 refundable_cap is '$c' (expected \"$AMOUNT\"): the top-up callback did not count"
-    [[ "$(flight "$NONCE" | jq -r '.top_ups_in_flight // 0')" == 0 ]] && pass "R2 nothing in flight once answered" || fail "R2 flight: $(flight "$NONCE")"
+    TOTAL=$(( AMOUNT * 2 ))
+    EXPECT="\"$TOTAL\""; c=$(wait_eq cap_of "$NONCE") \
+      && pass "R2b ledger refundable_cap $c: both top-ups counted, whichever way the close landed" || fail "R2b refundable_cap is '$c' (expected \"$TOTAL\")"
+    [[ "$(flight "$NONCE" | jq -r '.top_ups_in_flight // 0')" == 0 ]] && pass "R2b nothing in flight once answered" || fail "R2b flight: $(flight "$NONCE")"
     if sql_alive; then
-      b=$(wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $NONCE" "$AMOUNT" 20) \
-        && pass "R2 coordinator initial_balance $b agrees with the chain" || fail "R2 coordinator initial_balance '$b', expected $AMOUNT"
-    fi
-
-    log "R3 one HTTPS call with the key"
-    req_pk POST "/call/$PROJECT" '{"input":{"operation":"ping"}}'
-    [[ "$HTTP" == 200 ]] && pass "R3 call → 200 ($(jq -r '.status // empty' <<<"$BODY"))" || fail "R3 call → HTTP $HTTP: $(short)"
-    if sql_alive; then
-      for i in $(seq 1 20); do
-        n=$(q "SELECT count(*) FROM https_calls WHERE owner = '$KEY_OWNER' AND nonce = $NONCE AND status NOT IN ('completed','failed')"); [[ "$n" == 0 ]] && break; sleep 3
-      done
-      SPENT=$(q "SELECT COALESCE(spent::text,'0') FROM payment_key_balances WHERE owner = '$KEY_OWNER' AND nonce = $NONCE")
-      [[ -n "$SPENT" && "$SPENT" != 0 ]] && pass "R3 settled: spent $SPENT" || warn "R3 spent is '$SPENT' (a free ping?): the refund will be the whole top-up"
+      b=$(wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $NONCE" "$TOTAL" 20) \
+        && pass "R2b coordinator initial_balance $b agrees with the chain" || fail "R2b coordinator initial_balance '$b', expected $TOTAL"
     fi
 
     log "R4 close_payment_key $NONCE"
@@ -319,8 +348,8 @@ if [[ "$MODE" == apply ]]; then
       l=$(ledger "$NONCE")
       since=$(jq -r '.closing_since // empty' <<<"$l"); at=$(jq -r '.claimable_at // empty' <<<"$l")
       [[ -n "$since" && "$at" == "$((since + DAY_NS))" ]] && pass "R4 ledger closing_since $since, claimable_at = since + 24 h" || fail "R4 ledger after close: $(short "$l")"
-      [[ "$(jq -r .refundable_cap <<<"$l")" == "$AMOUNT" ]] && pass "R4 cap still $AMOUNT" || fail "R4 cap $(jq -r .refundable_cap <<<"$l")"
-      [[ "$(closing_count)" == 1 ]] && pass "R4 closing count 1" || fail "R4 closing count $(closing_count)"
+      [[ "$(jq -r .refundable_cap <<<"$l")" == "$TOTAL" ]] && pass "R4 cap still $TOTAL" || fail "R4 cap $(jq -r .refundable_cap <<<"$l")"
+      [[ "$(closing_count)" == $(( C0 + 1 )) ]] && pass "R4 closing count $(( C0 + 1 ))" || fail "R4 closing count $(closing_count), expected $(( C0 + 1 ))"
       secret_exists "$NONCE" && pass "R4 the secret stays on chain until the claim" || fail "R4 the secret is gone after the close"
       if sql_alive; then
         d=$(wait_sql "SELECT (deleted_at IS NOT NULL)::text FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $NONCE" true 10) \
@@ -337,10 +366,10 @@ if [[ "$MODE" == apply ]]; then
     out=$(ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)")
     TX=$(tx_of "$out")
     if [[ -n "$TX" ]]; then
-      logs=$(tx_logs "$TX" "$KEY_OWNER")
-      has_log "$logs" "is closing since" && pass "R5 refused at admission: 'is closing since'" || fail "R5 no closing refusal in $TX"
+      fails=$(tx_failures "$TX" "$KEY_OWNER")
+      has_failure "$fails" "is closing since" && pass "R5 refused at admission (receipt failed with 'is closing since')" || fail "R5 no closing refusal in $TX: $(short "$fails")"
       EXPECT=$T3; t=$(wait_eq token_balance) && pass "R5 token balance unchanged" || fail "R5 token balance '$t', expected $EXPECT"
-      [[ "$(ledger "$NONCE" | jq -r .refundable_cap)" == "$AMOUNT" ]] && pass "R5 cap unchanged" || fail "R5 cap changed"
+      [[ "$(ledger "$NONCE" | jq -r .refundable_cap)" == "$TOTAL" ]] && pass "R5 cap unchanged" || fail "R5 cap changed"
     else
       fail "R5 the transfer was not sent: $(why_of "$out")"
     fi
@@ -376,7 +405,7 @@ if [[ "$MODE" == apply ]]; then
       l=$(ledger "$G_NONCE")
       [[ "$(jq -r .refundable_cap <<<"$l")" == 0 && -n "$(jq -r '.closing_since // empty' <<<"$l")" ]] \
         && pass "G1 closing, refundable_cap 0 (a grant is not a deposit)" || fail "G1 ledger: $(short "$l")"
-      [[ "$(closing_count)" == 2 ]] && pass "G1 closing count 2" || fail "G1 closing count $(closing_count)"
+      [[ "$(closing_count)" == $(( C0 + 2 )) ]] && pass "G1 closing count $(( C0 + 2 ))" || fail "G1 closing count $(closing_count), expected $(( C0 + 2 ))"
     else
       fail "G1 close: $(why_of "$out")"
     fi

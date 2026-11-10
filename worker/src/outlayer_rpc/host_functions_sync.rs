@@ -778,7 +778,7 @@ impl near::rpc::api::Host for RpcHostState {
 /// Add NEAR RPC host functions to a wasmtime component linker
 pub fn add_rpc_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut RpcHostState + Send + Sync + Copy + 'static,
+    get_state: fn(&mut T) -> &mut RpcHostState,
 ) -> anyhow::Result<()> {
-    near::rpc::api::add_to_linker(linker, get_state)
+    near::rpc::api::add_to_linker::<T, wasmtime::component::HasSelf<RpcHostState>>(linker, get_state)
 }

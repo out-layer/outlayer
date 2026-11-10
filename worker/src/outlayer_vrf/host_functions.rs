@@ -191,9 +191,9 @@ impl near::vrf::api::Host for VrfHostState {
 /// Add VRF host functions to a wasmtime component linker
 pub fn add_vrf_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut VrfHostState + Send + Sync + Copy + 'static,
+    get_state: fn(&mut T) -> &mut VrfHostState,
 ) -> Result<()> {
-    near::vrf::api::add_to_linker(linker, get_state)
+    near::vrf::api::add_to_linker::<T, wasmtime::component::HasSelf<VrfHostState>>(linker, get_state)
 }
 
 #[cfg(test)]

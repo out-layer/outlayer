@@ -90,7 +90,7 @@ impl near::payment::api::Host for PaymentHostState {
 /// Add payment host functions to a wasmtime component linker
 pub fn add_payment_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut PaymentHostState + Send + Sync + Copy + 'static,
+    get_state: fn(&mut T) -> &mut PaymentHostState,
 ) -> Result<()> {
-    near::payment::api::add_to_linker(linker, get_state)
+    near::payment::api::add_to_linker::<T, wasmtime::component::HasSelf<PaymentHostState>>(linker, get_state)
 }

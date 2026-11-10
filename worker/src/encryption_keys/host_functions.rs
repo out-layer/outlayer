@@ -74,9 +74,9 @@ impl outlayer::encryption_keys::api::Host for EncryptionKeysHostState {
 /// Add the encryption-keys host functions to a component linker.
 pub fn add_encryption_keys_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut EncryptionKeysHostState + Send + Sync + Copy + 'static,
+    get_state: fn(&mut T) -> &mut EncryptionKeysHostState,
 ) -> Result<()> {
-    outlayer::encryption_keys::api::add_to_linker(linker, get_state)
+    outlayer::encryption_keys::api::add_to_linker::<T, wasmtime::component::HasSelf<EncryptionKeysHostState>>(linker, get_state)
 }
 
 #[cfg(test)]

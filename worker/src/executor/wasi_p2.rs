@@ -10,7 +10,7 @@
 //! - Async execution
 //!
 //! ## Requirements
-//! - wasmtime 28+
+//! - wasmtime 36 (LTS)
 //! - WASM component format (not core module)
 //! - wasi:cli/run interface
 
@@ -51,8 +51,8 @@ fn get_p2_engine() -> &'static Engine {
         Engine::new(&config).expect("Failed to create P2 WASM engine")
     })
 }
-use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi::bindings::Command;
+use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::p2::bindings::Command;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
@@ -131,12 +131,8 @@ struct HostState {
 }
 
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
-    }
-
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView { ctx: &mut self.wasi_ctx, table: &mut self.table }
     }
 }
 
@@ -431,7 +427,7 @@ pub async fn execute(
 
     // Create linker with WASI and HTTP support
     let mut linker: Linker<HostState> = Linker::new(&engine);
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
 
     // Add NEAR RPC host functions if context has RPC proxy
@@ -635,9 +631,9 @@ pub async fn execute(
 
     // Prepare stdin/stdout/stderr pipes. stdout has a fixed capacity and a
     // write past it fails; memory is bounded separately, by the store's limits.
-    let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
-    let stdout_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(max_output_bytes);
-    let stderr_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024);
+    let stdin_pipe = wasmtime_wasi::p2::pipe::MemoryInputPipe::new(input_data.to_vec());
+    let stdout_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(max_output_bytes);
+    let stderr_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(1024 * 1024);
 
     // Build WASI context
     let mut wasi_builder = WasiCtxBuilder::new();

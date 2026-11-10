@@ -294,10 +294,10 @@ impl v0_1::near::storage::api::Host for StorageHostState {
 /// of `near:storage/api`.
 pub fn add_storage_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut StorageHostState + Send + Sync + Copy + 'static,
+    get_state: fn(&mut T) -> &mut StorageHostState,
 ) -> Result<()> {
-    near::storage::api::add_to_linker(linker, get_state)?;
-    v0_1::near::storage::api::add_to_linker(linker, get_state)
+    near::storage::api::add_to_linker::<T, wasmtime::component::HasSelf<StorageHostState>>(linker, get_state)?;
+    v0_1::near::storage::api::add_to_linker::<T, wasmtime::component::HasSelf<StorageHostState>>(linker, get_state)
 }
 
 #[cfg(test)]

@@ -1299,9 +1299,9 @@ impl wit::Host for TasksHostState {
 /// Add the task host functions to a wasmtime component linker.
 pub fn add_tasks_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut TasksHostState + Send + Sync + Copy + 'static,
+    get_state: fn(&mut T) -> &mut TasksHostState,
 ) -> anyhow::Result<()> {
-    wit::add_to_linker(linker, get_state)
+    wit::add_to_linker::<T, wasmtime::component::HasSelf<TasksHostState>>(linker, get_state)
 }
 
 #[cfg(test)]

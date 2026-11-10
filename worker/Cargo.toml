@@ -31,22 +31,21 @@ near-jsonrpc-primitives = "0.37"
 # TEE-side verdict cannot drift from the coordinator's.
 shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", branch = "main" }
 
-# WASM execution (wasmtime with WASI Preview 2 support)
-# wasmtime = { version = "37", features = ["component-model", "async"] }
-# WASI core, CLI (for WasiCommand), and HTTP support.
-# FIX: Added 'cli' feature to export `bindings` module for WasiCommand.
-# wasmtime-wasi = { version = "37" } 
-
-wasmtime = { version = "28", features = ["component-model", "async"] }
-wasmtime-wasi = "28"
-wasmtime-wasi-http = "28"
+# WASM execution (wasmtime: WASI P2 components and P1 modules)
+wasmtime = { version = "36", features = ["component-model", "async"] }
+wasmtime-wasi = { version = "36", features = ["preview1"] }
+# Without `default-send-request`: every guest request goes through our own
+# `send_request` (executor/pinned_http.rs), so the crate's own TLS client
+# and its rustls 0.22 stay out of the binary.
+wasmtime-wasi-http = { version = "36", default-features = false }
 hyper = "1.8"
-# Guest HTTP to a checked address (executor/pinned_http.rs): the versions
-# wasmtime-wasi-http 28 itself builds with, so TLS behaves exactly as before.
+# Guest HTTP to a checked address (executor/pinned_http.rs). The `ring`
+# provider is named at the call site: the tree carries more than one, and a
+# bare `ClientConfig::builder()` panics when it cannot pick.
 http-body-util = "0.1"
-rustls = "0.22"
-tokio-rustls = "0.25"
-webpki-roots = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+webpki-roots = "1"
 wasmparser = "0.220"
 
 # WASM execution (wasmi for WASI Preview 1 support)

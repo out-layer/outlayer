@@ -9,7 +9,7 @@
 //! header, so the far side sees an ordinary request.
 //!
 //! The rest follows `wasmtime_wasi_http::types::default_send_request_handler`
-//! (28.0.1): same TLS roots, same HTTP/1 handshake, same timeouts and errors.
+//! (36.0.20): same TLS roots, same HTTP/1 handshake, same timeouts and errors.
 
 use std::net::SocketAddr;
 
@@ -55,9 +55,13 @@ pub(crate) async fn send_to(
         let root_cert_store = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.into(),
         };
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_cert_store)
-            .with_no_client_auth();
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| ErrorCode::TlsProtocolError)?
+        .with_root_certificates(root_cert_store)
+        .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
         // An IPv6 literal arrives bracketed in the URI; a server name has none.
         let name = host.trim_start_matches('[').trim_end_matches(']');

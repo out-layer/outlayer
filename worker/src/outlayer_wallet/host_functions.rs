@@ -730,9 +730,9 @@ impl outlayer::wallet::api::Host for WalletHostState {
 /// Add wallet host functions to a wasmtime component linker
 pub fn add_wallet_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut WalletHostState + Send + Sync + Copy + 'static,
+    get_state: fn(&mut T) -> &mut WalletHostState,
 ) -> Result<()> {
-    outlayer::wallet::api::add_to_linker(linker, get_state)
+    outlayer::wallet::api::add_to_linker::<T, wasmtime::component::HasSelf<WalletHostState>>(linker, get_state)
 }
 
 #[cfg(test)]

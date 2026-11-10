@@ -8,7 +8,7 @@
 //! - Fuel metering for instruction counting
 //!
 //! ## Requirements
-//! - wasmtime 28+ with WASI P1 compatibility layer
+//! - wasmtime 36 (LTS) with its WASI P1 compatibility layer
 //! - Core WASM module (not component)
 //! - `_start` export (created by Rust from `fn main()`)
 
@@ -87,9 +87,9 @@ pub async fn execute(
 
     // Prepare stdin/stdout pipes. stdout has a fixed capacity and a write past
     // it fails; memory is bounded separately, by the store's limits below.
-    let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
-    let stdout_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(max_output_bytes);
-    let stderr_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024);
+    let stdin_pipe = wasmtime_wasi::p2::pipe::MemoryInputPipe::new(input_data.to_vec());
+    let stdout_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(max_output_bytes);
+    let stderr_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(1024 * 1024);
 
     // Build WASI P1 context
     let mut wasi_builder = WasiCtxBuilder::new();
