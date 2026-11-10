@@ -12,7 +12,7 @@ pub fn reason(e: reqwest::Error) -> String {
 }
 
 /// The cause chain of an error whose URL is already removed (`without_url`).
-pub fn chain(e: &reqwest::Error) -> String {
+fn chain(e: &reqwest::Error) -> String {
     let mut text = e.to_string();
     let mut source = std::error::Error::source(e);
     while let Some(cause) = source {

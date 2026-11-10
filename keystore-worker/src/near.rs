@@ -17,6 +17,17 @@ use std::str::FromStr;
 /// i.e. a fresh connection and NO timeout, which is the same silent-hang exposure
 /// [`rpc_client`] exists to close — a stalled connection here pins the handler that called it.
 /// Same 30s ceiling as the query client for that reason.
+fn raw_rpc_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to build raw JSON-RPC client")
+    })
+}
+
 /// A failed RPC call as text, URL removed, with every cause under it (DNS, refused, timed out,
 /// a body that did not parse): `reqwest::Error` displays only its kind and keeps the cause in
 /// `source()`, and the URL can carry the provider's API key.
@@ -32,17 +43,6 @@ fn transport_reason(e: reqwest::Error) -> String {
     text
 }
 
-fn raw_rpc_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("Failed to build raw JSON-RPC client")
-    })
-}
-
 /// A NEAR JSON-RPC client whose errors never name the endpoint.
 ///
 /// The RPC URL can carry the provider's API key (`?apiKey=…`), and a reqwest
@@ -52,35 +52,84 @@ fn raw_rpc_client() -> &'static reqwest::Client {
 #[derive(Clone)]
 pub struct RpcClient(JsonRpcClient);
 
+/// What a call through [`RpcClient`] fails with.
+///
+/// `near-jsonrpc-client` wraps the transport failure as `PayloadSendError(reqwest::Error)` with
+/// no `source()`, so the only text it can ever show is reqwest's own `Display` — the kind alone,
+/// "error sending request". The transport arm carries instead the text of
+/// [`transport_reason`]: URL stripped, every cause under it kept (DNS, refused, timed out, TLS,
+/// a body that did not parse). Everything the server answered stays typed, for callers that
+/// match on it ([`RpcError::rpc`]).
+#[derive(Debug)]
+pub enum RpcError<E> {
+    /// The request never got a JSON-RPC answer; the text names why, never where.
+    Transport(String),
+    /// The server's answer, as the crate types it.
+    Rpc(JsonRpcError<E>),
+}
+
+impl<E> RpcError<E> {
+    /// The server's error, if the server answered at all.
+    pub fn rpc(&self) -> Option<&JsonRpcError<E>> {
+        match self {
+            RpcError::Rpc(e) => Some(e),
+            RpcError::Transport(_) => None,
+        }
+    }
+}
+
+impl<E> std::fmt::Display for RpcError<E>
+where
+    JsonRpcError<E>: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcError::Transport(reason) => write!(f, "RPC transport error: {reason}"),
+            RpcError::Rpc(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for RpcError<E>
+where
+    E: std::fmt::Debug,
+    JsonRpcError<E>: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RpcError::Transport(_) => None,
+            RpcError::Rpc(e) => e.source(),
+        }
+    }
+}
+
 impl RpcClient {
     /// Wrap a client built elsewhere (e.g. `JsonRpcClient::connect`).
     pub fn new(inner: JsonRpcClient) -> Self {
         Self(inner)
     }
 
-    /// [`JsonRpcClient::call`], with the URL stripped from any transport error.
-    pub async fn call<M>(&self, method: M) -> MethodCallResult<M::Response, M::Error>
+    /// [`JsonRpcClient::call`]; a transport failure comes back as its reason without the URL.
+    pub async fn call<M>(&self, method: M) -> Result<M::Response, RpcError<M::Error>>
     where
         M: methods::RpcMethod,
     {
-        self.0.call(method).await.map_err(rpc_error_without_url)
+        self.0.call(method).await.map_err(rpc_error)
     }
 }
 
-/// The same error, minus the request URL inside any reqwest error it holds.
-fn rpc_error_without_url<E>(e: JsonRpcError<E>) -> JsonRpcError<E> {
+/// The crate's error with a transport failure turned into text: URL removed, cause chain kept.
+fn rpc_error<E>(e: JsonRpcError<E>) -> RpcError<E> {
     use near_jsonrpc_client::errors::{
         JsonRpcTransportRecvError as Recv, JsonRpcTransportSendError as Send,
         RpcTransportError as Transport,
     };
     match e {
-        JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e))) => {
-            JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e.without_url())))
+        JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e)))
+        | JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e))) => {
+            RpcError::Transport(transport_reason(e))
         }
-        JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e))) => {
-            JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e.without_url())))
-        }
-        other => other,
+        other => RpcError::Rpc(other),
     }
 }
 
@@ -1117,6 +1166,8 @@ mod tests {
             let text = format!("{e:#} {e:?}");
             let text = format!("{text} {:#}", anyhow::Error::new(e));
             assert!(!text.contains("apiKey") && !text.contains("SECRET"), "{text}");
+            // …and still says why: the cause chain survives the stripping.
+            assert!(text.contains("refused"), "the cause was dropped with the URL: {text}");
         }
     }
 
@@ -1131,6 +1182,7 @@ mod tests {
             .expect_err("nothing listens on port 9");
         let text = format!("{e:#} {e:?}");
         assert!(!text.contains("apiKey") && !text.contains("SECRET"), "{text}");
+        assert!(text.contains("refused"), "the cause was dropped with the URL: {text}");
     }
 
     /// The RPC client must send `Content-Type: application/json`.

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use near_crypto::InMemorySigner;
+use near_jsonrpc_client::errors::JsonRpcError;
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_primitives::transaction::{Action, FunctionCallAction, Transaction, TransactionV0};
 use near_primitives::types::{AccountId, Balance, BlockReference, Finality, Gas};
@@ -64,7 +65,76 @@ pub struct NearClient {
     http: reqwest::Client,
 }
 
+/// What a NEAR RPC call fails with.
+///
+/// `near-jsonrpc-client` wraps a transport failure as `PayloadSendError(reqwest::Error)` with no
+/// `source()`, so the only text it can show is reqwest's kind alone — "error sending request" —
+/// with the request URL, which can carry an API key. The transport arm carries instead
+/// [`crate::transport_error::reason`]: URL stripped, every cause kept (DNS, refused, timed out,
+/// TLS, a body that did not parse). What the server answered stays typed, for the callers that
+/// match on it ([`RpcError::rpc`]).
+#[derive(Debug)]
+pub enum RpcError<E> {
+    /// The request never got a JSON-RPC answer; the text names why, never where.
+    Transport(String),
+    /// The server's answer, as the crate types it.
+    Rpc(JsonRpcError<E>),
+}
+
+impl<E> RpcError<E> {
+    /// The server's error, if the server answered at all.
+    pub fn rpc(&self) -> Option<&JsonRpcError<E>> {
+        match self {
+            RpcError::Rpc(e) => Some(e),
+            RpcError::Transport(_) => None,
+        }
+    }
+}
+
+impl<E> std::fmt::Display for RpcError<E>
+where
+    JsonRpcError<E>: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcError::Transport(reason) => write!(f, "RPC transport error: {reason}"),
+            RpcError::Rpc(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for RpcError<E>
+where
+    E: std::fmt::Debug,
+    JsonRpcError<E>: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RpcError::Transport(_) => None,
+            RpcError::Rpc(e) => e.source(),
+        }
+    }
+}
+
 impl NearClient {
+    /// [`JsonRpcClient::call`]; a transport failure comes back as its reason without the URL.
+    async fn rpc<M>(&self, method: M) -> Result<M::Response, RpcError<M::Error>>
+    where
+        M: methods::RpcMethod,
+    {
+        use near_jsonrpc_client::errors::{
+            JsonRpcTransportRecvError as Recv, JsonRpcTransportSendError as Send,
+            RpcTransportError as Transport,
+        };
+        self.client.call(method).await.map_err(|e| match e {
+            JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e)))
+            | JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e))) => {
+                RpcError::Transport(crate::transport_error::reason(e))
+            }
+            other => RpcError::Rpc(other),
+        })
+    }
+
     /// Create a new NEAR client
     ///
     /// # Arguments
@@ -169,8 +239,8 @@ impl NearClient {
                 signed_transaction: signed_transaction.clone(),
                 wait_until: TxExecutionStatus::None,
             };
-            if let Ok(Err(e)) = tokio::time::timeout(wait(), self.client.call(send)).await {
-                if let Some(RpcTransactionError::InvalidTransaction { context }) = e.handler_error() {
+            if let Ok(Err(e)) = tokio::time::timeout(wait(), self.rpc(send)).await {
+                if let Some(RpcTransactionError::InvalidTransaction { context }) = e.rpc().and_then(|e| e.handler_error()) {
                     let nonce = matches!(context, InvalidTxError::InvalidNonce { .. });
                     refused = Some((format!("{context:?}"), nonce));
                 }
@@ -184,7 +254,7 @@ impl NearClient {
                 },
                 wait_until: TxExecutionStatus::ExecutedOptimistic,
             };
-            let unknown = match tokio::time::timeout(wait(), self.client.call(status)).await {
+            let unknown = match tokio::time::timeout(wait(), self.rpc(status)).await {
                 Ok(Ok(response)) => match response.final_execution_outcome.map(|o| o.into_outcome()) {
                     // An outcome whose receipts have not all run yet is not an
                     // answer: reading it as one would refuse a transaction
@@ -208,7 +278,7 @@ impl NearClient {
                         false
                     }
                 },
-                Ok(Err(e)) => match e.handler_error() {
+                Ok(Err(e)) => match e.rpc().and_then(|e| e.handler_error()) {
                     Some(RpcTransactionError::UnknownTransaction { .. }) => {
                         last = "the chain has not seen it".to_string();
                         true
@@ -809,7 +879,7 @@ impl NearClient {
             },
         };
 
-        let access_key_response = tokio::time::timeout(Self::RPC_TIMEOUT, self.client.call(access_key_query))
+        let access_key_response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(access_key_query))
             .await
             .context("NEAR RPC access key query timed out")?
             .context("Failed to query access key")?;
@@ -826,7 +896,7 @@ impl NearClient {
             block_reference: BlockReference::Finality(Finality::Final),
         };
 
-        let block = tokio::time::timeout(Self::RPC_TIMEOUT, self.client.call(block_query))
+        let block = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(block_query))
             .await
             .context("NEAR RPC block query timed out")?
             .context("Failed to query block")?;
@@ -1104,7 +1174,7 @@ impl NearClient {
             },
         };
 
-        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.client.call(request))
+        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(request))
             .await
             .context("NEAR RPC get_project timed out")?
             .context("Failed to call get_project")?;
@@ -1155,7 +1225,7 @@ impl NearClient {
             },
         };
 
-        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.client.call(request))
+        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(request))
             .await
             .context("NEAR RPC get_secret_vault timed out")?
             .context("Failed to call get_secret_vault")?;
@@ -1204,7 +1274,7 @@ impl NearClient {
             },
         };
 
-        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.client.call(request))
+        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(request))
             .await
             .context("NEAR RPC hos_agent_status timed out")?
             .context("Failed to call hos_agent_status")?;
@@ -1244,7 +1314,7 @@ impl NearClient {
             },
         };
 
-        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.client.call(request))
+        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(request))
             .await
             .context("NEAR RPC w_is_extension_enabled timed out")?
             .context("Failed to call w_is_extension_enabled")?;
@@ -1329,7 +1399,7 @@ impl NearClient {
             },
         };
 
-        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.client.call(request))
+        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(request))
             .await
             .context("NEAR RPC get_version timed out")?
             .context("Failed to call get_version")?;
@@ -1878,6 +1948,18 @@ mod tests {
         assert!(format!("{err:#}").contains("InvalidNonce"), "{err:#}");
         let rounds = NearClient::NONCE_REFUSAL_ROUNDS;
         assert_eq!(*counts.lock().unwrap(), (rounds, rounds));
+    }
+
+    /// A transport failure names its cause and never the endpoint, whose URL can carry a key:
+    /// the crate's own error shows only "error sending request" (its reqwest error has no
+    /// `source()`), so `NearClient::rpc` renders the reason itself.
+    #[tokio::test]
+    async fn an_rpc_transport_error_keeps_its_cause_and_drops_the_url() {
+        let client = client_at("http://127.0.0.1:9/?apiKey=SECRET");
+        let err = client.fetch_project("p").await.expect_err("nothing listens on port 9");
+        let text = format!("{err:#} {err:?}");
+        assert!(!text.contains("apiKey") && !text.contains("SECRET"), "{text}");
+        assert!(text.contains("refused"), "the cause was dropped with the URL: {text}");
     }
 
     #[test]

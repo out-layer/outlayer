@@ -649,7 +649,7 @@ bs58 = "0.5"
 borsh = { version = "1.5", features = ["derive"] }
 sha2 = "0.10"
 base64 = "0.21"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 ```

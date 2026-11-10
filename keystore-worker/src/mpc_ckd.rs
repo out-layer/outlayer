@@ -674,7 +674,7 @@ impl MpcCkdClient {
 
         match self.rpc_client_tx.call(request).await {
             Ok(o) => break o,
-            Err(e) if is_invalid_nonce(&e) && invalid_nonce_retries < CKD_INVALID_NONCE_RETRIES => {
+            Err(e) if e.rpc().is_some_and(is_invalid_nonce) && invalid_nonce_retries < CKD_INVALID_NONCE_RETRIES => {
                 invalid_nonce_retries += 1;
                 // Short jittered pause so two instances that collided do not re-read the nonce in
                 // lockstep and collide again.
@@ -713,7 +713,7 @@ impl MpcCkdClient {
                 // it into a TYPED, actionable error so the HTTP layer can tell
                 // the user to top up the vault instead of returning an opaque
                 // 400/503. (Exact have/need amounts stay in the log above.)
-                if is_not_enough_balance(&e) {
+                if e.rpc().is_some_and(is_not_enough_balance) {
                     return Err(anyhow::Error::new(InsufficientVaultBalance {
                         vault: signer.account_id.clone(),
                     }));
