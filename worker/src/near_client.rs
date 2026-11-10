@@ -80,9 +80,16 @@ struct SendRefusal {
     nonce_too_large: bool,
 }
 
-/// The chain's answer to one `send_tx` that decides something. A node that
-/// does not answer, or accepts, is `None`.
-type Refused = Option<SendRefusal>;
+/// What one `send_tx` came back with.
+#[derive(Debug, Clone)]
+enum Sent {
+    /// The node took the transaction into its pool: it knows the hash.
+    Accepted,
+    /// The chain refused it; only this decides anything.
+    Refused(SendRefusal),
+    /// No answer, or a late one: nothing is known about where it is.
+    NoAnswer,
+}
 
 /// How a follow starts: with its own first send, or after the caller sent the
 /// transaction once already (under the nonce lock) and brings that send's
@@ -91,7 +98,7 @@ enum FirstRound {
     /// Tests follow a transaction they signed themselves.
     #[allow(dead_code)]
     Send,
-    Sent(Refused),
+    Sent(Sent),
 }
 
 /// Where a transaction stands when looked up by hash.
@@ -262,7 +269,9 @@ impl NearClient {
     ///
     /// A transaction the chain refused and does not know fails at once — a
     /// nonce refusal after [`Self::NONCE_REFUSAL_ROUNDS`] rounds, since a
-    /// resend of a transaction already in a block is refused the same way.
+    /// resend of a transaction already in a block is refused the same way. A
+    /// round whose look the node did not answer neither counts nor clears the
+    /// count: only a node that knows the transaction does.
     ///
     /// Errors name what happened, never the RPC's own text: a transport error
     /// quotes the endpoint URL, and this text reaches the job's error details.
@@ -280,14 +289,14 @@ impl NearClient {
         self.follow_within(signed_transaction, FirstRound::Send, follow, pause).await
     }
 
-    /// One `send_tx` without waiting: the chain's refusal, if it gave one. A
-    /// node that does not answer, answers late, or accepts decides nothing
-    /// (`None`); the look that follows says where the transaction is.
+    /// One `send_tx` without waiting. Only a refusal decides anything; an
+    /// acceptance says the node has the hash, and no answer says nothing —
+    /// the look that follows says where the transaction is.
     async fn send_once(
         &self,
         signed_transaction: &near_primitives::transaction::SignedTransaction,
         wait: std::time::Duration,
-    ) -> Refused {
+    ) -> Sent {
         use near_jsonrpc_primitives::types::transactions::RpcTransactionError;
         use near_primitives::errors::InvalidTxError;
         use near_primitives::views::TxExecutionStatus;
@@ -297,13 +306,14 @@ impl NearClient {
             wait_until: TxExecutionStatus::None,
         };
         match tokio::time::timeout(wait, self.rpc(send)).await {
+            Ok(Ok(_)) => Sent::Accepted,
             Ok(Err(e)) => match e.rpc().and_then(|e| e.handler_error()) {
                 Some(RpcTransactionError::InvalidTransaction { context }) => {
                     let ak_nonce = match context {
                         InvalidTxError::InvalidNonce { ak_nonce, .. } => Some(*ak_nonce),
                         _ => None,
                     };
-                    Some(SendRefusal {
+                    Sent::Refused(SendRefusal {
                         reason: format!("{context:?}"),
                         ak_nonce,
                         nonce_too_large: matches!(context, InvalidTxError::NonceTooLarge { .. }),
@@ -311,10 +321,10 @@ impl NearClient {
                 }
                 _ => {
                     debug!("send_tx of {} gave no verdict: {}", signed_transaction.get_hash(), e);
-                    None
+                    Sent::NoAnswer
                 }
             },
-            _ => None,
+            Err(_) => Sent::NoAnswer,
         }
     }
 
@@ -325,7 +335,12 @@ impl NearClient {
     /// for an unknown hash with HTTP 408 after ten seconds, which the client
     /// reads as a transport error, not as an answer). A transaction the chain
     /// knows and has not finished is then waited for within this round.
-    async fn look(&self, hash: near_primitives::hash::CryptoHash, sender: &AccountId, wait: std::time::Duration) -> Seen {
+    /// `quick` — after a refused or unanswered send, when "does the chain know
+    /// this hash at all?" is the question — asks first with `wait_until: None`
+    /// as described; after an ACCEPTED send the node has the hash, so the wait
+    /// for its execution is asked straight away: one request, one or two
+    /// blocks, no round spent on a question already answered.
+    async fn look(&self, hash: near_primitives::hash::CryptoHash, sender: &AccountId, wait: std::time::Duration, quick: bool) -> Seen {
         use near_jsonrpc_primitives::types::transactions::{RpcTransactionError, TransactionInfo};
         use near_primitives::views::{FinalExecutionStatus, TxExecutionStatus};
 
@@ -346,27 +361,38 @@ impl NearClient {
             }
         };
         let started = tokio::time::Instant::now();
-        match tokio::time::timeout(wait, self.rpc(status(TxExecutionStatus::None))).await {
-            Ok(Ok(response)) => match read(response) {
-                Seen::Known(_) => {}
-                seen => return seen,
-            },
-            Ok(Err(e)) => {
-                return match e.rpc().and_then(|e| e.handler_error()) {
-                    Some(RpcTransactionError::UnknownTransaction { .. }) => Seen::Unknown,
-                    Some(other) => Seen::Unanswered(format!("status answered {}", tx_error_name(other))),
-                    None => Seen::Unanswered(format!("status: the RPC did not answer: {e}")),
+        if quick {
+            match tokio::time::timeout(wait, self.rpc(status(TxExecutionStatus::None))).await {
+                Ok(Ok(response)) => match read(response) {
+                    Seen::Known(_) => {}
+                    seen => return seen,
+                },
+                Ok(Err(e)) => {
+                    return match e.rpc().and_then(|e| e.handler_error()) {
+                        Some(RpcTransactionError::UnknownTransaction { .. }) => Seen::Unknown,
+                        Some(other) => Seen::Unanswered(format!("status answered {}", tx_error_name(other))),
+                        None => Seen::Unanswered(format!("status: the RPC did not answer: {e}")),
+                    }
                 }
+                Err(_) => return Seen::Unanswered("status: the RPC did not answer in time".to_string()),
             }
-            Err(_) => return Seen::Unanswered("status: the RPC did not answer in time".to_string()),
+            // Known, not executed: wait for the execution with what is left
+            // of this round's budget. Whatever this wait says, the chain has it.
+            let left = wait.saturating_sub(started.elapsed());
+            return match tokio::time::timeout(left, self.rpc(status(TxExecutionStatus::ExecutedOptimistic))).await {
+                Ok(Ok(response)) => read(response),
+                Ok(Err(e)) => Seen::Known(format!("known to the chain, not executed yet; status: {e}")),
+                Err(_) => Seen::Known("known to the chain, not executed in time".to_string()),
+            };
         }
-        // Known, not executed: wait for the execution with what is left of
-        // this round's budget. Whatever this wait says, the chain has it.
-        let left = wait.saturating_sub(started.elapsed());
-        match tokio::time::timeout(left, self.rpc(status(TxExecutionStatus::ExecutedOptimistic))).await {
+        match tokio::time::timeout(wait, self.rpc(status(TxExecutionStatus::ExecutedOptimistic))).await {
             Ok(Ok(response)) => read(response),
-            Ok(Err(e)) => Seen::Known(format!("known to the chain, not executed yet; status: {e}")),
-            Err(_) => Seen::Known("known to the chain, not executed in time".to_string()),
+            Ok(Err(e)) => match e.rpc().and_then(|e| e.handler_error()) {
+                Some(RpcTransactionError::UnknownTransaction { .. }) => Seen::Unknown,
+                Some(other) => Seen::Unanswered(format!("status answered {}", tx_error_name(other))),
+                None => Seen::Unanswered(format!("status: the RPC did not answer: {e}")),
+            },
+            Err(_) => Seen::Unanswered("status: the RPC did not answer in time".to_string()),
         }
     }
 
@@ -413,12 +439,17 @@ impl NearClient {
             // that does not answer, or answers late, does not, and the look
             // that follows says where the transaction is.
             sends += 1;
-            let refused: Refused = match first.take() {
+            let mut answered = true;
+            let sent = match first.take() {
                 Some(FirstRound::Sent(answer)) => answer,
                 _ => self.send_once(&signed_transaction, wait()).await,
             };
+            let refused = match &sent {
+                Sent::Refused(refusal) => Some(refusal.clone()),
+                _ => None,
+            };
 
-            let unknown = match self.look(hash, &sender, wait()).await {
+            let unknown = match self.look(hash, &sender, wait(), !matches!(sent, Sent::Accepted)).await {
                 Seen::Executed(outcome) => {
                     if sends > 1 {
                         info!("Transaction {} executed after {} sends", hash, sends);
@@ -450,10 +481,18 @@ impl NearClient {
                 }
                 Seen::Unanswered(why) => {
                     last = why;
+                    answered = false;
                     false
                 }
             };
 
+            // The send's own verdict is in this round's line whatever the look
+            // said: the status problem alone would hide the refusal.
+            if let Some(SendRefusal { reason, .. }) = &refused {
+                if !unknown {
+                    last = format!("{last}; send refused: {reason}");
+                }
+            }
             match refused {
                 Some(SendRefusal { reason, ak_nonce, .. }) if unknown => {
                     let nonce = ak_nonce.is_some();
@@ -463,6 +502,10 @@ impl NearClient {
                     }
                     last = format!("send refused: {reason}");
                 }
+                // A look the node did not answer decides nothing: the refusals
+                // counted so far stand, and only a node that KNOWS the
+                // transaction clears them.
+                _ if !answered => {}
                 _ => nonce_refusals = 0,
             }
             if deadline.saturating_duration_since(tokio::time::Instant::now()) < pause {
@@ -1047,7 +1090,7 @@ impl NearClient {
     async fn send_and_follow_first(
         &self,
         signed: near_primitives::transaction::SignedTransaction,
-        first: Refused,
+        first: Sent,
     ) -> Result<FinalExecutionOutcomeView> {
         let hash = signed.get_hash();
         let outcome = self.follow_within(signed, FirstRound::Sent(first), Self::TX_FOLLOW, Self::TX_POLL_PAUSE).await?;
@@ -1099,7 +1142,7 @@ impl NearClient {
         actions: Vec<Action>,
         block_hash: near_primitives::hash::CryptoHash,
         reseed_from: Option<u64>,
-    ) -> Result<(near_primitives::transaction::SignedTransaction, Refused)> {
+    ) -> Result<(near_primitives::transaction::SignedTransaction, Sent)> {
         let mut slot = self.nonce.lock().await;
         if let Some(ak_nonce) = reseed_from {
             *slot = Some(slot.map_or(ak_nonce, |n| n.max(ak_nonce)));
@@ -1122,9 +1165,9 @@ impl NearClient {
         let signature = self.signer.sign(transaction.get_hash_and_size().0.as_ref());
         let signed = near_primitives::transaction::SignedTransaction::new(signature, transaction);
         debug!("Sending transaction {:?} (nonce {})", signed.get_hash(), nonce);
-        let refused = self.send_once(&signed, Self::RPC_TIMEOUT).await;
-        match &refused {
-            Some(SendRefusal { ak_nonce: Some(ak_nonce), .. }) => {
+        let sent = self.send_once(&signed, Self::RPC_TIMEOUT).await;
+        match &sent {
+            Sent::Refused(SendRefusal { ak_nonce: Some(ak_nonce), .. }) => {
                 *slot = Some(slot.map_or(*ak_nonce, |n| n.max(*ak_nonce)));
             }
             // The counter is above the chain's bound: it was seeded or moved
@@ -1132,7 +1175,7 @@ impl NearClient {
             // broke. The counter only ever moves up, so without this it would
             // stay wrong until a restart and every signature would be refused.
             // Dropped, it is seeded from the chain again by the next signer.
-            Some(SendRefusal { nonce_too_large: true, .. }) => {
+            Sent::Refused(SendRefusal { nonce_too_large: true, .. }) => {
                 warn!(
                     "Transaction {} refused: nonce {} is above the chain's bound; the nonce counter is dropped and reseeded from the chain",
                     signed.get_hash(), nonce
@@ -1141,7 +1184,7 @@ impl NearClient {
             }
             _ => {}
         }
-        Ok((signed, refused))
+        Ok((signed, sent))
     }
 
     /// Resume a TopUp yield promise
@@ -2196,6 +2239,51 @@ mod tests {
         assert_eq!(*counts.lock().unwrap(), (rounds, 2 * rounds), "each refused round looks twice: quick, then slow");
     }
 
+    /// A look the node does not answer (FastNEAR: HTTP 408 after its wait)
+    /// between two that say "unknown" neither counts as a refusal nor clears
+    /// the ones counted: the send still fails after the set number of refused
+    /// rounds, one round later, not at the end of the follow window.
+    #[tokio::test]
+    async fn a_nonce_refusal_count_survives_an_unanswered_look() {
+        let body = r#"{"jsonrpc":"2.0","error":{"name":"HANDLER_ERROR","cause":{"info":{"cause":"NOT_OBSERVED"},"name":"TIMEOUT_ERROR"},"code":-32000,"message":"Server error","data":"Timeout"},"id":"dontcare"}"#;
+        let raw = format!("RAW:HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        // Round 1: quick look unknown, slow look unknown (counted). Round 2: the
+        // quick look is not answered (no slow look). Rounds 3 and 4: as round 1.
+        let (url, counts) = scripted_rpc(
+            vec![invalid_tx(NONCE_USED)],
+            vec![unknown_tx(), unknown_tx(), raw, unknown_tx()],
+        );
+        let client = client_at(&url);
+        let err = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect_err("the nonce is not ours");
+        assert!(format!("{err:#}").contains("InvalidNonce"), "{err:#}");
+        let rounds = NearClient::NONCE_REFUSAL_ROUNDS;
+        assert_eq!(
+            *counts.lock().unwrap(),
+            (rounds + 1, 2 * rounds + 1),
+            "one unanswered round in the middle costs one extra send and one look, not the count"
+        );
+    }
+
+    /// When the node answers no look at all, the follow still ends with the
+    /// send's verdict in its text: the refusal is not hidden behind the
+    /// status problem.
+    #[tokio::test]
+    async fn a_refusal_under_an_unanswered_look_is_named_in_the_error() {
+        let body = r#"{"jsonrpc":"2.0","error":{"name":"HANDLER_ERROR","cause":{"info":{"cause":"NOT_OBSERVED"},"name":"TIMEOUT_ERROR"},"code":-32000,"message":"Server error","data":"Timeout"},"id":"dontcare"}"#;
+        let raw = format!("RAW:HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        let (url, _counts) = scripted_rpc(vec![invalid_tx(NONCE_USED)], vec![raw]);
+        let client = client_at(&url);
+        let err = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_millis(300), std::time::Duration::from_millis(50))
+            .await
+            .expect_err("never executed");
+        let text = format!("{err:#}");
+        assert!(text.contains("the RPC did not answer") && text.contains("send refused") && text.contains("InvalidNonce"), "{text}");
+    }
+
     /// A transport failure names its cause and never the endpoint, whose URL can carry a key:
     /// the crate's own error shows only "error sending request" (its reqwest error has no
     /// `source()`), so `NearClient::rpc` renders the reason itself.
@@ -2376,19 +2464,48 @@ mod tests {
         assert!(counts.lock().unwrap().1 >= 2);
     }
 
-    /// A transaction the chain knows and has not finished is waited for
-    /// within the round, not only looked at: the first lookup says "known",
-    /// the wait returns the execution.
+    /// An accepted send is followed with one wait for its execution per round
+    /// — no "does the chain know it" question, the node that took it does. A
+    /// wait that ends with the transaction still unfinished is looked at again
+    /// next round.
     #[tokio::test]
-    async fn a_known_unfinished_transaction_is_waited_for_within_the_round() {
+    async fn an_accepted_send_waits_for_its_execution_and_a_pending_one_is_looked_at_again() {
         let pending = r#"{"jsonrpc":"2.0","id":"dontcare","result":{"final_execution_status":"INCLUDED"}}"#;
         let (url, counts) = scripted_rpc(vec![ACCEPTED.to_string()], vec![pending.to_string(), EXECUTED.to_string()]);
         let client = client_at(&url);
         client
             .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
             .await
-            .expect("executed within the first round");
-        assert_eq!(*counts.lock().unwrap(), (1, 2), "one send; a look, then a wait");
+            .expect("executed on the second look");
+        assert_eq!(*counts.lock().unwrap(), (2, 2), "one wait per round, no quick question after an accepted send");
+    }
+
+    /// The common case costs one send and one wait: accepted, then executed.
+    #[tokio::test]
+    async fn an_accepted_and_executed_send_costs_one_send_and_one_look() {
+        let (url, counts) = scripted_rpc(vec![ACCEPTED.to_string()], vec![EXECUTED.to_string()]);
+        let client = client_at(&url);
+        client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect("executed");
+        assert_eq!(*counts.lock().unwrap(), (1, 1));
+    }
+
+    /// A send the node did not answer leaves the question open, and the quick
+    /// look asks it: unknown → sent again next round.
+    #[tokio::test]
+    async fn an_unanswered_send_asks_whether_the_chain_knows_the_hash() {
+        let (url, counts) = scripted_rpc(
+            vec![handler_error(r#"{"name":"TIMEOUT_ERROR"}"#), ACCEPTED.to_string()],
+            vec![unknown_tx(), EXECUTED.to_string()],
+        );
+        let client = client_at(&url);
+        client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect("executed after the resend");
+        assert_eq!(*counts.lock().unwrap(), (2, 2));
     }
 
 }
