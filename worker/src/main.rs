@@ -6,6 +6,7 @@ mod config;
 mod event_monitor;
 mod executor;
 mod net_guard;
+mod transport_error;
 mod fastfs;
 mod keystore_client;
 mod near_client;

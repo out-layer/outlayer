@@ -2750,13 +2750,13 @@ fn classify_view_error(
 
     match err {
         JsonRpcError::TransportError(RpcTransportError::SendError(Send::PayloadSendError(e))) => {
-            ViewFailure::Unavailable(format!("sending the request failed: {}", e.without_url()))
+            ViewFailure::Unavailable(format!("sending the request failed: {}", crate::transport_error::reason(e)))
         }
         JsonRpcError::TransportError(RpcTransportError::SendError(e @ Send::PayloadSerializeError(_))) => {
             ViewFailure::Final(e.to_string())
         }
         JsonRpcError::TransportError(RpcTransportError::RecvError(Recv::PayloadRecvError(e))) => {
-            ViewFailure::Unavailable(format!("reading the response failed: {}", e.without_url()))
+            ViewFailure::Unavailable(format!("reading the response failed: {}", crate::transport_error::reason(e)))
         }
         // A body that is not a JSON-RPC response: a proxy's error page, a
         // truncated answer.

@@ -2446,7 +2446,7 @@ impl ApiClient {
         let result: CreateCleanupTaskResponse = response.json().await.map_err(|e| {
             anyhow::anyhow!(
                 "Create cleanup task answered with a body that does not parse: {}",
-                e.without_url()
+                crate::transport_error::reason(e)
             )
         })?;
         if result.created {

@@ -17,6 +17,21 @@ use std::str::FromStr;
 /// i.e. a fresh connection and NO timeout, which is the same silent-hang exposure
 /// [`rpc_client`] exists to close — a stalled connection here pins the handler that called it.
 /// Same 30s ceiling as the query client for that reason.
+/// A failed RPC call as text, URL removed, with every cause under it (DNS, refused, timed out,
+/// a body that did not parse): `reqwest::Error` displays only its kind and keeps the cause in
+/// `source()`, and the URL can carry the provider's API key.
+fn transport_reason(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 fn raw_rpc_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -117,13 +132,13 @@ fn build_rpc_client(rpc_url: &str, timeout_secs: u64) -> RpcClient {
     // sends its payload with `.body()`, not `.json()`. Without this header every NEAR RPC call
     // answers HTTP 415, i.e. the keystore cannot read the chain at all. Covered by
     // `rpc_client_sends_json_content_type`.
-    let mut headers = reqwest_rpc::header::HeaderMap::with_capacity(1);
+    let mut headers = reqwest::header::HeaderMap::with_capacity(1);
     headers.insert(
-        reqwest_rpc::header::CONTENT_TYPE,
-        reqwest_rpc::header::HeaderValue::from_static("application/json"),
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
     );
 
-    let http = reqwest_rpc::Client::builder()
+    let http = reqwest::Client::builder()
         .default_headers(headers)
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -985,10 +1000,10 @@ impl NearClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("RPC POST failed: {}", e.without_url()))?
+            .map_err(|e| format!("RPC POST failed: {}", transport_reason(e)))?
             .json()
             .await
-            .map_err(|e| format!("RPC body not JSON: {}", e.without_url()))
+            .map_err(|e| format!("RPC body not JSON: {}", transport_reason(e)))
     }
 
     /// Verify that a public key is a FULL-ACCESS key of an account — the only

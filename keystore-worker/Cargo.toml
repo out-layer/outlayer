@@ -43,10 +43,6 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 
 # NEAR integration
 near-jsonrpc-client = "0.22"
-# Same reqwest major the RPC client is built on (our own HTTP code is still on 0.11), so we can
-# hand it a client that HAS a timeout — `JsonRpcClient::connect` builds one without any.
-# native-tls to match near-jsonrpc-client's default feature; no second TLS stack is pulled in.
-reqwest-rpc = { package = "reqwest", version = "0.12", default-features = false, features = ["json", "native-tls"] }
 near-primitives = "0.37"
 near-crypto = "0.37"
 near-jsonrpc-primitives = "0.37"
@@ -68,7 +64,7 @@ dstack-sdk = "0.1"  # Phala dstack SDK for TDX attestation
 
 # TEE authentication (challenge-response with register-contract)
 shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", branch = "main" }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 
 # TEE support (conditional compilation for future)
@@ -78,7 +74,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 [dev-dependencies]
 # Must match the normal `reqwest` dependency above, otherwise the test build sees two
 # candidate rlibs for the same extern name (E0464).
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 [profile.release]
 opt-level = 3
