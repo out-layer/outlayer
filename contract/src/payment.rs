@@ -769,6 +769,7 @@ impl Contract {
         // or delete is: see `refunds::KeyFlight`.
         self.assert_no_top_up_in_flight(&caller, nonce);
         self.assert_no_other_close_pending(&caller, nonce);
+        self.assert_no_claim_open(&caller, nonce);
 
         // Create callback data
         let callback_data = json!({
@@ -999,7 +1000,12 @@ impl Contract {
             self.secrets_storage.get(&secret_key).is_some(),
             "Payment key not found. Create it first with store_secrets()"
         );
+        // The same two refusals the stablecoin path makes at admission
+        // (`handle_top_up`), made here before the NEAR leaves: the swapped
+        // stablecoin would otherwise be refused there and go back to the
+        // swap account, not to the caller.
         self.assert_payment_key_not_closing(&caller, nonce);
+        self.assert_no_close_pending(&caller, nonce);
 
         // Verify we have enough reserved for ft_transfer (1 yocto) + base_fee
         let ft_transfer_deposit: u128 = 1;

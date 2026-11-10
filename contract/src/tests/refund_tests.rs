@@ -476,10 +476,10 @@ fn a_stale_in_flight_count_does_not_brick_the_key() {
     assert_eq!(top_ups_in_flight(&c, 1), 0, "the stale count was dropped");
 }
 
-// ── one claim at a time, an hour apart ──────────────────────────────────────
+// ── one claim at a time, a day apart ────────────────────────────────────────
 
 #[test]
-fn one_claim_is_in_flight_at_a_time_and_an_hour_apart() {
+fn one_claim_is_in_flight_at_a_time_and_a_day_apart() {
     let mut c = fresh();
     store_key(&mut c, 1);
     credit(&mut c, 1, 40_000);
@@ -507,9 +507,59 @@ fn one_claim_is_in_flight_at_a_time_and_an_hour_apart() {
     testing_env!(one_yocto(accounts(1)).block_timestamp(open + CLAIM_COOLDOWN_NS).block_height(13).build());
     c.claim_payment_key_refund(1);
 
-    // A claim whose callback never ran (stale by height) does not lock the key.
-    testing_env!(one_yocto(accounts(1)).block_timestamp(open + 2 * CLAIM_COOLDOWN_NS).block_height(13 + FLIGHT_STALE_BLOCKS + 1).build());
+    // A delete while the claim waits is refused; the claim answered, it goes.
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + CLAIM_COOLDOWN_NS + 1).block_height(14).build());
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.delete_payment_key(1)));
+    assert!(r.is_err(), "no delete while a claim is open");
+    testing_env!(ctx(accounts(0)).block_timestamp(open + CLAIM_COOLDOWN_NS + 2).build());
+    c.on_payment_key_refund_response(accounts(1), 1, Ok(DeletePaymentKeyResult::Error { message: "in_flight".into() }));
+    // And a claim while a delete waits is refused the same way.
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + CLAIM_COOLDOWN_NS + 3).block_height(15).build());
+    c.delete_payment_key(1);
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + 2 * CLAIM_COOLDOWN_NS).block_height(16).build());
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.claim_payment_key_refund(1)));
+    assert!(r.is_err(), "no claim while a delete is open");
+    testing_env!(ctx(accounts(0)).build());
+    c.on_delete_payment_key_response(accounts(1), 1, Ok(DeletePaymentKeyResult::Error { message: "db".into() }));
+
+    // Both answered, the cooldown over: the next claim goes.
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + 2 * CLAIM_COOLDOWN_NS).block_height(17).build());
     c.claim_payment_key_refund(1);
+}
+
+/// A claim or a delete whose answer never came does not lock the key for
+/// good: past `FLIGHT_STALE_BLOCKS` the flag is ignored, by the delete and
+/// by the claim alike.
+#[test]
+fn a_stale_claim_or_delete_does_not_lock_the_key() {
+    // A claim opened and never answered; a delete at the next block is
+    // refused, the same delete past the stale window goes.
+    let mut c = fresh();
+    store_key(&mut c, 1);
+    credit(&mut c, 1, 40_000);
+    confirm_close(&mut c, 1, T0);
+    let open = T0 + REFUND_SETTLE_DELAY_NS;
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open).block_height(10).build());
+    c.claim_payment_key_refund(1);
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + 1).block_height(11).build());
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.delete_payment_key(1)));
+    assert!(r.is_err(), "the open claim refuses a delete");
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + 2).block_height(10 + FLIGHT_STALE_BLOCKS + 1).build());
+    c.delete_payment_key(1);
+
+    // A delete opened and never answered; a claim at the next block is
+    // refused, the same claim past the stale window goes.
+    let mut c = fresh();
+    store_key(&mut c, 2);
+    credit(&mut c, 2, 40_000);
+    confirm_close(&mut c, 2, T0);
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open).block_height(10).build());
+    c.delete_payment_key(2);
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + 1).block_height(11).build());
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.claim_payment_key_refund(2)));
+    assert!(r.is_err(), "the open delete refuses a claim");
+    testing_env!(one_yocto(accounts(1)).block_timestamp(open + 2).block_height(10 + FLIGHT_STALE_BLOCKS + 1).build());
+    c.claim_payment_key_refund(2);
 }
 
 /// A refund that pays drops the flight record with the ledger.
@@ -611,6 +661,19 @@ fn a_top_up_answered_after_the_close_goes_back() {
     assert_eq!(credit(&mut c, 1, 20_000), 20_000, "returned");
     let v = c.get_payment_key_refund_ledger(accounts(1), 1).unwrap();
     assert_eq!(v.user_funded.0, 30_000, "the late top-up is not counted");
+}
+
+/// A close or a delete waiting for its answer refuses a NEAR top-up before
+/// the NEAR leaves, as the stablecoin path refuses at admission.
+#[test]
+#[should_panic(expected = "is waiting for its answer")]
+fn a_key_with_a_close_pending_refuses_a_near_top_up() {
+    let mut c = fresh();
+    store_key(&mut c, 1);
+    testing_env!(one_yocto(accounts(1)).block_height(10).build());
+    c.close_payment_key(1);
+    testing_env!(ctx(accounts(1)).attached_deposit(NearToken::from_near(1)).block_height(11).build());
+    c.top_up_payment_key_with_near(1, "swap.test".parse().unwrap());
 }
 
 #[test]

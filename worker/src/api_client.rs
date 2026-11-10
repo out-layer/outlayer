@@ -433,6 +433,30 @@ impl TerminalRelay {
     }
 }
 
+/// Whether a coordinator status is its ANSWER — the same tomorrow, so the
+/// relay is not repeated — rather than a condition that passes. A 4xx is the
+/// answer, except the three that are not: 408 (the request timed out on the
+/// way), 425 (too early) and 429 (rate-limited), which are repeated like a
+/// 5xx. A 401 or 403 is the answer too, and a loud one: the worker's token or
+/// TEE session is refused, and nothing it relays will land until an operator
+/// looks — so it is logged at error level here, once per refusal.
+pub fn relay_refused(status: reqwest::StatusCode) -> bool {
+    if !status.is_client_error() {
+        return false;
+    }
+    match status.as_u16() {
+        408 | 425 | 429 => false,
+        401 | 403 => {
+            tracing::error!(
+                "❌ the coordinator refuses this worker's credentials ({}): nothing relayed lands until that is fixed",
+                status
+            );
+            true
+        }
+        _ => true,
+    }
+}
+
 /// The pauses between the attempts [`retry_relay`] makes: eight attempts
 /// within about a hundred seconds, enough to ride out a coordinator redeploy
 /// or a 503 while it cannot yet read the contract.
@@ -447,17 +471,20 @@ pub const RELAY_RETRY_DELAYS: [Duration; 7] = [
 ];
 
 /// The pauses between the attempts of the top-up creditable check
-/// (`ApiClient::top_up_creditable`): six attempts within about half a
-/// minute, well inside the contract's yield window (200 blocks), so a short
-/// coordinator blip does not turn a NEAR top-up into a return to the swap
-/// account. A `creditable: false` is an answer, not a failure, and is not
-/// retried.
-pub const CREDITABLE_RETRY_DELAYS: [Duration; 5] = [
+/// (`ApiClient::top_up_creditable`): seven attempts within about a minute,
+/// so a coordinator blip of up to a minute does not turn a NEAR top-up into
+/// a return to the swap account — and short enough that the check, the
+/// keystore round trip and the resume all land inside the contract's yield
+/// window (200 blocks): with [`RELAY_ATTEMPT_TIMEOUT`] on every attempt the
+/// check gives up after about 130 s at the worst, pinned by a test. A
+/// `creditable: false` is an answer, not a failure, and is not retried.
+pub const CREDITABLE_RETRY_DELAYS: [Duration; 6] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
     Duration::from_secs(4),
     Duration::from_secs(8),
     Duration::from_secs(16),
+    Duration::from_secs(32),
 ];
 
 /// How long one attempt of an event relay [`retry_relay`] repeats may take:
@@ -1080,7 +1107,7 @@ impl ApiClient {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("❌ Complete job failed: HTTP {} {}", status, error_text);
             let message = format!("Complete job failed: {}", error_text);
-            if status.is_client_error() {
+            if relay_refused(status) {
                 return Err(anyhow::Error::new(TerminalRelay).context(message));
             }
             Err(anyhow::anyhow!(message))
@@ -1167,7 +1194,7 @@ impl ApiClient {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("❌ Complete HTTPS call failed: HTTP {} {}", status, error_text);
             let message = format!("Complete HTTPS call failed: {}", error_text);
-            if status.is_client_error() {
+            if relay_refused(status) {
                 return Err(anyhow::Error::new(TerminalRelay).context(message));
             }
             Err(anyhow::anyhow!(message))
@@ -1811,11 +1838,14 @@ impl ApiClient {
         key_hash: &str,
         project_ids: &[String],
         max_per_call: Option<&str>,
+        data_id: Option<&str>,
     ) -> Result<()> {
         let url = format!("{}/topup/complete", self.base_url);
 
         /// As for `init`: `key_hash` carries whether this is an agent's key,
         /// because it IS the answer — see [`ApiClient::init_payment_key`].
+        /// `data_id` names the yield: with it the coordinator credits once per
+        /// yield, so this call may be repeated until it lands.
         #[derive(Serialize)]
         struct CompleteTopUpRequest {
             owner: String,
@@ -1825,6 +1855,7 @@ impl ApiClient {
             key_hash: String,
             project_ids: Vec<String>,
             max_per_call: Option<String>,
+            data_id: Option<String>,
         }
 
         let request = CompleteTopUpRequest {
@@ -1835,6 +1866,7 @@ impl ApiClient {
             key_hash: key_hash.to_string(),
             project_ids: project_ids.to_vec(),
             max_per_call: max_per_call.map(String::from),
+            data_id: data_id.map(String::from),
         };
 
         tracing::info!(
@@ -1843,19 +1875,28 @@ impl ApiClient {
         );
 
         let response = self.add_auth_headers(self.client.post(&url))
+            .timeout(self.relay_timeout)
             .json(&request)
             .send()
             .await
             .context("Failed to notify coordinator of topup completion")?;
 
-        // The coordinator ADDS `amount` to the key's balance here, so a refusal
-        // means the customer paid on chain and was not credited. It is an
-        // error, not repeated: the credit is additive, and a repeat of one that
-        // did land would credit twice.
+        // The coordinator ADDS `amount` to the key's balance here, so a failure
+        // means the customer paid on chain and was not credited. A 4xx is the
+        // coordinator's answer and is terminal — a 409 is a row the chain
+        // closed AFTER the resume: the chain kept the money, the coordinator
+        // has it on record as owed, and the caller says so. Anything else
+        // (a 5xx, a 429, a dropped connection, the relay timeout) is repeated
+        // by the caller — safely, because the credit is recorded once per
+        // `data_id`.
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Coordinator refused the top-up credit: HTTP {} {}", status, error_text);
+            let error_text: String = response.text().await.unwrap_or_default().chars().take(512).collect();
+            let message = format!("Coordinator refused the top-up credit: HTTP {} {}", status, error_text);
+            if relay_refused(status) {
+                return Err(anyhow::Error::new(TerminalRelay).context(message));
+            }
+            anyhow::bail!("{}", message);
         }
 
         tracing::info!("Balance cache updated successfully");
@@ -1970,11 +2011,12 @@ impl ApiClient {
 
     /// Whether the coordinator would credit a top-up on `(owner, nonce)`.
     ///
-    /// Asked BEFORE the top-up is resumed on chain. A row the chain closed
-    /// (a close or delete whose chain half did not land, or landed after
-    /// this top-up was admitted) is not credited there — so the top-up is
-    /// resumed with an error instead and the contract returns it to the
-    /// payer: nothing is accepted on chain that the coordinator cannot hold.
+    /// Asked BEFORE the top-up is resumed on chain. A deleted row — closed
+    /// by the chain (a close or delete whose chain half did not land, or
+    /// landed after this top-up was admitted) or deleted by an admin — is
+    /// never credited there and never comes back, so the top-up is resumed
+    /// with an error instead and the contract returns it to the payer:
+    /// nothing is accepted on chain that the coordinator will not hold.
     /// `Err` is the transport or the coordinator itself.
     pub async fn top_up_creditable(&self, owner: &str, nonce: u32) -> Result<(bool, String)> {
         let url = format!("{}/payment-keys/creditable", self.base_url);
@@ -1991,6 +2033,7 @@ impl ApiClient {
         }
 
         let response = self.add_auth_headers(self.client.post(&url))
+            .timeout(self.relay_timeout)
             .json(&Req { owner, nonce })
             .send()
             .await
@@ -2088,13 +2131,14 @@ impl ApiClient {
         tracing::info!("💱 Asking the coordinator for a refund quote: owner={} nonce={}", owner, nonce);
 
         let response = self.add_auth_headers(self.client.post(&url))
+            .timeout(self.relay_timeout)
             .json(&RefundQuoteRequest { owner, nonce })
             .send()
             .await
             .context("Failed to ask the coordinator for a refund quote")?;
 
         let status = response.status();
-        if status.is_client_error() {
+        if relay_refused(status) {
             // The sentence is relayed into the contract's `Error { message }`
             // and logged there: bounded, because a log line past the chain's
             // limit would panic the callback that keeps the key closing.
@@ -2176,7 +2220,7 @@ impl ApiClient {
             // Anything else — a connection refused while the coordinator
             // restarts, a 5xx during its migrations — is the failure that goes
             // away on its own, and the one worth holding the block for.
-            if status.is_client_error() {
+            if relay_refused(status) {
                 return Err(anyhow::Error::new(TerminalRelay).context(format!(
                     "Subscription purchase notify refused ({}): {}",
                     status, body
@@ -2330,7 +2374,7 @@ impl ApiClient {
                 "Project uuid cache invalidation failed with status {}: {}",
                 status, error_text
             );
-            if status.is_client_error() {
+            if relay_refused(status) {
                 return Err(anyhow::Error::new(TerminalRelay).context(message));
             }
             anyhow::bail!(message)
@@ -2391,7 +2435,7 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             let message = format!("Create cleanup task failed with status {}: {}", status, error_text);
-            if status.is_client_error() {
+            if relay_refused(status) {
                 return Err(anyhow::Error::new(TerminalRelay).context(message));
             }
             anyhow::bail!(message)
@@ -3273,6 +3317,50 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
         assert!(!TerminalRelay::is_terminal(&cleanup), "{cleanup:#}");
         assert!(!TerminalRelay::is_terminal(&invalidate), "{invalidate:#}");
+    }
+
+    /// The creditable pre-check runs inside a yield: a coordinator that hangs
+    /// every attempt is given up on with time left for the keystore and the
+    /// resume before the contract's 200 blocks are out.
+    #[test]
+    fn the_creditable_check_gives_up_with_time_left_in_the_yield() {
+        let pauses: Duration = CREDITABLE_RETRY_DELAYS.iter().sum();
+        assert!(pauses >= Duration::from_secs(60) && pauses <= Duration::from_secs(70), "{pauses:?}");
+        let worst = RELAY_ATTEMPT_TIMEOUT * (CREDITABLE_RETRY_DELAYS.len() as u32 + 1) + pauses;
+        assert!(worst <= Duration::from_secs(140), "{worst:?}");
+    }
+
+    /// The top-up credit: a 2xx lands, a 4xx is the coordinator's answer and
+    /// ends the relay (a 409: the chain kept the money, owed), a 429 and a 5xx
+    /// are repeated.
+    #[tokio::test]
+    async fn a_top_up_credit_is_ended_by_a_4xx_and_repeated_after_a_429_or_5xx() {
+        let credit = |base_url: String| async move {
+            ApiClient::new(base_url, "t".to_string())
+                .unwrap()
+                .complete_topup("a.near", 1, "50000", "50000", "abcdef01", &[], None, Some("d1"))
+                .await
+        };
+        credit(coordinator_answering(200, r#"{"success":true,"repeated":false}"#)).await.unwrap();
+        let owed = credit(coordinator_answering(409, "closed by the chain; recorded as owed")).await.unwrap_err();
+        assert!(TerminalRelay::is_terminal(&owed), "{owed:#}");
+        assert!(format!("{owed:#}").contains("recorded as owed"), "{owed:#}");
+        assert!(TerminalRelay::is_terminal(&credit(coordinator_answering(401, "bad token")).await.unwrap_err()));
+        let limited = credit(coordinator_answering(429, "slow down")).await.unwrap_err();
+        assert!(!TerminalRelay::is_terminal(&limited), "{limited:#}");
+        let down = credit(coordinator_answering(503, "restarting")).await.unwrap_err();
+        assert!(!TerminalRelay::is_terminal(&down), "{down:#}");
+    }
+
+    #[test]
+    fn a_relay_is_refused_by_a_4xx_except_the_three_that_pass() {
+        use reqwest::StatusCode as S;
+        for refused in [S::BAD_REQUEST, S::UNAUTHORIZED, S::FORBIDDEN, S::NOT_FOUND, S::CONFLICT, S::UNPROCESSABLE_ENTITY] {
+            assert!(relay_refused(refused), "{refused}");
+        }
+        for passing in [S::REQUEST_TIMEOUT, S::from_u16(425).unwrap(), S::TOO_MANY_REQUESTS, S::INTERNAL_SERVER_ERROR, S::BAD_GATEWAY, S::SERVICE_UNAVAILABLE, S::OK] {
+            assert!(!relay_refused(passing), "{passing}");
+        }
     }
 
     /// A coordinator that refuses connections is asked for about a hundred

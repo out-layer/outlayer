@@ -7,7 +7,9 @@
 //! keeps, per key, what the user deposited and what was paid back, and pays a
 //! refund of at most the difference. Whatever a worker or the coordinator
 //! reports as the key's remaining balance — honest, inflated, or forged —
-//! nothing leaves this contract that was not deposited on chain by that owner.
+//! nothing leaves this contract that was not deposited on chain onto that
+//! owner's key (by the owner, or by anybody paying for them: it is the key's
+//! money, refundable to its owner alone).
 //!
 //! The ledger starts at zero for every key that existed before it did: only
 //! deposits made after this release are refundable.
@@ -382,6 +384,21 @@ impl Contract {
         }
     }
 
+    /// A key whose refund claim waits for its answer is not deleted: the two
+    /// answers would race over the secret and the ledger, and a failed refund
+    /// transfer would then find no ledger to reopen.
+    pub(crate) fn assert_no_claim_open(&mut self, owner: &AccountId, nonce: u32) {
+        let id = PaymentKeyId { owner: owner.clone(), nonce };
+        let f = self.flight(&id);
+        if f.claim_open && env::block_height() <= f.last_claim_height.saturating_add(FLIGHT_STALE_BLOCKS) {
+            env::panic_str(&format!(
+                "A refund claim of payment key {owner}:{nonce} is waiting for its answer (block {}); \
+                 retry once it has settled (a few blocks).",
+                f.last_claim_height
+            ));
+        }
+    }
+
     /// A key with a top-up not yet answered is neither closed nor deleted:
     /// the answer would then return the money to the payer while the
     /// coordinator, told only of the resume, credits it.
@@ -617,7 +634,9 @@ impl Contract {
                 at.saturating_sub(now) / 1_000_000_000
             ));
         }
-        // One claim at a time, and an hour between two.
+        // Not while a close or delete of the key waits for its answer, one
+        // claim at a time, and a day between two.
+        self.assert_no_other_close_pending(&owner, nonce);
         let mut flight = self.flight(&id);
         let height = env::block_height();
         if flight.claim_open && height <= flight.last_claim_height.saturating_add(FLIGHT_STALE_BLOCKS) {

@@ -4032,11 +4032,13 @@ async fn run_contract_system_callbacks_handler(
                         );
 
                         // Before anything is resumed on chain: will the coordinator
-                        // credit this row? A row the chain closed will not, and a
-                        // top-up accepted on chain but credited nowhere is money
-                        // stuck in the contract. Refused here, the contract returns
-                        // it to the payer. A creation event (amount 0) has no yield
-                        // and registers the key: not asked.
+                        // credit this row? A deleted row — closed by the chain or
+                        // deleted by an admin — will not, ever (a deleted key does
+                        // not come back), and a top-up accepted on chain but
+                        // credited nowhere is money stuck in the contract. Refused
+                        // here, the contract returns it to the payer. A creation
+                        // event (amount 0) has no yield and registers the key: not
+                        // asked.
                         if payload.amount != "0" {
                             // A transport failure is retried for about half a minute
                             // (`CREDITABLE_RETRY_DELAYS`); a `false` is an answer.
@@ -4103,26 +4105,50 @@ async fn run_contract_system_callbacks_handler(
                                     // so a top-up whose yield timed out and was refunded
                                     // is not credited. The callback itself runs in the
                                     // payer's transaction and is not seen here.
-                                    if let Err(e) = api_client
-                                        .complete_topup(
-                                            &payload.owner,
-                                            payload.nonce,
-                                            &result.new_balance,
-                                            &payload.amount,
-                                            &result.key_hash,
-                                            &result.project_ids,
-                                            result.max_per_call.as_deref(),
-                                        )
-                                        .await
-                                    {
-                                        // A 409 is the chain-closed row: the contract's callback
-                                        // returned the top-up to the payer, nothing is owed.
-                                        // Anything else is a top-up the chain kept and this
-                                        // side did not record — reconcile.
-                                        error!(
-                                            "❌ TopUp resumed on chain but NOT credited in the coordinator (a 409 means the key is closed by the chain and the contract returned the top-up to the payer; anything else needs reconciling): owner={} nonce={} amount={} error={}",
-                                            payload.owner, payload.nonce, payload.amount, e
-                                        );
+                                    // Repeated through `retry_relay` until it lands or the
+                                    // coordinator answers 4xx: the credit is once per yield
+                                    // (`data_id`), so a repeat cannot credit twice. The
+                                    // creation event (amount 0) has no yield and no record.
+                                    let data_id = (payload.amount != "0").then_some(payload.data_id.as_str());
+                                    let credited = api_client::retry_relay(
+                                        "top-up credit",
+                                        &api_client::RELAY_RETRY_DELAYS,
+                                        || {
+                                            api_client.complete_topup(
+                                                &payload.owner,
+                                                payload.nonce,
+                                                &result.new_balance,
+                                                &payload.amount,
+                                                &result.key_hash,
+                                                &result.project_ids,
+                                                result.max_per_call.as_deref(),
+                                                data_id,
+                                            )
+                                        },
+                                    )
+                                    .await;
+                                    if let Err(e) = credited {
+                                        if payload.amount == "0" {
+                                            // The creation event, no money: the row at this
+                                            // nonce stays closed (a 409) and the new key is
+                                            // unusable here; the owner creates another nonce.
+                                            error!(
+                                                "❌ PaymentKey creation not registered in the coordinator: owner={} nonce={} error={}",
+                                                payload.owner, payload.nonce, e
+                                            );
+                                        } else {
+                                            // The resume was taken, so the chain KEPT this amount
+                                            // (it is in the key's refund cap) and this side did not
+                                            // add it: a 409 is a row the chain closed after the
+                                            // resume — the coordinator has it on record as owed
+                                            // (`payment_key_topups`, `credited = FALSE`); anything
+                                            // else is a credit that never landed and has no
+                                            // record but this line. Either way, OWED — reconcile.
+                                            error!(
+                                                "❌ OWED: TopUp taken on chain and NOT credited in the coordinator — reconcile: owner={} nonce={} amount={} data_id={} error={}",
+                                                payload.owner, payload.nonce, payload.amount, payload.data_id, e
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -4247,8 +4273,18 @@ async fn run_contract_system_callbacks_handler(
                         // The quote, or the reason there is none. Either way the
                         // yield is resumed: the contract pays at most its cap of
                         // an amount, and keeps the key closing on an error so the
-                        // owner can claim again.
-                        let answer = api_client.refund_quote(&payload.owner, payload.nonce).await;
+                        // owner can claim again — a day later, which is what a
+                        // coordinator blip would cost them, so a transport
+                        // failure or a 5xx is asked again for about a minute
+                        // (`CREDITABLE_RETRY_DELAYS`, inside the yield window); the
+                        // quote is given once and read back, so a repeat is safe.
+                        // A refusal (4xx) is an answer and is not asked again.
+                        let answer = api_client::retry_relay(
+                            "refund quote",
+                            &api_client::CREDITABLE_RETRY_DELAYS,
+                            || api_client.refund_quote(&payload.owner, payload.nonce),
+                        )
+                        .await;
                         let resumed = match answer {
                             Ok(api_client::RefundQuote::Amount(amount)) => {
                                 near_client.resume_payment_key_refund(&payload.data_id, &amount).await

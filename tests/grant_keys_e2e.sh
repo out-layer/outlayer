@@ -15,9 +15,18 @@
 #   G1  /admin/grant-payment-key: an amount past i64 → 400, the key untouched;
 #       $0.05 on a fresh key → 200, is_grant, balance +50000, exactly one new
 #       payment_key_grants row of 50000; onto the money key → 409, untouched
-#   P1  /subscription/purchase on the grant key → 403 grant_key_not_purchasable,
-#       terminal, nothing spent, no allowance. The money key with the same body
-#       → refused for another reason, nothing spent
+#   P1  the grant key is granted up to the price of the cheapest plan, then
+#       buys it → 403 grant_key_not_purchasable, terminal, nothing spent, no
+#       allowance. The money key, topped up with the price from the owner's
+#       own money, sends the same body → 200: the plan's allowance on the key,
+#       the price spent. Without the gate the grant would buy that allowance
+#   P2  (DB_WRITE=1) the fence where the allowance is written: a key with the
+#       price of its own money is not a grant key when the purchase passes the
+#       gate, and becomes one while the purchase waits on its balance row (a
+#       lock this suite holds, then `is_grant = true`, committed) → the write
+#       finds no row: 401 invalid_key, nothing spent, no allowance. `is_grant`
+#       is never cleared (the schema refuses), so the fence key is deleted on
+#       chain at the end: its PLAN_PRICE of testnet stablecoin is forfeited
 #   D1  X-Attached-Deposit from the grant key → 403 no_deposit
 #   A1  connector-probe `secret` (price 10000, author share 7000 bp to the
 #       probe's author) from the grant key → settled, the fee charged to the
@@ -48,6 +57,9 @@
 #
 # Run:
 #   PSQL_CMD=… ./tests/grant_keys_e2e.sh            # dry run: preflight only
+#   P2 also needs DB_WRITE=1 and PSQL_SESSION_CMD — a command that runs the
+#   statements on its stdin as ONE session on the same DB. It writes only the
+#   suite's own key: a lock on its balance row and its is_grant flag.
 #   PSQL_CMD=… ./tests/grant_keys_e2e.sh --apply    # everything
 #   ROWS="S1 P1" PSQL_CMD=… ./tests/grant_keys_e2e.sh --apply
 
@@ -71,7 +83,9 @@ PROJECT="${PROJECT:-$CONNECTORS/connector-probe}"
 OUTLAYER="${OUTLAYER:-$HOME/projects/outlayer-cli/target/release/outlayer}"
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/scripts/.env}"
 FUND_NEAR="${FUND_NEAR:-0.3}"
-ROWS="${ROWS:-S1 G1 P1 D1 A1 R1 R2 R3 R4 W1 W2}"
+ROWS="${ROWS:-S1 G1 P1 P2 D1 A1 R1 R2 R3 R4 W1 W2}"
+DB_WRITE="${DB_WRITE:-0}"
+PSQL_SESSION_CMD="${PSQL_SESSION_CMD:-}"
 GRANT=50000        # $0.05
 MONEY=50000        # $0.05, the money key's own top-up
 CENT=10000         # $0.01, the smallest top-up
@@ -99,14 +113,18 @@ view() { # view <contract> <method> <args-json>
     | jq -r 'if .result.result then (.result.result | implode) else empty end' 2>/dev/null
 }
 call() { # call <contract> <method> <args-json> <deposit> [gas] — signed by KEY_OWNER
+  # Retried only while no transaction went out at all — a transport failure,
+  # or the nonce race near-cli loses right after `outlayer keys create` signed
+  # with the same access key. A transaction the contract refused is an answer
+  # and is not sent again.
   local out i
-  for i in 1 2; do
+  for i in 1 2 3; do
     out=$(near contract call-function as-transaction "$1" "$2" json-args "$3" \
       prepaid-gas "${5:-100.0 Tgas}" attached-deposit "$4" sign-as "$KEY_OWNER" network-config "$NETWORK" \
       sign-with-legacy-keychain send 2>&1)
     grep -q 'Transaction ID' <<<"$out" && break
-    grep -qiE 'error sending request|failed to fetch' <<<"$out" || break
-    sleep 5
+    grep -qiE 'InvalidNonce|nonce|error sending request|failed to fetch|timed out|timeout|connection' <<<"$out" || break
+    sleep 6
   done
   printf '%s\n' "$out"
 }
@@ -116,7 +134,10 @@ tx_of() { grep -oE 'Transaction ID: *[1-9A-HJ-NP-Za-km-z]{40,50}' <<<"$1" | grep
 why_of() {
   local m
   m=$(grep -oE 'Smart contract panicked: [^"\\]*|panicked at [^"\\]*|ExecutionError\("[^"]*' <<<"$1" | grep -viE 'https?:|apikey' | head -2 | tr '\n' ' ' | head -c 300)
-  [[ -n "$m" ]] && printf '%s' "$m" || printf 'near-cli failed without a contract panic (output withheld)'
+  [[ -n "$m" ]] && { printf '%s' "$m"; return; }
+  # No panic: name the error class, never the text around it (it may carry the URL).
+  m=$(grep -oE '[A-Z][A-Za-z]+(Error|Nonce)\b' <<<"$1" | sort -u | tr '\n' ' ' | head -c 160)
+  printf 'near-cli failed without a contract panic%s' "${m:+ ($m)}"
 }
 top_up() { # top_up <nonce> <amount> — ft_transfer_call top_up_payment_key for KEY_OWNER's key
   call "$TOKEN" ft_transfer_call \
@@ -224,6 +245,20 @@ SECRET_OP=$(jq -c '.operations[] | select(.operation=="secret") | {price_usd, de
 [[ "$SECRET_OP" == '{"price_usd":"10000","developer_share_bp":7000}' && -n "$AUTHOR" ]] \
   || { echo "✗ $PROJECT 'secret' is priced $SECRET_OP by '$AUTHOR', not 10000 / 7000 bp: A1's expectations are about something else" >&2; exit 1; }
 note "probe 'secret': price 10000, author share 7000 bp to $AUTHOR"
+PLAN=$(view "$CONTRACT_ID" get_subscription_plans '{}' | jq -c '[.[] | select(.active)] | sort_by(.price_usd|tonumber) | first // empty')
+PLAN_INDEX=$(jq -r '.index // empty' <<<"$PLAN"); PLAN_PRICE=$(jq -r '.price_usd // empty' <<<"$PLAN")
+PLAN_ALLOW=""
+for _ in 1 2 3; do
+  [[ -n "$PLAN_INDEX" ]] && PLAN_ALLOW=$(q "SELECT allowance_usd FROM subscription_plan_terms WHERE plan_index = $PLAN_INDEX")
+  [[ -n "$PLAN_ALLOW" ]] && break; sleep 3
+done
+[[ -n "$PLAN_PRICE" && -n "$PLAN_ALLOW" ]] \
+  || { echo "✗ no plan on sale on $NETWORK (chain: '$PLAN', terms: '$PLAN_ALLOW'): P1 cannot buy anything" >&2; exit 1; }
+note "cheapest plan: '$(jq -r .name <<<"$PLAN")' at $PLAN_PRICE for $PLAN_ALLOW of allowance"
+if want P2; then
+  if [[ "$DB_WRITE" == 1 && -n "$PSQL_SESSION_CMD" ]]; then note "P2: DB writes on the suite's own key ENABLED"
+  else warn "P2 needs DB_WRITE=1 and PSQL_SESSION_CMD: it will be SKIPPED"; fi
+fi
 
 if ! $APPLY; then
   sed -n '3,/^$/p' "$0" >&2
@@ -270,9 +305,17 @@ if $NEED_KEYS; then
   done
   if [[ -n "$M_NONCE" ]]; then
     out=$(top_up "$M_NONCE" "$MONEY")
-    [[ -n "$(tx_of "$out")" ]] || fail "fixture: the money key's top-up was not sent: $(why_of "$out")"
-    wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $M_NONCE" "$MONEY" 30 >/dev/null \
-      && note "money key: $MONEY of the owner's own money on it" || fail "fixture: the money key's balance never reached $MONEY"
+    if [[ -z "$(tx_of "$out")" ]]; then
+      fail "fixture: the money key's top-up was not sent: $(why_of "$out")"
+    fi
+    if wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $M_NONCE" "$MONEY" 30 >/dev/null; then
+      note "money key: $MONEY of the owner's own money on it"
+    else
+      # An unfunded key would take the G1 grant and turn into a grant key, and
+      # every control below would then test a second grant key.
+      fail "fixture: the money key's balance never reached $MONEY — the money controls (G1 409, P1, A1, R1) are not run"
+      M_NONCE=""; M_KEY=""
+    fi
   fi
 fi
 
@@ -301,34 +344,6 @@ if want G1 && [[ -n "$G_NONCE" ]]; then
     [[ "$HTTP" == 409 && "$(key_row "$KEY_OWNER" "$M_NONCE")" == "$MR0" && "$(granted_rows "$KEY_OWNER" "$M_NONCE")" == 0 ]] \
       && pass "G1 a grant onto the owner's funded key → 409, untouched" \
       || fail "G1 grant onto the money key → HTTP $HTTP, key $(key_row "$KEY_OWNER" "$M_NONCE") (was $MR0): $(short)"
-  fi
-fi
-
-# ══ P1: no subscription from a grant ═════════════════════════════════════════
-purchase_body='{"amount_usd":"50000"}'
-if want P1 && [[ -n "$G_NONCE" ]]; then
-  log "P1 a grant cannot buy a subscription"
-  R0=$(key_row "$KEY_OWNER" "$G_NONCE")
-  PK_SECRET=$G_KEY; req_pk POST /subscription/purchase "$purchase_body"
-  if [[ "$HTTP" == 403 && "$(j .reason)" == grant_key_not_purchasable && "$(j .terminal)" == true \
-        && "$(key_row "$KEY_OWNER" "$G_NONCE")" == "$R0" ]]; then
-    pass "P1 grant key → 403 grant_key_not_purchasable, terminal; spent, balance and allowance unchanged ($R0)"
-  else
-    fail "P1 grant key → HTTP $HTTP reason '$(j .reason)', key $(key_row "$KEY_OWNER" "$G_NONCE") (was $R0): $(short)"
-  fi
-  if [[ -n "$M_NONCE" ]]; then
-    MR0=$(key_row "$KEY_OWNER" "$M_NONCE")
-    PK_SECRET=$M_KEY; req_pk POST /subscription/purchase "$purchase_body"
-    MR1=$(key_row "$KEY_OWNER" "$M_NONCE")
-    if [[ "$(j .reason)" == grant_key_not_purchasable ]]; then
-      fail "P1 the money key was refused as a grant key: the refusal is not about is_grant"
-    elif [[ "$HTTP" == 200 ]]; then
-      note "P1 the money key bought a plan with the same body ($(short "$BODY" 120)): its own money may"
-      pass "P1 control: the same purchase from the owner's money is not refused as a grant"
-    else
-      [[ "$MR1" == "$MR0" ]] && pass "P1 control: the money key → HTTP $HTTP $(j .reason), not grant_key_not_purchasable; nothing spent" \
-        || fail "P1 control: the money key was refused ($HTTP) yet its row moved: $MR0 → $MR1"
-    fi
   fi
 fi
 
@@ -371,6 +386,110 @@ if want A1 && [[ -n "$G_NONCE" ]]; then
         || fail "A1 control: the money call quotes bp $(field "$CALL_ROW" 2) to $(field "$CALL_ROW" 3), credits $CR — the grant result above proves nothing"
     else
       fail "A1 control: the money call did not settle (HTTP $HTTP, call '$CALL_ID'): $(short)"
+    fi
+  fi
+fi
+
+# ══ P1: no subscription from a grant ═════════════════════════════════════════
+purchase_body=$(jq -nc --arg a "${PLAN_PRICE:-0}" --argjson p "${PLAN_INDEX:-0}" '{amount_usd:$a, plan:$p}')
+if want P1 && [[ -n "$G_NONCE" ]]; then
+  log "P1 a grant as large as the plan's price cannot buy it"
+  req_admin POST /admin/grant-payment-key "$(jq -nc --arg o "$KEY_OWNER" --argjson n "$G_NONCE" --arg a "$PLAN_PRICE" '{owner:$o, nonce:$n, amount:$a, note:"grant_keys_e2e plan price"}')"
+  [[ "$HTTP" == 200 ]] && note "grant key topped up by $PLAN_PRICE: balance $(field "$(key_row "$KEY_OWNER" "$G_NONCE")" 1)" \
+    || fail "P1 the grant key was not granted the plan's price (HTTP $HTTP): $(short)"
+  R0=$(key_row "$KEY_OWNER" "$G_NONCE")
+  PK_SECRET=$G_KEY; req_pk POST /subscription/purchase "$purchase_body"
+  if [[ "$HTTP" == 403 && "$(j .reason)" == grant_key_not_purchasable && "$(j .terminal)" == true \
+        && "$(key_row "$KEY_OWNER" "$G_NONCE")" == "$R0" ]]; then
+    pass "P1 grant key holding $(field "$R0" 1) → 403 grant_key_not_purchasable, terminal; nothing spent, no allowance ($R0)"
+  else
+    fail "P1 grant key → HTTP $HTTP reason '$(j .reason)', key $(key_row "$KEY_OWNER" "$G_NONCE") (was $R0): $(short)"
+  fi
+  if [[ -n "$M_NONCE" ]]; then
+    MB=$(field "$(key_row "$KEY_OWNER" "$M_NONCE")" 1)
+    out=$(top_up "$M_NONCE" "$PLAN_PRICE")
+    if [[ -n "$(tx_of "$out")" ]] && wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $M_NONCE" "$(( MB + PLAN_PRICE ))" 30 >/dev/null; then
+      MR0=$(key_row "$KEY_OWNER" "$M_NONCE")
+      PK_SECRET=$M_KEY; req_pk POST /subscription/purchase "$purchase_body"
+      MR1=$(key_row "$KEY_OWNER" "$M_NONCE")
+      if [[ "$HTTP" == 200 && "$(j .allowance_purchased_usd)" == "$PLAN_ALLOW" && "$(j .spent_usd)" == "$PLAN_PRICE" \
+            && "$(field "$MR1" 2)" == "$(( $(field "$MR0" 2) + PLAN_PRICE ))" && "$(field "$MR1" 6)" == "$(( $(field "$MR0" 6) + PLAN_ALLOW ))" ]]; then
+        pass "P1 control: the owner's own $PLAN_PRICE buys '$(j .plan)' → 200, allowance $(field "$MR0" 6) → $(field "$MR1" 6), spent +$PLAN_PRICE"
+      else
+        fail "P1 control: the money key → HTTP $HTTP $(j .reason), key $MR0 → $MR1: $(short)"
+      fi
+    else
+      fail "P1 control: the money key was not topped up with the plan's price: $(why_of "$out")"
+    fi
+  fi
+fi
+
+# ══ P2: the fence where the allowance is written ═════════════════════════════
+if want P2; then
+  if [[ "$DB_WRITE" != 1 || -z "$PSQL_SESSION_CMD" ]]; then
+    skip "P2 the allowance-write fence: needs DB_WRITE=1 and PSQL_SESSION_CMD"
+  else
+    log "P2 a key that turns into a grant key mid-purchase is refused at the write"
+    if create_key; then
+      F_NONCE=$NONCE; F_KEY=$KEY; note "fence key: nonce $F_NONCE"
+      wait_sql "SELECT count(*) FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $F_NONCE AND deleted_at IS NULL" 1 30 >/dev/null
+      out=$(top_up "$F_NONCE" "$PLAN_PRICE")
+      if [[ -n "$(tx_of "$out")" ]] && wait_sql "SELECT initial_balance FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $F_NONCE" "$PLAN_PRICE" 30 >/dev/null; then
+        FR0=$(key_row "$KEY_OWNER" "$F_NONCE")
+        # Hold the balance row, so the purchase stops after the gate; flip the
+        # flag while it waits; commit.
+        printf '%s\n' \
+          "INSERT INTO payment_key_balances (owner, nonce, spent, reserved) VALUES ('$KEY_OWNER', $F_NONCE, 0, 0) ON CONFLICT DO NOTHING;" \
+          "BEGIN;" \
+          "SELECT 1 FROM payment_key_balances WHERE owner = '$KEY_OWNER' AND nonce = $F_NONCE FOR UPDATE;" \
+          "SELECT pg_sleep(12);" \
+          "UPDATE payment_keys SET is_grant = TRUE WHERE owner = '$KEY_OWNER' AND nonce = $F_NONCE;" \
+          "COMMIT;" | $PSQL_SESSION_CMD >/dev/null 2>"$RUN_TMP/p2.err" &
+        HOLDER=$!
+        sleep 3
+        ( printf 'X-Payment-Key: %s\n' "$F_KEY" | command curl -sS -o "$RUN_TMP/p2.body" -w '%{http_code}' --max-time 90 \
+            -X POST -H @- -H 'Content-Type: application/json' --data-binary "$purchase_body" \
+            "$COORDINATOR_URL/subscription/purchase" > "$RUN_TMP/p2.code" 2>/dev/null ) &
+        BUYER=$!
+        WAITED=false
+        for _ in $(seq 1 15); do
+          [[ "$(q "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query ILIKE '%payment_key_balances%FOR UPDATE%'")" -gt 0 ]] && { WAITED=true; break; }
+          sleep 0.5
+        done
+        wait "$HOLDER"; HELD=$?
+        wait "$BUYER"
+        P2_HTTP=$(cat "$RUN_TMP/p2.code" 2>/dev/null); P2_BODY=$(tr -d '\n' < "$RUN_TMP/p2.body" 2>/dev/null)
+        FR1=$(key_row "$KEY_OWNER" "$F_NONCE")
+        [[ "$P2_HTTP" == 401 ]] && pass "P2 the purchase → 401 ($(short "$P2_BODY" 80)): the write found no non-grant row" \
+          || fail "P2 the purchase → HTTP $P2_HTTP: $(short "$P2_BODY")"
+        $WAITED && pass "P2 the purchase passed the gate and waited on the balance row (seen in pg_stat_activity)" \
+          || fail "P2 the purchase was never seen waiting on the balance row: it did not reach the write"
+        [[ "$HELD" == 0 ]] || fail "P2 the holding session failed: $(head -c 160 "$RUN_TMP/p2.err")"
+        BOUGHT=$(q "SELECT COALESCE(allowance_purchased_usd,0) FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $F_NONCE")
+        if [[ "$(field "$FR1" 4)" == t && "$(field "$FR1" 2)" == "$(field "$FR0" 2)" && "$(field "$FR1" 6)" == "$(field "$FR0" 6)" && "$BOUGHT" == 0 ]]; then
+          pass "P2 the write refused the key that became a grant key: nothing spent ($(field "$FR1" 2)), no allowance ($(field "$FR1" 6)), nothing bought"
+        else
+          fail "P2 the key moved: $FR0 → $FR1, allowance bought $BOUGHT"
+        fi
+        PK_SECRET=$F_KEY; req_pk GET /subscription/status
+        note "P2 the key afterwards: $(jq -c '{has_subscription, allowance_total_usd, expires_at}' <<<"$BODY" 2>/dev/null)"
+        # `is_grant` is never cleared — the schema refuses (migration
+        # 20261109000004) — so the fence key stays a grant key for good. It is
+        # deleted on chain instead: the PLAN_PRICE of testnet stablecoin on it
+        # is forfeited (a grant key's remainder is not refundable), and the
+        # owner is not left with one more closing key or a grant key that
+        # spends. The worker relays the delete to the coordinator.
+        out=$(call "$CONTRACT_ID" delete_payment_key "$(jq -nc --argjson n "$F_NONCE" '{nonce:$n}')" '1 yoctoNEAR')
+        if [[ -n "$(tx_of "$out")" ]] && wait_sql "SELECT count(*) FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $F_NONCE AND deleted_at IS NOT NULL" 1 60 >/dev/null; then
+          note "P2 the fence key is deleted on chain and in the coordinator (its $PLAN_PRICE forfeited)"
+        else
+          fail "P2 the fence key (nonce $F_NONCE) was not deleted; it stays a grant key holding $PLAN_PRICE: $(why_of "$out")"
+        fi
+      else
+        fail "P2 the fence key was not topped up with the plan's price: $(why_of "$out")"
+      fi
+    else
+      fail "P2 no fence key"
     fi
   fi
 fi

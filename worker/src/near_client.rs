@@ -923,6 +923,7 @@ impl NearClient {
         data_id: &str,
         error_message: &str,
     ) -> Result<String> {
+        let error_message = &bounded_reason(error_message);
         info!("📤 Resuming TopUp with error: data_id={} error={}", data_id, error_message);
 
         // Build TopUpResult::Error
@@ -1048,6 +1049,7 @@ impl NearClient {
         data_id: &str,
         error_message: &str,
     ) -> Result<String> {
+        let error_message = &bounded_reason(error_message);
         info!(
             "📤 Resuming DeletePaymentKey with error: data_id={} error={}",
             data_id, error_message
@@ -1896,5 +1898,94 @@ mod tests {
         );
 
         assert!(client.is_ok());
+    }
+}
+
+/// The most bytes a reason relayed into a yield's `Error { message }` may
+/// take ONCE JSON-ESCAPED, which is how it travels: the contract serialises
+/// the result with `serde_json` before `promise_yield_resume`, whose payload
+/// is capped at 1024 bytes, and the envelope `{"Error":{"message":""}}` takes
+/// 24 of them. A quote or a backslash in the reason costs two bytes, a control
+/// character six, so the raw length says nothing; the escaped one is what is
+/// bounded, with room left. Over the budget the resume fails, the yield times
+/// out, and a refund claim waits a day to be made again.
+pub const MAX_RELAYED_REASON_JSON_BYTES: usize = 960;
+
+/// The yield payload's cap, and the envelope's share of it.
+const YIELD_PAYLOAD_CAP_BYTES: usize = 1024;
+const YIELD_ERROR_ENVELOPE_BYTES: usize = r#"{"Error":{"message":""}}"#.len();
+
+/// The bytes `s` takes inside a JSON string, quotes not counted.
+fn json_escaped_len(s: &str) -> usize {
+    serde_json::to_string(s).map(|j| j.len() - 2).unwrap_or(usize::MAX)
+}
+
+/// `reason` with its JSON-escaped form within
+/// [`MAX_RELAYED_REASON_JSON_BYTES`], marked `…` when cut; cut on a char
+/// boundary, never inside an escape.
+pub fn bounded_reason(reason: &str) -> String {
+    if json_escaped_len(reason) <= MAX_RELAYED_REASON_JSON_BYTES {
+        return reason.to_string();
+    }
+    let budget = MAX_RELAYED_REASON_JSON_BYTES - json_escaped_len("…");
+    let mut kept = 0usize;
+    let mut used = 0usize;
+    for (i, c) in reason.char_indices() {
+        let cost = json_escaped_len(c.encode_utf8(&mut [0u8; 4]));
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept = i + c.len_utf8();
+    }
+    format!("{}…", &reason[..kept])
+}
+
+#[cfg(test)]
+mod bounded_reason_tests {
+    use super::{bounded_reason, json_escaped_len, MAX_RELAYED_REASON_JSON_BYTES, YIELD_ERROR_ENVELOPE_BYTES, YIELD_PAYLOAD_CAP_BYTES};
+
+    /// The payload the contract builds from the bounded reason, as it goes
+    /// into `promise_yield_resume`.
+    fn payload(reason: &str) -> usize {
+        serde_json::to_vec(&serde_json::json!({ "Error": { "message": reason } })).unwrap().len()
+    }
+
+    #[test]
+    fn the_budget_leaves_room_for_the_envelope() {
+        assert_eq!(YIELD_ERROR_ENVELOPE_BYTES, 24);
+        assert!(MAX_RELAYED_REASON_JSON_BYTES + YIELD_ERROR_ENVELOPE_BYTES < YIELD_PAYLOAD_CAP_BYTES);
+        assert_eq!(payload(""), YIELD_ERROR_ENVELOPE_BYTES);
+    }
+
+    #[test]
+    fn a_short_reason_is_untouched_and_a_long_one_is_cut_on_a_char_boundary() {
+        assert_eq!(bounded_reason("in_flight: 1 call pending"), "in_flight: 1 call pending");
+        let long = "é".repeat(2000); // 2 bytes a char, no escaping
+        let cut = bounded_reason(&long);
+        assert!(json_escaped_len(&cut) <= MAX_RELAYED_REASON_JSON_BYTES, "{}", cut.len());
+        assert!(cut.ends_with('…'));
+        assert!(payload(&cut) <= YIELD_PAYLOAD_CAP_BYTES);
+        let html = "<html>".repeat(500);
+        assert!(payload(&bounded_reason(&html)) <= YIELD_PAYLOAD_CAP_BYTES);
+    }
+
+    /// What is bounded is the escaped size: 800 quotes are 1600 bytes on the
+    /// wire, 300 control characters 1800, and both must still fit the yield.
+    #[test]
+    fn escaping_counts_against_the_budget() {
+        let quotes = "\"".repeat(800);
+        let cut = bounded_reason(&quotes);
+        assert!(cut.len() < 800, "{}", cut.len());
+        assert!(payload(&cut) <= YIELD_PAYLOAD_CAP_BYTES, "{}", payload(&cut));
+        let control = "\u{1}".repeat(300);
+        let cut = bounded_reason(&control);
+        assert!(cut.chars().filter(|c| *c == '\u{1}').count() < 300);
+        assert!(payload(&cut) <= YIELD_PAYLOAD_CAP_BYTES, "{}", payload(&cut));
+        let backslashes = "\\".repeat(700);
+        assert!(payload(&bounded_reason(&backslashes)) <= YIELD_PAYLOAD_CAP_BYTES);
+        // Just inside the budget: untouched.
+        let fits = "\"".repeat(MAX_RELAYED_REASON_JSON_BYTES / 2);
+        assert_eq!(bounded_reason(&fits), fits);
     }
 }

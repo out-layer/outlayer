@@ -70,10 +70,11 @@ yield window. What each event may do late or out of order is decided in
 |---|---|---|
 | `execution_requested` | run only if still pending at the final block | same |
 | top-up (amount > 0) | relayed; the chain refuses a late resume and nothing is credited | relayed |
-| top-up, before the resume | the worker asks `POST /payment-keys/creditable`; a key the chain has closed in the coordinator is resumed with an error (the contract returns the transfer to the payer), never credited nowhere | same |
+| top-up, before the resume | the worker asks `POST /payment-keys/creditable`; a key whose coordinator row is deleted — closed by the chain or deleted by an admin — is resumed with an error (the contract returns the transfer to the payer), never credited nowhere. A deleted key does not come back; the owner creates another | same |
+| top-up, after the resume | the credit (`POST /topup/complete`) carries the yield's `data_id` and is recorded once per yield in `payment_key_topups`, so it is repeated through `retry_relay` until it lands (a 5xx, a 429, a dropped connection, the relay timeout); a 4xx ends it. The chain took the resume, so a credit that ends without landing is money the chain KEPT and the coordinator does not have: a 409 is a row the chain closed after the resume, recorded by the coordinator as owed (`payment_key_topups.credited = FALSE`); anything else has no record but the worker's `OWED` error line. Both are the operator's to reconcile. **Deploy order is a money rule:** the coordinator that records `data_id` (migration `20261109000005`) goes FIRST on each network, the workers after — an older coordinator accepts `data_id`, ignores it, and credits every repeat again | same |
 | payment key creation (amount 0) | relayed | relayed only if the key still exists at the final block |
 | `delete_payment_key` / `close_payment_key` | not relayed: the contract keeps the key, the owner deletes or closes again (an unknown tip: tried again) | same rule |
-| `claim_payment_key_refund` | not relayed: the contract keeps the key closing, the owner claims again (an unknown tip: tried again) | same rule |
+| `claim_payment_key_refund` | not relayed: the contract keeps the key closing, the owner claims again (an unknown tip: tried again). The quote itself (`POST /payment-keys/refund-quote`) is asked again on a transport failure or a 5xx for about a minute, inside the yield window — a failed quote costs the owner a day; a 4xx is the coordinator's refusal and is relayed as is | same rule |
 
 The three payment-key yields — delete, close, refund claim — are all resumed
 through `resume_delete_payment_key`, the one method the worker's access key on

@@ -715,8 +715,10 @@ on the key has settled, and that can take longer than a yield lives.
 - `claim_payment_key_refund(nonce)` (payable, exactly 1 yoctoNEAR) — accepted
   24 h after the close (`claimable_at` in `get_payment_key_refund_ledger`),
   one claim in flight at a time and a day between two claims of one key
-  (`next_claim_at` in `get_payment_key_flight`). Yields until the worker has
-  asked the coordinator what the key has left (`RefundPaymentKey` event; the
+  (`next_claim_at` in `get_payment_key_flight`); refused while a close or
+  delete of the key waits for its answer, and `delete_payment_key` is refused
+  while a claim does — the two never race over the key. Yields until the
+  worker has asked the coordinator what the key has left (`RefundPaymentKey` event; the
   coordinator refuses while anything is still reserved or pending on the key,
   and the key stays closing — claim again the next day). On a quote the
   contract pays **`min(quoted, cap)`** — nothing below 10000 = $0.01 —

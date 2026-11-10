@@ -109,6 +109,11 @@ note "attacker holds $(token_balance "$ATTACKER") of $TOKEN; contract balance $(
 if ! $APPLY; then sed -n '3,/^$/p' "$0" >&2; echo "  Pass --apply to run." >&2; exit 0; fi
 
 VC0=$(closing_count "$VICTIM"); VB0=$(user_balance "$VICTIM"); AT0=$(token_balance "$ATTACKER"); AB0=$(user_balance "$ATTACKER")
+# A9 compares against these: an empty baseline (an RPC miss) would make every
+# "unchanged" check vacuous, so none may be empty.
+for v in L0 VC0 VB0 AT0 AB0; do
+  [[ -n "${!v}" && "${!v}" != null ]] || { echo "✗ baseline $v is empty (RPC miss?); not running against nothing" >&2; exit 1; }
+done
 nonce_arg=$(jq -nc --argjson n "$VICTIM_NONCE" '{nonce:$n}')
 
 log "A1 attacker closes the victim's key"
