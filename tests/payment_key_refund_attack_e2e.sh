@@ -8,7 +8,7 @@
 #
 #   A1  attacker close_payment_key(victim's nonce)        → "Payment key not found" (keyed by caller)
 #   A2  attacker claim_payment_key_refund(victim's nonce) → "is not closing" (keyed by caller)
-#   A3  attacker withdraw_balance with no balance          → "Insufficient stablecoin balance"
+#   A3  attacker withdraw_balance over its balance        → "Insufficient stablecoin balance"
 #   A4  attacker calls the #[private] callbacks directly   → "Method … is private" (every one)
 #   A5  attacker resume_delete_payment_key with a forged Refund, resume_topup → "Only operator"
 #   A6  attacker tops up the victim's CLOSING key (owner in msg) → refused, USDC back to attacker
@@ -122,8 +122,12 @@ refused "A1 close_payment_key($VICTIM_NONCE) by $ATTACKER" "$(call "$ATTACKER" "
 log "A2 attacker claims the victim's refund"
 refused "A2 claim_payment_key_refund($VICTIM_NONCE) by $ATTACKER" "$(call "$ATTACKER" "$CONTRACT_ID" claim_payment_key_refund "$nonce_arg" '1 yoctoNEAR')" "is not closing"
 
-log "A3 attacker withdraws a balance it does not have"
-refused "A3 withdraw_balance(10000) by $ATTACKER (balance $AB0)" "$(call "$ATTACKER" "$CONTRACT_ID" withdraw_balance '{"amount":"10000"}' '1 yoctoNEAR')" "Insufficient stablecoin balance"
+log "A3 attacker withdraws more than it has"
+# $0.01 (the minimum withdrawal, so the floor is not what refuses it) over
+# whatever the attacker holds in the contract — the refund suite leaves a
+# balance behind. Refused at any balance, and A9's baseline stays put.
+over=$(( AB0 + 10000 ))
+refused "A3 withdraw_balance($over) by $ATTACKER (balance $AB0)" "$(call "$ATTACKER" "$CONTRACT_ID" withdraw_balance "$(jq -nc --arg a "$over" '{amount:$a}')" '1 yoctoNEAR')" "Insufficient stablecoin balance"
 
 log "A4 attacker calls the private callbacks directly"
 for m in on_payment_key_refund_response on_close_payment_key_response on_delete_payment_key_response on_top_up_response; do
