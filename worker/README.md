@@ -224,6 +224,17 @@ production worker's env is `deploy/self-hosted-tdx/worker/<net>-worker.env.templ
   `INIT_ACCOUNT_PRIVATE_KEY` pay the registration gas. `TEE_MODE=outlayer_tee`
   reads the quote from the dstack guest agent. `WORKER_KEY_TYPE` is `ed25519`
   (default) or `ml-dsa-65`.
+  Keep at least 0.4 NEAR available on the init account (a registration
+  prepays 300 TGas and spends about 0.025 NEAR). A registration can be taken
+  by the RPC and never included by the chain while the balance still covers
+  its prepaid gas, with no error from either; the protocol rule behind it is
+  not known, and 0.4 NEAR is a margin, not a protocol figure. On every start
+  the worker logs the init account's balance and, under 0.4 NEAR, an error
+  line starting `❌❌❌ INIT ACCOUNT BALANCE LOW`; before it registers it
+  refuses when the balance cannot cover the prepaid gas, and follows the
+  registration for two minutes. A transaction the RPC took and the chain did
+  not see in two rounds in a row ends with "taken by the RPC and not seen by
+  the chain".
 - `USE_TEE_REGISTRATION=false`: `OPERATOR_PRIVATE_KEY` signs results directly
   (local development). A worker with `EXECUTION_ENABLED=false` needs no
   operator key.

@@ -1,16 +1,48 @@
 use anyhow::{Context, Result};
 use near_crypto::{InMemorySigner, KeyType, PublicKey, SecretKey};
-use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_jsonrpc_client::methods;
 use near_jsonrpc_primitives::types::query::RpcQueryError;
 use near_primitives::types::{AccountId, BlockReference, Finality};
 use near_primitives::views::QueryRequest;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::near_client::NearClient;
 use crate::tdx_attestation::TdxClient;
+
+/// The prepaid gas of `register_worker_key`: the TDX quote's verification is
+/// gas-heavy.
+const REGISTRATION_GAS: u64 = 300_000_000_000_000;
+
+/// How long the registration transaction is followed. No yield waits on it,
+/// so a transaction that did not land is reported in two minutes.
+const REGISTRATION_FOLLOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The init account's balance the worker asks the operator to keep, and
+/// says so at error level on every start below it. A registration can be
+/// taken by the RPC and never included by the chain while the balance still
+/// covers its prepaid gas, with no error from either; the protocol rule
+/// behind that is not known, and this floor is a margin above where it
+/// happened, not a figure the protocol states.
+const INIT_BALANCE_FLOOR_YOCTO: u128 = 400_000_000_000_000_000_000_000;
+
+/// How long the init account's balance read may take: it runs on every
+/// start, before the worker takes work.
+const INIT_BALANCE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What an account can spend: its liquid balance less the part its storage
+/// holds that its locked stake does not cover.
+fn spendable(amount: u128, locked: u128, storage_usage: u64) -> u128 {
+    let storage = (storage_usage as u128).saturating_mul(STORAGE_YOCTO_PER_BYTE);
+    amount.saturating_sub(storage.saturating_sub(locked))
+}
+
+/// The protocol's storage staking price, yoctoNEAR per byte
+/// (`storage_amount_per_byte`, the same on mainnet and testnet): the part of
+/// an account's balance its storage holds and a transaction cannot spend.
+const STORAGE_YOCTO_PER_BYTE: u128 = 10_000_000_000_000_000_000;
 
 /// Worker registration client
 ///
@@ -20,9 +52,10 @@ pub struct RegistrationClient {
     near_client: NearClient,
     /// Operator account where register-contract is deployed and keys are stored
     operator_account_id: AccountId,
-    rpc_client: JsonRpcClient,
     /// Signature scheme for the generated worker key (ed25519 or ml-dsa-65)
     key_type: KeyType,
+    /// The account that signs and pays for the registration
+    init_account_id: AccountId,
 }
 
 impl RegistrationClient {
@@ -39,26 +72,23 @@ impl RegistrationClient {
     ) -> Result<Self> {
         // Create signer for init account (pays gas for registration)
         let signer = InMemorySigner {
-            account_id: init_account_id,
+            account_id: init_account_id.clone(),
             public_key: init_secret_key.public_key(),
             secret_key: init_secret_key,
         };
 
         // Create NearClient pointing to operator account (register-contract deployed there)
         let near_client = NearClient::new(
-            near_rpc_url.clone(),
+            near_rpc_url,
             signer,
             operator_account_id.clone(),
         )?;
 
-        // Create RPC client for queries (view access keys)
-        let rpc_client = JsonRpcClient::connect(&near_rpc_url);
-
         Ok(Self {
             near_client,
             operator_account_id,
-            rpc_client,
             key_type,
+            init_account_id,
         })
     }
 
@@ -197,14 +227,16 @@ impl RegistrationClient {
             },
         };
 
-        match self.rpc_client.call(request).await {
+        // Through `NearClient::rpc`: a transport error comes back without the
+        // endpoint, whose URL can carry the RPC key.
+        match self.near_client.rpc(request).await {
             Ok(_response) => {
                 info!("✅ Access key found on operator account");
                 Ok(true)
             }
             Err(e) => {
                 // Check if this is UnknownAccessKey error (key not found - which is OK)
-                if let Some(handler_error) = e.handler_error() {
+                if let Some(handler_error) = e.rpc().and_then(|e| e.handler_error()) {
                     match handler_error {
                         RpcQueryError::UnknownAccessKey { public_key, .. } => {
                             info!("ℹ️  Access key NOT found on operator account: {}", public_key);
@@ -219,9 +251,73 @@ impl RegistrationClient {
                 }
 
                 // Non-handler errors (network, parse errors, etc.)
-                anyhow::bail!("Failed to query access key (network/transport error): {:?}", e)
+                anyhow::bail!("Failed to query access key (network/transport error): {}", e)
             }
         }
+    }
+
+    /// What the init account can spend, against what a registration prepays.
+    ///
+    /// Run on every start, registered or not: the init account pays every
+    /// worker's registration, and an operator hears that it runs low before
+    /// the next worker needs it. Below [`INIT_BALANCE_FLOOR_YOCTO`] it says
+    /// so at error level — such a registration can be taken by the RPC and
+    /// never included by the chain. With `about_to_send`, it fails when the
+    /// account cannot cover the prepaid gas at the current gas price. A read
+    /// that fails is reported and stops nothing.
+    pub async fn check_init_balance(&self, about_to_send: bool) -> Result<()> {
+        // Through `NearClient::rpc`: an error's text carries no endpoint URL.
+        let account = self.near_client.rpc(methods::query::RpcQueryRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+            request: QueryRequest::ViewAccount { account_id: self.init_account_id.clone() },
+        });
+        let gas_price = self.near_client.rpc(methods::gas_price::RpcGasPriceRequest { block_id: None });
+        let then = if about_to_send { "; registering anyway" } else { "" };
+        let (account, gas_price) = match tokio::time::timeout(INIT_BALANCE_READ_TIMEOUT, async { tokio::join!(account, gas_price) }).await {
+            Ok((Ok(a), Ok(g))) => (a, g),
+            Ok((a, g)) => {
+                let why = match (a.err(), g.err()) {
+                    (Some(e), _) => e.to_string(),
+                    (None, Some(e)) => e.to_string(),
+                    (None, None) => String::new(),
+                };
+                warn!("Could not read the init account {}'s balance or the gas price ({}){}", self.init_account_id, why, then);
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(
+                    "The init account {}'s balance was not read within {}s{}",
+                    self.init_account_id, INIT_BALANCE_READ_TIMEOUT.as_secs(), then
+                );
+                return Ok(());
+            }
+        };
+        let near_jsonrpc_primitives::types::query::QueryResponseKind::ViewAccount(view) = account.kind else {
+            warn!("Unexpected answer for the init account {}{}", self.init_account_id, then);
+            return Ok(());
+        };
+        let available = spendable(view.amount.as_yoctonear(), view.locked.as_yoctonear(), view.storage_usage);
+        let prepaid = (REGISTRATION_GAS as u128).saturating_mul(gas_price.gas_price.as_yoctonear());
+        let near = |y: u128| y as f64 / 1e24;
+        info!(
+            "   Init account {}: {:.4} NEAR available; this registration prepays {:.4} NEAR of gas",
+            self.init_account_id, near(available), near(prepaid)
+        );
+        if about_to_send && available < prepaid {
+            anyhow::bail!(
+                "init account {} has {:.4} NEAR available and a registration prepays {:.4} NEAR of gas: top it up",
+                self.init_account_id, near(available), near(prepaid)
+            );
+        }
+        if available < INIT_BALANCE_FLOOR_YOCTO {
+            error!(
+                "❌❌❌ INIT ACCOUNT BALANCE LOW: {} has {:.4} NEAR available, below {:.1} NEAR — TOP IT UP. \
+                 It pays every worker's registration, and a registration on a low balance has been taken \
+                 by the RPC and never included by the chain, with no error from either.",
+                self.init_account_id, near(available), near(INIT_BALANCE_FLOOR_YOCTO)
+            );
+        }
+        Ok(())
     }
 
     /// Check if TEE measurements are approved on the register contract.
@@ -250,8 +346,8 @@ impl RegistrationClient {
         };
 
         let response = self
-            .rpc_client
-            .call(request)
+            .near_client
+            .rpc(request)
             .await
             .context("Failed to call is_measurements_approved")?;
 
@@ -369,21 +465,24 @@ impl RegistrationClient {
         let args_json = serde_json::to_string(&args)
             .context("Failed to serialize register_worker_key args")?;
 
+        self.check_init_balance(true).await?;
+
         info!("📤 Calling register_worker_key on {}...", self.operator_account_id);
         info!("   Args size: {} bytes", args_json.len());
 
         // Call contract method using NearClient (reuses working transaction logic)
         let outcome = self
             .near_client
-            .call_contract(
+            .call_contract_within(
                 &self.operator_account_id,
                 "register_worker_key",
                 args_json.into_bytes(),
-                300_000_000_000_000, // 300 TGas
+                REGISTRATION_GAS,
                 0, // No deposit
+                REGISTRATION_FOLLOW,
             )
             .await
-            .context("Failed to call register_worker_key")?;
+            .with_context(|| format!("Failed to call register_worker_key (signed and paid by {})", self.init_account_id))?;
 
         info!("📋 Transaction outcome status: {:?}", outcome.status);
         info!("   Transaction logs: {}", outcome.transaction_outcome.outcome.logs.len());
@@ -480,6 +579,7 @@ pub async fn register_worker_on_startup(
         .context("Failed to check if access key exists on operator account")?;
 
     let tdx_quote_hex = if key_exists {
+        registration_client.check_init_balance(false).await?;
         info!("✅ Worker key already registered on operator account - skipping registration");
         info!("   Using existing key for signing execution results");
 
@@ -509,6 +609,20 @@ pub async fn register_worker_on_startup(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    /// What the init account can spend: storage comes off the liquid balance
+    /// only where the locked stake does not cover it.
+    #[test]
+    fn spendable_balance_leaves_storage_covered() {
+        let near = 1_000_000_000_000_000_000_000_000u128;
+        // 264 bytes of storage hold 0.00264 NEAR.
+        assert_eq!(spendable(near, 0, 264), near - 264 * STORAGE_YOCTO_PER_BYTE);
+        // A locked stake that covers the storage leaves the liquid balance whole.
+        assert_eq!(spendable(near, near, 264), near);
+        // Storage above the balance: nothing to spend, never an underflow.
+        assert_eq!(spendable(1, 0, 264), 0);
+        assert!(INIT_BALANCE_FLOOR_YOCTO > (REGISTRATION_GAS as u128) * 100_000_000, "the floor is above one registration's prepaid gas at 1e8");
+    }
 
     /// ed25519 keeps the legacy binding: report_data[..32] is the raw public key.
     /// This is what makes already-registered ed25519 workers survive the upgrade.

@@ -192,7 +192,7 @@ where
 
 impl NearClient {
     /// [`JsonRpcClient::call`]; a transport failure comes back as its reason without the URL.
-    async fn rpc<M>(&self, method: M) -> Result<M::Response, RpcError<M::Error>>
+    pub(crate) async fn rpc<M>(&self, method: M) -> Result<M::Response, RpcError<M::Error>>
     where
         M: methods::RpcMethod,
     {
@@ -396,6 +396,32 @@ impl NearClient {
         }
     }
 
+    /// Where the chain has `hash`, asked with `wait_until: None`, which a node
+    /// answers at once: executed (a finished outcome), known, or unknown.
+    /// `Unanswered` when the node gives no answer in `wait`.
+    async fn known_to_chain(&self, hash: near_primitives::hash::CryptoHash, sender: &AccountId, wait: std::time::Duration) -> Seen {
+        use near_jsonrpc_primitives::types::transactions::{RpcTransactionError, TransactionInfo};
+        use near_primitives::views::{FinalExecutionStatus, TxExecutionStatus};
+
+        let status = methods::tx::RpcTransactionStatusRequest {
+            transaction_info: TransactionInfo::TransactionId { tx_hash: hash, sender_account_id: sender.clone() },
+            wait_until: TxExecutionStatus::None,
+        };
+        match tokio::time::timeout(wait, self.rpc(status)).await {
+            Ok(Ok(response)) => match response.final_execution_outcome.map(|o| o.into_outcome()) {
+                Some(outcome) if !matches!(outcome.status, FinalExecutionStatus::NotStarted | FinalExecutionStatus::Started) => {
+                    Seen::Executed(outcome)
+                }
+                _ => Seen::Known("known to the chain, not executed yet".to_string()),
+            },
+            Ok(Err(e)) => match e.rpc().and_then(|e| e.handler_error()) {
+                Some(RpcTransactionError::UnknownTransaction { .. }) => Seen::Unknown,
+                _ => Seen::Unanswered(String::new()),
+            },
+            Err(_) => Seen::Unanswered(String::new()),
+        }
+    }
+
     /// Whether the chain has EXECUTED `hash`, waited for: `ExecutedOptimistic`
     /// with a full RPC timeout, which a node that has the block answers at
     /// once and a node that does not holds for its own limit (FastNEAR ~10 s).
@@ -433,6 +459,13 @@ impl NearClient {
         let mut sends = 0u32;
         let mut nonce_refusals = 0u32;
         let mut last: String;
+        // Rounds in a row in which the node took the send and the chain did
+        // not know the hash. A node takes a transaction after its own checks;
+        // a chunk producer can still drop it, and nothing reports that drop.
+        // One such round can be a lagging node behind the balancer; two in a
+        // row name the drop.
+        let mut taken_unseen: bool;
+        let mut taken_unseen_rounds = 0u32;
         loop {
             // (Re)send without waiting — or take the first send's answer from
             // the caller. Only a refusal by the chain decides anything; a node
@@ -449,7 +482,9 @@ impl NearClient {
                 _ => None,
             };
 
-            let unknown = match self.look(hash, &sender, wait(), !matches!(sent, Sent::Accepted)).await {
+            let taken = matches!(sent, Sent::Accepted);
+            taken_unseen = false;
+            let unknown = match self.look(hash, &sender, wait(), !taken).await {
                 Seen::Executed(outcome) => {
                     if sends > 1 {
                         info!("Transaction {} executed after {} sends", hash, sends);
@@ -476,12 +511,35 @@ impl NearClient {
                             return Ok(outcome);
                         }
                     }
-                    last = "the chain has not seen it".to_string();
+                    taken_unseen = taken;
+                    last = if taken {
+                        "the RPC took it, the chain has not seen it".to_string()
+                    } else {
+                        "the chain has not seen it".to_string()
+                    };
                     true
                 }
                 Seen::Unanswered(why) => {
-                    last = why;
                     answered = false;
+                    // A taken send whose wait for the execution ran out: does
+                    // the chain have the hash at all? Text only — the round
+                    // still decides nothing.
+                    last = if taken {
+                        match self.known_to_chain(hash, &sender, std::time::Duration::from_secs(10).min(wait())).await {
+                            Seen::Executed(outcome) => {
+                                info!("Transaction {} executed after {} sends (seen on the quick look)", hash, sends);
+                                return Ok(outcome);
+                            }
+                            Seen::Unknown => {
+                                taken_unseen = true;
+                                "the RPC took it, the chain has not seen it".to_string()
+                            }
+                            Seen::Known(where_) => where_,
+                            Seen::Unanswered(_) => why,
+                        }
+                    } else {
+                        why
+                    };
                     false
                 }
             };
@@ -508,7 +566,16 @@ impl NearClient {
                 _ if !answered => {}
                 _ => nonce_refusals = 0,
             }
+            taken_unseen_rounds = if taken_unseen { taken_unseen_rounds + 1 } else { 0 };
             if deadline.saturating_duration_since(tokio::time::Instant::now()) < pause {
+                if taken_unseen_rounds >= 2 {
+                    anyhow::bail!(
+                        "transaction {hash} was taken by the RPC and not seen by the chain in the last {taken_unseen_rounds} rounds \
+                         within {}s ({sends} sends): the RPC does not report a transaction dropped after its own checks — \
+                         check the signer's balance (for a function-call key, its allowance)",
+                        follow.as_secs()
+                    );
+                }
                 anyhow::bail!(
                     "transaction {hash} was not seen executed within {}s after {sends} sends ({last})",
                     follow.as_secs()
@@ -984,27 +1051,21 @@ impl NearClient {
         let tx_hash = format!("{}", outcome.transaction_outcome.id);
         Ok((tx_hash, outcome))
     }
-
-    /// Call a contract method (public API for registration and other use cases)
-    ///
-    /// # Arguments
-    /// * `contract_id` - Target contract account ID
-    /// * `method_name` - Contract method name
-    /// * `args` - Serialized JSON arguments
-    /// * `gas` - Gas limit in yoctoGas
-    /// * `deposit` - Attached NEAR deposit in yoctoNEAR
-    ///
-    /// # Returns
-    /// * Transaction outcome with logs and receipts
-    pub async fn call_contract(
+    /// Call a method of any contract, signed by this client's signer, and
+    /// follow the transaction for `follow` rather than [`Self::TX_FOLLOW`]:
+    /// for a call no yield is waiting on (the worker's registration), where
+    /// the caller would rather hear early that the transaction did not land.
+    /// Returns the outcome once the transaction executed, whatever its status.
+    pub async fn call_contract_within(
         &self,
         contract_id: &AccountId,
         method_name: &str,
         args: Vec<u8>,
         gas: u64,
         deposit: u128,
+        follow: std::time::Duration,
     ) -> Result<FinalExecutionOutcomeView> {
-        self.call_contract_method_internal(contract_id, method_name, args, gas, deposit).await
+        self.call_contract_method_internal(contract_id, method_name, args, gas, deposit, follow).await
     }
 
     /// Call a contract method (internal - uses default contract_id)
@@ -1015,7 +1076,7 @@ impl NearClient {
         gas: u64,
         deposit: u128,
     ) -> Result<FinalExecutionOutcomeView> {
-        self.call_contract_method_internal(&self.contract_id, method_name, args, gas, deposit).await
+        self.call_contract_method_internal(&self.contract_id, method_name, args, gas, deposit, Self::TX_FOLLOW).await
     }
 
     /// Call a contract method (internal implementation)
@@ -1034,6 +1095,7 @@ impl NearClient {
         args: Vec<u8>,
         gas: u64,
         deposit: u128,
+        follow: std::time::Duration,
     ) -> Result<FinalExecutionOutcomeView> {
         let block_hash = self.final_block_hash().await?;
         let actions = vec![Action::FunctionCall(Box::new(FunctionCallAction {
@@ -1046,7 +1108,7 @@ impl NearClient {
         let (signed, first) = self.sign_and_send_once(contract_id, actions.clone(), block_hash, None).await?;
         let hash = signed.get_hash();
         let sender = self.signer.account_id.clone();
-        match self.send_and_follow_first(signed, first).await {
+        match self.send_and_follow_first(signed, first, follow).await {
             Ok(outcome) => Ok(outcome),
             Err(e) => match e.downcast_ref::<SendRefused>().and_then(|r| r.ak_nonce) {
                 Some(ak_nonce) => {
@@ -1055,7 +1117,7 @@ impl NearClient {
                         hash, ak_nonce, method_name
                     );
                     let (signed, first) = self.sign_and_send_once(contract_id, actions, block_hash, Some(ak_nonce)).await?;
-                    let second = self.send_and_follow_first(signed, first).await;
+                    let second = self.send_and_follow_first(signed, first, follow).await;
                     // The verdict that replaced the first transaction can be
                     // wrong in one way: it was ours, in a block a lagging node
                     // had not seen. Then the second one finds the contract's
@@ -1091,9 +1153,10 @@ impl NearClient {
         &self,
         signed: near_primitives::transaction::SignedTransaction,
         first: Sent,
+        follow: std::time::Duration,
     ) -> Result<FinalExecutionOutcomeView> {
         let hash = signed.get_hash();
-        let outcome = self.follow_within(signed, FirstRound::Sent(first), Self::TX_FOLLOW, Self::TX_POLL_PAUSE).await?;
+        let outcome = self.follow_within(signed, FirstRound::Sent(first), follow, Self::TX_POLL_PAUSE).await?;
         debug!("Transaction executed: {:?}", hash);
         Ok(outcome)
     }
@@ -2133,8 +2196,9 @@ mod tests {
         assert_eq!((sends, looks), (2, 2), "sent again after the chain did not know it");
     }
 
-    /// A transaction the chain never sees fails once the window has passed, and
-    /// the error names what happened — never the RPC URL.
+    /// A transaction the node takes and the chain never sees fails once the
+    /// window has passed, and the error names what happened — a drop after
+    /// the RPC's checks — never the RPC URL.
     #[tokio::test]
     async fn a_transaction_the_chain_never_sees_fails_after_the_window() {
         let unknown = handler_error(r#"{"name":"UNKNOWN_TRANSACTION","info":{"requested_transaction_hash":"11111111111111111111111111111111"}}"#);
@@ -2148,7 +2212,7 @@ mod tests {
             .await
             .expect_err("never executed");
         let text = format!("{err:#}");
-        assert!(text.contains("was not seen executed") && text.contains("the chain has not seen it"), "{text}");
+        assert!(text.contains("taken by the RPC and not seen by the chain"), "{text}");
         assert!(!text.contains("127.0.0.1") && !text.contains("http"), "the error must not carry the RPC URL: {text}");
         assert!(counts.lock().unwrap().0 >= 2, "sent again while the chain did not know it");
     }
@@ -2462,6 +2526,60 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("the RPC did not answer: ") && text.contains("timeout"), "the node's own words are kept: {text}");
         assert!(counts.lock().unwrap().1 >= 2);
+    }
+
+    /// The node takes every send, its wait for the execution runs out every
+    /// round (FastNEAR mainnet holds it past our timeout), and the quick
+    /// question says the chain does not know the hash: after two such rounds
+    /// the error names a transaction dropped after the RPC's checks, not an
+    /// RPC that did not answer. Every round goes through the quick question.
+    #[tokio::test]
+    async fn a_send_the_rpc_took_and_the_chain_never_saw_is_named_so() {
+        let body = r#"{"jsonrpc":"2.0","error":{"name":"HANDLER_ERROR","cause":{"info":{"cause":"NOT_OBSERVED"},"name":"TIMEOUT_ERROR"},"code":-32000,"message":"Server error","data":"Timeout"},"id":"dontcare"}"#;
+        let raw = format!("RAW:HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        let looks: Vec<String> = (0..40).flat_map(|_| [raw.clone(), unknown_tx()]).collect();
+        let (url, counts) = scripted_rpc(vec![ACCEPTED.to_string()], looks);
+        let client = client_at(&url);
+        let err = client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_millis(300), std::time::Duration::from_millis(50))
+            .await
+            .expect_err("never included");
+        let text = format!("{err:#}");
+        assert!(text.contains("taken by the RPC and not seen by the chain"), "{text}");
+        assert!(text.contains("balance"), "the first thing to check is named: {text}");
+        let (sends, looks) = *counts.lock().unwrap();
+        assert_eq!(looks, 2 * sends, "each round: the wait, then the quick question");
+    }
+
+    /// The wait for the execution runs out, and the quick question finds the
+    /// transaction executed: that is the answer, not "not executed yet".
+    #[tokio::test]
+    async fn an_execution_the_quick_question_finds_is_the_answer() {
+        let body = r#"{"jsonrpc":"2.0","error":{"name":"HANDLER_ERROR","cause":{"info":{"cause":"NOT_OBSERVED"},"name":"TIMEOUT_ERROR"},"code":-32000,"message":"Server error","data":"Timeout"},"id":"dontcare"}"#;
+        let raw = format!("RAW:HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        let (url, counts) = scripted_rpc(vec![ACCEPTED.to_string()], vec![raw, EXECUTED.to_string()]);
+        let client = client_at(&url);
+        client
+            .send_and_follow_within(a_signed_transaction(&client), std::time::Duration::from_secs(20), std::time::Duration::from_millis(10))
+            .await
+            .expect("executed, found by the quick question");
+        assert_eq!(*counts.lock().unwrap(), (1, 2), "one send; the wait, then the quick question");
+    }
+
+    /// A call followed for its own window gives up inside it: the
+    /// registration's two minutes, not a yield's five.
+    #[tokio::test]
+    async fn call_contract_within_keeps_to_its_window() {
+        let (url, _, sent) = scripted_node(vec![ACCEPTED.to_string()], vec![unknown_tx()], 40);
+        let client = client_at(&url);
+        let started = std::time::Instant::now();
+        let err = client
+            .call_contract_within(&"worker.outlayer.testnet".parse().unwrap(), "register_worker_key", vec![], 1, 0, std::time::Duration::from_millis(400))
+            .await
+            .expect_err("never included");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(format!("{err:#}").contains("the RPC took it, the chain has not seen it"), "{err:#}");
+        assert_eq!(sent.lock().unwrap().first(), Some(&41));
     }
 
     /// An accepted send is followed with one wait for its execution per round
