@@ -107,6 +107,16 @@ Stub contracts: `deputy-stub/`, `hos-status-stub/`.
 `worker_memory_e2e.sh` (fixture `mem-probe/`), `worker_soft_stop_e2e.sh` —
 testnet.
 
+`dao/` — governance of the three contracts by the keystore DAO, on a separate set
+deployed under `testoutlayerdao.testnet` (never the live contracts): `deploy.sh`
+(once), `upgrade_e2e.sh` (each contract upgrades through a vote from a stored blob,
+the new code upgrades again, a failing `migrate` reverts the switch, the DAO
+upgrades itself only with nothing else open),
+`governance_e2e.sh` (electorate snapshot, the owner as a brake, `Call` proposals,
+members-only governance, keystore-key check, the owner's money),
+`fa_removal.sh --yes` (deletes the accounts' full-access keys for good, then both
+suites again) — testnet.
+
 ### Basic execution
 
 | Script | What it does |

@@ -9,7 +9,7 @@ or near-cli's keychain; never pass a secret on a command line you log.
 
 | Script | Description |
 |--------|-------------|
-| `deploy_tdx.sh` | Deploy a worker or keystore CVM to a TDX node from the Mac: resolve and check the release digest, deploy over SSH, read measurements, approve them locally (register-contract for a worker, DAO for a keystore), wait for registration / vote. `--os-image` upgrades a CVM's guest image in place; `--kms-url` selects the KMS |
+| `deploy_tdx.sh` | Deploy a worker or keystore CVM to a TDX node from the Mac: resolve and check the release digest, deploy over SSH, read measurements, approve them — through a DAO proposal once the DAO carries governance (`GOV_MEMBER` proposes and votes; it stops and prints the remaining steps while the proposal waits for votes or its delay), with the owner key before that — then wait for registration / vote. `--os-image` upgrades a CVM's guest image in place; `--kms-url` selects the KMS |
 | `keystore_urls.sh` | Set `KEYSTORE_BASE_URLS` for a network from the keystores that are live; dry run by default, `--apply` writes, `--up` recreates the coordinator |
 | `smoke_after_deploy.sh` | Post-deploy smoke test of coordinator + keystore endpoints; config from `scripts/.env`, missing config is reported SKIP |
 
@@ -45,7 +45,10 @@ or near-cli's keychain; never pass a secret on a command line you log.
 
 | Script | Description |
 |--------|-------------|
-| `update_collateral.sh` | Write an Intel collateral into a register-contract slot (one slot per FMSPC; slot 1 = self-hosted TDX): `<collateral.json> <index> [network] [contract]` |
+| `update_collateral.sh` | Owner: write an Intel collateral into a register-contract or DAO slot (one slot per FMSPC; slot 1 = self-hosted TDX): `<collateral.json> <index> [network] [contract]` |
+| `dao_upgrade.sh` | Upgrade the main, DAO or register contract through the DAO: store the wasm as a blob, propose, vote, execute once approved and past the delay; rerun to move the same proposal on |
+| `dao_upgrade_plan.sh` | The same upgrade as plain near-cli commands with every value filled in (code hash, blob deposit, proposal action); sends nothing |
+| `lib/dao_gov.sh` | Sourced by `deploy_tdx.sh` and `dao_upgrade.sh`: find or make a proposal, vote, execute (DAO members only), print what is left |
 | `update_collateral_mainnet.sh` | `update_collateral` on `dao.outlayer.near` from `collateral.json` |
 | `fetch_intel_collateral.sh` | Fetch TDX collateral (TCB info, QE identity, CRLs) from Intel PCS |
 | `collateral.json`, `our_collateral.json` | Collateral files those scripts take; public Intel data |
