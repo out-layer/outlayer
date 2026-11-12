@@ -374,8 +374,8 @@ async fn main() -> Result<()> {
             for attempt in 1..=MAX_TEE_RETRIES {
                 info!("🔐 Registering TEE session with coordinator (attempt {}/{})", attempt, MAX_TEE_RETRIES);
                 match api_client.register_tee_session(&tee_secret_key).await {
-                    Ok(session_id) => {
-                        info!("✅ TEE session registered with coordinator: {}", session_id);
+                    Ok(_) => {
+                        info!("✅ TEE session registered with coordinator");
                         coordinator_session_ok = true;
                         break;
                     }
@@ -401,8 +401,8 @@ async fn main() -> Result<()> {
                 for attempt in 1..=MAX_TEE_RETRIES {
                     info!("🔐 Registering TEE session with keystore directly (attempt {}/{})", attempt, MAX_TEE_RETRIES);
                     match kc.register_tee_session(&tee_secret_key).await {
-                        Ok(session_id) => {
-                            info!("✅ TEE session registered with keystore: {}", session_id);
+                        Ok(_) => {
+                            info!("✅ TEE session registered with keystore");
                             keystore_session_ok = true;
                             break;
                         }
@@ -3145,6 +3145,12 @@ async fn handle_execute_job(
         CodeSource::GitHub { build_target, .. } => Some(build_target.as_str()),
         CodeSource::WasmUrl { build_target, .. } => Some(build_target.as_str()),
     };
+
+    // The storage and VRF clients below are handed the keystore session by value and cannot
+    // replace it mid-run, so an old one is replaced first.
+    if let Some(kc) = keystore_client {
+        kc.renew_stale_session().await;
+    }
 
     // Create storage config if keystore is configured AND project_uuid exists
     // Storage requires both: keystore for encryption/decryption AND project for data organization

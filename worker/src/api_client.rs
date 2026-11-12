@@ -627,10 +627,11 @@ impl ApiClient {
         let challenge_resp: ChallengeResponse = response.json().await
             .with_context(|| format!("Failed to parse {} TEE challenge", path_prefix))?;
 
-        // 2. Sign challenge with TEE key (ed25519 or ml-dsa-65), send signature in NEAR form.
-        let challenge_bytes = hex::decode(&challenge_resp.challenge)
-            .context("Invalid challenge hex")?;
-        let signature = secret_key.sign(&challenge_bytes).to_string();
+        // 2. Sign the challenge under the session domain with the TEE key (ed25519 or
+        //    ml-dsa-65), send the signature in NEAR form.
+        let signature = shared_tee_helpers::sign_session_challenge(secret_key, &challenge_resp.challenge)
+            .with_context(|| format!("{} sent a challenge the worker does not sign", path_prefix))?
+            .to_string();
 
         // 3. Submit registration
         let url = format!("{}/{}/register-tee", self.base_url, path_prefix);
@@ -668,7 +669,8 @@ impl ApiClient {
     ) -> Result<String> {
         let session_id = self.do_tee_challenge_response("workers", secret_key).await?;
         *self.tee_session_id.lock().unwrap() = Some(session_id.clone());
-        tracing::info!("TEE session registered with coordinator: {}", session_id);
+        // The session id is a bearer credential for the coordinator: it is never logged.
+        tracing::info!("TEE session registered with coordinator");
         Ok(session_id)
     }
 

@@ -465,9 +465,9 @@ pub struct LoadedVaultsResponse {
     pub vaults: Vec<String>,
     /// How many of them there are.
     pub count: usize,
-    /// TEE handshakes since boot — NOT live workers. Sessions are never expired (`created_at` is
-    /// unread), so this only ever climbs until a restart; two workers reconnecting concurrently
-    /// add two. Reported here rather than on the public `/health` so that reading it requires a
+    /// TEE sessions held in memory — NOT live workers. A session is dropped at the first
+    /// handshake after its `TEE_SESSION_TTL`, and a worker renews at half that age, so one live
+    /// worker accounts for two or three. Reported here rather than on the public `/health` so that reading it requires a
     /// token checked by real auth middleware, which also logs failures.
     pub tee_sessions: usize,
 }
@@ -1755,6 +1755,7 @@ pub(super) struct RegisterTeeRequest {
 /// 4. Create session and return session_id
 pub(super) async fn register_tee_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterTeeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // 1. Find and remove challenge (one-time use)
@@ -1780,7 +1781,7 @@ pub(super) async fn register_tee_handler(
     })?;
 
     let key_exists = shared_tee_helpers::check_access_key_with_retry(
-        &state.config.near_rpc_url,
+        state.config.near_rpc_url.as_str(),
         operator_account_id,
         &req.public_key,
     )
@@ -1794,18 +1795,24 @@ pub(super) async fn register_tee_handler(
         )));
     }
 
-    // 4. Create session
+    // 4. Create the session, bound to the bearer token it was registered with. The
+    //    registration middleware has already required one.
+    let token_hash = bearer_token_hash(&headers).ok_or_else(|| {
+        ApiError::Unauthorized("Missing Authorization header".to_string())
+    })?;
     let session_id = uuid::Uuid::new_v4();
     {
         let mut sessions = state.tee_sessions.lock().unwrap();
+        sessions.retain(|_, s| !s.is_expired());
         sessions.insert(session_id, TeeSession {
             worker_public_key: req.public_key.clone(),
+            token_hash,
             created_at: std::time::Instant::now(),
         });
     }
 
+    // The session id is a bearer credential: it is never logged.
     tracing::info!(
-        session_id = %session_id,
         public_key = %crate::near::key_for_display(&req.public_key),
         "TEE session registered on keystore"
     );

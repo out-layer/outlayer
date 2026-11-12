@@ -277,6 +277,15 @@ impl RunDecrypt<'_> {
 /// the probe, and one connect timeout per window is the whole cost of a wrong guess.
 const DOWN_WINDOW: Duration = Duration::from_secs(60);
 
+/// Age at which the worker replaces its session on an instance before using it.
+///
+/// The keystore refuses a session an hour after it was made (`TEE_SESSION_TTL` in
+/// keystore-worker), so a removed worker key stops working within that hour. A job is handed the
+/// session by value at its start and cannot replace it mid-run, so the session it gets must
+/// outlive the job: renewing at half the TTL leaves it at least 30 minutes, against a job cap of
+/// minutes.
+const SESSION_RENEW_AFTER: Duration = Duration::from_secs(30 * 60);
+
 /// Parse `KEYSTORE_BASE_URLS`: a comma-separated list of `http(s)://` origins, in preference
 /// order. Blank entries and duplicates are dropped; an empty result is an error, because a
 /// worker that silently ran without a keystore would fail every secrets job with a message
@@ -310,25 +319,49 @@ pub fn parse_base_urls(raw: &str) -> Result<Vec<String>> {
 /// another: every instance carries its own, established the first time the worker talks to it.
 struct Instance {
     url: String,
-    session_id: Mutex<Option<String>>,
+    session: Mutex<Option<Session>>,
+    /// Held across a handshake, so requests that find the session missing or old at the same
+    /// moment make one handshake between them, not one each.
+    handshake: tokio::sync::Mutex<()>,
     down_until: Mutex<Option<Instant>>,
+}
+
+/// A session id and when the worker got it.
+struct Session {
+    id: String,
+    made_at: Instant,
 }
 
 impl Instance {
     fn new(url: String) -> Self {
         Self {
             url,
-            session_id: Mutex::new(None),
+            session: Mutex::new(None),
+            handshake: tokio::sync::Mutex::new(()),
             down_until: Mutex::new(None),
         }
     }
 
     fn session(&self) -> Option<String> {
-        self.session_id.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|s| s.id.clone())
+    }
+
+    /// A session younger than [`SESSION_RENEW_AFTER`].
+    fn has_fresh_session(&self) -> bool {
+        self.session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(false, |s| s.made_at.elapsed() < SESSION_RENEW_AFTER)
     }
 
     fn set_session(&self, id: Option<String>) {
-        *self.session_id.lock().unwrap_or_else(|p| p.into_inner()) = id;
+        *self.session.lock().unwrap_or_else(|p| p.into_inner()) =
+            id.map(|id| Session { id, made_at: Instant::now() });
     }
 
     fn is_down(&self, now: Instant) -> bool {
@@ -470,6 +503,28 @@ impl KeystoreClient {
     /// For clients that are handed a fixed endpoint at job start (storage, VRF): they keep talking
     /// to this instance for the job's lifetime, so a failover mid-job fails that job — the same
     /// accepted behaviour as a keystore restart mid-job.
+    /// Replace the session on the serving instance when it is older than
+    /// [`SESSION_RENEW_AFTER`], so the endpoint a job is about to be handed outlives the job.
+    ///
+    /// A failed renewal leaves the old session in place: it is still valid until the keystore's
+    /// TTL, and the job's own calls report whatever is wrong with the keystore.
+    pub async fn renew_stale_session(&self) {
+        let i = self.current.load(Ordering::Relaxed);
+        let inst = &self.instances[i];
+        if self.tee_signing_info.is_none() || inst.session().is_none() {
+            return;
+        }
+        if let Err(CallError::Unreachable(e) | CallError::Stalled(e) | CallError::Final(e)) =
+            self.ensure_fresh_session(i).await
+        {
+            tracing::warn!(
+                keystore = %inst.url,
+                error = %format!("{e:#}"),
+                "TEE session renewal failed; keeping the current session"
+            );
+        }
+    }
+
     pub fn current_endpoint(&self) -> (String, Option<String>) {
         let inst = &self.instances[self.current.load(Ordering::Relaxed)];
         (inst.url.clone(), inst.session())
@@ -479,6 +534,15 @@ impl KeystoreClient {
     #[cfg(test)]
     fn set_session_for_test(&self, i: usize, session_id: &str) {
         self.instances[i].set_session(Some(session_id.to_string()));
+    }
+
+    /// Test hook: pretend the session on instance `i` was made `age` ago.
+    #[cfg(test)]
+    fn set_aged_session_for_test(&self, i: usize, session_id: &str, age: Duration) {
+        *self.instances[i].session.lock().unwrap() = Some(Session {
+            id: session_id.to_string(),
+            made_at: Instant::now() - age,
+        });
     }
 
     /// Test hook: a short request timeout, so a silent instance fails in test time.
@@ -635,11 +699,12 @@ impl KeystoreClient {
             .context("Failed to parse keystore TEE challenge")
             .map_err(CallError::Final)?;
 
-        // 2. Sign challenge (ed25519 or ml-dsa-65), send signature in NEAR form.
-        let challenge_bytes = hex::decode(&challenge_resp.challenge)
-            .context("Invalid challenge hex")
-            .map_err(CallError::Final)?;
-        let signature = secret_key.sign(&challenge_bytes).to_string();
+        // 2. Sign the challenge under the session domain (ed25519 or ml-dsa-65), send the
+        //    signature in NEAR form.
+        let signature = shared_tee_helpers::sign_session_challenge(secret_key, &challenge_resp.challenge)
+            .context("Keystore sent a challenge the worker does not sign")
+            .map_err(CallError::Final)?
+            .to_string();
 
         // 3. Register with signed challenge
         let url = format!("{}/register-tee", inst.url);
@@ -677,11 +742,8 @@ impl KeystoreClient {
             .map_err(CallError::Final)?;
 
         inst.set_session(Some(register_resp.session_id.clone()));
-        tracing::info!(
-            keystore = %inst.url,
-            session_id = %register_resp.session_id,
-            "TEE session registered directly with keystore"
-        );
+        // The session id is a bearer credential for the keystore: it is never logged.
+        tracing::info!(keystore = %inst.url, "TEE session registered directly with keystore");
 
         Ok(register_resp.session_id)
     }
@@ -733,12 +795,24 @@ impl KeystoreClient {
         self.register_session_on(i, &secret_key).await.map(|_| ())
     }
 
+    /// Make sure instance `i` holds a session younger than [`SESSION_RENEW_AFTER`], making one
+    /// if not. Concurrent callers wait for one handshake and then find the session fresh.
+    async fn ensure_fresh_session(&self, i: usize) -> std::result::Result<(), CallError> {
+        let inst = &self.instances[i];
+        let _handshake = inst.handshake.lock().await;
+        if inst.has_fresh_session() {
+            return Ok(());
+        }
+        self.establish_session_on(i).await
+    }
+
     /// POST a JSON body to the keystore and read the whole reply.
     ///
     /// Three recoveries live here, in this order, so every business endpoint gets all of them:
     ///
-    /// 1. **No session yet on this instance** (first contact after a failover): establish one
-    ///    before sending, when the worker has a signing key. Without one the request goes out
+    /// 1. **No session on this instance, or one older than [`SESSION_RENEW_AFTER`]** (first
+    ///    contact after a failover, or a session nearing the keystore's TTL): make one before
+    ///    sending, when the worker has a signing key. Without one the request goes out
     ///    with the bearer token only, as it always did outside TEE mode.
     /// 2. **Instance unreachable** (connection refused, DNS, connect timeout, dropped before a
     ///    reply): mark it down and repeat the request on the next candidate. A request that was
@@ -747,7 +821,7 @@ impl KeystoreClient {
     ///    [`should_failover`] and [`is_stall`]. The handshake in step 1 is repeated on a timeout
     ///    too — it has nothing to double.
     /// 3. **Session expired** (the keystore's own 403): the keystore restarted and forgot every
-    ///    session at once. Re-handshake on the same instance and repeat the request there once.
+    ///    session at once, or the session outlived its TTL. Re-handshake on the same instance and repeat the request there once.
     ///
     /// Deliberately NOT covering `/storage/*` and `/vrf/generate`: those run inside a WASI
     /// execution on blocking clients that were handed an endpoint by value at job start, so a
@@ -767,8 +841,8 @@ impl KeystoreClient {
         for i in self.candidates() {
             let inst = &self.instances[i];
 
-            if self.tee_signing_info.is_some() && inst.session().is_none() {
-                match self.establish_session_on(i).await {
+            if self.tee_signing_info.is_some() && !inst.has_fresh_session() {
+                match self.ensure_fresh_session(i).await {
                     Ok(()) => {}
                     Err(CallError::Unreachable(e)) | Err(CallError::Stalled(e)) => {
                         self.leave(i, what, &e);
@@ -1030,7 +1104,7 @@ impl KeystoreClient {
         let (keystore, tee_session) = self.current_endpoint();
         tracing::info!(
             keystore = %keystore,
-            tee_session_id = ?tee_session,
+            tee_session = tee_session.is_some(),
             accessor = %accessor_desc,
             profile = %profile,
             owner = %owner,
@@ -1591,7 +1665,7 @@ mod tests {
                 seen.push(path.clone());
 
                 let (code, body) = match path.as_str() {
-                    "/tee-challenge" => (200, r#"{"challenge":"deadbeef"}"#.to_string()),
+                    "/tee-challenge" => (200, format!(r#"{{"challenge":"{}"}}"#, "ab".repeat(32))),
                     "/register-tee" => (
                         200,
                         r#"{"session_id":"6f1e9d3a-0000-4000-8000-000000000001"}"#.to_string(),
@@ -1671,6 +1745,60 @@ mod tests {
                 "/encrypt".to_string(),
             ],
             "expected: rejected call, handshake, then the same call again"
+        );
+    }
+
+    /// A session older than `SESSION_RENEW_AFTER` is replaced before the call goes out, so the
+    /// keystore's TTL never refuses a call of a worker that keeps working.
+    #[tokio::test]
+    async fn an_old_session_is_replaced_before_the_call() {
+        let (url, server) = fake_keystore_serving(false, 3);
+        let client = client_with_signing_key(url);
+        client.set_aged_session_for_test(0, "old-session", SESSION_RENEW_AFTER);
+
+        let out = client.encrypt("seed", b"plaintext", None).await;
+
+        let seen = server.join().expect("server thread");
+        assert!(out.is_ok(), "got {out:?}");
+        assert_eq!(seen, vec!["/tee-challenge", "/register-tee", "/encrypt"]);
+        assert_ne!(client.current_endpoint().1.as_deref(), Some("old-session"));
+    }
+
+    /// Calls that find the session old at the same moment make one handshake between them.
+    #[tokio::test]
+    async fn concurrent_calls_on_an_old_session_share_one_handshake() {
+        let (url, server) = fake_keystore_serving(false, 4);
+        let client = client_with_signing_key(url);
+        client.set_aged_session_for_test(0, "old-session", SESSION_RENEW_AFTER);
+
+        let (a, b) = tokio::join!(
+            client.encrypt("seed", b"one", None),
+            client.encrypt("seed", b"two", None)
+        );
+
+        let seen = server.join().expect("server thread");
+        assert!(a.is_ok() && b.is_ok(), "got {a:?} / {b:?}");
+        assert_eq!(seen, vec!["/tee-challenge", "/register-tee", "/encrypt", "/encrypt"]);
+    }
+
+    /// At job start an old session is replaced, a fresh one is left alone: the job is handed a
+    /// session by value and must be able to finish on it.
+    #[tokio::test]
+    async fn a_job_is_handed_a_session_younger_than_the_renewal_age() {
+        let (url, server) = fake_keystore_serving(false, 2);
+        let client = client_with_signing_key(url);
+
+        client.renew_stale_session().await; // fresh: nothing happens
+        assert_eq!(client.current_endpoint().1.as_deref(), Some("stale-session"));
+
+        client.set_aged_session_for_test(0, "old-session", SESSION_RENEW_AFTER);
+        client.renew_stale_session().await;
+
+        let seen = server.join().expect("server thread");
+        assert_eq!(seen, vec!["/tee-challenge", "/register-tee"]);
+        assert_eq!(
+            client.current_endpoint().1.as_deref(),
+            Some("6f1e9d3a-0000-4000-8000-000000000001")
         );
     }
 

@@ -1286,6 +1286,7 @@ mod tests {
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -1429,6 +1430,7 @@ mod tests {
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -1558,21 +1560,81 @@ mod tests {
             session_id,
             TeeSession {
                 worker_public_key: "ed25519:WorkerAAA".to_string(),
+                token_hash: token_hash_of("s3cret"),
                 created_at: std::time::Instant::now(),
             },
         );
 
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-TEE-Session", session_id.to_string().parse().unwrap());
+        let headers = session_headers(&session_id.to_string(), "s3cret");
         assert_eq!(
             validate_tee_session(&state, &headers).unwrap(),
             Some("ed25519:WorkerAAA".to_string())
         );
 
         // An unknown session is refused outright — the identity is not optional in TEE mode.
-        let mut unknown = axum::http::HeaderMap::new();
-        unknown.insert("X-TEE-Session", uuid::Uuid::new_v4().to_string().parse().unwrap());
+        let unknown = session_headers(&uuid::Uuid::new_v4().to_string(), "s3cret");
         assert!(validate_tee_session(&state, &unknown).is_err());
+    }
+
+    fn token_hash_of(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(token.as_bytes()))
+    }
+
+    fn session_headers(session_id: &str, token: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-TEE-Session", session_id.parse().unwrap());
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    fn tee_state_with_session(token: &str, age: std::time::Duration) -> (AppState, uuid::Uuid) {
+        let mut config = state_with_worker_token(token).config.clone();
+        config.tee_mode = crate::config::TeeMode::OutlayerTee;
+        let state = AppState::new(crate::crypto::Keystore::generate(), config, None);
+        let session_id = uuid::Uuid::new_v4();
+        state.tee_sessions.lock().unwrap().insert(
+            session_id,
+            TeeSession {
+                worker_public_key: "ed25519:WorkerCCC".to_string(),
+                token_hash: token_hash_of(token),
+                created_at: std::time::Instant::now() - age,
+            },
+        );
+        (state, session_id)
+    }
+
+    /// A session id alone opens nothing: it is honoured only with the bearer token it was
+    /// registered with, and an id seen in a log is useless to the holder of another token.
+    #[test]
+    fn a_session_is_refused_with_another_token_or_none() {
+        let (state, id) = tee_state_with_session("s3cret", std::time::Duration::ZERO);
+        let id = id.to_string();
+        assert!(validate_tee_session(&state, &session_headers(&id, "s3cret")).is_ok());
+        assert!(validate_tee_session(&state, &session_headers(&id, "other")).is_err());
+        let mut no_token = axum::http::HeaderMap::new();
+        no_token.insert("X-TEE-Session", id.parse().unwrap());
+        assert!(validate_tee_session(&state, &no_token).is_err());
+    }
+
+    /// A session older than the TTL is refused with the sentence the worker re-handshakes on, and
+    /// dropped, so the next handshake re-checks the worker's key on chain.
+    #[test]
+    fn a_session_past_its_ttl_is_refused_as_expired_and_dropped() {
+        let (state, id) = tee_state_with_session("s3cret", TEE_SESSION_TTL);
+        let err = validate_tee_session(&state, &session_headers(&id.to_string(), "s3cret"))
+            .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::Forbidden(m) if m == "TEE session expired"),
+            "got {err:?}"
+        );
+        assert!(state.tee_sessions.lock().unwrap().get(&id).is_none());
+
+        let (state, id) = tee_state_with_session(
+            "s3cret",
+            TEE_SESSION_TTL - std::time::Duration::from_secs(5),
+        );
+        assert!(validate_tee_session(&state, &session_headers(&id.to_string(), "s3cret")).is_ok());
     }
 
     /// The identity has to survive the trip from the middleware to the handler. If the extension
@@ -1591,6 +1653,7 @@ mod tests {
             session_id,
             TeeSession {
                 worker_public_key: "ed25519:WorkerBBB".to_string(),
+                token_hash: token_hash_of("s3cret"),
                 created_at: std::time::Instant::now(),
             },
         );
@@ -1612,6 +1675,7 @@ mod tests {
                 axum::http::Request::builder()
                     .uri("/echo")
                     .header("X-TEE-Session", session_id.to_string())
+                    .header("Authorization", "Bearer s3cret")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1638,6 +1702,7 @@ mod tests {
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -4113,6 +4178,7 @@ mod signing_keys_at_the_door {
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -4839,7 +4905,7 @@ mod signing_keys_at_the_door {
                 mpc_contract_id: "v1.signer.test".parse().unwrap(),
                 mpc_domain_id: 2,
                 mpc_public_key: "unused".into(),
-                near_rpc_url: state.config.near_rpc_url.clone(),
+                near_rpc_url: state.config.near_rpc_url.as_str().to_string(),
                 keystore_dao_id: "dao.test".parse().unwrap(),
             },
             near_crypto::InMemorySigner {
@@ -5943,6 +6009,7 @@ mod contract_vote_tests {
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -5998,12 +6065,13 @@ mod contract_vote_tests {
         let config = crate::config::Config {
             server_addr: "127.0.0.1:0".parse().unwrap(),
             near_network: "testnet".into(),
-            near_rpc_url: url.clone(),
+            near_rpc_url: url.clone().into(),
             offchainvm_contract_id: "outlayer.test".into(),
             allowed_worker_token_hashes: vec![],
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -6323,12 +6391,13 @@ mod payment_check_multisig_tests {
         let config = crate::config::Config {
             server_addr: "127.0.0.1:0".parse().unwrap(),
             near_network: "testnet".into(),
-            near_rpc_url: url.clone(),
+            near_rpc_url: url.clone().into(),
             offchainvm_contract_id: "outlayer.test".into(),
             allowed_worker_token_hashes: vec![],
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -6539,12 +6608,13 @@ mod policy_lock_tests {
         let config = crate::config::Config {
             server_addr: "127.0.0.1:0".parse().unwrap(),
             near_network: "testnet".into(),
-            near_rpc_url: url.clone(),
+            near_rpc_url: url.clone().into(),
             offchainvm_contract_id: "outlayer.test".into(),
             allowed_worker_token_hashes: vec![],
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };
@@ -6806,6 +6876,7 @@ mod policy_lock_tests {
             allowed_coordinator_token_hashes: vec![],
             tee_mode: crate::config::TeeMode::None,
             operator_account_id: None,
+            near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
         };

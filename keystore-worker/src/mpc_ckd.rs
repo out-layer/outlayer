@@ -258,8 +258,9 @@ pub struct MpcCkdConfig {
 }
 
 impl MpcCkdConfig {
-    /// Load configuration from environment variables
-    pub fn from_env() -> Result<Self> {
+    /// Load configuration from environment variables. The RPC is the resolved one
+    /// (`config::resolve_chain`), never read from the env here.
+    pub fn from_env(near_rpc_url: &str) -> Result<Self> {
         let mpc_contract_id_raw = std::env::var("MPC_CONTRACT_ID")
             .context("MPC_CONTRACT_ID is required for MPC CKD")?;
         let mpc_contract_id: AccountId = mpc_contract_id_raw
@@ -286,8 +287,7 @@ impl MpcCkdConfig {
                 .context("MPC_PUBLIC_KEY required for CKD")?,
 
 
-            near_rpc_url: std::env::var("NEAR_RPC_URL")
-                 .context("NEAR_RPC_URL is required for MPC CKD")?,
+            near_rpc_url: near_rpc_url.to_string(),
 
             keystore_dao_id,
         })
@@ -1009,13 +1009,14 @@ pub async fn check_access_key_methods(
 pub async fn initialize_mpc_keystore(
     dao_contract_id: String,
     keystore_secret_key: near_crypto::SecretKey,
+    near_rpc_url: &str,
 ) -> Result<(crate::crypto::Keystore, MpcCkdConfig, near_crypto::InMemorySigner)> {
     tracing::info!("Initializing keystore with MPC CKD...");
 
     // Load configuration. Override keystore_dao_id with the explicit
     // arg (the env-loaded value is the boot-time default; some
     // entrypoints pass a different one).
-    let mut config = MpcCkdConfig::from_env()?;
+    let mut config = MpcCkdConfig::from_env(near_rpc_url)?;
     config.keystore_dao_id = dao_contract_id.parse().with_context(|| {
         format!("dao_contract_id is not a valid AccountId: {}", dao_contract_id)
     })?;

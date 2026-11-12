@@ -62,7 +62,9 @@ async fn main() -> Result<()> {
     tracing::info!(
         server_addr = %config.server_addr,
         tee_mode = ?config.tee_mode,
-        contract = %config.offchainvm_contract_id,
+        secrets_contract = config.near_contract_id.as_deref().unwrap_or("-"),
+        operator_account = config.operator_account_id.as_deref().unwrap_or("-"),
+        rpc = %config.near_rpc_url.public(),
         "Configuration loaded"
     );
 
@@ -84,15 +86,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize NEAR RPC client for reading secrets from contract
-    // Only NEAR_RPC_URL and NEAR_CONTRACT_ID are required (read-only)
-    let near_client = if let (Ok(rpc_url), Ok(contract_id)) = (
-        std::env::var("NEAR_RPC_URL"),
-        std::env::var("NEAR_CONTRACT_ID"),
-    ) {
-        tracing::info!("Initializing NEAR RPC client (read-only)");
+    // Initialize NEAR RPC client for reading secrets from contract (read-only). The RPC and the
+    // contract are the resolved ones (`config::resolve_chain`), fixed in code for a production DAO.
+    let near_client = if let Some(contract_id) = config.near_contract_id.as_deref() {
+        tracing::info!(contract = %contract_id, "Initializing NEAR RPC client (read-only)");
 
-        match near::NearClient::new(&rpc_url, &contract_id) {
+        match near::NearClient::new(config.near_rpc_url.as_str(), contract_id) {
             Ok(client) => {
                 tracing::info!("✅ NEAR RPC client initialized");
                 Some(client)
@@ -104,9 +103,8 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        tracing::warn!("NEAR_RPC_URL or NEAR_CONTRACT_ID not set");
+        tracing::warn!("NEAR_CONTRACT_ID not set");
         tracing::warn!("Secrets reading from contract will be disabled");
-        tracing::warn!("Required env vars: NEAR_RPC_URL, NEAR_CONTRACT_ID");
         None
     };
 
@@ -233,8 +231,7 @@ async fn perform_tee_registration(config: &Config) -> Result<TeeRegistrationResu
         .context("INIT_ACCOUNT_ID not set")?;
     let init_private_key = std::env::var("INIT_ACCOUNT_PRIVATE_KEY")
         .context("INIT_ACCOUNT_PRIVATE_KEY not set")?;
-    let near_rpc_url = std::env::var("NEAR_RPC_URL")
-        .context("NEAR_RPC_URL is required for TEE registration")?;
+    let near_rpc_url = config.near_rpc_url.as_str().to_string();
 
     // Create registration client
     let registration = tee_registration::RegistrationClient::new(
@@ -407,7 +404,7 @@ async fn perform_tee_registration(config: &Config) -> Result<TeeRegistrationResu
     // Now we're approved, get MPC-derived secret
     tracing::info!("🔑 Requesting master secret from MPC network via CKD");
     let (keystore, mpc_ckd_config, keystore_dao_signer) =
-        mpc_ckd::initialize_mpc_keystore(dao_contract.clone(), secret_key).await?;
+        mpc_ckd::initialize_mpc_keystore(dao_contract.clone(), secret_key, config.near_rpc_url.as_str()).await?;
 
     tracing::info!("✅ Successfully obtained MPC-derived master secret");
     Ok(TeeRegistrationResult {

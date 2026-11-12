@@ -61,10 +61,15 @@ A session comes from a challenge-response:
 ```
 POST /tee-challenge                      → {"challenge": "<64 hex>"}     (valid 60 s, one use)
 POST /register-tee {public_key, challenge, signature}
-     → signature verified (schemes allowed by TEE_ALLOWED_KEY_TYPES)
+     → signature verified over "outlayer-tee-session-v1:" ‖ challenge
+       (schemes allowed by TEE_ALLOWED_KEY_TYPES)
      → view_access_key(OPERATOR_ACCOUNT_ID, public_key) must exist on chain
      → {"session_id": "<uuid>"}
 ```
+
+A session is honoured for one hour, and only together with the bearer token it was registered
+with; the id alone opens nothing and is never logged. The worker renews its session at half that
+age, so a worker key removed from `OPERATOR_ACCOUNT_ID` stops decrypting within the hour.
 
 `OPERATOR_ACCOUNT_ID` is the worker registration contract (`worker.outlayer.near`), which
 adds a worker's key only after verifying its TDX quote; see
@@ -147,14 +152,15 @@ membership and ownership are read from the chain. A body that names `signing_key
 |---|---|---|
 | `SERVER_HOST`, `SERVER_PORT` | no (`0.0.0.0`, `8081`) | listen address |
 | `NEAR_NETWORK` | no (`testnet`) | |
-| `NEAR_RPC_URL` | yes | keyed RPC; every chain read and the registration transactions |
+| `NEAR_RPC_URL` | yes, except for a production DAO | keyed RPC; every chain read and the registration transactions. Refused for `dao.outlayer.<net>`, see below |
+| `NEAR_RPC_API_KEY` | for a production DAO | the FastNEAR key for the host fixed in code; without it the host is used unkeyed, with a warning |
 | `OFFCHAINVM_CONTRACT_ID` | yes | the OutLayer contract (`outlayer.near`) |
-| `NEAR_CONTRACT_ID` | yes, to read secrets | the contract secrets are read from (`outlayer.near`) |
+| `NEAR_CONTRACT_ID` | yes, to read secrets, except for a production DAO | the contract secrets are read from (`outlayer.near`) |
 | `ALLOWED_WORKER_TOKEN_HASHES` | yes | comma-separated SHA-256 hex of worker tokens |
 | `ALLOWED_COORDINATOR_TOKEN_HASHES` | yes | comma-separated SHA-256 hex of coordinator tokens |
 | `TEE_MODE` | no (`none`) | `outlayer_tee` or `none` |
 | `USE_TEE_REGISTRATION` | no (`false`) | `true`: master from MPC after the DAO vote |
-| `OPERATOR_ACCOUNT_ID` | with `outlayer_tee` | account whose access keys admit a worker (`worker.outlayer.near`) |
+| `OPERATOR_ACCOUNT_ID` | with `outlayer_tee`, except for a production DAO | account whose access keys admit a worker (`worker.outlayer.near`) |
 | `TEE_ALLOWED_KEY_TYPES` | no (`ed25519`) | worker key schemes accepted for sessions, e.g. `ed25519,ml-dsa-65` |
 | `KEYSTORE_KEY_TYPE` | no (`ed25519`) | registration key scheme: `ed25519` or `ml-dsa-65` |
 | `KEYSTORE_DAO_CONTRACT` | with TEE registration | `dao.outlayer.near` |
@@ -168,6 +174,16 @@ membership and ownership are read from the chain. A body that names `signing_key
 | `KEYSTORE_ALLOW_INLINE_POLICY` | no | testing only: lets `/wallet/check-policy` take an inline encrypted policy instead of reading it from the chain |
 | `LOG_MASTER_KEY_HASH` | no | `true` logs a SHA-256 of the master and extra registration diagnostics |
 | `RUST_LOG` | no | log filter |
+
+**A production DAO fixes the chain in code.** For `KEYSTORE_DAO_CONTRACT` =
+`dao.outlayer.near` / `dao.outlayer.testnet` the keystore reads the chain only through
+`rpc.mainnet.fastnear.com` / `rpc.testnet.fastnear.com`, about `worker.outlayer.<net>` and
+`outlayer.<net>`. The env is not part of the keystore's measurement: an RPC answering the
+worker-key check, or another operator account or secrets contract, would decide who opens a TEE
+session and which access conditions apply, under the same approved build. The keystore refuses
+to start when `NEAR_RPC_URL` is set, or when `OPERATOR_ACCOUNT_ID` / `NEAR_CONTRACT_ID` name
+anything else (both values are named in the error). Changing the RPC provider of a production
+DAO is a keystore release. Any other DAO, or none, takes the three from the env.
 
 A token is generated and hashed like this; the worker or coordinator holds the token,
 the keystore only its hash:
@@ -359,8 +375,9 @@ proposal.
 
 ### "TEE session not found or expired"
 
-The keystore has no session for this worker: it restarted, or the worker never completed the
-handshake. The worker re-registers on this error for `/decrypt`, `/encrypt` and
+The keystore has no session for this worker: it restarted, the session is older than an hour
+("TEE session expired"), the request carries another bearer token than the handshake did, or
+the worker never completed the handshake. The worker re-registers on this error for `/decrypt`, `/encrypt` and
 `/decrypt-raw`; if that fails, check that the worker's key is still an access key on
 `OPERATOR_ACCOUNT_ID`.
 
