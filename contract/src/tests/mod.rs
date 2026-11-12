@@ -103,11 +103,11 @@ mod admin_tests {
     }
 
     #[test]
-    #[should_panic(expected = "Only owner can call this method")]
+    #[should_panic(expected = "Only governance")]
     fn test_set_operator_unauthorized() {
         let mut contract = setup_contract();
 
-        // Non-owner tries to set operator
+        // Not governance (a fresh contract is governed by its owner)
         let context = get_context(accounts(2), NearToken::from_near(0));
         testing_env!(context.build());
 

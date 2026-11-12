@@ -135,6 +135,27 @@ mod tests {
         assert!(contract.get_request(0).is_none());
     }
 
+    /// The bulk cancel returns the stablecoin as the single one does.
+    #[test]
+    fn test_cancel_pending_requests_returns_the_stablecoin_too() {
+        let mut contract = setup_contract();
+        let owner = accounts(0);
+        let sender = accounts(3);
+
+        for id in 0..2u64 {
+            let mut r = test_execution_request(id, sender.clone(), env::block_timestamp());
+            r.attached_usd = 12_000;
+            contract.pending_requests.insert(&id, &r);
+        }
+        contract.user_stablecoin_balances.insert(&sender, &976_000);
+
+        testing_env!(get_context(owner, NearToken::from_near(0)).build());
+        assert_eq!(contract.cancel_pending_requests(vec![0, 1, 7]), 2);
+
+        assert_eq!(contract.user_stablecoin_balances.get(&sender).unwrap(), 1_000_000);
+        assert!(contract.get_request(0).is_none() && contract.get_request(1).is_none());
+    }
+
     #[test]
     #[should_panic(expected = "Only the sender can cancel this execution")]
     fn test_cancel_stale_execution_unauthorized() {
@@ -863,6 +884,20 @@ mod input_storage_and_callback_tests {
         assert_eq!(transfers(), vec![(accounts(1), quoted - c.base_fee)]);
         assert_eq!(c.total_fees_collected, c.base_fee);
         assert_eq!(c.user_stablecoin_balances.get(&accounts(1)).unwrap(), 7_000);
+    }
+
+    /// A base fee raised after the request was made is never credited past what the request
+    /// paid: the fees counter bounds the owner's NEAR withdrawal.
+    #[test]
+    fn a_timed_out_run_never_credits_more_than_was_paid() {
+        let mut c = setup_contract();
+        let quoted = c.estimate_execution_cost(None, None).0;
+        request_with(&mut c, quoted, Some("{}".to_string()));
+        c.base_fee = quoted * 1_000;
+
+        settle_with(&mut c, 0, Err(PromiseError::Failed));
+        assert_eq!(c.total_fees_collected, quoted, "kept the payment, not the new base fee");
+        assert!(transfers().is_empty(), "nothing left to refund");
     }
 
     #[test]

@@ -553,8 +553,10 @@ impl Contract {
     /// Only the controller (caller == entry.owner) can freeze.
     /// Does not require wallet key signature — enables emergency freeze
     /// even if agent's key is compromised.
+    ///
+    /// Works while the contract is paused: a freeze only takes rights away, and a pause must
+    /// never leave an owner without their emergency stop. Unfreezing waits for the unpause.
     pub fn freeze_wallet(&mut self, wallet_pubkey: String) {
-        self.assert_not_paused();
 
         let caller = env::predecessor_account_id();
         // The SAME spelling anything is stored under. `store_wallet_policy`

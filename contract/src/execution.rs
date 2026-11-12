@@ -765,8 +765,9 @@ impl Contract {
                     // Promise failed - refund NEAR (except base fee) and stablecoin
                     // Developer gets nothing on failure
 
-                    // Refund NEAR (minus base fee)
-                    let refund = payment.0.saturating_sub(self.base_fee);
+                    // Refund NEAR minus the base fee; the contract keeps at most what was paid.
+                    let kept = payment.0.min(self.base_fee);
+                    let refund = payment.0 - kept;
                     if refund > 0 {
                         near_sdk::Promise::new(request.payer_account_id.clone())
                             .transfer(NearToken::from_yoctonear(refund));
@@ -778,10 +779,10 @@ impl Contract {
                         "the execution promise failed",
                     );
 
-                    self.total_fees_collected += self.base_fee;
+                    self.total_fees_collected += kept;
 
                     // Log payment charged in easy-to-parse format for worker (only base fee charged on promise failure)
-                    log!("[[yNEAR charged: \"{}\"]]", self.base_fee);
+                    log!("[[yNEAR charged: \"{}\"]]", kept);
 
                     // Log the promise failure (don't panic - state changes must persist!)
                     log!(

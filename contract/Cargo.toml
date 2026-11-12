@@ -2,7 +2,17 @@
 name = "outlayer-contract"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/out-layer/outlayer"
 license = "Apache-2.0"
+
+# `cargo near build reproducible-wasm`: the release build, in this pinned image, from a clean
+# committed tree. Anyone rebuilding the same commit gets the same wasm and the same sha256 —
+# the code hash a DAO upgrade proposal names.
+[package.metadata.near.reproducible_build]
+image = "sourcescan/cargo-near:0.13.4-rust-1.85.0"
+image_digest = "sha256:a9d8bee7b134856cc8baa142494a177f2ba9ecfededfcdd38f634e14cca8aae2"
+passed_env = []
+container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

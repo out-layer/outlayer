@@ -28,18 +28,19 @@ impl Contract {
 
 #[near_bindgen]
 impl Contract {
-    /// Set new owner (only current owner can call)
+    /// Governance: replace the owner (the ops role).
     pub fn set_owner(&mut self, new_owner_id: AccountId) {
-        self.assert_owner();
+        self.assert_governance();
         let old_owner = self.owner_id.clone();
         self.owner_id = new_owner_id.clone();
 
         log!("Owner changed from {} to {}", old_owner, new_owner_id);
     }
 
-    /// Set new operator (only owner can call)
+    /// Governance: replace the operator. The operator resolves executions and answers
+    /// payment-key yields, so choosing it is a governance decision.
     pub fn set_operator(&mut self, new_operator_id: AccountId) {
-        self.assert_owner();
+        self.assert_governance();
         let old_operator = self.operator_id.clone();
         self.operator_id = new_operator_id.clone();
 
@@ -255,8 +256,9 @@ impl Contract {
         }
     }
 
+    /// Governance: the stablecoin top-ups are accepted in and payouts are made in.
     pub fn set_payment_token_contract(&mut self, token_contract: Option<AccountId>) {
-        self.assert_owner();
+        self.assert_governance();
         self.payment_token_contract = token_contract.clone();
         match token_contract {
             Some(contract) => log!("Payment token contract set to {}", contract),
@@ -324,6 +326,14 @@ impl Contract {
             if let Some(request) = self.pending_requests.remove(&request_id) {
                 near_sdk::Promise::new(request.payer_account_id.clone())
                     .transfer(NearToken::from_yoctonear(request.payment));
+
+                // And the stablecoin, as on every other path that ends a request without
+                // earning anything.
+                self.return_attached_usd(
+                    &request.sender_id,
+                    request.attached_usd,
+                    "the request was cancelled by the operator",
+                );
 
                 log!(
                     "Cancelled request {} and refunded {} yoctoNEAR to {}",

@@ -1,37 +1,35 @@
 use crate::*;
 use near_sdk::borsh::BorshDeserialize;
 
-/// Previous on-chain layout: a single `quote_collateral: Option<String>`.
-/// The live `worker.outlayer.testnet` state matches this (owner + init account +
-/// approved_measurements + one collateral). `migrate()` moves that single collateral into the
-/// new multi-slot `collaterals` vec at slot 0 (e.g. the existing Phala 20a06f000000 collateral),
-/// preserving approved_measurements. Field order MUST match the serialized layout.
+/// The layout live on `worker.outlayer.{testnet,near}`: multi-slot collaterals, no governance.
+/// Field order MUST match the serialized layout.
 #[derive(BorshDeserialize)]
+#[cfg_attr(test, derive(near_sdk::borsh::BorshSerialize))]
 #[borsh(crate = "near_sdk::borsh")]
-#[allow(dead_code)] // fields needed for Borsh deserialization during migration
-pub struct RegisterContractV2 {
+pub struct RegisterContractV3 {
     pub owner_id: AccountId,
     pub init_worker_account: AccountId,
     pub approved_measurements: Vec<ApprovedMeasurements>,
-    pub quote_collateral: Option<String>,
+    pub collaterals: Vec<String>,
     pub outlayer_contract_id: AccountId,
 }
 
 #[near_bindgen]
 impl RegisterContract {
+    /// V3 → V4: adds `governance_id`. Run once, with the full-access key that deploys V4 —
+    /// the last deploy that key makes. Every version deployed through governance after this
+    /// one has a `migrate()` without arguments (see `upgrade`).
     #[private]
     #[init(ignore_state)]
-    pub fn migrate() -> Self {
-        let old: RegisterContractV2 = env::state_read().expect("Failed to read old state");
-
+    pub fn migrate(governance_id: AccountId) -> Self {
+        let old: RegisterContractV3 = env::state_read().expect("Failed to read V3 state");
         Self {
             owner_id: old.owner_id,
             init_worker_account: old.init_worker_account,
             approved_measurements: old.approved_measurements,
-            // Move the single cached collateral into slot 0; owner adds others (self-hosted
-            // FMSPC) via `update_collateral(collateral, 1)`.
-            collaterals: old.quote_collateral.map(|c| vec![c]).unwrap_or_default(),
+            collaterals: old.collaterals,
             outlayer_contract_id: old.outlayer_contract_id,
+            governance_id,
         }
     }
 }

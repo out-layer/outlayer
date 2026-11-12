@@ -1,13 +1,17 @@
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::{env, near_bindgen, AccountId, Allowance, CurveType, NearToken, Promise, PublicKey, BorshStorageKey};
+use near_sdk::json_types::Base58CryptoHash;
+use near_sdk::{env, near_bindgen, require, AccountId, Allowance, CurveType, Gas, NearToken, Promise, PublicKey, BorshStorageKey};
 use schemars::JsonSchema;
 
 // Collateral wrapper with Borsh support (same approach as MPC Node)
 mod collateral;
 use collateral::Collateral;
 
-mod migration;
+pub(crate) mod migration;
+
+#[cfg(test)]
+mod governance_tests;
 
 // Custom getrandom implementation for WASM (same as MPC Node)
 // We don't need actual randomness in this contract (only verification)
@@ -61,12 +65,11 @@ pub struct ApprovedMeasurements {
 /// 5. This contract adds public key to itself (current_account_id) with permissions for offchainvm_contract_id
 /// 6. Result: Public key is cryptographically proven to be generated in approved TEE
 ///
-/// # Usage
-/// 1. Deploy contract: `near deploy worker.outlayer.testnet --wasmFile register.wasm`
-/// 2. Initialize: `near call worker.outlayer.testnet new '{"owner_id":"outlayer.testnet","init_worker_account":"init-worker.outlayer.testnet"}' --accountId outlayer.testnet`
-/// 3. Add approved measurements: `near call worker.outlayer.testnet add_approved_measurements '{"measurements":{...}}' --accountId outlayer.testnet`
-/// 4. Init worker calls: `near call worker.outlayer.testnet register_worker_key '{"public_key":"...","tdx_quote_hex":"..."}' --accountId init-worker.outlayer.testnet`
-/// 5. Contract verifies and adds key to worker.outlayer.testnet with permissions for outlayer.testnet
+/// # Roles
+/// - Governance (`governance_id`, the DAO): approves worker builds, replaces the owner (`set_owner`),
+///   upgrades this contract.
+/// - Owner (ops): revokes builds, removes worker keys, keeps the Intel collateral current.
+/// - `init_worker_account`: submits `register_worker_key` with a TDX quote of an approved build.
 /// Max number of cached quote collaterals (one per platform/FMSPC, e.g. Phala + self-hosted).
 /// register_worker_key tries each until the worker's quote verifies; keep small (gas).
 const MAX_COLLATERALS: usize = 2;
@@ -91,8 +94,17 @@ pub struct RegisterContract {
     /// MAX_COLLATERALS; owner manages slots via `update_collateral(collateral, index)`.
     pub collaterals: Vec<String>,
 
-    pub outlayer_contract_id: AccountId
+    pub outlayer_contract_id: AccountId,
+
+    /// The DAO (`dao.outlayer.<net>`). Approves worker builds, replaces the owner and
+    /// upgrades this contract — see `upgrade`. A worker build that registers here opens
+    /// keystore sessions, so approving one is a governance decision, never an owner's.
+    pub governance_id: AccountId,
 }
+
+/// Gas for `migrate` and `gov_health` in the upgrade batch.
+const MIGRATE_GAS: Gas = Gas::from_tgas(60);
+const HEALTH_GAS: Gas = Gas::from_tgas(20);
 
 impl Default for RegisterContract {
     fn default() -> Self {
@@ -118,13 +130,19 @@ pub struct WorkerKeyInfo {
 impl RegisterContract {
     /// Initialize contract
     #[init]
-    pub fn new(owner_id: AccountId, init_worker_account: AccountId, outlayer_contract_id: AccountId) -> Self {
+    pub fn new(
+        owner_id: AccountId,
+        init_worker_account: AccountId,
+        outlayer_contract_id: AccountId,
+        governance_id: AccountId,
+    ) -> Self {
         Self {
             owner_id,
             init_worker_account,
             approved_measurements: Vec::new(),
             collaterals: Vec::new(),
             outlayer_contract_id,
+            governance_id,
         }
     }
 
@@ -386,15 +404,11 @@ impl RegisterContract {
         ));
     }
 
-    /// Add approved TEE measurements (MRTD + RTMR0-3).
-    ///
-    /// All 5 measurements must match for a worker to register.
-    /// Get measurements from Phala attestation:
-    /// `phala cvms attestation <CVM_NAME> --json | jq '.tcb_info'`
-    ///
-    /// If `clear_others` is true, removes all existing entries before adding.
+    /// Governance: approve a worker build (MRTD + RTMR0-3; all 5 must match for a worker to
+    /// register). The DAO calls it through a `Call` proposal, so it runs after the vote and the
+    /// delay. If `clear_others` is true, removes all existing entries before adding.
     pub fn add_approved_measurements(&mut self, measurements: ApprovedMeasurements, clear_others: Option<bool>) {
-        self.assert_owner();
+        self.assert_governance();
         Self::validate_measurements(&measurements);
 
         if clear_others.unwrap_or(false) {
@@ -415,16 +429,17 @@ impl RegisterContract {
         env::log_str(&format!("Total approved measurements: {}", self.approved_measurements.len()));
     }
 
-    /// Remove approved measurements
+    /// Owner or governance: remove one approved build. The fast path for a bad build — revoking
+    /// takes a right away, so it needs no vote.
     pub fn remove_approved_measurements(&mut self, measurements: ApprovedMeasurements) {
-        self.assert_owner();
+        self.assert_owner_or_governance();
         self.approved_measurements.retain(|m| m != &measurements);
         env::log_str(&format!("Approved measurements removed. Remaining: {}", self.approved_measurements.len()));
     }
 
-    /// Clear all approved measurements
+    /// Owner or governance: remove every approved build (see `remove_approved_measurements`).
     pub fn clear_all_approved_measurements(&mut self) {
-        self.assert_owner();
+        self.assert_owner_or_governance();
         let count = self.approved_measurements.len();
         self.approved_measurements.clear();
         env::log_str(&format!("Cleared all {} measurement entries", count));
@@ -439,11 +454,12 @@ impl RegisterContract {
     /// missing key does not cause the entire batch to fail.
     ///
     /// # Security
-    /// - Removing a key invalidates any TEE sessions that rely on
-    ///   `view_access_key` checks against this contract
+    /// - Owner or governance. The keys on this account are the workers' function-call keys
+    ///   (`register_worker_key`), so the worst a removal does is stop a worker: no key it can
+    ///   delete moves funds or decrypts anything.
     /// - Frees ~0.042 NEAR storage per key
     pub fn remove_worker_keys(&mut self, public_keys: Vec<PublicKey>) {
-        self.assert_owner();
+        self.assert_owner_or_governance();
         let account = env::current_account_id();
         for key in &public_keys {
             // Short fingerprint only: an ml-dsa-65 key debug-prints to ~19 KB (over the log limit).
@@ -460,14 +476,46 @@ impl RegisterContract {
         env::log_str(&format!("Scheduled removal of {} worker key(s)", public_keys.len()));
     }
 
-    /// Transfer ownership
-    pub fn transfer_ownership(&mut self, new_owner: AccountId) {
-        self.assert_owner();
-        env::log_str(&format!(
-            "Ownership transferred: {} -> {}",
-            self.owner_id, new_owner
-        ));
-        self.owner_id = new_owner;
+    /// Governance: replace the owner (the ops role). Same name and argument as on the main
+    /// contract, so one `Call` shape replaces the owner on both.
+    pub fn set_owner(&mut self, new_owner_id: AccountId) {
+        self.assert_governance();
+        env::log_str(&format!("Owner changed from {} to {}", self.owner_id, new_owner_id));
+        self.owner_id = new_owner_id;
+    }
+
+    /// Governance: hand governance to another account.
+    pub fn set_governance(&mut self, governance_id: AccountId) {
+        self.assert_governance();
+        env::log_str(&format!("governance_set {} -> {}", self.governance_id, governance_id));
+        self.governance_id = governance_id;
+    }
+
+    /// Governance: deploy the wasm given as the raw input of the call (not JSON) on this
+    /// account. `upgrade_and_migrate` also calls the new code's `migrate()`. One atomic batch:
+    /// a failing `migrate`, or a state the new code cannot read (`gov_health`), leaves the old
+    /// code in place. Every version keeps `upgrade`, `upgrade_and_migrate`, `migrate()` (no
+    /// arguments once deployed through governance) and `gov_health`: an earlier version calls
+    /// them on a later one.
+    pub fn upgrade(&mut self) -> Promise {
+        self.governed_upgrade(false)
+    }
+
+    pub fn upgrade_and_migrate(&mut self) -> Promise {
+        self.governed_upgrade(true)
+    }
+
+    /// Reads the state; the last step of the upgrade batch.
+    pub fn gov_health(&self) -> usize {
+        self.approved_measurements.len()
+    }
+
+    pub fn get_governance(&self) -> AccountId {
+        self.governance_id.clone()
+    }
+
+    pub fn get_owner(&self) -> AccountId {
+        self.owner_id.clone()
     }
 
     // ========== View methods ==========
@@ -504,6 +552,38 @@ impl RegisterContract {
             env::predecessor_account_id(),
             self.owner_id,
             "Only owner can call this method"
+        );
+    }
+
+    fn governed_upgrade(&self, migrate: bool) -> Promise {
+        self.assert_governance();
+        let code = env::input().unwrap_or_default();
+        require!(!code.is_empty(), "upgrade takes the wasm as the raw input of the call");
+        env::log_str(&format!(
+            "upgrade code_hash={} size={} migrate={}",
+            String::from(&Base58CryptoHash::from(env::sha256_array(&code))),
+            code.len(),
+            migrate
+        ));
+        let mut p = Promise::new(env::current_account_id()).deploy_contract(code);
+        if migrate {
+            p = p.function_call("migrate".to_string(), b"{}".to_vec(), NearToken::from_yoctonear(0), MIGRATE_GAS);
+        }
+        p.function_call("gov_health".to_string(), b"{}".to_vec(), NearToken::from_yoctonear(0), HEALTH_GAS)
+    }
+
+    fn assert_governance(&self) {
+        require!(
+            env::predecessor_account_id() == self.governance_id,
+            format!("Only governance ({}) can call this method", self.governance_id)
+        );
+    }
+
+    fn assert_owner_or_governance(&self) {
+        let p = env::predecessor_account_id();
+        require!(
+            p == self.owner_id || p == self.governance_id,
+            "Only the owner or governance can call this method"
         );
     }
 
@@ -563,8 +643,9 @@ mod tests {
         let context = get_context();
         testing_env!(context.build());
 
-        let contract = RegisterContract::new(accounts(1), accounts(2), accounts(3));
-        assert_eq!(contract.owner_id, accounts(1));
+        let contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
+        assert_eq!(contract.owner_id, accounts(4));
+        assert_eq!(contract.governance_id, accounts(1));
         assert_eq!(contract.init_worker_account, accounts(2));
         assert_eq!(contract.get_approved_measurements().len(), 0);
     }
@@ -574,7 +655,7 @@ mod tests {
         let context = get_context();
         testing_env!(context.build());
 
-        let mut contract = RegisterContract::new(accounts(1), accounts(2), accounts(3));
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
         let m = dummy_measurements();
         contract.add_approved_measurements(m.clone(), None);
 
@@ -587,7 +668,7 @@ mod tests {
         let context = get_context();
         testing_env!(context.build());
 
-        let mut contract = RegisterContract::new(accounts(1), accounts(2), accounts(3));
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
         let m = dummy_measurements();
         contract.add_approved_measurements(m.clone(), None);
         contract.add_approved_measurements(m.clone(), None);
@@ -600,7 +681,7 @@ mod tests {
         let context = get_context();
         testing_env!(context.build());
 
-        let mut contract = RegisterContract::new(accounts(1), accounts(2), accounts(3));
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
         let m1 = dummy_measurements();
         contract.add_approved_measurements(m1.clone(), None);
 
@@ -617,7 +698,7 @@ mod tests {
         let context = get_context();
         testing_env!(context.build());
 
-        let mut contract = RegisterContract::new(accounts(1), accounts(2), accounts(3));
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
         let m = ApprovedMeasurements {
             mrtd: "abc".to_string(),
             rtmr0: "b".repeat(96),
@@ -629,15 +710,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Only owner")]
-    fn test_non_owner_cannot_add_measurements() {
+    #[should_panic(expected = "Only governance")]
+    fn test_non_governance_cannot_add_measurements() {
         let mut context = get_context();
         testing_env!(context.build());
 
-        let mut contract = RegisterContract::new(accounts(1), accounts(2), accounts(3));
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
 
-        // Change predecessor to non-owner
-        testing_env!(context.predecessor_account_id(accounts(3)).build());
+        // The owner is not governance.
+        testing_env!(context.predecessor_account_id(accounts(4)).build());
 
         contract.add_approved_measurements(dummy_measurements(), None);
     }
@@ -647,7 +728,7 @@ mod tests {
         let context = get_context();
         testing_env!(context.build());
 
-        let mut contract = RegisterContract::new(accounts(1), accounts(2), accounts(3));
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
         let m = dummy_measurements();
         contract.add_approved_measurements(m.clone(), None);
         assert_eq!(contract.get_approved_measurements().len(), 1);

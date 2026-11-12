@@ -2,10 +2,20 @@
 name = "register-contract"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/out-layer/outlayer"
 license = "Apache-2.0"
 
 [package.metadata.near.build]
 wasm-opt-args = ["--enable-bulk-memory"]
+
+# `cargo near build reproducible-wasm`: the release build, in this pinned image, from a clean
+# committed tree. Anyone rebuilding the same commit gets the same wasm and the same sha256 —
+# the code hash a DAO upgrade proposal names.
+[package.metadata.near.reproducible_build]
+image = "sourcescan/cargo-near:0.21.1-rust-1.93.0"
+image_digest = "sha256:79b789c81ba19ec30794a6b1046b02dcaf5c055994b22cc7c9af67ab5096b095"
+passed_env = []
+container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked", "--features", "abi", "--no-embed-abi"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

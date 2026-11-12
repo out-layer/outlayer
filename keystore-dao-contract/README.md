@@ -12,33 +12,77 @@ vaults).
 
 Read the live configuration with `get_config`, `get_owner` and `get_dao_members`.
 
-Source: `src/lib.rs` (contract), `src/collateral.rs` (Intel collateral parsing,
-taken from the NEAR MPC node), `src/migration.rs` (state migration).
+Source: `src/lib.rs` (contract), `src/governance.rs` (proposals, delay, blobs,
+upgrades), `src/collateral.rs` (Intel collateral parsing, taken from the NEAR MPC
+node), `src/migration.rs` (state migration).
 
-## Governance at this stage
+## Governance
 
-Read this before the rest. The contract's checks are only as strong as the keys
-around it:
+The DAO governs itself, the main contract (`outlayer.<net>`) and the register
+contract (`worker.outlayer.<net>`). Whoever can change this contract's code
+controls the master — MPC derives it for this account — so its members and its
+delay are the root of trust. Every governance method is for DAO members only.
 
-- **Owner-only, no vote:** `add_approved_measurements`,
-  `remove_approved_measurements`, `clear_all_approved_measurements`,
-  `add_dao_member`, `remove_dao_member`, `update_collateral`. The owner decides
-  which enclave builds may register and who votes. Because the owner sets
-  membership, the owner can change who meets any threshold below.
-- **`request_key` checks only that the caller is the contract account itself**
-  (`predecessor_account_id == current_account_id`). Any key on the contract
-  account passes that check: the function-call keys installed by a vote, and
-  also a full-access key. `dao.outlayer.near` currently carries a full-access
-  key, so its holder can obtain the shared master secret outside any enclave.
-- **The contract upgrades by key.** There is no upgrade method and no vote:
-  the account's full-access key deploys new code. `migrate` is `#[private]`
-  and runs right after a deploy.
-- **The DAO has one member**, so `approval_threshold` is 1 and every vote below
-  passes on that member's single call.
+- **Proposals.** A member calls `propose(action)`; the proposer's vote is
+  recorded with it. The proposal fixes its electorate (the members at that
+  moment) and its threshold. A vote counts only from an account in that
+  electorate that is still a member. Quorum makes it `Approved`.
+- **Delay.** An approved proposal runs from `approved_at + gov_delay` — 72 h on
+  mainnet, 0 on testnet; `SetDelay` changes it (at most 30 days). A member calls
+  `execute(proposal_id)` once the delay has passed.
+- **Expiry.** A proposal waits for votes at most 14 days, and an approved one is
+  executed within 7 days after its delay. Past that, any member closes it with
+  `expire(proposal_id)` — role replacements included, which the owner cannot
+  cancel. An approved proposal is never executed long after it was voted for.
+- **Storage.** `propose` is payable: the proposer pays the storage of the
+  proposal and of the members' votes to come; the excess comes back. A `Call`'s
+  `args` is at most 8 KB.
+- **Actions:** `Upgrade{target, code_hash, migrate}` (this contract or a
+  governed one), `Call{target, method, args, deposit, gas_tgas}` (a method on a
+  governed contract; never this contract, never the MPC contract),
+  `ApproveMeasurements`, `RevokeMeasurements`, `AddMember`, `RemoveMember`,
+  `SetDelay`, `SetOwner`.
+- **The owner** (`owner_id`) cannot propose, vote or execute. It cancels a
+  pending or approved proposal — except one that replaces a role (`SetOwner`, or a
+  `Call` to `set_owner` / `set_governance` / `set_operator` on a governed
+  contract), which members can only vote down — revokes keystore builds without a vote, keeps
+  the Intel collateral current, and deletes keystore registrations that have
+  been pending for more than a day.
+- **Only keystore keys reach the master.** `request_key`, `mark_vault_verified`
+  and the self-call of `ban_vault` require the call to come from this account
+  AND be signed with a key in `approved_keystores` — a key installed by a
+  registration vote. No other key on the account, a full-access key included,
+  passes.
 
-Every use of these keys is a public NEAR transaction. See
-[docs/NON_CUSTODIAL.md](../docs/NON_CUSTODIAL.md#governance-at-this-stage) for
-what moves to the DAO before significant funds go through.
+### Upgrades
+
+Code reaches a vote as a blob. A member calls `store_blob()` with the wasm as
+the raw input of the call (not JSON) and the storage deposit for its bytes; it
+returns the wasm's sha256 — the code hash NEAR reports for the account after the
+deploy, and the hash a reproducible build of the release gives. Members check
+that hash against the release before they vote. An `Upgrade` proposal names it.
+
+`execute` marks the proposal `Executed`, drops the blob (its deposit goes back
+to the member who stored it) and dispatches the deploy: on this account as one
+batch `deploy` [+ `migrate()`] + `gov_health()`, on another contract through its
+`upgrade()` / `upgrade_and_migrate()` with the wasm as raw input. There is no
+callback: `Executed` is the DAO's record, and whoever executed checks the
+target. The batch is atomic: a failing `migrate`, or a state the new code
+cannot read, leaves the old code; members then propose again. A `Call` cannot
+reach `upgrade` or `upgrade_and_migrate`: code changes only as an `Upgrade`
+naming a stored blob.
+
+Proposals are stored versioned (`VersionedGovProposal::V1`). A released
+variant is never changed or removed — a later version adds `V2` and keeps
+reading `V1` — so every version reads what earlier ones wrote, and the DAO
+upgrades itself whatever is open.
+
+Every version keeps `migrate()` (no arguments) and `gov_health()`: an earlier
+version calls them on a later one. `GovProposal` and `GovAction` are `V1`'s
+shape and do not change.
+
+`scripts/dao_upgrade.sh` stores the blob, proposes, votes and executes when the
+delay has passed.
 
 ## How a keystore obtains the master
 
@@ -96,11 +140,13 @@ transaction's logs.
 
 ## Voting
 
-`approval_threshold = dao_members / 2 + 1`, set at `new` and recomputed by
-`add_dao_member` and `remove_dao_member`.
+`approval_threshold = dao_members / 2 + 1`, set at `new` and recomputed when
+an `AddMember` or `RemoveMember` proposal executes.
 
-Registration and key-revocation proposals share one id counter and one
-`vote(proposal_id, approve)` entry point. A member votes once per proposal.
+Registration, key-revocation and governance proposals share one id counter and
+one `vote(proposal_id, approve)` entry point. Governance proposals follow the
+rules in [Governance](#governance); the rest of this section is about
+registration and revocation proposals. A member votes once per proposal.
 After each vote the contract counts only votes from accounts that are members
 at that moment:
 
@@ -139,38 +185,43 @@ A vault-version vote counts only current members: votes recorded by an account
 removed since are dropped on the next vote. `label` is at most 64 bytes,
 `audit_url` at most 256.
 
-`mark_vault_verified` and `ban_vault` trust every key on the contract account
-equally: any approved keystore, and the full-access key, can call them.
+`mark_vault_verified` and `ban_vault` accept any approved keystore key equally.
 
 ## Methods
 
 ### Init and migration
 
-- `new(owner_id, init_account_id, dao_members, mpc_contract_id)` — `dao_members`
-  must be non-empty.
+- `new(owner_id, init_account_id, dao_members, mpc_contract_id, gov_delay_sec?)`
+  — `dao_members` must be non-empty; `gov_delay_sec` defaults to 72 h on a
+  `.near` account and 0 elsewhere.
 - `migrate()` — `#[private]`; reads the previous state layout and adds the
-  `revoke_proposals` map. Run once after deploying a build whose state layout
-  changed; until then every method panics on deserialization.
+  governance state (no proposals, no blobs, the default delay). Run once after
+  deploying a build whose state layout changed; until then every method panics
+  on deserialization.
 
-### Owner only
+### Owner
 
-- `add_approved_measurements(measurements, clear_others?)` — each field is
-  exactly 96 hex characters; `clear_others: true` drops every other entry first.
-  Adding an existing entry is a no-op.
-- `remove_approved_measurements(measurements)`
-- `clear_all_approved_measurements()`
-- `add_dao_member(member)` / `remove_dao_member(member)` — both recompute the
-  threshold; `remove_dao_member` refuses when only one member is left.
+- `cancel(proposal_id)` — a pending or approved governance proposal, not one
+  that replaces the owner or the governance (`SetOwner`, a `Call` to `set_owner` /
+  `set_governance`).
+- `remove_approved_measurements(measurements)`, `clear_all_approved_measurements()`
+  — registered keystores keep their keys; revoke those with
+  `propose_revoke_keystore_keys`.
 - `update_collateral(collateral, index)` — `collateral` is the
   `QuoteCollateralV3` JSON as a string; `index` is the slot, `0` or `1` (at most
   two slots, one per platform FMSPC). A slot is replaced in place, and a new
-  slot may only be the next index. Updating one slot leaves the other.
-
-There is no method to transfer ownership.
+  slot may only be the next index. The contract stores it as given; a
+  registration verifies the quote against it.
+- `remove_stale_proposals(proposal_ids) -> u32` — deletes keystore registration
+  proposals still `Pending` more than 48 h after they were made (a keystore
+  stops waiting for its vote after 24 h); other ids are skipped.
 
 ### DAO members
 
-- `vote(proposal_id, approve)`
+- `propose(action) -> u64` (payable: the proposal's storage), `vote(proposal_id, approve)`,
+  `execute(proposal_id)`, `expire(proposal_id)`
+- `store_blob()` — raw wasm input, attach the storage deposit; returns its sha256
+- `remove_blob(hash)` — the member who stored it
 - `propose_revoke_keystore_keys(public_keys) -> u64`
 - the vault-registry methods above
 
@@ -179,7 +230,7 @@ There is no method to transfer ownership.
 - `submit_keystore_registration(public_key, tdx_quote_hex, app_id?) -> u64` —
   `app_id`, when given, is only logged.
 
-### Contract account (approved keystore keys)
+### Contract account, signed with an approved keystore key
 
 - `request_key(request) -> CKDResponse` — `request` is
   `{derivation_path, app_public_key, domain_id}`, forwarded to the MPC contract.
@@ -195,6 +246,8 @@ There is no method to transfer ownership.
 - `get_approved_keystores(from_index, limit)`
 - `get_approved_measurements()`, `is_measurements_approved(measurements)`
 - `get_dao_members()`, `get_owner()`, `get_config()`
+- `get_gov_proposal(proposal_id)`, `get_gov_proposals(from_index, limit)`,
+  `get_gov_delay_sec()`, `get_blob(hash)`
 - `get_collateral()` (slot 0), `get_collaterals()` (all slots)
 - `is_ceased()`
 - `is_vault_code_approved(hash)` — includes deprecated hashes
@@ -213,10 +266,20 @@ near contract call-function as-read-only dao.outlayer.near get_approved_measurem
 near contract call-function as-read-only dao.outlayer.near get_proposals \
   json-args '{"from_index": 1, "limit": 20}' network-config mainnet now
 
-# Vote on a registration (DAO member)
+# Vote on a registration or a governance proposal (DAO member)
 near contract call-function as-transaction dao.outlayer.testnet vote \
   json-args '{"proposal_id": 42, "approve": true}' \
   prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
+  sign-as <member> network-config testnet sign-with-keychain send
+
+# Propose a member (DAO member), then a member executes it after the delay
+near contract call-function as-transaction dao.outlayer.testnet propose \
+  json-args '{"action": {"AddMember": {"member": "<account>"}}}' \
+  prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
+  sign-as <member> network-config testnet sign-with-keychain send
+near contract call-function as-transaction dao.outlayer.testnet execute \
+  json-args '{"proposal_id": 43}' \
+  prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' \
   sign-as <member> network-config testnet sign-with-keychain send
 ```
 
@@ -231,14 +294,25 @@ with `near account list-keys dao.outlayer.near network-config mainnet now`.
 cargo test          # unit tests
 ```
 
-Both write `res/keystore_dao_contract.wasm`. Both run
-`cargo near build non-reproducible-wasm`, so the result is not a reproducible
-build: a deployed code hash cannot be re-derived from this source with these
-scripts.
+Both write `res/keystore_dao_contract.wasm` and are for development. The release
+build is reproducible, from a clean committed tree, in the image pinned in
+`Cargo.toml` (`[package.metadata.near.reproducible_build]`):
+
+```bash
+cargo near build reproducible-wasm   # target/near/keystore_dao_contract.wasm
+```
+
+Its sha256 is the `code_hash` a DAO upgrade proposal names; anyone rebuilding the
+commit gets the same.
 
 Production keystores are deployed with `scripts/deploy_tdx.sh keystore`, which
-approves the new build's measurements as the owner and votes on the resulting
-proposal; see [keystore-worker/README.md](../keystore-worker/README.md).
+proposes the new build's measurements to the DAO (or executes the open proposal
+once it is approved and its delay has passed) and votes on the keystore's
+registration; see [keystore-worker/README.md](../keystore-worker/README.md).
+A restarted keystore waits up to 24 h for its registration vote.
+
+The governance suites run against a separate set of contracts on testnet:
+[tests/dao/](../tests/dao/).
 
 ## License
 

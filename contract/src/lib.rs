@@ -12,6 +12,7 @@ use std::convert::TryInto;
 mod admin;
 mod events;
 mod execution;
+mod governance;
 mod migration;
 mod payment;
 mod projects;
@@ -689,6 +690,14 @@ pub struct Contract {
     // deleted only with nothing in flight — see `refunds::KeyFlight`. Beside
     // the ledger, not in it: borsh has no schema evolution.
     payment_key_flight: LookupMap<refunds::PaymentKeyId, refunds::KeyFlight>,
+
+    // Who upgrades this contract and replaces its owner, operator and payment token: the
+    // DAO. See `governance`.
+    governance_id: AccountId,
+
+    // NEAR fees counted as withdrawn — every fee collected before v14, then what the owner
+    // takes; the owner may take `total_fees_collected` minus this, never more.
+    platform_near_withdrawn: Balance,
 }
 
 #[near_bindgen]
@@ -696,6 +705,7 @@ impl Contract {
     #[init]
     pub fn new(owner_id: AccountId, operator_id: Option<AccountId>, event_standard: Option<String>,
         event_version: Option<String>) -> Self {
+        let governance_id = owner_id.clone();
         Self {
             owner_id: owner_id.clone(),
             operator_id: operator_id.unwrap_or(owner_id),
@@ -747,6 +757,10 @@ impl Contract {
             withdrawing: LookupSet::new(StorageKey::Withdrawing),
             closing_counts: LookupMap::new(StorageKey::ClosingCounts),
             payment_key_flight: LookupMap::new(StorageKey::PaymentKeyFlight),
+            // Governed by its owner until the owner hands governance to the DAO
+            // (`set_governance`).
+            governance_id,
+            platform_near_withdrawn: 0,
         }
     }
 

@@ -202,24 +202,38 @@ on the variants that answer its question and logs the others. Both methods
 panic when no yield is waiting (it timed out and was settled, or was already
 resumed).
 
-### Owner Functions
+### Governance Functions
 
-All `assert_owner`.
+Callable only by `governance_id` — the keystore DAO (`dao.outlayer.<net>`), so each
+call ran through a DAO vote and its delay (72 h on mainnet). A fresh deployment is
+governed by its owner until the owner calls `set_governance`.
 
 | Method | What it does |
 |---|---|
-| `set_owner(new_owner_id)` | Hand the owner role on |
-| `set_operator(new_operator_id)` | Change the operator account |
-| `set_paused(paused)` | Pause: refuses `request_execution`, `create_project`, `add_version`, `accept_project_transfer`, `store_wallet_policy`, `freeze_wallet`, `unfreeze_wallet`, `set_storage_refund_to`, `top_up_payment_key_with_near` |
-| `set_pricing(base_fee?, per_million_instructions_fee?, per_ms_fee?, per_compile_ms_fee?, base_fee_usd?, per_million_instructions_fee_usd?, per_sec_fee_usd?, per_compile_ms_fee_usd?)` | NEAR prices (yoctoNEAR) and HTTPS API prices (stablecoin minimal units); each `U128` string, an omitted one is unchanged |
+| `set_owner(new_owner_id)` | Replace the owner (the ops role) |
+| `set_operator(new_operator_id)` | Replace the operator: it resolves executions and answers payment-key yields |
 | `set_payment_token_contract(token_contract?)` | The stablecoin `ft_on_transfer` accepts and earnings are paid in; `null` clears it. The contract account must be registered on the token (`storage_deposit`) |
+| `set_governance(governance_id)` | Hand governance to another account |
+| `upgrade()` / `upgrade_and_migrate()` | Deploy the wasm given as the raw input of the call (not JSON) on this account: one atomic batch, deploy [+ `migrate()`] + `gov_health()`; a failing step leaves the old code. Every version keeps these, `migrate()` without arguments and `gov_health()` |
+| `gov_transfer(token?, amount, receiver_id)` | Move any balance of the contract — NEAR (`token: null`) or a fungible token: the rescue for money stuck by a bug |
+
+### Owner Functions
+
+All `assert_owner`. None of them changes code, roles or the payment token.
+
+| Method | What it does |
+|---|---|
+| `set_paused(paused)` | Pause: refuses `request_execution`, `create_project`, `add_version`, `accept_project_transfer`, `store_wallet_policy`, `unfreeze_wallet`, `set_storage_refund_to`, `top_up_payment_key_with_near`. `freeze_wallet` works while paused |
+| `set_pricing(base_fee?, per_million_instructions_fee?, per_ms_fee?, per_compile_ms_fee?, base_fee_usd?, per_million_instructions_fee_usd?, per_sec_fee_usd?, per_compile_ms_fee_usd?)` | NEAR prices (yoctoNEAR) and HTTPS API prices (stablecoin minimal units); each `U128` string, an omitted one is unchanged |
 | `set_subscription_plans(plans)` | Replace the plan list: `[{index, name, price_usd, active}]`, at most 16, unique indexes, each named and priced; an index already in the list keeps its name |
 | `set_project_pricing(project_id, pricing)` | Price an existing project: `{author_account_id, operations: [{operation, price_usd, developer_share_bp}]}`, 1–32 unique operations, share ≤ 10000 bp |
 | `remove_project_pricing(project_id)` | Unprice a project |
 | `set_event_metadata(standard?, version?)` | The NEP-297 `standard` / `version` events carry |
 | `emergency_cancel_execution(request_id)` | Cancel one pending request; refunds the whole NEAR deposit and the stablecoin |
-| `cancel_pending_requests(request_ids)` → `u64` | Cancel a list; refunds the NEAR deposit only — the request's `attached_usd` is not returned to the sender's stablecoin balance on this path |
+| `cancel_pending_requests(request_ids)` → `u64` | Cancel a list; refunds the NEAR deposit and the stablecoin |
 | `clear_all_pending_requests(limit?)` → `u64` | Cancel up to `limit` (default 100) pending requests from id 0; refunds NEAR and stablecoin |
+| `withdraw_platform_near(amount, receiver_id)` (1 yocto) | NEAR fees the contract collected: at most `total_fees_collected` minus what was withdrawn; a failed transfer makes the amount available again |
+| `withdraw_platform_token(amount, receiver_id)` (1 yocto) | Stablecoin from the contract's balance, **without a bound**: the balance holds the platform's revenue together with users' unspent payment-key balances, deposited balances and developer earnings, and the contract cannot tell them apart (payment keys are spent off chain). The owner key is trusted with it |
 
 ```bash
 near call outlayer.testnet set_pricing '{"base_fee": "1000000000000000000000"}' --accountId <owner>
@@ -251,7 +265,9 @@ near call outlayer.testnet set_pricing '{"base_fee": "1000000000000000000000"}' 
 | `get_payment_key_refund_ledger(owner, nonce)` | `{user_funded, refunded, refundable_cap, closing_since?, claimable_at?}` — what the chain saw deposited on the key since the ledger exists, what it paid back, and the close clock; `null` for a pre-ledger key never topped up or closed since |
 | `get_closing_payment_key_count(owner)` | How many of the owner's keys are closing (at most 20) |
 | `get_payment_key_flight(owner, nonce)` | `{top_ups_in_flight, last_top_up_height, close_pending, claim_open, last_claim_at, next_claim_at?}` — top-up yields not yet answered (the key is closed or deleted only at zero), a close or delete not yet answered (the key takes no top-up until it is), and the claim in flight / cooldown; `null` when nothing is |
-| `get_storage_version()` | The state layout the code expects (`"13"`) |
+| `get_storage_version()` | The state layout the code expects (`"14"`) |
+| `get_governance()` | The account that governs this contract |
+| `get_platform_near()` | `[collected, withdrawn, available]` NEAR fees, yoctoNEAR |
 
 ```bash
 near view outlayer.testnet get_request '{"request_id": 123}'
@@ -455,7 +471,9 @@ starts without one, at version 1. The `WalletPolicyDeleted` event carries
 #### `freeze_wallet` / `unfreeze_wallet`
 
 Controller only, no wallet signature: the emergency stop for a compromised
-agent key. Emit `WalletFrozenChanged { wallet_pubkey, owner, frozen }`.
+agent key. `freeze_wallet` works while the contract is paused — a pause never
+takes an owner's emergency stop away; `unfreeze_wallet` waits for the unpause.
+Emit `WalletFrozenChanged { wallet_pubkey, owner, frozen }`.
 
 #### Views
 
@@ -811,8 +829,14 @@ timeout).
 ### Build
 
 ```bash
-./build.sh   # cargo near build non-reproducible-wasm → res/local/outlayer_contract.wasm
+./build.sh                           # development: res/local/outlayer_contract.wasm
+cargo near build reproducible-wasm   # release: target/near/outlayer_contract.wasm
 ```
+
+The release build runs from a clean committed tree in the image pinned in
+`Cargo.toml` (`[package.metadata.near.reproducible_build]`); its sha256 is the
+`code_hash` a DAO upgrade proposal names, and anyone rebuilding the commit gets
+the same.
 
 ### Test
 
@@ -823,29 +847,32 @@ cargo test
 ### Initialize
 
 `new(owner_id, operator_id?, event_standard?, event_version?)`; the operator
-defaults to the owner.
+defaults to the owner, and so does governance until the owner calls
+`set_governance`.
 
 ```bash
 near contract deploy <contract-account> use-file res/local/outlayer_contract.wasm with-init-call new json-args '{"owner_id":"<owner>","operator_id":"<operator>"}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' network-config testnet sign-with-keychain send
+near contract call-function as-transaction <contract-account> set_governance json-args '{"governance_id":"<dao>"}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' sign-as <owner> network-config testnet sign-with-keychain send
 ```
 
 ### Upgrade
 
-The contract is upgraded by redeploying it with the contract account's
-full-access key, without a vote or a delay; see
-[Governance at this stage](../docs/NON_CUSTODIAL.md#governance-at-this-stage).
-
-`get_storage_version` answers the state layout the code expects. A deploy that
-changes the layout calls `migrate` (private: signed by the contract account) in
-the same transaction; `migrate` reads the previous layout (`"12"`) and writes
-`"13"`, and fails on any other state. A deploy that keeps the layout calls
-nothing.
+Through the DAO: the wasm is stored in the DAO as a blob, members vote on its
+sha256, and after the delay a member executes the proposal, which calls
+`upgrade()` or `upgrade_and_migrate()` here with the blob.
 
 ```bash
-near contract deploy outlayer.testnet use-file res/local/outlayer_contract.wasm without-init-call network-config testnet sign-with-keychain send
-
-near contract deploy outlayer.near use-file res/local/outlayer_contract.wasm with-init-call migrate json-args '{}' prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' network-config mainnet sign-with-keychain send
+scripts/dao_upgrade.sh --network testnet --target main --wasm res/local/outlayer_contract.wasm [--migrate]
 ```
+
+`get_storage_version` answers the state layout the code expects. A release
+that changes the layout is upgraded with `upgrade_and_migrate`; its `migrate`
+reads the previous layout and fails on any other state, which reverts the
+whole upgrade. A release that keeps the layout uses `upgrade`.
+
+The v13 → v14 migration adds governance and is the last deploy made with the
+contract account's full-access key:
+`migrate(governance_id)` in the same transaction as the deploy.
 
 ## License
 

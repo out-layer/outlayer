@@ -10,27 +10,26 @@ results from.
 | mainnet | `worker.outlayer.near` | `owner.outlayer.near` | `init-worker.outlayer.near` | `outlayer.near` |
 | testnet | `worker.outlayer.testnet` | `owner.outlayer.testnet` | `init-worker.outlayer.testnet` | `outlayer.testnet` |
 
-`get_init_worker_account` returns the init account; the contract has no view for its owner
-or main-contract id.
+Governance is the keystore DAO (`dao.outlayer.<net>`). `get_init_worker_account`,
+`get_owner` and `get_governance` return the roles.
 
 Source: `src/lib.rs` (contract), `src/collateral.rs` (Intel collateral parsing, taken from
 the NEAR MPC node; see `NOTICE`), `src/migration.rs` (state migration). The `attestation/`
 and `mpc-primitives/` directories are not part of the contract build.
 
-## Governance at this stage
+## Roles
 
-- **One owner key, no vote.** Approving measurements, replacing collateral, removing worker
-  keys and transferring ownership are owner-only calls.
-- **The contract upgrades by key.** There is no upgrade method: the account's full-access
-  key deploys new code, and `migrate` is `#[private]`.
-- **Any key on the account counts as the operator.** The main contract authorizes
-  `resolve_execution` and the other worker methods by `predecessor == operator_id`, and the
-  coordinator and keystore admit a worker session for any access key on this account. A
-  full-access key on the account therefore reaches everything a TDX-registered worker key
-  reaches.
-
-Every use of these keys is a public NEAR transaction. See
-[docs/NON_CUSTODIAL.md](../docs/NON_CUSTODIAL.md#governance-at-this-stage).
+- **Governance (the DAO, by vote and delay):** approves worker builds
+  (`add_approved_measurements`, through a DAO `Call` proposal), replaces the owner
+  (`set_owner`) and itself (`set_governance`), and upgrades this contract
+  (`upgrade` / `upgrade_and_migrate`). An approved build registers keys that open keystore
+  sessions, so approving one is never an owner's decision.
+- **Owner (ops):** revokes builds (`remove_approved_measurements`,
+  `clear_all_approved_measurements`), removes worker keys, keeps the Intel collateral
+  current. Governance can revoke and remove keys too.
+- **The worker keys** on this account are the operator the main contract accepts results
+  from (`predecessor == operator_id`). The coordinator and keystore admit a worker session
+  only for a function-call key on this account.
 
 ## How a worker registers
 
@@ -59,7 +58,7 @@ The contract stores no record of registered keys or their quotes: the access-key
 the account is the registry, and each registration's quote and measurements are in its
 transaction (the measurements also in its logs).
 
-A key stays valid until the owner removes it. Keys of decommissioned workers are retired
+A key stays valid until the owner or governance removes it. Keys of decommissioned workers are retired
 with `scripts/revoke_old_worker_keys.sh <network>`: it keeps the keys the coordinator has
 recorded for running workers (each confirmed on chain) and prints, or with `--send`
 sends, `remove_worker_keys` for the rest.
@@ -68,21 +67,32 @@ sends, `remove_worker_keys` for the rest.
 
 ### Init and migration
 
-- `new(owner_id, init_worker_account, outlayer_contract_id)`
-- `migrate()` — `#[private]`; run once after deploying a build whose state layout changed.
+- `new(owner_id, init_worker_account, outlayer_contract_id, governance_id)`
+- `migrate(governance_id)` — `#[private]`; adds governance to the previous state layout.
+  Every version deployed through governance after this one has a `migrate()` without
+  arguments.
 
-### Owner only
+### Governance
 
 - `add_approved_measurements(measurements, clear_others?)` — `measurements` is
   `{mrtd, rtmr0, rtmr1, rtmr2, rtmr3}`, each exactly 96 hex characters. `clear_others: true`
   drops every other entry first. Adding an existing entry is a no-op.
-- `remove_approved_measurements(measurements)`
-- `clear_all_approved_measurements()`
-- `update_collateral(collateral, index)` — see [Collateral](#collateral).
+- `set_owner(new_owner_id)`, `set_governance(governance_id)` — the same names and arguments as
+  on the main contract
+- `upgrade()` / `upgrade_and_migrate()` — the wasm as the raw input of the call (not JSON).
+  One atomic batch on this account: deploy [+ `migrate()`] + `gov_health()`; a failing step
+  leaves the old code. Every version keeps these three methods.
+
+### Owner or governance
+
+- `remove_approved_measurements(measurements)`, `clear_all_approved_measurements()`
 - `remove_worker_keys(public_keys)` — schedules one `DeleteKey` per key, each independent,
-  so a missing key does not stop the others. It deletes whatever key it is given; nothing
-  stops it from naming the account's full-access key.
-- `transfer_ownership(new_owner)`
+  so a missing key does not stop the others. The account holds only workers' function-call
+  keys, so the worst a removal does is stop a worker.
+
+### Owner
+
+- `update_collateral(collateral, index)` — see [Collateral](#collateral).
 
 ### Init worker account
 
@@ -92,7 +102,7 @@ sends, `remove_worker_keys` for the rest.
 
 - `get_approved_measurements()`, `is_measurements_approved(measurements)`
 - `get_collateral()` (slot 0), `get_collaterals()` (all slots)
-- `get_init_worker_account()`
+- `get_init_worker_account()`, `get_owner()`, `get_governance()`, `gov_health()`
 
 ```bash
 near contract call-function as-read-only worker.outlayer.near get_approved_measurements \
@@ -108,9 +118,10 @@ contract holds it as `QuoteCollateralV3` JSON, in at most two slots, one per pla
 a registration is checked against the slot whose FMSPC matches the quote. The keystore DAO
 contract keeps collateral the same way.
 
-- `update_collateral(collateral, index)` takes the JSON **as a string** and a slot index
-  (`0` or `1`). A slot is replaced in place, a new slot may only be the next index, and the
-  other slot is untouched.
+- `update_collateral(collateral, index)` (owner) takes the JSON **as a string** and a slot
+  index (`0` or `1`). A slot is replaced in place, a new slot may only be the next index, and
+  the other slot is untouched. The contract stores it as given; a registration verifies the
+  quote against it.
 - The TCB info and QE identity each carry an issue date and a next-update date, and
   `dcap-qvl` refuses a quote verified outside that window. Collateral must be replaced before
   its next-update date, or every registration on that platform fails.
@@ -137,9 +148,14 @@ From an operator machine:
 ```
 
 It deploys the CVM on the node from a pinned, attested release image, reads the new
-measurements, approves them here with the owner key (the key stays on the operator machine,
-never on the node), and waits for the worker to register itself. Measurements are approved
-once per (network, version). The node-side files are under `deploy/self-hosted-tdx`.
+measurements and proposes them to the DAO as a `Call` to `add_approved_measurements` (or
+executes the open proposal once it is approved and its delay has passed; `GOV_MEMBER` signs),
+and waits for the worker to register itself. When the proposal still waits for votes or for
+the delay, it prints the remaining steps and stops; a worker that gave up waiting is
+restarted after the execution. Measurements are approved once per (network, version). The
+node-side files are under `deploy/self-hosted-tdx`.
+
+Upgrading this contract: `scripts/dao_upgrade.sh --target worker --wasm <file>`.
 
 ## Build and test
 
@@ -149,8 +165,19 @@ once per (network, version). The node-side files are under `deploy/self-hosted-t
 cargo test
 ```
 
-Both write `res/register_contract.wasm`. Both run `cargo near build non-reproducible-wasm`,
-so a deployed code hash cannot be re-derived from this source with these scripts.
+Both write `res/register_contract.wasm` and are for development. The release build is
+reproducible, from a clean committed tree, in the image pinned in `Cargo.toml`
+(`[package.metadata.near.reproducible_build]`):
+
+```bash
+cargo near build reproducible-wasm   # target/near/register_contract.wasm
+```
+
+Its sha256 is the `code_hash` a DAO upgrade proposal names.
+
+`cargo test` needs near-sdk's `unit-testing` feature as a dev-dependency, which the committed
+`Cargo.lock` does not resolve; run the tests on a copy with that dev-dependency and the DAO's
+lock file.
 
 ## License
 

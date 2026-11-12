@@ -14,21 +14,26 @@
 //!   which project from whom. (Run.)
 //! * v11 → v12: add `policy_meta` — a wallet policy's version and lock.
 //!   (Run.)
-//! * **v12 → v13 (current): add `payment_key_refund_ledger`, `withdrawing`,
-//!   `closing_counts` and `payment_key_flight` — what each payment key's
-//!   owner deposited on chain and had back, the accounts with a balance
-//!   withdrawal in flight, how many keys each owner has closing, and what is
-//!   in flight on each key.**
+//! * v12 → v13: add `payment_key_refund_ledger`, `withdrawing`,
+//!   `closing_counts` and `payment_key_flight`. (Run.)
+//! * **v13 → v14 (current): add `governance_id` — the DAO that upgrades this
+//!   contract and replaces its owner, operator and payment token — and
+//!   `platform_near_withdrawn`, the NEAR fees counted as taken (every fee
+//!   collected before the release).**
 //!
-//! **`ContractV12` mirrors what is DEPLOYED, not this working tree minus
+//! **`ContractV13` mirrors what is DEPLOYED, not this working tree minus
 //! the new fields.** Check it against `git show HEAD:` before touching
 //! it. The two are the same only when the previous migration is already
 //! committed, and it is the DEPLOYED shape that `state_read` will be
 //! handed.
 //!
-//! Versions ≤ v12 are historical. Production deployments must be on v12
-//! before calling this migration; an earlier-version deployment must
-//! first run the prior migrations from an earlier code revision.
+//! Versions ≤ v13 are historical. Production deployments must be on v13
+//! before calling this migration.
+//!
+//! This migration takes `governance_id` and runs with the full-access key
+//! that deploys v14 — the last deploy that key makes. Every version deployed
+//! through governance after it has a `migrate()` without arguments: the
+//! upgrade batch calls it that way (see `governance`).
 //!
 //! Deploy and `migrate` go in ONE transaction (a `DeployContract` action
 //! followed by a `FunctionCall` of `migrate`): between the two, every call
@@ -38,10 +43,10 @@ use crate::*;
 use near_sdk::borsh::BorshDeserialize;
 use near_sdk::collections::{LookupMap, LookupSet, UnorderedMap, UnorderedSet};
 
-/// Contract state as DEPLOYED at v12 — the last shape any chain has held.
+/// Contract state as DEPLOYED at v13 — the last shape any chain has held.
 ///
-/// Mirrors `Contract` as it was before the refund ledger existed; every field
-/// carries over verbatim. Check it against `git show HEAD:contract/src/lib.rs`,
+/// Mirrors `Contract` as it was before governance; every field carries over
+/// verbatim. Check it against `git show HEAD:contract/src/lib.rs`,
 /// not against the struct in this working tree: the two differ by exactly the
 /// fields this migration adds.
 ///
@@ -52,7 +57,7 @@ use near_sdk::collections::{LookupMap, LookupSet, UnorderedMap, UnorderedSet};
 #[cfg_attr(test, derive(near_sdk::borsh::BorshSerialize))]
 #[borsh(crate = "near_sdk::borsh")]
 #[allow(dead_code)] // fields needed for borsh deserialisation only
-pub struct ContractV12 {
+pub struct ContractV13 {
     owner_id: AccountId,
     operator_id: AccountId,
     paused: bool,
@@ -105,69 +110,74 @@ pub struct ContractV12 {
     project_transfer_acceptances: LookupMap<TransferAcceptance, Balance>,
 
     policy_meta: LookupMap<String, wallet::PolicyMeta>,
+
+    payment_key_refund_ledger: LookupMap<refunds::PaymentKeyId, refunds::RefundLedger>,
+    withdrawing: LookupSet<AccountId>,
+    closing_counts: LookupMap<AccountId, u32>,
+    payment_key_flight: LookupMap<refunds::PaymentKeyId, refunds::KeyFlight>,
 }
 
 #[near_bindgen]
 impl Contract {
-    /// Migrate from v12 to v13: add the payment-key refund ledger, the
-    /// withdrawal in-flight set, the per-owner closing count and the per-key
-    /// in-flight record.
-    ///
-    /// All four start EMPTY, and that is the rule, not a shortcut: a key
-    /// that existed before the ledger has `user_funded = 0`, so only deposits
-    /// made after this release are refundable (no backfill).
+    /// Migrate from v13 to v14: add `governance_id` and `platform_near_withdrawn`, set to every
+    /// fee collected so far. The owner's bounded withdrawal covers only fees collected from
+    /// here on; whether earlier fees already left the account cannot be read from the state,
+    /// and anything of them still here moves only through governance (`gov_transfer`).
     #[private]
     #[init(ignore_state)]
-    pub fn migrate() -> Self {
-        let v12: ContractV12 = env::state_read().expect("failed to read v12 state");
+    pub fn migrate(governance_id: AccountId) -> Self {
+        let v13: ContractV13 = env::state_read().expect("failed to read v13 state");
 
         log!(
-            "Migrating contract v12 -> v13 (payment_key_refund_ledger, withdrawing, closing_counts, payment_key_flight): owner={}, total_executions={}",
-            v12.owner_id,
-            v12.total_executions
+            "Migrating contract v13 -> v14 (governance_id={}, platform_near_withdrawn): owner={}, total_executions={}",
+            governance_id,
+            v13.owner_id,
+            v13.total_executions
         );
 
         Self {
-            owner_id: v12.owner_id,
-            operator_id: v12.operator_id,
-            paused: v12.paused,
-            event_standard: v12.event_standard,
-            event_version: v12.event_version,
-            base_fee: v12.base_fee,
-            per_million_instructions_fee: v12.per_million_instructions_fee,
-            per_ms_fee: v12.per_ms_fee,
-            per_compile_ms_fee: v12.per_compile_ms_fee,
-            base_fee_usd: v12.base_fee_usd,
-            per_million_instructions_fee_usd: v12.per_million_instructions_fee_usd,
-            per_sec_fee_usd: v12.per_sec_fee_usd,
-            per_compile_ms_fee_usd: v12.per_compile_ms_fee_usd,
-            payment_token_contract: v12.payment_token_contract,
-            next_request_id: v12.next_request_id,
-            pending_requests: v12.pending_requests,
-            total_executions: v12.total_executions,
-            total_fees_collected: v12.total_fees_collected,
-            secrets_storage: v12.secrets_storage,
-            user_secrets_index: v12.user_secrets_index,
-            projects: v12.projects,
-            project_versions: v12.project_versions,
-            user_projects_index: v12.user_projects_index,
-            next_project_id: v12.next_project_id,
-            developer_earnings: v12.developer_earnings,
-            user_stablecoin_balances: v12.user_stablecoin_balances,
-            wallet_policies: v12.wallet_policies,
-            wallet_owner_index: v12.wallet_owner_index,
-            secret_vault_bindings: v12.secret_vault_bindings,
-            subscription_plans: v12.subscription_plans,
-            project_pricing: v12.project_pricing,
-            payment_key_nonce_floors: v12.payment_key_nonce_floors,
-            storage_refund_to: v12.storage_refund_to,
-            project_transfer_acceptances: v12.project_transfer_acceptances,
-            policy_meta: v12.policy_meta,
-            // ----- v13 -----
-            payment_key_refund_ledger: LookupMap::new(StorageKey::PaymentKeyRefundLedger),
-            withdrawing: LookupSet::new(StorageKey::Withdrawing),
-            closing_counts: LookupMap::new(StorageKey::ClosingCounts),
-            payment_key_flight: LookupMap::new(StorageKey::PaymentKeyFlight),
+            owner_id: v13.owner_id,
+            operator_id: v13.operator_id,
+            paused: v13.paused,
+            event_standard: v13.event_standard,
+            event_version: v13.event_version,
+            base_fee: v13.base_fee,
+            per_million_instructions_fee: v13.per_million_instructions_fee,
+            per_ms_fee: v13.per_ms_fee,
+            per_compile_ms_fee: v13.per_compile_ms_fee,
+            base_fee_usd: v13.base_fee_usd,
+            per_million_instructions_fee_usd: v13.per_million_instructions_fee_usd,
+            per_sec_fee_usd: v13.per_sec_fee_usd,
+            per_compile_ms_fee_usd: v13.per_compile_ms_fee_usd,
+            payment_token_contract: v13.payment_token_contract,
+            next_request_id: v13.next_request_id,
+            pending_requests: v13.pending_requests,
+            total_executions: v13.total_executions,
+            total_fees_collected: v13.total_fees_collected,
+            secrets_storage: v13.secrets_storage,
+            user_secrets_index: v13.user_secrets_index,
+            projects: v13.projects,
+            project_versions: v13.project_versions,
+            user_projects_index: v13.user_projects_index,
+            next_project_id: v13.next_project_id,
+            developer_earnings: v13.developer_earnings,
+            user_stablecoin_balances: v13.user_stablecoin_balances,
+            wallet_policies: v13.wallet_policies,
+            wallet_owner_index: v13.wallet_owner_index,
+            secret_vault_bindings: v13.secret_vault_bindings,
+            subscription_plans: v13.subscription_plans,
+            project_pricing: v13.project_pricing,
+            payment_key_nonce_floors: v13.payment_key_nonce_floors,
+            storage_refund_to: v13.storage_refund_to,
+            project_transfer_acceptances: v13.project_transfer_acceptances,
+            policy_meta: v13.policy_meta,
+            payment_key_refund_ledger: v13.payment_key_refund_ledger,
+            withdrawing: v13.withdrawing,
+            closing_counts: v13.closing_counts,
+            payment_key_flight: v13.payment_key_flight,
+            // ----- v14 -----
+            governance_id,
+            platform_near_withdrawn: v13.total_fees_collected,
         }
     }
 
@@ -175,7 +185,7 @@ impl Contract {
     /// `migrate()` advances the layout. Off-chain tooling reads this to
     /// decide whether a deploy needs a migration call.
     pub fn get_storage_version(&self) -> String {
-        "13".to_string()
+        "14".to_string()
     }
 }
 
@@ -195,45 +205,29 @@ mod tests {
         b
     }
 
-    fn store_key(c: &mut Contract, b: &mut VMContextBuilder, nonce: u32) {
-        testing_env!(b.attached_deposit(NearToken::from_near(1)).build());
-        c.store_secrets(
-            Acc::System(SystemSecretType::PaymentKey),
-            nonce.to_string(),
-            "encrypted".to_string(),
-            types::AccessCondition::AllowAll,
-            None,
-        );
+    fn dao() -> AccountId {
+        "dao.outlayer.testnet".parse().unwrap()
     }
 
-    /// A v12 chain: the contract as it stands, payment keys, a wallet policy
-    /// with a beneficiary, a project and a stablecoin balance in storage, no
-    /// refund ledger.
-    fn v12_state(nonces: &[u32], policy_key: &str) -> VMContextBuilder {
+    /// A v13 chain: payment keys with a refund ledger, a balance withdrawal in
+    /// flight, a wallet policy, a project, a stablecoin balance and fees.
+    fn v13_state() -> VMContextBuilder {
         let mut b = ctx(accounts(1));
         testing_env!(b.build());
-        let mut c = Contract::new(accounts(0), Some(accounts(0)), None, None);
-        for &n in nonces {
-            store_key(&mut c, &mut b, n);
-            // A v12 key has no ledger entry: the map did not exist.
-            c.payment_key_refund_ledger
-                .remove(&refunds::PaymentKeyId { owner: accounts(1), nonce: n });
+        let mut c = Contract::new(accounts(0), Some(accounts(3)), None, None);
+        for n in [1u32, 2] {
+            testing_env!(b.attached_deposit(NearToken::from_near(1)).build());
+            c.store_secrets(
+                Acc::System(SystemSecretType::PaymentKey),
+                n.to_string(),
+                "encrypted".to_string(),
+                types::AccessCondition::AllowAll,
+                None,
+            );
         }
-        c.wallet_policies.insert(
-            &policy_key.to_string(),
-            &wallet::WalletPolicyEntry {
-                owner: accounts(1),
-                encrypted_data: "enc".to_string(),
-                frozen: false,
-                updated_at: 0,
-                storage_deposit: 7,
-            },
-        );
-        c.storage_refund_to.insert(
-            &wallet::StorageItem::WalletPolicy { wallet_pubkey: policy_key.to_string() },
-            &accounts(2),
-        );
         c.user_stablecoin_balances.insert(&accounts(1), &250_000);
+        c.withdrawing.insert(&accounts(2));
+        c.total_fees_collected = 3_580;
         testing_env!(b.attached_deposit(NearToken::from_near(1)).build());
         c.create_project(
             "app".to_string(),
@@ -243,7 +237,7 @@ mod tests {
                 build_target: None,
             },
         );
-        let v12 = ContractV12 {
+        let v13 = ContractV13 {
             owner_id: c.owner_id,
             operator_id: c.operator_id,
             paused: c.paused,
@@ -279,99 +273,90 @@ mod tests {
             storage_refund_to: c.storage_refund_to,
             project_transfer_acceptances: c.project_transfer_acceptances,
             policy_meta: c.policy_meta,
+            payment_key_refund_ledger: c.payment_key_refund_ledger,
+            withdrawing: c.withdrawing,
+            closing_counts: c.closing_counts,
+            payment_key_flight: c.payment_key_flight,
         };
-        env::state_write(&v12);
+        env::state_write(&v13);
         b
     }
 
-    /// Everything a v12 chain held reads on as before; a pre-ledger key has
-    /// nothing refundable, and a pre-ledger balance can be withdrawn.
     #[test]
-    fn a_v12_state_migrates_with_an_empty_refund_ledger() {
-        let key = format!("ed25519:{}", "ab".repeat(32));
-        let _b = v12_state(&[1, 2, 3], &key);
+    fn a_v13_state_migrates_under_governance() {
+        let _b = v13_state();
         testing_env!(ctx(accounts(0)).build());
-        let mut c = Contract::migrate();
+        let mut c = Contract::migrate(dao());
 
-        assert_eq!(c.get_storage_version(), "13");
-        assert_eq!(c.owner_id, accounts(0));
-        for n in 1..=3 {
+        assert_eq!(c.get_storage_version(), "14");
+        assert_eq!(c.get_config(), (accounts(0), accounts(3)));
+        assert_eq!(c.get_governance(), dao());
+        assert_eq!(
+            c.get_platform_near(),
+            (U128(3_580), U128(3_580), U128(0)),
+            "fees collected before the release are not the owner's to withdraw"
+        );
+        for n in 1..=2 {
             assert!(
                 c.get_secrets(Acc::System(SystemSecretType::PaymentKey), n.to_string(), accounts(1))
                     .is_some(),
                 "key {n} survives the migration"
             );
-            assert!(
-                c.get_payment_key_refund_ledger(accounts(1), n).is_none(),
-                "a pre-ledger key has no ledger entry: nothing of it is refundable"
-            );
+            assert!(c.get_payment_key_refund_ledger(accounts(1), n).is_some(), "its ledger too");
         }
-        assert_eq!(c.get_payment_key_nonce_floor(accounts(1)), 3, "the v12 floors carry over");
-        assert_eq!(c.get_closing_payment_key_count(accounts(1)), 0);
-        assert!(!c.is_withdrawing(accounts(1)));
-        let view = c.get_wallet_policy(key.clone()).expect("the policy survives");
-        assert_eq!(view.owner, accounts(1));
-        assert_eq!(view.storage_deposit.0, 7);
-        assert_eq!(view.storage_refund_to, Some(accounts(2)), "the v12 beneficiaries carry over");
-        assert_eq!((view.version, view.locked), (0, false));
-        let project_id = format!("{}/app", accounts(1));
-        assert!(c.get_project(project_id).is_some(), "the project survives");
-        assert_eq!(
-            c.get_user_stablecoin_balance(accounts(1)).0,
-            250_000,
-            "the v12 stablecoin balance carries over"
-        );
+        assert!(c.is_withdrawing(accounts(2)), "an in-flight withdrawal carries over");
+        assert_eq!(c.get_user_stablecoin_balance(accounts(1)).0, 250_000);
+        assert!(c.get_project(format!("{}/app", accounts(1))).is_some());
 
-        // The new maps work on the migrated state: a pre-ledger key can be
-        // closed (its ledger entry appears at zero), and the balance can be
-        // withdrawn once a token is configured.
-        testing_env!(ctx(accounts(0)).build());
-        c.on_close_payment_key_response(accounts(1), 2, Ok(payment::DeletePaymentKeyResult::Success));
-        let ledger = c.get_payment_key_refund_ledger(accounts(1), 2).expect("closing creates the entry");
-        assert_eq!((ledger.user_funded.0, ledger.refunded.0, ledger.refundable_cap.0), (0, 0, 0));
-        assert!(ledger.closing_since.is_some());
-        assert_eq!(c.get_closing_payment_key_count(accounts(1)), 1);
-
-        testing_env!(ctx(accounts(0)).build());
-        c.set_payment_token_contract(Some("usdc.test".parse().unwrap()));
-        testing_env!(ctx(accounts(1)).attached_deposit(NearToken::from_yoctonear(1)).build());
-        c.withdraw_balance(U128(100_000));
-        assert_eq!(c.get_user_stablecoin_balance(accounts(1)).0, 150_000);
-        assert!(c.is_withdrawing(accounts(1)));
+        // The DAO governs; the owner no longer replaces the operator.
+        testing_env!(ctx(dao()).build());
+        c.set_operator(accounts(4));
+        assert_eq!(c.get_config(), (accounts(0), accounts(4)));
     }
 
-    /// `ContractV12` is HEAD's `Contract`, field for field: a drift here is
+    #[test]
+    #[should_panic(expected = "Only governance")]
+    fn after_migration_the_owner_cannot_replace_the_operator() {
+        let _b = v13_state();
+        testing_env!(ctx(accounts(0)).build());
+        let mut c = Contract::migrate(dao());
+        c.set_operator(accounts(4));
+    }
+
+    /// `ContractV13` is HEAD's `Contract`, field for field: a drift here is
     /// a migration that reads the deployed bytes into the wrong shape.
     #[test]
-    fn contract_v12_mirrors_the_deployed_shape() {
-        let _b = v12_state(&[1], &format!("ed25519:{}", "cd".repeat(32)));
+    fn contract_v13_mirrors_the_deployed_shape() {
+        let _b = v13_state();
         let bytes = env::storage_read(b"STATE").expect("state written");
         assert!(
             Contract::try_from_slice(&bytes).is_err(),
-            "a v12 STATE must not read as the v13 shape"
+            "a v13 STATE must not read as the v14 shape"
         );
-        let v12 = ContractV12::try_from_slice(&bytes).expect("the v12 STATE reads as ContractV12");
-        assert_eq!(v12.owner_id, accounts(0));
+        let v13 = ContractV13::try_from_slice(&bytes).expect("the v13 STATE reads as ContractV13");
+        assert_eq!(v13.owner_id, accounts(0));
     }
 
-    /// The deployed state itself, read through `ContractV12`. Runs when
-    /// `V12_STATE_FILE` names a file holding the raw `STATE` value of a live
+    /// The deployed state itself, read through `ContractV13`. Runs when
+    /// `V13_STATE_FILE` names a file holding the raw `STATE` value of a live
     /// contract (a `view_state` with prefix `STATE`); skipped otherwise.
     #[test]
-    fn a_deployed_state_reads_as_v12_and_migrates() {
-        let Ok(path) = std::env::var("V12_STATE_FILE") else { return };
-        let bytes = std::fs::read(&path).expect("read V12_STATE_FILE");
+    fn a_deployed_state_reads_as_v13_and_migrates() {
+        let Ok(path) = std::env::var("V13_STATE_FILE") else { return };
+        let bytes = std::fs::read(&path).expect("read V13_STATE_FILE");
         testing_env!(ctx(accounts(0)).build());
         assert!(
             Contract::try_from_slice(&bytes).is_err(),
-            "the deployed STATE already reads as the v13 shape — this migration is not for it"
+            "the deployed STATE already reads as the v14 shape — this migration is not for it"
         );
-        let v12 = ContractV12::try_from_slice(&bytes).expect("the deployed STATE is not the v12 shape");
-        let owner = v12.owner_id.clone();
-        env::state_write(&v12);
-        let c = Contract::migrate();
+        let v13 = ContractV13::try_from_slice(&bytes).expect("the deployed STATE is not the v13 shape");
+        let owner = v13.owner_id.clone();
+        let fees = v13.total_fees_collected;
+        env::state_write(&v13);
+        let c = Contract::migrate(dao());
         assert_eq!(c.owner_id, owner);
-        assert_eq!(c.get_storage_version(), "13");
-        println!("v12 state of {} bytes, owner {owner}, migrated", bytes.len());
+        assert_eq!(c.get_storage_version(), "14");
+        assert_eq!(c.get_platform_near().0, U128(fees));
+        println!("v13 state of {} bytes, owner {owner}, fees {fees}, migrated", bytes.len());
     }
 }

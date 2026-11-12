@@ -9,7 +9,13 @@ use schemars::JsonSchema;
 mod collateral;
 use collateral::Collateral;
 
-mod migration;
+pub(crate) mod migration;
+
+pub mod governance;
+pub use governance::{BlobInfo, GovAction, GovProposal, GovStatus};
+
+#[cfg(test)]
+mod governance_tests;
 
 // Custom getrandom implementation for WASM (required by dcap-qvl)
 #[cfg(target_arch = "wasm32")]
@@ -82,10 +88,16 @@ enum StorageKey {
     VaultVersionApprovalArgs,
     // ----- v4 (keystore-key revocation proposals) -----
     RevokeProposals,
+    // ----- v5 (governance) -----
+    GovProposals,
+    Blobs,
 }
 
 /// Full TEE measurements for verifying the entire dstack environment.
 /// All fields are 96 hex characters (48 bytes).
+///
+/// Frozen: stored inside `governance::VersionedGovProposal::V1` (`ApproveMeasurements`,
+/// `RevokeMeasurements`) as well as in the root state. Never change its fields.
 ///
 /// Without verifying MRTD + RTMR0-2, an attacker can run a dev dstack image
 /// (with SSH enabled), connect to the container, and modify the running code
@@ -191,6 +203,10 @@ const MAX_COLLATERALS: usize = 2;
 /// of args and a ~1953-byte set element — 16 of those stays well inside 300 Tgas, where a
 /// 62-key ml-dsa batch plausibly would not. Larger cleanups run as several ballots.
 const MAX_REVOKE_BATCH: usize = 16;
+
+/// Age after which a still-pending keystore registration proposal may be deleted by the owner:
+/// twice the 24 h a keystore waits for its vote.
+const STALE_REGISTRATION_NS: u64 = 48 * 60 * 60 * 1_000_000_000;
 
 /// Keystore DAO Contract
 ///
@@ -305,6 +321,14 @@ pub struct KeystoreDao {
     /// Proposals to revoke keystore access keys, keyed by the SAME id counter as registration
     /// proposals (so ids are unambiguous and the `votes` map can be shared).
     pub revoke_proposals: LookupMap<u64, RevokeKeysProposal>,
+
+    // ----- v5: governance (see governance.rs) -----
+    /// Governance proposals, keyed by the shared proposal id counter.
+    pub gov_proposals: LookupMap<u64, governance::VersionedGovProposal>,
+    /// Time between quorum and the earliest `execute` (nanoseconds).
+    pub gov_delay_ns: u64,
+    /// Wasm stored for upgrade proposals, by sha256 (bytes under a raw key, see `store_blob`).
+    pub blobs: LookupMap<Base58CryptoHash, governance::BlobInfo>,
 }
 
 /// First-proposer's metadata for an in-flight approve proposal. See
@@ -390,8 +414,19 @@ impl KeystoreDao {
         init_account_id: AccountId,
         dao_members: Vec<AccountId>,
         mpc_contract_id: AccountId,
+        gov_delay_sec: Option<u64>,
     ) -> Self {
         assert!(!dao_members.is_empty(), "DAO must have at least one member");
+        let gov_delay_ns = match gov_delay_sec {
+            Some(sec) => {
+                require!(
+                    sec <= governance::MAX_GOV_DELAY_SEC,
+                    format!("gov_delay_sec must be at most {}", governance::MAX_GOV_DELAY_SEC)
+                );
+                sec * 1_000_000_000
+            }
+            None => Self::default_gov_delay_ns(),
+        };
 
         let mut members_set = UnorderedSet::new(StorageKey::DaoMembers);
         for member in dao_members.iter() {
@@ -423,6 +458,9 @@ impl KeystoreDao {
                 StorageKey::VaultVersionApprovalArgs,
             ),
             revoke_proposals: LookupMap::new(StorageKey::RevokeProposals),
+            gov_proposals: LookupMap::new(StorageKey::GovProposals),
+            gov_delay_ns,
+            blobs: LookupMap::new(StorageKey::Blobs),
         }
     }
 
@@ -571,8 +609,11 @@ impl KeystoreDao {
             "Only DAO members can vote"
         );
 
-        // Registration and keystore-key-revocation proposals share one id counter, so the id
-        // alone says which kind this is — one `vote` entry point for both.
+        // Registration, keystore-key-revocation and governance proposals share one id counter,
+        // so the id alone says which kind this is — one `vote` entry point for all three.
+        if self.gov_proposals.get(&proposal_id).is_some() {
+            return self.internal_gov_vote(proposal_id, approve);
+        }
         if self.revoke_proposals.get(&proposal_id).is_some() {
             return self.internal_vote_revoke(proposal_id, approve);
         }
@@ -643,36 +684,34 @@ impl KeystoreDao {
         }
     }
 
-    /// Owner: Add approved TEE measurements (MRTD + RTMR0-3).
-    ///
-    /// All 5 measurements must match for a keystore to register.
-    /// Get measurements from Phala attestation:
-    /// `phala cvms attestation <CVM_NAME> --json | jq '.tcb_info'`
-    ///
-    /// If `clear_others` is true, removes all existing entries before adding.
-    pub fn add_approved_measurements(&mut self, measurements: ApprovedMeasurements, clear_others: Option<bool>) {
+    /// Owner: delete keystore registration proposals still `Pending` more than 48 h
+    /// (`STALE_REGISTRATION_NS`) after they were made. A keystore waits for its vote 24 h and
+    /// then gives up, so such a proposal belongs to an instance that no longer listens.
+    /// Returns how many were deleted; ids that are not stale pending registrations are skipped.
+    pub fn remove_stale_proposals(&mut self, proposal_ids: Vec<u64>) -> u32 {
         self.assert_owner();
-        Self::validate_measurements(&measurements);
-
-        if clear_others.unwrap_or(false) {
-            let count = self.approved_measurements.len();
-            self.approved_measurements.clear();
-            env::log_str(&format!("Cleared {} existing measurement entries", count));
+        let now = env::block_timestamp();
+        let mut removed = 0u32;
+        for id in proposal_ids {
+            let stale = self.proposals.get(&id).map_or(false, |p| {
+                p.status == ProposalStatus::Pending
+                    && now.saturating_sub(p.created_at) > STALE_REGISTRATION_NS
+            });
+            if stale {
+                self.proposals.remove(&id);
+                for member in self.dao_members.iter() {
+                    self.votes.remove(&(id, member));
+                }
+                removed += 1;
+            }
         }
-
-        if !self.approved_measurements.contains(&measurements) {
-            self.approved_measurements.push(measurements.clone());
-        }
-
-        env::log_str(&format!(
-            "Approved measurements added: mrtd={}, rtmr0={}, rtmr1={}, rtmr2={}, rtmr3={}",
-            measurements.mrtd, measurements.rtmr0, measurements.rtmr1,
-            measurements.rtmr2, measurements.rtmr3
-        ));
-        env::log_str(&format!("Total approved measurements: {}", self.approved_measurements.len()));
+        env::log_str(&format!("stale_registration_proposals_removed {}", removed));
+        removed
     }
 
-    /// Owner: Clear all approved measurements
+    /// Owner: clear all approved measurements. The fast path for a bad build: no keystore
+    /// registers until governance approves measurements again (`GovAction::ApproveMeasurements`).
+    /// Registered keystores keep their keys; revoke those with `propose_revoke_keystore_keys`.
     pub fn clear_all_approved_measurements(&mut self) {
         self.assert_owner();
 
@@ -682,7 +721,7 @@ impl KeystoreDao {
         env::log_str(&format!("Cleared all {} measurement entries", count));
     }
 
-    /// Owner: Remove specific approved measurements
+    /// Owner: remove one approved measurement set (fast path; see `clear_all_approved_measurements`).
     pub fn remove_approved_measurements(&mut self, measurements: ApprovedMeasurements) {
         self.assert_owner();
         self.approved_measurements.retain(|m| m != &measurements);
@@ -846,31 +885,6 @@ impl KeystoreDao {
     }
 
 
-    /// Owner: Add DAO member
-    pub fn add_dao_member(&mut self, member: AccountId) {
-        self.assert_owner();
-
-        self.dao_members.insert(&member);
-
-        // Recalculate threshold
-        self.approval_threshold = (self.dao_members.len() as u32 / 2) + 1;
-
-        env::log_str(&format!("Added DAO member: {}", member));
-    }
-
-    /// Owner: Remove DAO member
-    pub fn remove_dao_member(&mut self, member: AccountId) {
-        self.assert_owner();
-        assert!(self.dao_members.len() > 1, "Cannot remove last DAO member");
-
-        self.dao_members.remove(&member);
-
-        // Recalculate threshold
-        self.approval_threshold = (self.dao_members.len() as u32 / 2) + 1;
-
-        env::log_str(&format!("Removed DAO member: {}", member));
-    }
-
     /// Owner: Update TDX quote collateral at a given slot.
     ///
     /// `index` selects the collateral slot (0..MAX_COLLATERALS), one per platform/FMSPC — e.g.
@@ -967,6 +981,7 @@ impl KeystoreDao {
             "approved_measurements_count": self.approved_measurements.len(),
             "has_collateral": !self.collaterals.is_empty(),
             "collaterals_count": self.collaterals.len(),
+            "gov_delay_sec": self.gov_delay_ns / 1_000_000_000,
         })
     }
 
@@ -985,10 +1000,7 @@ impl KeystoreDao {
     /// This function makes a cross-contract call to the MPC contract to derive a private key
     /// The request must come from an approved keystore with a valid access key
     pub fn request_key(&self, request: CKDRequestArgs) -> PromiseOrValue<CKDResponse> {
-        require!(
-            env::predecessor_account_id() == env::current_account_id(),
-            "must be called via an approved-keystore access key on this contract"
-        );
+        self.assert_approved_keystore_signer();
 
         // Make cross-contract call to MPC contract
         // Attach all gas and 1 yoctoNEAR as required by MPC contract
@@ -1270,10 +1282,7 @@ impl KeystoreDao {
     /// short-circuits to `false` for banned vaults but the underlying
     /// state would be misleading.
     pub fn mark_vault_verified(&mut self, vault_id: AccountId) {
-        require!(
-            env::predecessor_account_id() == env::current_account_id(),
-            "must be called via an approved-keystore access key on this contract"
-        );
+        self.assert_approved_keystore_signer();
         require!(
             !self.banned_vaults.contains(&vault_id),
             "vault is banned; call unban_vault (DAO-only) before re-marking it verified"
@@ -1299,8 +1308,9 @@ impl KeystoreDao {
     /// `vault_banned` log events for off-chain indexers.
     pub fn ban_vault(&mut self, vault_id: AccountId, reason: String) {
         let pred = env::predecessor_account_id();
-        let allowed =
-            pred == env::current_account_id() || self.dao_members.contains(&pred);
+        let allowed = (pred == env::current_account_id()
+            && self.approved_keystores.contains(&env::signer_account_pk()))
+            || self.dao_members.contains(&pred);
         require!(
             allowed,
             "ban_vault: only an approved keystore (via this contract's access key) \
@@ -1409,6 +1419,20 @@ impl KeystoreDao {
         report_data_prefix.copy_from_slice(&td10.report_data[..32]);
 
         Ok((measurements, report_data_prefix))
+    }
+
+    /// The caller is this account AND it signed with a key that DAO voting installed for an
+    /// approved keystore. Any other key on this account — a full-access key included — is
+    /// refused, so no key outside `approved_keystores` reaches the master.
+    fn assert_approved_keystore_signer(&self) {
+        require!(
+            env::predecessor_account_id() == env::current_account_id(),
+            "must be called via an approved-keystore access key on this contract"
+        );
+        require!(
+            self.approved_keystores.contains(&env::signer_account_pk()),
+            "signer key is not an approved keystore key"
+        );
     }
 
     fn assert_owner(&self) {
@@ -1588,6 +1612,19 @@ mod tests {
         b
     }
 
+    /// A call signed with an approved keystore's access key on the DAO account: predecessor is
+    /// the DAO itself and the signer key is in `approved_keystores`.
+    fn as_approved_keystore(dao: &mut KeystoreDao) {
+        dao.approved_keystores.insert(&test_key(200));
+        testing_env!(ctx(dao_account()).signer_account_pk(test_key(200)).build());
+    }
+
+    /// What an executed `GovAction::RemoveMember` does to the member set.
+    fn remove_member_as_governance(dao: &mut KeystoreDao, member: AccountId) {
+        dao.dao_members.remove(&member);
+        dao.approval_threshold = (dao.dao_members.len() as u32 / 2) + 1;
+    }
+
     fn fresh_dao() -> KeystoreDao {
         testing_env!(ctx("owner.near".parse().unwrap()).build());
         KeystoreDao::new(
@@ -1595,6 +1632,7 @@ mod tests {
             "init.near".parse().unwrap(),
             vec![member_a(), member_b()],
             "v1.signer.near".parse().unwrap(),
+            None,
         )
     }
 
@@ -1802,8 +1840,8 @@ mod tests {
         assert!(dao.approved_keystores.contains(&test_key(1)));
 
         testing_env!(ctx("owner.near".parse().unwrap()).build());
-        dao.remove_dao_member(m("m1.near"));
-        dao.remove_dao_member(m("m2.near"));
+        remove_member_as_governance(&mut dao, m("m1.near"));
+        remove_member_as_governance(&mut dao, m("m2.near"));
         assert_eq!(dao.approval_threshold, 2); // (3/2)+1
 
         testing_env!(ctx(m("m3.near")).build());
@@ -1891,6 +1929,7 @@ mod tests {
             "init.near".parse().unwrap(),
             vec![member_a()],
             "v1.signer.near".parse().unwrap(),
+            None,
         )
     }
 
@@ -1908,6 +1947,7 @@ mod tests {
                 m("m5.near"),
             ],
             m("v1.signer.near"),
+            None,
         )
     }
 
@@ -2014,8 +2054,8 @@ mod tests {
         // are still in storage and would falsely satisfy quorum
         // without the retain guard.
         testing_env!(ctx("owner.near".parse().unwrap()).build());
-        dao.remove_dao_member(m("m1.near"));
-        dao.remove_dao_member(m("m2.near"));
+        remove_member_as_governance(&mut dao, m("m1.near"));
+        remove_member_as_governance(&mut dao, m("m2.near"));
         assert_eq!(dao.approval_threshold, 2); // (3/2)+1
 
         // m3 votes — m1/m2 are no longer members, must be discarded.
@@ -2052,8 +2092,8 @@ mod tests {
         assert!(dao.is_vault_code_approved(h));
 
         testing_env!(ctx("owner.near".parse().unwrap()).build());
-        dao.remove_dao_member(m("m1.near"));
-        dao.remove_dao_member(m("m2.near"));
+        remove_member_as_governance(&mut dao, m("m1.near"));
+        remove_member_as_governance(&mut dao, m("m2.near"));
         assert_eq!(dao.approval_threshold, 2);
 
         testing_env!(ctx(m("m3.near")).build());
@@ -2080,9 +2120,9 @@ mod tests {
         dao.approve_vault_version(h, "v1".into(), Some("url".into()));
 
         testing_env!(ctx("owner.near".parse().unwrap()).build());
-        dao.remove_dao_member(m("m3.near"));
-        dao.remove_dao_member(m("m4.near"));
-        dao.remove_dao_member(m("m5.near"));
+        remove_member_as_governance(&mut dao, m("m3.near"));
+        remove_member_as_governance(&mut dao, m("m4.near"));
+        remove_member_as_governance(&mut dao, m("m5.near"));
         assert_eq!(dao.approval_threshold, 2); // (2/2)+1
 
         // m1 re-votes. retain leaves [m1, m2]; push skipped (m1 already in).
@@ -2115,9 +2155,9 @@ mod tests {
         // Remove m2 (one of the voters) and m3, m4. DAO becomes
         // {m1, m5}, threshold = 2. Without retain, voters list is
         // [m1, m2] → len == 2 == threshold → would falsely execute.
-        dao.remove_dao_member(m("m2.near"));
-        dao.remove_dao_member(m("m3.near"));
-        dao.remove_dao_member(m("m4.near"));
+        remove_member_as_governance(&mut dao, m("m2.near"));
+        remove_member_as_governance(&mut dao, m("m3.near"));
+        remove_member_as_governance(&mut dao, m("m4.near"));
         assert_eq!(dao.approval_threshold, 2);
 
         testing_env!(ctx(m("m1.near")).build());
@@ -2183,7 +2223,7 @@ mod tests {
         // Approved keystores call into this method by signing a tx FROM
         // the dao account itself (using their installed access key) —
         // so predecessor == current_account_id.
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.mark_vault_verified(vault_a());
         assert!(dao.is_vault_verified(vault_a()));
     }
@@ -2199,7 +2239,7 @@ mod tests {
     #[test]
     fn is_vault_verified_returns_false_when_banned() {
         let mut dao = fresh_dao();
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.mark_vault_verified(vault_a());
         assert!(dao.is_vault_verified(vault_a()));
         // DAO member bans the vault.
@@ -2239,7 +2279,7 @@ mod tests {
     #[test]
     fn ban_vault_via_self_access_key() {
         let mut dao = fresh_dao();
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.ban_vault(vault_a(), "automated_detection".to_string());
         assert!(dao.is_vault_banned(vault_a()));
     }
@@ -2269,7 +2309,7 @@ mod tests {
         // (via predecessor == current), but unban requires a human DAO
         // member.
         let mut dao = fresh_dao();
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.unban_vault(vault_a());
     }
 
@@ -2281,23 +2321,23 @@ mod tests {
         // sync. Off-chain indexers can rely on `verified_vaults` ⊥
         // `banned_vaults` invariant.
         let mut dao = fresh_dao();
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.mark_vault_verified(vault_a());
         testing_env!(ctx(member_a()).build());
         dao.ban_vault(vault_a(), "race attack".to_string());
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.mark_vault_verified(vault_a()); // panics: "vault is banned"
     }
 
     #[test]
     fn unban_then_remark_succeeds() {
         let mut dao = fresh_dao();
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.mark_vault_verified(vault_a());
         testing_env!(ctx(member_a()).build());
         dao.ban_vault(vault_a(), "false positive".to_string());
         dao.unban_vault(vault_a());
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.mark_vault_verified(vault_a());
         assert!(dao.is_vault_verified(vault_a()));
     }
@@ -2305,7 +2345,7 @@ mod tests {
     #[test]
     fn vault_b_isolated_from_vault_a_state() {
         let mut dao = fresh_dao();
-        testing_env!(ctx(dao_account()).build());
+        as_approved_keystore(&mut dao);
         dao.mark_vault_verified(vault_a());
         assert!(dao.is_vault_verified(vault_a()));
         assert!(!dao.is_vault_verified(vault_b()));

@@ -114,19 +114,17 @@ pub struct KeystoreDaoV2 {
 }
 
 // ============================================================
-// V3 → V4 (keystore-key revocation proposals)
+// V4 → V5 (governance)
 // ============================================================
 //
-// V3 is the shape live on `dao.outlayer.{testnet,near}` today — the multi-collateral struct
-// produced by the previous migration. V4 appends `revoke_proposals`, the map behind
-// `propose_revoke_keystore_keys` / `vote_revoke_keystore_keys`.
-//
-// Field order MUST match the current on-chain layout exactly: the `KeystoreDao` struct in
-// lib.rs minus the new trailing field.
+// V4 is the shape live on `dao.outlayer.{testnet,near}`: the multi-collateral struct with
+// `revoke_proposals`. V5 appends the governance state. Field order MUST match the on-chain
+// layout exactly: the `KeystoreDao` struct in lib.rs minus the v5 fields.
 
 #[derive(BorshDeserialize)]
+#[cfg_attr(test, derive(near_sdk::borsh::BorshSerialize))]
 #[borsh(crate = "near_sdk::borsh")]
-pub struct KeystoreDaoV3 {
+pub struct KeystoreDaoV4 {
     pub dao_members: UnorderedSet<AccountId>,
     pub approval_threshold: u32,
     pub owner_id: AccountId,
@@ -145,23 +143,22 @@ pub struct KeystoreDaoV3 {
     pub banned_vaults: UnorderedSet<AccountId>,
     pub vault_version_votes: LookupMap<VaultVersionAction, Vec<AccountId>>,
     pub vault_version_approval_args: LookupMap<Base58CryptoHash, ApprovalArgs>,
+    pub revoke_proposals: LookupMap<u64, RevokeKeysProposal>,
 }
 
 #[near_bindgen]
 impl KeystoreDao {
-    /// Migrate V3 (multi-collateral) → V4: adds the empty `revoke_proposals` map. Every other
-    /// field is carried through verbatim; no existing value is rewritten.
+    /// Migrate V4 → V5: adds the governance state — no proposals, no pending upgrades, and
+    /// the default delay for this account (72 h on `.near`, none elsewhere; governance
+    /// changes it with `SetDelay`). Every other field is carried through verbatim.
     ///
-    /// **Run once, right after deploying the V4 wasm** — until it runs, every method panics on
-    /// state deserialization.
-    ///
-    /// Earlier migrations (V0→V1, V1→V2, V2→V3) are no longer reachable from this method;
-    /// `dao.outlayer.{testnet,near}` already went through them and the structs above remain
-    /// only for archaeological reference.
+    /// **Run once, right after deploying the V5 wasm** — until it runs, every method panics on
+    /// state deserialization. Takes no arguments: it is part of the upgrade ABI
+    /// (governance.rs), called the same way by every later upgrade.
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: KeystoreDaoV3 = env::state_read().expect("failed to read V3 state");
+        let old: KeystoreDaoV4 = env::state_read().expect("failed to read V4 state");
 
         Self {
             dao_members: old.dao_members,
@@ -182,8 +179,11 @@ impl KeystoreDao {
             banned_vaults: old.banned_vaults,
             vault_version_votes: old.vault_version_votes,
             vault_version_approval_args: old.vault_version_approval_args,
-            // ----- v4 -----
-            revoke_proposals: LookupMap::new(StorageKey::RevokeProposals),
+            revoke_proposals: old.revoke_proposals,
+            // ----- v5 -----
+            gov_proposals: LookupMap::new(StorageKey::GovProposals),
+            gov_delay_ns: Self::default_gov_delay_ns(),
+            blobs: LookupMap::new(StorageKey::Blobs),
         }
     }
 }
