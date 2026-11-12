@@ -15,8 +15,14 @@
 #     R1   a fresh key: ledger {0, 0, 0}, not closing
 #     R2   top-up $0.05 → ledger user_funded 50000, refundable_cap 50000
 #     R3   one HTTPS call with the key → settled, spent > 0
+#     R2b  a second top-up, and a close sent RACE_DELAY s behind it while its yield
+#          is open → the close refused "in flight"; cap = both top-ups, chain and
+#          coordinator agree (a close that goes through = the window missed, warned)
 #     R4   close_payment_key → tx ok; coordinator deleted_at set; ledger closing_since
 #          set, claimable_at = since + 24 h; closing count 1; the secret still on chain
+#     R4b  a top-up sent RACE_DELAY s behind the R4 close, while its yield is open →
+#          refused at admission "waiting for its answer", the transfer back, cap
+#          unchanged, nothing in flight, coordinator row not credited, deleted_by chain
 #     R5   a top-up on the closing key → refused, the transfer comes back
 #     R6   claim_payment_key_refund now → refused "can be claimed from"
 #     R7   close again → refused "already closing"
@@ -25,8 +31,9 @@
 #
 #   --claim <nonce> [--grant <nonce>]   phase 2, a day later:
 #     C1   claim → tx ok, the returned value = paid; logs "Payment key refunded"
-#     C2   the token balance of the owner rose by paid; paid = min(quote, cap)
-#     C3   coordinator payment_key_refunds row = the quote; payment_keys.initial_balance = spent
+#     C2   0 < paid ≤ cap; the token balance of the owner rose by paid
+#     C3   coordinator payment_key_refunds row = the quote; paid = min(quote, cap);
+#          payment_keys.initial_balance = spent
 #     C4   on chain: ledger gone, secret gone, closing count 0, nonce floor ≥ nonce
 #     C5   (--grant) the grant key claims 0: "refund capped" logged, key gone, no transfer
 #
@@ -65,6 +72,7 @@ CONNECTORS="${CONNECTORS:-connectors.outlayer.$NETWORK}"
 PROJECT="${PROJECT:-$CONNECTORS/connector-probe}"
 AMOUNT="${AMOUNT:-50000}"          # $0.05
 WITHDRAW="${WITHDRAW:-30000}"      # $0.03
+RACE_DELAY="${RACE_DELAY:-2}"      # s between the two sends of R2b and R4b: inside the yield, after admission
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/scripts/.env}"
 CREDS_DIR="$HOME/.near-credentials/$NETWORK"
 DAY_NS=$((24 * 60 * 60 * 1000000000))
@@ -303,17 +311,22 @@ if [[ "$MODE" == apply ]]; then
       [[ -n "$SPENT" && "$SPENT" != 0 ]] && pass "R3 settled: spent $SPENT" || warn "R3 spent is '$SPENT' (a free ping?): the refund will be the whole top-up"
     fi
 
-    # A second top-up, and a close sent right behind it: the key cannot be
-    # closed while the top-up is in flight — or the worker was faster and the
-    # close goes through. Either way the chain, the ledger and the coordinator
-    # row must agree afterwards.
-    log "R2b a second top-up, then close while it may still be in flight"
-    out=$(ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)")
-    TX=$(tx_of "$out")
-    [[ -n "$TX" ]] && pass "R2b second top-up sent ($TX)" || fail "R2b second top-up not sent: $(why_of "$out")"
+    # A second top-up, and a close sent RACE_DELAY s behind it without waiting
+    # for the top-up's outcome (near-cli returns only after the yield callback,
+    # so a close sent after it never meets the yield open): the key cannot be
+    # closed while the top-up is in flight. A close that goes through means the
+    # worker answered first — a missed window, named, not a pass. Either way the
+    # chain, the ledger and the coordinator row must agree afterwards.
+    log "R2b a second top-up, then close ${RACE_DELAY}s later while it is in flight"
+    ( ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)" > "$RUN_TMP/r2b_topup.out" ) &
+    sleep "$RACE_DELAY"
     out=$(call "$KEY_OWNER" "$CONTRACT_ID" close_payment_key "$(jq -nc --argjson n "$NONCE" '{nonce:$n}')" '1 yoctoNEAR')
+    wait
+    tu=$(cat "$RUN_TMP/r2b_topup.out")
+    TX=$(tx_of "$tu")
+    [[ -n "$TX" ]] && pass "R2b second top-up sent ($TX)" || fail "R2b second top-up not sent: $(why_of "$tu")"
     if succeeded "$out"; then
-      note "R2b the top-up had settled first: the close went through ($(tx_of "$out")) — R4 reads it as already closing"
+      warn "R2b window missed: the top-up had settled first and the close went through ($(tx_of "$out")) — R4 reads it as already closing, R4b is skipped"
       CLOSED_EARLY=true
     elif grep -q 'in flight' <<<"$out"; then
       pass "R2b close refused while the top-up is in flight: $(why_of "$out" | head -c 160)"
@@ -336,8 +349,38 @@ if [[ "$MODE" == apply ]]; then
       out=""; TX=""
       note "R4 closed in R2b already; checking the state it left"
     else
-      out=$(call "$KEY_OWNER" "$CONTRACT_ID" close_payment_key "$(jq -nc --argjson n "$NONCE" '{nonce:$n}')" '1 yoctoNEAR')
+      # R4b rides on this close: a top-up sent RACE_DELAY s behind it meets the
+      # close's yield open and is refused at admission, the transfer back.
+      T4=$(token_balance)
+      ( call "$KEY_OWNER" "$CONTRACT_ID" close_payment_key "$(jq -nc --argjson n "$NONCE" '{nonce:$n}')" '1 yoctoNEAR' > "$RUN_TMP/r4_close.out" ) &
+      sleep "$RACE_DELAY"
+      tu=$(ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)")
+      wait
+      out=$(cat "$RUN_TMP/r4_close.out")
       TX=$(tx_of "$out")
+      log "R4b a top-up while the close waits for its answer"
+      TU_TX=$(tx_of "$tu")
+      if [[ -z "$TU_TX" ]]; then
+        fail "R4b the transfer was not sent: $(why_of "$tu")"
+      else
+        fails=$(tx_failures "$TU_TX" "$KEY_OWNER")
+        if has_failure "$fails" 'waiting for its answer'; then
+          pass "R4b refused at admission while the close waits ($TU_TX)"
+        elif has_failure "$fails" 'is closing since'; then
+          warn "R4b window missed: the close had settled first — refused as closing instead ($TU_TX)"
+        else
+          fail "R4b the top-up was refused by neither fence: $(short "$fails")"
+        fi
+        EXPECT=$T4; t=$(wait_eq token_balance) && pass "R4b token balance unchanged: the transfer came back" || fail "R4b token balance '$t', expected $EXPECT"
+        [[ "$(ledger "$NONCE" | jq -r .refundable_cap)" == "$TOTAL" ]] && pass "R4b cap unchanged" || fail "R4b cap $(ledger "$NONCE" | jq -r .refundable_cap), expected $TOTAL"
+        f=$(flight "$NONCE")
+        [[ -z "$f" || "$f" == null || "$(jq -r '(.top_ups_in_flight // 0) == 0 and ((.close_pending // false) | not)' <<<"$f")" == true ]] \
+          && pass "R4b nothing in flight, no close pending" || fail "R4b flight: $(short "$f")"
+        if sql_alive; then
+          r=$(wait_sql "SELECT initial_balance || '/' || COALESCE(deleted_by,'') FROM payment_keys WHERE owner = '$KEY_OWNER' AND nonce = $NONCE" "$TOTAL/chain" 10) \
+            && pass "R4b coordinator row $r: not credited, closed by the chain" || fail "R4b coordinator row '$r', expected $TOTAL/chain"
+        fi
+      fi
     fi
     if [[ "${CLOSED_EARLY:-false}" == true ]] || succeeded "$out"; then
       [[ -n "$TX" ]] && pass "R4 close sent and resumed ($TX)"
@@ -444,7 +487,9 @@ claim_key() { # claim_key <nonce> <expect-paid|"cap">
   has_log "$logs" "Payment key refunded: owner=$KEY_OWNER, nonce=$nonce" && pass "C1 'Payment key refunded' logged" || fail "C1 no 'Payment key refunded' log"
 
   if [[ "$2" == cap ]]; then
-    [[ "$paid" == "$cap" ]] && pass "C2 paid = cap ($cap)" || fail "C2 paid $paid, cap $cap"
+    # The key ran calls, so the quote is below the cap: the chain alone holds
+    # 0 < paid ≤ cap; the exact amount, min(quote, cap), is C3's.
+    (( paid > 0 && paid <= cap )) && pass "C2 0 < paid $paid ≤ cap $cap" || fail "C2 paid $paid, cap $cap: expected 0 < paid ≤ cap"
   else
     [[ "$paid" == "$2" ]] && pass "C2 paid $paid as expected" || fail "C2 paid $paid, expected $2"
   fi
