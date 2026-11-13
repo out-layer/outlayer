@@ -22,9 +22,6 @@ pub struct Config {
     /// production DAO; see [`resolve_chain`].
     pub near_contract_id: Option<String>,
 
-    /// OffchainVM contract account ID
-    pub offchainvm_contract_id: String,
-
     /// Allowed worker token hashes (SHA256) - for TEE workers only
     /// Grants access to: /decrypt, /encrypt, /decrypt-raw, /storage/*
     pub allowed_worker_token_hashes: Vec<String>,
@@ -271,9 +268,6 @@ impl Config {
                  RPC host WITHOUT a key. The unkeyed host is rate-limited; set NEAR_RPC_API_KEY"
             );
         }
-        let offchainvm_contract_id = std::env::var("OFFCHAINVM_CONTRACT_ID")
-            .context("OFFCHAINVM_CONTRACT_ID is required")?;
-
         let allowed_worker_token_hashes = std::env::var("ALLOWED_WORKER_TOKEN_HASHES")
             .unwrap_or_default()
             .split(',')
@@ -315,7 +309,6 @@ impl Config {
             near_network,
             near_rpc_url: chain.rpc_url,
             near_contract_id: chain.near_contract_id,
-            offchainvm_contract_id,
             allowed_worker_token_hashes,
             allowed_coordinator_token_hashes,
             tee_mode,

@@ -154,7 +154,6 @@ membership and ownership are read from the chain. A body that names `signing_key
 | `NEAR_NETWORK` | no (`testnet`) | |
 | `NEAR_RPC_URL` | yes, except for a production DAO | keyed RPC; every chain read and the registration transactions. Refused for `dao.outlayer.<net>`, see below |
 | `NEAR_RPC_API_KEY` | for a production DAO | the FastNEAR key for the host fixed in code; without it the host is used unkeyed, with a warning |
-| `OFFCHAINVM_CONTRACT_ID` | yes | the OutLayer contract (`outlayer.near`) |
 | `NEAR_CONTRACT_ID` | yes, to read secrets, except for a production DAO | the contract secrets are read from (`outlayer.near`) |
 | `ALLOWED_WORKER_TOKEN_HASHES` | yes | comma-separated SHA-256 hex of worker tokens |
 | `ALLOWED_COORDINATOR_TOKEN_HASHES` | yes | comma-separated SHA-256 hex of coordinator tokens |
@@ -200,7 +199,6 @@ Locally, without a TEE:
 ```bash
 cd keystore-worker
 cp .env.example .env     # TEE_MODE=none, USE_TEE_REGISTRATION=false; set the token hashes
-echo 'OFFCHAINVM_CONTRACT_ID=outlayer.testnet' >> .env   # required, absent from the example
 cargo run --release
 curl http://localhost:8081/health
 ```
