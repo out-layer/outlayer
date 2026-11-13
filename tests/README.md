@@ -115,7 +115,8 @@ upgrades itself only with nothing else open),
 `governance_e2e.sh` (electorate snapshot, the owner as a brake, `Call` proposals,
 members-only governance, keystore-key check, the owner's money),
 `fa_removal.sh --yes` (deletes the accounts' full-access keys for good, then both
-suites again) — testnet.
+suites again), `requests_e2e.sh` (stored-output pricing, block staleness, the batch cancel
+and the self-cleaning sweep on stuck requests made through `proxy.wat`; ~10 min) — testnet.
 
 ### Basic execution
 

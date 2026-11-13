@@ -4,9 +4,17 @@
 #   1. upgrade to a variant of the built wasm (same code, an extra custom section: another
 #      hash) — the account reports the variant's hash;
 #   2. upgrade back to the built wasm — the variant's own upgrade path works;
-#   3. an upgrade whose migrate fails (`migrate` on a state already migrated) — the batch
-#      reverts and the code stays; the proposal is Executed (there is no callback) and its blob
-#      is gone, deposit returned.
+#   3. an upgrade whose migrate fails — the built wasm's `migrate` is this release's one-time
+#      migration and panics on the state it already migrated — the batch reverts and the code
+#      stays; the proposal is Executed (there is no callback) and its blob is gone;
+#   4. an upgrade WITH migrate that succeeds: to the `migrate-probe` build, whose `migrate()`
+#      takes no arguments and reads the current layout, as every later release's does; then
+#      back to the built wasm.
+# Build the probes once, before the built wasms (both write target/near/):
+#   (cd contract && cargo near build non-reproducible-wasm --features migrate-probe \
+#     && mkdir -p target/near/migrate-probe && cp target/near/outlayer_contract.wasm target/near/migrate-probe/)
+#   and the same in register-contract/ and keystore-dao-contract/ (with their build.sh flags),
+#   then build the three contracts as usual.
 # Then: the DAO upgrades itself while other proposals are open, and a proposal opened between
 # execute and the deploy (one transaction: [execute, propose]) stays readable by the new code —
 # proposals are stored versioned.
@@ -74,7 +82,7 @@ for target in "$MAIN" "$WORKER" "$DAO"; do
     fi
     view "$target" gov_health >/dev/null && ok "state reads after two upgrades" || bad "gov_health"
 
-    # migrate on a state that is already migrated panics: the whole batch reverts.
+    # The release's one-time migrate panics on the state it already migrated: the batch reverts.
     variant "$wasm" "$v" "migrate-$(date +%s%N)"
     vhash=$(wasm_hash "$v")
     id=$(upgrade "$target" "$v" true) || true
@@ -86,6 +94,30 @@ for target in "$MAIN" "$WORKER" "$DAO"; do
         bad "failing migrate: status $st, code $(code_hash "$target") (expected Executed, $original)"
     fi
     [ "$(view "$DAO" get_blob "{\"hash\":\"$vhash\"}")" = "null" ] && ok "its blob is gone" || bad "the blob is still stored"
+
+    case "$target" in
+        "$MAIN") probe="$WASM_MAIN_PROBE" ;;
+        "$WORKER") probe="$WASM_WORKER_PROBE" ;;
+        "$DAO") probe="$WASM_DAO_PROBE" ;;
+    esac
+    if [ ! -f "$probe" ]; then
+        bad "no migrate-probe build at $probe (see the header): the migrating upgrade is not tested"
+        continue
+    fi
+    phash=$(wasm_hash "$probe")
+    id=$(upgrade "$target" "$probe" true) || true
+    if [ "$(gov_status "$id")" = "Executed" ] && [ "$(code_hash "$target")" = "$phash" ]; then
+        ok "an upgrade with migrate switched to the probe $phash (proposal $id)"
+    else
+        bad "upgrade with migrate: status $(gov_status "$id"), code $(code_hash "$target") (expected $phash)"
+    fi
+    view "$target" gov_health >/dev/null && ok "state reads after the migrating upgrade" || bad "gov_health after migrate"
+    id=$(upgrade "$target" "$wasm" false) || true
+    if [ "$(gov_status "$id")" = "Executed" ] && [ "$(code_hash "$target")" = "$original" ]; then
+        ok "the probe upgraded back to $original (proposal $id)"
+    else
+        bad "upgrade back from the probe: status $(gov_status "$id"), code $(code_hash "$target")"
+    fi
 done
 
 step "the DAO upgrades itself while another proposal is open"

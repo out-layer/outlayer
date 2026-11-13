@@ -35,6 +35,11 @@ MPC_CONTRACT="v1.signer-prod.testnet"
 WASM_MAIN="${WASM_MAIN:-$REPO_ROOT/contract/target/near/outlayer_contract.wasm}"
 WASM_DAO="${WASM_DAO:-$REPO_ROOT/keystore-dao-contract/target/near/keystore_dao_contract.wasm}"
 WASM_WORKER="${WASM_WORKER:-$REPO_ROOT/register-contract/target/near/register_contract.wasm}"
+# Test builds with `--features migrate-probe`: a `migrate()` without arguments that reads the
+# current layout, the shape of every later release (see upgrade_e2e.sh).
+WASM_MAIN_PROBE="${WASM_MAIN_PROBE:-$REPO_ROOT/contract/target/near/migrate-probe/outlayer_contract.wasm}"
+WASM_DAO_PROBE="${WASM_DAO_PROBE:-$REPO_ROOT/keystore-dao-contract/target/near/migrate-probe/keystore_dao_contract.wasm}"
+WASM_WORKER_PROBE="${WASM_WORKER_PROBE:-$REPO_ROOT/register-contract/target/near/migrate-probe/register_contract.wasm}"
 FIXTURES="$REPO_ROOT/keystore-dao-contract/src/testdata"
 
 PASS=0
