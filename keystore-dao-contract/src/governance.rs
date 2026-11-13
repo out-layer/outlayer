@@ -56,9 +56,10 @@ pub const EXECUTION_WINDOW_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 
 const MIGRATE_GAS: Gas = Gas::from_tgas(60);
 const HEALTH_GAS: Gas = Gas::from_tgas(20);
-/// Gas for a governed contract's `upgrade` / `upgrade_and_migrate`: deploying the wasm on
-/// itself costs ~70 Tgas per MB, then its `migrate` (60) and `gov_health` (20). Passing ~1 MB
-/// as the call's argument costs the DAO another ~50 Tgas, so `execute` fits in 300 Tgas.
+/// The least gas a governed contract's `upgrade` / `upgrade_and_migrate` gets: deploying the
+/// wasm on itself, then its `migrate` (60) and `gov_health` (20). The call also takes all the
+/// gas `execute` leaves unused (weight 1), so a larger wasm needs only more gas on `execute`,
+/// never a new DAO release.
 const REMOTE_UPGRADE_GAS: Gas = Gas::from_tgas(180);
 
 /// Raw storage key of a stored blob's bytes. Outside the `StorageKey` prefix table (one borsh
@@ -193,6 +194,20 @@ impl From<VersionedGovProposal> for GovProposal {
     }
 }
 
+/// Methods of a governed contract that replace one of its roles: its owner, its governance, its
+/// operator. A `Call` to one of them is a role change (`role_of`).
+const GOVERNED_ROLE_METHODS: [&str; 3] = ["set_owner", "set_governance", "set_operator"];
+
+/// A role a governance proposal changes.
+enum Role<'a> {
+    /// This contract's owner (`SetOwner`).
+    Owner,
+    /// A governed contract's owner, governance or operator (a `Call` to that method).
+    Governed { method: &'a str, target: &'a AccountId },
+    /// One account's membership (`AddMember` / `RemoveMember`).
+    Member(&'a AccountId),
+}
+
 impl KeystoreDao {
     pub(crate) fn gov_get(&self, proposal_id: u64) -> Option<GovProposal> {
         self.gov_proposals.get(&proposal_id).map(GovProposal::from)
@@ -200,6 +215,35 @@ impl KeystoreDao {
 
     fn gov_put(&mut self, p: &GovProposal) {
         self.gov_proposals.insert(&p.id, &VersionedGovProposal::V1(p.clone()));
+    }
+
+    /// The role a proposal changes, if any. The one list of roles: `execute` orders proposals
+    /// by it (`role_key`) and `cancel` keeps the owner from stopping its own replacement by it.
+    fn role_of(action: &GovAction) -> Option<Role<'_>> {
+        match action {
+            GovAction::SetOwner { .. } => Some(Role::Owner),
+            GovAction::Call { target, method, .. } if GOVERNED_ROLE_METHODS.contains(&method.as_str()) => {
+                Some(Role::Governed { method: method.as_str(), target })
+            }
+            GovAction::AddMember { member } | GovAction::RemoveMember { member } => Some(Role::Member(member)),
+            _ => None,
+        }
+    }
+
+    /// Of two approved proposals for one role, the newer decision wins: once a proposal has
+    /// changed a role, an older proposal for the same role no longer executes. Otherwise a
+    /// duplicate approved earlier could be executed by a single member after the majority
+    /// decided otherwise.
+    fn role_key(action: &GovAction) -> Option<String> {
+        Self::role_of(action).map(|role| match role {
+            Role::Owner => format!("set_owner:{}", env::current_account_id()),
+            Role::Governed { method, target } => format!("{}:{}", method, target),
+            Role::Member(member) => format!("member:{}", member),
+        })
+    }
+
+    fn role_changes() -> LookupMap<String, u64> {
+        LookupMap::new(StorageKey::RoleChanges)
     }
 
     /// Delay for a fresh or migrated contract when none is given (see `MAINNET_GOV_DELAY_SEC`).
@@ -214,7 +258,11 @@ impl KeystoreDao {
 
     fn validate_gov_action(&self, action: &GovAction) {
         match action {
-            GovAction::Upgrade { code_hash, .. } => {
+            GovAction::Upgrade { target, code_hash, .. } => {
+                require!(
+                    *target != self.mpc_contract_id,
+                    "An Upgrade proposal cannot target the MPC contract"
+                );
                 require!(
                     self.blobs.get(code_hash).is_some(),
                     format!("No blob {} stored; store_blob the wasm first", String::from(code_hash))
@@ -265,6 +313,12 @@ impl KeystoreDao {
             }
             GovAction::SetOwner { owner } => {
                 require!(*owner != self.owner_id, "Already the owner");
+                // This contract cannot sign as its own owner: the brake would be gone until
+                // another SetOwner.
+                require!(
+                    *owner != env::current_account_id(),
+                    "The owner cannot be this contract itself"
+                );
             }
         }
     }
@@ -455,6 +509,19 @@ impl KeystoreDao {
         );
         // The same checks as at proposal time, against the state now.
         self.validate_gov_action(&p.action);
+        if let Some(role) = Self::role_key(&p.action) {
+            let mut changes = Self::role_changes();
+            if let Some(last) = changes.get(&role) {
+                require!(
+                    p.id > last,
+                    format!(
+                        "Proposal {} for {} is older than proposal {}, which already changed it",
+                        p.id, role, last
+                    )
+                );
+            }
+            changes.insert(&role, &p.id);
+        }
 
         p.status = GovStatus::Executed;
         self.gov_put(&p);
@@ -467,11 +534,12 @@ impl KeystoreDao {
                     PromiseOrValue::Promise(Self::self_upgrade_batch(code, migrate))
                 } else {
                     let method = if migrate { "upgrade_and_migrate" } else { "upgrade" };
-                    PromiseOrValue::Promise(Promise::new(target).function_call(
+                    PromiseOrValue::Promise(Promise::new(target).function_call_weight(
                         method.to_string(),
                         code,
                         NearToken::from_yoctonear(0),
                         REMOTE_UPGRADE_GAS,
+                        near_sdk::GasWeight(1),
                     ))
                 }
             }
@@ -484,6 +552,7 @@ impl KeystoreDao {
                 ))
             }
             GovAction::ApproveMeasurements { measurements } => {
+                let measurements = measurements.lowercase();
                 if !self.approved_measurements.contains(&measurements) {
                     self.approved_measurements.push(measurements.clone());
                 }
@@ -496,6 +565,7 @@ impl KeystoreDao {
                 PromiseOrValue::Value(true)
             }
             GovAction::RevokeMeasurements { measurements } => {
+                let measurements = measurements.lowercase();
                 self.approved_measurements.retain(|m| m != &measurements);
                 env::log_str(&format!(
                     "measurements_revoked mrtd={} rtmr3={} total={}",
@@ -553,13 +623,9 @@ impl KeystoreDao {
             matches!(p.status, GovStatus::Pending | GovStatus::Approved),
             "Only a pending or approved proposal can be cancelled"
         );
-        let replaces_a_role = match &p.action {
-            GovAction::SetOwner { .. } => true,
-            GovAction::Call { method, .. } => {
-                matches!(method.as_str(), "set_owner" | "set_governance" | "set_operator")
-            }
-            _ => false,
-        };
+        // Membership is the members' own business; the owner is kept from stopping only the
+        // replacement of an owner, a governance or an operator.
+        let replaces_a_role = matches!(Self::role_of(&p.action), Some(Role::Owner | Role::Governed { .. }));
         require!(
             !replaces_a_role,
             "A proposal that replaces the owner cannot be cancelled by the owner; members can vote it down"
@@ -645,6 +711,11 @@ impl KeystoreDao {
         (from_index..from_index.saturating_add(limit).min(self.next_proposal_id))
             .filter_map(|i| self.gov_get(i))
             .collect()
+    }
+
+    /// Id of the last executed proposal that changed `role` (`role_key`).
+    pub fn get_last_role_change(&self, role: String) -> Option<u64> {
+        Self::role_changes().get(&role)
     }
 
     pub fn get_gov_delay_sec(&self) -> u64 {

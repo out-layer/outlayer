@@ -1,6 +1,5 @@
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::json_types::Base58CryptoHash;
 use near_sdk::{env, near_bindgen, require, AccountId, Allowance, CurveType, Gas, NearToken, Promise, PublicKey, BorshStorageKey};
 use schemars::JsonSchema;
 
@@ -52,6 +51,21 @@ pub struct ApprovedMeasurements {
     pub rtmr3: String,
 }
 
+impl ApprovedMeasurements {
+    /// The one form every entry is stored and compared in: lowercase hex, as a quote's
+    /// measurements are read. Hex is accepted in either case, so a value written in uppercase
+    /// would otherwise never match: a revoke would silently remove nothing.
+    pub fn lowercase(self) -> Self {
+        Self {
+            mrtd: self.mrtd.to_ascii_lowercase(),
+            rtmr0: self.rtmr0.to_ascii_lowercase(),
+            rtmr1: self.rtmr1.to_ascii_lowercase(),
+            rtmr2: self.rtmr2.to_ascii_lowercase(),
+            rtmr3: self.rtmr3.to_ascii_lowercase(),
+        }
+    }
+}
+
 /// Register Contract - TEE Worker Key Registration
 ///
 /// This contract verifies TDX attestations and registers worker public keys
@@ -73,6 +87,12 @@ pub struct ApprovedMeasurements {
 /// Max number of cached quote collaterals (one per platform/FMSPC, e.g. Phala + self-hosted).
 /// register_worker_key tries each until the worker's quote verifies; keep small (gas).
 const MAX_COLLATERALS: usize = 2;
+/// Largest collateral string a slot accepts. Real Intel TDX collateral (certificates, TCB
+/// info, QE identity, CRLs) is about 20 KB; the bound leaves room for it to grow. Slots
+/// live in the root state that every state-changing call loads, so an unbounded slot
+/// would let the owner key push governance's own calls past their gas, the replacement
+/// of that owner included.
+const MAX_COLLATERAL_BYTES: usize = 128 * 1024;
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize)]
@@ -388,6 +408,11 @@ impl RegisterContract {
     /// the others, so a mixed fleet coexists.
     pub fn update_collateral(&mut self, collateral: String, index: u32) {
         self.assert_owner();
+        assert!(
+            collateral.len() <= MAX_COLLATERAL_BYTES,
+            "collateral must be at most {} bytes",
+            MAX_COLLATERAL_BYTES
+        );
         let i = index as usize;
         assert!(i < MAX_COLLATERALS, "index must be < {} (MAX_COLLATERALS)", MAX_COLLATERALS);
         if i < self.collaterals.len() {
@@ -410,6 +435,7 @@ impl RegisterContract {
     pub fn add_approved_measurements(&mut self, measurements: ApprovedMeasurements, clear_others: Option<bool>) {
         self.assert_governance();
         Self::validate_measurements(&measurements);
+        let measurements = measurements.lowercase();
 
         if clear_others.unwrap_or(false) {
             let count = self.approved_measurements.len();
@@ -433,6 +459,7 @@ impl RegisterContract {
     /// takes a right away, so it needs no vote.
     pub fn remove_approved_measurements(&mut self, measurements: ApprovedMeasurements) {
         self.assert_owner_or_governance();
+        let measurements = measurements.lowercase();
         self.approved_measurements.retain(|m| m != &measurements);
         env::log_str(&format!("Approved measurements removed. Remaining: {}", self.approved_measurements.len()));
     }
@@ -527,7 +554,7 @@ impl RegisterContract {
 
     /// Check if measurements are approved
     pub fn is_measurements_approved(&self, measurements: ApprovedMeasurements) -> bool {
-        self.approved_measurements.contains(&measurements)
+        self.approved_measurements.contains(&measurements.lowercase())
     }
 
     /// Get cached collateral at slot 0 (backward-compatible; None if no slots set)
@@ -560,8 +587,7 @@ impl RegisterContract {
         let code = env::input().unwrap_or_default();
         require!(!code.is_empty(), "upgrade takes the wasm as the raw input of the call");
         env::log_str(&format!(
-            "upgrade code_hash={} size={} migrate={}",
-            String::from(&Base58CryptoHash::from(env::sha256_array(&code))),
+            "upgrade size={} migrate={}",
             code.len(),
             migrate
         ));

@@ -46,8 +46,19 @@ delay are the root of trust. Every governance method is for DAO members only.
   pending or approved proposal — except one that replaces a role (`SetOwner`, or a
   `Call` to `set_owner` / `set_governance` / `set_operator` on a governed
   contract), which members can only vote down — revokes keystore builds without a vote, keeps
-  the Intel collateral current, and deletes keystore registrations that have
-  been pending for more than a day.
+  the Intel collateral current, rejects a pending keystore registration, and deletes
+  keystore registrations that have been pending for more than 48 h.
+- **The newer decision on a role wins.** A role is this contract's owner, a governed
+  contract's owner, governance or operator (`SetOwner`, a `Call` to `set_owner` /
+  `set_governance` / `set_operator`, per target), or one account's membership
+  (`AddMember` / `RemoveMember`). Once a proposal has changed a role, an older proposal for
+  the same role no longer executes, so an approved duplicate cannot undo a later decision.
+  `get_last_role_change(role)` returns the id of the last one, `role` as
+  `set_owner:<this account>`, `<method>:<target>` or `member:<account>`.
+- **Upgrade gas.** A governed contract's `upgrade` / `upgrade_and_migrate` gets at least
+  180 TGas and every unused TGas of `execute`, so a larger wasm needs only more gas on
+  `execute`. An `Upgrade` never targets the MPC contract; `SetOwner` never names this
+  contract.
 - **Only keystore keys reach the master.** `request_key`, `mark_vault_verified`
   and the self-call of `ban_vault` require the call to come from this account
   AND be signed with a key in `approved_keystores` — a key installed by a
@@ -118,7 +129,10 @@ keystore (Intel TDX)                     dao.outlayer.near                    MP
      it to equal the quote's;
    - creates a `Pending` proposal and returns its id.
 4. DAO members call `vote(proposal_id, approve)`.
-5. When enough current members approve, the contract adds the key to its own
+5. When enough current members approve, the contract checks the build again: if its
+   measurements were revoked while the registration waited (by the owner or by a
+   `RevokeMeasurements` proposal), the proposal ends `Rejected` and nothing is installed.
+   Otherwise the contract adds the key to its own
    account as a function-call key: receiver = the contract itself, methods
    `request_key`, `mark_vault_verified`, `ban_vault`, **unlimited allowance**.
    The key goes into `approved_keystores` and the proposal ends `Executed`.
@@ -209,9 +223,13 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
   `propose_revoke_keystore_keys`.
 - `update_collateral(collateral, index)` — `collateral` is the
   `QuoteCollateralV3` JSON as a string; `index` is the slot, `0` or `1` (at most
-  two slots, one per platform FMSPC). A slot is replaced in place, and a new
-  slot may only be the next index. The contract stores it as given; a
-  registration verifies the quote against it.
+  two slots, one per platform FMSPC), at most 128 KiB each. A slot is replaced
+  in place, and a new slot may only be the next index. The contract stores it
+  as given; a registration verifies the quote against it.
+- `reject_registration(proposal_id)` — a keystore registration still `Pending`
+  becomes `Rejected` and no vote can install its key. A brake: it installs,
+  approves and votes nothing, so its worst use is rejecting a good
+  registration, whose keystore then restarts and submits again.
 - `remove_stale_proposals(proposal_ids) -> u32` — deletes keystore registration
   proposals still `Pending` more than 48 h after they were made (a keystore
   stops waiting for its vote after 24 h); other ids are skipped.
@@ -244,7 +262,9 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 - `is_keystore_approved(public_key)` — `public_key` as a string; an unparsable
   key returns `false`
 - `get_approved_keystores(from_index, limit)`
-- `get_approved_measurements()`, `is_measurements_approved(measurements)`
+- `get_approved_measurements()`, `is_measurements_approved(measurements)` — measurements
+  are 96 hex characters each, accepted in either case and stored, revoked and compared in
+  lowercase, as a quote is read
 - `get_dao_members()`, `get_owner()`, `get_config()`
 - `get_gov_proposal(proposal_id)`, `get_gov_proposals(from_index, limit)`,
   `get_gov_delay_sec()`, `get_blob(hash)`

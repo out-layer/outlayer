@@ -146,6 +146,7 @@ pub struct KeystoreDaoV4 {
     pub revoke_proposals: LookupMap<u64, RevokeKeysProposal>,
 }
 
+#[cfg(not(feature = "migrate-probe"))]
 #[near_bindgen]
 impl KeystoreDao {
     /// Migrate V4 → V5: adds the governance state — no proposals, no pending upgrades, and
@@ -187,3 +188,16 @@ impl KeystoreDao {
         }
     }
 }
+
+/// `migrate-probe` (tests only): the shape every later release's `migrate()` has — no arguments,
+/// called by the governed upgrade batch — reading this release's layout unchanged.
+#[cfg(feature = "migrate-probe")]
+#[near_bindgen]
+impl KeystoreDao {
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        env::state_read().expect("failed to read V5 state")
+    }
+}
+

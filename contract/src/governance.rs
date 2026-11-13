@@ -15,7 +15,6 @@
 //! governance, `gov_health()`.
 
 use crate::*;
-use near_sdk::json_types::Base58CryptoHash;
 use near_sdk::{assert_one_yocto, require, Promise};
 
 const MIGRATE_GAS: Gas = Gas::from_tgas(60);
@@ -29,8 +28,7 @@ impl Contract {
         let code = env::input().unwrap_or_default();
         require!(!code.is_empty(), "upgrade takes the wasm as the raw input of the call");
         log!(
-            "upgrade code_hash={} size={} migrate={}",
-            String::from(&Base58CryptoHash::from(env::sha256_array(&code))),
+            "upgrade size={} migrate={}",
             code.len(),
             migrate
         );
@@ -117,10 +115,11 @@ impl Contract {
             None => {
                 // NEAR leaving through governance counts against the platform's fees first, so
                 // the owner's bounded withdrawal never draws on what is no longer there.
-                self.platform_near_withdrawn = self
-                    .platform_near_withdrawn
-                    .saturating_add(amount.0)
-                    .min(self.total_fees_collected);
+                // Not clamped to what was collected: an owner withdrawal in flight may be
+                // credited back on failure, and a clamp would erase this transfer from the
+                // count. `platform_near_available` saturates at zero.
+                self.platform_near_withdrawn =
+                    self.platform_near_withdrawn.saturating_add(amount.0);
                 Promise::new(receiver_id).transfer(NearToken::from_yoctonear(amount.0))
             }
             Some(token) => Promise::new(token).function_call(
@@ -169,10 +168,13 @@ impl Contract {
 
     /// The transfer's outcome, read as success or failure only.
     #[private]
-    pub fn on_platform_near_withdrawn(&mut self, amount: U128, receiver_id: AccountId) {
-        let failed = env::promise_results_count() != 1
-            || matches!(env::promise_result(0), near_sdk::PromiseResult::Failed);
-        if failed {
+    pub fn on_platform_near_withdrawn(
+        &mut self,
+        #[callback_result] transfer: Result<(), near_sdk::PromiseError>,
+        amount: U128,
+        receiver_id: AccountId,
+    ) {
+        if transfer.is_err() {
             self.platform_near_withdrawn = self.platform_near_withdrawn.saturating_sub(amount.0);
             log!(
                 "Platform NEAR withdrawal to {} failed; {} yoctoNEAR is available again",
@@ -306,7 +308,47 @@ mod tests {
         let _ = c.gov_transfer(None, U128(600), a("treasury.testnet"));
         assert_eq!(c.get_platform_near().2, U128(400));
         let _ = c.gov_transfer(None, U128(5_000), a("treasury.testnet"));
-        assert_eq!(c.get_platform_near(), (U128(1_000), U128(1_000), U128(0)));
+        assert_eq!(c.get_platform_near(), (U128(1_000), U128(5_600), U128(0)));
+    }
+
+    /// A governance transfer made while an owner withdrawal is in flight stays
+    /// counted when that withdrawal fails and is credited back.
+    #[test]
+    fn a_governance_transfer_survives_a_failed_owner_withdrawal() {
+        let mut c = contract();
+        c.total_fees_collected = 1_000;
+        at("owner.testnet", 1);
+        let _ = c.withdraw_platform_near(U128(1_000), a("missing.testnet"));
+        at("dao.testnet", 0);
+        let _ = c.gov_transfer(None, U128(100), a("treasury.testnet"));
+        at("outlayer.testnet", 0);
+        c.on_platform_near_withdrawn(
+            Err(near_sdk::PromiseError::Failed),
+            U128(1_000),
+            a("missing.testnet"),
+        );
+        assert_eq!(c.get_platform_near(), (U128(1_000), U128(100), U128(900)));
+    }
+
+    #[test]
+    #[should_panic(expected = "event standard and version must be at most 64 bytes")]
+    fn a_long_event_standard_is_refused() {
+        let mut c = contract();
+        at("owner.testnet", 0);
+        c.set_event_metadata(Some("s".repeat(65)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "a plan name must be at most 64 bytes")]
+    fn a_long_plan_name_is_refused() {
+        let mut c = contract();
+        at("owner.testnet", 0);
+        c.set_subscription_plans(vec![crate::payment::SubscriptionPlan {
+            index: 0,
+            name: "p".repeat(65),
+            price_usd: U128(1),
+            active: true,
+        }]);
     }
 
     #[test]
@@ -373,7 +415,11 @@ mod tests {
             Default::default(),
             vec![PromiseResult::Failed],
         );
-        c.on_platform_near_withdrawn(U128(700), a("missing.testnet"));
+        c.on_platform_near_withdrawn(
+            Err(near_sdk::PromiseError::Failed),
+            U128(700),
+            a("missing.testnet"),
+        );
         assert_eq!(c.get_platform_near().2, U128(1_000));
     }
 

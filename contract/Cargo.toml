@@ -14,6 +14,12 @@ image_digest = "sha256:a9d8bee7b134856cc8baa142494a177f2ba9ecfededfcdd38f634e14c
 passed_env = []
 container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked"]
 
+[features]
+# `migrate-probe`: a TEST build whose `migrate()` takes no arguments and reads the current
+# layout as it is, for tests/dao/upgrade_e2e.sh to prove a governed upgrade with migrate.
+# Never deployed outside a test set.
+migrate-probe = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

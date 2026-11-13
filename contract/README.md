@@ -74,8 +74,9 @@ near call outlayer.testnet request_execution '{
   a field left out takes its default (1 billion, 128 MB, 60 s). **Always pass
   it, even as `{}`**: a request without `resource_limits` is compile-only and
   runs nothing.
-- `input_data` — the guest's stdin. 10,000 bytes and more is left out of the
-  event and read by the worker from state (`get_request`).
+- `input_data` — the guest's stdin, at most 1.5 MiB (what one transaction
+  carries). 10,000 bytes and more is left out of the event and read by the
+  worker from state (`get_request`).
 - `secrets_ref` — `{profile, account_id}`: the secret row the run asks the
   keystore for. `profile` must satisfy the rule `store_secrets` applies (1–64
   bytes of letters, digits, `-` or `_`); a reference no row could match is
@@ -108,15 +109,32 @@ operation, and `attached_usd` must be at least its price. The excess comes back
 to the caller's stablecoin balance at settlement. Not applied to compile-only
 requests.
 
-**Deposit.** `estimate_execution_cost(resource_limits, input_len)` is what to
-attach: the compute estimate for the limits
+**Deposit.** `estimate_execution_cost(resource_limits, input_len, output_len)` is
+what to attach: the compute estimate for the limits
 (`base_fee + max_instructions/1e6 × per_million_instructions_fee + max_execution_seconds × 1000 × per_ms_fee`),
 plus — for an `input_data` longer than 32 KB — 0.00001 NEAR per byte above
-that, held while the request is pending and returned at settlement. A
-compile-only request requires the base fee.
+that, plus 0.00001 NEAR per byte of a stored output. Both are held while the
+request is pending and returned at settlement. A compile-only request requires
+the base fee.
 
-**Gas.** The settlement callback is created with 50 TGas taken from the gas
-attached to the call, so attach more than that (the example uses 100 TGas).
+An output of 1024 bytes or more is stored in the contract until the request
+settles, and every byte of it is paid: it must fit in what the payment has
+left above the run's cost and the input's deposit. Its size is known only when
+the run ends, so this is checked then. An output that does not fit is not
+stored, and the request fails with an error starting `output_storage_unpaid:`
+that names the bytes and the deposit they need; the run's cost is charged and
+the rest refunded. A stored output is at most 1.5 MiB
+(`MAX_STORED_OUTPUT_BYTES`); a larger one fails the request with an error
+starting `output_too_large:`. Keep `input_data` and the output together under
+about 2 MB: the worker delivers a stored output in one transaction, and above
+that its gas does not cover writing it, so the request ends at its timeout.
+A caller whose guest may answer 1 KB or more attaches more
+NEAR — the estimate with the largest `output_len` it expects, or simply a
+larger deposit: whatever the run does not use comes back. An output under
+1024 bytes travels with the answer and needs nothing.
+
+**Gas.** Attach at least 100 TGas to `request_execution`; 200 TGas is
+recommended. The settlement callback is created with 50 TGas taken from it.
 Above 32 KB of input it gets 25 MGas more per byte (about 52 TGas more for
 2 MiB).
 
@@ -140,19 +158,42 @@ whole when the run fails or times out; on a success the price goes to the
 project (split with the author for a priced project), less the guest's own
 refund, and any change returns to the caller.
 
-#### `cancel_stale_execution`
+#### `cancel_stale_execution`, `cancel_stale_executions`
 
-Only the request's sender, only after 10 minutes. Returns the whole of the
-stablecoin and the NEAR above the charge, the storage part of a large input
-always included. The charge is the base fee when no output was delivered — as
+Anyone, only once the request is stale: 400 blocks after its admission
+(`STALE_AFTER_BLOCKS`, twice the yield window, whatever the block time); a
+request admitted before this release, 10 minutes. The outcome is the same
+whoever calls. A request still pending then is one whose callback never
+settled it, and it holds the contract's storage until removed.
+
+Every `request_execution` removes such requests itself before it stores its
+own: from a cursor at the oldest pending id it looks at up to 16 ids, through a
+small record of each (admission block, bytes held) rather than the request
+itself, settles up to 2 stale ones holding at most 256 KB of input and output,
+and stops at the first live one. The space they held pays for the new request in the same
+transaction, so stuck requests never keep the next caller out, and whoever made
+them pays for their removal by making more. It runs only when the caller
+attached 40 TGas beyond its own callback's gas. A larger stuck request is left
+to `cancel_stale_executions`. Returns the whole of the stablecoin to the
+sender and the NEAR above the charge to the payer, the storage part of a large
+input always included, whatever the prices are now. The charge is the base fee when no output was delivered — as
 a timed-out request pays — and the compute estimate for the limits when the
 worker has delivered the output through the 2-call flow and the callback never
 settled it: the run happened and its output is readable with
-`get_pending_output`.
+`get_pending_output` until the request is cancelled. After that the output is still in the
+chain history, in the arguments of the worker's `submit_execution_output_and_resolve`.
 
 ```bash
 near call outlayer.testnet cancel_stale_execution '{"request_id": 123}' --accountId user.testnet
 ```
+
+`cancel_stale_executions(request_ids)` does the same for up to 100 requests in
+one call and returns how many it cancelled; a request that is gone or not yet
+stale is skipped. One transaction's fixed cost (~2 TGas) is shared: a small
+request costs ~1.2 TGas with its refund, less than it is charged; one holding
+32 KB of input and 32 KB of output ~3.9 TGas. A hundred of those exceed the
+300 TGas of a transaction, and a call that runs out of gas reverts whole, so
+size batches by what the requests hold: `scripts/cancel_stale_requests.sh` does.
 
 ### Operator Functions
 
@@ -215,7 +256,7 @@ governed by its owner until the owner calls `set_governance`.
 | `set_payment_token_contract(token_contract?)` | The stablecoin `ft_on_transfer` accepts and earnings are paid in; `null` clears it. The contract account must be registered on the token (`storage_deposit`) |
 | `set_governance(governance_id)` | Hand governance to another account |
 | `upgrade()` / `upgrade_and_migrate()` | Deploy the wasm given as the raw input of the call (not JSON) on this account: one atomic batch, deploy [+ `migrate()`] + `gov_health()`; a failing step leaves the old code. Every version keeps these, `migrate()` without arguments and `gov_health()` |
-| `gov_transfer(token?, amount, receiver_id)` | Move any balance of the contract — NEAR (`token: null`) or a fungible token: the rescue for money stuck by a bug |
+| `gov_transfer(token?, amount, receiver_id)` | Move any balance of the contract — NEAR (`token: null`) or a fungible token: the rescue for money stuck by a bug. NEAR moved this way counts as withdrawn platform fees, even beyond what was collected, so it lowers what the owner's `withdraw_platform_near` can take from fees collected later |
 
 ### Owner Functions
 
@@ -225,13 +266,13 @@ All `assert_owner`. None of them changes code, roles or the payment token.
 |---|---|
 | `set_paused(paused)` | Pause: refuses `request_execution`, `create_project`, `add_version`, `accept_project_transfer`, `store_wallet_policy`, `unfreeze_wallet`, `set_storage_refund_to`, `top_up_payment_key_with_near`. `freeze_wallet` works while paused |
 | `set_pricing(base_fee?, per_million_instructions_fee?, per_ms_fee?, per_compile_ms_fee?, base_fee_usd?, per_million_instructions_fee_usd?, per_sec_fee_usd?, per_compile_ms_fee_usd?)` | NEAR prices (yoctoNEAR) and HTTPS API prices (stablecoin minimal units); each `U128` string, an omitted one is unchanged |
-| `set_subscription_plans(plans)` | Replace the plan list: `[{index, name, price_usd, active}]`, at most 16, unique indexes, each named and priced; an index already in the list keeps its name |
+| `set_subscription_plans(plans)` | Replace the plan list: `[{index, name, price_usd, active}]`, at most 16, unique indexes, each named (at most 64 bytes) and priced; an index already in the list keeps its name |
 | `set_project_pricing(project_id, pricing)` | Price an existing project: `{author_account_id, operations: [{operation, price_usd, developer_share_bp}]}`, 1–32 unique operations, share ≤ 10000 bp |
 | `remove_project_pricing(project_id)` | Unprice a project |
-| `set_event_metadata(standard?, version?)` | The NEP-297 `standard` / `version` events carry |
+| `set_event_metadata(standard?, version?)` | The NEP-297 `standard` / `version` events carry, at most 64 bytes each |
 | `emergency_cancel_execution(request_id)` | Cancel one pending request; refunds the whole NEAR deposit and the stablecoin |
 | `cancel_pending_requests(request_ids)` → `u64` | Cancel a list; refunds the NEAR deposit and the stablecoin |
-| `clear_all_pending_requests(limit?)` → `u64` | Cancel up to `limit` (default 100) pending requests from id 0; refunds NEAR and stablecoin |
+| `clear_all_pending_requests(from_id?, limit?)` → `u64` | Cancel up to `limit` (default 100, at least 1) pending requests, newest first from `from_id` (default the newest), over at most 1000 ids; refunds NEAR and stablecoin in full. Each request with a large stored output costs 50–75 TGas: pass a `limit` of about 5 then |
 | `withdraw_platform_near(amount, receiver_id)` (1 yocto) | NEAR fees the contract collected: at most `total_fees_collected` minus what was withdrawn; a failed transfer makes the amount available again |
 | `withdraw_platform_token(amount, receiver_id)` (1 yocto) | Stablecoin from the contract's balance, **without a bound**: the balance holds the platform's revenue together with users' unspent payment-key balances, deposited balances and developer earnings, and the contract cannot tell them apart (payment keys are spent off chain). The owner key is trusted with it |
 
@@ -244,12 +285,13 @@ near call outlayer.testnet set_pricing '{"base_fee": "1000000000000000000000"}' 
 | Method | Answer |
 |---|---|
 | `get_request(request_id)` | The pending `ExecutionRequest`, or `null` once settled |
-| `get_pending_request_ids(from_index?, limit?)` | Pending ids (default limit 100) |
+| `get_pending_request_ids(from_id?, limit?)` → `{ids, next_from_id}` | Pending ids, newest first from `from_id` (default the newest), at most `limit` (default 100, at least 1) out of at most 1000 ids looked at; `next_from_id` continues the scan, `null` once id 0 was looked at. `scripts/cancel_stale_requests.sh` pages through it |
+| `get_request_status(request_id)` | A pending request without its input and output: sender, payer, timestamp, payment, `output_submitted`, `input_bytes`, `output_bytes`, and `stale` (past `EXECUTION_TIMEOUT` at this block). `get_request` also returns the input and output, which past ~1.3 MB a view cannot return |
 | `get_pending_output(request_id)` / `has_pending_output(request_id)` | Output delivered through the 2-call flow, not yet settled |
 | `get_stats()` | `[total_executions, total_fees_collected]` |
 | `get_pricing()` | `[base_fee, per_million_instructions_fee, per_ms_fee, per_compile_ms_fee]` |
 | `get_pricing_full()` | The NEAR prices and the HTTPS API prices (`base_fee_usd`, `per_million_instructions_fee_usd`, `per_sec_fee_usd`, `per_compile_ms_fee_usd`) |
-| `estimate_execution_cost(resource_limits?, input_len?)` | Deposit for `request_execution`, yoctoNEAR |
+| `estimate_execution_cost(resource_limits?, input_len?, output_len?)` | Deposit for `request_execution`, yoctoNEAR: compute estimate, plus the storage of input above 32 KB and of every output byte |
 | `get_max_limits()` | `[max_instructions, max_execution_seconds, max_compilation_seconds]` |
 | `get_config()` | `[owner, operator]` |
 | `get_event_metadata()` | `[standard, version]` |
@@ -759,10 +801,11 @@ cap. The ledger entry's bytes are part of the key's storage deposit
 - Top-up with the stablecoin: `ft_on_transfer` with `top_up_payment_key` (see
   [Stablecoin](#stablecoin-deposits-and-earnings)).
 - `top_up_payment_key_with_near(nonce, swap_contract_id)` (payable) — **mainnet
-  only** (NEAR Intents). Wraps the attached NEAR minus 0.01 NEAR to wNEAR,
+  only** (NEAR Intents). Wraps the attached NEAR minus 0.015 NEAR to wNEAR,
   sends it to `swap_contract_id` and requests a swap to the stablecoin through
-  the `publishintent.near/payment-keys-with-intents` project. Requires at least
-  0.01 NEAR above that 0.01 NEAR and an existing key of the caller's.
+  the `publishintent.near/payment-keys-with-intents` project; the 0.015 NEAR
+  pays that swap run. Requires at least 0.01 NEAR above the 0.015 NEAR and an
+  existing key of the caller's.
 - `top_up_payment_key_with_token(nonce, token_id, amount, swap_contract_id)` is
   disabled: it always panics.
 

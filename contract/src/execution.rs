@@ -244,6 +244,13 @@ impl Contract {
         // keeps it, so none has to know about it.
         let payment = env::attached_deposit().as_yoctonear();
         let input_len = input_data.as_ref().map_or(0, |d| d.len());
+        near_sdk::require!(
+            input_len <= MAX_INPUT_DATA_BYTES,
+            format!(
+                "input_data is {} bytes; at most {} (what one transaction can carry)",
+                input_len, MAX_INPUT_DATA_BYTES
+            )
+        );
         let input_storage = input_storage_deposit(input_len);
         let required_payment = estimated_cost + input_storage;
 
@@ -257,6 +264,13 @@ impl Contract {
             INPUT_DATA_FREE_BYTES,
             payment
         );
+
+        // Clean up stuck requests first: the space they free is what this request is stored in.
+        if env::prepaid_gas().saturating_sub(env::used_gas())
+            >= response_gas(input_len).saturating_add(SWEEP_GAS_RESERVE)
+        {
+            self.sweep_stale();
+        }
 
         let request_id = self.next_request_id;
         self.next_request_id += 1;
@@ -357,6 +371,10 @@ impl Contract {
 
         self.pending_requests
             .insert(&request_id, &execution_request);
+        request_meta().insert(
+            &request_id,
+            &RequestMeta { admitted_height: env::block_height(), held_bytes: input_len as u64 },
+        );
 
         // Emit event for workers to catch
         events::emit::execution_requested(&self.event_standard, &self.event_version, &request_data.to_string(), data_id);
@@ -373,7 +391,14 @@ impl Contract {
         // Only operator can submit execution data
         self.assert_operator();
 
-        self.submit_execution_output_internal(request_id, output);
+        // No resources are reported on this path: the compute estimate stands for the cost.
+        let stored = StoredOutput::from(output);
+        let request = self.pending_requests.get(&request_id).expect("Execution request not found");
+        let cost = self.estimate_cost(&request.resource_limits);
+        if let Some(reason) = self.output_refusal(request_id, stored.len(), cost) {
+            env::panic_str(&reason);
+        }
+        self.submit_execution_output_internal(request_id, stored);
     }
 
     /// Worker calls this to submit large output AND resolve in one transaction (recommended)
@@ -402,13 +427,25 @@ impl Contract {
         // Only operator can submit execution data
         self.assert_operator();
 
-        // Step 1: Store the large output
-        self.submit_execution_output_internal(request_id, output);
+        // An output the payment cannot hold is not stored: the request settles as failed, with
+        // what the run cost charged and the rest refunded, and the reason in its event.
+        let stored = StoredOutput::from(output);
+        let cost = self.calculate_cost(&resources_used);
+        // A refusal drops the compilation note: the reason must fit the yield-resume payload.
+        let (success, error, compilation_note) =
+            match self.output_refusal(request_id, stored.len(), cost) {
+                Some(reason) => (false, Some(reason), None),
+                None => {
+                    // Step 1: Store the large output
+                    self.submit_execution_output_internal(request_id, stored);
+                    (success, error, compilation_note)
+                }
+            };
 
         // Step 2: Immediately resolve with metadata only (no Promise needed!)
         let response = ExecutionResponse {
             success,
-            output: None, // Output already stored above
+            output: None, // Output already stored above, or refused
             error,
             resources_used,
             compilation_note,
@@ -485,9 +522,7 @@ impl Contract {
                         // The cap also keeps `total_fees_collected` honest when
                         // compile time — which `estimate_cost` does not
                         // include — takes the cost past the compute deposit.
-                        let storage_part = input_storage_deposit(
-                            request.input_data.as_ref().map_or(0, |d| d.len()),
-                        );
+                        let storage_part = held_storage(&request);
                         let chargeable = payment.0.saturating_sub(storage_part);
                         let cost = self.calculate_cost(&exec_response.resources_used).min(chargeable);
 
@@ -708,9 +743,7 @@ impl Contract {
                         // so the storage part of a large input always comes
                         // back. A failure before the guest ran reports little
                         // or nothing and costs about the base fee.
-                        let storage_part = input_storage_deposit(
-                            request.input_data.as_ref().map_or(0, |d| d.len()),
-                        );
+                        let storage_part = held_storage(&request);
                         let chargeable = payment.0.saturating_sub(storage_part);
                         let cost = self.calculate_cost(&exec_response.resources_used).min(chargeable);
 
@@ -765,8 +798,10 @@ impl Contract {
                     // Promise failed - refund NEAR (except base fee) and stablecoin
                     // Developer gets nothing on failure
 
-                    // Refund NEAR minus the base fee; the contract keeps at most what was paid.
-                    let kept = payment.0.min(self.base_fee);
+                    // Refund NEAR minus the base fee, taken from the compute part only: the
+                    // storage part of a large input or output comes back whatever the price is.
+                    let storage_part = held_storage(&request);
+                    let kept = payment.0.saturating_sub(storage_part).min(self.base_fee);
                     let refund = payment.0 - kept;
                     if refund > 0 {
                         near_sdk::Promise::new(request.payer_account_id.clone())
@@ -803,11 +838,14 @@ impl Contract {
         }
     }
 
-    /// Cancel a request that is still pending after `EXECUTION_TIMEOUT`.
-    ///
-    /// The sender gets back the NEAR above what the request is charged — the
-    /// storage part of a large input always included — and the whole of the
-    /// stablecoin. What is charged depends on whether the work was done:
+    /// Cancel a request that is still pending after `EXECUTION_TIMEOUT`. Anyone may call it:
+    /// the outcome does not depend on the caller. The payer gets back the NEAR above what the
+    /// request is charged — the storage part of a large input always included — and the
+    /// sender the whole of the stablecoin. A request still pending after the timeout is one
+    /// whose callback never settled it (its yield is long spent), and its input and output
+    /// hold the contract's storage until it is removed; letting anyone remove it means no one
+    /// has to wait for the sender, or the owner, to free it. What is charged depends on
+    /// whether the work was done:
     ///
     /// * output not delivered: the base fee, as a timed-out request pays —
     ///   admitted and announced, and a cancel that cost nothing would make a
@@ -827,17 +865,81 @@ impl Contract {
             .get(&request_id)
             .expect("Execution request not found");
 
-        // Ensure the caller is the original sender
-        assert_eq!(
-            env::predecessor_account_id(),
-            request.sender_id,
-            "Only the sender can cancel this execution"
+        assert!(
+            is_stale(request_id, request.timestamp),
+            "Execution is not yet stale, please wait"
         );
 
-        // Check if the timeout period has passed
-        let is_stale = env::block_timestamp() > request.timestamp + EXECUTION_TIMEOUT;
-        assert!(is_stale, "Execution is not yet stale, please wait");
+        self.settle_stale(request_id);
+    }
 
+    /// `cancel_stale_execution` for many requests in one call, by anyone. A
+    /// request that is gone or not yet stale is skipped, not refused, so one
+    /// settled in the meantime does not fail the rest. Returns how many were
+    /// cancelled. A batch shares one transaction's fixed cost: the cleanup of
+    /// small stuck requests costs less gas than what each one is charged.
+    pub fn cancel_stale_executions(&mut self, request_ids: Vec<u64>) -> u32 {
+        near_sdk::require!(
+            request_ids.len() <= MAX_STALE_CANCEL_BATCH,
+            format!("At most {} requests per call", MAX_STALE_CANCEL_BATCH)
+        );
+        let mut cancelled = 0;
+        for request_id in request_ids {
+            let stale = self
+                .pending_requests
+                .get(&request_id)
+                .map_or(false, |r| is_stale(request_id, r.timestamp));
+            if stale && self.settle_stale(request_id) {
+                cancelled += 1;
+            }
+        }
+        log!("Cancelled {} stale executions", cancelled);
+        cancelled
+    }
+
+    /// The oldest pending ids, from the sweep cursor up, judged by their
+    /// `RequestMeta` alone: a gone id is passed, a stale one holding at most
+    /// `SWEEP_MAX_HELD_BYTES` is settled, a larger stale one is passed (left
+    /// to `cancel_stale_executions`), and a live one stops the sweep — every
+    /// later id is newer. Ids grow with blocks, so the oldest pending request
+    /// is always the first to go stale.
+    pub(crate) fn sweep_stale(&mut self) {
+        let start = env::storage_read(SWEEP_CURSOR_KEY)
+            .and_then(|b| b.try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+        let mut metas = request_meta();
+        let (mut cursor, mut looks, mut settled) = (start, 0, 0);
+        while cursor < self.next_request_id && looks < SWEEP_MAX_LOOKS && settled < SWEEP_MAX_SETTLED {
+            looks += 1;
+            if !self.pending_requests.contains_key(&cursor) {
+                // Settled already: its meta goes with the cursor.
+                metas.remove(&cursor);
+                cursor += 1;
+                continue;
+            }
+            // The request itself is not read unless it is settled here.
+            let Some(meta) = metas.get(&cursor) else {
+                // Admitted before metas existed: left to the cancels.
+                cursor += 1;
+                continue;
+            };
+            if env::block_height() <= meta.admitted_height + STALE_AFTER_BLOCKS {
+                break;
+            }
+            if meta.held_bytes as usize <= SWEEP_MAX_HELD_BYTES && self.settle_stale(cursor) {
+                metas.remove(&cursor);
+                settled += 1;
+            }
+            cursor += 1;
+        }
+        if cursor != start {
+            env::storage_write(SWEEP_CURSOR_KEY, &cursor.to_le_bytes());
+        }
+    }
+
+    /// Settle a stale request: the one rule for `cancel_stale_execution` and
+    /// `cancel_stale_executions`. Returns whether it was there to settle.
+    fn settle_stale(&mut self, request_id: u64) -> bool {
         // Remove the request and return BOTH sides of what it took: the NEAR
         // above the charge, and the stablecoin admission debited for the
         // developers. A cancelled request earns the developers nothing, so
@@ -853,7 +955,8 @@ impl Contract {
             } else {
                 self.base_fee
             };
-            let kept = stale_request.payment.min(charge);
+            let storage_part = held_storage(&stale_request);
+            let kept = stale_request.payment.saturating_sub(storage_part).min(charge);
             let refund = stale_request.payment - kept;
             if refund > 0 {
                 near_sdk::Promise::new(stale_request.payer_account_id.clone())
@@ -876,6 +979,9 @@ impl Contract {
                 kept,
                 if stale_request.output_submitted { "the compute estimate: the output was delivered" } else { "the base fee" }
             );
+            true
+        } else {
+            false
         }
     }
 }
@@ -1016,7 +1122,33 @@ impl Contract {
     }
 
     /// Internal helper to submit execution output (used by both public methods)
-    pub(crate) fn submit_execution_output_internal(&mut self, request_id: u64, output: ExecutionOutput) {
+    /// Why `len` bytes of output cannot be stored, if they cannot: more than
+    /// `MAX_STORED_OUTPUT_BYTES`, or more than the payment holds — what is left
+    /// of it above the run's cost and the stored input must cover
+    /// `output_storage_deposit(len)`. The message names what to change.
+    pub(crate) fn output_refusal(&self, request_id: u64, len: usize, cost: Balance) -> Option<String> {
+        if len > MAX_STORED_OUTPUT_BYTES {
+            return Some(format!(
+                "{}: the output is {} bytes; at most {} can be stored",
+                OUTPUT_TOO_LARGE, len, MAX_STORED_OUTPUT_BYTES
+            ));
+        }
+        let request = self.pending_requests.get(&request_id).expect("Execution request not found");
+        let needed = output_storage_deposit(len);
+        let input = input_storage_deposit(request.input_data.as_ref().map_or(0, |d| d.len()));
+        let left = request.payment.saturating_sub(input).saturating_sub(cost);
+        if left >= needed {
+            return None;
+        }
+        // Short: it travels in the yield-resume payload (1024 bytes) with the rest of the response.
+        Some(format!(
+            "{}: the output is {} bytes and needs {} yoctoNEAR held for its storage; the payment had {} \
+             left after the run's cost. Attach more NEAR to request_execution: the rest is refunded",
+            OUTPUT_STORAGE_UNPAID, len, needed, left
+        ))
+    }
+
+    pub(crate) fn submit_execution_output_internal(&mut self, request_id: u64, stored_output: StoredOutput) {
         // Get the pending request
         let mut request = self
             .pending_requests
@@ -1029,10 +1161,14 @@ impl Contract {
             "Output already submitted for this request"
         );
 
-        // Store the output in the request (convert to internal storage format)
-        let stored_output: crate::StoredOutput = output.into();
+        let output_len = stored_output.len() as u64;
         request.pending_output = Some(stored_output);
         request.output_submitted = true;
+        let mut metas = request_meta();
+        if let Some(mut meta) = metas.get(&request_id) {
+            meta.held_bytes += output_len;
+            metas.insert(&request_id, &meta);
+        }
 
         // Save updated request
         self.pending_requests.insert(&request_id, &request);
@@ -1523,3 +1659,14 @@ mod a_condition_past_the_bounds_is_not_stored {
     }
 
 }
+
+/// Whether a pending request is stale: `STALE_AFTER_BLOCKS` past its admission
+/// block, or, for a request admitted before `RequestMeta` existed,
+/// `EXECUTION_TIMEOUT` past its admission timestamp.
+pub(crate) fn is_stale(request_id: u64, admitted_at: u64) -> bool {
+    match request_meta().get(&request_id) {
+        Some(meta) => env::block_height() > meta.admitted_height + STALE_AFTER_BLOCKS,
+        None => env::block_timestamp() > admitted_at + EXECUTION_TIMEOUT,
+    }
+}
+

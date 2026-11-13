@@ -91,6 +91,9 @@ enum StorageKey {
     // ----- v5 (governance) -----
     GovProposals,
     Blobs,
+    /// Per role, the id of the last governance proposal that changed it (`governance.rs`,
+    /// `role_key`). A collection under its own prefix, outside the root struct.
+    RoleChanges,
 }
 
 /// Full TEE measurements for verifying the entire dstack environment.
@@ -115,6 +118,21 @@ pub struct ApprovedMeasurements {
     pub rtmr2: String,
     /// RTMR3 - Runtime events (compose-hash, key-provider)
     pub rtmr3: String,
+}
+
+impl ApprovedMeasurements {
+    /// The one form every entry is stored and compared in: lowercase hex, as a quote's
+    /// measurements are read. Hex is accepted in either case, so a value written in uppercase
+    /// would otherwise never match: a revoke would silently remove nothing.
+    pub fn lowercase(self) -> Self {
+        Self {
+            mrtd: self.mrtd.to_ascii_lowercase(),
+            rtmr0: self.rtmr0.to_ascii_lowercase(),
+            rtmr1: self.rtmr1.to_ascii_lowercase(),
+            rtmr2: self.rtmr2.to_ascii_lowercase(),
+            rtmr3: self.rtmr3.to_ascii_lowercase(),
+        }
+    }
 }
 
 /// Proposal for registering a new keystore
@@ -197,6 +215,12 @@ pub struct VaultVersionInfo {
 /// `submit_keystore_registration` selects the slot whose FMSPC matches the worker's quote and
 /// verifies ONLY that slot; keep small (gas).
 const MAX_COLLATERALS: usize = 2;
+/// Largest collateral string a slot accepts. Real Intel TDX collateral (certificates, TCB
+/// info, QE identity, CRLs) is about 20 KB; the bound leaves room for it to grow. Slots
+/// live in the root state that every state-changing call loads, so an unbounded slot
+/// would let the owner key push governance's own calls past their gas, the replacement
+/// of that owner included.
+const MAX_COLLATERAL_BYTES: usize = 128 * 1024;
 
 /// Max keys per `revoke_keystore_keys` ballot. Bounds the threshold-crossing call: each key
 /// costs an UnorderedSet remove + a DeleteKey receipt + a log, and an ml-dsa-65 key is ~2 KB
@@ -661,6 +685,20 @@ impl KeystoreDao {
         );
 
         if live_for >= self.approval_threshold {
+            // The build is checked again here, not only at submission: a revocation of the
+            // build (owner or governance) made while the registration waited for its votes
+            // must stop it. A member's vote cannot install a key for a build that is no
+            // longer approved.
+            if !self.approved_measurements.contains(&proposal.measurements) {
+                proposal.status = ProposalStatus::Rejected;
+                self.proposals.insert(&proposal_id, &proposal);
+                env::log_str(&format!(
+                    "Proposal {} rejected: its build is no longer approved",
+                    proposal_id
+                ));
+                return;
+            }
+
             proposal.status = ProposalStatus::Approved;
 
             env::log_str(&format!(
@@ -682,6 +720,28 @@ impl KeystoreDao {
             // Update proposal
             self.proposals.insert(&proposal_id, &proposal);
         }
+    }
+
+    /// Owner: reject a keystore registration that is still `Pending`, so no vote can install
+    /// its key. A brake for an incident: a suspicious instance whose build is otherwise fine,
+    /// or a registration to stop at once rather than after `STALE_REGISTRATION_NS`. It only
+    /// takes away: it installs no key, approves no build and casts no vote, so the worst a
+    /// hostile owner does with it is reject a good registration, and that keystore restarts
+    /// and submits a new one.
+    pub fn reject_registration(&mut self, proposal_id: u64) {
+        self.assert_owner();
+        let mut proposal = self
+            .proposals
+            .get(&proposal_id)
+            .expect("Registration proposal not found");
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::Pending,
+            "Only a pending registration can be rejected"
+        );
+        proposal.status = ProposalStatus::Rejected;
+        self.proposals.insert(&proposal_id, &proposal);
+        env::log_str(&format!("Proposal {} rejected by the owner", proposal_id));
     }
 
     /// Owner: delete keystore registration proposals still `Pending` more than 48 h
@@ -724,6 +784,7 @@ impl KeystoreDao {
     /// Owner: remove one approved measurement set (fast path; see `clear_all_approved_measurements`).
     pub fn remove_approved_measurements(&mut self, measurements: ApprovedMeasurements) {
         self.assert_owner();
+        let measurements = measurements.lowercase();
         self.approved_measurements.retain(|m| m != &measurements);
         env::log_str(&format!("Approved measurements removed. Remaining: {}", self.approved_measurements.len()));
     }
@@ -893,6 +954,11 @@ impl KeystoreDao {
     /// the others, so a mixed fleet coexists.
     pub fn update_collateral(&mut self, collateral: String, index: u32) {
         self.assert_owner();
+        assert!(
+            collateral.len() <= MAX_COLLATERAL_BYTES,
+            "collateral must be at most {} bytes",
+            MAX_COLLATERAL_BYTES
+        );
         let i = index as usize;
         assert!(i < MAX_COLLATERALS, "index must be < {} (MAX_COLLATERALS)", MAX_COLLATERALS);
         if i < self.collaterals.len() {
@@ -939,7 +1005,7 @@ impl KeystoreDao {
 
     /// Check if measurements are approved
     pub fn is_measurements_approved(&self, measurements: ApprovedMeasurements) -> bool {
-        self.approved_measurements.contains(&measurements)
+        self.approved_measurements.contains(&measurements.lowercase())
     }
 
     /// Check if keystore with given public key is approved

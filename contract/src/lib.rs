@@ -42,11 +42,13 @@ pub const DATA_ID_REGISTER: u64 = 37;
 /// The OUTPUT is not known at admission and is not reserved for. It is
 /// covered by the weight share of whatever the caller left unused — a call
 /// made with 300 TGas, or a proxy forwarding its remaining gas, leaves the
-/// callback a couple of hundred TGas, enough to evict the largest output the
-/// operator can submit. A caller who attaches just enough for admission and
-/// whose guest then emits megabytes starves only themselves: a request whose
-/// output was delivered but never settled is cancelled at the compute
-/// estimate (`cancel_stale_execution`), so there is nothing to gain by it.
+/// callback a couple of hundred TGas. A caller who attaches less, or chains
+/// callbacks that each pay per byte of the returned output, can leave the
+/// callback out of gas: the request then stays pending with its output in
+/// state; above the stored bytes' deposit, held from the contract's balance.
+/// After `EXECUTION_TIMEOUT` the next `request_execution` settles it
+/// (`sweep_stale`), and anyone may cancel it: the compute estimate is charged
+/// and the rest refunded to the payer.
 pub const CALLBACK_GAS_PER_INPUT_BYTE: u64 = 25_000_000;
 
 /// The gas the settlement callback is created with for a request holding
@@ -83,8 +85,81 @@ pub fn input_storage_deposit(len: usize) -> Balance {
     len.saturating_sub(INPUT_DATA_FREE_BYTES) as u128 * STORAGE_PRICE_PER_BYTE
 }
 
+/// The deposit `len` bytes of stored output need: every byte at
+/// `STORAGE_PRICE_PER_BYTE`. Held, not charged, and returned at settlement.
+///
+/// Only an output of 1024 bytes or more is stored (the 2-call flow keeps it in
+/// the request until the request settles); a smaller one travels in the
+/// resume and costs nothing. A stored output stays until the request settles,
+/// or, when its callback never runs to the end, until someone cancels it. No
+/// byte of it is free: whatever the payment does not hold would be held by the
+/// contract's own balance, which a caller could pin for the price of a request.
+pub fn output_storage_deposit(len: usize) -> Balance {
+    len as u128 * STORAGE_PRICE_PER_BYTE
+}
+
+/// Starts the error of an output the payment cannot hold, so it is found in
+/// the docs ("output_storage_unpaid").
+pub const OUTPUT_STORAGE_UNPAID: &str = "output_storage_unpaid";
+
+/// What a pending request holds for its stored input and output: returned
+/// whole whichever way it ends, never charged.
+pub(crate) fn held_storage(request: &ExecutionRequest) -> Balance {
+    input_storage_deposit(request.input_data.as_ref().map_or(0, |d| d.len()))
+        + output_storage_deposit(request.pending_output.as_ref().map_or(0, StoredOutput::len))
+}
+
 // Timeout for stale execution cancellation (10 minutes)
+/// Blocks after admission from which a pending request is stale: twice the
+/// yield window (200 blocks), whatever the block time. A request still pending
+/// then is one whose callback never settled it.
+pub const STALE_AFTER_BLOCKS: u64 = 400;
+
+/// Staleness of a request admitted without a `RequestMeta` (before it
+/// existed): its admission timestamp plus this.
 pub const EXECUTION_TIMEOUT: u64 = 600 * 1_000_000_000;
+
+/// The largest `input_data` a request may carry: what one transaction can.
+/// A contract may forward up to 4 MiB in a receipt, but a request whose input
+/// and stored output pass ~4 MB cannot be read at all (the per-receipt
+/// storage-proof limit): no settlement, no cancel, no sweep could remove it.
+pub const MAX_INPUT_DATA_BYTES: usize = 1_572_864;
+
+/// The largest output a request may store (the 2-call flow), held by the
+/// contract rather than by the worker's transaction size: with the input's
+/// cap it keeps every request readable. A larger output fails the request.
+pub const MAX_STORED_OUTPUT_BYTES: usize = 1_572_864;
+
+/// Starts the error of an output above `MAX_STORED_OUTPUT_BYTES`.
+pub const OUTPUT_TOO_LARGE: &str = "output_too_large";
+
+/// The cursor of `sweep_stale`, under a raw key outside the root struct.
+pub const SWEEP_CURSOR_KEY: &[u8] = b"sweep_cursor";
+
+/// The self-cleaning every `request_execution` does before it stores its own
+/// request (`sweep_stale`): a spammer's stuck requests are removed by the next
+/// call that needs the space, the spammer's own or an honest caller's, inside
+/// the same transaction, so the space they held pays for the new request. It
+/// looks at the oldest pending ids from a cursor, through their `RequestMeta`
+/// only, and settles stale ones by the one rule of `cancel_stale_execution`.
+///
+/// Bounded so it can never be turned against the caller: at most
+/// `SWEEP_MAX_LOOKS` ids looked at and `SWEEP_MAX_SETTLED` settled per call,
+/// only requests holding at most `SWEEP_MAX_HELD_BYTES` of input and output
+/// (~14 TGas each at most; larger ones are left to `cancel_stale_executions`),
+/// and only when the caller attached `SWEEP_GAS_RESERVE` beyond its own
+/// callback's gas. A request above the bound holds over 224 KB of its sender's
+/// own deposit (only the input's first 32 KB are free), so dodging the sweep
+/// costs a spammer about seven times what it holds of this contract.
+pub const SWEEP_MAX_LOOKS: u32 = 16;
+pub const SWEEP_MAX_SETTLED: u32 = 2;
+pub const SWEEP_MAX_HELD_BYTES: usize = 256 * 1024;
+pub const SWEEP_GAS_RESERVE: Gas = Gas::from_tgas(40);
+
+/// Requests one `cancel_stale_executions` call may name. Each costs ~1.2 TGas
+/// small, ~3.9 TGas holding the free 32 KB of input and of output: a full batch
+/// of those exceeds a transaction's gas and reverts whole.
+pub const MAX_STALE_CANCEL_BATCH: usize = 100;
 
 // Maximum resource limits (hard caps)
 pub const MAX_INSTRUCTIONS: u64 = 500_000_000_000; // 500 billion instructions
@@ -143,6 +218,26 @@ enum StorageKey {
     // What is in flight on a payment key: open top-up yields, an open refund
     // claim, the last claim's time (PaymentKeyId -> KeyFlight)
     PaymentKeyFlight,
+    // Per pending request: the block it was admitted at and the bytes it holds
+    // (request id -> RequestMeta). Outside the root struct; read by the sweep
+    // instead of the request itself.
+    RequestMeta,
+}
+
+/// What the sweep and the stale checks need of a pending request, kept apart
+/// from it: reading it costs the same whatever the request holds.
+#[near(serializers = [borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestMeta {
+    /// Block height at admission. Staleness counts blocks, as the yield
+    /// window does.
+    pub admitted_height: u64,
+    /// Bytes of input and stored output the request holds.
+    pub held_bytes: u64,
+}
+
+pub(crate) fn request_meta() -> LookupMap<u64, RequestMeta> {
+    LookupMap::new(StorageKey::RequestMeta)
 }
 
 /// Execution source - GitHub repo, pre-compiled WASM URL, or project reference
@@ -313,6 +408,15 @@ pub enum StoredOutput {
     Bytes(Vec<u8>),
     Text(Vec<u8>),      // UTF-8 bytes
     Json(Vec<u8>),      // JSON string as UTF-8 bytes
+}
+
+impl StoredOutput {
+    /// Bytes held in state.
+    pub fn len(&self) -> usize {
+        match self {
+            StoredOutput::Bytes(b) | StoredOutput::Text(b) | StoredOutput::Json(b) => b.len(),
+        }
+    }
 }
 
 impl From<ExecutionOutput> for StoredOutput {

@@ -611,6 +611,266 @@ fn only_the_owner_deletes_stale_registrations() {
     d.remove_stale_proposals(vec![1]);
 }
 
+#[test]
+fn a_registration_of_a_build_revoked_while_it_waited_is_rejected_at_quorum() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    d.approved_measurements.push(measurements('e'));
+    pending_registration(&mut d, 1, 0);
+    at(owner(), 0);
+    d.remove_approved_measurements(measurements('e'));
+
+    at(a("m1.testnet"), 0);
+    d.vote(1, true);
+    at(a("m2.testnet"), 0);
+    d.vote(1, true);
+    assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Rejected);
+    assert!(!d.is_keystore_approved(String::from(&key(1))));
+    assert!(get_created_receipts().is_empty(), "no key is added");
+}
+
+#[test]
+fn a_registration_of_a_build_still_approved_installs_its_key_at_quorum() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    d.approved_measurements.push(measurements('e'));
+    pending_registration(&mut d, 1, 0);
+    at(a("m1.testnet"), 0);
+    d.vote(1, true);
+    at(a("m2.testnet"), 0);
+    d.vote(1, true);
+    assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Executed);
+    assert!(d.is_keystore_approved(String::from(&key(1))));
+}
+
+#[test]
+fn the_owner_rejects_a_pending_registration_and_no_vote_installs_it() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    d.approved_measurements.push(measurements('e'));
+    pending_registration(&mut d, 1, 0);
+    at(owner(), 0);
+    d.reject_registration(1);
+    assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Rejected);
+    at(a("m1.testnet"), 0);
+    let voted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.vote(1, true)));
+    assert!(voted.is_err(), "a rejected registration takes no votes");
+    assert!(!d.is_keystore_approved(String::from(&key(1))));
+}
+
+#[test]
+#[should_panic(expected = "Only owner")]
+fn only_the_owner_rejects_a_registration() {
+    let mut d = dao(&["m1.testnet"], 0);
+    pending_registration(&mut d, 1, 0);
+    at(a("m1.testnet"), 0);
+    d.reject_registration(1);
+}
+
+#[test]
+#[should_panic(expected = "Only a pending registration can be rejected")]
+fn an_executed_registration_cannot_be_rejected() {
+    let mut d = dao(&["m1.testnet"], 0);
+    pending_registration(&mut d, 1, 0);
+    let mut p = d.proposals.get(&1).unwrap();
+    p.status = ProposalStatus::Executed;
+    d.proposals.insert(&1, &p);
+    at(owner(), 0);
+    d.reject_registration(1);
+}
+
+#[test]
+#[should_panic(expected = "Registration proposal not found")]
+fn reject_registration_does_not_reach_a_governance_proposal() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let id = d.propose(GovAction::SetDelay { seconds: 5 });
+    at(owner(), 0);
+    d.reject_registration(id);
+}
+
+#[test]
+fn a_build_approved_in_uppercase_is_stored_in_lowercase() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let id = d.propose(GovAction::ApproveMeasurements { measurements: measurements('E') });
+    let _ = d.execute(id);
+    assert_eq!(d.get_approved_measurements(), vec![measurements('e')]);
+    assert!(d.is_measurements_approved(measurements('E')));
+}
+
+#[test]
+fn a_revoke_in_another_case_removes_the_build_and_its_pending_registration_dies() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    d.approved_measurements.push(measurements('e'));
+    pending_registration(&mut d, 1, 0);
+    at(owner(), 0);
+    d.remove_approved_measurements(measurements('E'));
+    assert!(d.get_approved_measurements().is_empty(), "the uppercase revoke matched");
+
+    at(a("m1.testnet"), 0);
+    d.vote(1, true);
+    at(a("m2.testnet"), 0);
+    d.vote(1, true);
+    assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Rejected);
+}
+
+#[test]
+fn a_governance_revoke_in_another_case_removes_the_build() {
+    let mut d = dao(&["m1.testnet"], 0);
+    d.approved_measurements.push(measurements('b'));
+    at(a("m1.testnet"), 0);
+    let id = d.propose(GovAction::RevokeMeasurements { measurements: measurements('B') });
+    let _ = d.execute(id);
+    assert!(d.get_approved_measurements().is_empty());
+}
+
+// ===== collateral =====
+
+#[test]
+fn collateral_up_to_the_bound_is_stored() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(owner(), 0);
+    d.update_collateral("c".repeat(128 * 1024), 0);
+    assert_eq!(d.get_collaterals()[0].len(), 128 * 1024);
+}
+
+#[test]
+#[should_panic(expected = "collateral must be at most")]
+fn collateral_above_the_bound_is_refused() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(owner(), 0);
+    d.update_collateral("c".repeat(128 * 1024 + 1), 0);
+}
+
+// ===== roles: the newer decision wins =====
+
+#[test]
+fn an_older_approved_owner_change_does_not_execute_after_a_newer_one() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let first = d.propose(GovAction::SetOwner { owner: a("y.testnet") });
+    let duplicate = d.propose(GovAction::SetOwner { owner: a("y.testnet") });
+    let _ = d.execute(first);
+    assert_eq!(d.get_owner(), a("y.testnet"));
+    let later = d.propose(GovAction::SetOwner { owner: a("z.testnet") });
+    let _ = d.execute(later);
+    assert_eq!(d.get_owner(), a("z.testnet"));
+
+    let stale = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.execute(duplicate)));
+    assert!(stale.is_err(), "the duplicate is older than the change that executed");
+    assert_eq!(d.get_owner(), a("z.testnet"));
+    assert_eq!(d.get_last_role_change("set_owner:dao.testnet".into()), Some(later));
+}
+
+#[test]
+fn of_two_open_owner_changes_the_newer_one_still_executes_after_the_older() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let older = d.propose(GovAction::SetOwner { owner: a("y.testnet") });
+    let newer = d.propose(GovAction::SetOwner { owner: a("z.testnet") });
+    let _ = d.execute(older);
+    let _ = d.execute(newer);
+    assert_eq!(d.get_owner(), a("z.testnet"));
+}
+
+#[test]
+#[should_panic(expected = "which already changed it")]
+fn an_older_owner_change_does_not_undo_a_newer_one() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let older = d.propose(GovAction::SetOwner { owner: a("y.testnet") });
+    let newer = d.propose(GovAction::SetOwner { owner: a("z.testnet") });
+    let _ = d.execute(newer);
+    let _ = d.execute(older);
+}
+
+#[test]
+#[should_panic(expected = "which already changed it")]
+fn an_older_call_to_set_owner_on_a_governed_contract_does_not_execute_after_a_newer_one() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let call = |owner: &str| GovAction::Call {
+        target: a("outlayer.testnet"),
+        method: "set_owner".into(),
+        args: Base64VecU8(format!("{{\"owner_id\":\"{}\"}}", owner).into_bytes()),
+        deposit: U128(0),
+        gas_tgas: 50,
+    };
+    let older = d.propose(call("y.testnet"));
+    let newer = d.propose(call("z.testnet"));
+    let _ = d.execute(newer);
+    let _ = d.execute(older);
+}
+
+#[test]
+fn owner_changes_on_different_contracts_do_not_block_each_other() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let call = |target: &str| GovAction::Call {
+        target: a(target),
+        method: "set_owner".into(),
+        args: Base64VecU8(b"{\"owner_id\":\"z.testnet\"}".to_vec()),
+        deposit: U128(0),
+        gas_tgas: 50,
+    };
+    let own = d.propose(GovAction::SetOwner { owner: a("z.testnet") });
+    let main = d.propose(call("outlayer.testnet"));
+    let register = d.propose(call("worker.outlayer.testnet"));
+    // An incident replaces the owner of all three; they execute in any order.
+    let _ = d.execute(register);
+    let _ = d.execute(own);
+    let _ = d.execute(main);
+    assert_eq!(d.get_owner(), a("z.testnet"));
+}
+
+#[test]
+#[should_panic(expected = "which already changed it")]
+fn an_older_approved_add_member_does_not_bring_back_a_removed_member() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let add = d.propose(GovAction::AddMember { member: a("x.testnet") });
+    let add_again = d.propose(GovAction::AddMember { member: a("x.testnet") });
+    let _ = d.execute(add);
+    let remove = d.propose(GovAction::RemoveMember { member: a("x.testnet") });
+    at(a("x.testnet"), 0);
+    d.vote(remove, true);
+    at(a("m1.testnet"), 0);
+    let _ = d.execute(remove);
+    assert!(!d.get_dao_members().contains(&a("x.testnet")));
+    let _ = d.execute(add_again);
+}
+
+#[test]
+#[should_panic(expected = "The owner cannot be this contract itself")]
+fn the_owner_cannot_be_the_dao_itself() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    d.propose(GovAction::SetOwner { owner: dao_id() });
+}
+
+#[test]
+#[should_panic(expected = "An Upgrade proposal cannot target the MPC contract")]
+fn an_upgrade_cannot_target_the_mpc_contract() {
+    let mut d = dao(&["m1.testnet"], 0);
+    let h = blob(&mut d, 7);
+    at(a("m1.testnet"), 0);
+    d.propose(GovAction::Upgrade { target: a("v1.signer-prod.testnet"), code_hash: h, migrate: false });
+}
+
+#[test]
+fn a_remote_upgrade_takes_the_gas_execute_leaves() {
+    let mut d = dao(&["m1.testnet"], 0);
+    let h = blob(&mut d, 7);
+    at(a("m1.testnet"), 0);
+    let id = d.propose(GovAction::Upgrade { target: a("outlayer.testnet"), code_hash: h, migrate: true });
+    let _ = d.execute(id);
+    let receipts = get_created_receipts();
+    let weight = receipts.iter().flat_map(|r| r.actions.iter()).find_map(|act| match act {
+        MockAction::FunctionCallWeight { method_name, gas_weight, .. }
+            if method_name == b"upgrade_and_migrate" => Some(gas_weight.0),
+        _ => None,
+    });
+    assert_eq!(weight, Some(1));
+}
+
 // ===== migration =====
 
 #[test]

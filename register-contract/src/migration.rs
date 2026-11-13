@@ -14,6 +14,7 @@ pub struct RegisterContractV3 {
     pub outlayer_contract_id: AccountId,
 }
 
+#[cfg(not(feature = "migrate-probe"))]
 #[near_bindgen]
 impl RegisterContract {
     /// V3 → V4: adds `governance_id`. Run once, with the full-access key that deploys V4 —
@@ -31,5 +32,17 @@ impl RegisterContract {
             outlayer_contract_id: old.outlayer_contract_id,
             governance_id,
         }
+    }
+}
+
+/// `migrate-probe` (tests only): the shape every later release's `migrate()` has — no arguments,
+/// called by the governed upgrade batch — reading this release's layout unchanged.
+#[cfg(feature = "migrate-probe")]
+#[near_bindgen]
+impl RegisterContract {
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        env::state_read().expect("failed to read V4 state")
     }
 }

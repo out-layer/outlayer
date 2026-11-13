@@ -117,6 +117,7 @@ pub struct ContractV13 {
     payment_key_flight: LookupMap<refunds::PaymentKeyId, refunds::KeyFlight>,
 }
 
+#[cfg(not(feature = "migrate-probe"))]
 #[near_bindgen]
 impl Contract {
     /// Migrate from v13 to v14: add `governance_id` and `platform_near_withdrawn`, set to every
@@ -127,6 +128,8 @@ impl Contract {
     #[init(ignore_state)]
     pub fn migrate(governance_id: AccountId) -> Self {
         let v13: ContractV13 = env::state_read().expect("failed to read v13 state");
+        // The sweep starts at the next request: older ids, settled or not, are the cancels'.
+        env::storage_write(SWEEP_CURSOR_KEY, &v13.next_request_id.to_le_bytes());
 
         log!(
             "Migrating contract v13 -> v14 (governance_id={}, platform_near_withdrawn): owner={}, total_executions={}",
@@ -180,7 +183,22 @@ impl Contract {
             platform_near_withdrawn: v13.total_fees_collected,
         }
     }
+}
 
+/// `migrate-probe` (tests only): the shape every later release's `migrate()` has — no arguments,
+/// called by the governed upgrade batch — reading this release's layout unchanged.
+#[cfg(feature = "migrate-probe")]
+#[near_bindgen]
+impl Contract {
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        env::state_read().expect("failed to read v14 state")
+    }
+}
+
+#[near_bindgen]
+impl Contract {
     /// Returns the contract's storage-schema version. Bumped each time
     /// `migrate()` advances the layout. Off-chain tooling reads this to
     /// decide whether a deploy needs a migration call.
@@ -307,6 +325,11 @@ mod tests {
         assert!(c.is_withdrawing(accounts(2)), "an in-flight withdrawal carries over");
         assert_eq!(c.get_user_stablecoin_balance(accounts(1)).0, 250_000);
         assert!(c.get_project(format!("{}/app", accounts(1))).is_some());
+        assert_eq!(
+            env::storage_read(SWEEP_CURSOR_KEY),
+            Some(c.next_request_id.to_le_bytes().to_vec()),
+            "the sweep starts at the next request"
+        );
 
         // The DAO governs; the owner no longer replaces the operator.
         testing_env!(ctx(dao()).build());

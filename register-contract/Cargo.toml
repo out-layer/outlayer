@@ -22,6 +22,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 abi = ["borsh/unstable__schema"]
+# `migrate-probe`: a TEST build whose `migrate()` takes no arguments and reads the current
+# layout as it is, for tests/dao/upgrade_e2e.sh to prove a governed upgrade with migrate.
+# Never deployed outside a test set.
+migrate-probe = []
 
 [dependencies]
 near-sdk = { version = "= 5.29.0", features = ["legacy"] }

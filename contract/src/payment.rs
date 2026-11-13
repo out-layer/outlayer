@@ -63,9 +63,10 @@ pub const MIN_NEAR_DEPOSIT: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
 /// wNEAR contract on mainnet
 pub const WNEAR_CONTRACT: &str = "wrap.near";
 
-/// Cost for OutLayer execution (covers base_fee + 1 yoctoNEAR for ft_transfer)
-/// Must be >= base_fee + 1. Currently set to 0.01 NEAR to have margin.
-pub const EXECUTION_COST: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
+/// NEAR kept from a NEAR top-up for its own swap run: the 1 yoctoNEAR of the `ft_transfer`
+/// and the deposit of the contract's `request_execution` (`EXECUTION_COST - 1`). That run's
+/// admission estimate (10B instructions, 120 s) is about 0.013 NEAR at default prices.
+pub const EXECUTION_COST: u128 = 15_000_000_000_000_000_000_000; // 0.015 NEAR
 
 /// Gas for wrap.near calls
 pub const WRAP_GAS: Gas = Gas::from_tgas(10);
@@ -1413,7 +1414,8 @@ impl Contract {
             })
             .to_string()
             .into_bytes(),
-            NearToken::from_yoctonear(15000000000000000000000), // Pay base fee for execution
+            // What the top-up kept for this run, less the 1 yoctoNEAR its ft_transfer took.
+            NearToken::from_yoctonear(EXECUTION_COST - 1),
             Gas::from_tgas(0), // minimum gas (will get all remaining)
             GasWeight(1),      // weight = 1, gets all remaining gas
         )

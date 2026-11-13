@@ -63,6 +63,12 @@ with `scripts/revoke_old_worker_keys.sh <network>`: it keeps the keys the coordi
 recorded for running workers (each confirmed on chain) and prints, or with `--send`
 sends, `remove_worker_keys` for the rest.
 
+Removing a key is cleanup, not revocation. A running instance of an approved build registers
+again with a fresh key, and a removed key's own registration can be replayed by the
+`init_worker_account`. A build under suspicion is revoked: `remove_approved_measurements`
+(owner, at once) or a governance revoke, after which no worker of it registers, by either
+route. A suspected leak of the `init_worker_account` key also means rotating that key.
+
 ## Methods
 
 ### Init and migration
@@ -75,7 +81,8 @@ sends, `remove_worker_keys` for the rest.
 ### Governance
 
 - `add_approved_measurements(measurements, clear_others?)` — `measurements` is
-  `{mrtd, rtmr0, rtmr1, rtmr2, rtmr3}`, each exactly 96 hex characters. `clear_others: true`
+  `{mrtd, rtmr0, rtmr1, rtmr2, rtmr3}`, each exactly 96 hex characters, in either case:
+  entries are stored, revoked and compared in lowercase, as a quote is read. `clear_others: true`
   drops every other entry first. Adding an existing entry is a no-op.
 - `set_owner(new_owner_id)`, `set_governance(governance_id)` — the same names and arguments as
   on the main contract
@@ -119,7 +126,7 @@ a registration is checked against the slot whose FMSPC matches the quote. The ke
 contract keeps collateral the same way.
 
 - `update_collateral(collateral, index)` (owner) takes the JSON **as a string** and a slot
-  index (`0` or `1`). A slot is replaced in place, a new slot may only be the next index, and
+  index (`0` or `1`), at most 128 KiB. A slot is replaced in place, a new slot may only be the next index, and
   the other slot is untouched. The contract stores it as given; a registration verifies the
   quote against it.
 - The TCB info and QE identity each carry an issue date and a next-update date, and

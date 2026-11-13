@@ -116,3 +116,31 @@ fn v3_state_migrates_to_v4() {
     assert_eq!(c.get_collaterals(), vec!["c0".to_string(), "c1".to_string()]);
     assert_eq!(c.get_init_worker_account(), a("init.testnet"));
 }
+
+#[test]
+fn collateral_up_to_the_bound_is_stored() {
+    let mut c = contract();
+    at("owner.testnet", 0);
+    c.update_collateral("c".repeat(128 * 1024), 0);
+    assert_eq!(c.get_collaterals()[0].len(), 128 * 1024);
+}
+
+#[test]
+#[should_panic(expected = "collateral must be at most")]
+fn collateral_above_the_bound_is_refused() {
+    let mut c = contract();
+    at("owner.testnet", 0);
+    c.update_collateral("c".repeat(128 * 1024 + 1), 0);
+}
+
+#[test]
+fn a_build_approved_in_uppercase_is_stored_in_lowercase_and_revoked_in_either_case() {
+    let mut c = contract();
+    at("dao.testnet", 0);
+    c.add_approved_measurements(m('E'), None);
+    assert_eq!(c.get_approved_measurements(), vec![m('e')]);
+    assert!(c.is_measurements_approved(m('E')));
+    at("owner.testnet", 0);
+    c.remove_approved_measurements(m('E'));
+    assert!(c.get_approved_measurements().is_empty());
+}
