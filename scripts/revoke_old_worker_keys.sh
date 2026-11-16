@@ -149,7 +149,7 @@ trap 'rm -f "$PLAN"' EXIT
 
 export REGISTER OWNER INIT RPC IDX NETWORK LIVE EXPECT_LIVE
 python3 - <<'PY' > "$PLAN"
-import json, os, sys, time, urllib.error, urllib.request
+import base64, json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 REGISTER, OWNER, INIT = os.environ['REGISTER'], os.environ['OWNER'], os.environ['INIT']
 RPC, IDX, NETWORK = os.environ['RPC'], os.environ['IDX'], os.environ['NETWORK']
@@ -241,47 +241,57 @@ def indexer(path):
                 w(f"  indexer {e.code} (rate limit), waiting {wait}s…\n")
                 time.sleep(wait)
                 continue
-            raise SystemExit(f"indexer error {e.code} on {path}: set NEARBLOCKS_API_KEY in "
-                             f"scripts/.env to avoid the 60s waits")
+            raise SystemExit(f"indexer error {e.code} on {path}")
     raise SystemExit("indexer unreachable")
 
 
 # 1. Every key ever registered, in FULL form, from the registration arguments.
+# NearBlocks v3: the account's transactions come by cursor (`meta.next_page`, passed back as
+# `next`) and carry each action's method but not its arguments; the arguments — the full public
+# key — are on the transaction itself (/v3/txns/<hash>).
 registered = {}   # public_key -> block_timestamp
-page = 1
+cursor, pages = None, 0
 while True:
-    d = indexer(f"/v1/account/{INIT}/txns?page={page}&per_page=50&order=desc")
-    txns = d.get('txns', [])
-    if not txns:
-        break
+    path = f"/v3/accounts/{INIT}/txns?per_page=50&order=desc"
+    if cursor:
+        path += "&next=" + urllib.parse.quote(cursor, safe="")
+    d = indexer(path)
+    txns = d.get('data') or []
+    pages += 1
     for t in txns:
-        # Provenance matters: this endpoint is receipt-based and returns INBOUND rows from any
-        # sender, including failed ones. Without these three checks anybody could put a key of
-        # their choosing into the revoke list by sending a failing `register_worker_key` to the
-        # init account — including this account's own full-access keys.
-        if t.get('receiver_account_id') != REGISTER:
+        # Provenance matters: only a successful transaction that INIT itself signed to the
+        # register contract counts. Without these checks anybody could put a key of their
+        # choosing into the revoke list by sending a failing `register_worker_key` — including
+        # this account's own full-access keys.
+        if t.get('signer_account_id') != INIT or t.get('receiver_account_id') != REGISTER:
             continue
-        if t.get('predecessor_account_id') != INIT:
+        if (t.get('outcomes') or {}).get('status') is not True:
             continue
-        status = (t.get('outcomes') or {}).get('status')
-        if status is not True:
+        if not any(a.get('method') == 'register_worker_key' for a in (t.get('actions') or [])):
             continue
-        for a in (t.get('actions') or []):
-            if a.get('method') != 'register_worker_key':
+        detail = indexer(f"/v3/txns/{t['transaction_hash']}").get('data') or []
+        for tx in (detail if isinstance(detail, list) else [detail]):
+            if tx.get('signer_account_id') != INIT or tx.get('receiver_account_id') != REGISTER:
                 continue
-            try:
-                args = json.loads(a.get('args') or '{}')
-            except json.JSONDecodeError:
-                continue
-            pk = args.get('public_key')
-            if pk:
-                registered.setdefault(pk, t.get('block_timestamp'))
-    w(f"  history page {page}: {len(registered)} key(s) so far\n")
-    if len(txns) < 50:
+            for a in (tx.get('actions') or []):
+                if a.get('method') != 'register_worker_key':
+                    continue
+                av = a.get('args') or {}
+                args = av.get('args_json')
+                if args is None and av.get('args_base64'):
+                    try:
+                        args = json.loads(base64.b64decode(av['args_base64']))
+                    except (ValueError, json.JSONDecodeError):
+                        args = None
+                pk = (args or {}).get('public_key') if isinstance(args, dict) else None
+                if pk:
+                    registered.setdefault(pk, t.get('block_timestamp'))
+    w(f"  history page {pages}: {len(registered)} key(s) so far\n")
+    cursor = (d.get('meta') or {}).get('next_page')
+    if not txns or not cursor:
         break
-    page += 1
-    if page > 20:                                   # sanity bound
-        w("!! stopped paging the indexer at 1000 transactions\n")
+    if pages >= 40:                                  # sanity bound
+        w("!! stopped paging the indexer at 2000 transactions\n")
         break
 
 w(f"\nregistration history: {len(registered)} distinct key(s) ever registered by {INIT}\n")
