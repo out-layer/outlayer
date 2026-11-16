@@ -85,3 +85,8 @@ tests/hos-status-stub/target/
 
 # A separate git repository checked out here; not part of this tree.
 wasi-examples/private-token-ark/
+
+# Private connectors: separate clones of out-layer/<name>, built against ../../sdk and ../../worker
+/connectors/mercury-connector/
+/connectors/hyperliquid-connector/
+/connectors/polymarket-connector/

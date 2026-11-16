@@ -1,36 +1,36 @@
 [submodule "wasi-examples/random-ark"]
 	path = wasi-examples/random-example
-	url = git@github.com:out-layer/random-example.git
+	url = https://github.com/out-layer/random-example.git
 [submodule "wasi-examples/ai-ark"]
 	path = wasi-examples/ai-example
-	url = git@github.com:out-layer/ai-example.git
+	url = https://github.com/out-layer/ai-example.git
 [submodule "wasi-examples/echo-ark"]
 	path = wasi-examples/echo-example
-	url = git@github.com:out-layer/echo-example.git
+	url = https://github.com/out-layer/echo-example.git
 [submodule "wasi-examples/oracle-ark"]
 	path = wasi-examples/oracle-example
-	url = git@github.com:out-layer/oracle-example.git
+	url = https://github.com/out-layer/oracle-example.git
 [submodule "wasi-examples/captcha-ark"]
 	path = wasi-examples/captcha-example
-	url = git@github.com:out-layer/captcha-example.git
+	url = https://github.com/out-layer/captcha-example.git
 [submodule "wasi-examples/weather-ark"]
 	path = wasi-examples/weather-example
-	url = git@github.com:out-layer/weather-example.git
+	url = https://github.com/out-layer/weather-example.git
 [submodule "wasi-examples/private-dao-ark"]
 	path = wasi-examples/private-dao-example
-	url = git@github.com:out-layer/private-dao-example.git
+	url = https://github.com/out-layer/private-dao-example.git
 [submodule "wasi-examples/botfather-ark"]
 	path = wasi-examples/botfather-example
-	url = git@github.com:out-layer/botfather-example.git
+	url = https://github.com/out-layer/botfather-example.git
 [submodule "wasi-examples/env-test-ark"]
 	path = wasi-examples/env-test-example
-	url = git@github.com:out-layer/env-test-example.git
+	url = https://github.com/out-layer/env-test-example.git
 [submodule "wasi-examples/test-secrets-ark"]
 	path = wasi-examples/test-secrets-example
-	url = git@github.com:out-layer/test-secrets-example.git
+	url = https://github.com/out-layer/test-secrets-example.git
 [submodule "wasi-examples/near-email"]
 	path = wasi-examples/near-email
-	url = git@github.com:out-layer/near-email.git
+	url = https://github.com/out-layer/near-email.git
 [submodule "self-hosted-scheduler"]
 	path = self-hosted-scheduler
 	url = https://github.com/out-layer/self-hosted-scheduler.git
@@ -39,22 +39,13 @@
 	url = https://github.com/out-layer/self-hosted-tdx.git
 [submodule "wasi-examples/vrf-example"]
 	path = wasi-examples/vrf-example
-	url = git@github.com:out-layer/vrf-example.git
+	url = https://github.com/out-layer/vrf-example.git
 [submodule "wasi-examples/intents-example"]
 	path = wasi-examples/intents-example
-	url = git@github.com:out-layer/intents-example.git
+	url = https://github.com/out-layer/intents-example.git
 [submodule "wasi-examples/eth-proof-example"]
 	path = wasi-examples/eth-proof-example
-	url = git@github.com:out-layer/eth-proof-example.git
+	url = https://github.com/out-layer/eth-proof-example.git
 [submodule "wasi-examples/eas-attestor"]
 	path = wasi-examples/eas-attestor
 	url = https://github.com/out-layer/eas-attestor.git
-[submodule "wasi-examples/mercury-connector"]
-	path = connectors/mercury-connector
-	url = git@github.com:out-layer/mercury-connector.git
-[submodule "connectors/hyperliquid-connector"]
-	path = connectors/hyperliquid-connector
-	url = git@github.com:out-layer/hyperliquid-connector.git
-[submodule "connectors/polymarket-connector"]
-	path = connectors/polymarket-connector
-	url = git@github.com:out-layer/polymarket-connector.git

@@ -76,7 +76,7 @@ of a call every other check passed, so a rule never widens the policy. A
 condition the operation does not carry (an amount on a cancellation) makes the
 policy unreadable, like a misspelt field. `ask` then follows this document
 exactly as a listed operation does. The reference is
-`connectors/mercury-connector` (a private submodule; `src/rules.rs`,
+`connectors/mercury-connector` (a private repository; `src/rules.rs`,
 conditions `min_usd`, `max_usd`, `methods`, `payee`), proved live by
 `tests/mercury_rules_e2e.sh` (MR0–MR8).
 
