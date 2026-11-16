@@ -1462,6 +1462,25 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// Wrong tokens past the threshold lock the keystore: further wrong ones get a bare 429, a
+    /// missing token included; the valid token still passes, during the lockout too.
+    #[tokio::test]
+    async fn wrong_tokens_lock_the_keystore_and_the_valid_one_still_passes() {
+        let state = state_with_worker_token("s3cret");
+        for _ in 0..crate::auth_guard::THRESHOLD {
+            let (status, _) = get_loaded_vaults(state.clone(), Some("Bearer guess")).await;
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        }
+        let (status, body) = get_loaded_vaults(state.clone(), Some("Bearer guess-again")).await;
+        assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(body.contains("Too many requests") && !body.chars().any(|c| c.is_ascii_digit()), "no number in the answer: {body}");
+        let (status, _) = get_loaded_vaults(state.clone(), None).await;
+        assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS, "a missing token counts too");
+        let (status, _) = get_loaded_vaults(state.clone(), Some("Bearer s3cret")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "the valid token passes during the lockout");
+        assert!(state.auth_guard.locked(std::time::Instant::now()));
+    }
+
     /// This endpoint lists which vaults this keystore holds a master for. That list is
     /// operational detail, not public information, and the route must stay behind the worker
     /// token — a router refactor that dropped the auth layer would otherwise go unnoticed.

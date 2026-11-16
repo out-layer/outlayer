@@ -246,6 +246,8 @@ pub struct AppState {
     tee_challenges: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, TeeChallenge>>>,
     /// In-memory TEE session store: session_id -> TeeSession
     tee_sessions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, TeeSession>>>,
+    /// Refused bearer tokens, counted for the whole keystore (`auth_guard`).
+    pub auth_guard: std::sync::Arc<crate::auth_guard::AuthGuard>,
 }
 
 impl AppState {
@@ -272,6 +274,7 @@ impl AppState {
             mpc_context: std::sync::Arc::new(std::sync::OnceLock::new()),
             tee_challenges: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             tee_sessions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            auth_guard: std::sync::Arc::new(crate::auth_guard::AuthGuard::default()),
         }
     }
 
@@ -563,6 +566,9 @@ fn repo_seed_root(repo: &str) -> Result<String, ApiError> {
 pub enum ApiError {
     BadRequest(String),
     Unauthorized(String),
+    /// A request without a valid token while the keystore is in lockout (`auth_guard`): HTTP 429,
+    /// one fixed answer that names no number and no window.
+    TooManyRequests,
     Forbidden(String),
     /// The customer vault is underfunded and cannot pay for on-chain key
     /// derivation. HTTP 402 — the client must top up the vault. Distinct from
@@ -629,6 +635,7 @@ impl ApiError {
             | ApiError::Unavailable(m)
             | ApiError::SecretsNotFound(m)
             | ApiError::SigningKeysRefused(_, m) => m,
+            ApiError::TooManyRequests => "Too many requests",
         }
     }
 
@@ -653,6 +660,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(msg) | ApiError::SecretsNotFound(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
+            ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Too many requests".to_string()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::PaymentRequired(msg) => (StatusCode::PAYMENT_REQUIRED, msg),
             // 422 and not 402: the status IS the meaning, so nothing has to
@@ -3282,6 +3290,27 @@ async fn tee_session_middleware(
 #[derive(Clone)]
 pub struct WorkerIdentity(pub String);
 
+/// A request whose bearer token is refused, for any cause: counted by `auth_guard`, then logged
+/// and answered 401 as before, or — in lockout — answered 429 with no detail and no log line of
+/// its own (one summary per window).
+fn refuse(state: &AppState, why: &str, token_hash: Option<&str>, answer: &str) -> ApiError {
+    match state.auth_guard.refused(std::time::Instant::now()) {
+        crate::auth_guard::Refusal::Logged => {
+            match token_hash {
+                Some(h) => tracing::warn!(token_hash = %h, "{why}"),
+                None => tracing::warn!("{why}"),
+            }
+            ApiError::Unauthorized(answer.to_string())
+        }
+        crate::auth_guard::Refusal::Quiet { summary } => {
+            if let Some(n) = summary {
+                tracing::warn!(refused = n, total = state.auth_guard.total(), "Bearer-token lockout: refused requests answered without detail");
+            }
+            ApiError::TooManyRequests
+        }
+    }
+}
+
 /// Worker authentication middleware
 ///
 /// For TEE worker-only endpoints: /decrypt, /encrypt, /decrypt-raw, /storage/*
@@ -3296,18 +3325,12 @@ async fn worker_auth_middleware(
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            tracing::warn!("Missing Authorization header in worker request");
-            ApiError::Unauthorized("Missing Authorization header".to_string())
-        })?;
+        .ok_or_else(|| refuse(&state, "Missing Authorization header in worker request", None, "Missing Authorization header"))?;
 
     // Extract Bearer token
     let token = auth_header
         .strip_prefix("Bearer ")
-        .ok_or_else(|| {
-            tracing::warn!("Invalid Authorization format (expected 'Bearer <token>')");
-            ApiError::Unauthorized("Invalid Authorization format".to_string())
-        })?;
+        .ok_or_else(|| refuse(&state, "Invalid Authorization format (expected 'Bearer <token>')", None, "Invalid Authorization format"))?;
 
     // Hash token with SHA256
     use sha2::{Digest, Sha256};
@@ -3317,11 +3340,7 @@ async fn worker_auth_middleware(
 
     // Check if hash is in allowed WORKER list (constant-time — see token_hash_allowed_ct)
     if !token_hash_allowed_ct(&state.config.allowed_worker_token_hashes, &token_hash) {
-        tracing::warn!(
-            token_hash = %token_hash,
-            "Unauthorized: token hash not in worker allowed list"
-        );
-        return Err(ApiError::Unauthorized("Invalid worker token".to_string()));
+        return Err(refuse(&state, "Unauthorized: token hash not in worker allowed list", Some(&token_hash), "Invalid worker token"));
     }
 
     // Find which worker this token belongs to (for logging)
@@ -3353,18 +3372,12 @@ async fn coordinator_auth_middleware(
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            tracing::warn!("Missing Authorization header in coordinator request");
-            ApiError::Unauthorized("Missing Authorization header".to_string())
-        })?;
+        .ok_or_else(|| refuse(&state, "Missing Authorization header in coordinator request", None, "Missing Authorization header"))?;
 
     // Extract Bearer token
     let token = auth_header
         .strip_prefix("Bearer ")
-        .ok_or_else(|| {
-            tracing::warn!("Invalid Authorization format (expected 'Bearer <token>')");
-            ApiError::Unauthorized("Invalid Authorization format".to_string())
-        })?;
+        .ok_or_else(|| refuse(&state, "Invalid Authorization format (expected 'Bearer <token>')", None, "Invalid Authorization format"))?;
 
     // Hash token with SHA256
     use sha2::{Digest, Sha256};
@@ -3374,11 +3387,7 @@ async fn coordinator_auth_middleware(
 
     // Check if hash is in allowed COORDINATOR list
     if !state.config.allowed_coordinator_token_hashes.contains(&token_hash) {
-        tracing::warn!(
-            token_hash = %token_hash,
-            "Unauthorized: token hash not in coordinator allowed list"
-        );
-        return Err(ApiError::Unauthorized("Invalid coordinator token".to_string()));
+        return Err(refuse(&state, "Unauthorized: token hash not in coordinator allowed list", Some(&token_hash), "Invalid coordinator token"));
     }
 
     tracing::debug!(
@@ -3410,15 +3419,9 @@ async fn admin_read_auth_middleware(
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            tracing::warn!("Missing Authorization header in admin read request");
-            ApiError::Unauthorized("Missing Authorization header".to_string())
-        })?;
+        .ok_or_else(|| refuse(&state, "Missing Authorization header in admin read request", None, "Missing Authorization header"))?;
 
-    let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
-        tracing::warn!("Invalid Authorization format (expected 'Bearer <token>')");
-        ApiError::Unauthorized("Invalid Authorization format".to_string())
-    })?;
+    let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| refuse(&state, "Invalid Authorization format (expected 'Bearer <token>')", None, "Invalid Authorization format"))?;
 
     use sha2::{Digest, Sha256};
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
@@ -3429,8 +3432,7 @@ async fn admin_read_auth_middleware(
     let coordinator_ok =
         token_hash_allowed_ct(&state.config.allowed_coordinator_token_hashes, &token_hash);
     if !worker_ok && !coordinator_ok {
-        tracing::warn!(token_hash = %token_hash, "Unauthorized: token in neither allowed list");
-        return Err(ApiError::Unauthorized("Invalid token".to_string()));
+        return Err(refuse(&state, "Unauthorized: token in neither allowed list", Some(&token_hash), "Invalid token"));
     }
 
     Ok(next.run(req).await)
@@ -3449,17 +3451,11 @@ async fn tee_registration_auth_middleware(
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            tracing::warn!("Missing Authorization header in TEE registration request");
-            ApiError::Unauthorized("Missing Authorization header".to_string())
-        })?;
+        .ok_or_else(|| refuse(&state, "Missing Authorization header in TEE registration request", None, "Missing Authorization header"))?;
 
     let token = auth_header
         .strip_prefix("Bearer ")
-        .ok_or_else(|| {
-            tracing::warn!("Invalid Authorization format (expected 'Bearer <token>')");
-            ApiError::Unauthorized("Invalid Authorization format".to_string())
-        })?;
+        .ok_or_else(|| refuse(&state, "Invalid Authorization format (expected 'Bearer <token>')", None, "Invalid Authorization format"))?;
 
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -3470,11 +3466,7 @@ async fn tee_registration_auth_middleware(
     let is_worker = state.config.allowed_worker_token_hashes.contains(&token_hash);
 
     if !is_coordinator && !is_worker {
-        tracing::warn!(
-            token_hash = %token_hash,
-            "Unauthorized: token hash not in coordinator or worker allowed list"
-        );
-        return Err(ApiError::Unauthorized("Invalid token".to_string()));
+        return Err(refuse(&state, "Unauthorized: token hash not in coordinator or worker allowed list", Some(&token_hash), "Invalid token"));
     }
 
     let source = if is_coordinator { "coordinator" } else { "worker" };
