@@ -92,8 +92,10 @@ else
 fi
 
 step "the owner's money"
-expect_refused "the platform's fees available are 0" "$OWNER" "$MAIN" withdraw_platform_near \
-    "{\"amount\":\"1\",\"receiver_id\":\"$OWNER\"}" "50 Tgas" "1 yoctoNEAR"
+# One yocto above the fees collected and not yet withdrawn: users' deposits stay out of reach.
+over=$(view "$MAIN" get_platform_near | python3 -I -c 'import sys,json; print(int(json.load(sys.stdin)[2]) + 1)')
+expect_refused "the platform's fees available are" "$OWNER" "$MAIN" withdraw_platform_near \
+    "{\"amount\":\"$over\",\"receiver_id\":\"$OWNER\"}" "50 Tgas" "1 yoctoNEAR"
 expect_refused "Only owner" "$STRANGER" "$MAIN" withdraw_platform_token \
     "{\"amount\":\"1\",\"receiver_id\":\"$STRANGER\"}" "50 Tgas" "1 yoctoNEAR"
 expect_refused "Only governance" "$OWNER" "$MAIN" gov_transfer \
