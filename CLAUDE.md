@@ -222,3 +222,14 @@ money path is a place to find a position that pays out, and a rule that
 rewards an error will be wrapped into a bug or an attack. The site, the CLI
 and the docs tell the user what will happen instead (decided by Vadim,
 2026-11-09, on the payment-key refund).
+
+## Rollout order over compatibility code
+When a change between components or versions can be made safe by deploying in
+the right order, it is: one path in the code, and the order written down where
+the rollout is run (the runbook, `UPGRADE.md`, the release notes). No second
+path, fallback or "accept the old form too" branch kept alive to survive a
+wrong order or an old peer: every extra path is attack surface, and it outlives
+the rollout it was written for. The cost is stated plainly instead — what stops
+working until the next step lands (decided by Vadim, 2026-11-16, on keystore
+registration: one path with the boot event log, no legacy measurements path for
+keystores that have not been updated yet).
