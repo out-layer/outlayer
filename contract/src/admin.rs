@@ -6,6 +6,12 @@ use crate::*;
 /// every call pays to read.
 const MAX_SUBSCRIPTION_PLANS: usize = 16;
 
+/// Longest plan name: a label for the purchase page, in the root state every call reads.
+const MAX_PLAN_NAME_BYTES: usize = 64;
+
+/// Longest event `standard` or `version`: both are written into every event the contract logs.
+const MAX_EVENT_METADATA_BYTES: usize = 64;
+
 /// How many operations one project may price.
 ///
 /// Read whole on every call to that project, so it bounds the gas a priced
@@ -28,18 +34,19 @@ impl Contract {
 
 #[near_bindgen]
 impl Contract {
-    /// Set new owner (only current owner can call)
+    /// Governance: replace the owner (the ops role).
     pub fn set_owner(&mut self, new_owner_id: AccountId) {
-        self.assert_owner();
+        self.assert_governance();
         let old_owner = self.owner_id.clone();
         self.owner_id = new_owner_id.clone();
 
         log!("Owner changed from {} to {}", old_owner, new_owner_id);
     }
 
-    /// Set new operator (only owner can call)
+    /// Governance: replace the operator. The operator resolves executions and answers
+    /// payment-key yields, so choosing it is a governance decision.
     pub fn set_operator(&mut self, new_operator_id: AccountId) {
-        self.assert_owner();
+        self.assert_governance();
         let old_operator = self.operator_id.clone();
         self.operator_id = new_operator_id.clone();
 
@@ -148,6 +155,11 @@ impl Contract {
             );
             assert!(!plan.name.trim().is_empty(), "a plan needs a name");
             assert!(
+                plan.name.len() <= MAX_PLAN_NAME_BYTES,
+                "a plan name must be at most {} bytes",
+                MAX_PLAN_NAME_BYTES
+            );
+            assert!(
                 plan.price_usd.0 > 0,
                 "plan {} has no price: a free plan is granted, not sold",
                 plan.name
@@ -255,8 +267,9 @@ impl Contract {
         }
     }
 
+    /// Governance: the stablecoin top-ups are accepted in and payouts are made in.
     pub fn set_payment_token_contract(&mut self, token_contract: Option<AccountId>) {
-        self.assert_owner();
+        self.assert_governance();
         self.payment_token_contract = token_contract.clone();
         match token_contract {
             Some(contract) => log!("Payment token contract set to {}", contract),
@@ -297,6 +310,15 @@ impl Contract {
     /// Used to customize event standard name and version for different deployments
     pub fn set_event_metadata(&mut self, standard: Option<String>, version: Option<String>) {
         self.assert_owner();
+        // Both go into every event the contract logs; a long one would push events past the
+        // log limit and fail every method that emits one, `freeze_wallet` included.
+        for value in standard.iter().chain(version.iter()) {
+            assert!(
+                value.len() <= MAX_EVENT_METADATA_BYTES,
+                "event standard and version must be at most {} bytes",
+                MAX_EVENT_METADATA_BYTES
+            );
+        }
 
         if let Some(s) = standard {
             self.event_standard = s.clone();
@@ -325,6 +347,14 @@ impl Contract {
                 near_sdk::Promise::new(request.payer_account_id.clone())
                     .transfer(NearToken::from_yoctonear(request.payment));
 
+                // And the stablecoin, as on every other path that ends a request without
+                // earning anything.
+                self.return_attached_usd(
+                    &request.sender_id,
+                    request.attached_usd,
+                    "the request was cancelled by the operator",
+                );
+
                 log!(
                     "Cancelled request {} and refunded {} yoctoNEAR to {}",
                     request_id,
@@ -340,25 +370,16 @@ impl Contract {
         cancelled
     }
 
-    /// Admin method to clear all pending requests (only owner can call)
-    /// Used for emergency cleanup or testing
-    ///
-    /// # Arguments
-    /// * `limit` - Maximum number of requests to clear in this call (to avoid gas limits)
-    ///
-    /// # Returns
-    /// Number of requests cleared
-    pub fn clear_all_pending_requests(&mut self, limit: Option<u64>) -> u64 {
+    /// Owner: cancel pending requests in full, newest first, from `from_id` down (default: the
+    /// newest), over the same window and `limit` (default 100) as `get_pending_request_ids`.
+    /// For emergency cleanup or testing; returns how many were cancelled.
+    pub fn clear_all_pending_requests(&mut self, from_id: Option<u64>, limit: Option<u64>) -> u64 {
         self.assert_owner();
 
-        let max_limit = limit.unwrap_or(100); // Default to 100 to avoid gas issues
+        let (ids, _) = self.scan_pending(from_id, limit.unwrap_or(100));
         let mut cleared = 0;
 
-        for request_id in 0..self.next_request_id {
-            if cleared >= max_limit {
-                break;
-            }
-
+        for request_id in ids {
             if let Some(request) = self.pending_requests.remove(&request_id) {
                 // Refund payment to payer
                 near_sdk::Promise::new(request.payer_account_id.clone())

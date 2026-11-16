@@ -227,7 +227,7 @@ pub fn request_execution(
 
 **Compile-only mode**: When `resource_limits` is `None` or `params.compile_only` is `true`, only compilation occurs (no execution); the required deposit is the base fee. It is a build path: with builds off it runs nothing. A caller that wants a run passes `resource_limits`, even as `{}`.
 
-**Large payloads**: Input data >= 10,000 bytes is stored in contract state only (not in the event log); workers fetch it via `get_request()`. Input beyond 32 KB holds a storage deposit of 0.00001 NEAR per byte while the request is pending, returned at settlement — `estimate_execution_cost(resource_limits, input_len)` includes it.
+**Large payloads**: Input data >= 10,000 bytes is stored in contract state only (not in the event log); workers fetch it via `get_request()`. Input beyond 32 KB holds a storage deposit of 0.00001 NEAR per byte while the request is pending, returned at settlement — `estimate_execution_cost(resource_limits, input_len, output_len)` includes it. An output stored by the 2-call flow (1024 bytes or more) pays for every byte the same way: it must fit in the payment left above the run's cost and the input's deposit, else it is not stored and the request fails with `output_storage_unpaid:` and the amount to attach. A stored output is at most 1.5 MiB (`output_too_large:` above). Keep `input_data` and the output together under about 2 MB: above that the worker's delivery transaction runs out of gas and the request ends at its timeout.
 
 ### resolve_execution (operator-only)
 
@@ -239,7 +239,7 @@ Large outputs: the output is stored in contract state first, then the request is
 
 ### cancel_stale_execution
 
-The sender can cancel a request still pending after 10 minutes (`EXECUTION_TIMEOUT = 600 * 1_000_000_000` nanoseconds). Refunds the whole `attached_usd` to the sender and the payment above the charge to the payer: the base fee when no output was delivered, the compute estimate for the limits when the output was delivered through the 2-call flow (`output_submitted`) and the callback never settled it. The contract owner's `emergency_cancel_execution(request_id)` cancels any pending request and refunds in full.
+Anyone can cancel a request still pending 400 blocks after its admission (`STALE_AFTER_BLOCKS`; a request admitted before this release: `EXECUTION_TIMEOUT`, 10 minutes), and every `request_execution` first settles up to 2 such requests (each holding at most 256 KB, judged from a small per-request record, not the request) itself, so stuck requests are cleaned by the next caller in the same transaction. Refunds the whole `attached_usd` to the sender and the payment above the charge to the payer: the base fee when no output was delivered, the compute estimate for the limits when the output was delivered through the 2-call flow (`output_submitted`) and the callback never settled it. The contract owner's `emergency_cancel_execution(request_id)` cancels any pending request and refunds in full.
 
 ---
 
@@ -420,7 +420,7 @@ A payment that names a plan not on sale, or does not cover it, or names a key
 that does not exist, fails the transfer — which returns the money.
 
 **With NEAR**:
-`top_up_payment_key_with_near(nonce, swap_contract_id)` — wraps NEAR → wNEAR → swaps via Intents to stablecoin (mainnet only). The deposit must cover 0.01 NEAR execution cost plus at least 0.01 NEAR to wrap.
+`top_up_payment_key_with_near(nonce, swap_contract_id)` — wraps NEAR → wNEAR → swaps via Intents to stablecoin (mainnet only). The deposit must cover 0.015 NEAR for the swap run plus at least 0.01 NEAR to wrap.
 
 `top_up_payment_key_with_token` exists in the contract ABI but is disabled: it panics.
 
@@ -678,7 +678,7 @@ The public HTTPS API is listed in [API.md](API.md); admin routes and their auth 
 | `get_pricing()` | `(U128, U128, U128, U128)` | NEAR pricing tuple |
 | `get_pricing_full()` | `PricingView` | Full NEAR + USD pricing |
 | `get_payment_token_contract()` | `Option<AccountId>` | Stablecoin contract |
-| `estimate_execution_cost(resource_limits, input_len)` | `U128` | What to attach: the compute estimate plus the deposit held for `input_data` beyond the free 32 KB |
+| `estimate_execution_cost(resource_limits, input_len, output_len)` | `U128` | What to attach: the compute estimate plus the deposit held for input beyond the free 32 KB and for every byte of a stored output |
 | `get_max_limits()` | `(u64, u64, u64)` | Hard caps: instructions, exec_sec, compile_sec (builds only) |
 | `is_paused()` | `bool` | Contract pause status |
 | `get_config()` | `(AccountId, AccountId)` | Owner, operator |
@@ -687,7 +687,7 @@ The public HTTPS API is listed in [API.md](API.md); admin routes and their auth 
 | `has_pending_output(request_id)` | `bool` | Output submitted flag |
 | `get_developer_earnings(account_id)` | `U128` | Developer stablecoin balance |
 | `get_user_stablecoin_balance(account_id)` | `U128` | User deposit balance |
-| `get_pending_request_ids(from_index, limit)` | `Vec<u64>` | Paginated pending IDs |
+| `get_pending_request_ids(from_id, limit)` | `{ids, next_from_id}` | Pending IDs, newest first, 1000 ids looked at per call |
 | `get_next_payment_key_nonce(account_id)` | `u32` | Next available nonce (starts at 1) |
 | `get_payment_key_nonce_floor(account_id)` | `u32` | Highest nonce the contract has seen the owner create or delete |
 | `get_subscription_plans()` | `Vec<SubscriptionPlan>` | Plans on sale |

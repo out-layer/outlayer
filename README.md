@@ -95,6 +95,7 @@ curl -X POST https://api.outlayer.ai/call/alice.near/my-project \
 ## Security Model
 
 - **Intel TDX**: Hardware memory encryption and isolation — the host operator cannot read TEE memory
+- **Own TDX hosts**: Workers and keystores run in Intel TDX CVMs on OutLayer's own bare-metal servers, deployed with [`deploy/self-hosted-tdx`](deploy/self-hosted-tdx/README.md). Registration verifies Intel DCAP quotes on chain against Intel PCS collateral; no third-party cloud service is in that path. The Phala Cloud files in `docker/` and `scripts/` are a supported alternative deployment, not a dependency — see [docker/README.md](docker/README.md#phala-cloud)
 - **5-Measurement Verification**: Workers are registered only when all 5 TDX measurements (MRTD + RTMR0-3) match an approved set, so a dev/debug image fails attestation even when the application matches
 - **Sigstore build provenance**: The worker and keystore Docker images are built by GitHub Actions with Sigstore-backed build-provenance attestations, so an image digest can be traced to the source commit it was built from
 - **No builds in the TEE**: TEE execution workers run a WASM binary whose sha256 they measure and report to the keystore with every secret decryption; they run no build scripts

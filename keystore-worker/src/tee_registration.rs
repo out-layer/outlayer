@@ -423,44 +423,57 @@ impl RegistrationClient {
         info!("⏳ Waiting for DAO approval of proposal #{}...", proposal_id);
         info!("   DAO members need to vote to approve the keystore");
 
-        let mut attempts = 0;
-        const MAX_ATTEMPTS: u32 = 360; // 30 minutes with 5 second intervals
+        // Members vote by hand; with several of them a vote can take a day. The keystore stays
+        // not-ready meanwhile, so restarts are rolled one keystore at a time.
+        // The DAO's owner may delete a registration still pending after 48 h, twice this wait.
+        const POLL: Duration = Duration::from_secs(5);
+        const VOTE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+        const LOG_EVERY: u32 = 120; // about 10 minutes of polls
+        let started = std::time::Instant::now();
+        let mut polls: u32 = 0;
 
         loop {
-            // Check if keystore is already approved (proposal executed)
-            if self.check_approval_status(public_key).await? {
-                info!("✅ Keystore approved by DAO!");
-                return Ok(());
+            // A failed read is retried: over a day of polling, one dropped RPC answer must not
+            // end the wait.
+            match self.check_approval_status(public_key).await {
+                Ok(true) => {
+                    info!("✅ Keystore approved by DAO!");
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => warn!("   Approval check failed, retrying: {e}"),
             }
 
-            // Check proposal status
-            let proposal_status = self.get_proposal_status(proposal_id).await?;
-            match proposal_status.as_str() {
-                "Approved" => {
-                    info!("✅ Proposal approved! Will auto-execute when quorum reached");
-                }
-                "Executed" => {
-                    // Proposal already executed, wait for keystore to be approved
-                    info!("✅ Proposal already executed, waiting for keystore approval...");
-                }
-                "Rejected" => {
-                    anyhow::bail!("❌ Proposal rejected by DAO");
-                }
-                "Pending" => {
-                    if attempts % 12 == 0 { // Log every minute
-                        info!("   Still waiting for votes... ({}/{})",
-                            attempts * 5, MAX_ATTEMPTS * 5);
+            match self.get_proposal_status(proposal_id).await {
+                Ok(status) => match status.as_str() {
+                    "Approved" => info!("✅ Proposal approved! Will auto-execute when quorum reached"),
+                    "Executed" => info!("✅ Proposal already executed, waiting for keystore approval..."),
+                    "Rejected" => anyhow::bail!("❌ Proposal rejected by DAO"),
+                    "Pending" => {
+                        if polls % LOG_EVERY == 0 {
+                            info!(
+                                "   Still waiting for votes on proposal #{} ({} of {} min)",
+                                proposal_id,
+                                started.elapsed().as_secs() / 60,
+                                VOTE_WAIT.as_secs() / 60
+                            );
+                        }
                     }
-                }
-                _ => {}
+                    _ => {}
+                },
+                Err(e) => warn!("   Proposal status read failed, retrying: {e}"),
             }
 
-            attempts += 1;
-            if attempts >= MAX_ATTEMPTS {
-                anyhow::bail!("Timeout waiting for DAO approval");
+            polls = polls.wrapping_add(1);
+            if started.elapsed() >= VOTE_WAIT {
+                anyhow::bail!(
+                    "No DAO decision on proposal #{} within {} h",
+                    proposal_id,
+                    VOTE_WAIT.as_secs() / 3600
+                );
             }
 
-            sleep(Duration::from_secs(5)).await;
+            sleep(POLL).await;
         }
     }
 

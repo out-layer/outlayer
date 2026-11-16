@@ -456,7 +456,7 @@ impl Contract {
         self.raise_payment_key_nonce_floor(owner, nonce);
     }
 
-    fn stablecoin_transfer(&self, to: &AccountId, amount: u128, memo: &str) -> Promise {
+    pub(crate) fn stablecoin_transfer(&self, to: &AccountId, amount: u128, memo: &str) -> Promise {
         let token_contract = self
             .payment_token_contract
             .as_ref()

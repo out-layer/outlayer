@@ -1,5 +1,64 @@
 use crate::*;
 
+/// Ids one call looks at for pending requests (`get_pending_request_ids`,
+/// `clear_all_pending_requests`). Each look is a storage read of about 0.06 TGas, so a
+/// window stays far inside the gas of a view or a transaction.
+pub const PENDING_SCAN_WINDOW: u64 = 1_000;
+
+/// A pending request without its input and output (`get_request_status`): what a cleanup needs,
+/// in a few hundred bytes whatever the request holds.
+#[near(serializers = [json])]
+#[derive(Debug, PartialEq)]
+pub struct RequestStatus {
+    pub request_id: u64,
+    pub sender_id: AccountId,
+    pub payer_account_id: AccountId,
+    /// Block timestamp (ns) of the admission.
+    pub timestamp: u64,
+    pub payment: U128,
+    pub output_submitted: bool,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    /// Stale at this block (`execution::is_stale`): `cancel_stale_execution` accepts it.
+    pub stale: bool,
+}
+
+/// A page of `get_pending_request_ids`.
+#[near(serializers = [json])]
+#[derive(Debug, PartialEq)]
+pub struct PendingRequestIds {
+    pub ids: Vec<u64>,
+    /// Where the next page starts; `None` when the scan has reached id 0.
+    pub next_from_id: Option<u64>,
+}
+
+impl Contract {
+    /// Pending ids from `from_id` (clamped to the newest id) downwards, over at most
+    /// `PENDING_SCAN_WINDOW` ids and at most `limit` found; with where to go on.
+    pub(crate) fn scan_pending(&self, from_id: Option<u64>, limit: u64) -> (Vec<u64>, Option<u64>) {
+        near_sdk::require!(limit > 0, "limit must be at least 1");
+        let Some(newest) = self.next_request_id.checked_sub(1) else {
+            return (Vec::new(), None);
+        };
+        let top = from_id.unwrap_or(newest).min(newest);
+        let bottom = top.saturating_sub(PENDING_SCAN_WINDOW - 1);
+        let mut ids = Vec::new();
+        let mut id = top;
+        loop {
+            if self.pending_requests.contains_key(&id) {
+                ids.push(id);
+                if ids.len() as u64 >= limit {
+                    return (ids, id.checked_sub(1));
+                }
+            }
+            if id == bottom {
+                return (ids, bottom.checked_sub(1));
+            }
+            id -= 1;
+        }
+    }
+}
+
 #[near_bindgen]
 impl Contract {
     /// Get execution request by ID
@@ -109,11 +168,24 @@ impl Contract {
 
     /// What `request_execution` requires attached: the compute estimate for
     /// the limits, plus the deposit held for `input_len` bytes of `input_data`
-    /// beyond `INPUT_DATA_FREE_BYTES` (returned at settlement). `input_len`
-    /// may be omitted; absent, the input is taken as small.
-    pub fn estimate_execution_cost(&self, resource_limits: Option<ResourceLimits>, input_len: Option<u64>) -> U128 {
+    /// beyond `INPUT_DATA_FREE_BYTES`, plus the deposit held for an output of
+    /// `output_len` bytes, every byte (both returned at settlement). Either
+    /// length may be omitted; absent, it is taken as small.
+    /// The input deposit is required at admission; the output's is checked
+    /// when the output arrives, and an output the payment cannot hold fails
+    /// the request with the amount to attach.
+    pub fn estimate_execution_cost(
+        &self,
+        resource_limits: Option<ResourceLimits>,
+        input_len: Option<u64>,
+        output_len: Option<u64>,
+    ) -> U128 {
         let limits = resource_limits.unwrap_or_default();
-        U128(self.estimate_cost(&limits) + input_storage_deposit(input_len.unwrap_or(0) as usize))
+        U128(
+            self.estimate_cost(&limits)
+                + input_storage_deposit(input_len.unwrap_or(0) as usize)
+                + output_storage_deposit(output_len.unwrap_or(0) as usize),
+        )
     }
 
     /// Get maximum resource limits (hard caps)
@@ -182,35 +254,37 @@ impl Contract {
         U128(self.user_stablecoin_balances.get(&account_id).unwrap_or(0))
     }
 
-    /// Get IDs of all pending execution requests with pagination
-    ///
-    /// # Arguments
-    /// * `from_index` - Starting index (default: 0)
-    /// * `limit` - Maximum number of IDs to return (default: 100)
-    ///
-    /// # Returns
-    /// Vector of pending request IDs
-    pub fn get_pending_request_ids(&self, from_index: Option<u64>, limit: Option<u64>) -> Vec<u64> {
-        let from = from_index.unwrap_or(0);
-        let max_limit = limit.unwrap_or(100);
-
-        let mut result = Vec::new();
-        let mut skipped = 0u64;
-
-        for request_id in 0..self.next_request_id {
-            if self.pending_requests.contains_key(&request_id) {
-                if skipped < from {
-                    skipped += 1;
-                    continue;
-                }
-                result.push(request_id);
-                if result.len() as u64 >= max_limit {
-                    break;
-                }
+    /// A pending request without its input and output, and whether it is stale by this block's
+    /// time. `get_request` returns both, and a request holding over ~1.3 MB of them is more than
+    /// a view may return.
+    pub fn get_request_status(&self, request_id: u64) -> Option<RequestStatus> {
+        self.pending_requests.get(&request_id).map(|r| {
+            let output_bytes = match &r.pending_output {
+                Some(StoredOutput::Bytes(b)) | Some(StoredOutput::Text(b)) | Some(StoredOutput::Json(b)) => b.len() as u64,
+                None => 0,
+            };
+            RequestStatus {
+                request_id: r.request_id,
+                sender_id: r.sender_id,
+                payer_account_id: r.payer_account_id,
+                timestamp: r.timestamp,
+                payment: U128(r.payment),
+                output_submitted: r.output_submitted,
+                input_bytes: r.input_data.as_ref().map_or(0, |d| d.len() as u64),
+                output_bytes,
+                stale: crate::execution::is_stale(request_id, r.timestamp),
             }
-        }
+        })
+    }
 
-        result
+    /// Pending request ids, newest first, from `from_id` down (default: the newest id). One call
+    /// looks at no more than `PENDING_SCAN_WINDOW` ids and returns at most `limit` (default 100);
+    /// `next_from_id` is where the next call goes on, `None` once id 0 has been looked at.
+    /// Bounded by ids looked at, not by ids found: a scan of every id from 0 runs out of a
+    /// view's gas once there are some thousands of requests.
+    pub fn get_pending_request_ids(&self, from_id: Option<u64>, limit: Option<u64>) -> PendingRequestIds {
+        let (ids, next_from_id) = self.scan_pending(from_id, limit.unwrap_or(100));
+        PendingRequestIds { ids, next_from_id }
     }
 
     /// The lowest nonce a new payment key of `account_id` may use: one above both

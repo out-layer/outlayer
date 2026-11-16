@@ -176,6 +176,12 @@ fi
 VER="${DEPLOY_VERSION#v}"
 SUFFIX=$([ "$NETWORK" = mainnet ] && echo near || echo testnet)
 OWNER="owner.outlayer.$SUFFIX"
+# Builds are approved by the DAO once it carries governance: a proposal that members vote on and
+# anyone executes after the delay. GOV_MEMBER proposes and votes from this machine.
+GOV_DAO="dao.outlayer.$SUFFIX"
+GOV_MEMBER="${GOV_MEMBER:-zavodil.$SUFFIX}"
+# shellcheck source=lib/dao_gov.sh
+source "$(dirname "$0")/lib/dao_gov.sh"
 # Per-component config:
 #   IMAGE   = Docker Hub image (also the GitHub-release digest row label, lowercased).
 #   NAME    = per-instance CVM VM label (lsvm / worker-ctl.sh).
@@ -353,18 +359,34 @@ RTMR3=$(printf '%s' "$MEAS" | grep -oE '"rtmr3":"[a-f0-9]{96}"' | grep -oE '[a-f
 echo "  mrtd=$MRTD"
 echo "  rtmr3=$RTMR3"
 
-# [4/5] approve measurements on the register-contract (idempotent; owner key local)
-echo "[4/5] Approve measurements on $REGISTER (signer $OWNER)..."
+# [4/5] approve measurements on the register-contract (idempotent)
+echo "[4/5] Approve measurements on $REGISTER..."
 APPROVED=$(near contract call-function as-read-only "$REGISTER" is_measurements_approved \
   json-args "{\"measurements\":$MEAS}" network-config "$NETWORK" now 2>/dev/null | tr -d '[:space:]' || true)
 if printf '%s' "$APPROVED" | grep -qi true; then
   echo "  already approved — skipping (approve-once per net+version)"
+elif dao_has_governance "$GOV_DAO"; then
+  # A worker build opens keystore sessions: approving it is a DAO decision.
+  echo "  through the DAO $GOV_DAO (member $GOV_MEMBER)"
+  rc=0; dao_drive "$GOV_DAO" "$GOV_MEMBER" "$(dao_measurements_action worker "$REGISTER" "$MEAS")" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "  The CVM '$NAME' is up; it registers once the proposal executes. If it gave up waiting by then,"
+    echo "  restart it: NAME=$NAME ./worker-ctl.sh restart (on $NODE)."
+    exit 3
+  fi
+  [ "$rc" -eq 0 ] || { echo "  approval through the DAO failed" >&2; exit 1; }
+  # The DAO records the proposal as executed before its Call reaches the register: check there.
+  sleep 3
+  near contract call-function as-read-only "$REGISTER" is_measurements_approved \
+    json-args "{\"measurements\":$MEAS}" network-config "$NETWORK" now 2>/dev/null | grep -q true \
+    || { echo "  the DAO executed the proposal, but $REGISTER does not list the build as approved" >&2; exit 1; }
+  echo "  measurements approved"
 else
   near contract call-function as-transaction "$REGISTER" add_approved_measurements \
     json-args "{\"measurements\":$MEAS,\"clear_others\":false}" \
     prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
     sign-as "$OWNER" network-config "$NETWORK" sign-with-legacy-keychain send
-  echo "  measurements approved"
+  echo "  measurements approved (owner; the DAO has no governance yet)"
 fi
 
 # [5/5] wait for the worker to register. It polls is_measurements_approved every 5 s for ~8 min
@@ -472,8 +494,8 @@ RTMR3=$(printf '%s' "$MEAS" | grep -oE '"rtmr3":"[a-f0-9]{96}"' | grep -oE '[a-f
 echo "  mrtd=$MRTD"
 echo "  rtmr3=$RTMR3"
 
-# [4/6] approve measurements on the DAO contract (idempotent; owner key local)
-echo "[4/6] Approve measurements on $DAO (signer $OWNER)..."
+# [4/6] approve measurements on the DAO contract (idempotent)
+echo "[4/6] Approve measurements on $DAO..."
 # M1: parse the bool strictly (the old `grep -qi true` over full near-cli-rs output is fragile — it
 # matches "true" anywhere in the noisy output). Mirror the stricter phala form: pull the FIRST
 # true|false token and compare exactly.
@@ -482,12 +504,23 @@ APPROVED=$(near contract call-function as-read-only "$DAO" is_measurements_appro
   | grep -oiE 'true|false' | head -1 || true)
 if [ "$APPROVED" = true ]; then
   echo "  already approved — skipping (approve-once per net+version)"
+elif dao_has_governance "$DAO"; then
+  # A keystore build receives the master: approving it is a DAO decision.
+  echo "  through the DAO (member $GOV_MEMBER)"
+  rc=0; dao_drive "$DAO" "$GOV_MEMBER" "$(dao_measurements_action keystore "" "$MEAS")" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "  The CVM '$NAME' is up; its registration goes through once the proposal executes."
+    echo "  Rerun this deploy then to vote on the keystore's registration."
+    exit 3
+  fi
+  [ "$rc" -eq 0 ] || { echo "  approval through the DAO failed" >&2; exit 1; }
+  echo "  measurements approved"
 else
   near contract call-function as-transaction "$DAO" add_approved_measurements \
     json-args "{\"measurements\":$MEAS,\"clear_others\":false}" \
     prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
     sign-as "$OWNER" network-config "$NETWORK" sign-with-legacy-keychain send
-  echo "  measurements approved"
+  echo "  measurements approved (owner; the DAO has no governance yet)"
 fi
 
 # [5/6] wait for the keystore's self-submitted proposal, then vote as zavodil.
@@ -536,8 +569,9 @@ done
 [ -n "$PROPOSAL_ID" ] || { echo "  No 'Proposal ID' in logs after ~5min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
 echo "  proposal id: $PROPOSAL_ID (live key $LIVE_KEY, pending on $DAO)"
 
-# Vote: auto on testnet, manual on mainnet (mirror deploy_phala.sh step 7 — a human turns the
-# mainnet key). Threshold with the single member zavodil is 1, so one approve passes it.
+# Vote: auto on testnet, manual on mainnet (a human turns the mainnet key). With more than one
+# member this vote alone does not pass it: the other members vote, and the keystore waits for
+# their quorum up to 24 h (tee_registration.rs wait_for_approval).
 VOTE_ARGS="{\"proposal_id\":$PROPOSAL_ID,\"approve\":true}"
 if [ "$NETWORK" = mainnet ]; then
   echo "  MAINNET — vote manually to approve proposal #$PROPOSAL_ID:"
@@ -563,6 +597,15 @@ near contract call-function as-transaction "$DAO" vote \
   prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
   sign-as "$VOTER" network-config "$NETWORK" sign-with-legacy-keychain send
 echo "  voted"
+P_STATUS=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
+  network-config "$NETWORK" now 2>/dev/null | grep -oE '"status": "[A-Za-z]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
+if [ "$P_STATUS" = Pending ]; then
+  echo "  #$PROPOSAL_ID still needs the other members' votes (the keystore waits up to 24 h). Each runs:"
+  echo "    near contract call-function as-transaction $DAO vote json-args '$VOTE_ARGS' \\"
+  echo "      prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as <member> network-config $NETWORK sign-with-legacy-keychain send"
+  echo "  Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
+  exit 0
+fi
 
 # [6/6] poll the keystore until it is READY. /health returns 200 unconditionally (it does NOT
 # reflect is_ready), so 200 only proves the server is UP. The authoritative readiness signal is

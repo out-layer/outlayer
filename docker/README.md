@@ -16,8 +16,24 @@ files and deploy scripts are in [`deploy/self-hosted-tdx`](../deploy/self-hosted
 | `Dockerfile.worker` | Standalone worker image built from `worker/` | nothing; it does not copy `worker/wit`, which the build needs |
 | `docker-compose.phala.yml`, `docker-compose.keystore-phala.yml` | Phala Cloud CVM compose files | `scripts/deploy_phala.sh` only; production does not run on Phala Cloud |
 
-The `-phala` suffix of the two release Dockerfiles is a file name only: the
-images they build are the ones the self-hosted TDX CVMs run.
+## Phala Cloud
+
+Phala Cloud is supported, not depended on. Production workers and keystores
+run on OutLayer's own Intel TDX hosts ([`deploy/self-hosted-tdx`](../deploy/self-hosted-tdx/README.md)),
+and nothing on their path calls a Phala-operated service:
+
+- the `-phala` suffix of the two release Dockerfiles is a file name only — the
+  images they build are the ones the self-hosted CVMs run;
+- the register-contract verifies Intel DCAP quotes on chain, against collateral
+  for our platform's FMSPC fetched from Intel PCS;
+- `docker-compose.phala.yml`, `docker-compose.keystore-phala.yml` and
+  `scripts/deploy_phala.sh` deploy the same images to Phala Cloud for an
+  operator who chooses it; a Phala worker registers only after its platform's
+  collateral is cached in the register-contract.
+
+The one Phala endpoint in the worker's code is a diagnostic: after a failed
+registration the worker asks Phala Cloud's API for collateral and prints it for
+the operator. It runs only on that failure and does not decide registration.
 
 ## Building
 

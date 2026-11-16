@@ -93,7 +93,7 @@ anyhow::bail!("Feature X is not supported. Please use Y instead.");
 | [shared-tee-helpers](https://github.com/out-layer/shared-tee-helpers) | - | TEE challenge-response auth (private repo) |
 | `wasi-examples/` | - | WASI container examples (public) |
 | `connectors/` | - | Connectors: public ones in-tree (`connector-probe`, `subkey-probe`, `gmail-connector`), and each pro connector as a PRIVATE `out-layer/*-connector` submodule (`mercury-connector`, `hyperliquid-connector`, `polymarket-connector`) |
-| `docker/` | - | Docker configs (Phala deployment) |
+| `docker/` | - | Worker/keystore/compiler Dockerfiles; production runs on own TDX hosts (`deploy/self-hosted-tdx`), Phala Cloud files are a supported alternative, not a dependency |
 | `tests/` | - | Integration tests |
 | `scripts/` | - | Deployment & utility scripts |
 

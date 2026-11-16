@@ -153,12 +153,40 @@ struct TeeChallenge {
     created_at: std::time::Instant,
 }
 
+/// How long a TEE session is honoured after its handshake.
+///
+/// A handshake is the only moment the worker's key is checked on chain, so the TTL bounds how
+/// long a worker key removed from the register-contract account (`remove_worker_keys`) keeps
+/// decrypting, and how long a session id that leaked stays usable. A worker renews its session
+/// at half this age (`SESSION_RENEW_AFTER` in the worker's keystore client) and re-handshakes on
+/// the "TEE session expired" refusal.
+const TEE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// In-memory TEE session entry
 #[derive(Clone)]
 struct TeeSession {
     worker_public_key: String,
-    #[allow(dead_code)]
+    /// sha256 (hex) of the bearer token the session was registered with. A request presenting
+    /// the session must carry the same token: the id alone is not a credential.
+    token_hash: String,
     created_at: std::time::Instant,
+}
+
+impl TeeSession {
+    fn is_expired(&self) -> bool {
+        self.created_at.elapsed() >= TEE_SESSION_TTL
+    }
+}
+
+/// sha256 (hex) of the request's bearer token, if it carries one.
+fn bearer_token_hash(headers: &axum::http::HeaderMap) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let token = headers
+        .get("Authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    Some(hex::encode(Sha256::digest(token.as_bytes())))
 }
 
 /// Bundled context populated together by `set_mpc_context` after TEE
@@ -3209,10 +3237,23 @@ fn validate_tee_session(
     let session_id = uuid::Uuid::parse_str(session_header)
         .map_err(|_| ApiError::Forbidden("Invalid TEE session ID format".to_string()))?;
 
-    let sessions = state.tee_sessions.lock().unwrap();
+    let token_hash = bearer_token_hash(headers).unwrap_or_default();
+    let mut sessions = state.tee_sessions.lock().unwrap();
     match sessions.get(&session_id) {
-        Some(session) => Ok(Some(session.worker_public_key.clone())),
-        None => Err(ApiError::Forbidden(
+        Some(session) if session.is_expired() => {
+            sessions.remove(&session_id);
+            Err(ApiError::Forbidden("TEE session expired".to_string()))
+        }
+        Some(session)
+            if constant_time_eq::constant_time_eq(
+                session.token_hash.as_bytes(),
+                token_hash.as_bytes(),
+            ) =>
+        {
+            Ok(Some(session.worker_public_key.clone()))
+        }
+        // A session presented with another token is answered exactly like an unknown one.
+        _ => Err(ApiError::Forbidden(
             "TEE session not found or expired".to_string(),
         )),
     }

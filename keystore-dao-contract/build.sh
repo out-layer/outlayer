@@ -22,20 +22,14 @@ ls -lh res/keystore_dao_contract.wasm
 echo "✅ Build complete: res/keystore_dao_contract.wasm"
 echo "Note: Built without wasm-opt due to bulk-memory operations in dcap-qvl/ring dependencies"
 
-# near account create-account fund-myself dao.outlayer.testnet '5 NEAR' autogenerate-new-keypair save-to-legacy-keychain sign-as outlayer.testnet network-config testnet sign-with-keychain send
-# near contract deploy dao.outlayer.testnet use-file res/keystore_dao_contract.wasm without-init-call network-config testnet sign-with-keychain send
-# near contract call-function as-transaction dao.outlayer.testnet new json-args '{"owner_id": "owner.outlayer.testnet", "init_account_id": "init-keystore.outlayer.testnet", "dao_members": ["zavodil.testnet"], "mpc_contract_id": "v1.signer-prod.testnet"}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' sign-as dao.outlayer.testnet network-config testnet sign-with-keychain send
-# near contract call-function as-transaction dao.outlayer.testnet migrate json-args {} prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as dao.outlayer.testnet network-config testnet sign-with-keychain send
-
-# MAINNET
-# near contract deploy dao.outlayer.near use-file res/keystore_dao_contract.wasm without-init-call network-config mainnet sign-with-keychain send
-# near contract call-function as-transaction dao.outlayer.near new json-args '{"owner_id": "owner.outlayer.near", "init_account_id": "init-keystore.outlayer.near", "dao_members": ["zavodil.near"], "mpc_contract_id": "v1.signer"}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' sign-as dao.outlayer.near network-config mainnet sign-with-keychain send
-# near contract deploy dao.outlayer.near use-file res/keystore_dao_contract.wasm without-init-call network-config mainnet sign-with-keychain send
-# near contract call-function as-transaction dao.outlayer.near migrate json-args {} prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as dao.outlayer.near network-config mainnet sign-with-keychain send
-
-
-# add collateral
-# ./scripts/update_collateral.sh
-
-# add measurements from phala (use scripts/deploy_phala.sh to extract all 5 measurements)
-# near contract call-function as-transaction dao.outlayer.testnet add_approved_measurements json-args '{"measurements":{"mrtd":"...","rtmr0":"...","rtmr1":"...","rtmr2":"...","rtmr3":"..."}, "clear_others": true}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' sign-as owner.outlayer.testnet network-config testnet sign-with-keychain send
+# A fresh account: deploy and `new` in one transaction.
+# near contract deploy dao.outlayer.testnet use-file res/keystore_dao_contract.wasm with-init-call new json-args '{"owner_id": "owner.outlayer.testnet", "init_account_id": "init-keystore.outlayer.testnet", "dao_members": ["zavodil.testnet"], "mpc_contract_id": "v1.signer-prod.testnet", "gov_delay_sec": null}' prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' network-config testnet sign-with-keychain send
+#
+# The release that brings governance, signed with the account's full-access key: deploy and
+# `migrate` in ONE transaction, so a failing migrate leaves the old code in place.
+# near contract deploy dao.outlayer.testnet use-file res/keystore_dao_contract.wasm with-init-call migrate json-args '{}' prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' network-config testnet sign-with-keychain send
+# near contract deploy dao.outlayer.near use-file res/keystore_dao_contract.wasm with-init-call migrate json-args '{}' prepaid-gas '300.0 Tgas' attached-deposit '0 NEAR' network-config mainnet sign-with-keychain send
+#
+# Every later upgrade goes through the DAO itself: scripts/dao_upgrade.sh --target dao.
+# Collateral: ./scripts/update_collateral.sh (owner). Keystore builds are approved by an
+# `ApproveMeasurements` proposal (scripts/deploy_tdx.sh makes it).
