@@ -15,7 +15,9 @@
 #
 # The suite acts as the main contract's operator for a while: the DAO sets OPERATOR as operator
 # (one vote, delay 0) and sets the register account back at the end, also on failure.
-# Testnet only. Needs: the DAO delay at 0, wasm-tools (builds the proxy), ~3 NEAR on CALLER.
+# Testnet only. Needs: the DAO delay at 0, wasm-tools (builds the proxy). The proxy is created once
+# with 3 NEAR from CALLER; it signs its own stuck requests and is their payer, so their deposits
+# (~1.3 NEAR each) come back to it.
 # Takes ~10 minutes (400 blocks).
 
 source "$(dirname "$0")/lib.sh"
@@ -42,7 +44,7 @@ set_operator() {
 restore() {
     wait 2>/dev/null
     set_operator "$WORKER" && echo "operator set back to $WORKER" || echo "!! set the operator of $MAIN back to $WORKER by a DAO proposal"
-    rm -rf "$WORK"
+    if [ "$FAIL" -eq 0 ]; then rm -rf "$WORK"; else echo "outputs kept in $WORK"; fi
 }
 
 [ "$(view "$DAO" get_gov_delay_sec)" = "0" ] || { echo "the DAO delay must be 0 for this suite"; exit 1; }
@@ -57,7 +59,7 @@ next_id() { view "$MAIN" gov_health; }
 status() { view "$MAIN" get_request_status "{\"request_id\":$1}"; }
 field() { python3 -I -c 'import sys,json; d=json.loads(sys.argv[1]); print("none" if d is None else d[sys.argv[2]])' "$1" "$2"; }
 height() { curl -s "$RPC_URL" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"block","params":{"finality":"final"}}' | python3 -I -c 'import sys,json; print(json.load(sys.stdin)["result"]["header"]["height"])'; }
-balance() { rpc_query "{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$1\"}" | python3 -I -c 'import sys,json; print(json.load(sys.stdin)["result"]["result"]["amount"])'; }
+balance() { rpc_query "{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$1\"}" | python3 -I -c 'import sys,json; print(json.load(sys.stdin)["result"]["amount"])'; }
 
 # submit <id> <bytes> — the output as the operator, success, small resources.
 submit() {
@@ -69,20 +71,22 @@ submit() {
 }
 
 # request_bg <tag> <signer> <deposit-yocto> — request_execution from <signer>, in the background
-# (the call waits for its yield); prints the request id.
+# (the call waits for its yield). Sets REQ (the request id) and PID (wait on it for the answer);
+# not called in $(…), whose subshell the caller could not wait on.
 request_bg() {
-    local id; id=$(next_id)
+    REQ=$(next_id)
     near contract call-function as-transaction "$MAIN" request_execution \
         json-args "{\"source\":$source_json,\"resource_limits\":$limits,\"input_data\":\"{}\",\"response_format\":\"Text\"}" \
         prepaid-gas '200 Tgas' attached-deposit "$(yocto_near "$3") NEAR" sign-as "$2" \
         network-config "$NETWORK" sign-with-legacy-keychain send > "$WORK/$1.out" 2>&1 &
-    printf '%s\n' "$id"
+    PID=$!
+    wait_pending "$REQ"
 }
 
 # stuck_bg <tag> — request_execution through the proxy with CHAINED callbacks on its promise and
-# just enough gas for its own callback; prints the request id.
+# just enough gas for its own callback. Sets REQ and PID like request_bg.
 stuck_bg() {
-    local id args; id=$(next_id)
+    local args; REQ=$(next_id)
     args=$(python3 -I -c '
 import struct, sys, json, base64
 main, limits, src = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
@@ -91,9 +95,10 @@ gas = 60 * 10**12
 print(base64.b64encode(struct.pack("<Q", gas) + bytes([int(sys.argv[4]), len(main)]) + main.encode() + req).decode())
 ' "$MAIN" "$limits" "$source_json" "$CHAINED")
     near contract call-function as-transaction "$PROXY" go base64-args "$args" \
-        prepaid-gas '300 Tgas' attached-deposit "$(yocto_near "$(estimate $OUT_LEN)") NEAR" sign-as "$CALLER" \
+        prepaid-gas '300 Tgas' attached-deposit "$(yocto_near "$(estimate $OUT_LEN)") NEAR" sign-as "$PROXY" \
         network-config "$NETWORK" sign-with-legacy-keychain send > "$WORK/$1.out" 2>&1 &
-    printf '%s\n' "$id"
+    PID=$!
+    wait_pending "$REQ"
 }
 
 wait_pending() {  # <id> — until the request is admitted
@@ -101,8 +106,13 @@ wait_pending() {  # <id> — until the request is admitted
 }
 
 step "setup"
-if [ -z "$(rpc_query "{\"request_type\":\"view_code\",\"finality\":\"final\",\"account_id\":\"$PROXY\"}" 2>/dev/null)" ]; then
-    near account create-account fund-myself "$PROXY" '1 NEAR' autogenerate-new-keypair save-to-legacy-keychain \
+has_code() {  # <account> — 0 when the account exists and holds a contract
+    curl -s "$RPC_URL" -H 'content-type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$1\"}}" \
+        | python3 -I -c 'import sys,json; d=json.load(sys.stdin); r=d.get("result") or {}; sys.exit(0 if r.get("code_hash","11111111111111111111111111111111") != "11111111111111111111111111111111" else 1)'
+}
+if ! has_code "$PROXY"; then
+    near account create-account fund-myself "$PROXY" '3 NEAR' autogenerate-new-keypair save-to-legacy-keychain \
         sign-as "$CALLER" network-config "$NETWORK" sign-with-legacy-keychain send >/dev/null 2>&1 \
         || { echo "could not create $PROXY"; exit 1; }
     wasm-tools parse "$(dirname "$0")/proxy.wat" -o "$WORK/proxy.wasm" \
@@ -116,11 +126,12 @@ trap restore EXIT
 
 step "R1 the estimate quotes the stored output"
 base=$(estimate 0); with=$(estimate 2000)
-[ "$((with - base))" = "20000000000000000000000" ] && ok "2000 bytes of output add 0.02 NEAR" || bad "estimate: $base -> $with"
+python3 -I -c 'import sys; sys.exit(0 if int(sys.argv[2]) - int(sys.argv[1]) == 2000 * 10**19 else 1)' "$base" "$with" \
+    && ok "2000 bytes of output add 0.02 NEAR" || bad "estimate: $base -> $with"
 
 step "R2 an output the payment cannot hold"
-id=$(request_bg r2 "$CALLER" "$base")
-wait_pending "$id" && submit "$id" 2000; wait
+request_bg r2 "$CALLER" "$base"; id=$REQ
+submit "$id" 2000; wait "$PID"
 # The reason is in the settlement callback, which belongs to the request's transaction.
 if grep -q "output_storage_unpaid" "$WORK/r2.out" && [ "$(status "$id")" = "null" ]; then
     ok "refused with output_storage_unpaid; request $id settled"
@@ -129,14 +140,14 @@ else
 fi
 
 step "R3 an output the payment holds"
-id=$(request_bg r3 "$CALLER" "$with")
-wait_pending "$id" && submit "$id" 2000; wait
+request_bg r3 "$CALLER" "$with"; id=$REQ
+submit "$id" 2000; wait "$PID"
 grep -q "xxxxxxxxxx" "$WORK/r3.out" && [ "$(status "$id")" = "null" ] \
     && ok "stored, returned to the caller, settled ($id)" || bad "request $id: $(status "$id"); $(grep -iE 'error|panick' "$WORK/r3.out" | head -1)"
 
 step "R4 two stuck requests"
-a=$(stuck_bg stuck-a); wait_pending "$a"
-b=$(stuck_bg stuck-b); wait_pending "$b"
+stuck_bg stuck-a; a=$REQ; pid_a=$PID
+stuck_bg stuck-b; b=$REQ; pid_b=$PID
 submit "$a" "$OUT_LEN"; submit "$b" "$OUT_LEN"
 sleep 5
 for id in "$a" "$b"; do
@@ -147,8 +158,10 @@ done
 
 step "R5 stale after 400 blocks; a stranger's batch cancel"
 from=$(height); waited=0
-until [ "$(field "$(status "$a")" stale)" = "True" ] || [ $waited -ge 1200 ]; do sleep 20; waited=$((waited + 20)); done
-[ "$(field "$(status "$a")" stale)" = "True" ] && ok "stale after $(( $(height) - from )) more blocks" || bad "not stale after ${waited}s"
+# b was admitted after a: once b is stale, both are.
+until [ "$(field "$(status "$b")" stale)" = "True" ] || [ $waited -ge 1200 ]; do sleep 20; waited=$((waited + 20)); done
+[ "$(field "$(status "$a")" stale)" = "True" ] && [ "$(field "$(status "$b")" stale)" = "True" ] \
+    && ok "both stale after $(( $(height) - from )) more blocks" || bad "not stale after ${waited}s"
 before=$(balance "$PROXY")
 call "$OPERATOR" "$MAIN" cancel_stale_executions "{\"request_ids\":[$b]}" "300 Tgas" \
     && [ "$(status "$b")" = "null" ] && ok "request $b cancelled by a batch" || bad "batch cancel: $(status "$b")"
@@ -158,11 +171,12 @@ python3 -I -c 'import sys; sys.exit(0 if int(sys.argv[2]) - int(sys.argv[1]) >= 
 
 step "R6 the next ordinary request cleans the stuck one"
 before=$(balance "$PROXY")
-c=$(request_bg r6 "$HONEST" "$base"); wait_pending "$c"
+request_bg r6 "$HONEST" "$base"; c=$REQ
 [ "$(status "$a")" = "null" ] && ok "request $a settled by $HONEST's request $c" || bad "sweep: $(status "$a")"
 after=$(balance "$PROXY")
 python3 -I -c 'import sys; sys.exit(0 if int(sys.argv[2]) - int(sys.argv[1]) >= 131072 * 10**19 else 1)' "$before" "$after" \
     && ok "the payer got the output deposit back" || bad "refund: $before -> $after"
-call "$OPERATOR" "$MAIN" resolve_execution "{\"request_id\":$c,\"response\":{\"success\":true,\"output\":{\"Text\":\"ok\"},\"error\":null,\"resources_used\":{\"instructions\":1000,\"time_ms\":1,\"compile_time_ms\":null},\"compilation_note\":null}}" "300 Tgas"; wait
+call "$OPERATOR" "$MAIN" resolve_execution "{\"request_id\":$c,\"response\":{\"success\":true,\"output\":{\"Text\":\"ok\"},\"error\":null,\"resources_used\":{\"instructions\":1000,\"time_ms\":1,\"compile_time_ms\":null},\"compilation_note\":null}}" "300 Tgas"
+wait "$PID" "$pid_a" "$pid_b" 2>/dev/null
 
 summary
