@@ -475,8 +475,8 @@ KS_PROPOSAL="${KS_LINE}(📤 Registration submitted! |✅ Registration submitted
 KS_UNAPPROVED="${KS_LINE}⏸️  Registration NOT submitted — this build is not approved by the DAO yet\$"
 KS_READY="${KS_LINE}✅ TEE registration complete! Keystore is now ready to serve requests\$"
 
-# How many times the keystore has started, by its log.
-ks_boots() { ks_logs 20000 2>/dev/null | grep -cE "$KS_START" || true; }
+# The key the keystore's current boot printed (a new one every boot), or nothing yet.
+ks_live_key() { ks_boot_logs 2>/dev/null | grep -E "$KS_KEY" | tail -1 | sed 's/.*: //' || true; }
 
 # The keystore's log of its CURRENT boot: everything after its last start line. A keystore opens
 # its port only once it is registered, so until then this part of the log holds nothing a
@@ -496,20 +496,23 @@ ks_serving() {
   [ -n "$h" ]
 }
 
-# wait_registration <tries> [<boots-before>] — where this boot of the keystore stands. With
-# <boots-before>, only a boot after that many starts counts (the one a restart brought up).
+# wait_registration <tries> [<old-key>] — where this boot of the keystore stands. With <old-key>
+# (the key of the boot before a restart), only a boot that printed another key counts: the key is
+# minted per boot, so this holds whether or not the container log survives the restart.
 # Sets KS_STATE:
 #   registered        PROPOSAL_ID is its registration: the id its log printed, Pending on chain
 #                     and for LIVE_KEY, the key the same boot printed
 #   build_unapproved  it did not submit: the DAO has not approved its guest OS or its compose
 #   ""                none of these within <tries> (12 s each)
 wait_registration() {
-  local tries="$1" after="${2:-0}" i L P P_KEY P_STATUS
+  local tries="$1" old_key="${2:-}" i L P P_KEY P_STATUS
   PROPOSAL_ID=""; LIVE_KEY=""; KS_STATE=""
   for i in $(seq 1 "$tries"); do
-    if [ "$(ks_boots)" -le "$after" ]; then sleep 12; continue; fi
     L=$(ks_boot_logs || true)
     LIVE_KEY=$(printf '%s\n' "$L" | grep -E "$KS_KEY" | tail -1 | sed 's/.*: //' || true)
+    if [ -z "$LIVE_KEY" ] || { [ -n "$old_key" ] && [ "$LIVE_KEY" = "$old_key" ]; }; then
+      LIVE_KEY=""; sleep 12; continue
+    fi
     PROPOSAL_ID=$(printf '%s\n' "$L" | grep -E "$KS_PROPOSAL" | tail -1 | grep -oE '[0-9]+$' || true)
     if [ -n "$PROPOSAL_ID" ]; then
       P=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
@@ -548,6 +551,7 @@ if [ -n "$OS_IMAGE" ]; then
 # [2/6] upgrade: the existing keystore boots the new guest OS; app-id, URL, disk, env and the
 # gateway registration are untouched. It is not ready from the stop until the vote lands.
 echo "[2/6] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image, start)..."
+OLD_KEY=$(ks_live_key)
 node_run "./worker-ctl.sh set-image $NAME $OS_IMAGE"
 KEYSTORE_URL=""   # unchanged by an image upgrade; nothing new to announce
 elif $RESUME; then
@@ -608,7 +612,7 @@ echo "  rtmr3=$RTMR3"
 # release, so the second instance finds them approved. The keystore asks the DAO itself and
 # submits its registration only then.
 echo "[4/6] Wait for the keystore's registration, or for what it says is not approved..."
-wait_registration 20
+wait_registration 20 "${OLD_KEY:-}"
 RESTART=false
 case "$KS_STATE" in
   registered) echo "  the build is approved: the keystore registered on its own" ;;
@@ -616,15 +620,15 @@ case "$KS_STATE" in
     IDENT=$(agent_identity || true)
     [ -n "$IDENT" ] || { echo "  could not read the CVM's compose hash from its guest agent" >&2; exit 1; }
     COMPOSE_HASH=$(echo "$IDENT" | cut -d' ' -f2)
-    OS_IMAGE=$(printf '%s' "$MEAS" | python3 -I -c 'import json,sys
+    OS_TUPLE=$(printf '%s' "$MEAS" | python3 -I -c 'import json,sys
 m=json.load(sys.stdin); print(json.dumps({k: m[k] for k in ("mrtd","rtmr0","rtmr1","rtmr2")}, separators=(",",":")))')
     OS_OK=$(near contract call-function as-read-only "$DAO" get_approved_os_images json-args '{}' network-config "$NETWORK" now 2>/dev/null \
-      | python3 -I -c 'import json,sys; print("true" if json.loads(sys.argv[1]) in json.load(sys.stdin) else "false")' "$OS_IMAGE" || echo false)
+      | python3 -I -c 'import json,sys; print("true" if json.loads(sys.argv[1]) in json.load(sys.stdin) else "false")' "$OS_TUPLE" || echo false)
     C_OK=$(near contract call-function as-read-only "$DAO" get_approved_composes json-args '{}' network-config "$NETWORK" now 2>/dev/null \
       | python3 -I -c 'import json,sys; print("true" if sys.argv[1] in json.load(sys.stdin) else "false")' "$COMPOSE_HASH" || echo false)
     echo "  guest OS  mrtd=${MRTD:0:16}…  approved: $OS_OK"
     echo "  compose   $COMPOSE_HASH  approved: $C_OK"
-    [ "$OS_OK" = true ] || approve_through_dao "guest OS" "{\"ApproveOsImage\":{\"image\":$OS_IMAGE}}"
+    [ "$OS_OK" = true ] || approve_through_dao "guest OS" "{\"ApproveOsImage\":{\"image\":$OS_TUPLE}}"
     [ "$C_OK" = true ] || approve_through_dao "compose of v$VER" "{\"ApproveCompose\":{\"compose_hash\":\"$COMPOSE_HASH\"}}"
     RESTART=true ;;
   *) echo "  No registration and no refusal in the keystore's log after ~4min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1 ;;
@@ -635,9 +639,9 @@ esac
 # boot's lines are read, so the registration found is the one of the key it holds now.
 if $RESTART; then
   echo "[5/6] Restart the keystore so it registers against the approved build..."
-  BOOTS=$(ks_boots)
+  OLD_KEY=$(ks_live_key)
   node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
-  wait_registration 25 "$BOOTS"
+  wait_registration 25 "$OLD_KEY"
   [ "$KS_STATE" = registered ] || { echo "  No registration after the restart (${KS_STATE:-nothing in the log}). Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
 fi
 

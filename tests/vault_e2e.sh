@@ -229,11 +229,12 @@ scenario_manual_notes() {
 
 S2 — Code update simulation
    1. Build a v2 keystore-worker binary.
-   2. Operator's submitter account calls keystore-DAO
-      `submit_keystore_registration(public_key, tdx_quote_hex, app_id)`
-      with the v2 attestation.
-   3. DAO members vote `vote(proposal_id, true)` until the threshold
-      passes.
+   2. The DAO approves the v2 build by vote (`ApproveOsImage`,
+      `ApproveCompose`); the keystore submits
+      `submit_keystore_registration(public_key, tdx_quote_hex, app_id, event_log)`
+      itself on boot.
+   3. DAO members vote `vote(proposal_id, true, public_key)`, naming the
+      keystore's key, until the threshold passes.
    4. For each existing vault: `outlayer vault status <account>` then
       anyone calls `propose_tee_key` on the vault with the v2 pubkey.
    5. The vault contract verifies the new key against
