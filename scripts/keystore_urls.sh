@@ -15,6 +15,14 @@
 # source of truth: a URL saved at deploy time goes stale when a keystore is removed or never
 # becomes ready, this cannot.
 #
+# Order: each node's files get the list with that node's own keystores FIRST, then the others in
+# node order. Keep it so — it is the only thing that spreads the workers over the keystores. A
+# worker is sticky (worker/src/keystore_client.rs, KeystoreClient): it sends every request to the
+# first URL that answers and moves to the next only when that one dies. With one list for every
+# node, every worker of every node used the first node's keystore, the other one stood idle as a
+# standby nobody exercised, and a worker on ams crossed to the dal gateway for each secret. The
+# coordinator spreads its own requests whatever the order (least-in-flight).
+#
 # Where it writes (each file only when its value changes; a .bak-<stamp> next to each node file):
 #   worker/.env.<net>-worker-tdx    on every node that has one, and the Mac copy in
 #                                   deploy/self-hosted-tdx/worker/ (never synced to a node; kept
@@ -118,11 +126,20 @@ else
 fi
 # one URL per (site, app-id), in node order
 NEW=$(printf '%s\n' "${PICK[@]}" | awk '{print $3}' | awk '!seen[$0]++' | paste -sd, -)
-echo "  KEYSTORE_BASE_URLS=$NEW"
+# The list for one node: its own keystores first, then the rest in node order (see "Order" above).
+list_for() { # site
+  { printf '%s\n' "${PICK[@]}" | awk -v s="$1" '$2 == s {print $3}'
+    printf '%s\n' "${PICK[@]}" | awk -v s="$1" '$2 != s {print $3}'; } | awk '!seen[$0]++' | paste -sd, -
+}
+for n in "${NODES[@]}"; do
+  read -r site _ _ <<<"$n"
+  echo "  $site: KEYSTORE_BASE_URLS=$(list_for "$site")"
+done
+echo "  mac copy (node order): KEYSTORE_BASE_URLS=$NEW"
 echo
 
 stamp=$(date -u +%Y%m%d-%H%M%S)
-NEW_B64=$(printf '%s' "$NEW" | base64 | tr -d '\n')
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 # Replace (or append) the KEYSTORE_BASE_URLS line of $1, keeping the file's owner and mode
 # (written in place, not replaced). Prints OLD:<value> and, with apply, DONE.
 SETTER='import base64, os, sys
@@ -139,27 +156,28 @@ if apply and (not old or old[-1] != new):
     out.append("KEYSTORE_BASE_URLS=" + new + "\n")
     with open(path, "r+") as f: f.seek(0); f.writelines(out); f.truncate()
     print("DONE")'
-show() { # label old
-  if [ "$2" = "$NEW" ]; then echo "  $1: already set"
-  else echo "  $1:"; echo "      was: $2"; echo "      now: $NEW$($APPLY || echo '   (dry run)')"; fi
+show() { # label old new
+  if [ "$2" = "$3" ]; then echo "  $1: already set"
+  else echo "  $1:"; echo "      was: $2"; echo "      now: $3$($APPLY || echo '   (dry run)')"; fi
 }
 
 echo "== files =="
 CHANGED_API=""
 for n in "${NODES[@]}"; do
   read -r site host _ <<<"$n"
+  mine=$(list_for "$site")
   for f in "/home/outlayer/self-hosted-tdx/worker/.env.$NETWORK-worker-tdx" "/opt/outlayer-$NETWORK-api/coordinator.env"; do
-    res=$(node_sh "$host" "[ -f '$f' ] || exit 0; python3 -c '$SETTER' '$f' '$NEW_B64' '$($APPLY && echo 1 || echo 0)' '$stamp'" || true)
+    res=$(node_sh "$host" "[ -f '$f' ] || exit 0; python3 -c '$SETTER' '$f' '$(b64 "$mine")' '$($APPLY && echo 1 || echo 0)' '$stamp'" || true)
     [ -n "$res" ] || continue
     old=$(printf '%s\n' "$res" | sed -n 's/^OLD://p')
-    show "$site $f" "$old"
+    show "$site $f" "$old" "$mine"
     if printf '%s' "$res" | grep -qx DONE && [[ "$f" == */coordinator.env ]]; then CHANGED_API="$site $host"; fi
   done
 done
 mac="$TREE/worker/.env.$NETWORK-worker-tdx"
 if [ -f "$mac" ]; then
-  res=$(python3 -c "$SETTER" "$mac" "$NEW_B64" "$($APPLY && echo 1 || echo 0)" "")
-  show "mac  deploy/self-hosted-tdx/worker/.env.$NETWORK-worker-tdx" "$(printf '%s\n' "$res" | sed -n 's/^OLD://p')"
+  res=$(python3 -c "$SETTER" "$mac" "$(b64 "$NEW")" "$($APPLY && echo 1 || echo 0)" "")
+  show "mac  deploy/self-hosted-tdx/worker/.env.$NETWORK-worker-tdx" "$(printf '%s\n' "$res" | sed -n 's/^OLD://p')" "$NEW"
 fi
 echo
 
