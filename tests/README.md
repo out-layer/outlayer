@@ -116,7 +116,11 @@ upgrades itself only with nothing else open),
 members-only governance, keystore-key check, the owner's money),
 `fa_removal.sh --yes` (deletes the accounts' full-access keys for good, then both
 suites again), `requests_e2e.sh` (stored-output pricing, block staleness, the batch cancel
-and the self-cleaning sweep on stuck requests made through `proxy.wat`; ~10 min) — testnet.
+and the self-cleaning sweep on stuck requests made through `proxy.wat`; ~10 min),
+`registration_e2e.sh` (a real keystore's TDX quote and boot event log through
+`submit_keystore_registration`: what a hostile submitter sends instead, the gas of each,
+the build approved by vote and taken off by the owner, votes that name the key) — testnet.
+The same registration on the same real data, offline: `keystore-dao-contract/src/registration_tests.rs`.
 
 ### Basic execution
 
