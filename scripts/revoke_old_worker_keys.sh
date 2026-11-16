@@ -197,6 +197,45 @@ def rpc(params):
         urllib.request.Request(RPC, body, {'Content-Type': 'application/json'}), timeout=30))
 
 
+# The registration's arguments come from the transaction itself, through the ARCHIVAL host of the
+# same keyed FastNEAR RPC: the regular one keeps only the last few epochs, and the indexer would
+# cost one rate-limited request per registration.
+ARCHIVAL_RPC = RPC.replace(f"://rpc.{NETWORK}.fastnear.com", f"://archival-rpc.{NETWORK}.fastnear.com", 1)
+
+
+def registration_args(tx_hash):
+    """`register_worker_key` arguments of a successful transaction INIT signed to REGISTER, or []."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "EXPERIMENTAL_tx_status",
+                       "params": {"tx_hash": tx_hash, "sender_account_id": INIT, "wait_until": "NONE"}}).encode()
+    for attempt in range(4):
+        try:
+            r = json.load(urllib.request.urlopen(
+                urllib.request.Request(ARCHIVAL_RPC, body, {'Content-Type': 'application/json'}), timeout=40))
+            break
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == 3:
+                raise SystemExit(f"archival RPC unreachable for {tx_hash}: {e}")
+            time.sleep(3)
+    res = r.get('result')
+    if not res:
+        raise SystemExit(f"archival RPC has no transaction {tx_hash}: {json.dumps(r.get('error'))[:200]}")
+    tx = res.get('transaction') or {}
+    if tx.get('signer_id') != INIT or tx.get('receiver_id') != REGISTER:
+        return []
+    if 'SuccessValue' not in (res.get('status') or {}):
+        return []
+    out = []
+    for a in tx.get('actions') or []:
+        fc = a.get('FunctionCall') if isinstance(a, dict) else None
+        if not fc or fc.get('method_name') != 'register_worker_key':
+            continue
+        try:
+            out.append(json.loads(base64.b64decode(fc.get('args') or '')))
+        except (ValueError, json.JSONDecodeError):
+            continue
+    return out
+
+
 _ak_cache = {}
 
 
@@ -224,18 +263,28 @@ def key_on_account(pk):
     return ak['nonce'] if ak else None
 
 
+_use_key = bool(API_KEY)
+
+
 def indexer(path):
-    headers = {'Accept': 'application/json', 'User-Agent': 'outlayer-ops/1.0'}
-    if API_KEY:
-        headers['Authorization'] = f'Bearer {API_KEY}'
-    req = urllib.request.Request(IDX + path, headers=headers)
+    """GET a NearBlocks path. The key's plan has its own quota: once NearBlocks says it is spent,
+    the run goes on without the key, on the free tier."""
+    global _use_key
     # NearBlocks counts requests per minute-window (~10/min on the free tier; an API key raises
     # the ceiling but not the window). Once rejected, only a full minute clears it — a shorter
     # wait just burns another rejection.
     for attempt in range(8):
+        headers = {'Accept': 'application/json', 'User-Agent': 'outlayer-ops/1.0'}
+        if _use_key:
+            headers['Authorization'] = f'Bearer {API_KEY}'
         try:
-            return json.load(urllib.request.urlopen(req, timeout=40))
+            return json.load(urllib.request.urlopen(urllib.request.Request(IDX + path, headers=headers), timeout=40))
         except urllib.error.HTTPError as e:
+            body = e.read().decode(errors='replace') if e.code == 429 else ''
+            if e.code == 429 and _use_key and 'exceeded your API request limit' in body:
+                _use_key = False
+                w("  indexer: the NEARBLOCKS_API_KEY plan's quota is spent; going on without the key\n")
+                continue
             if e.code in (429, 403) and attempt < 7:
                 wait = 60
                 w(f"  indexer {e.code} (rate limit), waiting {wait}s…\n")
@@ -246,9 +295,9 @@ def indexer(path):
 
 
 # 1. Every key ever registered, in FULL form, from the registration arguments.
-# NearBlocks v3: the account's transactions come by cursor (`meta.next_page`, passed back as
-# `next`) and carry each action's method but not its arguments; the arguments — the full public
-# key — are on the transaction itself (/v3/txns/<hash>).
+# NearBlocks v3 lists the account's transactions by cursor (`meta.next_page`, passed back as
+# `next`), with each action's method but not its arguments; the arguments — the full public key —
+# are read from the transaction through the archival RPC (`registration_args`).
 registered = {}   # public_key -> block_timestamp
 cursor, pages = None, 0
 while True:
@@ -269,23 +318,10 @@ while True:
             continue
         if not any(a.get('method') == 'register_worker_key' for a in (t.get('actions') or [])):
             continue
-        detail = indexer(f"/v3/txns/{t['transaction_hash']}").get('data') or []
-        for tx in (detail if isinstance(detail, list) else [detail]):
-            if tx.get('signer_account_id') != INIT or tx.get('receiver_account_id') != REGISTER:
-                continue
-            for a in (tx.get('actions') or []):
-                if a.get('method') != 'register_worker_key':
-                    continue
-                av = a.get('args') or {}
-                args = av.get('args_json')
-                if args is None and av.get('args_base64'):
-                    try:
-                        args = json.loads(base64.b64decode(av['args_base64']))
-                    except (ValueError, json.JSONDecodeError):
-                        args = None
-                pk = (args or {}).get('public_key') if isinstance(args, dict) else None
-                if pk:
-                    registered.setdefault(pk, t.get('block_timestamp'))
+        for args in registration_args(t['transaction_hash']):
+            pk = args.get('public_key') if isinstance(args, dict) else None
+            if pk:
+                registered.setdefault(pk, t.get('block_timestamp'))
     w(f"  history page {pages}: {len(registered)} key(s) so far\n")
     cursor = (d.get('meta') or {}).get('next_page')
     if not txns or not cursor:
