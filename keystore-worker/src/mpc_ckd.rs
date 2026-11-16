@@ -1502,11 +1502,10 @@ mod tests {
 
     /// The gas-saving pre-check must ask the DAO exactly what the DAO would assert.
     ///
-    /// `submit_keystore_registration` gates on `approved_measurements.contains(&measurements)`
-    /// (keystore-dao `lib.rs:508`) and `is_measurements_approved` evaluates the SAME expression
-    /// over the SAME collection — so a mismatch here can only come from us sending the wrong
-    /// argument shape. That is what this pins: the method name, the `measurements` wrapper, and
-    /// all five field names.
+    /// `submit_keystore_registration` requires the quote's guest OS and the event log's compose
+    /// hash on the DAO's approved lists, and `is_build_approved` answers the same two questions
+    /// over the same lists — so a mismatch here can only come from us sending the wrong argument
+    /// shape. That is what this pins: the method name and its arguments.
     ///
     /// Getting it wrong degrades safely (a malformed view call errors, and `main.rs` submits
     /// anyway rather than blocking) — but it would silently stop saving the gas this exists for.

@@ -50,7 +50,10 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,keystore_worker=debug".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        // Plain text, never colour: `scripts/deploy_tdx.sh` reads the keystore's key and
+        // registration id from this log by exact, anchored lines, so its format must not
+        // depend on whether the guest agent hands it over as a terminal.
+        .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .init();
 
     tracing::info!("Starting NEAR OutLayer Keystore Worker");
