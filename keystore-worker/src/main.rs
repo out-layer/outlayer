@@ -273,79 +273,39 @@ async fn perform_tee_registration(config: &Config) -> Result<TeeRegistrationResu
         let (tdx_quote, event_log) = tdx_client.generate_registration_quote(&pubkey_bytes).await?;
         tracing::info!("📡 Generated TEE attestation (mode: {:?})", config.tee_mode);
 
-        // A DAO that reads the event log takes the registration as it is: it replays the log
-        // against the quote, records which compose and which instance registers, and the
-        // members' vote on it approves both. A DAO that does not, or a registration without a
-        // log, needs the measurements approved beforehand, checked below before any gas is spent.
-        let by_event_log = event_log.is_some()
-            && mpc_ckd::dao_reads_event_log(&near_rpc_url, &dao_contract)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Could not ask the DAO whether it reads the event log; taking the approved-measurements path");
-                    false
-                });
-        if by_event_log {
-            tracing::info!("📜 The registration carries its boot event log: DAO members vote on this instance, no build approval beforehand");
-        }
-
-        // Do not pay to be told something a free view call answers.
-        //
-        // `submit_keystore_registration` verifies the DCAP quote and extracts the measurements
-        // BEFORE it checks them against the approved list, so an unapproved set burns virtually
-        // the whole verification — measured at 183.6 TGas / 0.0183 NEAR on a real rejection, and
-        // repeated on every container restart until an operator approves. The measurements are
-        // already in hand here (the quote was just generated and the line above logged them), so
-        // ask the DAO first and submit only when the answer is yes.
-        //
-        // Nothing is lost by deciding locally: the keystore parses the same measurements the
-        // contract does — verified against a live rejection where both values matched exactly —
-        // and `scripts/deploy_tdx.sh` already reads them from this log rather than from the
-        // contract's receipt.
-        if by_event_log {
-            // Nothing to check beforehand.
-        } else if let Some(measurements) =
-            crate::tdx_attestation::extract_all_measurements_from_quote_hex(&tdx_quote)
-        {
-            let approved = mpc_ckd::check_measurements_approved(
-                &near_rpc_url,
-                &dao_contract,
-                &measurements,
-            )
+        // The registration carries the quote's boot event log: the DAO replays it against the
+        // quote and takes the registration only for a guest OS and a compose governance approved.
+        // Without the log there is nothing to register with.
+        let event_log = event_log.ok_or_else(|| {
+            anyhow::anyhow!("dstack gave no event log with the quote: a keystore registers only with its boot event log")
+        })?;
+        // Both halves of the build are in hand (the quote's measurements, the log's compose hash),
+        // so ask first: a refused submission burns the whole quote verification, on every
+        // container restart, until the build is approved.
+        let compose_hash = crate::tdx_attestation::compose_hash_of(&event_log)
+            .ok_or_else(|| anyhow::anyhow!("the event log has no compose-hash event"))?;
+        let measurements = crate::tdx_attestation::extract_all_measurements_from_quote_hex(&tdx_quote)
+            .ok_or_else(|| anyhow::anyhow!("could not read the measurements of the quote"))?;
+        let approved = mpc_ckd::check_build_approved(&near_rpc_url, &dao_contract, &measurements, &compose_hash)
             .await
             .unwrap_or_else(|e| {
-                // An RPC failure must not become a silent refusal to register: fall through to
-                // the submit and let the chain be the authority, exactly as before this check.
-                tracing::warn!(error = %e, "Could not check measurements against the DAO; submitting anyway");
+                // An RPC failure must not become a silent refusal to register: the chain decides.
+                tracing::warn!(error = %e, "Could not check the build against the DAO; submitting anyway");
                 true
             });
-
-            if !approved {
-                tracing::error!("⏸️  Registration NOT submitted — these measurements are not approved yet");
-                tracing::error!("   No transaction was sent, so no gas was spent.");
-                tracing::error!("");
-                tracing::error!("📝 Approve them (owner key), then restart the keystore:");
-                tracing::error!(
-                    "   near contract call-function as-transaction {} add_approved_measurements \\",
-                    dao_contract
-                );
-                tracing::error!(
-                    "     json-args '{}' \\",
-                    crate::tdx_attestation::measurements_approval_args(&measurements)
-                );
-                tracing::error!("     prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as <owner> ...");
-                tracing::error!("");
-                tracing::error!("   (scripts/deploy_tdx.sh does this automatically at step [4/6].)");
-                anyhow::bail!(
-                    "TEE measurements not approved on {} — approve them and restart",
-                    dao_contract
-                );
-            }
-            tracing::info!("✅ Measurements already approved by the DAO — submitting registration");
-        } else {
-            // Malformed/short quote: leave the decision to the contract rather than blocking a
-            // registration on our own parsing.
-            tracing::warn!("Could not extract measurements from the quote; submitting without the pre-check");
+        if !approved {
+            tracing::error!("⏸️  Registration NOT submitted — this build is not approved by the DAO yet");
+            tracing::error!("   No transaction was sent, so no gas was spent.");
+            tracing::error!("   compose_hash={}", compose_hash);
+            tracing::error!(
+                "   guest OS: mrtd={} rtmr0={} rtmr1={} rtmr2={}",
+                measurements.mrtd, measurements.rtmr0, measurements.rtmr1, measurements.rtmr2
+            );
+            tracing::error!("   DAO members approve them (ApproveCompose, ApproveOsImage); then restart the keystore.");
+            tracing::error!("   (scripts/deploy_tdx.sh proposes both and prints the votes.)");
+            anyhow::bail!("Build not approved on {} — approve it and restart", dao_contract);
         }
+        tracing::info!("✅ Guest OS and compose are approved by the DAO — submitting registration");
 
         // The dstack app_id goes with the registration (logged in the transaction)
         let app_id = crate::tdx_attestation::get_dstack_app_info()

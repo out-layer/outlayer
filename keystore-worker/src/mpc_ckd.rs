@@ -817,28 +817,15 @@ impl MpcCkdClient {
     }
 }
 
-/// Check if keystore is approved by DAO contract
-/// Are these TEE measurements in the DAO's approved list?
-///
-/// A FREE view call, and the whole point of it is that it is free. Without this check the
-/// keystore submits `submit_keystore_registration` blind: the contract verifies the DCAP quote,
-/// extracts the measurements, and only THEN panics if they are unapproved — so essentially all
-/// of the verification gas is burnt for an outcome we could have predicted. Measured on a real
-/// rejection: 183.6 TGas / 0.0183 NEAR, repeated on every container restart until an operator
-/// approves.
-///
-/// The keystore parses the same measurements out of the same quote the contract does; this was
-/// confirmed against a live rejection, where the keystore's log line and the contract's own
-/// receipt log carried identical values. `scripts/deploy_tdx.sh` already trusts that local parse
-/// (it greps the keystore's log, not the contract's receipt), so nothing is lost by deciding
-/// here instead of paying the chain to tell us.
-pub async fn check_measurements_approved(
+/// Whether the DAO has approved this keystore's build: the guest OS of `measurements` and the
+/// compose `compose_hash` (`is_build_approved`). An error when the DAO has no such view.
+pub async fn check_build_approved(
     near_rpc_url: &str,
     dao_contract: &str,
     measurements: &crate::tdx_attestation::TdxMeasurements,
+    compose_hash: &str,
 ) -> Result<bool> {
     let client = crate::near::rpc_client(near_rpc_url);
-
     let args = serde_json::json!({
         "measurements": {
             "mrtd": measurements.mrtd,
@@ -846,46 +833,22 @@ pub async fn check_measurements_approved(
             "rtmr1": measurements.rtmr1,
             "rtmr2": measurements.rtmr2,
             "rtmr3": measurements.rtmr3,
-        }
+        },
+        "compose_hash": compose_hash,
     });
-
     let request = methods::query::RpcQueryRequest {
         block_reference: BlockReference::Finality(Finality::Final),
         request: QueryRequest::CallFunction {
             account_id: dao_contract.parse()?,
-            method_name: "is_measurements_approved".to_string(),
+            method_name: "is_build_approved".to_string(),
             args: FunctionArgs::from(serde_json::to_vec(&args)?),
         },
     };
-
     let response = client.call(request).await?;
-
     if let QueryResponseKind::CallResult(CallResult { result, .. }) = response.kind {
         Ok(serde_json::from_slice(&result)?)
     } else {
-        Ok(false)
-    }
-}
-
-/// Whether the DAO contract reads a registration's boot event log: it then has the
-/// `get_registration_facts` view. A contract without it ignores the log and wants the
-/// measurements approved beforehand.
-pub async fn dao_reads_event_log(near_rpc_url: &str, dao_contract: &str) -> Result<bool> {
-    let client = crate::near::rpc_client(near_rpc_url);
-    let request = methods::query::RpcQueryRequest {
-        block_reference: BlockReference::Finality(Finality::Final),
-        request: QueryRequest::CallFunction {
-            account_id: dao_contract.parse()?,
-            method_name: "get_registration_facts".to_string(),
-            args: FunctionArgs::from(serde_json::to_vec(&serde_json::json!({ "proposal_id": 0 }))?),
-        },
-    };
-    match client.call(request).await {
-        Ok(_) => Ok(true),
-        // The node answers a missing method as a handler error naming it; anything else is
-        // the RPC failing, which says nothing about the contract.
-        Err(e) if e.to_string().contains("MethodNotFound") || e.to_string().contains("MethodResolveError") => Ok(false),
-        Err(e) => Err(e.into()),
+        anyhow::bail!("unexpected answer to is_build_approved")
     }
 }
 
@@ -1548,10 +1511,10 @@ mod tests {
     /// Getting it wrong degrades safely (a malformed view call errors, and `main.rs` submits
     /// anyway rather than blocking) — but it would silently stop saving the gas this exists for.
     #[tokio::test]
-    async fn measurements_check_asks_the_dao_the_question_the_dao_answers() {
+    async fn the_build_check_asks_the_dao_the_question_the_dao_answers() {
         let (url, seen) = fake_rpc(
             std::time::Duration::ZERO,
-            vec![("is_measurements_approved", "true")],
+            vec![("is_build_approved", "true")],
         );
         let m = crate::tdx_attestation::TdxMeasurements {
             mrtd: "7f".repeat(48),
@@ -1561,14 +1524,14 @@ mod tests {
             rtmr3: "d3".repeat(48),
         };
 
-        let approved = check_measurements_approved(&url, "dao.testnet", &m)
+        let approved = check_build_approved(&url, "dao.testnet", &m, &"ab".repeat(32))
             .await
             .expect("view call must succeed");
 
         assert!(approved, "a `true` answer must be read as approved");
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            ["is_measurements_approved"],
+            ["is_build_approved"],
             "must call exactly the method the contract gates on"
         );
     }
@@ -1579,7 +1542,7 @@ mod tests {
     async fn a_false_answer_is_read_as_not_approved() {
         let (url, _seen) = fake_rpc(
             std::time::Duration::ZERO,
-            vec![("is_measurements_approved", "false")],
+            vec![("is_build_approved", "false")],
         );
         let m = crate::tdx_attestation::TdxMeasurements {
             mrtd: "00".repeat(48),
@@ -1588,7 +1551,7 @@ mod tests {
             rtmr2: "00".repeat(48),
             rtmr3: "00".repeat(48),
         };
-        assert!(!check_measurements_approved(&url, "dao.testnet", &m).await.unwrap());
+        assert!(!check_build_approved(&url, "dao.testnet", &m, &"ab".repeat(32)).await.unwrap());
     }
 
     /// `vault_id` arrives from the caller: the coordinator forwards `X-Customer-Vault` verbatim

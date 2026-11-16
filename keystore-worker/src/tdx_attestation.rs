@@ -187,6 +187,17 @@ impl TdxClient {
     }
 }
 
+/// The compose hash the RTMR3 events state: the payload of the first `compose-hash` event.
+pub fn compose_hash_of(rtmr3_events: &serde_json::Value) -> Option<String> {
+    rtmr3_events
+        .as_array()?
+        .iter()
+        .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("compose-hash"))?
+        .get("event_payload")?
+        .as_str()
+        .map(|s| s.to_ascii_lowercase())
+}
+
 /// The RTMR3 entries of dstack's event log (a JSON array), with the fields the DAO contract
 /// reads: `imr`, `event_type`, `digest`, `event`, `event_payload`. RTMR3 is the register the
 /// guest extends with the app id, the compose hash, the instance id and the key provider; the
@@ -223,17 +234,6 @@ pub fn rtmr3_events(event_log_json: &str) -> Option<serde_json::Value> {
 pub fn format_measurements_line(m: &TdxMeasurements) -> String {
     format!(
         "TDX Measurements: MRTD={}, RTMR0={}, RTMR1={}, RTMR2={}, RTMR3={}",
-        m.mrtd, m.rtmr0, m.rtmr1, m.rtmr2, m.rtmr3
-    )
-}
-
-/// Ready-to-paste `measurements` argument for the DAO's `add_approved_measurements`.
-///
-/// Printed when registration is blocked so the operator can approve without reassembling five
-/// hex strings by hand. Field names match the contract's `ApprovedMeasurements`.
-pub fn measurements_approval_args(m: &TdxMeasurements) -> String {
-    format!(
-        r#"{{"measurements":{{"mrtd":"{}","rtmr0":"{}","rtmr1":"{}","rtmr2":"{}","rtmr3":"{}"}},"clear_others":false}}"#,
         m.mrtd, m.rtmr0, m.rtmr1, m.rtmr2, m.rtmr3
     )
 }
@@ -307,46 +307,17 @@ mod tests {
         assert!(!line.contains("MRTD:"), "must NOT use the worker's colon form: {line}");
     }
 
-    /// The printed approval command has to be pasteable as-is; a wrong field name means an
-    /// operator approves a set that never matches and the keystore keeps refusing to register.
+    /// The line carries the five values the quote carries, by name: `scripts/deploy_tdx.sh`
+    /// reads the guest OS of a refused build from it.
     #[test]
-    fn approval_args_match_the_contract_argument_shape() {
-        let m = sample();
-        let v: serde_json::Value =
-            serde_json::from_str(&measurements_approval_args(&m)).expect("must be valid JSON");
-
-        assert_eq!(v["measurements"]["mrtd"], m.mrtd);
-        assert_eq!(v["measurements"]["rtmr0"], m.rtmr0);
-        assert_eq!(v["measurements"]["rtmr1"], m.rtmr1);
-        assert_eq!(v["measurements"]["rtmr2"], m.rtmr2);
-        assert_eq!(v["measurements"]["rtmr3"], m.rtmr3);
-        // Approving a new set must never wipe the ones already approved: other live instances
-        // are still registering against them.
-        assert_eq!(v["clear_others"], false);
-    }
-
-    /// The line is built from the same values the pre-check sends to the DAO, so an operator
-    /// approving what they read in the log approves exactly what the keystore will ask about.
-    #[test]
-    fn the_logged_line_and_the_approval_args_agree() {
+    fn the_logged_line_carries_each_measurement_by_name() {
         let m = sample();
         let line = format_measurements_line(&m);
-        let v: serde_json::Value = serde_json::from_str(&measurements_approval_args(&m)).unwrap();
-
-        for (key, field) in [
-            ("MRTD", "mrtd"),
-            ("RTMR0", "rtmr0"),
-            ("RTMR1", "rtmr1"),
-            ("RTMR2", "rtmr2"),
-            ("RTMR3", "rtmr3"),
-        ] {
-            assert_eq!(
-                grep_measurement(&line, key).as_deref(),
-                v["measurements"][field].as_str(),
-                "{key} differs between the log line and the approval args"
-            );
+        for (key, value) in [("MRTD", &m.mrtd), ("RTMR0", &m.rtmr0), ("RTMR1", &m.rtmr1), ("RTMR2", &m.rtmr2), ("RTMR3", &m.rtmr3)] {
+            assert_eq!(grep_measurement(&line, key).as_ref(), Some(value), "{key}");
         }
     }
+
     #[test]
     fn rtmr3_events_keeps_only_register_three_with_the_contract_fields() {
         let log = r#"[
@@ -361,6 +332,7 @@ mod tests {
         assert_eq!(a[1]["event_payload"], "cfcb");
         assert_eq!(a[1]["event_type"], 134217729u64);
         assert!(a[1].get("extra").is_none());
+        assert_eq!(compose_hash_of(&events).as_deref(), Some("cfcb"));
     }
 
     #[test]

@@ -359,15 +359,22 @@ No other binding exists; any other `bind` value is refused.
 
 ## Troubleshooting
 
-### Startup stops at "TEE measurements not approved"
+### Startup stops at "this build is not approved by the DAO yet"
 
-The build's five measurements are not on the DAO's approved list; no transaction was sent.
-The log prints the `add_approved_measurements` call to sign as the DAO owner. Approve, then
-restart the keystore. `scripts/deploy_tdx.sh keystore` does this as part of a deploy.
+The DAO has not approved this build: its guest OS (`mrtd`, `rtmr0`–`rtmr2`) or its
+`compose_hash`, both printed in the log; no transaction was sent. DAO members approve them
+(`ApproveOsImage`, `ApproveCompose`), then restart the keystore — the same CVM: a new deploy
+is a new instance. `scripts/deploy_tdx.sh keystore` proposes both and continues with
+`--resume`.
+
+### Startup stops at "dstack gave no event log with the quote"
+
+A keystore registers only with the boot event log of its quote. dstack returns it with every
+quote; without it the guest is not a dstack CVM the DAO can register.
 
 ### Startup stops waiting for the DAO vote
 
-The registration proposal was not approved within 30 minutes. The instance stays up without
+The registration proposal was not approved within 24 hours. The instance stays up without
 a listener. Restart it after a voter is available: the restart generates a new key and a new
 proposal.
 
