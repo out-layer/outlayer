@@ -214,7 +214,8 @@ for tool in jq curl near outlayer; do command -v "$tool" >/dev/null || { echo "�
 TOKEN=$(view "$CONTRACT_ID" get_payment_token_contract '{}' | jq -r '. // empty' 2>/dev/null)
 [[ -n "$TOKEN" ]] || { echo "✗ the contract names no payment token" >&2; exit 1; }
 note "payment token: $TOKEN; storage version $(view "$CONTRACT_ID" get_storage_version '{}')"
-[[ "$(view "$CONTRACT_ID" get_storage_version '{}')" == '"13"' ]] || { echo "✗ the contract is not at storage version 13: the refund methods are not deployed" >&2; exit 1; }
+SV=$(view "$CONTRACT_ID" get_storage_version '{}' | tr -dc '0-9')
+[[ -n "$SV" && "$SV" -ge 13 ]] || { echo "✗ the contract is below storage version 13: the refund methods are not deployed" >&2; exit 1; }
 if sql_alive; then note "coordinator DB: reachable"; else warn "PSQL_CMD unset or not answering: the coordinator-row checks will be SKIPPED"; fi
 [[ -n "$ADMIN_TOKEN" ]] && note "admin bearer: present (length ${#ADMIN_TOKEN})" || warn "no ADMIN_BEARER_TOKEN_TESTNET in $ENV_FILE: G1 (the grant key) will be SKIPPED"
 
