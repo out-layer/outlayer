@@ -405,8 +405,8 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 ### Init account
 
-- `submit_keystore_registration(public_key, tdx_quote_hex, app_id?, event_log?) -> u64` —
-  `event_log` is the quote's RTMR3 events; `app_id`, when given, is only logged.
+- `submit_keystore_registration(public_key, tdx_quote_hex, app_id?, event_log) -> u64` —
+  `event_log` (required) is the quote's RTMR3 events; `app_id`, when given, is only logged.
 
 ### Contract account, signed with an approved keystore key
 

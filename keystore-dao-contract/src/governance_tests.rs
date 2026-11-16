@@ -1353,3 +1353,76 @@ fn a_stale_registration_is_deleted_with_what_it_stated() {
     let anew = register(&mut d, 7, measured(&log), log);
     assert_ne!(anew, id, "the key registers anew");
 }
+
+#[test]
+fn the_owner_cannot_cancel_a_revocation_of_a_keystore_build() {
+    let mut d = dao(&["m1.testnet", "m2.testnet"], 3_600);
+    at(a("m1.testnet"), 0);
+    let os = d.propose(GovAction::RevokeOsImage { image: OsImage::of(&measurements('a')) });
+    let compose = d.propose(GovAction::RevokeCompose { compose_hash: "ab".repeat(32) });
+    at(owner(), 0);
+    for id in [os, compose] {
+        assert!(refused(|| d.cancel(id)), "the owner keeps no build the members take away");
+        assert_eq!(status(&d, id), GovStatus::Pending);
+    }
+    // An approval it may still stop.
+    at(a("m1.testnet"), 0);
+    let approve = d.propose(GovAction::ApproveCompose { compose_hash: "ab".repeat(32) });
+    at(owner(), 0);
+    d.cancel(approve);
+    assert_eq!(status(&d, approve), GovStatus::Cancelled);
+}
+
+#[test]
+fn a_build_approved_in_uppercase_is_stored_and_checked_in_lowercase() {
+    let mut d = dao(&["m1.testnet"], 0);
+    let upper = OsImage {
+        mrtd: "A".repeat(96),
+        rtmr0: "B".repeat(96),
+        rtmr1: "C".repeat(96),
+        rtmr2: "D".repeat(96),
+    };
+    at(a("m1.testnet"), 0);
+    let p = d.propose(GovAction::ApproveOsImage { image: upper.clone() });
+    let _ = d.execute(p);
+    let p = d.propose(GovAction::ApproveCompose { compose_hash: COMPOSE.to_uppercase() });
+    let _ = d.execute(p);
+    assert_eq!(d.get_approved_os_images(), vec![upper.lowercase()]);
+    let mut m = measurements('a');
+    m.mrtd = "a".repeat(96);
+    m.rtmr0 = "b".repeat(96);
+    m.rtmr1 = "c".repeat(96);
+    m.rtmr2 = "d".repeat(96);
+    assert!(d.is_build_approved(m.clone(), COMPOSE.to_uppercase()));
+    // Revoked in uppercase too.
+    let p = d.propose(GovAction::RevokeOsImage { image: upper });
+    let _ = d.execute(p);
+    assert!(!d.is_build_approved(m, COMPOSE.to_string()));
+}
+
+/// A registration that states its build (made with an event log by the code before the OS and
+/// compose lists existed) is checked against both at quorum like any other.
+#[test]
+fn a_stored_registration_with_facts_is_checked_against_the_lists_at_quorum() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    let log = boot_log('1');
+    let m = measured(&log);
+    d.proposals.insert(&1, &KeystoreProposal {
+        id: 1,
+        public_key: key(1),
+        measurements: m.clone(),
+        submitter: a("init.testnet"),
+        created_at: 0,
+        votes_for: 0,
+        votes_against: 0,
+        status: ProposalStatus::Pending,
+    });
+    KeystoreDao::registration_facts_for_tests().insert(&1, &event_log::replay(&log).unwrap().1);
+    KeystoreDao::set_composes(&vec![COMPOSE.to_string()]); // the compose, not the OS
+    at(a("m1.testnet"), 0);
+    d.vote(1, true, Some(key(1)));
+    at(a("m2.testnet"), 0);
+    d.vote(1, true, Some(key(1)));
+    assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Rejected);
+    assert!(!d.is_keystore_approved(String::from(&key(1))));
+}

@@ -321,7 +321,8 @@ pub struct KeystoreDao {
 
     /// Read by nothing, kept for the state layout: a keystore build is its guest OS and its
     /// compose (`ApprovedOsImages`, `ApprovedComposes`), never a five-register tuple, since RTMR3
-    /// carries the instance id. Empty from `migrate()` on.
+    /// carries the instance id. `migrate()` from the V4 layout leaves it empty; a contract
+    /// upgraded without a migration keeps the old entries, unread.
     #[allow(dead_code)]
     pub approved_measurements: Vec<ApprovedMeasurements>,
 
@@ -725,6 +726,11 @@ impl KeystoreDao {
 
     fn registration_facts() -> LookupMap<u64, RegistrationFacts> {
         LookupMap::new(StorageKey::RegistrationFacts)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registration_facts_for_tests() -> LookupMap<u64, RegistrationFacts> {
+        Self::registration_facts()
     }
 
     fn registration_by_key() -> LookupMap<PublicKey, u64> {

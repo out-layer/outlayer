@@ -280,7 +280,7 @@ fn any_changed_byte_of_the_quote_is_refused() {
     let mut d = dao();
     let f = dal();
     // The header, the TD report (MRTD at 48+136, RTMR3 at 48+472, report_data at 48+520), the
-    // signature-data length (its high byte), the ECDSA signature, the attestation key, the QE
+    // signature-data length (its second byte: 256 more), the ECDSA signature, the attestation key, the QE
     // report, the PCK certificate and the intermediate CA.
     let pck = cert_start(&f.quote, 0);
     let intermediate = cert_start(&f.quote, 1);
