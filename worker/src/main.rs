@@ -40,7 +40,7 @@ use executor::{Executor, ExecutionContext};
 use keystore_client::KeystoreClient;
 use near_client::NearClient;
 use outlayer_storage::StorageConfig;
-use tdx_attestation::{TdxClient, get_phala_app_info};
+use tdx_attestation::{TdxClient, get_dstack_app_info};
 
 /// Generate a dummy TDX quote and fetch collateral from Phala Cloud API
 ///
@@ -95,25 +95,25 @@ async fn main() -> Result<()> {
 
     // Auto-generate worker_id if not explicitly set via WORKER_ID env var
     if !Config::is_worker_id_from_env() {
-        info!("🔍 WORKER_ID not set, auto-generating from network + type + Phala app_id...");
+        info!("🔍 WORKER_ID not set, auto-generating from network + type + dstack app_id...");
 
-        // Try to get Phala app info (only works in TEE environment)
+        // Try to get the dstack app info (only works in a TEE)
         // Use timeout to avoid hanging if dstack socket exists but is unresponsive
-        let phala_app_id = if config.tee_mode == "outlayer_tee" {
+        let dstack_app_id = if config.tee_mode == "outlayer_tee" {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                get_phala_app_info()
+                get_dstack_app_info()
             ).await {
                 Ok(Some(info)) => {
-                    info!("📱 Detected Phala TEE: app_id={}", info.app_id);
+                    info!("📱 Detected dstack TEE: app_id={}", info.app_id);
                     Some(info.app_id)
                 }
                 Ok(None) => {
-                    warn!("⚠️  Could not get Phala app info, using random UUID");
+                    warn!("⚠️  Could not get dstack app info, using random UUID");
                     None
                 }
                 Err(_) => {
-                    warn!("⚠️  Timeout getting Phala app info (5s), using random UUID");
+                    warn!("⚠️  Timeout getting dstack app info (5s), using random UUID");
                     None
                 }
             }
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
             None
         };
 
-        let generated_id = config.generate_worker_id(phala_app_id.as_deref());
+        let generated_id = config.generate_worker_id(dstack_app_id.as_deref());
         info!("🏷️  Generated worker_id: {}", generated_id);
         config.set_worker_id(generated_id);
     }
@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
                 info!("📦 WASM cache directory: {} (writable)", configured_dir.display());
                 configured_dir
             } else {
-                // Fall back to /tmp subdirectory (TEE environment like Phala)
+                // Fall back to /tmp subdirectory (a TEE environment)
                 // Security note: WASI P2 has access to /tmp, but cache has checksum verification
                 // so tampering would be detected. In TEE only /tmp is writable.
                 let fallback_dir = std::path::PathBuf::from("/tmp/outlayer-wasm-cache");

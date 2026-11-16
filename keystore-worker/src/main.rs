@@ -68,24 +68,6 @@ async fn main() -> Result<()> {
         "Configuration loaded"
     );
 
-    // Try to get Phala app info (for TEE verification URL)
-    if config.tee_mode == TeeMode::OutlayerTee {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tdx_attestation::get_phala_app_info()
-        ).await {
-            Ok(Some(info)) => {
-                tracing::info!("🔐 Phala TEE verification: https://trust.phala.com/app/{}", info.app_id);
-            }
-            Ok(None) => {
-                tracing::warn!("⚠️ Could not get Phala app info");
-            }
-            Err(_) => {
-                tracing::warn!("⚠️ Timeout getting Phala app info");
-            }
-        }
-    }
-
     // Initialize NEAR RPC client for reading secrets from contract (read-only). The RPC and the
     // contract are the resolved ones (`config::resolve_chain`), fixed in code for a production DAO.
     let near_client = if let Some(contract_id) = config.near_contract_id.as_deref() {
@@ -365,8 +347,8 @@ async fn perform_tee_registration(config: &Config) -> Result<TeeRegistrationResu
             tracing::warn!("Could not extract measurements from the quote; submitting without the pre-check");
         }
 
-        // Get Phala app_id for TEE verification (will be logged in blockchain tx)
-        let app_id = crate::tdx_attestation::get_phala_app_info()
+        // The dstack app_id goes with the registration (logged in the transaction)
+        let app_id = crate::tdx_attestation::get_dstack_app_info()
             .await
             .map(|info| info.app_id);
 
