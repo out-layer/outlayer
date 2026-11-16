@@ -25,7 +25,7 @@
 #   1. the OLD keys    — `propose_revoke_keystore_keys` (one proposal per <=16 keys, signed by
 #                        zavodil.*). With a single DAO member the proposal executes in the same
 #                        call; with more members the others just vote by id, with the same
-#                        `vote {"proposal_id":N,"approve":true}` used for registrations
+#                        `vote {"proposal_id":N,"approve":true}` governance proposals take
 #   2. the OLD images  — each removed with `remove_approved_measurements` (owner-signed), so a
 #                        retired image can never register again. The kept images are never
 #                        touched: there is no moment in which the allowlist is empty or partial,

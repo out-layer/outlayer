@@ -62,17 +62,20 @@ dao_local_key() {
     [ -f "$d/$1.json" ] || [ -n "$(ls "$d/$1"/*.json 2>/dev/null | head -1)" ]
 }
 
-# dao_vote_local <dao> <id> — vote for <id> with every member whose key is local, until it no
-# longer waits for votes. Governance proposals name who voted; for a registration or a key
-# revocation a member who already voted is refused by the contract, which is skipped.
+# dao_vote_local <dao> <id> [keystore-key] — vote for <id> with every member whose key is
+# local, until it no longer waits for votes. Governance proposals name who voted; for a
+# registration or a key revocation a member who already voted is refused by the contract, which
+# is skipped. A keystore registration takes <keystore-key>, the key read from the operator's own
+# CVM: the vote names it and the DAO refuses it on a registration for another key.
 dao_vote_local() {
-    local dao="$1" id="$2" m status
+    local dao="$1" id="$2" key="${3:-}" m status args
+    args="{\"proposal_id\":$id,\"approve\":true${key:+,\"public_key\":\"$key\"}}"
     for m in $(dao_members_json "$dao" | python3 -I -c 'import json,sys; print(" ".join(json.load(sys.stdin)["members"]))'); do
         status=$(dao_status "$dao" "$id")
         [ "$status" = Pending ] || break
         if dao_has_voted "$dao" "$id" "$m"; then continue; fi
         dao_local_key "$m" || { echo "  (no local key for $m)"; continue; }
-        if dao_tx "$m" "$dao" vote "{\"proposal_id\":$id,\"approve\":true}" >/dev/null 2>&1; then
+        if dao_tx "$m" "$dao" vote "$args" >/dev/null 2>&1; then
             echo "  voted for #$id as $m"
         fi
     done
@@ -156,11 +159,13 @@ import sys,json; p=json.load(sys.stdin); print(p["status"], p.get("executable_af
     return 2
 }
 
-# dao_print_votes <dao> <id> — how many votes proposal <id> still needs, and the ready `vote`
-# command for every member of its electorate who has not voted. Works for governance proposals
-# and keystore registrations alike (one `vote` method, one id counter).
+# dao_print_votes <dao> <id> [keystore-key] — how many votes proposal <id> still needs, and the
+# ready `vote` command for every member of its electorate who has not voted. Works for
+# governance proposals, key revocations and keystore registrations (one `vote` method, one id
+# counter). A registration's commands name <keystore-key> — the key the operator read from
+# their own CVM, never the one the chain shows for the id.
 dao_print_votes() {
-    local dao="$1" id="$2" p kind
+    local dao="$1" id="$2" key="${3:-}" p kind
     p=$(_dao_view "$dao" get_gov_proposal "{\"proposal_id\":$id}")
     kind=gov
     if [ -z "$p" ] || [ "$p" = null ]; then p=$(_dao_view "$dao" get_proposal "{\"proposal_id\":$id}"); kind=registration; fi
@@ -168,7 +173,7 @@ dao_print_votes() {
     if [ -z "$p" ] || [ "$p" = null ]; then echo "  #$id: no such proposal on $dao" >&2; return 1; fi
     printf '%s' "$p" | python3 -I -c '
 import json, sys
-dao, pid, net, kind, members_json = sys.argv[1:6]
+dao, pid, net, kind, members_json, key = sys.argv[1:7]
 p = json.load(sys.stdin)
 members = json.loads(members_json)
 if kind == "gov":
@@ -182,12 +187,19 @@ else:
     voted, have = set(), int(p.get("votes_for") or 0)
 need = max(threshold - have, 0)
 todo = [m for m in electorate if m not in voted]
+vote = {"proposal_id": int(pid), "approve": True}
+if kind == "registration":
+    vote["public_key"] = key or "<the key your own CVM printed: Using keystore public key>"
+    chain_key = p["public_key"]
+    if key and chain_key != key:
+        print(f"  !! registration #{pid} on chain is for {chain_key}, not for {key}: no vote for {key} will land on it")
+vote_json = json.dumps(vote, separators=(",", ":"))
 print(f"  #{pid} waits for votes: {have} of {threshold}; {need} more needed. Ready commands"
       + (" (any of them; a member who already voted is refused):" if kind != "gov" else ":"))
 for m in todo:
-    print(f"    near contract call-function as-transaction {dao} vote json-args \x27{{\"proposal_id\":{pid},\"approve\":true}}\x27 "
+    print(f"    near contract call-function as-transaction {dao} vote json-args \x27{vote_json}\x27 "
           f"prepaid-gas \x27100 Tgas\x27 attached-deposit \x270 NEAR\x27 sign-as {m} network-config {net} sign-with-legacy-keychain send")
-' "$dao" "$id" "$NETWORK" "$kind" "$(dao_members_json "$dao")"
+' "$dao" "$id" "$NETWORK" "$kind" "$(dao_members_json "$dao")" "$key"
 }
 
 # dao_members_json <dao> — {"members":[...],"threshold":N} of the DAO as it stands.

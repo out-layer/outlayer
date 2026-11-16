@@ -61,10 +61,12 @@
 # worker:   deploy -> read measurements -> owner-approve on the register-contract -> wait for the
 #           worker to register by itself (restarted only if it gave up waiting). Owner key stays
 #           on the Mac.
-# keystore: deploy (self-submits its DAO registration) -> read measurements -> owner-approve on
-#           the DAO contract -> wait for the keystore's "Proposal ID: N" -> vote as zavodil
-#           (auto on testnet, printed for manual run on mainnet) -> poll /health until ready.
-#           Owner + zavodil keys stay on the Mac.
+# keystore: deploy -> read the CVM's measurements, instance id and compose hash from its guest
+#           agent, and its key and "Proposal ID: N" from its log -> check that registration N
+#           on the DAO is this CVM's (same instance, compose, RTMR3, key) -> the members vote
+#           FOR THAT KEY (DAO_CHAIN: sent with the local keys, or printed) -> poll /health until
+#           ready. One vote per instance; nothing is approved beforehand. A keystore that sends
+#           no boot event log has its measurements approved by a DAO vote first.
 #
 # Examples:
 #   ./scripts/deploy_tdx.sh worker   testnet --version 0.1.35 --node root@$DAL_HOST
@@ -228,6 +230,17 @@ t = json.loads(json.load(sys.stdin)[\"tcb_info\"])
 m = {k: t[k] for k in (\"mrtd\", \"rtmr0\", \"rtmr1\", \"rtmr2\", \"rtmr3\")}
 assert all(len(v) == 96 for v in m.values())
 print(json.dumps(m, separators=(\",\", \":\")))' 2>/dev/null" 2>/dev/null | grep -oE '^\{"mrtd":"[a-f0-9]{96}".*\}$' | tail -1
+}
+
+# What the CVM named $NAME is, from its own guest agent over the node loopback:
+# "<instance_id> <compose_hash> <app_id>". This is the operator's own reading of the CVM they
+# deployed; the registration on chain is checked against it.
+agent_identity() {
+  node_run "p=\$(NAME=$NAME ./worker-ctl.sh port 2>/dev/null); case \"\$p\" in ''|'<'*) exit 0;; esac; \
+    curl -s --max-time 5 \"http://127.0.0.1:\$p/prpc/Info?json\" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print(\"IDENT\", d[\"instance_id\"], d[\"compose_hash\"], d[\"app_id\"])' 2>/dev/null" 2>/dev/null | grep -oE '^IDENT [a-f0-9]{40} [a-f0-9]{64} [a-f0-9]{40}$' | tail -1 | cut -d' ' -f2-
 }
 
 # Run a command on the node as REMOTE_USER inside REMOTE_DIR. base64 avoids all quoting hell.
@@ -449,6 +462,39 @@ fi  # end worker
 # Logs come from the dstack-keystore-1 container (worker-ctl.sh defaults to dstack-worker-1).
 ks_logs() { node_run "NAME=$NAME CONTAINER=$KS_CONTAINER TAIL=${1:-600} ./worker-ctl.sh logs"; }
 
+# The keystore's log lines from $SINCE on (they start with an ISO timestamp); all of them while
+# SINCE is empty.
+SINCE=""
+ks_logs_since() { ks_logs "${1:-600}" 2>/dev/null | awk -v t="$SINCE" '/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && substr($0, 1, 19) >= t'; }
+
+# wait_registration <tries> — the pending registration of the key this CVM holds now. Sets
+# LIVE_KEY (the last "Using keystore public key" the keystore logged) and PROPOSAL_ID (the id it
+# logged, taken only when that registration on chain is Pending and for LIVE_KEY); PROPOSAL_ID
+# stays empty when none appears. NOT_SUBMITTED=1 when the keystore said it did not submit.
+wait_registration() {
+  local tries="$1" i L P P_KEY P_STATUS
+  PROPOSAL_ID=""; LIVE_KEY=""; NOT_SUBMITTED=""
+  for i in $(seq 1 "$tries"); do
+    L=$(ks_logs_since 600 || true)
+    LIVE_KEY=$(printf '%s' "$L" | grep -oE 'Using keystore public key: [a-z0-9-]+:[A-Za-z0-9]+' | tail -1 | sed 's/.*: //' || true)
+    # main.rs logs "Proposal ID: {}" on a successful submit; tee_registration.rs logs the same.
+    PROPOSAL_ID=$(printf '%s' "$L" | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+    if [ -n "$PROPOSAL_ID" ]; then
+      P=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
+        network-config "$NETWORK" now 2>/dev/null || true)
+      P_KEY=$(printf '%s' "$P" | grep -oE '"public_key": "[^"]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
+      P_STATUS=$(printf '%s' "$P" | grep -oE '"status": "[A-Za-z]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
+      if [ -z "$LIVE_KEY" ] || [ "$P_KEY" != "$LIVE_KEY" ] || [ "$P_STATUS" != Pending ]; then
+        echo "  #$PROPOSAL_ID is not the live key's pending proposal yet (key ${P_KEY:-?}, live ${LIVE_KEY:-not logged yet}, status ${P_STATUS:-?}); waiting"
+        PROPOSAL_ID=""
+      fi
+    fi
+    [ -n "$PROPOSAL_ID" ] && return 0
+    if [ "$tries" -lt 25 ] && printf '%s' "$L" | grep -q "Registration NOT submitted"; then NOT_SUBMITTED=1; return 0; fi
+    sleep 12
+  done
+}
+
 # [2/6] deploy the CVM on the node (node-side deploy_tdx.sh derives the stable COMPOSE_NAME).
 # GATEWAY_URL (optional) flows Mac --gateway-url -> node env -> 40-deploy-keystore.sh: when set, the
 # keystore deploys gateway-enabled and gets a public HTTPS endpoint.
@@ -511,6 +557,47 @@ RTMR3=$(printf '%s' "$MEAS" | grep -oE '"rtmr3":"[a-f0-9]{96}"' | grep -oE '[a-f
 echo "  mrtd=$MRTD"
 echo "  rtmr3=$RTMR3"
 
+# [4/6] A DAO that reads the boot event log takes the keystore's first registration as it is:
+# it replays the log against the quote and records which compose and which instance registers
+# (`get_registration_facts`), and the members' vote on that registration approves both. Nothing
+# is approved beforehand and the CVM is not restarted. A keystore that sends no event log, or a
+# DAO that reads none, goes the other way: its measurements approved by a DAO vote, then a
+# restart, then the registration.
+BY_LOG=false
+if near contract call-function as-read-only "$DAO" get_registration_facts json-args '{"proposal_id":0}' \
+     network-config "$NETWORK" now >/dev/null 2>&1; then
+  echo "[4/6] Wait for this CVM's registration on $DAO (it carries its boot event log)..."
+  wait_registration 12
+  if [ -n "$PROPOSAL_ID" ]; then
+    FACTS=$(near contract call-function as-read-only "$DAO" get_registration_facts json-args "{\"proposal_id\":$PROPOSAL_ID}" \
+      network-config "$NETWORK" now 2>/dev/null | python3 -I -c 'import json,sys
+f=json.load(sys.stdin)
+print(f["instance_id"], f["compose_hash"], f["app_id"]) if f else None' 2>/dev/null || true)
+    [ -n "$FACTS" ] && [ "$FACTS" != None ] && BY_LOG=true
+  fi
+  $BY_LOG || echo "  this keystore registers without an event log: its measurements are approved first"
+fi
+
+if $BY_LOG; then
+  # The registration on chain must be THIS CVM's: the instance and the compose its own guest
+  # agent reports, and the RTMR3 read from it in [3/6]. The key is the one its log printed.
+  IDENT=$(agent_identity || true)
+  [ -n "$IDENT" ] || { echo "  could not read the CVM's instance id from its guest agent" >&2; exit 1; }
+  P_RTMR3=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
+    network-config "$NETWORK" now 2>/dev/null | grep -oE '"rtmr3": "[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}' || true)
+  if [ "$FACTS" != "$IDENT" ] || [ "$P_RTMR3" != "$RTMR3" ]; then
+    echo "  REFUSING: registration #$PROPOSAL_ID on $DAO is not this CVM's." >&2
+    echo "    this CVM (guest agent):  instance/compose/app = $IDENT  rtmr3=$RTMR3" >&2
+    echo "    registration on chain:   instance/compose/app = $FACTS  rtmr3=${P_RTMR3:-?}" >&2
+    exit 1
+  fi
+  echo "  registration #$PROPOSAL_ID is this CVM's:"
+  echo "    key          $LIVE_KEY"
+  echo "    instance_id  ${IDENT%% *}"
+  echo "    compose_hash $(echo "$IDENT" | cut -d' ' -f2)   (the same for every instance of v$VER)"
+  # [6/6] counts only a "ready" line logged from here on.
+  SINCE=$(node_run "date -u +%Y-%m-%dT%H:%M:%S" 2>/dev/null | tail -1 | tr -d '\r')
+else
 # [4/6] approve measurements on the DAO contract (idempotent)
 echo "[4/6] Approve measurements on $DAO..."
 # M1: parse the bool strictly (the old `grep -qi true` over full near-cli-rs output is fragile — it
@@ -558,41 +645,20 @@ node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
 SINCE=$(node_run "date -u +%Y-%m-%dT%H:%M:%S" 2>/dev/null | tail -1 | tr -d '\r')
 [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}$ ]] || { echo "  could not read the node's clock (got '$SINCE')" >&2; exit 1; }
 echo "  counting only what the keystore logs from $SINCE UTC on"
-# The keystore's log lines from $SINCE on (they start with an ISO timestamp).
-ks_logs_since() { ks_logs "${1:-600}" 2>/dev/null | awk -v t="$SINCE" '/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && substr($0, 1, 19) >= t'; }
 echo "  waiting for the keystore to submit its DAO proposal (Proposal ID: N)..."
-PROPOSAL_ID=""; LIVE_KEY=""
-for i in $(seq 1 25); do
-  L=$(ks_logs_since 600 || true)
-  LIVE_KEY=$(printf '%s' "$L" | grep -oE 'Using keystore public key: [a-z0-9-]+:[A-Za-z0-9]+' | tail -1 | sed 's/.*: //' || true)
-  # main.rs logs "Proposal ID: {}" on a successful submit; tee_registration.rs logs the same.
-  PROPOSAL_ID=$(printf '%s' "$L" | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)
-  if [ -n "$PROPOSAL_ID" ]; then
-    P=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
-      network-config "$NETWORK" now 2>/dev/null || true)
-    P_KEY=$(printf '%s' "$P" | grep -oE '"public_key": "[^"]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
-    P_STATUS=$(printf '%s' "$P" | grep -oE '"status": "[A-Za-z]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
-    if [ -z "$LIVE_KEY" ] || [ "$P_KEY" != "$LIVE_KEY" ] || [ "$P_STATUS" != Pending ]; then
-      echo "  #$PROPOSAL_ID is not the live key's pending proposal yet (key ${P_KEY:-?}, live ${LIVE_KEY:-not logged yet}, status ${P_STATUS:-?}); waiting"
-      PROPOSAL_ID=""
-    fi
-  fi
-  [ -n "$PROPOSAL_ID" ] && break
-  # Do NOT early-exit on "measurements not approved" / "Registration rejected": that line is EXPECTED
-  # from the keystore's FIRST boot (before [4/6] approved) and persists in the log buffer, so bailing
-  # on it is a false negative — the keystore retries (container `restart: on-failure`) and submits a
-  # proposal once the measurements are approved. The ~5min timeout below catches a genuine failure.
-  sleep 12
-done
+wait_registration 25
 [ -n "$PROPOSAL_ID" ] || { echo "  No 'Proposal ID' in logs after ~5min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
+fi  # by event log, or by approved measurements
 echo "  proposal id: $PROPOSAL_ID (live key $LIVE_KEY, pending on $DAO)"
 
-# Vote (DAO_CHAIN, scripts/lib/dao_gov.sh): `send` votes with every member whose key is local
+# Vote (DAO_CHAIN, scripts/lib/dao_gov.sh). Every vote names LIVE_KEY, the key this CVM's own
+# log printed: the DAO refuses it on a registration for any other key, so a vote asked for here
+# cannot land on someone else's keystore. `send` votes with every member whose key is local
 # until the registration executes; `print` (and mainnet always) prints one ready command per
 # member. The keystore waits for the quorum up to 24 h (tee_registration.rs wait_for_approval).
 if [ "$(dao_chain_mode)" = print ]; then
   echo "  Nothing sent (print mode). The members vote on the keystore's registration:"
-  dao_print_votes "$DAO" "$PROPOSAL_ID" || true
+  dao_print_votes "$DAO" "$PROPOSAL_ID" "$LIVE_KEY" || true
   echo "  Once the quorum votes, the keystore pulls its MPC-CKD master and becomes ready."
   echo "  Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
   if [ -n "$KEYSTORE_URL" ]; then
@@ -601,11 +667,11 @@ if [ "$(dao_chain_mode)" = print ]; then
   fi
   exit 0
 fi
-dao_vote_local "$DAO" "$PROPOSAL_ID"
+dao_vote_local "$DAO" "$PROPOSAL_ID" "$LIVE_KEY"
 P_STATUS=$(dao_status "$DAO" "$PROPOSAL_ID")
 if [ "$P_STATUS" = Pending ]; then
   echo "  #$PROPOSAL_ID still needs votes the local keys cannot give; the keystore waits up to 24 h."
-  dao_print_votes "$DAO" "$PROPOSAL_ID" || true
+  dao_print_votes "$DAO" "$PROPOSAL_ID" "$LIVE_KEY" || true
   echo "  Then it pulls its master and becomes ready. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
   exit 0
 fi

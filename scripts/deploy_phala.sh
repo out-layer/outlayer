@@ -393,18 +393,25 @@ if [ "$COMPONENT" = "keystore" ]; then
                 grep -o 'Proposal ID: [0-9]*' | sed 's/Proposal ID: //' | tail -1 || echo "")
         fi
 
-        if [ -n "$PROPOSAL_ID" ]; then
+        # The key this boot registered: a vote for the registration names it.
+        LIVE_KEY=$(echo "$RAW_LOGS" | grep -oE 'Using keystore public key: [a-z0-9-]+:[A-Za-z0-9]+' | tail -1 | sed 's/.*: //' || echo "")
+        if [ -z "$LIVE_KEY" ]; then
+            LIVE_KEY=$(echo "$RAW_LOGS" | jq -r '.message // empty' 2>/dev/null | base64 -d 2>/dev/null | \
+                grep -oE 'Using keystore public key: [a-z0-9-]+:[A-Za-z0-9]+' | tail -1 | sed 's/.*: //' || echo "")
+        fi
+
+        if [ -n "$PROPOSAL_ID" ] && [ -n "$LIVE_KEY" ]; then
             echo ""
-            echo -e "${GREEN}✓ Found Proposal ID: ${PROPOSAL_ID}${NC}"
+            echo -e "${GREEN}✓ Found Proposal ID: ${PROPOSAL_ID} (key ${LIVE_KEY})${NC}"
             break
         fi
 
         sleep 5
     done
 
-    if [ -z "$PROPOSAL_ID" ]; then
+    if [ -z "$PROPOSAL_ID" ] || [ -z "${LIVE_KEY:-}" ]; then
         echo ""
-        echo -e "${RED}Error: Could not find proposal ID in logs${NC}"
+        echo -e "${RED}Error: Could not find the proposal ID and the keystore's public key in logs${NC}"
         echo -e "${YELLOW}Check logs manually: phala cvms logs $CVM_NAME${NC}"
         exit 1
     fi
@@ -415,7 +422,7 @@ if [ "$COMPONENT" = "keystore" ]; then
         echo -e "Run this to approve proposal #${PROPOSAL_ID}:"
         echo ""
         echo "  near contract call-function as-transaction $DAO_CONTRACT vote \\"
-        echo "    json-args '{\"proposal_id\": $PROPOSAL_ID, \"approve\": true}' \\"
+        echo "    json-args '{\"proposal_id\": $PROPOSAL_ID, \"approve\": true, \"public_key\": \"$LIVE_KEY\"}' \\"
         echo "    prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \\"
         echo "    sign-as $VOTER_ACCOUNT network-config $NETWORK sign-with-keychain send"
         echo ""
@@ -423,7 +430,7 @@ if [ "$COMPONENT" = "keystore" ]; then
         echo -e "${YELLOW}Voting on proposal #${PROPOSAL_ID}...${NC}"
 
         near contract call-function as-transaction "$DAO_CONTRACT" vote \
-            json-args "{\"proposal_id\": $PROPOSAL_ID, \"approve\": true}" \
+            json-args "{\"proposal_id\": $PROPOSAL_ID, \"approve\": true, \"public_key\": \"$LIVE_KEY\"}" \
             prepaid-gas '100.0 Tgas' \
             attached-deposit '0 NEAR' \
             sign-as "$VOTER_ACCOUNT" \
