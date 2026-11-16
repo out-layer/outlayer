@@ -36,6 +36,10 @@
 #                       https://kms-v2.<site>.dstack.outlayer.ai:11102 for KMS v2. Changes the
 #                       measurements (RTMR3 carries the KMS), approved like any other. The
 #                       <site> must be the node's own (see node_kms_site); refused otherwise.
+#   --resume           keystore only: continue with the CVM [instance-name] as it is deployed — no
+#                       new deploy. For the second run after its measurements were approved by
+#                       DAO vote: a new deploy would be a new CVM with a new instance-id in RTMR3,
+#                       whose measurements the approved ones no longer match.
 #   --dry-run          show what would happen; no deploy, no tx
 #
 # The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
@@ -64,7 +68,7 @@
 #   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@$DAL_HOST
 set -euo pipefail
 
-DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""; KMS_URL=""
+DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""; KMS_URL=""; RESUME=false
 EXECUTE_EXCLUDES=""; EXCLUDES_SET=false
 REMOTE_USER="outlayer"; REMOTE_DIR="/home/outlayer/self-hosted-tdx"
 POS=()
@@ -86,6 +90,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   # `<project>:*`, comma-separated. Given here it overrides the per-node table
   # below; an empty string forces "no exclusions" on a node the table covers.
   --execute-excludes) EXECUTE_EXCLUDES="${2-}"; EXCLUDES_SET=true; shift 2;;
+  --resume)      RESUME=true; shift;;
   --dry-run|--info) DRY_RUN=true; shift;;
   *) POS+=("$1"); shift;;
 esac; done
@@ -93,6 +98,10 @@ COMPONENT="${POS[0]:-}"; NETWORK="${POS[1]:-testnet}"; INSTANCE_NAME="${POS[2]:-
 
 case "$COMPONENT" in worker|keystore) ;; *) echo "component must be worker|keystore (got '$COMPONENT')" >&2; exit 1;; esac
 case "$NETWORK" in testnet|mainnet) ;; *) echo "network must be testnet|mainnet (got '$NETWORK')" >&2; exit 1;; esac
+if $RESUME; then
+  [ "$COMPONENT" = keystore ] || { echo "--resume is for a keystore (a worker registers by itself once approved)" >&2; exit 1; }
+  [ -n "$INSTANCE_NAME" ] || { echo "--resume needs the instance name of the deployed CVM" >&2; exit 1; }
+fi
 [ -n "$DEPLOY_VERSION" ] || { echo "--version <ver> required (e.g. --version 0.1.35)" >&2; exit 1; }
 [ -n "$NODE" ] || { echo "--node <ssh-target> required (e.g. --node root@<node-ip>)" >&2; exit 1; }
 
@@ -444,6 +453,9 @@ if [ -n "$OS_IMAGE" ]; then
 echo "[2/6] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image, start)..."
 node_run "./worker-ctl.sh set-image $NAME $OS_IMAGE"
 KEYSTORE_URL=""   # unchanged by an image upgrade; nothing new to announce
+elif $RESUME; then
+echo "[2/6] --resume: CVM '$NAME' stays as deployed (no new deploy, so its measurements stay the approved ones)"
+KEYSTORE_URL=""
 else
 echo "[2/6] Deploy CVM on node (reads node env: $REMOTE_DIR/keystore/.env.${NETWORK}-keystore-tdx — NOT your local copy)..."
 if [ -n "$GATEWAY_URL" ]; then
@@ -510,7 +522,8 @@ elif dao_has_governance "$DAO"; then
   rc=0; dao_drive "$DAO" "$GOV_MEMBER" "$(dao_measurements_action keystore "" "$MEAS")" || rc=$?
   if [ "$rc" -eq 2 ]; then
     echo "  The CVM '$NAME' is up; its registration goes through once the proposal executes."
-    echo "  Rerun this deploy then to vote on the keystore's registration."
+    echo "  After the execute, continue WITHOUT a new deploy (a new CVM has new measurements):"
+    echo "    $0 keystore $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume"
     exit 3
   fi
   [ "$rc" -eq 0 ] || { echo "  approval through the DAO failed" >&2; exit 1; }
@@ -574,12 +587,8 @@ echo "  proposal id: $PROPOSAL_ID (live key $LIVE_KEY, pending on $DAO)"
 # their quorum up to 24 h (tee_registration.rs wait_for_approval).
 VOTE_ARGS="{\"proposal_id\":$PROPOSAL_ID,\"approve\":true}"
 if [ "$NETWORK" = mainnet ]; then
-  echo "  MAINNET — vote manually to approve proposal #$PROPOSAL_ID:"
-  echo ""
-  echo "    near contract call-function as-transaction $DAO vote \\"
-  echo "      json-args '$VOTE_ARGS' \\"
-  echo "      prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \\"
-  echo "      sign-as $VOTER network-config $NETWORK sign-with-legacy-keychain send"
+  echo "  MAINNET — members vote by hand on the keystore's registration (each with their own signer):"
+  dao_print_votes "$DAO" "$PROPOSAL_ID" || true
   echo ""
   echo "  After the vote lands, the keystore pulls its MPC-CKD master and becomes ready."
   echo "  Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
@@ -600,10 +609,9 @@ echo "  voted"
 P_STATUS=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
   network-config "$NETWORK" now 2>/dev/null | grep -oE '"status": "[A-Za-z]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
 if [ "$P_STATUS" = Pending ]; then
-  echo "  #$PROPOSAL_ID still needs the other members' votes (the keystore waits up to 24 h). Each runs:"
-  echo "    near contract call-function as-transaction $DAO vote json-args '$VOTE_ARGS' \\"
-  echo "      prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as <member> network-config $NETWORK sign-with-legacy-keychain send"
-  echo "  Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
+  echo "  The keystore waits for the other members' votes up to 24 h."
+  dao_print_votes "$DAO" "$PROPOSAL_ID" || true
+  echo "  Then it pulls its master and becomes ready. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
   exit 0
 fi
 

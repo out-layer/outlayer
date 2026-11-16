@@ -89,16 +89,55 @@ import sys,json; p=json.load(sys.stdin); print(p["status"], p.get("executable_af
     fi
 
     if [ "$status" = Pending ]; then
-        echo "  #$id waits for votes. Each other member runs:"
-        echo "    near contract call-function as-transaction $dao vote json-args '{\"proposal_id\":$id,\"approve\":true}' \\"
-        echo "      prepaid-gas '100 Tgas' attached-deposit '0 NEAR' sign-as <member> network-config $NETWORK sign-with-legacy-keychain send"
+        dao_print_votes "$dao" "$id"
     else
         echo "  #$id is approved; it executes from $(python3 -I -c 'import sys,datetime; print(datetime.datetime.fromtimestamp(int(sys.argv[1])/1e9, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))' "$after")."
     fi
-    echo "  Then a member executes it (or rerun this script):"
-    echo "    near contract call-function as-transaction $dao execute json-args '{\"proposal_id\":$id}' \\"
-    echo "      prepaid-gas '300 Tgas' attached-deposit '0 NEAR' sign-as <member> network-config $NETWORK sign-with-legacy-keychain send"
+    echo "  Then any member executes it (or rerun this script):"
+    echo "    near contract call-function as-transaction $dao execute json-args '{\"proposal_id\":$id}' prepaid-gas '300 Tgas' attached-deposit '0 NEAR' sign-as $member network-config $NETWORK sign-with-legacy-keychain send"
     return 2
+}
+
+# dao_print_votes <dao> <id> — how many votes proposal <id> still needs, and the ready `vote`
+# command for every member of its electorate who has not voted. Works for governance proposals
+# and keystore registrations alike (one `vote` method, one id counter).
+dao_print_votes() {
+    local dao="$1" id="$2" p kind
+    p=$(_dao_view "$dao" get_gov_proposal "{\"proposal_id\":$id}")
+    kind=gov
+    if [ -z "$p" ] || [ "$p" = null ]; then p=$(_dao_view "$dao" get_proposal "{\"proposal_id\":$id}"); kind=registration; fi
+    if [ -z "$p" ] || [ "$p" = null ]; then p=$(_dao_view "$dao" get_revoke_proposal "{\"proposal_id\":$id}"); kind=revoke; fi
+    if [ -z "$p" ] || [ "$p" = null ]; then echo "  #$id: no such proposal on $dao" >&2; return 1; fi
+    printf '%s' "$p" | python3 -I -c '
+import json, sys
+dao, pid, net, kind, members_json = sys.argv[1:6]
+p = json.load(sys.stdin)
+members = json.loads(members_json)
+if kind == "gov":
+    electorate, threshold = p["electorate"], p["threshold"]
+    voted = set(p["votes_for"]) | set(p["votes_against"])
+    have = len(p["votes_for"])
+else:
+    # A registration or a key revocation counts the votes of the current members against the
+    # current threshold.
+    electorate, threshold = members["members"], members["threshold"]
+    voted, have = set(), int(p.get("votes_for") or 0)
+need = max(threshold - have, 0)
+todo = [m for m in electorate if m not in voted]
+print(f"  #{pid} waits for votes: {have} of {threshold}; {need} more needed. Ready commands"
+      + (" (any of them; a member who already voted is refused):" if kind != "gov" else ":"))
+for m in todo:
+    print(f"    near contract call-function as-transaction {dao} vote json-args \x27{{\"proposal_id\":{pid},\"approve\":true}}\x27 "
+          f"prepaid-gas \x27100 Tgas\x27 attached-deposit \x270 NEAR\x27 sign-as {m} network-config {net} sign-with-legacy-keychain send")
+' "$dao" "$id" "$NETWORK" "$kind" "$(dao_members_json "$dao")"
+}
+
+# dao_members_json <dao> — {"members":[...],"threshold":N} of the DAO as it stands.
+dao_members_json() {
+    local m t
+    m=$(_dao_view "$1" get_dao_members '{}' | tr -d '\n')
+    t=$(_dao_view "$1" get_config '{}' | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["approval_threshold"])')
+    printf '{"members":%s,"threshold":%s}' "${m:-[]}" "${t:-1}"
 }
 
 # dao_measurements_action <component> <register> <measurements-json> — the action that approves
