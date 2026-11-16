@@ -5,9 +5,10 @@
 //! this very CVM, the key provider (KMS) — so two instances of one release share a compose hash
 //! and still differ in RTMR3. The register is opaque without its event log.
 //!
-//! A registration carries the RTMR3 events. Each event's digest is recomputed from its fields,
-//! the digests are replayed into the register, and the result must equal the RTMR3 of the
-//! verified TDX quote: only then are the fields facts about the quoted TD. Members vote on a
+//! A registration carries the RTMR3 events. Each event's digest is computed from its fields (a
+//! digest the submitter sends is not used), the digests are replayed into the register, and the
+//! result must equal the RTMR3 of the verified TDX quote: only then are the fields facts about
+//! the quoted TD. A changed field changes the register. Members vote on a
 //! registration knowing WHICH compose runs there and WHICH instance it is, and a compose hash can
 //! be rebuilt from the release.
 //!
@@ -28,13 +29,15 @@ pub const MAX_EVENTS: usize = 64;
 /// Bounds one event's payload (the key provider's JSON is the largest, about 150 bytes).
 const MAX_PAYLOAD_HEX: usize = 1024;
 
-/// One entry of dstack's event log, as its guest agent prints it. Other fields are ignored.
+/// One entry of dstack's event log. Other fields are ignored.
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug)]
 #[serde(crate = "near_sdk::serde")]
 pub struct EventLogEntry {
     pub imr: u32,
     pub event_type: u32,
-    /// sha384 of the event, hex.
+    /// Not read: the digest is computed from the event's fields. dstack's quote API leaves it
+    /// empty for these events; its guest agent fills it in.
+    #[serde(default)]
     pub digest: String,
     pub event: String,
     /// Hex.
@@ -87,9 +90,6 @@ pub fn replay(log: &[EventLogEntry]) -> Result<(String, RegistrationFacts), Stri
         h.update(b":");
         h.update(&payload);
         let digest = h.finalize();
-        if !e.digest.eq_ignore_ascii_case(&hex::encode(digest)) {
-            return Err(format!("event '{}': digest does not match its fields", e.event));
-        }
 
         let mut ext = Sha384::new();
         ext.update(mr);
@@ -212,10 +212,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_changed_field_no_longer_matches_its_digest() {
+    fn a_changed_field_changes_the_register() {
+        let (genuine, _) = replay(&boot_log(COMPOSE, INSTANCE)).unwrap();
         let mut log = boot_log(COMPOSE, INSTANCE);
         log[3].event_payload = "00".repeat(32);
-        assert!(replay(&log).unwrap_err().contains("digest does not match"));
+        let (forged, facts) = replay(&log).unwrap();
+        assert_ne!(forged, genuine, "the quote's RTMR3 no longer matches");
+        assert_eq!(facts.compose_hash, "00".repeat(32));
+    }
+
+    /// dstack's quote API gives these events without their digests; the register is the same.
+    #[test]
+    fn a_log_without_digests_replays_to_the_same_register() {
+        let (with, _) = replay(&boot_log(COMPOSE, INSTANCE)).unwrap();
+        let mut log = boot_log(COMPOSE, INSTANCE);
+        for e in log.iter_mut() {
+            e.digest = String::new();
+        }
+        assert_eq!(replay(&log).unwrap().0, with);
+        // A wrong digest sent along changes nothing either.
+        log[1].digest = "ee".repeat(48);
+        assert_eq!(replay(&log).unwrap().0, with);
     }
 
     #[test]

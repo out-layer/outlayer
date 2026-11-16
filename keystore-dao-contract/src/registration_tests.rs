@@ -25,6 +25,7 @@ const DAL: &str = include_str!("../tests/fixtures/keystore_dal.json");
 const AMS_QUOTE: &str = include_str!("../tests/fixtures/keystore_ams_quote.json");
 const AMS_EVENTS: &str = include_str!("../tests/fixtures/keystore_ams_events.json");
 const COLLATERALS: &str = include_str!("../tests/fixtures/collaterals.json");
+const V025: &str = include_str!("../tests/fixtures/keystore_v025.json");
 
 fn a(s: &str) -> AccountId {
     s.parse().unwrap()
@@ -202,6 +203,30 @@ fn two_members_voting_for_its_key_install_it_and_nothing_else_does() {
     assert!(key_installed(&f.key), "the access key is added to the DAO account");
 }
 
+/// The registration exactly as keystore v0.2.5 sends it: the event log of dstack's quote API, whose
+/// RTMR3 entries carry no digest.
+#[test]
+fn the_registration_as_the_keystore_sends_it_is_taken() {
+    let v = json(V025);
+    let events = events_of(&v);
+    assert!(events.iter().all(|e| e.digest.is_empty()), "the fixture is the quote API's log");
+    let key: PublicKey = v["public_key"].as_str().unwrap().parse().unwrap();
+    let compose = v["compose_hash"].as_str().unwrap().to_string();
+
+    let mut d = bare_dao();
+    // The same guest OS as the dal fixture; the release is v0.2.5's.
+    KeystoreDao::set_os_images(&vec![OsImage::of(&dal().measurements)]);
+    KeystoreDao::set_composes(&vec![compose.clone()]);
+    at_time(init(), v["registered_at_ns"].as_u64().unwrap());
+    let id = d.submit_keystore_registration(key.clone(), v["tdx_quote_hex"].as_str().unwrap().to_string(), None, events);
+
+    let facts = d.get_registration_facts(id).unwrap();
+    assert_eq!(facts.compose_hash, compose);
+    assert_eq!(facts.instance_id, v["instance_id"].as_str().unwrap());
+    assert_eq!(facts.app_id, v["app_id"].as_str().unwrap());
+    assert_eq!(d.get_proposal(id).unwrap().public_key, key);
+}
+
 // ===== who may submit, and with what collateral =====
 
 #[test]
@@ -366,11 +391,11 @@ fn a_changed_fact_is_refused_whether_or_not_its_digest_is_recomputed() {
         ("app-id", "ee".repeat(20)),
         ("key-provider", hex::encode(br#"{"name":"none","id":""}"#)),
     ] {
-        // Only the payload changed: its digest no longer matches.
+        // Only the payload changed (the digest sent along is not used): the register changes.
         let mut log = f.events.clone();
         let i = log.iter().position(|e| e.event == event).unwrap();
         log[i].event_payload = replacement.clone();
-        assert_refused(|| { submit(&mut d, &f.key, &f.quote, log); }, "digest does not match");
+        assert_refused(|| { submit(&mut d, &f.key, &f.quote, log); }, "does not replay to the quote's RTMR3");
 
         // The digest recomputed for the new payload: the register no longer matches the quote.
         let mut log = f.events.clone();

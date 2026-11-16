@@ -6,6 +6,8 @@
 # The data is public, from testnet (keystore-dao-contract/tests/fixtures/):
 #   keystore_dal.json         a real keystore's key, quote and RTMR3 events (registration #175
 #                             on dao.outlayer.testnet)
+#   keystore_v025.json        keystore v0.2.5's registration as it sends it: the quote API's
+#                             event log, whose RTMR3 entries carry no digest
 #   keystore_ams_events.json  the RTMR3 events of another CVM of the same release
 #   keystore_ams_quote.json   another real keystore's quote
 #   collaterals.json          Intel's collateral as dao.outlayer.testnet cached it
@@ -16,6 +18,8 @@
 #       quote byte, a stranger submitting, an unapproved release, no event log
 #   R3  the real registration is taken and states the fixture's compose, instance and app;
 #       its gas leaves room under the 300 TGas the keystore attaches
+#   R3b keystore v0.2.5's registration exactly as it sends it (the quote API's event log, no
+#       digests): taken under its approved release, then rejected by the owner
 #   R4  sent again: the same id, and no quote verification spent
 #   R5  a vote naming another key is refused; two votes for its key install it on the DAO account
 #   R6  cleanup: the key is revoked by vote, the build taken off the lists by the owner
@@ -162,7 +166,7 @@ ev=json.load(sys.stdin)
 for e in ev:
     if e["event"]=="compose-hash": e["event_payload"]="ee"*32
 print(json.dumps(ev, separators=(",",":")))')
-refused "digest does not match" "$INIT" "$KEY" "$QUOTE" "$FORGED"
+refused "does not replay to the quote's RTMR3" "$INIT" "$KEY" "$QUOTE" "$FORGED"
 refused "Public key mismatch" "$INIT" "$(fx keystore_ams_quote.json public_key)" "$QUOTE" "$EVENTS"
 refused "TDX quote verification failed" "$INIT" "$KEY" "$(flip_byte "$QUOTE" 568)" "$EVENTS"
 refused "Event log refused" "$INIT" "$KEY" "$QUOTE" "[]"
@@ -180,6 +184,21 @@ f=json.load(sys.stdin); print(f["compose_hash"], f["instance_id"], f["app_id"])'
 else
     bad "the real registration was refused: $(printf '%s' "$LAST_OUT" | grep -iE 'panicked|error' | head -1 | cut -c1-200)"
     summary; exit 1
+fi
+
+step "R3b the registration as keystore v0.2.5 sends it"
+V25_COMPOSE=$(fx keystore_v025.json compose_hash)
+if gov "{\"ApproveCompose\":{\"compose_hash\":\"$V25_COMPOSE\"}}"; then
+    if submit "$INIT" "$(fx keystore_v025.json public_key)" "$(fx keystore_v025.json tdx_quote_hex)" "$(fx keystore_v025.json rtmr3_events)"; then
+        V25_ID=$(returned)
+        ok "taken: #$V25_ID, gas $(last_gas_tgas) TGas — an event log without digests"
+        call "$DAO_OWNER" "$DAO" reject_registration "{\"proposal_id\":$V25_ID}" && ok "rejected by the owner (it is not ours to install here)" || bad "reject_registration"
+    else
+        bad "the v0.2.5 registration was refused: $(printf '%s' "$LAST_OUT" | grep -iE 'panicked|error' | head -1 | cut -c1-200)"
+    fi
+    call "$DAO_OWNER" "$DAO" remove_approved_compose "{\"compose_hash\":\"$V25_COMPOSE\"}" >/dev/null || true
+else
+    bad "ApproveCompose v0.2.5"
 fi
 
 step "R4 sent again"

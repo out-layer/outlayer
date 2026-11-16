@@ -1234,7 +1234,7 @@ fn an_event_log_of_another_td_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "Event log refused")]
+#[should_panic(expected = "does not replay to the quote's RTMR3")]
 fn an_event_log_with_a_forged_field_is_refused() {
     let mut d = dao_with_build(&["m1.testnet"]);
     let mut log = boot_log('1');

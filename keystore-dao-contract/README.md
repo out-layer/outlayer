@@ -259,10 +259,11 @@ TDX measures a CVM into five registers, and they answer different questions.
   is a new instance with a new RTMR3.
 
 A registration carries its RTMR3 events (`event_log`: dstack's entries with
-`imr`, `event_type`, `digest`, `event`, `event_payload`). The contract
-recomputes each digest (`sha384(event_type ‖ ":" ‖ event ‖ ":" ‖ payload)`),
-replays them, and takes the registration only when the result is the RTMR3 of
-the verified quote. It reads the facts from the events before `system-ready` —
+`imr`, `event_type`, `event`, `event_payload`, as the quote API returns them;
+a `digest` sent along is not read). The contract computes each event's digest
+from its fields (`sha384(event_type ‖ ":" ‖ event ‖ ":" ‖ payload)`), replays
+them, and takes the registration only when the result is the RTMR3 of the
+verified quote: a changed field changes the register. It reads the facts from the events before `system-ready` —
 those the guest OS wrote; an app may add events after it — each must be there
 once and have the size dstack writes, and an event name carries no `:`.
 
