@@ -18,6 +18,8 @@ pub use governance::{BlobInfo, GovAction, GovProposal, GovStatus};
 
 #[cfg(test)]
 mod governance_tests;
+#[cfg(test)]
+mod registration_tests;
 
 // Custom getrandom implementation for WASM (required by dcap-qvl)
 #[cfg(target_arch = "wasm32")]
@@ -99,13 +101,50 @@ enum StorageKey {
     /// Per keystore registration, what its replayed boot event log states (`event_log.rs`).
     /// A collection under its own prefix, outside the root struct.
     RegistrationFacts,
+    /// The guest OS images governance approved for keystores (`OsImage`), one list.
+    ApprovedOsImages,
+    /// The compose hashes governance approved for keystores, one list.
+    ApprovedComposes,
+    /// Per keystore key, the id of its last registration: a second submission of a key whose
+    /// registration is still pending answers with that id.
+    RegistrationByKey,
+}
+
+/// The guest OS of a CVM, as TDX measures it: the firmware (MRTD), its configuration (RTMR0),
+/// the kernel (RTMR1), the command line and the initrd with the root filesystem's hash (RTMR2).
+/// The TDX module and the firmware write these, not the guest. RTMR3 is written BY this OS, so
+/// its event log says what runs in the CVM only when the OS is a known one.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct OsImage {
+    pub mrtd: String,
+    pub rtmr0: String,
+    pub rtmr1: String,
+    pub rtmr2: String,
+}
+
+impl OsImage {
+    pub fn of(m: &ApprovedMeasurements) -> Self {
+        Self { mrtd: m.mrtd.clone(), rtmr0: m.rtmr0.clone(), rtmr1: m.rtmr1.clone(), rtmr2: m.rtmr2.clone() }
+    }
+
+    pub fn lowercase(&self) -> Self {
+        Self {
+            mrtd: self.mrtd.to_ascii_lowercase(),
+            rtmr0: self.rtmr0.to_ascii_lowercase(),
+            rtmr1: self.rtmr1.to_ascii_lowercase(),
+            rtmr2: self.rtmr2.to_ascii_lowercase(),
+        }
+    }
 }
 
 /// Full TEE measurements for verifying the entire dstack environment.
 /// All fields are 96 hex characters (48 bytes).
 ///
 /// Frozen: stored inside `governance::VersionedGovProposal::V1` (`ApproveMeasurements`,
-/// `RevokeMeasurements`) as well as in the root state. Never change its fields.
+/// `RevokeMeasurements`, proposals no longer taken) as well as in the root state and in every
+/// registration. Never change its fields.
 ///
 /// Without verifying MRTD + RTMR0-2, an attacker can run a dev dstack image
 /// (with SSH enabled), connect to the container, and modify the running code
@@ -280,8 +319,10 @@ pub struct KeystoreDao {
     /// Approved keystore public keys
     pub approved_keystores: UnorderedSet<PublicKey>,
 
-    /// Full TEE measurements approved for keystore registration.
-    /// Each entry contains MRTD + RTMR0-3 (all must match for registration).
+    /// Read by nothing, kept for the state layout: a keystore build is its guest OS and its
+    /// compose (`ApprovedOsImages`, `ApprovedComposes`), never a five-register tuple, since RTMR3
+    /// carries the instance id. Empty from `migrate()` on.
+    #[allow(dead_code)]
     pub approved_measurements: Vec<ApprovedMeasurements>,
 
     /// Cached quote collateral(s) — Intel reference data for TDX quote verification, one slot
@@ -496,17 +537,17 @@ impl KeystoreDao {
     /// Submit keystore registration with TEE attestation
     ///
     /// This method:
-    /// 1. Verifies TDX quote signature
-    /// 2. Extracts MRTD + RTMR0-3 and public key
-    /// 3. Checks all measurements against approved list
-    /// 4. Creates a proposal for DAO voting
+    /// 1. Verifies the TDX quote and extracts MRTD + RTMR0-3 and the key binding
+    /// 2. Replays the quote's RTMR3 event log and checks that the build is approved
+    ///    (`internal_register`): the guest OS and the compose hash the log states
+    /// 3. Creates a proposal the DAO members vote on, naming the key
     pub fn submit_keystore_registration(
         &mut self,
         public_key: PublicKey,
         tdx_quote_hex: String,
         #[allow(unused_variables)]
         app_id: Option<String>,
-        event_log: Option<Vec<EventLogEntry>>,
+        event_log: Vec<EventLogEntry>,
     ) -> u64 {
         // Only init account can submit (pays gas)
         assert_eq!(
@@ -521,6 +562,12 @@ impl KeystoreDao {
             !self.approved_keystores.contains(&public_key),
             "Keystore already approved"
         );
+
+        // A key whose registration still waits for votes: the same registration, no second
+        // one, and no quote verification spent on it.
+        if let Some(id) = self.pending_registration_of(&public_key) {
+            return id;
+        }
 
         // Use ONLY cached collateral(s) (security: prevent custom collateral bypass).
         let collaterals = self.collaterals.clone();
@@ -578,49 +625,56 @@ impl KeystoreDao {
     /// The registration of a keystore whose TDX quote is verified: `measurements` and
     /// `report_data_prefix` are the quote's.
     ///
-    /// With its boot event log, the registration states which compose and which instance the
-    /// quoted TD is (`event_log::replay` against the quote's RTMR3), and the members' vote on it
-    /// is the approval of both: no build is approved beforehand. An RTMR3 carries the instance
-    /// id, so it is unique to one CVM and approving it apart from the registration decides
-    /// nothing more.
+    /// The registration states which compose and which instance the quoted TD is, from its boot
+    /// event log (`event_log::replay` against the quote's RTMR3). It is taken only when
+    /// governance has approved both halves of the build:
+    ///   * the guest OS (`OsImage`: MRTD, RTMR0-2). RTMR3 is written by the guest, so its
+    ///     event log is evidence only under a known OS;
+    ///   * the compose hash the log states: the release.
+    /// Both are known before a CVM exists and are approved once, with the governance delay.
+    /// What is left for the members' vote on the registration is the one thing no measurement
+    /// says: that this instance (its key) is ours. An RTMR3 carries the instance id, so it is
+    /// unique to one CVM and is never approved as a value. There is no other way to register:
+    /// without its event log a quote says which code runs only through an RTMR3 nobody can
+    /// check.
     ///
-    /// Without an event log the registration states nothing but its measurements, and those
-    /// must be approved already (`ApproveMeasurements`).
+    /// A key whose registration is still pending is not registered twice: the call answers
+    /// with that registration's id.
     pub(crate) fn internal_register(
         &mut self,
         public_key: PublicKey,
         measurements: ApprovedMeasurements,
         report_data_prefix: [u8; 32],
-        event_log: Option<Vec<EventLogEntry>>,
+        event_log: Vec<EventLogEntry>,
     ) -> u64 {
         assert!(
             !self.approved_keystores.contains(&public_key),
             "Keystore already approved"
         );
+        if let Some(id) = self.pending_registration_of(&public_key) {
+            return id;
+        }
 
-        let facts = match event_log {
-            Some(log) => {
-                let (rtmr3, facts) = event_log::replay(&log)
-                    .unwrap_or_else(|e| env::panic_str(&format!("Event log refused: {e}")));
-                require!(
-                    rtmr3 == measurements.rtmr3,
-                    format!(
-                        "Event log does not replay to the quote's RTMR3 (replayed {}, quote {})",
-                        rtmr3, measurements.rtmr3
-                    )
-                );
-                Some(facts)
-            }
-            None => {
-                assert!(
-                    self.approved_measurements.contains(&measurements),
-                    "Worker measurements not approved. MRTD={}, RTMR0={}, RTMR1={}, RTMR2={}, RTMR3={}.",
-                    measurements.mrtd, measurements.rtmr0, measurements.rtmr1,
-                    measurements.rtmr2, measurements.rtmr3
-                );
-                None
-            }
-        };
+        let (rtmr3, facts) = event_log::replay(&event_log)
+            .unwrap_or_else(|e| env::panic_str(&format!("Event log refused: {e}")));
+        require!(
+            rtmr3 == measurements.rtmr3,
+            format!(
+                "Event log does not replay to the quote's RTMR3 (replayed {}, quote {})",
+                rtmr3, measurements.rtmr3
+            )
+        );
+        require!(
+            Self::os_images().contains(&OsImage::of(&measurements)),
+            format!(
+                "Guest OS not approved. MRTD={}, RTMR0={}, RTMR1={}, RTMR2={}.",
+                measurements.mrtd, measurements.rtmr0, measurements.rtmr1, measurements.rtmr2
+            )
+        );
+        require!(
+            Self::composes().contains(&facts.compose_hash),
+            format!("Compose not approved. compose_hash={}.", facts.compose_hash)
+        );
 
         // Verify the submitted public_key matches the binding embedded in the TDX quote.
         //   ed25519: the binding is the raw 32-byte public key.
@@ -658,20 +712,13 @@ impl KeystoreDao {
         };
         self.proposals.insert(&proposal_id, &proposal);
         self.next_proposal_id += 1;
+        Self::registration_by_key().insert(&public_key, &proposal_id);
 
-        match &facts {
-            Some(f) => {
-                Self::registration_facts().insert(&proposal_id, f);
-                env::log_str(&format!(
-                    "Created proposal {} for keystore registration: compose_hash={} instance_id={} app_id={}",
-                    proposal_id, f.compose_hash, f.instance_id, f.app_id
-                ));
-            }
-            None => env::log_str(&format!(
-                "Created proposal {} for keystore registration (approved measurements, no event log)",
-                proposal_id
-            )),
-        }
+        Self::registration_facts().insert(&proposal_id, &facts);
+        env::log_str(&format!(
+            "Created proposal {} for keystore registration: compose_hash={} instance_id={} app_id={}",
+            proposal_id, facts.compose_hash, facts.instance_id, facts.app_id
+        ));
 
         proposal_id
     }
@@ -680,8 +727,93 @@ impl KeystoreDao {
         LookupMap::new(StorageKey::RegistrationFacts)
     }
 
+    fn registration_by_key() -> LookupMap<PublicKey, u64> {
+        LookupMap::new(StorageKey::RegistrationByKey)
+    }
+
+    /// The id of `public_key`'s registration while it is still `Pending`.
+    fn pending_registration_of(&self, public_key: &PublicKey) -> Option<u64> {
+        let id = Self::registration_by_key().get(public_key)?;
+        let p = self.proposals.get(&id)?;
+        (p.status == ProposalStatus::Pending && p.public_key == *public_key).then_some(id)
+    }
+
+    /// The approved lists live under their own prefixes, outside the root struct, each as one
+    /// value: they are short (an OS image per dstack version and platform, a compose per
+    /// release) and are read whole.
+    pub(crate) fn os_images() -> Vec<OsImage> {
+        LookupMap::<u8, Vec<OsImage>>::new(StorageKey::ApprovedOsImages).get(&0).unwrap_or_default()
+    }
+
+    pub(crate) fn set_os_images(v: &Vec<OsImage>) {
+        LookupMap::<u8, Vec<OsImage>>::new(StorageKey::ApprovedOsImages).insert(&0, v);
+    }
+
+    pub(crate) fn composes() -> Vec<String> {
+        LookupMap::<u8, Vec<String>>::new(StorageKey::ApprovedComposes).get(&0).unwrap_or_default()
+    }
+
+    pub(crate) fn set_composes(v: &Vec<String>) {
+        LookupMap::<u8, Vec<String>>::new(StorageKey::ApprovedComposes).insert(&0, v);
+    }
+
+    pub(crate) fn validate_os_image(i: &OsImage) {
+        Self::validate_measurement_field("mrtd", &i.mrtd);
+        Self::validate_measurement_field("rtmr0", &i.rtmr0);
+        Self::validate_measurement_field("rtmr1", &i.rtmr1);
+        Self::validate_measurement_field("rtmr2", &i.rtmr2);
+    }
+
+    pub(crate) fn validate_compose_hash(h: &str) {
+        require!(
+            h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()),
+            "compose_hash must be 64 hex characters (a sha256)"
+        );
+    }
+
+    /// The guest OS images approved for keystores.
+    pub fn get_approved_os_images(&self) -> Vec<OsImage> {
+        Self::os_images()
+    }
+
+    /// The compose hashes approved for keystores.
+    pub fn get_approved_composes(&self) -> Vec<String> {
+        Self::composes()
+    }
+
+    /// Whether a keystore with these measurements and this compose hash may register with its
+    /// event log: its guest OS and its compose are both approved.
+    pub fn is_build_approved(&self, measurements: ApprovedMeasurements, compose_hash: String) -> bool {
+        Self::os_images().contains(&OsImage::of(&measurements.lowercase()))
+            && Self::composes().contains(&compose_hash.to_ascii_lowercase())
+    }
+
+    /// Owner: take a guest OS image off the approved list at once (the fast brake; approving
+    /// one is governance's, `ApproveOsImage`). No keystore under it registers from here on, a
+    /// registration waiting for votes included.
+    pub fn remove_approved_os_image(&mut self, image: OsImage) {
+        self.assert_owner();
+        let image = image.lowercase();
+        let mut v = Self::os_images();
+        v.retain(|i| *i != image);
+        Self::set_os_images(&v);
+        env::log_str(&format!("os_image_removed mrtd={} total={}", image.mrtd, v.len()));
+    }
+
+    /// Owner: take a compose hash off the approved list at once (the fast brake; approving one
+    /// is governance's, `ApproveCompose`). No keystore of that release registers from here on, a
+    /// registration waiting for votes included.
+    pub fn remove_approved_compose(&mut self, compose_hash: String) {
+        self.assert_owner();
+        let compose_hash = compose_hash.to_ascii_lowercase();
+        let mut v = Self::composes();
+        v.retain(|c| *c != compose_hash);
+        Self::set_composes(&v);
+        env::log_str(&format!("compose_removed {} total={}", compose_hash, v.len()));
+    }
+
     /// What the boot event log of registration `proposal_id` states: its compose hash, app id,
-    /// instance id and key provider. `None` for a registration made without an event log.
+    /// instance id and key provider.
     pub fn get_registration_facts(&self, proposal_id: u64) -> Option<RegistrationFacts> {
         Self::registration_facts().get(&proposal_id)
     }
@@ -775,16 +907,15 @@ impl KeystoreDao {
         );
 
         if live_for >= self.approval_threshold {
-            // A registration without an event log stands on its approved measurements, and
-            // they are checked again here, not only at submission: a revocation of the build
-            // (owner or governance) made while the registration waited for its votes must stop
-            // it. One with an event log is approved by this very quorum, and its measurements
-            // are recorded as approved with it.
-            if Self::registration_facts().get(&proposal_id).is_some() {
-                if !self.approved_measurements.contains(&proposal.measurements) {
-                    self.approved_measurements.push(proposal.measurements.clone());
-                }
-            } else if !self.approved_measurements.contains(&proposal.measurements) {
+            // The build is checked again here, not only at submission: a revocation (owner or
+            // governance) made while the registration waited for its votes must stop it. A
+            // registration that states no build (one made before registrations carried their
+            // event log) gets nothing.
+            let build_approved = Self::registration_facts().get(&proposal_id).map_or(false, |facts| {
+                Self::os_images().contains(&OsImage::of(&proposal.measurements))
+                    && Self::composes().contains(&facts.compose_hash)
+            });
+            if !build_approved {
                 proposal.status = ProposalStatus::Rejected;
                 self.proposals.insert(&proposal_id, &proposal);
                 env::log_str(&format!(
@@ -853,7 +984,12 @@ impl KeystoreDao {
                     && now.saturating_sub(p.created_at) > STALE_REGISTRATION_NS
             });
             if stale {
-                self.proposals.remove(&id);
+                if let Some(p) = self.proposals.remove(&id) {
+                    if Self::registration_by_key().get(&p.public_key) == Some(id) {
+                        Self::registration_by_key().remove(&p.public_key);
+                    }
+                }
+                Self::registration_facts().remove(&id);
                 for member in self.dao_members.iter() {
                     self.votes.remove(&(id, member));
                 }
@@ -862,26 +998,6 @@ impl KeystoreDao {
         }
         env::log_str(&format!("stale_registration_proposals_removed {}", removed));
         removed
-    }
-
-    /// Owner: clear all approved measurements. The fast path for a bad build: no keystore
-    /// registers until governance approves measurements again (`GovAction::ApproveMeasurements`).
-    /// Registered keystores keep their keys; revoke those with `propose_revoke_keystore_keys`.
-    pub fn clear_all_approved_measurements(&mut self) {
-        self.assert_owner();
-
-        let count = self.approved_measurements.len();
-        self.approved_measurements.clear();
-
-        env::log_str(&format!("Cleared all {} measurement entries", count));
-    }
-
-    /// Owner: remove one approved measurement set (fast path; see `clear_all_approved_measurements`).
-    pub fn remove_approved_measurements(&mut self, measurements: ApprovedMeasurements) {
-        self.assert_owner();
-        let measurements = measurements.lowercase();
-        self.approved_measurements.retain(|m| m != &measurements);
-        env::log_str(&format!("Approved measurements removed. Remaining: {}", self.approved_measurements.len()));
     }
 
     /// DAO member: propose revoking keystore access keys. Removing a key from
@@ -1093,16 +1209,6 @@ impl KeystoreDao {
         self.dao_members.to_vec()
     }
 
-    /// Get approved measurements list
-    pub fn get_approved_measurements(&self) -> Vec<ApprovedMeasurements> {
-        self.approved_measurements.clone()
-    }
-
-    /// Check if measurements are approved
-    pub fn is_measurements_approved(&self, measurements: ApprovedMeasurements) -> bool {
-        self.approved_measurements.contains(&measurements.lowercase())
-    }
-
     /// Check if keystore with given public key is approved
     pub fn is_keystore_approved(&self, public_key: String) -> bool {
         // Parse public key to validate format
@@ -1139,7 +1245,8 @@ impl KeystoreDao {
             "dao_members_count": self.dao_members.len(),
             "next_proposal_id": self.next_proposal_id,
             "approved_keystores_count": self.approved_keystores.len(),
-            "approved_measurements_count": self.approved_measurements.len(),
+            "approved_os_images_count": Self::os_images().len(),
+            "approved_composes_count": Self::composes().len(),
             "has_collateral": !self.collaterals.is_empty(),
             "collaterals_count": self.collaterals.len(),
             "gov_delay_sec": self.gov_delay_ns / 1_000_000_000,
@@ -1617,14 +1724,6 @@ impl KeystoreDao {
             "Invalid {} format: must be hex string",
             name
         );
-    }
-
-    fn validate_measurements(m: &ApprovedMeasurements) {
-        Self::validate_measurement_field("mrtd", &m.mrtd);
-        Self::validate_measurement_field("rtmr0", &m.rtmr0);
-        Self::validate_measurement_field("rtmr1", &m.rtmr1);
-        Self::validate_measurement_field("rtmr2", &m.rtmr2);
-        Self::validate_measurement_field("rtmr3", &m.rtmr3);
     }
 
     /// Execute approved proposal to add keystore access key

@@ -51,6 +51,7 @@ container: run it again.
 the release out and upgrade from the copy:
 
 ```bash
+rm -rf ~/dao-release
 mkdir -p ~/dao-release
 cp keystore-dao-contract/target/near/keystore_dao_contract.wasm ~/dao-release/
 shasum -a 256 ~/dao-release/keystore_dao_contract.wasm      # the hex from step 2
@@ -100,6 +101,21 @@ near account view-account-summary dao.outlayer.testnet network-config testnet no
 near contract call-function as-read-only dao.outlayer.testnet gov_health json-args '{}' network-config testnet now
 near contract call-function as-read-only outlayer.testnet get_storage_version json-args '{}' network-config testnet now   # main contract: the release's version
 ```
+
+## Order: a DAO release that changes how keystores register
+
+A keystore registers through the DAO, so a DAO release and a keystore release that change
+registration go in one order, and nothing in the code bridges a wrong one:
+
+1. **The DAO first**, steps 1–6. Running keystores keep their keys and keep serving.
+2. **The build of the new keystore, by vote**: `ApproveCompose` for its release and, for a guest
+   OS the DAO has not approved yet, `ApproveOsImage`. `scripts/deploy_tdx.sh keystore` reads both
+   from a deployed CVM and proposes them; on mainnet each waits out the 72 h delay.
+3. **Then the keystores**, one by one: `deploy_tdx.sh keystore …`, then `--resume` once the build
+   is approved. Each instance takes one vote, for its key.
+
+Between 1 and 3 no keystore of the previous release can register again: a restart of one stays
+down until it is replaced by the new release. Do not restart keystores in that window.
 
 ## If it fails
 

@@ -1,7 +1,8 @@
 # Governance
 
 OutLayer's three on-chain contracts are governed by a DAO. No account holds a key that can
-change their code. The DAO members decide together, and every decision waits out a public delay.
+change their code. The DAO members decide together, and every change of the rules, of the code
+or of the software that may hold the master secret waits out a public delay.
 An operations owner runs day-to-day settings. It can apply the brakes and adjust parameters, but
 it cannot change what the contracts are, and the DAO can replace it at any time.
 
@@ -21,8 +22,7 @@ installed by the contracts themselves:
   attestation is verified on chain against a build the DAO approved. The key may call only the
   four methods a worker needs on `outlayer.near`: delivering results and settling payments.
 - **Keystores on `dao.outlayer.near`.** Each keystore's key is added only by a DAO vote on its
-  verified attestation, which states on chain which build runs there and which instance it is.
-  It may call only `request_key`
+  verified attestation, and only for a build the DAO approved. It may call only `request_key`
   (obtain the master secret through NEAR MPC), `mark_vault_verified` and `ban_vault`.
 
 Read the keys yourself: `near account list-keys outlayer.near network-config mainnet now`.
@@ -33,7 +33,9 @@ Read the keys yourself: `near account list-keys outlayer.near network-config mai
   proposal (`approval_threshold = members / 2 + 1`, recomputed when membership changes).
   `get_dao_members` on `dao.outlayer.near` lists them.
 - **Delay.** An approved proposal executes no earlier than 72 hours after the vote that approved
-  it. Anyone watching the chain has three days to see what is coming.
+  it. Anyone watching the chain has three days to see what is coming. One vote has no delay:
+  admitting an instance of a keystore whose software the DAO already approved through such a
+  proposal.
 - **Lifetime.** A proposal collects votes for at most 14 days. Once approved, it must be executed
   within 7 days after its delay. Past either, it expires.
 - **Fixed electorate.** Each proposal records the members and the threshold at the time it was
@@ -49,7 +51,8 @@ Read the keys yourself: `near account list-keys outlayer.near network-config mai
 | Upgrade any of the three contracts, the DAO itself included | `Upgrade`: a member stores the wasm as a blob, members vote on its sha256 — the hash a reproducible build of the release gives — and after the delay the contract deploys it in one atomic step. A failing migration leaves the old code in place |
 | Add or remove a DAO member | `AddMember`, `RemoveMember`. The last member cannot be removed |
 | Change the delay | `SetDelay`, at most 30 days |
-| Let a keystore obtain the master secret | A vote on its registration. The contract verifies the keystore's Intel TDX attestation and replays its boot event log, so the registration states the hash of the exact software (`compose_hash`) and the instance. The vote approves both and names the key it installs: it cannot land on another keystore's registration. Every instance and every restart takes its own vote |
+| Approve the software a keystore may run (the builds that may obtain the master secret) | `ApproveCompose`: the hash of the release's exact software, rebuilt by anyone from the published compose. `ApproveOsImage`: the guest OS it runs under. Both wait out the delay |
+| Admit one keystore instance | A vote on its registration. The contract verifies the instance's Intel TDX attestation, checks that it runs an approved OS and an approved release, and records which instance it is. The vote names the key it installs, so it cannot land on another instance's registration. Every instance takes its own vote; the build is checked again when the vote reaches quorum |
 | Approve a worker build | A `Call` to `add_approved_measurements` on the register |
 | Replace the operations owner of any contract | `SetOwner`, or a `Call` to `set_owner` |
 | Replace a contract's governance account or the main contract's operator | A `Call` to `set_governance` / `set_operator` |
@@ -80,8 +83,8 @@ None of them touches code, keys, members, the delay or build approvals.
 
 | Contract | Owner method | What it does | Why the owner has it |
 |---|---|---|---|
-| DAO | `reject_registration` | Reject a keystore registration still waiting for votes | The fast brake: stops a suspicious instance at once. It installs nothing and approves nothing |
-| DAO | `remove_approved_measurements`, `clear_all_approved_measurements` | Remove measurements from the approved record | Housekeeping of the record of instances the members approved |
+| DAO | `remove_approved_compose`, `remove_approved_os_image` | Revoke keystore builds | The fast brake on a bad build: no keystore of it registers again until the DAO approves a build |
+| DAO | `reject_registration` | Reject a keystore registration still waiting for votes | Stops a suspicious instance at once. It installs nothing and approves nothing |
 | DAO | `remove_stale_proposals` | Delete registrations pending for more than 48 hours | Cleanup of instances that stopped waiting |
 | DAO | `cancel` | Cancel a pending or approved proposal | A brake on a mistaken proposal. It cannot cancel a proposal that replaces an owner, a governance account or an operator — the owner cannot keep itself in place |
 | DAO, register | `update_collateral` | Store Intel's TDX reference data (at most 128 KiB per slot) | Intel republishes it about monthly, and every registration verifies against it |

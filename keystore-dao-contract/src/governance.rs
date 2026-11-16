@@ -1,6 +1,8 @@
-//! Governance: every change that can reach the master secret, the members or the code of a
-//! contract is a proposal that DAO members vote on, and runs only after a delay. Every method
-//! here is for DAO members only; the owner can cancel a proposal and nothing else.
+//! Governance: every change of what may reach the master secret (a keystore's guest OS, its
+//! compose), of the members or of a contract's code is a proposal that DAO members vote on, and
+//! runs only after a delay. Every method here is for DAO members only; the owner can cancel a
+//! proposal and nothing else. Admitting one keystore INSTANCE of an approved build is not here:
+//! it is the members' vote on its registration (`lib.rs`), which has no delay.
 //!
 //! A proposal fixes its electorate and threshold when it is created. A vote counts only from
 //! an account in that electorate that is still a member. Quorum makes it `Approved`; a member
@@ -109,13 +111,22 @@ pub enum GovAction {
         deposit: U128,
         gas_tgas: u64,
     },
-    /// Whitelist a keystore build. Revoking one is also open to the owner (fast path).
+    /// No longer proposed (`validate_gov_action` refuses them): a keystore build is approved as
+    /// `ApproveOsImage` + `ApproveCompose`. Kept so that every stored proposal still reads.
     ApproveMeasurements { measurements: ApprovedMeasurements },
     RevokeMeasurements { measurements: ApprovedMeasurements },
     AddMember { member: AccountId },
     RemoveMember { member: AccountId },
     SetDelay { seconds: u64 },
     SetOwner { owner: AccountId },
+    /// Approve a guest OS image for keystores (`OsImage`): a keystore registers with its event
+    /// log only under an approved one. Revoking one is also open to the owner (fast path).
+    ApproveOsImage { image: OsImage },
+    RevokeOsImage { image: OsImage },
+    /// Approve a keystore release by the hash of its compose. Revoking one is also open to the
+    /// owner (fast path).
+    ApproveCompose { compose_hash: String },
+    RevokeCompose { compose_hash: String },
 }
 
 impl GovAction {
@@ -129,6 +140,10 @@ impl GovAction {
             GovAction::RemoveMember { .. } => "remove_member",
             GovAction::SetDelay { .. } => "set_delay",
             GovAction::SetOwner { .. } => "set_owner",
+            GovAction::ApproveOsImage { .. } => "approve_os_image",
+            GovAction::RevokeOsImage { .. } => "revoke_os_image",
+            GovAction::ApproveCompose { .. } => "approve_compose",
+            GovAction::RevokeCompose { .. } => "revoke_compose",
         }
     }
 }
@@ -178,8 +193,10 @@ pub struct GovProposal {
 
 /// How a proposal is stored. A released variant is never changed or removed: a later version of
 /// this contract adds `V2` and keeps reading `V1`, so whatever an earlier version wrote stays
-/// readable. `V1`'s shape is frozen once released — `GovProposal`, `GovAction`, `GovStatus`
-/// and every type inside them, `ApprovedMeasurements` included.
+/// readable. `V1`'s shape is frozen once released — `GovProposal`, `GovStatus` and every type
+/// inside them, `ApprovedMeasurements` and `OsImage` included. `GovAction` only grows: a new
+/// action is a new variant at the END of the enum, which leaves the encoding of every earlier
+/// one as it was; no variant is changed, removed or moved.
 #[derive(BorshSerialize, BorshDeserialize)]
 #[borsh(crate = "near_sdk::borsh")]
 pub enum VersionedGovProposal {
@@ -294,9 +311,16 @@ impl KeystoreDao {
                     format!("gas_tgas must be in 1..={}", MAX_CALL_GAS_TGAS)
                 );
             }
-            GovAction::ApproveMeasurements { measurements }
-            | GovAction::RevokeMeasurements { measurements } => {
-                Self::validate_measurements(measurements);
+            GovAction::ApproveMeasurements { .. } | GovAction::RevokeMeasurements { .. } => {
+                env::panic_str(
+                    "A keystore build is approved as its guest OS and its compose: propose ApproveOsImage and ApproveCompose",
+                );
+            }
+            GovAction::ApproveOsImage { image } | GovAction::RevokeOsImage { image } => {
+                Self::validate_os_image(image);
+            }
+            GovAction::ApproveCompose { compose_hash } | GovAction::RevokeCompose { compose_hash } => {
+                Self::validate_compose_hash(compose_hash);
             }
             GovAction::AddMember { member } => {
                 require!(!self.dao_members.contains(member), "Already a DAO member");
@@ -551,28 +575,45 @@ impl KeystoreDao {
                     Gas::from_tgas(gas_tgas),
                 ))
             }
-            GovAction::ApproveMeasurements { measurements } => {
-                let measurements = measurements.lowercase();
-                if !self.approved_measurements.contains(&measurements) {
-                    self.approved_measurements.push(measurements.clone());
+            // Refused by `validate_gov_action`, which `execute` runs again: a proposal of either
+            // made before they were retired does not get here, and expires.
+            GovAction::ApproveMeasurements { .. } | GovAction::RevokeMeasurements { .. } => {
+                env::panic_str("measurements proposals are retired")
+            }
+            GovAction::ApproveOsImage { image } => {
+                let image = image.lowercase();
+                let mut v = Self::os_images();
+                if !v.contains(&image) {
+                    v.push(image.clone());
+                    Self::set_os_images(&v);
                 }
-                env::log_str(&format!(
-                    "measurements_approved mrtd={} rtmr3={} total={}",
-                    measurements.mrtd,
-                    measurements.rtmr3,
-                    self.approved_measurements.len()
-                ));
+                env::log_str(&format!("os_image_approved mrtd={} total={}", image.mrtd, v.len()));
                 PromiseOrValue::Value(true)
             }
-            GovAction::RevokeMeasurements { measurements } => {
-                let measurements = measurements.lowercase();
-                self.approved_measurements.retain(|m| m != &measurements);
-                env::log_str(&format!(
-                    "measurements_revoked mrtd={} rtmr3={} total={}",
-                    measurements.mrtd,
-                    measurements.rtmr3,
-                    self.approved_measurements.len()
-                ));
+            GovAction::RevokeOsImage { image } => {
+                let image = image.lowercase();
+                let mut v = Self::os_images();
+                v.retain(|i| *i != image);
+                Self::set_os_images(&v);
+                env::log_str(&format!("os_image_revoked mrtd={} total={}", image.mrtd, v.len()));
+                PromiseOrValue::Value(true)
+            }
+            GovAction::ApproveCompose { compose_hash } => {
+                let compose_hash = compose_hash.to_ascii_lowercase();
+                let mut v = Self::composes();
+                if !v.contains(&compose_hash) {
+                    v.push(compose_hash.clone());
+                    Self::set_composes(&v);
+                }
+                env::log_str(&format!("compose_approved {} total={}", compose_hash, v.len()));
+                PromiseOrValue::Value(true)
+            }
+            GovAction::RevokeCompose { compose_hash } => {
+                let compose_hash = compose_hash.to_ascii_lowercase();
+                let mut v = Self::composes();
+                v.retain(|c| *c != compose_hash);
+                Self::set_composes(&v);
+                env::log_str(&format!("compose_revoked {} total={}", compose_hash, v.len()));
                 PromiseOrValue::Value(true)
             }
             GovAction::AddMember { member } => {

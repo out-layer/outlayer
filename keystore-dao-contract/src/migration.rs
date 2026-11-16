@@ -171,7 +171,9 @@ impl KeystoreDao {
             next_proposal_id: old.next_proposal_id,
             votes: old.votes,
             approved_keystores: old.approved_keystores,
-            approved_measurements: old.approved_measurements,
+            // A five-register tuple approves one CVM, not a build (RTMR3 carries its instance
+            // id); builds are approved as guest OS + compose from this version on.
+            approved_measurements: Vec::new(),
             collaterals: old.collaterals,
             ceased_operations: old.ceased_operations,
             approved_vault_code_hashes: old.approved_vault_code_hashes,

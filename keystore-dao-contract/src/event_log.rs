@@ -26,7 +26,7 @@ const BOOT_END: &str = "system-ready";
 /// More events than any boot writes; bounds the work a registration can ask for.
 pub const MAX_EVENTS: usize = 64;
 /// Bounds one event's payload (the key provider's JSON is the largest, about 150 bytes).
-const MAX_PAYLOAD_HEX: usize = 4096;
+const MAX_PAYLOAD_HEX: usize = 1024;
 
 /// One entry of dstack's event log, as its guest agent prints it. Other fields are ignored.
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug)]
@@ -73,6 +73,11 @@ pub fn replay(log: &[EventLogEntry]) -> Result<(String, RegistrationFacts), Stri
         if e.event_payload.len() > MAX_PAYLOAD_HEX {
             return Err(format!("event '{}': payload too long", e.event));
         }
+        // The digest is over `type:name:payload`: a name with a colon would let one digest be
+        // read as two different events.
+        if e.event.contains(':') || e.event.len() > 64 {
+            return Err(format!("event name '{}' is not one dstack writes", e.event));
+        }
         let payload = hex::decode(&e.event_payload)
             .map_err(|_| format!("event '{}': payload is not hex", e.event))?;
         let mut h = Sha384::new();
@@ -115,16 +120,26 @@ pub fn replay(log: &[EventLogEntry]) -> Result<(String, RegistrationFacts), Stri
     if !booted {
         return Err(format!("event log has no {} event", BOOT_END));
     }
-    let need = |v: Option<String>, name: &str| {
-        v.filter(|s| !s.is_empty()).ok_or_else(|| format!("event log has no {} before {}", name, BOOT_END))
+    // Each fact has the size dstack writes it in: a sha256, or the 20 bytes of an id.
+    let need = |v: Option<String>, name: &str, hex_len: Option<usize>| {
+        let v = v.filter(|s| !s.is_empty()).ok_or_else(|| format!("event log has no {} before {}", name, BOOT_END))?;
+        match hex_len {
+            Some(n) if v.len() != n => Err(format!("{} is {} hex characters, not {}", name, v.len(), n)),
+            _ => Ok(v),
+        }
     };
+    if let Some(h) = &os_image_hash {
+        if h.len() != 64 {
+            return Err(format!("os-image-hash is {} hex characters, not 64", h.len()));
+        }
+    }
     Ok((
         hex::encode(mr),
         RegistrationFacts {
-            compose_hash: need(compose_hash, "compose-hash")?,
-            app_id: need(app_id, "app-id")?,
-            instance_id: need(instance_id, "instance-id")?,
-            key_provider: need(key_provider, "key-provider")?,
+            compose_hash: need(compose_hash, "compose-hash", Some(64))?,
+            app_id: need(app_id, "app-id", Some(40))?,
+            instance_id: need(instance_id, "instance-id", Some(40))?,
+            key_provider: need(key_provider, "key-provider", None)?,
             os_image_hash,
         },
     ))
@@ -231,6 +246,24 @@ pub(crate) mod tests {
         let mut no_end = boot_log(COMPOSE, INSTANCE);
         no_end.retain(|e| e.event != "system-ready");
         assert!(replay(&no_end).unwrap_err().contains("no system-ready"));
+    }
+
+    #[test]
+    fn an_event_name_with_a_colon_is_refused() {
+        // `type:a:b` + payload could otherwise be told as event "a" with a payload starting ":b".
+        let mut log = boot_log(COMPOSE, INSTANCE);
+        log.insert(7, ev(3, "os-image-hash:x", "00"));
+        assert!(replay(&log).unwrap_err().contains("not one dstack writes"));
+    }
+
+    #[test]
+    fn a_fact_of_the_wrong_size_is_refused() {
+        let short = boot_log(COMPOSE, &"ab".repeat(19));
+        assert!(replay(&short).unwrap_err().contains("instance-id is 38 hex characters"));
+        let mut log = boot_log(COMPOSE, INSTANCE);
+        let i = log.iter().position(|e| e.event == "os-image-hash").unwrap();
+        log[i] = ev(3, "os-image-hash", "8d");
+        assert!(replay(&log).unwrap_err().contains("os-image-hash is 2 hex characters"));
     }
 
     #[test]

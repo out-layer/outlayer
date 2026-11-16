@@ -40,12 +40,15 @@ delay are the root of trust. Every governance method is for DAO members only.
 - **Actions:** `Upgrade{target, code_hash, migrate}` (this contract or a
   governed one), `Call{target, method, args, deposit, gas_tgas}` (a method on a
   governed contract; never this contract, never the MPC contract),
-  `ApproveMeasurements`, `RevokeMeasurements`, `AddMember`, `RemoveMember`,
-  `SetDelay`, `SetOwner`.
+  `ApproveOsImage`, `RevokeOsImage`, `ApproveCompose`, `RevokeCompose`,
+  `AddMember`, `RemoveMember`, `SetDelay`, `SetOwner`. `ApproveMeasurements` /
+  `RevokeMeasurements` are no longer taken (a keystore build is its guest OS and
+  its compose); a stored one still reads and does not execute.
 - **The owner** (`owner_id`) cannot propose, vote or execute. It cancels a
   pending or approved proposal — except one that replaces a role (`SetOwner`, or a
   `Call` to `set_owner` / `set_governance` / `set_operator` on a governed
-  contract), which members can only vote down — revokes keystore builds without a vote, keeps
+  contract), which members can only vote down — takes a keystore's guest OS, compose or measurements
+  off the approved lists without a vote, keeps
   the Intel collateral current, rejects a pending keystore registration, and deletes
   keystore registrations that have been pending for more than 48 h.
 - **The newer decision on a role wins.** A role is this contract's owner, a governed
@@ -209,15 +212,20 @@ keystore (Intel TDX)                     dao.outlayer.near                    MP
      outstanding Intel security advisories;
    - extracts MRTD and RTMR0–3;
    - replays the registration's boot event log (below) and requires the result
-     to equal the quote's RTMR3, then records what the log states: the compose
-     hash, the app id, the instance id and the key provider
-     (`get_registration_facts`);
+     to equal the quote's RTMR3;
+   - requires the guest OS (MRTD, RTMR0–2) and the compose hash the log states
+     to be approved by governance;
+   - records what the log states: the compose hash, the app id, the instance
+     id and the key provider (`get_registration_facts`);
+   - answers with the id of the same key's registration when one is pending;
    - recomputes the `report_data` binding from the submitted key and requires
      it to equal the quote's;
    - creates a `Pending` proposal and returns its id.
 4. DAO members call `vote(proposal_id, true, public_key)`, naming the key.
-5. When enough current members approve, the contract records the
-   registration's measurements as approved and adds the key to its own
+5. When enough current members approve, the contract checks the build again: if
+   its guest OS or its compose was taken off the list while the registration
+   waited (by the owner or by governance), the proposal ends `Rejected` and
+   nothing is installed. Otherwise it adds the key to its own
    account as a function-call key: receiver = the contract itself, methods
    `request_key`, `mark_vault_verified`, `ban_vault`, **unlimited allowance**.
    The key goes into `approved_keystores` and the proposal ends `Executed`.
@@ -237,50 +245,71 @@ The quote itself is not stored. The proposal records the measurements, the
 submitter and the key; the quote's verification is visible in the
 transaction's logs.
 
-### What a registration states, and what a vote approves
+### The build is approved once; every instance takes a vote
 
-RTMR3 of a dstack CVM is not a build hash. The guest OS extends it at boot with
-one event per fact: the app id, the hash of the app's compose (the images by
-digest), the **instance id** of this very CVM, the key provider. Two instances
-of one release share a compose hash and differ in RTMR3, and a redeployed CVM
-is a new instance with a new RTMR3. Approving an RTMR3 apart from the
-registration that carries it would decide nothing a vote on that registration
-does not.
+TDX measures a CVM into five registers, and they answer different questions.
 
-So a registration carries its RTMR3 events (`event_log`: dstack's entries with
+- **MRTD, RTMR0–2 — the guest OS**: firmware, its configuration, kernel, command
+  line and initrd with the root filesystem's hash. The TDX module and the
+  firmware write them; nothing in the guest can.
+- **RTMR3 — written by that guest OS** at boot, one event per fact: the app id,
+  the hash of the app's compose (the images by digest), the **instance id** of
+  this very CVM, the key provider. So RTMR3 is not a build hash: two instances
+  of one release share a compose hash and differ in RTMR3, and a redeployed CVM
+  is a new instance with a new RTMR3.
+
+A registration carries its RTMR3 events (`event_log`: dstack's entries with
 `imr`, `event_type`, `digest`, `event`, `event_payload`). The contract
 recomputes each digest (`sha384(event_type ‖ ":" ‖ event ‖ ":" ‖ payload)`),
 replays them, and takes the registration only when the result is the RTMR3 of
 the verified quote. It reads the facts from the events before `system-ready` —
-those the measured guest OS wrote; an app may add events of any name after it —
-and each fact must be there once.
+those the guest OS wrote; an app may add events after it — each must be there
+once and have the size dstack writes, and an event name carries no `:`.
 
-The members' vote on the registration is the approval of the build and of the
-instance at once:
+An event log is evidence only under a known OS: under another one, anything can
+extend RTMR3 with a real keystore's public log. Hence two approvals by
+governance, each with the governance delay, each known before a CVM exists:
 
-- `compose_hash` says which release runs there. It is the sha256 of the CVM's
-  app compose — the keystore's compose file with its image pinned by digest,
-  and the list of environment variables it may receive — the same for every
-  instance of a version. The compose itself is public (the CVM's guest agent
-  and the attestation portal show it), so a member reads what runs and checks
-  the hash.
-- `instance_id` says which CVM. The operator who deployed it reads the same id,
-  and the keystore's key, from the CVM's own guest agent and log
-  (`scripts/deploy_tdx.sh` does, and refuses a registration on chain that
-  differs), and asks the members to vote **for that key**.
+| What | Action | Changes |
+|---|---|---|
+| The guest OS: `{mrtd, rtmr0, rtmr1, rtmr2}` | `ApproveOsImage` / `RevokeOsImage` | per dstack version and platform |
+| The release: `compose_hash` | `ApproveCompose` / `RevokeCompose` | per keystore release |
+
+`compose_hash` is the sha256 of the CVM's app compose — the keystore's compose
+file with its image pinned by digest, and the names of the environment
+variables it may receive — the same for every instance of a version. The
+compose is public (the CVM's guest agent and the attestation portal show it),
+so a member reads what will run and checks the hash before voting.
+`is_build_approved(measurements, compose_hash)` answers for both. The owner
+takes either off the list at once (`remove_approved_os_image`,
+`remove_approved_compose`): no keystore of it registers from then on, one whose
+registration waits for votes included.
+
+An approved build says which code runs in the TD, not whose instance it is: the
+keystore's environment (which workers and which coordinator it serves) is not
+measured, and anyone with a TDX host can start the same build with their own.
+That is what the members' vote on a registration decides, and why every
+instance, and every restart of one (a new in-memory key), takes a vote:
+
+- The operator who deployed the CVM reads its key from its own log and its
+  measurements, instance id and compose hash from its own guest agent
+  (`scripts/deploy_tdx.sh` does, reads only the current boot of a keystore that
+  does not serve yet, and refuses a registration on chain that differs), and
+  asks the members to vote **for that key**.
 - A vote for a registration names its key: `vote(id, true, public_key)` is
   refused when registration `id` is for another key, and a vote for a
-  registration without a key is refused. A member's vote therefore cannot land
-  on a registration somebody else submitted, whatever id they were given.
+  registration without a key is refused. A member's vote cannot land on a
+  registration somebody else submitted — a clone of the same build with the
+  same instance id included — whatever id they were given and whichever
+  registration came first.
 
-The measurements say which code runs in the TD, not whose instance it is: the
-keystore's environment (which workers and which coordinator it serves) is not
-measured. That is what the members decide, and why every instance, and every
-restart of one (a new key), takes a vote.
+The vote on a registration has no delay and counts the current members against
+the current threshold; the delay stands in front of the build.
 
-A registration without an event log states only its measurements; those must be
-in `approved_measurements` already (`ApproveMeasurements`), when it is
-submitted and again at quorum.
+There is one way to register, with the event log: without it a quote says
+which code runs only through an RTMR3 nobody can check. A registration stored
+before registrations carried their log states no build, and a quorum on it
+installs nothing.
 
 ## Voting
 
@@ -349,8 +378,8 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 - `cancel(proposal_id)` — a pending or approved governance proposal, not one
   that replaces the owner or the governance (`SetOwner`, a `Call` to `set_owner` /
   `set_governance`).
-- `remove_approved_measurements(measurements)`, `clear_all_approved_measurements()`
-  — registered keystores keep their keys; revoke those with
+- `remove_approved_os_image(image)`, `remove_approved_compose(compose_hash)` —
+  registered keystores keep their keys; revoke those with
   `propose_revoke_keystore_keys`.
 - `update_collateral(collateral, index)` — `collateral` is the
   `QuoteCollateralV3` JSON as a string; `index` is the slot, `0` or `1` (at most
@@ -395,9 +424,9 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 - `is_keystore_approved(public_key)` — `public_key` as a string; an unparsable
   key returns `false`
 - `get_approved_keystores(from_index, limit)`
-- `get_approved_measurements()`, `is_measurements_approved(measurements)` — measurements
-  are 96 hex characters each, accepted in either case and stored, revoked and compared in
-  lowercase, as a quote is read
+- `get_approved_os_images()`, `get_approved_composes()`,
+  `is_build_approved(measurements, compose_hash)` — hex accepted in either case and
+  stored, revoked and compared in lowercase, as a quote is read
 - `get_dao_members()`, `get_owner()`, `get_config()`
 - `get_gov_proposal(proposal_id)`, `get_gov_proposals(from_index, limit)`,
   `get_gov_delay_sec()`, `get_blob(hash)`
@@ -414,7 +443,9 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 ```bash
 # Approved builds and pending work
-near contract call-function as-read-only dao.outlayer.near get_approved_measurements \
+near contract call-function as-read-only dao.outlayer.near get_approved_composes \
+  json-args '{}' network-config mainnet now
+near contract call-function as-read-only dao.outlayer.near get_approved_os_images \
   json-args '{}' network-config mainnet now
 near contract call-function as-read-only dao.outlayer.near get_proposals \
   json-args '{"from_index": 1, "limit": 20}' network-config mainnet now
