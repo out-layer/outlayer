@@ -162,7 +162,12 @@ the delay, it prints the remaining steps and stops; a worker that gave up waitin
 restarted after the execution. Measurements are approved once per (network, version). The
 node-side files are under `deploy/self-hosted-tdx`.
 
-Upgrading this contract: `scripts/dao_upgrade.sh --target worker --wasm <file>`.
+## Upgrading this contract
+
+Through the DAO, as the other two contracts. The commands — build, store the wasm, propose,
+check and vote, execute, check the result — are in
+[keystore-dao-contract/README.md](../keystore-dao-contract/README.md#deploying-a-release-through-the-dao),
+with `<target>` = `worker.outlayer.near`.
 
 ## Build and test
 

@@ -92,8 +92,91 @@ Every version keeps `migrate()` (no arguments) and `gov_health()`: an earlier
 version calls them on a later one. `GovProposal` and `GovAction` are `V1`'s
 shape and do not change.
 
-`scripts/dao_upgrade.sh` stores the blob, proposes, votes and executes when the
-delay has passed.
+### Deploying a release through the DAO
+
+The same commands for the three contracts. `<target>` is the account being
+upgraded and `<wasm>` its file:
+
+| Contract | `<target>` | `<wasm>` |
+|---|---|---|
+| DAO | `dao.outlayer.near` | `keystore-dao-contract/target/near/keystore_dao_contract.wasm` |
+| Main | `outlayer.near` | `contract/target/near/outlayer_contract.wasm` |
+| Register | `worker.outlayer.near` | `register-contract/target/near/register_contract.wasm` |
+
+Each member signs with their own key; `sign-with-keychain` below stands for
+whichever signer they use.
+
+**1. Build** — the proposer, and later every member who checks the proposal,
+from a clean committed tree:
+
+```bash
+(cd contract && cargo near build reproducible-wasm)    # or keystore-dao-contract, register-contract
+```
+
+It prints the wasm's size and its sha256 in hex and in base58. The base58 one
+is `<code_hash>`, the code hash NEAR shows for the account after the deploy.
+
+**2. Store the wasm** — the proposer. The deposit is its storage: 0.00001 NEAR
+per byte (8.76 NEAR for 876 KB); attach a little more, the excess comes back at
+once, and the deposit itself comes back when the upgrade executes:
+
+```bash
+near contract call-function as-transaction dao.outlayer.near store_blob file-args <wasm> \
+  prepaid-gas '100 Tgas' attached-deposit '<size × 0.00001 + 0.1> NEAR' \
+  sign-as <member> network-config mainnet sign-with-keychain send
+```
+
+It returns `<code_hash>`.
+
+**3. Propose** — the proposer. `migrate` is `true` for a release that changes
+the state layout (the new code's `migrate()` runs in the same batch), else
+`false`. The proposer's vote is counted with the proposal; the call returns
+`<id>`:
+
+```bash
+near contract call-function as-transaction dao.outlayer.near propose \
+  json-args '{"action":{"Upgrade":{"target":"<target>","code_hash":"<code_hash>","migrate":false}}}' \
+  prepaid-gas '100 Tgas' attached-deposit '0.1 NEAR' \
+  sign-as <member> network-config mainnet sign-with-keychain send
+```
+
+**4. Check and vote** — every other member. Rebuild the same commit (step 1)
+and compare its base58 sha256 with the proposal's `code_hash` and the stored
+blob:
+
+```bash
+near contract call-function as-read-only dao.outlayer.near get_gov_proposal json-args '{"proposal_id":<id>}' network-config mainnet now
+near contract call-function as-read-only dao.outlayer.near get_blob json-args '{"hash":"<code_hash>"}' network-config mainnet now
+near contract call-function as-transaction dao.outlayer.near vote json-args '{"proposal_id":<id>,"approve":true}' \
+  prepaid-gas '100 Tgas' attached-deposit '0 NEAR' sign-as <member> network-config mainnet sign-with-keychain send
+```
+
+With three members, the proposer and one more vote approve it
+(`approval_threshold = members / 2 + 1`). `get_gov_proposal` then shows
+`Approved` and `executable_after`, 72 hours later (`get_gov_delay_sec`).
+
+**5. Execute** — any member, after `executable_after`:
+
+```bash
+near contract call-function as-transaction dao.outlayer.near execute json-args '{"proposal_id":<id>}' \
+  prepaid-gas '300 Tgas' attached-deposit '0 NEAR' sign-as <member> network-config mainnet sign-with-keychain send
+```
+
+**6. Check the result:**
+
+```bash
+near account view-account-summary <target> network-config mainnet now      # code hash = <code_hash>
+near contract call-function as-read-only <target> gov_health json-args '{}' network-config mainnet now
+near contract call-function as-read-only outlayer.near get_storage_version json-args '{}' network-config mainnet now
+```
+
+A failing deploy or `migrate` leaves the old code. The proposal is `Executed`
+and its blob is gone: fix the release and start again from step 1. A proposal
+that collects no quorum in 14 days, or is not executed within 7 days after its
+delay, expires; the proposer then takes the blob back with `remove_blob`.
+
+On testnet the accounts are `*.outlayer.testnet`, `network-config testnet`, and
+the delay is 0: step 5 runs as soon as the proposal is approved.
 
 ## How a keystore obtains the master
 

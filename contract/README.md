@@ -902,11 +902,10 @@ near contract call-function as-transaction <contract-account> set_governance jso
 
 Through the DAO: the wasm is stored in the DAO as a blob, members vote on its
 sha256, and after the delay a member executes the proposal, which calls
-`upgrade()` or `upgrade_and_migrate()` here with the blob.
-
-```bash
-scripts/dao_upgrade.sh --network testnet --target main --wasm res/local/outlayer_contract.wasm [--migrate]
-```
+`upgrade()` or `upgrade_and_migrate()` here with the blob. The commands —
+build, store the wasm, propose, check and vote, execute, check the result —
+are in [keystore-dao-contract/README.md](../keystore-dao-contract/README.md#deploying-a-release-through-the-dao),
+with `<target>` = `outlayer.near`.
 
 `get_storage_version` answers the state layout the code expects. A release
 that changes the layout is upgraded with `upgrade_and_migrate`; its `migrate`
