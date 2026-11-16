@@ -867,6 +867,28 @@ pub async fn check_measurements_approved(
     }
 }
 
+/// Whether the DAO contract reads a registration's boot event log: it then has the
+/// `get_registration_facts` view. A contract without it ignores the log and wants the
+/// measurements approved beforehand.
+pub async fn dao_reads_event_log(near_rpc_url: &str, dao_contract: &str) -> Result<bool> {
+    let client = crate::near::rpc_client(near_rpc_url);
+    let request = methods::query::RpcQueryRequest {
+        block_reference: BlockReference::Finality(Finality::Final),
+        request: QueryRequest::CallFunction {
+            account_id: dao_contract.parse()?,
+            method_name: "get_registration_facts".to_string(),
+            args: FunctionArgs::from(serde_json::to_vec(&serde_json::json!({ "proposal_id": 0 }))?),
+        },
+    };
+    match client.call(request).await {
+        Ok(_) => Ok(true),
+        // The node answers a missing method as a handler error naming it; anything else is
+        // the RPC failing, which says nothing about the contract.
+        Err(e) if e.to_string().contains("MethodNotFound") || e.to_string().contains("MethodResolveError") => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn check_keystore_approval(
     near_rpc_url: &str,
     dao_contract: &str,

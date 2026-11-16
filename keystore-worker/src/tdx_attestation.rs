@@ -75,7 +75,12 @@ impl TdxClient {
     ///
     /// # Returns
     /// * Hex-encoded TDX quote (ready to pass to submit_keystore_registration)
-    pub async fn generate_registration_quote(&self, public_key_bytes: &[u8; 32]) -> Result<String> {
+    /// * The RTMR3 events of the quote's event log (`rtmr3_events`), when dstack gave one: the
+    ///   DAO replays them against the quote and reads which compose and which instance this is
+    pub async fn generate_registration_quote(
+        &self,
+        public_key_bytes: &[u8; 32],
+    ) -> Result<(String, Option<serde_json::Value>)> {
         info!("🔐 Generating registration TDX quote with embedded public key");
         info!("   Public key (hex): {}", hex::encode(public_key_bytes));
 
@@ -89,14 +94,14 @@ impl TdxClient {
                 report_data[..32].copy_from_slice(public_key_bytes);
 
                 // Call Phala dstack socket to generate TDX quote
-                let tdx_quote = self.call_phala_dstack_socket(&report_data)
+                let (tdx_quote, event_log) = self.call_phala_dstack_socket(&report_data)
                     .await
                     .context("Failed to generate TDX quote via dstack socket")?;
 
                 info!("✅ Generated real TDX quote (size: {} bytes)", tdx_quote.len());
 
                 // Return hex-encoded quote (DAO contract expects hex string)
-                Ok(hex::encode(&tdx_quote))
+                Ok((hex::encode(&tdx_quote), event_log))
             }
             "none" => {
                 // No attestation mode: Create minimal fake quote
@@ -109,7 +114,7 @@ impl TdxClient {
 
                 info!("✅ Generated NO-ATTESTATION stub (hex-encoded, size: {} bytes)", hex::encode(fake_quote.as_bytes()).len());
 
-                Ok(hex::encode(fake_quote.as_bytes()))
+                Ok((hex::encode(fake_quote.as_bytes()), None))
             }
             other => {
                 anyhow::bail!(
@@ -128,8 +133,11 @@ impl TdxClient {
     /// - Unix socket: /var/run/dstack.sock (default on Linux)
     /// - HTTP API: http://localhost:8090 (if DSTACK_SIMULATOR_ENDPOINT is set)
     ///
-    /// Returns raw TDX quote bytes (not hex!)
-    async fn call_phala_dstack_socket(&self, report_data: &[u8; 64]) -> Result<Vec<u8>> {
+    /// Returns raw TDX quote bytes (not hex!) and the RTMR3 events of its event log.
+    async fn call_phala_dstack_socket(
+        &self,
+        report_data: &[u8; 64],
+    ) -> Result<(Vec<u8>, Option<serde_json::Value>)> {
         use dstack_sdk::dstack_client::DstackClient;
 
         info!("🔌 Calling Phala dstack SDK for TDX quote generation");
@@ -166,8 +174,43 @@ impl TdxClient {
             warn!("⚠️ Quote too short to extract measurements: {} bytes (need {})", tdx_quote.len(), RTMR3_OFFSET + MEASUREMENT_SIZE);
         }
 
-        Ok(tdx_quote)
+        let event_log = rtmr3_events(&response.event_log);
+        match &event_log {
+            Some(events) => info!(
+                "   event log: {} RTMR3 events go with the registration",
+                events.as_array().map_or(0, |a| a.len())
+            ),
+            None => warn!("⚠️ dstack gave no readable event log; the registration goes without it"),
+        }
+
+        Ok((tdx_quote, event_log))
     }
+}
+
+/// The RTMR3 entries of dstack's event log (a JSON array), with the fields the DAO contract
+/// reads: `imr`, `event_type`, `digest`, `event`, `event_payload`. RTMR3 is the register the
+/// guest extends with the app id, the compose hash, the instance id and the key provider; the
+/// other registers hold firmware and kernel events the contract does not replay. `None` when
+/// the log is not such an array or has no RTMR3 entry.
+pub fn rtmr3_events(event_log_json: &str) -> Option<serde_json::Value> {
+    let all: Vec<serde_json::Value> = serde_json::from_str(event_log_json).ok()?;
+    let events: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|e| e.get("imr").and_then(|v| v.as_u64()) == Some(3))
+        .map(|e| {
+            Some(serde_json::json!({
+                "imr": 3,
+                "event_type": e.get("event_type")?.as_u64()?,
+                "digest": e.get("digest")?.as_str()?,
+                "event": e.get("event")?.as_str()?,
+                "event_payload": e.get("event_payload")?.as_str()?,
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if events.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Array(events))
 }
 
 /// The one place the measurement line's wire format is defined.
@@ -304,4 +347,29 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn rtmr3_events_keeps_only_register_three_with_the_contract_fields() {
+        let log = r#"[
+            {"imr":0,"event_type":2147483659,"digest":"aa","event":"","event_payload":"00"},
+            {"imr":3,"event_type":134217729,"digest":"f997","event":"system-preparing","event_payload":""},
+            {"imr":3,"event_type":134217729,"digest":"72f0","event":"compose-hash","event_payload":"cfcb","extra":1}
+        ]"#;
+        let events = rtmr3_events(log).unwrap();
+        let a = events.as_array().unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[1]["event"], "compose-hash");
+        assert_eq!(a[1]["event_payload"], "cfcb");
+        assert_eq!(a[1]["event_type"], 134217729u64);
+        assert!(a[1].get("extra").is_none());
+    }
+
+    #[test]
+    fn rtmr3_events_is_none_for_a_log_it_cannot_send_whole() {
+        assert!(rtmr3_events("").is_none());
+        assert!(rtmr3_events("{}").is_none());
+        assert!(rtmr3_events(r#"[{"imr":0,"event_type":1,"digest":"aa","event":"x","event_payload":""}]"#).is_none());
+        // An RTMR3 entry without a digest: sending the rest would not replay.
+        assert!(rtmr3_events(r#"[{"imr":3,"event_type":1,"event":"x","event_payload":""}]"#).is_none());
+    }
+
 }

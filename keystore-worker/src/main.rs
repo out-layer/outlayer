@@ -288,9 +288,23 @@ async fn perform_tee_registration(config: &Config) -> Result<TeeRegistrationResu
         // pubkey for ml-dsa-65). The DAO contract re-derives and checks this.
         let pubkey_bytes = tee_registration::report_data_binding(&public_key)?;
 
-        let tdx_quote = tdx_client.generate_registration_quote(&pubkey_bytes).await?;
+        let (tdx_quote, event_log) = tdx_client.generate_registration_quote(&pubkey_bytes).await?;
         tracing::info!("📡 Generated TEE attestation (mode: {:?})", config.tee_mode);
-        tracing::info!("   Quote will be verified by DAO contract against approved RTMR3 list");
+
+        // A DAO that reads the event log takes the registration as it is: it replays the log
+        // against the quote, records which compose and which instance registers, and the
+        // members' vote on it approves both. A DAO that does not, or a registration without a
+        // log, needs the measurements approved beforehand, checked below before any gas is spent.
+        let by_event_log = event_log.is_some()
+            && mpc_ckd::dao_reads_event_log(&near_rpc_url, &dao_contract)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Could not ask the DAO whether it reads the event log; taking the approved-measurements path");
+                    false
+                });
+        if by_event_log {
+            tracing::info!("📜 The registration carries its boot event log: DAO members vote on this instance, no build approval beforehand");
+        }
 
         // Do not pay to be told something a free view call answers.
         //
@@ -305,7 +319,9 @@ async fn perform_tee_registration(config: &Config) -> Result<TeeRegistrationResu
         // contract does — verified against a live rejection where both values matched exactly —
         // and `scripts/deploy_tdx.sh` already reads them from this log rather than from the
         // contract's receipt.
-        if let Some(measurements) =
+        if by_event_log {
+            // Nothing to check beforehand.
+        } else if let Some(measurements) =
             crate::tdx_attestation::extract_all_measurements_from_quote_hex(&tdx_quote)
         {
             let approved = mpc_ckd::check_measurements_approved(
@@ -355,7 +371,7 @@ async fn perform_tee_registration(config: &Config) -> Result<TeeRegistrationResu
             .map(|info| info.app_id);
 
         // Submit to DAO (contract will verify the quote)
-        let proposal_id = match registration.submit_registration(public_key.clone(), tdx_quote, app_id).await {
+        let proposal_id = match registration.submit_registration(public_key.clone(), tdx_quote, app_id, event_log).await {
             Ok(id) => id,
             Err(e) => {
                 let error_str = e.to_string();

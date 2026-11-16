@@ -207,15 +207,20 @@ impl RegistrationClient {
         public_key: PublicKey,
         tdx_quote_hex: String,
         app_id: Option<String>,
+        event_log: Option<serde_json::Value>,
     ) -> Result<u64> {
         info!("📤 Submitting keystore registration to DAO contract");
 
-        // Prepare function call
-        let args = json!({
+        // Prepare function call. `event_log` is the quote's RTMR3 events: the DAO replays them
+        // against the quote and records which compose and which instance registers.
+        let mut args = json!({
             "public_key": public_key.to_string(),
             "tdx_quote_hex": tdx_quote_hex,
             "app_id": app_id,
         });
+        if let Some(events) = event_log {
+            args["event_log"] = events;
+        }
 
         // Convert to JSON string first, then to bytes (NEAR expects JSON text, not MessagePack)
         let args_json = serde_json::to_string(&args)
