@@ -149,7 +149,7 @@ fn threshold_and_electorate_are_fixed_when_the_proposal_is_created() {
     assert_eq!(d.approval_threshold, 3);
 
     at(a("m2.testnet"), 0);
-    d.vote(id, true);
+    d.vote(id, true, None);
     // 2 of the snapshot threshold 2, not 2 of the current 3.
     assert_eq!(status(&d, id), GovStatus::Approved);
 }
@@ -162,7 +162,7 @@ fn a_member_added_after_the_proposal_cannot_vote_on_it() {
     let id = d.propose(GovAction::SetDelay { seconds: 5 });
     d.dao_members.insert(&a("m4.testnet"));
     at(a("m4.testnet"), 0);
-    d.vote(id, true);
+    d.vote(id, true, None);
 }
 
 #[test]
@@ -174,10 +174,10 @@ fn a_removed_members_vote_stops_counting() {
     d.approval_threshold = (d.dao_members.len() as u32 / 2) + 1;
 
     at(a("m2.testnet"), 0);
-    d.vote(id, true);
+    d.vote(id, true, None);
     assert_eq!(status(&d, id), GovStatus::Pending, "m1's vote no longer counts");
     at(a("m3.testnet"), 0);
-    d.vote(id, true);
+    d.vote(id, true, None);
     assert_eq!(status(&d, id), GovStatus::Approved);
 }
 
@@ -189,7 +189,7 @@ fn a_removed_member_cannot_vote() {
     let id = d.propose(GovAction::SetDelay { seconds: 5 });
     d.dao_members.remove(&a("m2.testnet"));
     at(a("m2.testnet"), 0);
-    d.vote(id, true);
+    d.vote(id, true, None);
 }
 
 #[test]
@@ -198,10 +198,10 @@ fn a_majority_against_rejects() {
     at(a("m1.testnet"), 0);
     let id = d.propose(GovAction::SetDelay { seconds: 5 });
     at(a("m2.testnet"), 0);
-    d.vote(id, false);
+    d.vote(id, false, None);
     assert_eq!(status(&d, id), GovStatus::Pending);
     at(a("m3.testnet"), 0);
-    d.vote(id, false);
+    d.vote(id, false, None);
     assert_eq!(status(&d, id), GovStatus::Rejected);
 }
 
@@ -211,7 +211,7 @@ fn double_vote_panics() {
     let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
     at(a("m1.testnet"), 0);
     let id = d.propose(GovAction::SetDelay { seconds: 5 });
-    d.vote(id, true);
+    d.vote(id, true, None);
 }
 
 // ===== action validation =====
@@ -282,7 +282,7 @@ fn members_change_only_by_vote_and_the_threshold_follows() {
         let id = d.propose(GovAction::AddMember { member: a(m) });
         if status(&d, id) == GovStatus::Pending {
             at(a("m2.testnet"), 0);
-            d.vote(id, true);
+            d.vote(id, true, None);
             at(a("m1.testnet"), 0);
         }
         let _ = d.execute(id);
@@ -292,7 +292,7 @@ fn members_change_only_by_vote_and_the_threshold_follows() {
 
     let id = d.propose(GovAction::RemoveMember { member: a("m3.testnet") });
     at(a("m2.testnet"), 0);
-    d.vote(id, true);
+    d.vote(id, true, None);
     let _ = d.execute(id);
     assert_eq!(d.get_dao_members().len(), 2);
     assert_eq!(d.approval_threshold, 2);
@@ -329,7 +329,7 @@ fn owner_cancels_a_pending_and_an_approved_proposal() {
     let pending = d.propose(GovAction::SetDelay { seconds: 1 });
     let approved = d.propose(GovAction::SetDelay { seconds: 2 });
     at(a("m2.testnet"), 0);
-    d.vote(approved, true);
+    d.vote(approved, true, None);
     assert_eq!(status(&d, approved), GovStatus::Approved);
 
     at(owner(), 0);
@@ -620,9 +620,9 @@ fn a_registration_of_a_build_revoked_while_it_waited_is_rejected_at_quorum() {
     d.remove_approved_measurements(measurements('e'));
 
     at(a("m1.testnet"), 0);
-    d.vote(1, true);
+    d.vote(1, true, Some(key(1)));
     at(a("m2.testnet"), 0);
-    d.vote(1, true);
+    d.vote(1, true, Some(key(1)));
     assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Rejected);
     assert!(!d.is_keystore_approved(String::from(&key(1))));
     assert!(get_created_receipts().is_empty(), "no key is added");
@@ -634,9 +634,9 @@ fn a_registration_of_a_build_still_approved_installs_its_key_at_quorum() {
     d.approved_measurements.push(measurements('e'));
     pending_registration(&mut d, 1, 0);
     at(a("m1.testnet"), 0);
-    d.vote(1, true);
+    d.vote(1, true, Some(key(1)));
     at(a("m2.testnet"), 0);
-    d.vote(1, true);
+    d.vote(1, true, Some(key(1)));
     assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Executed);
     assert!(d.is_keystore_approved(String::from(&key(1))));
 }
@@ -650,7 +650,7 @@ fn the_owner_rejects_a_pending_registration_and_no_vote_installs_it() {
     d.reject_registration(1);
     assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Rejected);
     at(a("m1.testnet"), 0);
-    let voted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.vote(1, true)));
+    let voted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.vote(1, true, Some(key(1)))));
     assert!(voted.is_err(), "a rejected registration takes no votes");
     assert!(!d.is_keystore_approved(String::from(&key(1))));
 }
@@ -706,9 +706,9 @@ fn a_revoke_in_another_case_removes_the_build_and_its_pending_registration_dies(
     assert!(d.get_approved_measurements().is_empty(), "the uppercase revoke matched");
 
     at(a("m1.testnet"), 0);
-    d.vote(1, true);
+    d.vote(1, true, Some(key(1)));
     at(a("m2.testnet"), 0);
-    d.vote(1, true);
+    d.vote(1, true, Some(key(1)));
     assert_eq!(d.get_proposal(1).unwrap().status, ProposalStatus::Rejected);
 }
 
@@ -831,7 +831,7 @@ fn an_older_approved_add_member_does_not_bring_back_a_removed_member() {
     let _ = d.execute(add);
     let remove = d.propose(GovAction::RemoveMember { member: a("x.testnet") });
     at(a("x.testnet"), 0);
-    d.vote(remove, true);
+    d.vote(remove, true, None);
     at(a("m1.testnet"), 0);
     let _ = d.execute(remove);
     assert!(!d.get_dao_members().contains(&a("x.testnet")));
@@ -1051,7 +1051,7 @@ fn the_dao_upgrades_itself_while_other_proposals_are_open() {
     let up = d.propose(GovAction::Upgrade { target: dao_id(), code_hash: h, migrate: false });
     let _other = d.propose(GovAction::SetDelay { seconds: 1 });
     at(a("m2.testnet"), 0);
-    d.vote(up, true);
+    d.vote(up, true, None);
     assert!(matches!(d.execute(up), PromiseOrValue::Promise(_)));
     assert_eq!(status(&d, up), GovStatus::Executed);
 }
@@ -1098,7 +1098,7 @@ fn an_expired_pending_proposal_takes_no_votes() {
     at(a("m1.testnet"), 0);
     let id = d.propose(GovAction::SetOwner { owner: a("attacker.testnet") });
     at(a("m2.testnet"), 60 * DAY_NS);
-    d.vote(id, true);
+    d.vote(id, true, None);
 }
 
 #[test]
@@ -1107,6 +1107,179 @@ fn a_pending_proposal_takes_votes_until_its_ttl() {
     at(a("m1.testnet"), 0);
     let id = d.propose(GovAction::SetDelay { seconds: 1 });
     at(a("m2.testnet"), 14 * DAY_NS);
-    d.vote(id, true);
+    d.vote(id, true, None);
     assert_eq!(status(&d, id), GovStatus::Approved);
+}
+
+// ===== registrations with a boot event log, and votes that name the key =====
+
+const COMPOSE: &str = "cfcba6acbf261f883b9f380c49c1401917f5f4e8c46007cf2cb027d1ddb010be";
+
+fn boot_log(instance: char) -> Vec<event_log::EventLogEntry> {
+    event_log::tests::boot_log(COMPOSE, &instance.to_string().repeat(40))
+}
+
+/// The measurements of the TD whose RTMR3 events are `log`.
+fn measured(log: &[event_log::EventLogEntry]) -> ApprovedMeasurements {
+    let mut m = measurements('a');
+    m.rtmr3 = event_log::replay(log).unwrap().0;
+    m
+}
+
+/// Register key `byte` from the init account, its quote verified: `report_data` binds the key.
+fn register(d: &mut KeystoreDao, byte: u8, m: ApprovedMeasurements, log: Option<Vec<event_log::EventLogEntry>>) -> u64 {
+    at(a("init.testnet"), 0);
+    d.internal_register(key(byte), m, [byte; 32], log)
+}
+
+#[test]
+fn a_registration_with_its_event_log_needs_no_approved_build_and_states_its_instance() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    let log = boot_log('1');
+    let id = register(&mut d, 7, measured(&log), Some(log));
+
+    assert_eq!(d.get_proposal(id).unwrap().status, ProposalStatus::Pending);
+    let facts = d.get_registration_facts(id).unwrap();
+    assert_eq!(facts.compose_hash, COMPOSE);
+    assert_eq!(facts.instance_id, "1".repeat(40));
+    assert!(d.get_approved_measurements().is_empty(), "nothing is approved before the vote");
+}
+
+#[test]
+fn the_quorum_on_such_a_registration_installs_the_key_and_records_its_measurements() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    let log = boot_log('1');
+    let m = measured(&log);
+    let id = register(&mut d, 7, m.clone(), Some(log));
+
+    at(a("m1.testnet"), 0);
+    d.vote(id, true, Some(key(7)));
+    assert!(!d.is_keystore_approved(String::from(&key(7))), "one vote of two installs nothing");
+    at(a("m2.testnet"), 0);
+    d.vote(id, true, Some(key(7)));
+
+    assert_eq!(d.get_proposal(id).unwrap().status, ProposalStatus::Executed);
+    assert!(d.is_keystore_approved(String::from(&key(7))));
+    assert!(d.is_measurements_approved(m));
+}
+
+#[test]
+#[should_panic(expected = "Event log does not replay to the quote's RTMR3")]
+fn an_event_log_of_another_td_is_refused() {
+    let mut d = dao(&["m1.testnet"], 0);
+    let quoted = measured(&boot_log('1'));
+    register(&mut d, 7, quoted, Some(boot_log('2')));
+}
+
+#[test]
+#[should_panic(expected = "Event log refused")]
+fn an_event_log_with_a_forged_field_is_refused() {
+    let mut d = dao(&["m1.testnet"], 0);
+    let mut log = boot_log('1');
+    let m = measured(&log);
+    log[3].event_payload = "ee".repeat(32);
+    register(&mut d, 7, m, Some(log));
+}
+
+#[test]
+#[should_panic(expected = "Worker measurements not approved")]
+fn a_registration_without_an_event_log_still_needs_its_build_approved() {
+    let mut d = dao(&["m1.testnet"], 0);
+    register(&mut d, 7, measurements('e'), None);
+}
+
+#[test]
+fn a_registration_without_an_event_log_of_an_approved_build_is_taken_and_states_nothing() {
+    let mut d = dao(&["m1.testnet"], 0);
+    d.approved_measurements.push(measurements('e'));
+    let id = register(&mut d, 7, measurements('e'), None);
+    assert!(d.get_registration_facts(id).is_none());
+    at(a("m1.testnet"), 0);
+    d.vote(id, true, Some(key(7)));
+    assert!(d.is_keystore_approved(String::from(&key(7))));
+}
+
+#[test]
+#[should_panic(expected = "Public key mismatch")]
+fn a_key_the_quote_does_not_bind_is_refused() {
+    let mut d = dao(&["m1.testnet"], 0);
+    let log = boot_log('1');
+    at(a("init.testnet"), 0);
+    d.internal_register(key(7), measured(&log), [8u8; 32], Some(log));
+}
+
+#[test]
+#[should_panic(expected = "names its key")]
+fn a_vote_for_a_registration_without_its_key_is_refused() {
+    let mut d = dao(&["m1.testnet", "m2.testnet"], 0);
+    let log = boot_log('1');
+    let id = register(&mut d, 7, measured(&log), Some(log));
+    at(a("m1.testnet"), 0);
+    d.vote(id, true, None);
+}
+
+/// Someone else's CVM registers first, or the id reaches the member wrong: the member's vote
+/// names the key the operator read from their own CVM, and lands nowhere else.
+#[test]
+fn a_vote_naming_one_key_cannot_approve_the_registration_of_another() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    let theirs = boot_log('9');
+    let other = register(&mut d, 9, measured(&theirs), Some(theirs));
+    let ours = boot_log('1');
+    let mine = register(&mut d, 7, measured(&ours), Some(ours));
+
+    for m in ["m1.testnet", "m2.testnet"] {
+        at(a(m), 0);
+        let wrong = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.vote(other, true, Some(key(7)))));
+        assert!(wrong.is_err(), "the vote for key 7 is refused on the registration of key 9");
+        d.vote(mine, true, Some(key(7)));
+    }
+    assert!(d.is_keystore_approved(String::from(&key(7))));
+    assert!(!d.is_keystore_approved(String::from(&key(9))));
+    assert_eq!(d.get_proposal(other).unwrap().status, ProposalStatus::Pending);
+    assert_eq!(d.get_proposal(other).unwrap().votes_for, 0);
+}
+
+#[test]
+fn a_vote_against_a_registration_needs_no_key_and_the_owner_still_rejects_it() {
+    let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
+    let log = boot_log('1');
+    let id = register(&mut d, 7, measured(&log), Some(log));
+    at(a("m1.testnet"), 0);
+    d.vote(id, false, None);
+    assert_eq!(d.get_proposal(id).unwrap().votes_against, 1);
+
+    at(owner(), 0);
+    d.reject_registration(id);
+    at(a("m2.testnet"), 0);
+    let voted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.vote(id, true, Some(key(7)))));
+    assert!(voted.is_err(), "a rejected registration takes no votes");
+    assert!(d.get_approved_measurements().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "public_key goes only with a vote on a keystore registration")]
+fn a_key_on_a_governance_vote_is_refused() {
+    let mut d = dao(&["m1.testnet", "m2.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let id = d.propose(GovAction::SetDelay { seconds: 1 });
+    at(a("m2.testnet"), 0);
+    d.vote(id, true, Some(key(7)));
+}
+
+#[test]
+fn a_restart_of_the_same_instance_registers_its_new_key_by_a_new_vote() {
+    let mut d = dao(&["m1.testnet"], 0);
+    let log = boot_log('1');
+    let m = measured(&log);
+    let first = register(&mut d, 7, m.clone(), Some(log.clone()));
+    at(a("m1.testnet"), 0);
+    d.vote(first, true, Some(key(7)));
+
+    // Same CVM, same measurements (now recorded as approved), a new key: nothing is installed
+    // until members vote for that key.
+    let second = register(&mut d, 8, m, Some(log));
+    assert_eq!(d.get_proposal(second).unwrap().status, ProposalStatus::Pending);
+    assert!(!d.is_keystore_approved(String::from(&key(8))));
+    assert_eq!(d.get_approved_measurements().len(), 1, "the measurements are recorded once");
 }

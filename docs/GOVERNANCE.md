@@ -21,7 +21,8 @@ installed by the contracts themselves:
   attestation is verified on chain against a build the DAO approved. The key may call only the
   four methods a worker needs on `outlayer.near`: delivering results and settling payments.
 - **Keystores on `dao.outlayer.near`.** Each keystore's key is added only by a DAO vote on its
-  verified attestation, and only for a build the DAO approved. It may call only `request_key`
+  verified attestation, which states on chain which build runs there and which instance it is.
+  It may call only `request_key`
   (obtain the master secret through NEAR MPC), `mark_vault_verified` and `ban_vault`.
 
 Read the keys yourself: `near account list-keys outlayer.near network-config mainnet now`.
@@ -48,13 +49,12 @@ Read the keys yourself: `near account list-keys outlayer.near network-config mai
 | Upgrade any of the three contracts, the DAO itself included | `Upgrade`: a member stores the wasm as a blob, members vote on its sha256 — the hash a reproducible build of the release gives — and after the delay the contract deploys it in one atomic step. A failing migration leaves the old code in place |
 | Add or remove a DAO member | `AddMember`, `RemoveMember`. The last member cannot be removed |
 | Change the delay | `SetDelay`, at most 30 days |
-| Approve a keystore build (the builds that may obtain the master secret) | `ApproveMeasurements` |
+| Let a keystore obtain the master secret | A vote on its registration. The contract verifies the keystore's Intel TDX attestation and replays its boot event log, so the registration states the hash of the exact software (`compose_hash`) and the instance. The vote approves both and names the key it installs: it cannot land on another keystore's registration. Every instance and every restart takes its own vote |
 | Approve a worker build | A `Call` to `add_approved_measurements` on the register |
 | Replace the operations owner of any contract | `SetOwner`, or a `Call` to `set_owner` |
 | Replace a contract's governance account or the main contract's operator | A `Call` to `set_governance` / `set_operator` |
 | Change the stablecoin the main contract accepts | A `Call` to `set_payment_token_contract` |
 | Move a balance held by the main contract (a rescue) | A `Call` to `gov_transfer` |
-| Install a keystore's key | A vote on its registration. The build is checked again when the vote reaches quorum, so a build revoked in the meantime gets nothing |
 | Revoke keystore keys | `propose_revoke_keystore_keys`, decided by the members' vote |
 
 A `Call` proposal can reach only a contract the DAO governs, and never the DAO itself or the MPC
@@ -80,8 +80,8 @@ None of them touches code, keys, members, the delay or build approvals.
 
 | Contract | Owner method | What it does | Why the owner has it |
 |---|---|---|---|
-| DAO | `remove_approved_measurements`, `clear_all_approved_measurements` | Revoke keystore builds | The fast brake on a bad build: no keystore of it registers again until the DAO approves a build |
-| DAO | `reject_registration` | Reject a keystore registration still waiting for votes | Stops a suspicious instance at once. It installs nothing and approves nothing |
+| DAO | `reject_registration` | Reject a keystore registration still waiting for votes | The fast brake: stops a suspicious instance at once. It installs nothing and approves nothing |
+| DAO | `remove_approved_measurements`, `clear_all_approved_measurements` | Remove measurements from the approved record | Housekeeping of the record of instances the members approved |
 | DAO | `remove_stale_proposals` | Delete registrations pending for more than 48 hours | Cleanup of instances that stopped waiting |
 | DAO | `cancel` | Cancel a pending or approved proposal | A brake on a mistaken proposal. It cannot cancel a proposal that replaces an owner, a governance account or an operator — the owner cannot keep itself in place |
 | DAO, register | `update_collateral` | Store Intel's TDX reference data (at most 128 KiB per slot) | Intel republishes it about monthly, and every registration verifies against it |

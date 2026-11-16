@@ -8,6 +8,8 @@ use schemars::JsonSchema;
 // Collateral wrapper for TDX verification (from register-contract)
 mod collateral;
 use collateral::Collateral;
+pub mod event_log;
+use event_log::{EventLogEntry, RegistrationFacts};
 
 pub(crate) mod migration;
 
@@ -94,6 +96,9 @@ enum StorageKey {
     /// Per role, the id of the last governance proposal that changed it (`governance.rs`,
     /// `role_key`). A collection under its own prefix, outside the root struct.
     RoleChanges,
+    /// Per keystore registration, what its replayed boot event log states (`event_log.rs`).
+    /// A collection under its own prefix, outside the root struct.
+    RegistrationFacts,
 }
 
 /// Full TEE measurements for verifying the entire dstack environment.
@@ -501,6 +506,7 @@ impl KeystoreDao {
         tdx_quote_hex: String,
         #[allow(unused_variables)]
         app_id: Option<String>,
+        event_log: Option<Vec<EventLogEntry>>,
     ) -> u64 {
         // Only init account can submit (pays gas)
         assert_eq!(
@@ -566,15 +572,55 @@ impl KeystoreDao {
             measurements.rtmr2, measurements.rtmr3
         ));
 
-        // CRITICAL: Check if measurements are in approved list
+        self.internal_register(public_key, measurements, report_data_prefix, event_log)
+    }
+
+    /// The registration of a keystore whose TDX quote is verified: `measurements` and
+    /// `report_data_prefix` are the quote's.
+    ///
+    /// With its boot event log, the registration states which compose and which instance the
+    /// quoted TD is (`event_log::replay` against the quote's RTMR3), and the members' vote on it
+    /// is the approval of both: no build is approved beforehand. An RTMR3 carries the instance
+    /// id, so it is unique to one CVM and approving it apart from the registration decides
+    /// nothing more.
+    ///
+    /// Without an event log the registration states nothing but its measurements, and those
+    /// must be approved already (`ApproveMeasurements`).
+    pub(crate) fn internal_register(
+        &mut self,
+        public_key: PublicKey,
+        measurements: ApprovedMeasurements,
+        report_data_prefix: [u8; 32],
+        event_log: Option<Vec<EventLogEntry>>,
+    ) -> u64 {
         assert!(
-            self.approved_measurements.contains(&measurements),
-            "Worker measurements not approved. MRTD={}, RTMR0={}, RTMR1={}, RTMR2={}, RTMR3={}.",
-            measurements.mrtd, measurements.rtmr0, measurements.rtmr1,
-            measurements.rtmr2, measurements.rtmr3
+            !self.approved_keystores.contains(&public_key),
+            "Keystore already approved"
         );
 
-        env::log_str("✅ Measurements are in approved list");
+        let facts = match event_log {
+            Some(log) => {
+                let (rtmr3, facts) = event_log::replay(&log)
+                    .unwrap_or_else(|e| env::panic_str(&format!("Event log refused: {e}")));
+                require!(
+                    rtmr3 == measurements.rtmr3,
+                    format!(
+                        "Event log does not replay to the quote's RTMR3 (replayed {}, quote {})",
+                        rtmr3, measurements.rtmr3
+                    )
+                );
+                Some(facts)
+            }
+            None => {
+                assert!(
+                    self.approved_measurements.contains(&measurements),
+                    "Worker measurements not approved. MRTD={}, RTMR0={}, RTMR1={}, RTMR2={}, RTMR3={}.",
+                    measurements.mrtd, measurements.rtmr0, measurements.rtmr1,
+                    measurements.rtmr2, measurements.rtmr3
+                );
+                None
+            }
+        };
 
         // Verify the submitted public_key matches the binding embedded in the TDX quote.
         //   ed25519: the binding is the raw 32-byte public key.
@@ -599,9 +645,9 @@ impl KeystoreDao {
             "Public key mismatch: provided key doesn't match TDX quote"
         );
 
-        // Create proposal
+        let proposal_id = self.next_proposal_id;
         let proposal = KeystoreProposal {
-            id: self.next_proposal_id,
+            id: proposal_id,
             public_key: public_key.clone(),
             measurements: measurements.clone(),
             submitter: env::predecessor_account_id(),
@@ -610,21 +656,44 @@ impl KeystoreDao {
             votes_against: 0,
             status: ProposalStatus::Pending,
         };
-
-        let proposal_id = self.next_proposal_id;
         self.proposals.insert(&proposal_id, &proposal);
         self.next_proposal_id += 1;
 
-        env::log_str(&format!(
-            "Created proposal {} for keystore registration (all 5 TEE measurements verified)",
-            proposal_id
-        ));
+        match &facts {
+            Some(f) => {
+                Self::registration_facts().insert(&proposal_id, f);
+                env::log_str(&format!(
+                    "Created proposal {} for keystore registration: compose_hash={} instance_id={} app_id={}",
+                    proposal_id, f.compose_hash, f.instance_id, f.app_id
+                ));
+            }
+            None => env::log_str(&format!(
+                "Created proposal {} for keystore registration (approved measurements, no event log)",
+                proposal_id
+            )),
+        }
 
         proposal_id
     }
 
-    /// DAO member votes on proposal
-    pub fn vote(&mut self, proposal_id: u64, approve: bool) {
+    fn registration_facts() -> LookupMap<u64, RegistrationFacts> {
+        LookupMap::new(StorageKey::RegistrationFacts)
+    }
+
+    /// What the boot event log of registration `proposal_id` states: its compose hash, app id,
+    /// instance id and key provider. `None` for a registration made without an event log.
+    pub fn get_registration_facts(&self, proposal_id: u64) -> Option<RegistrationFacts> {
+        Self::registration_facts().get(&proposal_id)
+    }
+
+    /// DAO member votes on a proposal: a governance proposal, a keystore-key revocation or a
+    /// keystore registration (one id counter for the three).
+    ///
+    /// A vote FOR a registration names the key it installs, `public_key`, and is refused when
+    /// the registration is for another key. The member votes for the key the operator read from
+    /// the CVM they deployed, not for a number: an id passed along wrongly, or a registration
+    /// someone else submitted, cannot collect that vote. `public_key` goes with nothing else.
+    pub fn vote(&mut self, proposal_id: u64, approve: bool, public_key: Option<PublicKey>) {
         let voter = env::predecessor_account_id();
 
         // Check if DAO member
@@ -635,16 +704,37 @@ impl KeystoreDao {
 
         // Registration, keystore-key-revocation and governance proposals share one id counter,
         // so the id alone says which kind this is — one `vote` entry point for all three.
-        if self.gov_proposals.get(&proposal_id).is_some() {
-            return self.internal_gov_vote(proposal_id, approve);
-        }
-        if self.revoke_proposals.get(&proposal_id).is_some() {
-            return self.internal_vote_revoke(proposal_id, approve);
+        let is_gov = self.gov_proposals.get(&proposal_id).is_some();
+        if is_gov || self.revoke_proposals.get(&proposal_id).is_some() {
+            require!(
+                public_key.is_none(),
+                "public_key goes only with a vote on a keystore registration"
+            );
+            return if is_gov {
+                self.internal_gov_vote(proposal_id, approve)
+            } else {
+                self.internal_vote_revoke(proposal_id, approve)
+            };
         }
 
         // Get proposal
         let mut proposal = self.proposals.get(&proposal_id)
             .expect("Proposal not found");
+
+        match &public_key {
+            Some(key) => require!(
+                *key == proposal.public_key,
+                format!(
+                    "Registration {} is for another key: {}",
+                    proposal_id,
+                    String::from(&proposal.public_key)
+                )
+            ),
+            None => require!(
+                !approve,
+                "A vote for a keystore registration names its key: pass public_key"
+            ),
+        }
 
         // Check status
         assert_eq!(
@@ -685,11 +775,16 @@ impl KeystoreDao {
         );
 
         if live_for >= self.approval_threshold {
-            // The build is checked again here, not only at submission: a revocation of the
-            // build (owner or governance) made while the registration waited for its votes
-            // must stop it. A member's vote cannot install a key for a build that is no
-            // longer approved.
-            if !self.approved_measurements.contains(&proposal.measurements) {
+            // A registration without an event log stands on its approved measurements, and
+            // they are checked again here, not only at submission: a revocation of the build
+            // (owner or governance) made while the registration waited for its votes must stop
+            // it. One with an event log is approved by this very quorum, and its measurements
+            // are recorded as approved with it.
+            if Self::registration_facts().get(&proposal_id).is_some() {
+                if !self.approved_measurements.contains(&proposal.measurements) {
+                    self.approved_measurements.push(proposal.measurements.clone());
+                }
+            } else if !self.approved_measurements.contains(&proposal.measurements) {
                 proposal.status = ProposalStatus::Rejected;
                 self.proposals.insert(&proposal_id, &proposal);
                 env::log_str(&format!(
@@ -1849,7 +1944,7 @@ mod tests {
 
         // The second member only needs the id — not the key list.
         testing_env!(ctx(member_b()).build());
-        dao.vote(id, true);
+        dao.vote(id, true, None);
         assert_eq!(dao.get_revoke_proposal(id).unwrap().status, ProposalStatus::Executed);
         assert_eq!(dao.approved_keystores.len(), 0);
     }
@@ -1861,7 +1956,7 @@ mod tests {
         testing_env!(ctx(member_a()).build());
         let id = dao.propose_revoke_keystore_keys(vec![test_key(1)]);
         testing_env!(ctx(member_b()).build());
-        dao.vote(id, false);
+        dao.vote(id, false, None);
 
         assert_eq!(dao.get_revoke_proposal(id).unwrap().status, ProposalStatus::Rejected);
         assert!(dao.approved_keystores.contains(&test_key(1)));
@@ -1881,11 +1976,11 @@ mod tests {
 
         // `narrow` reaches quorum first and takes key 1 out.
         testing_env!(ctx(member_b()).build());
-        dao.vote(narrow, true);
+        dao.vote(narrow, true, None);
         assert!(!dao.approved_keystores.contains(&test_key(1)));
 
         // `wide` still executes and removes what is left.
-        dao.vote(wide, true);
+        dao.vote(wide, true, None);
         assert_eq!(dao.get_revoke_proposal(wide).unwrap().status, ProposalStatus::Executed);
         assert_eq!(dao.approved_keystores.len(), 0);
     }
@@ -1902,7 +1997,7 @@ mod tests {
         testing_env!(ctx(m("m1.near")).build());
         let id = dao.propose_revoke_keystore_keys(vec![test_key(1)]);
         testing_env!(ctx(m("m2.near")).build());
-        dao.vote(id, true);
+        dao.vote(id, true, None);
         assert!(dao.approved_keystores.contains(&test_key(1)));
 
         testing_env!(ctx("owner.near".parse().unwrap()).build());
@@ -1911,7 +2006,7 @@ mod tests {
         assert_eq!(dao.approval_threshold, 2); // (3/2)+1
 
         testing_env!(ctx(m("m3.near")).build());
-        dao.vote(id, true);
+        dao.vote(id, true, None);
         assert!(
             dao.approved_keystores.contains(&test_key(1)),
             "stale votes from removed members must not carry the proposal"
@@ -1925,7 +2020,7 @@ mod tests {
         dao.approved_keystores.insert(&test_key(1));
         testing_env!(ctx(member_a()).build());
         let id = dao.propose_revoke_keystore_keys(vec![test_key(1)]);
-        dao.vote(id, true);
+        dao.vote(id, true, None);
     }
 
     #[test]

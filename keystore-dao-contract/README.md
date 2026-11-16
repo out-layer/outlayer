@@ -184,9 +184,10 @@ the delay is 0: step 5 runs as soon as the proposal is approved.
 keystore (Intel TDX)                     dao.outlayer.near                    MPC contract
   1. keypair in enclave memory
   2. TDX quote, report_data = key
-  3. ── submit_keystore_registration ──►  verify quote, check measurements,
+  3. ── submit_keystore_registration ──►  verify quote, replay its event log:
+     quote + boot event log               which compose, which instance;
      (signed by the init account)         create proposal
-                                          4. DAO members vote
+                                          4. DAO members vote for that key
                                           5. on approval: add a function-call
                                              key to its own account
   6. ── request_key (signed with that key) ──► request_app_private_key ──────►
@@ -206,16 +207,17 @@ keystore (Intel TDX)                     dao.outlayer.near                    MP
      quote with `dcap-qvl` against it (no collateral may be passed in the call);
    - refuses any TCB status other than `UpToDate`, and any quote with
      outstanding Intel security advisories;
-   - extracts MRTD and RTMR0–3 and requires the five together to match one
-     entry of `approved_measurements`;
+   - extracts MRTD and RTMR0–3;
+   - replays the registration's boot event log (below) and requires the result
+     to equal the quote's RTMR3, then records what the log states: the compose
+     hash, the app id, the instance id and the key provider
+     (`get_registration_facts`);
    - recomputes the `report_data` binding from the submitted key and requires
      it to equal the quote's;
    - creates a `Pending` proposal and returns its id.
-4. DAO members call `vote(proposal_id, approve)`.
-5. When enough current members approve, the contract checks the build again: if its
-   measurements were revoked while the registration waited (by the owner or by a
-   `RevokeMeasurements` proposal), the proposal ends `Rejected` and nothing is installed.
-   Otherwise the contract adds the key to its own
+4. DAO members call `vote(proposal_id, true, public_key)`, naming the key.
+5. When enough current members approve, the contract records the
+   registration's measurements as approved and adds the key to its own
    account as a function-call key: receiver = the contract itself, methods
    `request_key`, `mark_vault_verified`, `ban_vault`, **unlimited allowance**.
    The key goes into `approved_keystores` and the proposal ends `Executed`.
@@ -235,13 +237,59 @@ The quote itself is not stored. The proposal records the measurements, the
 submitter and the key; the quote's verification is visible in the
 transaction's logs.
 
+### What a registration states, and what a vote approves
+
+RTMR3 of a dstack CVM is not a build hash. The guest OS extends it at boot with
+one event per fact: the app id, the hash of the app's compose (the images by
+digest), the **instance id** of this very CVM, the key provider. Two instances
+of one release share a compose hash and differ in RTMR3, and a redeployed CVM
+is a new instance with a new RTMR3. Approving an RTMR3 apart from the
+registration that carries it would decide nothing a vote on that registration
+does not.
+
+So a registration carries its RTMR3 events (`event_log`: dstack's entries with
+`imr`, `event_type`, `digest`, `event`, `event_payload`). The contract
+recomputes each digest (`sha384(event_type ‖ ":" ‖ event ‖ ":" ‖ payload)`),
+replays them, and takes the registration only when the result is the RTMR3 of
+the verified quote. It reads the facts from the events before `system-ready` —
+those the measured guest OS wrote; an app may add events of any name after it —
+and each fact must be there once.
+
+The members' vote on the registration is the approval of the build and of the
+instance at once:
+
+- `compose_hash` says which release runs there. It is the sha256 of the CVM's
+  app compose — the keystore's compose file with its image pinned by digest,
+  and the list of environment variables it may receive — the same for every
+  instance of a version. The compose itself is public (the CVM's guest agent
+  and the attestation portal show it), so a member reads what runs and checks
+  the hash.
+- `instance_id` says which CVM. The operator who deployed it reads the same id,
+  and the keystore's key, from the CVM's own guest agent and log
+  (`scripts/deploy_tdx.sh` does, and refuses a registration on chain that
+  differs), and asks the members to vote **for that key**.
+- A vote for a registration names its key: `vote(id, true, public_key)` is
+  refused when registration `id` is for another key, and a vote for a
+  registration without a key is refused. A member's vote therefore cannot land
+  on a registration somebody else submitted, whatever id they were given.
+
+The measurements say which code runs in the TD, not whose instance it is: the
+keystore's environment (which workers and which coordinator it serves) is not
+measured. That is what the members decide, and why every instance, and every
+restart of one (a new key), takes a vote.
+
+A registration without an event log states only its measurements; those must be
+in `approved_measurements` already (`ApproveMeasurements`), when it is
+submitted and again at quorum.
+
 ## Voting
 
 `approval_threshold = dao_members / 2 + 1`, set at `new` and recomputed when
 an `AddMember` or `RemoveMember` proposal executes.
 
 Registration, key-revocation and governance proposals share one id counter and
-one `vote(proposal_id, approve)` entry point. Governance proposals follow the
+one `vote(proposal_id, approve, public_key?)` entry point; `public_key` goes
+with a vote for a registration and with nothing else. Governance proposals follow the
 rules in [Governance](#governance); the rest of this section is about
 registration and revocation proposals. A member votes once per proposal.
 After each vote the contract counts only votes from accounts that are members
@@ -319,7 +367,7 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 ### DAO members
 
-- `propose(action) -> u64` (payable: the proposal's storage), `vote(proposal_id, approve)`,
+- `propose(action) -> u64` (payable: the proposal's storage), `vote(proposal_id, approve, public_key?)`,
   `execute(proposal_id)`, `expire(proposal_id)`
 - `store_blob()` — raw wasm input, attach the storage deposit; returns its sha256
 - `remove_blob(hash)` — the member who stored it
@@ -328,8 +376,8 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 ### Init account
 
-- `submit_keystore_registration(public_key, tdx_quote_hex, app_id?) -> u64` —
-  `app_id`, when given, is only logged.
+- `submit_keystore_registration(public_key, tdx_quote_hex, app_id?, event_log?) -> u64` —
+  `event_log` is the quote's RTMR3 events; `app_id`, when given, is only logged.
 
 ### Contract account, signed with an approved keystore key
 
@@ -341,6 +389,8 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 - `get_proposal(proposal_id)`, `get_proposals(from_index, limit)` — registration
   proposals
+- `get_registration_facts(proposal_id)` — `{compose_hash, app_id, instance_id,
+  key_provider, os_image_hash}` of a registration made with an event log
 - `get_revoke_proposal(proposal_id)`
 - `is_keystore_approved(public_key)` — `public_key` as a string; an unparsable
   key returns `false`
@@ -369,9 +419,17 @@ near contract call-function as-read-only dao.outlayer.near get_approved_measurem
 near contract call-function as-read-only dao.outlayer.near get_proposals \
   json-args '{"from_index": 1, "limit": 20}' network-config mainnet now
 
-# Vote on a registration or a governance proposal (DAO member)
+# Vote on a governance proposal (DAO member)
 near contract call-function as-transaction dao.outlayer.testnet vote \
   json-args '{"proposal_id": 42, "approve": true}' \
+  prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
+  sign-as <member> network-config testnet sign-with-keychain send
+
+# What a keystore registration states, then a vote for its key (DAO member)
+near contract call-function as-read-only dao.outlayer.testnet get_registration_facts \
+  json-args '{"proposal_id": 43}' network-config testnet now
+near contract call-function as-transaction dao.outlayer.testnet vote \
+  json-args '{"proposal_id": 43, "approve": true, "public_key": "ed25519:<the key the operator read from the CVM>"}' \
   prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
   sign-as <member> network-config testnet sign-with-keychain send
 
