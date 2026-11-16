@@ -40,6 +40,10 @@
 #                       new deploy. For the second run after its measurements were approved by
 #                       DAO vote: a new deploy would be a new CVM with a new instance-id in RTMR3,
 #                       whose measurements the approved ones no longer match.
+#   --print            DAO steps send nothing: the ready propose / vote / execute commands are
+#                       printed, one per member (DAO_CHAIN=print). Without it, on testnet, every DAO
+#                       step is sent with the members' keys found in the local legacy keychain.
+#                       Mainnet always prints.
 #   --dry-run          show what would happen; no deploy, no tx
 #
 # The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
@@ -91,6 +95,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   # below; an empty string forces "no exclusions" on a node the table covers.
   --execute-excludes) EXECUTE_EXCLUDES="${2-}"; EXCLUDES_SET=true; shift 2;;
   --resume)      RESUME=true; shift;;
+  --print)       export DAO_CHAIN=print; shift;;
   --dry-run|--info) DRY_RUN=true; shift;;
   *) POS+=("$1"); shift;;
 esac; done
@@ -264,7 +269,7 @@ fi
 
 if $DRY_RUN; then
   if [ -n "$OS_IMAGE" ]; then
-    gate=$([ "$COMPONENT" = worker ] && echo "approve on $REGISTER (signer $OWNER) -> wait for it to register" || echo "approve on $DAO (signer $OWNER) -> wait for proposal -> vote (signer $VOTER) -> poll /health")
+    gate=$([ "$COMPONENT" = worker ] && echo "approve on $REGISTER (signer $OWNER) -> wait for it to register" || echo "approve on $DAO by DAO vote ($(dao_chain_mode)) -> wait for its registration -> members vote ($(dao_chain_mode)) -> poll /health")
     echo "(dry-run) would: on $NODE, worker-ctl.sh set-image $NAME $OS_IMAGE (soft stop, resize --image, start) -> read measurements -> $gate"
     exit 0
   fi
@@ -280,7 +285,7 @@ if $DRY_RUN; then
       esac
     fi
   else
-    echo "(dry-run) would: deploy CVM '$NAME' on $NODE${GATEWAY_URL:+ (gateway-url=$GATEWAY_URL)} -> read measurements -> approve on $DAO (signer $OWNER) -> wait for proposal -> vote (signer $VOTER) -> poll /health"
+    echo "(dry-run) would: deploy CVM '$NAME' on $NODE${GATEWAY_URL:+ (gateway-url=$GATEWAY_URL)} -> read measurements -> approve on $DAO by DAO vote ($(dao_chain_mode)) -> wait for its registration -> members vote ($(dao_chain_mode)) -> poll /health"
   fi
   exit 0
 fi
@@ -582,38 +587,29 @@ done
 [ -n "$PROPOSAL_ID" ] || { echo "  No 'Proposal ID' in logs after ~5min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
 echo "  proposal id: $PROPOSAL_ID (live key $LIVE_KEY, pending on $DAO)"
 
-# Vote: auto on testnet, manual on mainnet (a human turns the mainnet key). With more than one
-# member this vote alone does not pass it: the other members vote, and the keystore waits for
-# their quorum up to 24 h (tee_registration.rs wait_for_approval).
-VOTE_ARGS="{\"proposal_id\":$PROPOSAL_ID,\"approve\":true}"
-if [ "$NETWORK" = mainnet ]; then
-  echo "  MAINNET — members vote by hand on the keystore's registration (each with their own signer):"
+# Vote (DAO_CHAIN, scripts/lib/dao_gov.sh): `send` votes with every member whose key is local
+# until the registration executes; `print` (and mainnet always) prints one ready command per
+# member. The keystore waits for the quorum up to 24 h (tee_registration.rs wait_for_approval).
+if [ "$(dao_chain_mode)" = print ]; then
+  echo "  Nothing sent (print mode). The members vote on the keystore's registration:"
   dao_print_votes "$DAO" "$PROPOSAL_ID" || true
-  echo ""
-  echo "  After the vote lands, the keystore pulls its MPC-CKD master and becomes ready."
+  echo "  Once the quorum votes, the keystore pulls its MPC-CKD master and becomes ready."
   echo "  Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
   if [ -n "$KEYSTORE_URL" ]; then
-    echo ""
-    echo "  Once READY, the public endpoint (via dstack-gateway) is:"
-    echo "    $KEYSTORE_URL"
-    echo "  Add it to the comma-separated KEYSTORE_BASE_URLS in the worker env and the coordinator env."
+    echo "  Public endpoint once READY (via dstack-gateway): $KEYSTORE_URL"
+    echo "  Then: ./scripts/keystore_urls.sh $NETWORK --apply"
   fi
   exit 0
 fi
-echo "  Voting on proposal #$PROPOSAL_ID as $VOTER..."
-near contract call-function as-transaction "$DAO" vote \
-  json-args "$VOTE_ARGS" \
-  prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
-  sign-as "$VOTER" network-config "$NETWORK" sign-with-legacy-keychain send
-echo "  voted"
-P_STATUS=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
-  network-config "$NETWORK" now 2>/dev/null | grep -oE '"status": "[A-Za-z]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
+dao_vote_local "$DAO" "$PROPOSAL_ID"
+P_STATUS=$(dao_status "$DAO" "$PROPOSAL_ID")
 if [ "$P_STATUS" = Pending ]; then
-  echo "  The keystore waits for the other members' votes up to 24 h."
+  echo "  #$PROPOSAL_ID still needs votes the local keys cannot give; the keystore waits up to 24 h."
   dao_print_votes "$DAO" "$PROPOSAL_ID" || true
   echo "  Then it pulls its master and becomes ready. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow (on the node)"
   exit 0
 fi
+echo "  registration #$PROPOSAL_ID: $P_STATUS"
 
 # [6/6] poll the keystore until it is READY. /health returns 200 unconditionally (it does NOT
 # reflect is_ready), so 200 only proves the server is UP. The authoritative readiness signal is

@@ -46,37 +46,90 @@ dao_tx() {
     printf '%s\n' "$out" | sed -n '/Function execution return value/,$p' | sed -n '2p' | tr -d ' "'
 }
 
-# dao_drive <dao> <member> <action-json> — propose (or find the open proposal), vote as
-# <member>, and execute when it is approved and its delay has passed.
-# Returns 0 when executed, 2 when it waits for votes or for the delay (the next steps are
-# printed), 1 on an error. "Executed" is the DAO's record: an Upgrade or a Call is dispatched
-# after it, so the caller checks the target to know the call took effect.
+# DAO_CHAIN picks how far the helpers go on chain:
+#   send  — every transaction is sent: the proposal, the vote of every member whose key is in the
+#           local legacy keychain (~/.near-credentials/<net>/), and the execute. Testnet, where
+#           the members' keys are on this machine.
+#   print — nothing is sent: the ready commands are printed, one per member who still has to vote,
+#           and the execute. Mainnet always prints: its members sign on their own machines.
+dao_chain_mode() {
+    if [ "$NETWORK" = mainnet ]; then echo print; else echo "${DAO_CHAIN:-send}"; fi
+}
+
+# dao_local_key <account> — 0 when the legacy keychain holds a key for <account>.
+dao_local_key() {
+    local d="$HOME/.near-credentials/$NETWORK"
+    [ -f "$d/$1.json" ] || [ -n "$(ls "$d/$1"/*.json 2>/dev/null | head -1)" ]
+}
+
+# dao_vote_local <dao> <id> — vote for <id> with every member whose key is local, until it no
+# longer waits for votes. Governance proposals name who voted; for a registration or a key
+# revocation a member who already voted is refused by the contract, which is skipped.
+dao_vote_local() {
+    local dao="$1" id="$2" m status
+    for m in $(dao_members_json "$dao" | python3 -I -c 'import json,sys; print(" ".join(json.load(sys.stdin)["members"]))'); do
+        status=$(dao_status "$dao" "$id")
+        [ "$status" = Pending ] || break
+        if dao_has_voted "$dao" "$id" "$m"; then continue; fi
+        dao_local_key "$m" || { echo "  (no local key for $m)"; continue; }
+        if dao_tx "$m" "$dao" vote "{\"proposal_id\":$id,\"approve\":true}" >/dev/null 2>&1; then
+            echo "  voted for #$id as $m"
+        fi
+    done
+}
+
+# dao_status <dao> <id> — the status of a governance proposal, a registration or a key revocation.
+dao_status() {
+    local m
+    for m in get_gov_proposal get_proposal get_revoke_proposal; do
+        local s
+        s=$(_dao_view "$1" "$m" "{\"proposal_id\":$2}" | python3 -I -c 'import json,sys
+p=json.load(sys.stdin)
+print(p["status"] if p else "")' 2>/dev/null)
+        [ -n "$s" ] && { echo "$s"; return 0; }
+    done
+}
+
+# dao_has_voted <dao> <id> <member> — 0 when a governance proposal records <member>'s vote.
+dao_has_voted() {
+    _dao_view "$1" get_gov_proposal "{\"proposal_id\":$2}" | python3 -I -c '
+import json,sys
+p=json.load(sys.stdin); m=sys.argv[1]
+sys.exit(0 if p and (m in p["votes_for"] or m in p["votes_against"]) else 1)' "$3"
+}
+
+# dao_drive <dao> <member> <action-json> — the proposal for <action-json> as far as it can go now
+# (DAO_CHAIN, above): proposed by <member>, voted, executed once approved and past its delay.
+# Returns 0 when executed, 2 when it waits for votes or for the delay, or when nothing is sent
+# (the next steps are printed), 1 on an error. "Executed" is the DAO's record: an Upgrade or a
+# Call is dispatched after it, so the caller checks the target to know the call took effect.
 dao_drive() {
-    local dao="$1" member="$2" action="$3" found id status after now voted
+    local dao="$1" member="$2" action="$3" mode found id status after now
+    mode=$(dao_chain_mode)
     found=$(dao_find_open "$dao" "$action")
     if [ -z "$found" ]; then
-        # A proposal pays its storage; the excess of the 0.1 NEAR comes back.
+        if [ "$mode" = print ]; then
+            echo "  Nothing sent (print mode). Propose — it returns the id — then the members vote and one executes:"
+            echo "    near contract call-function as-transaction $dao propose json-args '{\"action\":$action}' prepaid-gas '100 Tgas' attached-deposit '0.1 NEAR' sign-as $member network-config $NETWORK sign-with-legacy-keychain send"
+            return 2
+        fi
+        # A proposal pays its storage; the excess of the 0.1 NEAR comes back. The proposer's
+        # vote comes with it.
         id=$(dao_tx "$member" "$dao" propose "{\"action\":$action}" '100 Tgas' '0.1 NEAR') || return 1
-        echo "  proposed: #$id (by $member)"
+        echo "  proposed: #$id (by $member, who voted with it)"
     else
         id=${found%% *}
         echo "  open proposal #$id ($(echo "$found" | cut -d' ' -f2))"
-        voted=$(_dao_view "$dao" get_gov_proposal "{\"proposal_id\":$id}" | python3 -I -c '
-import sys,json; p=json.load(sys.stdin); m=sys.argv[1]
-print("yes" if m in p["votes_for"] or m in p["votes_against"] else "no")' "$member")
-        if [ "$voted" = no ] && [ "$(echo "$found" | cut -d' ' -f2)" = Pending ]; then
-            dao_tx "$member" "$dao" vote "{\"proposal_id\":$id,\"approve\":true}" >/dev/null || return 1
-            echo "  voted for #$id as $member"
-        fi
     fi
+    [ "$mode" = send ] && dao_vote_local "$dao" "$id"
 
     read -r status after < <(_dao_view "$dao" get_gov_proposal "{\"proposal_id\":$id}" | python3 -I -c '
 import sys,json; p=json.load(sys.stdin); print(p["status"], p.get("executable_after") or 0)')
     now=$(python3 -I -c 'import time; print(int(time.time()*1e9))')
-    if [ "$status" = Approved ] && [ "$now" -ge "$after" ]; then
+    if [ "$mode" = send ] && [ "$status" = Approved ] && [ "$now" -ge "$after" ]; then
         local call_ok=yes
         dao_tx "$member" "$dao" execute "{\"proposal_id\":$id}" '300 Tgas' >/dev/null 2>&1 || call_ok=no
-        status=$(_dao_view "$dao" get_gov_proposal "{\"proposal_id\":$id}" | python3 -I -c 'import sys,json; print(json.load(sys.stdin)["status"])')
+        status=$(dao_status "$dao" "$id")
         if [ "$status" != Executed ]; then
             echo "  #$id did not execute (status $status)"; return 1
         fi
@@ -88,12 +141,17 @@ import sys,json; p=json.load(sys.stdin); print(p["status"], p.get("executable_af
         return 0
     fi
 
-    if [ "$status" = Pending ]; then
-        dao_print_votes "$dao" "$id"
-    else
-        echo "  #$id is approved; it executes from $(python3 -I -c 'import sys,datetime; print(datetime.datetime.fromtimestamp(int(sys.argv[1])/1e9, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))' "$after")."
-    fi
-    echo "  Then any member executes it (or rerun this script):"
+    case "$status" in
+        Pending) dao_print_votes "$dao" "$id" ;;
+        Approved)
+            if [ "$now" -lt "$after" ]; then
+                echo "  #$id is approved; it executes from $(python3 -I -c 'import sys,datetime; print(datetime.datetime.fromtimestamp(int(sys.argv[1])/1e9, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))' "$after")."
+            else
+                echo "  #$id is approved and executable."
+            fi ;;
+        *) echo "  #$id is $status"; return 1 ;;
+    esac
+    echo "  Execute (any member):"
     echo "    near contract call-function as-transaction $dao execute json-args '{\"proposal_id\":$id}' prepaid-gas '300 Tgas' attached-deposit '0 NEAR' sign-as $member network-config $NETWORK sign-with-legacy-keychain send"
     return 2
 }
