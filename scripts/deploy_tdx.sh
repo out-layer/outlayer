@@ -54,7 +54,7 @@
 # a variable this script writes to the node's env file (EXECUTE_EXCLUDES) never reaches a
 # container whose compose does not pass it on.
 #
-# Measurements are approved ONCE per (network, version): the measured compose-name is stable
+# Worker measurements are approved ONCE per (network, version): the measured compose-name is stable
 # (outlayer-<component>-<net>-<ver>), so re-runs / extra instances of the same version hit the
 # idempotent is_measurements_approved check and skip.
 #
@@ -62,11 +62,12 @@
 #           worker to register by itself (restarted only if it gave up waiting). Owner key stays
 #           on the Mac.
 # keystore: deploy -> read the CVM's measurements, instance id and compose hash from its guest
-#           agent, and its key and "Proposal ID: N" from its log -> check that registration N
-#           on the DAO is this CVM's (same instance, compose, RTMR3, key) -> the members vote
-#           FOR THAT KEY (DAO_CHAIN: sent with the local keys, or printed) -> poll /health until
-#           ready. One vote per instance; nothing is approved beforehand. A keystore that sends
-#           no boot event log has its measurements approved by a DAO vote first.
+#           agent -> if the DAO has not approved this build yet (its guest OS, its compose
+#           hash): propose it, and continue with --resume once it is executed -> read the key
+#           and "Proposal ID: N" from the current boot of the keystore's log -> check that
+#           registration N on the DAO is this CVM's (key, five measurements, instance, compose)
+#           -> the members vote FOR THAT KEY (DAO_CHAIN: sent with the local keys, or printed)
+#           -> poll until ready. One vote per release, one per instance.
 #
 # Examples:
 #   ./scripts/deploy_tdx.sh worker   testnet --version 0.1.35 --node root@$DAL_HOST
@@ -229,7 +230,8 @@ import sys, json
 t = json.loads(json.load(sys.stdin)[\"tcb_info\"])
 m = {k: t[k] for k in (\"mrtd\", \"rtmr0\", \"rtmr1\", \"rtmr2\", \"rtmr3\")}
 assert all(len(v) == 96 for v in m.values())
-print(json.dumps(m, separators=(\",\", \":\")))' 2>/dev/null" 2>/dev/null | grep -oE '^\{"mrtd":"[a-f0-9]{96}".*\}$' | tail -1
+print(json.dumps(m, separators=(\",\", \":\")))' 2>/dev/null" 2>/dev/null \
+    | grep -oE '^\{"mrtd":"[a-f0-9]{96}","rtmr0":"[a-f0-9]{96}","rtmr1":"[a-f0-9]{96}","rtmr2":"[a-f0-9]{96}","rtmr3":"[a-f0-9]{96}"\}$' | tail -1
 }
 
 # What the CVM named $NAME is, from its own guest agent over the node loopback:
@@ -455,44 +457,88 @@ exit 0
 fi  # end worker
 
 # ============================== keystore flow ==============================
-# Unlike the worker (owner-approve -> it registers by itself), the keystore self-submits its DAO
-# registration on boot (logs "Proposal ID: N"). Governance = owner-approve measurements on the
-# DAO + a DAO member (zavodil) vote. Both signed LOCALLY (keys stay on the Mac).
+# The DAO approves a keystore's build once (its guest OS and its compose hash, the same for
+# every instance of a release) and the members vote for every instance, naming its key. The
+# keystore submits its own registration on boot, once its build is approved (it logs
+# "Proposal ID: N"). Everything is signed LOCALLY (keys stay on the Mac).
 
 # Logs come from the dstack-keystore-1 container (worker-ctl.sh defaults to dstack-worker-1).
 ks_logs() { node_run "NAME=$NAME CONTAINER=$KS_CONTAINER TAIL=${1:-600} ./worker-ctl.sh logs"; }
 
-# The keystore's log lines from $SINCE on (they start with an ISO timestamp); all of them while
-# SINCE is empty.
-SINCE=""
-ks_logs_since() { ks_logs "${1:-600}" 2>/dev/null | awk -v t="$SINCE" '/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && substr($0, 1, 19) >= t'; }
+# The keystore's own log lines: its timestamp, level and module, then the message. Each pattern
+# below is one exact message of keystore-worker (main.rs, tee_registration.rs), anchored at both
+# ends, so a line ending in text a request put there does not match.
+KS_LINE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +(INFO|WARN|ERROR) keystore_worker(::[a-z_]+)*: '
+KS_START="${KS_LINE}Starting NEAR OutLayer Keystore Worker\$"
+KS_KEY="${KS_LINE}📂 Using keystore public key: [a-z0-9-]+:[A-Za-z0-9]+\$"
+KS_PROPOSAL="${KS_LINE}(📤 Registration submitted! |✅ Registration submitted successfully! )Proposal ID: [0-9]+\$"
+KS_UNAPPROVED="${KS_LINE}⏸️  Registration NOT submitted — this build is not approved by the DAO yet\$"
+KS_READY="${KS_LINE}✅ TEE registration complete! Keystore is now ready to serve requests\$"
 
-# wait_registration <tries> — the pending registration of the key this CVM holds now. Sets
-# LIVE_KEY (the last "Using keystore public key" the keystore logged) and PROPOSAL_ID (the id it
-# logged, taken only when that registration on chain is Pending and for LIVE_KEY); PROPOSAL_ID
-# stays empty when none appears. NOT_SUBMITTED=1 when the keystore said it did not submit.
+# How many times the keystore has started, by its log.
+ks_boots() { ks_logs 20000 2>/dev/null | grep -cE "$KS_START" || true; }
+
+# The keystore's log of its CURRENT boot: everything after its last start line. A keystore opens
+# its port only once it is registered, so until then this part of the log holds nothing a
+# request could have put there; lines of earlier boots — when the instance served — are left out.
+ks_boot_logs() {
+  ks_logs "${1:-20000}" 2>/dev/null | awk -v start="$KS_START" '
+    $0 ~ start { n = 0 } { buf[n++] = $0 } END { for (i = 0; i < n; i++) print buf[i] }'
+}
+
+# Whether the keystore answers on its port (loopback on the node): it is registered and serving.
+ks_serving() {
+  local h
+  h=$(node_run "set -e; u=\$(NAME=$NAME ./worker-ctl.sh uuid); \
+    p=\$(for pid in \$(pgrep -f qemu-system-x86_64); do c=\$(tr '\\0' ' ' < /proc/\$pid/cmdline 2>/dev/null) || continue; \
+      [[ \"\$c\" == *\"\$u\"* ]] || continue; echo \"\$c\" | grep -oE '127\\.0\\.0\\.1:[0-9]+-:8081' | sed -E 's/.*:([0-9]+)-:8081/\\1/' | head -1; break; done); \
+    [ -n \"\$p\" ] && curl -fs --max-time 5 \"http://127.0.0.1:\$p/health\" || true" 2>/dev/null || true)
+  [ -n "$h" ]
+}
+
+# wait_registration <tries> [<boots-before>] — where this boot of the keystore stands. With
+# <boots-before>, only a boot after that many starts counts (the one a restart brought up).
+# Sets KS_STATE:
+#   registered        PROPOSAL_ID is its registration: the id its log printed, Pending on chain
+#                     and for LIVE_KEY, the key the same boot printed
+#   build_unapproved  it did not submit: the DAO has not approved its guest OS or its compose
+#   ""                none of these within <tries> (12 s each)
 wait_registration() {
-  local tries="$1" i L P P_KEY P_STATUS
-  PROPOSAL_ID=""; LIVE_KEY=""; NOT_SUBMITTED=""
+  local tries="$1" after="${2:-0}" i L P P_KEY P_STATUS
+  PROPOSAL_ID=""; LIVE_KEY=""; KS_STATE=""
   for i in $(seq 1 "$tries"); do
-    L=$(ks_logs_since 600 || true)
-    LIVE_KEY=$(printf '%s' "$L" | grep -oE 'Using keystore public key: [a-z0-9-]+:[A-Za-z0-9]+' | tail -1 | sed 's/.*: //' || true)
-    # main.rs logs "Proposal ID: {}" on a successful submit; tee_registration.rs logs the same.
-    PROPOSAL_ID=$(printf '%s' "$L" | grep -oE 'Proposal ID: [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+    if [ "$(ks_boots)" -le "$after" ]; then sleep 12; continue; fi
+    L=$(ks_boot_logs || true)
+    LIVE_KEY=$(printf '%s\n' "$L" | grep -E "$KS_KEY" | tail -1 | sed 's/.*: //' || true)
+    PROPOSAL_ID=$(printf '%s\n' "$L" | grep -E "$KS_PROPOSAL" | tail -1 | grep -oE '[0-9]+$' || true)
     if [ -n "$PROPOSAL_ID" ]; then
       P=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
         network-config "$NETWORK" now 2>/dev/null || true)
       P_KEY=$(printf '%s' "$P" | grep -oE '"public_key": "[^"]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
       P_STATUS=$(printf '%s' "$P" | grep -oE '"status": "[A-Za-z]+"' | head -1 | sed -E 's/.*: "([^"]+)"/\1/')
-      if [ -z "$LIVE_KEY" ] || [ "$P_KEY" != "$LIVE_KEY" ] || [ "$P_STATUS" != Pending ]; then
-        echo "  #$PROPOSAL_ID is not the live key's pending proposal yet (key ${P_KEY:-?}, live ${LIVE_KEY:-not logged yet}, status ${P_STATUS:-?}); waiting"
-        PROPOSAL_ID=""
+      if [ -n "$LIVE_KEY" ] && [ "$P_KEY" = "$LIVE_KEY" ] && [ "$P_STATUS" = Pending ]; then
+        KS_STATE=registered; return 0
       fi
+      echo "  #$PROPOSAL_ID is not the live key's pending proposal yet (key ${P_KEY:-?}, live ${LIVE_KEY:-not logged yet}, status ${P_STATUS:-?}); waiting"
+      PROPOSAL_ID=""
     fi
-    [ -n "$PROPOSAL_ID" ] && return 0
-    if [ "$tries" -lt 25 ] && printf '%s' "$L" | grep -q "Registration NOT submitted"; then NOT_SUBMITTED=1; return 0; fi
+    if printf '%s\n' "$L" | grep -qE "$KS_UNAPPROVED"; then KS_STATE=build_unapproved; return 0; fi
     sleep 12
   done
+}
+
+# Propose (or move on) one DAO approval; stops the run when it waits for votes or for the delay.
+approve_through_dao() {
+  local what="$1" action="$2" rc=0
+  echo "  $what: through the DAO (member $GOV_MEMBER)"
+  dao_drive "$DAO" "$GOV_MEMBER" "$action" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "  The CVM '$NAME' stays up and registers once this is executed. Then continue WITHOUT a"
+    echo "  new deploy (a new CVM is a new instance):"
+    echo "    $0 keystore $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume"
+    exit 3
+  fi
+  [ "$rc" -eq 0 ] || { echo "  approval through the DAO failed" >&2; exit 1; }
 }
 
 # [2/6] deploy the CVM on the node (node-side deploy_tdx.sh derives the stable COMPOSE_NAME).
@@ -557,98 +603,78 @@ RTMR3=$(printf '%s' "$MEAS" | grep -oE '"rtmr3":"[a-f0-9]{96}"' | grep -oE '[a-f
 echo "  mrtd=$MRTD"
 echo "  rtmr3=$RTMR3"
 
-# [4/6] A DAO that reads the boot event log takes the keystore's first registration as it is:
-# it replays the log against the quote and records which compose and which instance registers
-# (`get_registration_facts`), and the members' vote on that registration approves both. Nothing
-# is approved beforehand and the CVM is not restarted. A keystore that sends no event log, or a
-# DAO that reads none, goes the other way: its measurements approved by a DAO vote, then a
-# restart, then the registration.
-BY_LOG=false
-if near contract call-function as-read-only "$DAO" get_registration_facts json-args '{"proposal_id":0}' \
-     network-config "$NETWORK" now >/dev/null 2>&1; then
-  echo "[4/6] Wait for this CVM's registration on $DAO (it carries its boot event log)..."
-  wait_registration 12
-  if [ -n "$PROPOSAL_ID" ]; then
-    FACTS=$(near contract call-function as-read-only "$DAO" get_registration_facts json-args "{\"proposal_id\":$PROPOSAL_ID}" \
-      network-config "$NETWORK" now 2>/dev/null | python3 -I -c 'import json,sys
+# [4/6] The build is approved by the DAO, once, before any instance of it registers: its guest
+# OS (MRTD, RTMR0-2) and the hash of its compose. Both are the same for every instance of a
+# release, so the second instance finds them approved. The keystore asks the DAO itself and
+# submits its registration only then.
+echo "[4/6] Wait for the keystore's registration, or for what it says is not approved..."
+wait_registration 20
+RESTART=false
+case "$KS_STATE" in
+  registered) echo "  the build is approved: the keystore registered on its own" ;;
+  build_unapproved)
+    IDENT=$(agent_identity || true)
+    [ -n "$IDENT" ] || { echo "  could not read the CVM's compose hash from its guest agent" >&2; exit 1; }
+    COMPOSE_HASH=$(echo "$IDENT" | cut -d' ' -f2)
+    OS_IMAGE=$(printf '%s' "$MEAS" | python3 -I -c 'import json,sys
+m=json.load(sys.stdin); print(json.dumps({k: m[k] for k in ("mrtd","rtmr0","rtmr1","rtmr2")}, separators=(",",":")))')
+    OS_OK=$(near contract call-function as-read-only "$DAO" get_approved_os_images json-args '{}' network-config "$NETWORK" now 2>/dev/null \
+      | python3 -I -c 'import json,sys; print("true" if json.loads(sys.argv[1]) in json.load(sys.stdin) else "false")' "$OS_IMAGE" || echo false)
+    C_OK=$(near contract call-function as-read-only "$DAO" get_approved_composes json-args '{}' network-config "$NETWORK" now 2>/dev/null \
+      | python3 -I -c 'import json,sys; print("true" if sys.argv[1] in json.load(sys.stdin) else "false")' "$COMPOSE_HASH" || echo false)
+    echo "  guest OS  mrtd=${MRTD:0:16}…  approved: $OS_OK"
+    echo "  compose   $COMPOSE_HASH  approved: $C_OK"
+    [ "$OS_OK" = true ] || approve_through_dao "guest OS" "{\"ApproveOsImage\":{\"image\":$OS_IMAGE}}"
+    [ "$C_OK" = true ] || approve_through_dao "compose of v$VER" "{\"ApproveCompose\":{\"compose_hash\":\"$COMPOSE_HASH\"}}"
+    RESTART=true ;;
+  *) echo "  No registration and no refusal in the keystore's log after ~4min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1 ;;
+esac
+
+# [5/6] A keystore that found its build unapproved stopped without submitting: restart it (the
+# same CVM, the same instance) so it registers. Its key is minted per boot, and only the current
+# boot's lines are read, so the registration found is the one of the key it holds now.
+if $RESTART; then
+  echo "[5/6] Restart the keystore so it registers against the approved build..."
+  BOOTS=$(ks_boots)
+  node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
+  wait_registration 25 "$BOOTS"
+  [ "$KS_STATE" = registered ] || { echo "  No registration after the restart (${KS_STATE:-nothing in the log}). Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
+fi
+
+# The registration on chain must be THIS CVM's before anyone is asked to vote for it:
+#   * the key is the one this boot's log printed (wait_registration);
+#   * the keystore is not serving yet — a registered keystore has nothing to vote on, and a log
+#     of one that serves is no longer only its own words;
+#   * all five measurements are the ones its guest agent reports;
+#   * the instance id, the compose hash and the app id are the guest agent's too.
+if ks_serving; then
+  echo "  REFUSING: the keystore in '$NAME' already serves — it is registered; there is nothing to vote on." >&2
+  exit 1
+fi
+P_JSON=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" network-config "$NETWORK" now 2>/dev/null || true)
+SAME_MEAS=$(printf '%s' "$P_JSON" | python3 -I -c 'import json,sys
+print("true" if json.load(sys.stdin)["measurements"] == json.loads(sys.argv[1]) else "false")' "$MEAS" 2>/dev/null || echo false)
+if [ "$SAME_MEAS" != true ]; then
+  echo "  REFUSING: registration #$PROPOSAL_ID on $DAO does not carry this CVM's measurements ($MEAS)." >&2
+  exit 1
+fi
+FACTS=$(near contract call-function as-read-only "$DAO" get_registration_facts json-args "{\"proposal_id\":$PROPOSAL_ID}" \
+  network-config "$NETWORK" now 2>/dev/null | python3 -I -c 'import json,sys
 f=json.load(sys.stdin)
 print(f["instance_id"], f["compose_hash"], f["app_id"]) if f else None' 2>/dev/null || true)
-    [ -n "$FACTS" ] && [ "$FACTS" != None ] && BY_LOG=true
-  fi
-  $BY_LOG || echo "  this keystore registers without an event log: its measurements are approved first"
+[ -n "$FACTS" ] && [ "$FACTS" != None ] || { echo "  registration #$PROPOSAL_ID states no build on $DAO" >&2; exit 1; }
+IDENT=$(agent_identity || true)
+[ -n "$IDENT" ] || { echo "  could not read the CVM's instance id from its guest agent" >&2; exit 1; }
+if [ "$FACTS" != "$IDENT" ]; then
+  echo "  REFUSING: registration #$PROPOSAL_ID on $DAO is not this CVM's." >&2
+  echo "    this CVM (guest agent):  instance/compose/app = $IDENT" >&2
+  echo "    registration on chain:   instance/compose/app = $FACTS" >&2
+  exit 1
 fi
-
-if $BY_LOG; then
-  # The registration on chain must be THIS CVM's: the instance and the compose its own guest
-  # agent reports, and the RTMR3 read from it in [3/6]. The key is the one its log printed.
-  IDENT=$(agent_identity || true)
-  [ -n "$IDENT" ] || { echo "  could not read the CVM's instance id from its guest agent" >&2; exit 1; }
-  P_RTMR3=$(near contract call-function as-read-only "$DAO" get_proposal json-args "{\"proposal_id\":$PROPOSAL_ID}" \
-    network-config "$NETWORK" now 2>/dev/null | grep -oE '"rtmr3": "[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}' || true)
-  if [ "$FACTS" != "$IDENT" ] || [ "$P_RTMR3" != "$RTMR3" ]; then
-    echo "  REFUSING: registration #$PROPOSAL_ID on $DAO is not this CVM's." >&2
-    echo "    this CVM (guest agent):  instance/compose/app = $IDENT  rtmr3=$RTMR3" >&2
-    echo "    registration on chain:   instance/compose/app = $FACTS  rtmr3=${P_RTMR3:-?}" >&2
-    exit 1
-  fi
-  echo "  registration #$PROPOSAL_ID is this CVM's:"
-  echo "    key          $LIVE_KEY"
-  echo "    instance_id  ${IDENT%% *}"
-  echo "    compose_hash $(echo "$IDENT" | cut -d' ' -f2)   (the same for every instance of v$VER)"
-  # [6/6] counts only a "ready" line logged from here on.
-  SINCE=$(node_run "date -u +%Y-%m-%dT%H:%M:%S" 2>/dev/null | tail -1 | tr -d '\r')
-else
-# [4/6] approve measurements on the DAO contract (idempotent)
-echo "[4/6] Approve measurements on $DAO..."
-# M1: parse the bool strictly (the old `grep -qi true` over full near-cli-rs output is fragile — it
-# matches "true" anywhere in the noisy output). Mirror the stricter phala form: pull the FIRST
-# true|false token and compare exactly.
-APPROVED=$(near contract call-function as-read-only "$DAO" is_measurements_approved \
-  json-args "{\"measurements\":$MEAS}" network-config "$NETWORK" now 2>/dev/null \
-  | grep -oiE 'true|false' | head -1 || true)
-if [ "$APPROVED" = true ]; then
-  echo "  already approved — skipping (approve-once per net+version)"
-elif dao_has_governance "$DAO"; then
-  # A keystore build receives the master: approving it is a DAO decision.
-  echo "  through the DAO (member $GOV_MEMBER)"
-  rc=0; dao_drive "$DAO" "$GOV_MEMBER" "$(dao_measurements_action keystore "" "$MEAS")" || rc=$?
-  if [ "$rc" -eq 2 ]; then
-    echo "  The CVM '$NAME' is up; its registration goes through once the proposal executes."
-    echo "  After the execute, continue WITHOUT a new deploy (a new CVM has new measurements):"
-    echo "    $0 keystore $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume"
-    exit 3
-  fi
-  [ "$rc" -eq 0 ] || { echo "  approval through the DAO failed" >&2; exit 1; }
-  echo "  measurements approved"
-else
-  near contract call-function as-transaction "$DAO" add_approved_measurements \
-    json-args "{\"measurements\":$MEAS,\"clear_others\":false}" \
-    prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
-    sign-as "$OWNER" network-config "$NETWORK" sign-with-legacy-keychain send
-  echo "  measurements approved (owner; the DAO has no governance yet)"
-fi
-
-# [5/6] wait for the keystore's self-submitted proposal, then vote as zavodil.
-# Measurements are approved now, so if the keystore had already submitted (and the DAO rejected
-# for not-approved) it will resubmit on the next boot. Restart once to force a clean submit
-# against the now-approved list, then grep for the Proposal ID.
-echo "[5/6] Restart keystore so it submits against the approved measurements..."
-# The keystore mints a new registration key on EVERY boot and submits a proposal for it, and
-# the container log survives the restart. So only what the keystore logs AFTER this restart
-# counts: a proposal or a "ready" line from before it belongs to a key the keystore no longer
-# holds, and a vote on such a proposal executes, changes nothing, and leaves the live key waiting
-# until its 30-min registration timeout. A boot that is still registering when the restart is
-# issued can submit after any "highest id so far" was read, so the cut is the node's clock taken
-# once the restart has returned (the old VM is down by then); the proposal is then checked on
-# chain against the key the new boot announced.
-node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
-SINCE=$(node_run "date -u +%Y-%m-%dT%H:%M:%S" 2>/dev/null | tail -1 | tr -d '\r')
-[[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}$ ]] || { echo "  could not read the node's clock (got '$SINCE')" >&2; exit 1; }
-echo "  counting only what the keystore logs from $SINCE UTC on"
-echo "  waiting for the keystore to submit its DAO proposal (Proposal ID: N)..."
-wait_registration 25
-[ -n "$PROPOSAL_ID" ] || { echo "  No 'Proposal ID' in logs after ~5min. Check: NAME=$NAME CONTAINER=$KS_CONTAINER worker-ctl.sh follow" >&2; exit 1; }
-fi  # by event log, or by approved measurements
+echo "  registration #$PROPOSAL_ID is this CVM's:"
+echo "    key          $LIVE_KEY"
+echo "    instance_id  ${IDENT%% *}"
+echo "    compose_hash $(echo "$IDENT" | cut -d' ' -f2)"
 echo "  proposal id: $PROPOSAL_ID (live key $LIVE_KEY, pending on $DAO)"
 
 # Vote (DAO_CHAIN, scripts/lib/dao_gov.sh). Every vote names LIVE_KEY, the key this CVM's own
@@ -690,8 +716,8 @@ for i in $(seq 1 25); do
       [[ \"\$c\" == *\"\$u\"* ]] || continue; echo \"\$c\" | grep -oE '127\\.0\\.0\\.1:[0-9]+-:8081' | sed -E 's/.*:([0-9]+)-:8081/\\1/' | head -1; break; done); \
     [ -n \"\$p\" ] && curl -fs --max-time 5 \"http://127.0.0.1:\$p/health\" || true" 2>/dev/null || true)
   # Only a "ready" line of THIS boot counts (see [5/6]): an earlier boot's line survives in the log.
-  L=$(ks_logs_since 600 || true)
-  if printf '%s' "$L" | grep -q "Keystore is now ready to serve requests"; then
+  L=$(ks_boot_logs || true)
+  if printf '%s\n' "$L" | grep -qE "$KS_READY"; then
     echo "  READY: keystore completed TEE registration + pulled its MPC-CKD master."
     [ -n "$HEALTH" ] && echo "  /health (loopback): $HEALTH"
     echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME CONTAINER=$KS_CONTAINER ./worker-ctl.sh follow"

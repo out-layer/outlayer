@@ -211,14 +211,11 @@ dao_members_json() {
 }
 
 # dao_measurements_action <component> <register> <measurements-json> — the action that approves
-# a build: the DAO's own ApproveMeasurements for a keystore, a Call to the register contract
-# for a worker.
+# a worker build: a Call to the register contract. A keystore build is not a measurements tuple:
+# it is approved as ApproveOsImage + ApproveCompose (scripts/deploy_tdx.sh).
 dao_measurements_action() {
     local component="$1" register="$2" meas="$3" args
-    if [ "$component" = keystore ]; then
-        printf '{"ApproveMeasurements":{"measurements":%s}}' "$meas"
-    else
-        args=$(printf '{"measurements":%s,"clear_others":false}' "$meas" | base64 | tr -d '\n')
-        printf '{"Call":{"target":"%s","method":"add_approved_measurements","args":"%s","deposit":"0","gas_tgas":30}}' "$register" "$args"
-    fi
+    [ "$component" = worker ] || { echo "dao_measurements_action: workers only; a keystore build is ApproveOsImage + ApproveCompose" >&2; return 1; }
+    args=$(printf '{"measurements":%s,"clear_others":false}' "$meas" | base64 | tr -d '\n')
+    printf '{"Call":{"target":"%s","method":"add_approved_measurements","args":"%s","deposit":"0","gas_tgas":30}}' "$register" "$args"
 }

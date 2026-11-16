@@ -26,8 +26,9 @@
 #                        zavodil.*). With a single DAO member the proposal executes in the same
 #                        call; with more members the others just vote by id, with the same
 #                        `vote {"proposal_id":N,"approve":true}` governance proposals take
-#   2. the OLD images  — each removed with `remove_approved_measurements` (owner-signed), so a
-#                        retired image can never register again. The kept images are never
+#   2. the OLD builds  — each stale compose and guest OS removed with `remove_approved_compose` /
+#                        `remove_approved_os_image` (owner-signed), so a
+#                        retired build can never register again. The kept builds are never
 #                        touched: there is no moment in which the allowlist is empty or partial,
 #                        so an instance that happens to boot mid-run still registers.
 # Both belong here rather than at deploy time: while an old instance is still serving, removing
@@ -255,14 +256,8 @@ if forced_keep:
     # the earlier key died with the earlier boot). The kept images are those the live keys
     # registered under.
     keep_keys = set(forced_keep)
-    keep_images = []
-    for k in forced_keep:
-        p = by_key.get(k)
-        if p and p['measurements'] not in keep_images:
-            keep_images.append(p['measurements'])
 else:
     keep_keys = set(groups[current_img]["keys"])
-    keep_images = [json.loads(current_img)]
 old_keys = [k for k in approved if k not in keep_keys]
 forced_unknown_image = [k for k in forced_keep if k not in by_key]
 
@@ -302,11 +297,33 @@ if orphans:
     for k in orphans:
         w(f"    {k}\n")
 
-images_onchain = view('get_approved_measurements', {})
-stale_images = [m for m in images_onchain if m not in keep_images]
+# The builds to keep are those of the kept keys: each one's guest OS (MRTD, RTMR0-2 of its
+# registration) and its compose hash (what its registration's event log stated). A kept key
+# whose registration states no compose leaves the compose list alone: any approved compose could
+# be the one it runs.
+keep_os = []
+keep_composes, compose_unknown = [], False
+for k in keep_keys:
+    p = by_key.get(k)
+    if not p:
+        continue
+    os_img = {f: p['measurements'][f] for f in ('mrtd', 'rtmr0', 'rtmr1', 'rtmr2')}
+    if os_img not in keep_os:
+        keep_os.append(os_img)
+    facts = view('get_registration_facts', {"proposal_id": p['id']})
+    if facts:
+        if facts['compose_hash'] not in keep_composes:
+            keep_composes.append(facts['compose_hash'])
+    else:
+        compose_unknown = True
+os_onchain = view('get_approved_os_images', {})
+composes_onchain = view('get_approved_composes', {})
+stale_os = [i for i in os_onchain if i not in keep_os]
+stale_composes = [] if compose_unknown else [c for c in composes_onchain if c not in keep_composes]
 
 w(f"\n=> revoke {len(old_keys)} key(s) via {-(-len(old_keys) // BATCH)} proposal(s); "
-  f"drop {len(stale_images)} of {len(images_onchain)} approved image(s)\n")
+  f"drop {len(stale_composes)} of {len(composes_onchain)} approved compose(s) and "
+  f"{len(stale_os)} of {len(os_onchain)} approved guest OS image(s)\n")
 
 # zavodil.near carries too many access keys for the legacy keychain file; its votes sign through
 # near-cli's own keychain. The testnet signer and both owners live in the legacy keychain.
@@ -318,18 +335,26 @@ for n in range(0, len(old_keys), BATCH):
           f"sign-as {SIGNER} network-config {NETWORK} {SIGNER_KEYCHAIN} send")
 
 if forced_unknown_image:
-    w("\nImage cleanup SKIPPED: a kept key has no readable proposal, so its image is unknown and "
-      "any approved image could be the one it runs on.\n")
-elif stale_images:
-    # One removal per stale image, never a rebuild: the kept images stay on the list throughout,
-    # so a keystore booting between two of these calls still finds its measurements approved.
-    for m in stale_images:
-        args = json.dumps({"measurements": m})
-        print(f"near contract call-function as-transaction {DAO} remove_approved_measurements "
+    w("\nBuild cleanup SKIPPED: a kept key has no readable proposal, so its build is unknown and "
+      "any approved build could be the one it runs on.\n")
+else:
+    if compose_unknown:
+        w("\nCompose cleanup SKIPPED: a kept key's registration states no compose (it was made "
+          "before registrations carried their event log).\n")
+    # One removal per stale entry, never a rebuild: the kept ones stay on the lists throughout,
+    # so a keystore booting between two of these calls still finds its build approved.
+    for c in stale_composes:
+        args = json.dumps({"compose_hash": c})
+        print(f"near contract call-function as-transaction {DAO} remove_approved_compose "
+              f"json-args '{args}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' "
+              f"sign-as {OWNER} network-config {NETWORK} sign-with-legacy-keychain send")
+    for i in stale_os:
+        args = json.dumps({"image": i})
+        print(f"near contract call-function as-transaction {DAO} remove_approved_os_image "
               f"json-args '{args}' prepaid-gas '30.0 Tgas' attached-deposit '0 NEAR' "
               f"sign-as {OWNER} network-config {NETWORK} sign-with-legacy-keychain send")
 
-if not old_keys and not stale_images:
+if not old_keys and not stale_composes and not stale_os:
     print("echo 'Nothing to retire — only the current version is approved.'")
 PY
 
