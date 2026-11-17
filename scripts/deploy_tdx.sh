@@ -259,6 +259,16 @@ node_run() {
 
 echo "== deploy_tdx: $COMPONENT $NETWORK  vm-label=$NAME  version=v$VER  node=$NODE =="
 
+# [0] The node's KMS refuses every device but this node's: through it an approved build is
+# approved for this hardware only (deploy/self-hosted-tdx/tools/check-kms-binding.sh says why).
+# Read-only; a node that fails it gets no deploy.
+echo "[0] KMS binding on $NODE..."
+if ! node_run "./tools/check-kms-binding.sh"; then
+  echo "  refused: the node's KMS is not bound to its hardware (deploy/self-hosted-tdx/kms/README.md)," >&2
+  echo "  or the check is not on the node yet (deploy/self-hosted-tdx/sync-node.sh <host>)" >&2
+  exit 1
+fi
+
 # [1/N] resolve + attest the image digest locally (the node has no gh). The GitHub release
 # body lists one row per component: `| worker | sha256:... |`, `| keystore | sha256:... |`.
 if [ -n "$OS_IMAGE" ]; then

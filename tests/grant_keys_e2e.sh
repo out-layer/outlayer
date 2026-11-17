@@ -309,6 +309,12 @@ if want S1; then
   log "S1 /public/stats is served from a copy refreshed every minute"
   req_none GET /public/stats; A=$(j .computed_at); T1=$SECS; X1=$(j .total_executions)
   req_none GET /public/stats; B=$(j .computed_at); T2=$SECS
+  # The copy is refreshed every minute: two reads that straddle a refresh differ once. Read the
+  # pair again then; two different copies twice in a row is a read that computed its own.
+  if [[ -n "$A" && "$A" != "$B" ]]; then
+    req_none GET /public/stats; A=$(j .computed_at); T1=$SECS; X1=$(j .total_executions)
+    req_none GET /public/stats; B=$(j .computed_at); T2=$SECS
+  fi
   if [[ "$HTTP" == 200 && -n "$A" ]] && python3 -c "import datetime,sys; datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00'))" "$A" 2>/dev/null; then
     pass "S1 computed_at is RFC 3339 ($A), total_executions $X1"
   else
