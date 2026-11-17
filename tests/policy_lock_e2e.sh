@@ -15,6 +15,9 @@
 #       deadline (expired, said before the signature check)
 #   L7  one vote keeps it pending; the second releases the signature on the
 #       request; the owner stores it — version 2, unlocked, still frozen
+#   L7w the first vote is announced (`approval_received`) to the webhook of the
+#       policy it was cast under (with HOOK_URL / HOOK_LOG_URL from
+#       `tests/hook_receiver.sh ensure`; skipped without them)
 #   L8  the same signed write a second time is refused (version)
 #   L9  unfreeze works
 #   L10 the owner alone re-locks (version 3)
@@ -33,6 +36,7 @@
 # approver (its own suite). Approvers vote by key from ~/.near-credentials.
 #
 # Run:
+#   tests/hook_receiver.sh ensure; set -a; source ~/.local/state/outlayer-hook/hook.env; set +a
 #   PARENT=outlayer-alice.testnet APPROVER=outlayer-carol.testnet \
 #     APPROVER2=outlayer-daniel.testnet ./tests/policy_lock_e2e.sh --apply
 
@@ -118,6 +122,16 @@ wait_request() { # wait_request <rid> — ST, BODY
 
 LOCKED=$(jq -nc --arg a "$APPROVER" --arg b "$APPROVER2" \
   '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:2}, approvers:[{id:$a},{id:$b}], locked:true}}')
+# The receiver's URL carries its token: it goes into the policy, never onto a
+# command line or the terminal.
+[[ -n "${HOOK_URL:-}" ]] && LOCKED=$(HOOK_URL="$HOOK_URL" jq -c '. + {webhook_url: env.HOOK_URL}' <<<"$LOCKED")
+# hook_saw <needle>… — one delivery in the receiver's log holds every needle
+# (read through stdin: its URL is a secret too).
+hook_saw() {
+  local log
+  log=$(printf 'url = "%s"\n' "$HOOK_LOG_URL" | curl -sS --max-time 20 -K - 2>/dev/null) || return 1
+  jq -e --args '[.requests[]? | (.body // "") as $b | select(all($ARGS.positional[]; . as $n | $b | contains($n)))] | length > 0' "$@" <<<"$log" >/dev/null 2>&1
+}
 OPEN='{"rules":{"transaction_types":["transfer"]}}'
 OPEN_B='{"rules":{"transaction_types":["transfer","call"]}}'
 OPEN_C='{"rules":{"transaction_types":["transfer","delete"]}}'
@@ -185,6 +199,14 @@ if [[ -n "${AID:-}" ]]; then
   vote approve "$APPROVER"
   assert_status "L7 first vote" 200
   [[ "$(jq -r .status <<<"$BODY")" == pending ]] && pass "L7 pending at 1 of 2" || fail "L7 $(jq -c '{status,approved,required}' <<<"$BODY")"
+  if [[ -n "${HOOK_URL:-}" && -n "${HOOK_LOG_URL:-}" ]]; then
+    SAW=""
+    for _ in $(seq 1 9); do hook_saw approval_received "$AID" && { SAW=1; break; }; sleep 5; done
+    [[ -n "$SAW" ]] && pass "L7w the vote was announced to the policy's webhook" \
+      || fail "L7w no approval_received for $AID reached the webhook in 45 s"
+  else
+    skip "L7w no webhook receiver (HOOK_URL / HOOK_LOG_URL): the policy-update vote's webhook is not checked"
+  fi
   api "$SEED" GET "/wallet/v1/requests/$RID" >/dev/null
   [[ "$(jq -r .status <<<"$BODY")" == pending_approval ]] && pass "L7 request still pending_approval" || fail "L7 request $(jq -r .status <<<"$BODY")"
 

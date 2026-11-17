@@ -11,8 +11,9 @@
 #
 # For each: the coordinator's copy of the policy (wallet_accounts.policy_json)
 # appears with the stored rules, and the coordinator log shows
-# "Policy sync complete: wallet=<id>" and no "Lazy-synced policy" for it —
-# the copy came from the worker, not from a lazy decrypt on first use.
+# "Policy sync complete: wallet=<id>" and no "Policy copy replaced from chain"
+# for it — the copy came from the worker, not from a read that decrypted it
+# first.
 #
 # Required env:
 #   PARENT              NEAR account that owns the vault (its key in the legacy keychain;
@@ -178,7 +179,7 @@ prepare_and_store_policy() {
 #
 # Waits up to ~3 min for the coordinator's copy of the stored policy, then reads
 # the log of this run: the worker's call writes "Policy sync complete" and no
-# lazy decrypt may have stood in for it. Echoes "ok" or the reason it is not.
+# read may have decrypted the copy in its place. Echoes "ok" or the reason it is not.
 coord_count() { # coord_count <fixed-string> — this run's coordinator log lines holding it
   local since=$(( $(date +%s) - RUN_START + 120 ))
   ssh -o ConnectTimeout=15 -o BatchMode=yes -o ControlMaster=no -o ControlPath=none "$COORD_SSH" \
@@ -193,9 +194,9 @@ synced_by_worker() { # synced_by_worker <wallet_id>
   done
   [[ "$got" == '["transfer"]' ]] || { echo "the coordinator's copy reads '${got:-no row}', expected [\"transfer\"]"; return; }
   synced=$(coord_count "Policy sync complete: wallet=$wid")
-  lazy=$(coord_count "Lazy-synced policy for wallet=$wid")
+  lazy=$(coord_count "Policy copy replaced from chain for wallet=$wid")
   if [[ "${synced:-0}" -ge 1 && "${lazy:-0}" == 0 ]]; then echo ok
-  else echo "log: 'Policy sync complete' ${synced:-?} line(s), 'Lazy-synced' ${lazy:-?}"; fi
+  else echo "log: 'Policy sync complete' ${synced:-?} line(s), 'Policy copy replaced' ${lazy:-?}"; fi
 }
 
 # ─── 2. Scenario A: Bearer near: + vault (the bug-prone path) ─────

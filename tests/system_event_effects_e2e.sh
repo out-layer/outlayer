@@ -21,10 +21,10 @@
 #        store_secrets at it is refused ("has already been used"). Skipped on a
 #        contract without get_payment_key_nonce_floor
 #   A8   `store_wallet_policy` twice (v1, then v2 with a different address
-#        list): `wallet_accounts.policy_json` follows the chain each time. v2
-#        replaces a NON-NULL copy, which only `/internal/wallet-policy-sync`
-#        writes (the lazy readers fill a NULL copy only) — and this suite calls
-#        no wallet route between the transaction and the read
+#        list): `wallet_accounts.policy_json` follows the chain each time. This
+#        suite calls no wallet route between the transaction and the read, so
+#        the copy of v2 is `/internal/wallet-policy-sync`'s and not a reader's —
+#        and the coordinator log shows no copy replaced by a read
 #   A9   `freeze_wallet`: `wallet_accounts.frozen` = t, a transfer → 403
 #        `wallet_frozen`; `unfreeze_wallet`: frozen = f, the same transfer → 200
 #   A10  `delete_wallet_policy`: `policy_json` NULL, `frozen` f
@@ -476,10 +476,10 @@ if [[ -z "$ONLY" || "$ONLY" == wallet ]]; then
         for i in $(seq 1 30); do got=$(list_of | tr -d ' '); [[ "$got" == "$L2" ]] && break; sleep 6; done
         [[ "$got" == "$L2" ]] && pass "A8 v2 replaced the non-null copy with no wallet call in between: addresses.list = $got" \
           || fail "A8 v2: the coordinator's copy reads '$got', expected $L2"
-        n2=$(coord_count "Policy sync complete: wallet=$WID"); nl=$(coord_count "Lazy-synced policy for wallet=$WID")
+        n2=$(coord_count "Policy sync complete: wallet=$WID"); nl=$(coord_count "Policy copy replaced from chain for wallet=$WID")
         (( n2 > n1 )) && [[ "$nl" == 0 ]] \
-          && pass "A8 coordinator log: 'Policy sync complete: wallet=$WID' $n1 → $n2 (the worker's /internal/wallet-policy-sync), 'Lazy-synced' 0" \
-          || fail "A8 coordinator log: policy sync lines $n1 → $n2, lazy-sync lines $nl"
+          && pass "A8 coordinator log: 'Policy sync complete: wallet=$WID' $n1 → $n2 (the worker's /internal/wallet-policy-sync), 'Policy copy replaced' 0" \
+          || fail "A8 coordinator log: policy sync lines $n1 → $n2, copy-replaced-by-a-read lines $nl"
       else
         fail "A8 v2 not stored"
       fi

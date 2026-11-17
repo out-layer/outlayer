@@ -18,6 +18,15 @@
 #   V9  a vote signed by a FUNCTION-CALL key of the approver itself is refused
 #       (401): only a full-access key is the approver's word. The suite adds
 #       that key to APPROVER and removes it on exit.
+#   V11 an approver removed from the policy on chain is refused at once, even
+#       while the coordinator's copy still names it (needs PSQL_CMD: the probe
+#       puts the copy one policy behind, as a lost chain event leaves it)
+#   V12 a reject cast before a final block holds the policy it was admitted
+#       under does not cancel yet (`reject_vote_recorded`); the same account's
+#       reject sent again is proven like a first one — a forged one is 401 and
+#       changes nothing — and cancels once the block is final; the vote is
+#       stored once. The window is a block or two: the probe tries three times
+#       and is SKIPPED, not passed, when it never lands in it.
 #
 # Actors: PARENT owns the wallet and is the second approver; APPROVER is the
 # first; STRANGER is in no policy. Each signs with its own key from
@@ -25,7 +34,7 @@
 #
 # Run:
 #   PARENT=outlayer-alice.testnet APPROVER=outlayer-bob.testnet \
-#     STRANGER=outlayer-carol.testnet ./tests/approval_votes_e2e.sh --apply
+#     STRANGER=outlayer-carol.testnet PSQL_CMD=… ./tests/approval_votes_e2e.sh --apply
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 
@@ -40,9 +49,10 @@ for a in "$APPROVER" "$STRANGER"; do
   [[ -f "$HOME/.near-credentials/$NETWORK/$a.json" ]] || { echo "✗ creds missing for $a" >&2; exit 1; }
 done
 
-# vote <approve|reject> <named-account> <signing-account> — a NEP-413 vote in
-# <named-account>'s name, signed with <signing-account>'s key.
-vote() {
+# signed_vote <approve|reject> <named-account> <signing-account> — the body of
+# a NEP-413 vote on the current approval in <named-account>'s name, signed with
+# <signing-account>'s key.
+signed_vote() {
   local verb=$1 named=$2 signer=$3 msg nonce sig body
   msg="$verb:$AID:$WPK:$RHASH"
   nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
@@ -51,8 +61,11 @@ vote() {
   body=$(jq -nc --arg s "$sig" --arg pk "$(creds "$signer" public_key)" --arg a "$named" --arg n "$nonce" \
     '{signature:$s, public_key:$pk, account_id:$a, nonce:$n}')
   [[ "$verb" == reject ]] && body=$(jq -c '. + {reason:"e2e"}' <<<"$body")
-  api - POST "/wallet/v1/$verb/$AID" "$body" >/dev/null
+  printf '%s' "$body"
 }
+
+# vote <approve|reject> <named-account> <signing-account> — cast it.
+vote() { api - POST "/wallet/v1/$1/$AID" "$(signed_vote "$@")" >/dev/null; }
 
 # vote_with <approve|reject> <named-account> <private-key> <public-key> — the
 # same, signed with an explicit key.
@@ -213,5 +226,96 @@ if store_policy "$SEED" "$WALLET_ID" "$POLICY2"; then
 else
   fail "V10 the policy adding $STRANGER was not stored"
 fi
+
+# hold_transfer <label> — a new transfer held for approval; sets AID, RID, RHASH, WPK.
+hold_transfer() {
+  api "$SEED" POST /wallet/v1/transfer \
+    "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"1000000000000000000000"}')" >/dev/null
+  AID=$(jq -r '.approval_id // empty' <<<"$BODY"); RID=$(jq -r '.request_id // empty' <<<"$BODY")
+  [[ -n "$AID" ]] || { fail "$1 transfer was not held for approval: HTTP $HTTP $(msg_of)"; return 1; }
+  api - GET "/wallet/v1/approval/$AID" >/dev/null
+  RHASH=$(jq -r '.request_hash' <<<"$BODY"); WPK=$(jq -r '.wallet_pubkey' <<<"$BODY")
+}
+request_status() { api "$SEED" GET "/wallet/v1/requests/$RID" >/dev/null; jq -r .status <<<"$BODY"; }
+
+# ── V11: an approver removed on chain, while the copy still names it ───────
+POLICY_TWO=$(jq -nc --arg a "$APPROVER" --arg p "$PARENT" \
+  '{rules:{transaction_types:["transfer"]}, approval:{threshold:{required:2}, approvers:[{id:$a},{id:$p}]}}')
+log "V11 the policy removes $STRANGER; the copy is put one policy behind; $STRANGER votes"
+if ! sql_alive; then
+  skip "V11 needs PSQL_CMD: without the copy put behind, the removal is not judged against a copy that still names $STRANGER"
+elif ! store_policy "$SEED" "$WALLET_ID" "$POLICY_TWO"; then
+  fail "V11 the policy removing $STRANGER was not stored"
+elif hold_transfer V11; then
+  copy_names() { sql "SELECT (policy_json::text LIKE '%\"$STRANGER\"%')::text FROM wallet_accounts WHERE wallet_id = '$WALLET_ID'"; }
+  copy_digest() { sql "SELECT COALESCE(policy_ciphertext_sha256, 'NULL') FROM wallet_accounts WHERE wallet_id = '$WALLET_ID'"; }
+  # The worker's sync of the removal lands first: a sync arriving after the
+  # tamper would put the right copy back and let a copy-admitting coordinator
+  # pass, and one arriving after the vote would replace the copy in its place.
+  SYNCED=""
+  for _ in $(seq 1 30); do [[ "$(copy_names)" == false && "$(copy_digest)" =~ ^[0-9a-f]{64}$ ]] && { SYNCED=1; break; }; sleep 4; done
+  [[ -n "$SYNCED" ]] || warn "V11 the worker's sync of the removal was not seen in the row; a late sync can mask the probe"
+  sql "UPDATE wallet_accounts SET policy_json = '$POLICY2'::jsonb, policy_ciphertext_sha256 = 'an-earlier-ciphertext' WHERE wallet_id = '$WALLET_ID'" >/dev/null
+  if [[ "$(copy_names)" != true ]]; then
+    fail "V11 fixture: the copy was not put behind"
+  else
+    vote approve "$STRANGER" "$STRANGER"
+    if assert_status "V11 the removed approver is refused" 403; then
+      [[ "$(err_of)" == not_approver ]] && pass "V11 not_approver, judged on the chain's policy" || fail "V11 error $(err_of)"
+    fi
+    [[ "$(votes_by "$STRANGER")" == 0 ]] && pass "V11 nothing stored for $STRANGER" || fail "V11 a vote of the removed approver was stored"
+    [[ "$(copy_names)" == false ]] && pass "V11 the vote's read replaced the copy with the chain's policy" \
+      || fail "V11 the copy still names $STRANGER after the read"
+  fi
+fi
+
+# ── V12: a reject before a final block holds its policy, then again ────────
+log "V12 $APPROVER rejects the moment a new policy is in; then again"
+V12_DONE=""
+for attempt in 1 2 3; do
+  hold_transfer "V12 (try $attempt)" || { V12_DONE=1; break; }
+  NO=$(signed_vote reject "$APPROVER" "$APPROVER")
+  # Each try stores a different policy, so the record the vote is admitted
+  # under is never the one a final block already holds.
+  TYPES=$([[ $((attempt % 2)) == 1 ]] && echo '["transfer","call"]' || echo '["transfer"]')
+  NEXT=$(jq -c --argjson t "$TYPES" '.rules.transaction_types = $t' <<<"$POLICY_TWO")
+  STORE_POLICY_NO_SETTLE=1 store_policy "$SEED" "$WALLET_ID" "$NEXT" || { fail "V12 (try $attempt) the policy was not stored"; V12_DONE=1; break; }
+  api - POST "/wallet/v1/reject/$AID" "$NO" >/dev/null
+  FIRST_STATUS=$(jq -r '.status // empty' <<<"$BODY")
+  if [[ "$HTTP" == 200 && "$FIRST_STATUS" == rejected ]]; then
+    note "V12 try $attempt: a final block already held the new policy (cancelled at once); trying again"
+    sleep 4
+    continue
+  fi
+  if [[ "$HTTP" != 200 || "$FIRST_STATUS" != reject_vote_recorded ]]; then
+    fail "V12a the first reject: HTTP $HTTP $(jq -c . <<<"$BODY" | head -c 200)"; V12_DONE=1; break
+  fi
+  V12_DONE=1
+  pass "V12a cast before a final block held the policy: reject_vote_recorded"
+  [[ "$(request_status)" == pending_approval ]] && pass "V12a the request is still pending" \
+    || fail "V12a the request is $(request_status) after a deferred reject"
+  sleep 4
+  vote reject "$APPROVER" "$STRANGER"
+  assert_status "V12b a repeat in $APPROVER's name signed with $STRANGER's key is refused" 401
+  [[ "$(request_status)" == pending_approval ]] && pass "V12b the forged repeat changed nothing" \
+    || fail "V12b the request is $(request_status) after a forged repeat"
+  # The same repeat as a contract-wallet vote with an authorization nobody
+  # proved: it is verified like a first contract vote and refused, never
+  # taken as the stored NO's word.
+  api - POST "/wallet/v1/reject/$AID" "$(jq -nc --arg a "$APPROVER" '{account_id:$a, authorization:"x", reason:"e2e"}')" >/dev/null
+  [[ "$HTTP" != 200 ]] && pass "V12b an unproven contract-vote repeat is refused (HTTP $HTTP $(err_of))" \
+    || fail "V12b an unproven contract-vote repeat was answered 200: $(jq -c . <<<"$BODY" | head -c 160)"
+  [[ "$(request_status)" == pending_approval ]] && pass "V12b the unproven repeat changed nothing" \
+    || fail "V12b the request is $(request_status) after an unproven repeat"
+  vote reject "$APPROVER" "$APPROVER"
+  if assert_status "V12c the repeat is answered like a first vote" 200; then
+    [[ "$(jq -r .status <<<"$BODY")" == rejected ]] && pass "V12c the repeat cancels once the block is final" \
+      || fail "V12c the repeat answered $(jq -r .status <<<"$BODY")"
+  fi
+  [[ "$(request_status)" == rejected ]] && pass "V12c the request is rejected" || fail "V12c the request is $(request_status)"
+  [[ "$(votes_by "$APPROVER")" == 1 ]] && pass "V12d the vote is stored once" || fail "V12d $APPROVER holds $(votes_by "$APPROVER") rows"
+  break
+done
+[[ -n "$V12_DONE" ]] || skip "V12 the window before a final block was not reached in 3 tries; the repeated reject was not exercised live"
 
 verdict "approval votes"
