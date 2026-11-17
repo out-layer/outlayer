@@ -233,3 +233,23 @@ the rollout it was written for. The cost is stated plainly instead — what stop
 working until the next step lands (decided by Vadim, 2026-11-16, on keystore
 registration: one path with the boot event log, no legacy measurements path for
 keystores that have not been updated yet).
+
+## A deploy is whole, and it succeeded
+Reason about the system as it runs after a complete deploy, not about the
+states in between.
+
+* **A working keystore is always there.** A keystore that is not ready until
+  its DAO vote is not an outage: the previous setup keeps serving until the new
+  one is ready. A keystore failure on a request path is a blip of seconds — a
+  `503` the caller retries — never hours. No fallback, cached answer or wait
+  loop is designed around a long keystore outage.
+* **The migration ran.** Code is written and reviewed against the schema its
+  own migrations produce. No check that a column, a row or a backfill is there
+  yet, and no branch for a database that is half migrated.
+* **Every component is on the release.** No version probe and no "is the peer
+  new enough" branch where two versions meet: a deploy is full, and what must
+  go first is written in the rollout order (see the section above).
+
+A finding that only holds mid-deploy, with a keystore down for long, or with
+one component left on the old version is not a finding against the code. If
+the window matters, it is one line in the rollout notes.
