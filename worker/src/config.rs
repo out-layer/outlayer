@@ -417,6 +417,8 @@ impl Config {
             );
         }
 
+        require_https_in_tee(&tee_mode, &api_base_url, keystore_base_urls.as_deref())?;
+
         // Debug logging flag (default: true = enabled)
         // WARNING: Stores raw stderr/stdout in system_hidden_logs table
         // Set SAVE_SYSTEM_HIDDEN_LOGS_TO_DEBUG=false in production to disable
@@ -674,6 +676,18 @@ impl Config {
             anyhow::bail!("API base URL cannot be empty");
         }
 
+        // Two modes, never mixed: a TEE worker (TEE_MODE=outlayer_tee, its key registered by
+        // attestation) and a local development worker (TEE_MODE=none, OPERATOR_PRIVATE_KEY). A
+        // stub quote registers nothing, so TEE registration without a TEE is a misconfiguration.
+        if (self.tee_mode == "outlayer_tee") != self.use_tee_registration {
+            anyhow::bail!(
+                "TEE_MODE=outlayer_tee goes with USE_TEE_REGISTRATION=true, TEE_MODE=none with \
+                 USE_TEE_REGISTRATION=false (local development); got TEE_MODE={} and USE_TEE_REGISTRATION={}",
+                self.tee_mode,
+                self.use_tee_registration
+            );
+        }
+
         // A TEE executor registers a session with the keystore at startup and decrypts through
         // it; without one it would come up and fail every job that carries secrets.
         if self.use_tee_registration && self.capabilities.execution {
@@ -741,6 +755,25 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// In a TEE the worker reaches the coordinator and the keystores over https only: its token, its
+/// TEE session and the secrets it asks for travel to these addresses, and TLS is what makes the
+/// address in its (measured) compose the party it talks to.
+fn require_https_in_tee(tee_mode: &str, api_base_url: &str, keystore_base_urls: Option<&[String]>) -> Result<()> {
+    if tee_mode != "outlayer_tee" {
+        return Ok(());
+    }
+    let plain: Vec<&str> = std::iter::once(api_base_url)
+        .chain(keystore_base_urls.unwrap_or_default().iter().map(String::as_str))
+        .filter(|u| !u.trim().starts_with("https://"))
+        .collect();
+    anyhow::ensure!(
+        plain.is_empty(),
+        "TEE_MODE=outlayer_tee reaches the coordinator and keystores over https only; not https: {}",
+        plain.join(", ")
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -811,9 +844,21 @@ mod tests {
     /// A TEE executor without a keystore would boot and then fail every secrets job, so the
     /// start is refused; a compile-only TEE worker and a non-TEE worker need no keystore.
     #[test]
+    fn the_tee_mode_and_the_registration_go_together() {
+        let mut mixed = create_test_config();
+        mixed.use_tee_registration = true; // TEE_MODE stays "none"
+        assert!(format!("{:#}", mixed.validate().unwrap_err()).contains("USE_TEE_REGISTRATION=false (local development)"));
+        let mut other = create_test_config();
+        other.tee_mode = "outlayer_tee".to_string(); // registration stays false
+        assert!(other.validate().is_err());
+        assert!(create_test_config().validate().is_ok(), "local development: none + false");
+    }
+
+    #[test]
     fn tee_executor_must_have_a_keystore() {
         let mut config = create_test_config();
         config.use_tee_registration = true;
+        config.tee_mode = "outlayer_tee".to_string();
         config.capabilities.execution = true;
         config.keystore_base_urls = None;
         config.keystore_auth_token = None;
@@ -827,6 +872,7 @@ mod tests {
 
         let mut compile_only = create_test_config();
         compile_only.use_tee_registration = true;
+        compile_only.tee_mode = "outlayer_tee".to_string();
         compile_only.capabilities.execution = false;
         compile_only.capabilities.compilation = true;
         assert!(compile_only.validate().is_ok());
@@ -900,5 +946,21 @@ mod tests {
             execute_excludes: Vec::new(),
             wasm_cache_dir: "/tmp/wasm_cache_test".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod https_in_tee_tests {
+    use super::require_https_in_tee;
+
+    #[test]
+    fn a_tee_worker_reaches_its_peers_over_https_only() {
+        let ks = vec!["https://k1".to_string(), "https://k2".to_string()];
+        assert!(require_https_in_tee("outlayer_tee", "https://api", Some(&ks)).is_ok());
+        assert!(require_https_in_tee("outlayer_tee", "https://api", None).is_ok());
+        assert!(require_https_in_tee("outlayer_tee", "http://api", Some(&ks)).is_err());
+        let plain = vec!["https://k1".to_string(), "http://k2".to_string()];
+        assert!(require_https_in_tee("outlayer_tee", "https://api", Some(&plain)).is_err());
+        assert!(require_https_in_tee("none", "http://localhost:8080", Some(&plain)).is_ok(), "dev mode");
     }
 }

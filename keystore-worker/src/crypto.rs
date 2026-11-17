@@ -15,7 +15,7 @@ use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng},
     ChaCha20Poly1305, Nonce,
 };
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
 use hmac::{Hmac, Mac};
 use hkdf::Hkdf;
 use near_primitives::types::AccountId;
@@ -727,7 +727,7 @@ impl Keystore {
     ) -> Result<()> {
         let (_, verifying_key) = self.derive_keypair(customer, seed)?;
         verifying_key
-            .verify(message, signature)
+            .verify_strict(message, signature)
             .context("Signature verification failed")
     }
 
@@ -1175,7 +1175,7 @@ mod tests {
         let signature = Signature::from_bytes(&sig_bytes);
         let vrf_pubkey = keystore.get_public_key_for_seed(None, "vrf-key").unwrap();
 
-        vrf_pubkey.verify(alpha, &signature).expect("VRF signature must verify");
+        vrf_pubkey.verify_strict(alpha, &signature).expect("VRF signature must verify");
     }
 
     #[test]
@@ -1292,7 +1292,7 @@ mod tests {
 
         // Verification with correct Ed25519 key must succeed
         ed25519_vk
-            .verify(message, &signature)
+            .verify_strict(message, &signature)
             .expect("Ed25519 verify must succeed with matching key");
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
         // It must fail: either VerifyingKey::from_bytes rejects the point,
         // or verify() returns an error.
         let result = VerifyingKey::from_bytes(&x25519_bytes)
-            .and_then(|vk| vk.verify(message, &signature));
+            .and_then(|vk| vk.verify_strict(message, &signature));
         assert!(
             result.is_err(),
             "Verification with X25519 key as Ed25519 must fail"
@@ -1346,7 +1346,7 @@ mod tests {
         // Step 4: Verify with Ed25519 key — must succeed
         let ed25519_vk = ks.get_public_key_for_seed(None, wallet_seed).unwrap();
         ed25519_vk
-            .verify(&hash, &signature)
+            .verify_strict(&hash, &signature)
             .expect("Verify with Ed25519 key must succeed");
 
         // Step 5: Verify with X25519 key — must fail (reproduces the bug)
@@ -1356,7 +1356,7 @@ mod tests {
             .try_into()
             .unwrap();
         let result = VerifyingKey::from_bytes(&x25519_bytes)
-            .and_then(|vk| vk.verify(&hash, &signature));
+            .and_then(|vk| vk.verify_strict(&hash, &signature));
         assert!(
             result.is_err(),
             "Verify with X25519 key must fail — this is the bug"
@@ -2243,8 +2243,8 @@ mod tests {
         let seed = ks.derive_signing_key_seed(None, &input).unwrap();
         let sk = SigningKey::from_bytes(&seed);
         let sig = sk.sign(b"record #1");
-        assert!(sk.verifying_key().verify(b"record #1", &sig).is_ok());
-        assert!(sk.verifying_key().verify(b"record #2", &sig).is_err());
+        assert!(sk.verifying_key().verify_strict(b"record #1", &sig).is_ok());
+        assert!(sk.verifying_key().verify_strict(b"record #2", &sig).is_err());
         // The same signature an independent ed25519 implementation makes.
         assert_eq!(
             hex::encode(sig.to_bytes()),

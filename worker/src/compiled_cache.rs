@@ -13,7 +13,7 @@
 //! - `{checksum}.sig` - ed25519 signature of (checksum || sha256(compiled_bytes))
 
 use anyhow::{Context, Result};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -309,7 +309,7 @@ impl CompiledCache {
 
         // Verify
         let message = Self::build_message(wasm_checksum, compiled_bytes);
-        self.verifying_key.verify(&message, &signature).is_ok()
+        self.verifying_key.verify_strict(&message, &signature).is_ok()
     }
 
     /// Build message for signing: checksum || sha256(compiled_bytes)

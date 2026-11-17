@@ -178,6 +178,44 @@ impl TeeSession {
     }
 }
 
+/// Every five minutes: the TEE sessions of a worker key that is no longer on the operator account
+/// end at once, and expired sessions are dropped. An RPC that does not answer for a key keeps its
+/// sessions until the next pass (`check_access_key_with_retry` answers `Ok(false)` only for a key
+/// the chain says is not there); the TTL ends them in any case.
+pub async fn run_tee_session_sweeper(state: AppState) {
+    const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+    let Some(operator_account_id) = state.config.operator_account_id.clone() else {
+        return;
+    };
+    loop {
+        tokio::time::sleep(SWEEP_EVERY).await;
+        let keys: std::collections::BTreeSet<String> = {
+            let mut sessions = state.tee_sessions.lock().unwrap_or_else(|p| p.into_inner());
+            sessions.retain(|_, s| !s.is_expired());
+            sessions.values().map(|s| s.worker_public_key.clone()).collect()
+        };
+        for key in keys {
+            match shared_tee_helpers::check_access_key_with_retry(state.config.near_rpc_url.as_str(), &operator_account_id, &key).await {
+                Ok(false) => {
+                    let ended = {
+                        let mut sessions = state.tee_sessions.lock().unwrap_or_else(|p| p.into_inner());
+                        let before = sessions.len();
+                        sessions.retain(|_, s| s.worker_public_key != key);
+                        before - sessions.len()
+                    };
+                    tracing::info!(
+                        public_key = %crate::near::key_for_display(&key),
+                        ended,
+                        "TEE sessions ended: the key is no longer on the operator account"
+                    );
+                }
+                Ok(true) => {}
+                Err(e) => tracing::warn!("TEE session sweep: key check failed, sessions kept until the next pass: {}", e),
+            }
+        }
+    }
+}
+
 /// sha256 (hex) of the request's bearer token, if it carries one.
 fn bearer_token_hash(headers: &axum::http::HeaderMap) -> Option<String> {
     use sha2::{Digest, Sha256};
@@ -3142,7 +3180,9 @@ fn verify_near_signature(
         "NEP-413 signature verification"
     );
 
-    if sig.verify(&digest, &pk) || (matches!(key_type, KeyType::MLDSA65) && sig.verify(&tagged, &pk)) {
+    if shared_tee_helpers::verify_strict(&sig, &digest, &pk)
+        || (matches!(key_type, KeyType::MLDSA65) && shared_tee_helpers::verify_strict(&sig, &tagged, &pk))
+    {
         Ok(())
     } else {
         anyhow::bail!("Signature verification failed")

@@ -1786,7 +1786,7 @@ pub(super) async fn register_tee_handler(
         &req.public_key,
     )
     .await
-    .map_err(|e| ApiError::InternalError(format!("NEAR RPC check failed: {}", e)))?;
+    .map_err(|e| ApiError::Unavailable(format!("NEAR RPC check failed, try again: {}", e)))?;
 
     if !key_exists {
         return Err(ApiError::Unauthorized(format!(

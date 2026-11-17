@@ -1,5 +1,4 @@
 mod api_client;
-mod collateral_fetcher;
 mod compiled_cache;
 mod compiler;
 mod config;
@@ -32,7 +31,6 @@ use tracing::{debug, error, info, warn};
 use api_client::{ApiClient, CodeSource, ExecutionResult, JobInfo, JobStatus, JobType};
 use compiled_cache::CompiledCache;
 use wasm_cache::WasmCache;
-use collateral_fetcher::fetch_collateral_from_phala;
 use compiler::Compiler;
 use config::Config;
 use event_monitor::EventMonitor;
@@ -40,30 +38,30 @@ use executor::{Executor, ExecutionContext};
 use keystore_client::KeystoreClient;
 use near_client::NearClient;
 use outlayer_storage::StorageConfig;
-use tdx_attestation::{TdxClient, get_dstack_app_info};
+use tdx_attestation::get_dstack_app_info;
 
-/// Generate a dummy TDX quote and fetch collateral from Phala Cloud API
-///
-/// This is used when registration fails with "Quote collateral required" error.
-/// We generate a fresh quote (with dummy data) just to get the collateral JSON.
-async fn generate_dummy_quote_and_fetch_collateral(tdx_client: &TdxClient) -> Result<String> {
-    info!("Generating dummy TDX quote for collateral fetching...");
+/// The coordinator ends a TEE session an hour after it was made. Every
+/// [`COORDINATOR_SESSION_RENEW_EVERY`] the worker makes a new one; the client swaps to it, and the
+/// old one stays valid until its own hour is up, so a request already sent with it still lands.
+/// A failed renewal keeps the current session and tries again after
+/// [`COORDINATOR_SESSION_RETRY_AFTER`].
+const COORDINATOR_SESSION_RENEW_EVERY: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const COORDINATOR_SESSION_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
-    // Generate quote with dummy 32-byte data
-    let dummy_data = [0u8; 32];
-    let tdx_quote_hex = tdx_client
-        .generate_registration_quote(&dummy_data)
-        .await
-        .context("Failed to generate dummy TDX quote")?;
-
-    info!("   Quote generated: {} bytes", tdx_quote_hex.len() / 2);
-
-    // Fetch collateral from Phala API
-    let collateral_json = fetch_collateral_from_phala(&tdx_quote_hex)
-        .await
-        .context("Failed to fetch collateral from Phala API")?;
-
-    Ok(collateral_json)
+fn spawn_coordinator_session_renewal(api_client: ApiClient, secret_key: near_crypto::SecretKey) {
+    tokio::spawn(async move {
+        let mut wait = COORDINATOR_SESSION_RENEW_EVERY;
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = match api_client.register_tee_session(&secret_key).await {
+                Ok(_) => COORDINATOR_SESSION_RENEW_EVERY,
+                Err(e) => {
+                    warn!("TEE session renewal with the coordinator failed, keeping the current one: {}", e);
+                    COORDINATOR_SESSION_RETRY_AFTER
+                }
+            };
+        }
+    });
 }
 
 #[tokio::main]
@@ -288,44 +286,10 @@ async fn main() -> Result<()> {
                     error!("      {}: {}", i, cause);
                 }
 
-                // Auto-fetch collateral from Phala Cloud for ANY registration error
-                // This helps diagnose all issues (missing collateral, wrong RTMR3, etc.)
-                error!("");
-                error!("🔍 Fetching collateral from Phala Cloud API for diagnostics...");
-                error!("");
-
-                match generate_dummy_quote_and_fetch_collateral(&tdx_client).await {
-                    Ok(collateral_json) => {
-                        error!("✅ Successfully fetched collateral from Phala Cloud!");
-                        error!("");
-                        error!("📋 COLLATERAL JSON (copy this for update_collateral call):");
-                        error!("");
-                        error!("{}", collateral_json);
-                        error!("");
-                        error!("📝 To cache this collateral in the register contract, run:");
-                        error!("");
-                        error!("   COLLATERAL=$(cat <<'EOF'");
-                        error!("{}", collateral_json);
-                        error!("EOF");
-                        error!("   )");
-                        error!("");
-                        error!("   near call {} update_collateral \\", config.operator_account_id);
-                        error!("     \"{{\\\"collateral\\\":$COLLATERAL}}\" \\");
-                        error!("     --accountId outlayer.testnet \\");
-                        error!("     --gas 300000000000000");
-                        error!("");
-                    }
-                    Err(fetch_err) => {
-                        error!("⚠️  Failed to auto-fetch collateral: {:?}", fetch_err);
-                        error!("   (This is OK if you already have collateral cached)");
-                        error!("");
-                    }
-                }
-
                 error!("📝 Common issues:");
-                error!("   - Missing collateral: Cache collateral JSON above via update_collateral");
-                error!("   - RTMR3 not approved: Check contract logs for RTMR3 and add via add_approved_rtmr3");
-                error!("   - Init account balance: Verify init-worker.outlayer.testnet has funds");
+                error!("   - No collateral for this platform: the operator caches it with scripts/update_collateral.sh");
+                error!("   - Build not approved: a DAO Call to add_approved_measurements on {}", config.operator_account_id);
+                error!("   - Init account balance: the init account pays the registration gas");
                 error!("");
                 error!("⏹️  Worker stopped - fix the issue and restart");
 
@@ -391,6 +355,7 @@ async fn main() -> Result<()> {
                 error!("❌ Failed to register TEE session with coordinator after {} attempts", MAX_TEE_RETRIES);
                 return Err(anyhow::anyhow!("TEE session registration with coordinator failed after {} attempts", MAX_TEE_RETRIES));
             }
+            spawn_coordinator_session_renewal(api_client.clone(), tee_secret_key.clone());
 
             // Register TEE session directly with keystore (bypasses coordinator proxy)
             if let Some(ref mut kc) = keystore_client {

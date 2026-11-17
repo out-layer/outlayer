@@ -128,6 +128,7 @@ async fn main() -> Result<()> {
 
     // Create API server
     let app_state = api::AppState::new(initial_keystore, config.clone(), near_client);
+    tokio::spawn(api::run_tee_session_sweeper(app_state.clone()));
 
     // The public listener is bound only once the instance can serve. The dstack gateway balances a
     // version's hostname across every instance of that app-id by first successful TCP connect, so
@@ -400,6 +401,12 @@ fn validate_master_source(e: &MasterSourceEnv) -> Result<()> {
              never valid there"
         );
     }
+    if e.use_tee_registration && !e.tee_mode_is_outlayer {
+        anyhow::bail!(
+            "USE_TEE_REGISTRATION=true requires TEE_MODE=outlayer_tee: a registration needs a real \
+             TDX quote; local development runs with TEE_MODE=none and USE_TEE_REGISTRATION=false"
+        );
+    }
     if in_tee && e.has_master_secret {
         anyhow::bail!(
             "KEYSTORE_MASTER_SECRET cannot be set in TEE mode (USE_TEE_REGISTRATION=true / \
@@ -445,6 +452,12 @@ mod master_source_tests {
     fn tee_mode_without_tee_registration_is_refused() {
         let err = validate_master_source(&env(true, false, false, false)).unwrap_err();
         assert!(err.to_string().contains("USE_TEE_REGISTRATION=true"));
+    }
+
+    #[test]
+    fn tee_registration_without_tee_mode_is_refused() {
+        let err = validate_master_source(&env(false, true, false, false)).unwrap_err();
+        assert!(err.to_string().contains("requires TEE_MODE=outlayer_tee"));
     }
 
     #[test]

@@ -147,7 +147,6 @@ pub fn verify_nep413(
     nonce: &str,
     recipient: &str,
 ) -> Result<(), String> {
-    use ed25519_dalek::Verifier;
     let signer = signer_pubkey
         .strip_prefix("ed25519:")
         .and_then(|key| bs58::decode(key).into_vec().ok())
@@ -170,7 +169,7 @@ pub fn verify_nep413(
     let payload = Nep413Payload { message: message.to_string(), nonce, recipient: recipient.to_string(), callback_url: None };
     let payload = borsh::to_vec(&payload).map_err(|_| "the statement could not be serialised".to_string())?;
     let signed = Sha256::digest([&NEP413_TAG.to_le_bytes()[..], &payload].concat());
-    signer.verify(&signed, &signature).map_err(|_| "the signature does not verify".to_string())
+    signer.verify_strict(&signed, &signature).map_err(|_| "the signature does not verify".to_string())
 }
 
 // ── the approval ────────────────────────────────────────────────────────────

@@ -145,6 +145,31 @@ impl RegistrationClient {
         Ok((public_key, secret_key))
     }
 
+    /// The measurements the stored key was registered under, as [`measurement_id`] writes them;
+    /// None for a key file that does not record them.
+    fn stored_registration(&self) -> Option<String> {
+        let contents = fs::read_to_string(Self::get_keypair_path()).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&contents).ok()?;
+        v["registered_under"].as_str().map(str::to_string)
+    }
+
+    /// Record in the key file the measurements the key was just registered under.
+    fn record_registration(&self, measurements: &str) -> Result<()> {
+        let path = Self::get_keypair_path();
+        let contents = fs::read_to_string(&path).context("Failed to read keypair file")?;
+        let mut v: serde_json::Value = serde_json::from_str(&contents).context("Failed to parse keypair JSON")?;
+        v["registered_under"] = serde_json::Value::String(measurements.to_string());
+        fs::write(&path, serde_json::to_string_pretty(&v)?).context("Failed to write keypair file")?;
+        Ok(())
+    }
+
+    /// A fresh keypair in place of the stored one.
+    fn replace_keypair(&self) -> Result<(PublicKey, SecretKey)> {
+        let (public_key, secret_key) = self.generate_keypair()?;
+        self.save_keypair(&Self::get_keypair_path(), &public_key, &secret_key)?;
+        Ok((public_key, secret_key))
+    }
+
     /// Save keypair to file
     fn save_keypair(&self, path: &Path, public_key: &PublicKey, secret_key: &SecretKey) -> Result<()> {
         // Create parent directory if it doesn't exist
@@ -457,8 +482,9 @@ impl RegistrationClient {
         }
 
         // Call register_worker_key on the register contract
-        // Note: Contract ONLY uses cached collateral (security: prevent bypass)
-        // If registration fails with "Quote collateral required", fetch collateral and cache it via update_collateral
+        // The contract verifies the quote against the collateral it caches, never one sent with
+        // the call; a platform without one is refused until the operator caches it
+        // (scripts/update_collateral.sh).
         let args = json!({
             "public_key": public_key.to_string(),
             "tdx_quote_hex": tdx_quote_hex,
@@ -572,7 +598,7 @@ pub async fn register_worker_on_startup(
     .context("Failed to create registration client")?;
 
     // Load or generate keypair
-    let (public_key, secret_key) = registration_client.load_or_generate_keypair()?;
+    let (mut public_key, mut secret_key) = registration_client.load_or_generate_keypair()?;
 
     // Check if key is already registered on the operator account
     let key_exists = registration_client
@@ -580,31 +606,43 @@ pub async fn register_worker_on_startup(
         .await
         .context("Failed to check if access key exists on operator account")?;
 
-    let tdx_quote_hex = if key_exists {
-        registration_client.check_init_balance(false).await?;
-        info!("✅ Worker key already registered on operator account - skipping registration");
-        info!("   Using existing key for signing execution results");
-
-        // Generate a TDX quote anyway for coordinator attestation (not sent to contract)
-        let report_data_prefix = report_data_binding(&public_key)?;
-
-        tdx_client
-            .generate_registration_quote(&report_data_prefix)
+    if key_exists {
+        // A stored key serves only the build it was registered under. The measurements come from
+        // this CVM's own quote (the local dstack socket, not the network): a CVM whose compose or
+        // env names changed since — other addresses, other allowed env — measures differently,
+        // and its key goes; the new key registers only if that build is approved.
+        let tdx_quote_hex = tdx_client
+            .generate_registration_quote(&report_data_binding(&public_key)?)
             .await
-            .context("Failed to generate TDX quote for coordinator")?
-    } else {
-        // Register worker key - fail fast if registration fails
-        info!("📝 Registering worker key with TDX attestation...");
+            .context("Failed to generate TDX quote for coordinator")?;
+        let now = crate::tdx_attestation::extract_all_measurements_from_quote_hex(&tdx_quote_hex)
+            .map(|m| measurement_id(&m));
+        if now.is_some() && now == registration_client.stored_registration() {
+            registration_client.check_init_balance(false).await?;
+            info!("✅ Worker key already registered on operator account, under these measurements - skipping registration");
+            return Ok((public_key, secret_key, tdx_quote_hex));
+        }
+        warn!("The stored worker key was registered under other measurements (or none recorded): it is replaced by a new key");
+        (public_key, secret_key) = registration_client.replace_keypair()?;
+    }
 
-        let (_tx_hash, tdx_quote) = registration_client
-            .register_worker_key(&public_key, tdx_client)
-            .await
-            .context("Failed to register worker key with register contract")?;
-
-        tdx_quote
-    };
+    // Register worker key - fail fast if registration fails
+    info!("📝 Registering worker key with TDX attestation...");
+    let (_tx_hash, tdx_quote_hex) = registration_client
+        .register_worker_key(&public_key, tdx_client)
+        .await
+        .context("Failed to register worker key with register contract")?;
+    let registered_under = crate::tdx_attestation::extract_all_measurements_from_quote_hex(&tdx_quote_hex)
+        .map(|m| measurement_id(&m))
+        .ok_or_else(|| anyhow::anyhow!("The registration quote carries no measurements"))?;
+    registration_client.record_registration(&registered_under)?;
 
     Ok((public_key, secret_key, tdx_quote_hex))
+}
+
+/// One build's five registers, lowercase, as the key file records them.
+fn measurement_id(m: &crate::tdx_attestation::TdxMeasurements) -> String {
+    format!("{}|{}|{}|{}|{}", m.mrtd, m.rtmr0, m.rtmr1, m.rtmr2, m.rtmr3).to_lowercase()
 }
 
 #[cfg(test)]

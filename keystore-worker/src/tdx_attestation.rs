@@ -6,6 +6,20 @@
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+/// Refuses a report_data binding that is an ed25519 key of small order: such a key has no secret,
+/// and near-crypto's verifier accepts signatures for it made without one, so a quote binding it
+/// would let anyone who obtains the quote register a key that anyone can sign for.
+pub fn refuse_small_order_binding(binding: &[u8; 32]) -> Result<()> {
+    let small = ed25519_dalek::VerifyingKey::from_bytes(binding)
+        .map(|k| k.is_weak())
+        .unwrap_or(false);
+    anyhow::ensure!(
+        !small,
+        "Refusing to quote a report_data binding that is an ed25519 key of small order"
+    );
+    Ok(())
+}
+
 // TDX Quote v4 = Header (48 bytes) + TD10 Report Body (584 bytes) + Auth Data
 // Absolute offsets for measurements within the raw quote bytes:
 const MEASUREMENT_SIZE: usize = 48; // Each measurement is 48 bytes (96 hex chars)
@@ -81,6 +95,7 @@ impl TdxClient {
         &self,
         public_key_bytes: &[u8; 32],
     ) -> Result<(String, Option<serde_json::Value>)> {
+        refuse_small_order_binding(public_key_bytes)?;
         info!("🔐 Generating registration TDX quote with embedded public key");
         info!("   Public key (hex): {}", hex::encode(public_key_bytes));
 
@@ -344,4 +359,26 @@ mod tests {
         assert!(rtmr3_events(r#"[{"imr":3,"event_type":1,"event":"x","event_payload":""}]"#).is_none());
     }
 
+}
+
+#[cfg(test)]
+mod small_order_tests {
+    use super::refuse_small_order_binding;
+
+    #[test]
+    fn a_binding_of_small_order_is_refused() {
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let mut order8 = [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98,
+            0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53,
+            0xfc, 0x05,
+        ];
+        order8[31] |= 0x80;
+        for b in [[0u8; 32], one, order8] {
+            assert!(refuse_small_order_binding(&b).is_err(), "{:02x?}", b);
+        }
+        let real = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes();
+        assert!(refuse_small_order_binding(&real).is_ok());
+    }
 }
