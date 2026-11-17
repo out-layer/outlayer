@@ -6,6 +6,8 @@
 #   T3  dao_drive (the deploy scripts' path) on an approved proposal under the delay: no execute,
 #       return code 2, and it names when the proposal executes — in send and in print mode
 #   T4  after DELAY the same proposal executes
+#   T5  the delay is the members' brake on the owner: the owner cannot cancel a SetDelay that
+#       raises it; of two approved SetDelay the newer wins — the older no longer executes after it
 # Each throwaway compose it approves is removed by the owner at the end. The delay stays DELAY
 # (RESTORE_DELAY=<seconds> proposes it back after the run; that proposal itself waits DELAY).
 #
@@ -83,6 +85,27 @@ echo "  waiting ${WAIT} s"
 sleep "$WAIT"
 exec_ "$p1" && [ "$(gov_status "$p1")" = Executed ] && composes | grep -q "$C1" \
     && ok "#$p1 executed after the delay; the compose is approved" || bad "#$p1 $(gov_status "$p1")"
+
+step "T5 SetDelay: the owner cannot hold the delay down; the newer decision wins"
+UP=$((DELAY + 60))
+older=$(propose "$M1" "{\"SetDelay\":{\"seconds\":$DELAY}}"); vote "$M2" "$older" true
+newer=$(propose "$M1" "{\"SetDelay\":{\"seconds\":$UP}}"); vote "$M2" "$newer" true
+expect_refused "raises the delay cannot be cancelled by the owner" "$OWNER" "$DAO" cancel "{\"proposal_id\":$newer}"
+AFTER=$(field "$newer" executable_after)
+WAIT=$(python3 -I -c "import time,sys; print(max(0, int(int(sys.argv[1])/1e9 - time.time()) + 10))" "$AFTER")
+echo "  waiting ${WAIT} s"
+sleep "$WAIT"
+exec_ "$newer" && [ "$(view "$DAO" get_gov_delay_sec | tr -d '\n ')" = "$UP" ] \
+    && ok "#$newer raised the delay to $UP" || bad "#$newer $(gov_status "$newer")"
+expect_refused "which already changed it" "$M3" "$DAO" execute "{\"proposal_id\":$older}" "300 Tgas"
+[ "$(view "$DAO" get_gov_delay_sec | tr -d '\n ')" = "$UP" ] && ok "the older #$older did not undo it" || bad "delay changed"
+p=$(propose "$M1" "{\"SetDelay\":{\"seconds\":$DELAY}}"); vote "$M2" "$p" true
+call "$OWNER" "$DAO" cancel "{\"proposal_id\":$p}" && [ "$(gov_status "$p")" = Cancelled ] \
+    && ok "the owner may cancel a SetDelay that lowers it (#$p)" || bad "cancel lower #$p: $(gov_status "$p")"
+p=$(propose "$M1" "{\"SetDelay\":{\"seconds\":$DELAY}}"); vote "$M2" "$p" true
+echo "  back to $DELAY: #$p, executes after $UP s"
+sleep $((UP + 10)); exec_ "$p" && [ "$(view "$DAO" get_gov_delay_sec | tr -d '\n ')" = "$DELAY" ] \
+    && ok "the delay is back to $DELAY" || bad "back: #$p $(gov_status "$p")"
 
 step "cleanup"
 for c in "$C1" "$C2"; do
