@@ -406,7 +406,9 @@ impl RegistrationClient {
         }
 
         anyhow::bail!(
-            "Measurements not approved after {} attempts. RTMR3={}. Add via: near call {} add_approved_measurements",
+            "Measurements not approved after {} attempts. RTMR3={}. A worker build is approved by the \
+             DAO: a Call proposal to add_approved_measurements on {} (scripts/deploy_tdx.sh proposes it); \
+             restart this worker once it is executed",
             MAX_ATTEMPTS, measurements.rtmr3, self.operator_account_id
         );
     }
