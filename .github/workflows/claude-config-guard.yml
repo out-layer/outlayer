@@ -1,0 +1,30 @@
+# The tree carries no Claude Code or MCP configuration. Such a file runs
+# commands on the machine of everyone who opens the repository in Claude Code
+# (hooks, MCP servers, status line, API key helper), and a gitignored or
+# freshly pushed one is never reviewed. A repository that needs one decides so
+# by changing this check in the same change.
+name: claude-config-guard
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No .claude/ or .mcp.json in the tree
+        run: |
+          found=$(git ls-files | grep -E '(^|/)(\.claude/|\.mcp\.json$)' || true)
+          if [ -n "$found" ]; then
+            echo "::error::Claude Code / MCP configuration in the tree. It executes commands on every machine that opens this repository in Claude Code."
+            printf '%s\n' "$found"
+            exit 1
+          fi
+          echo "no Claude Code / MCP configuration tracked"

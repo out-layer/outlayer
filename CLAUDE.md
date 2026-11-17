@@ -90,7 +90,7 @@ anyhow::bail!("Feature X is not supported. Please use Y instead.");
 | `self-hosted-scheduler/` | - | [Generic scheduler](https://github.com/out-layer/self-hosted-scheduler) for autonomous agents (submodule) |
 | [outlayer-cli](https://github.com/out-layer/cli) | - | CLI for deploying, running, and managing agents (separate repo) |
 | [outlayer-coordinator](https://github.com/out-layer/outlayer-coordinator) | 8080 | Task queue, WASM cache, PostgreSQL + Redis (private repo) |
-| [shared-tee-helpers](https://github.com/out-layer/shared-tee-helpers) | - | TEE challenge-response auth (private repo) |
+| [shared-tee-helpers](https://github.com/out-layer/shared-tee-helpers) | - | TEE challenge-response auth (public repo) |
 | `wasi-examples/` | - | WASI container examples (public) |
 | `connectors/` | - | Connectors: public ones in-tree (`connector-probe`, `subkey-probe`, `gmail-connector`), and each pro connector as a clone of its PRIVATE `out-layer/*-connector` repo at `connectors/<name>`, ignored by this repo (`mercury-connector`, `hyperliquid-connector`, `polymarket-connector`); not submodules, so a clone of this repo, `cargo near build reproducible-wasm` included, never needs them |
 | `docker/` | - | Worker/keystore/compiler Dockerfiles; production runs on own TDX hosts (`deploy/self-hosted-tdx`), Phala Cloud files are a supported alternative, not a dependency |
