@@ -488,16 +488,7 @@ impl KeystoreDao {
         gov_delay_sec: Option<u64>,
     ) -> Self {
         assert!(!dao_members.is_empty(), "DAO must have at least one member");
-        let gov_delay_ns = match gov_delay_sec {
-            Some(sec) => {
-                require!(
-                    sec <= governance::MAX_GOV_DELAY_SEC,
-                    format!("gov_delay_sec must be at most {}", governance::MAX_GOV_DELAY_SEC)
-                );
-                sec * 1_000_000_000
-            }
-            None => Self::default_gov_delay_ns(),
-        };
+        let gov_delay_ns = Self::initial_gov_delay_ns(gov_delay_sec);
 
         let mut members_set = UnorderedSet::new(StorageKey::DaoMembers);
         for member in dao_members.iter() {

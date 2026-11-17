@@ -263,6 +263,21 @@ impl KeystoreDao {
         LookupMap::new(StorageKey::RoleChanges)
     }
 
+    /// The delay a fresh or migrated contract starts with: `gov_delay_sec` when given (at most
+    /// `MAX_GOV_DELAY_SEC`), the account's default otherwise.
+    pub(crate) fn initial_gov_delay_ns(gov_delay_sec: Option<u64>) -> u64 {
+        match gov_delay_sec {
+            Some(sec) => {
+                require!(
+                    sec <= MAX_GOV_DELAY_SEC,
+                    format!("gov_delay_sec must be at most {}", MAX_GOV_DELAY_SEC)
+                );
+                sec * 1_000_000_000
+            }
+            None => Self::default_gov_delay_ns(),
+        }
+    }
+
     /// Delay for a fresh or migrated contract when none is given (see `MAINNET_GOV_DELAY_SEC`).
     pub(crate) fn default_gov_delay_ns() -> u64 {
         let delay_sec = if env::current_account_id().as_str().ends_with(".near") {

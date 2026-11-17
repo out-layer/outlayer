@@ -150,15 +150,17 @@ pub struct KeystoreDaoV4 {
 #[near_bindgen]
 impl KeystoreDao {
     /// Migrate V4 → V5: adds the governance state — no proposals, no pending upgrades, and
-    /// the default delay for this account (72 h on `.near`, none elsewhere; governance
-    /// changes it with `SetDelay`). Every other field is carried through verbatim.
+    /// the delay `gov_delay_sec` (at most `MAX_GOV_DELAY_SEC`), or without it the default for
+    /// this account (72 h on `.near`, none elsewhere). Governance changes it with `SetDelay`,
+    /// which itself waits out the delay in force. Every other field is carried through verbatim.
     ///
-    /// **Run once, right after deploying the V5 wasm** — until it runs, every method panics on
-    /// state deserialization. Takes no arguments: it is part of the upgrade ABI
-    /// (governance.rs), called the same way by every later upgrade.
+    /// **Run once, right after deploying the V5 wasm**, by the account's own full-access key —
+    /// until it runs, every method panics on state deserialization. Governance never calls it: a
+    /// V4 contract cannot upgrade itself, and once at V5 a governed upgrade calls the `migrate`
+    /// of the build it installs.
     #[private]
     #[init(ignore_state)]
-    pub fn migrate() -> Self {
+    pub fn migrate(gov_delay_sec: Option<u64>) -> Self {
         let old: KeystoreDaoV4 = env::state_read().expect("failed to read V4 state");
 
         Self {
@@ -185,7 +187,7 @@ impl KeystoreDao {
             revoke_proposals: old.revoke_proposals,
             // ----- v5 -----
             gov_proposals: LookupMap::new(StorageKey::GovProposals),
-            gov_delay_ns: Self::default_gov_delay_ns(),
+            gov_delay_ns: Self::initial_gov_delay_ns(gov_delay_sec),
             blobs: LookupMap::new(StorageKey::Blobs),
         }
     }

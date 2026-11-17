@@ -827,17 +827,12 @@ fn a_remote_upgrade_takes_the_gas_execute_leaves() {
 
 // ===== migration =====
 
-#[test]
-fn v4_state_migrates_to_v5_with_every_field_kept() {
-    let mut b = VMContextBuilder::new();
-    b.current_account_id(a("dao.outlayer.near")).predecessor_account_id(a("dao.outlayer.near"));
-    testing_env!(b.build());
-
+fn v4_state() -> KeystoreDaoV4 {
     let mut members = near_sdk::collections::UnorderedSet::new(StorageKey::DaoMembers);
     members.insert(&a("zavodil.near"));
     let mut keystores = near_sdk::collections::UnorderedSet::new(StorageKey::ApprovedKeystores);
     keystores.insert(&key(5));
-    let v4 = KeystoreDaoV4 {
+    KeystoreDaoV4 {
         dao_members: members,
         approval_threshold: 1,
         owner_id: a("owner.outlayer.near"),
@@ -861,10 +856,17 @@ fn v4_state_migrates_to_v5_with_every_field_kept() {
             StorageKey::VaultVersionApprovalArgs,
         ),
         revoke_proposals: near_sdk::collections::LookupMap::new(StorageKey::RevokeProposals),
-    };
-    env::state_write(&v4);
+    }
+}
 
-    let d = KeystoreDao::migrate();
+#[test]
+fn v4_state_migrates_to_v5_with_every_field_kept() {
+    let mut b = VMContextBuilder::new();
+    b.current_account_id(a("dao.outlayer.near")).predecessor_account_id(a("dao.outlayer.near"));
+    testing_env!(b.build());
+    env::state_write(&v4_state());
+
+    let d = KeystoreDao::migrate(None);
     assert_eq!(d.get_dao_members(), vec![a("zavodil.near")]);
     assert_eq!(d.get_owner(), a("owner.outlayer.near"));
     assert_eq!(d.next_proposal_id, 50);
@@ -872,6 +874,29 @@ fn v4_state_migrates_to_v5_with_every_field_kept() {
     assert!(d.approved_measurements.is_empty(), "a tuple approved one CVM; builds are OS + compose now");
     assert_eq!(d.get_collaterals(), vec!["c0".to_string(), "c1".to_string()]);
     assert_eq!(d.get_gov_delay_sec(), governance::MAINNET_GOV_DELAY_SEC, ".near starts at 72 h");
+}
+
+/// The deploy sets a shorter delay to start with; `SetDelay` raises it later. A delay above the
+/// bound is refused, as at `new`.
+#[test]
+fn migrate_takes_the_delay_it_is_given() {
+    let mut b = VMContextBuilder::new();
+    b.current_account_id(a("dao.outlayer.near")).predecessor_account_id(a("dao.outlayer.near"));
+    testing_env!(b.build());
+    env::state_write(&v4_state());
+    assert_eq!(KeystoreDao::migrate(Some(600)).get_gov_delay_sec(), 600);
+    env::state_write(&v4_state());
+    assert_eq!(KeystoreDao::migrate(Some(0)).get_gov_delay_sec(), 0);
+}
+
+#[test]
+#[should_panic(expected = "gov_delay_sec must be at most")]
+fn migrate_refuses_a_delay_above_the_bound() {
+    let mut b = VMContextBuilder::new();
+    b.current_account_id(a("dao.outlayer.near")).predecessor_account_id(a("dao.outlayer.near"));
+    testing_env!(b.build());
+    env::state_write(&v4_state());
+    KeystoreDao::migrate(Some(governance::MAX_GOV_DELAY_SEC + 1));
 }
 
 #[test]
