@@ -144,19 +144,29 @@ AUTH_FOR() { echo "Authorization: Bearer near:$(mk_token "$1")"; }
 
 # api <seed|-> <METHOD> <path> [body-json] [extra curl args…]
 # `-` as the seed sends NO Authorization header. Echoes "<http> <body>".
+#
+# Neither the credential nor the body is put on curl's command line, which
+# every process on the machine can read while curl runs: the header goes in
+# through stdin (`-H @-`), the body through a file only this user reads.
 HTTP=""; BODY=""
 api() {
   local seed=$1 method=$2 path=$3 body=${4:-}; shift 4 2>/dev/null || shift $#
-  local out http
+  local out http body_file=""
   throttle
   out=$(mktemp -t hos_api.XXXXXX)
   local -a args=(-sS -o "$out" -w '%{http_code}' -X "$method" "$COORDINATOR_URL$path" --max-time 60)
-  [[ "$seed" != "-" ]] && args+=(-H "$(AUTH_FOR "$seed")")
-  if [[ -n "$body" ]]; then args+=(-H 'Content-Type: application/json' --data-binary "$body"); fi
+  if [[ -n "$body" ]]; then
+    body_file=$(mktemp -t hos_body.XXXXXX); chmod 600 "$body_file"; printf '%s' "$body" > "$body_file"
+    args+=(-H 'Content-Type: application/json' --data-binary @"$body_file")
+  fi
   args+=("$@")
-  http=$(curl "${args[@]}" 2>/dev/null)
+  if [[ "$seed" != "-" ]]; then
+    http=$(AUTH_FOR "$seed" | curl "${args[@]}" -H @- 2>/dev/null)
+  else
+    http=$(curl "${args[@]}" 2>/dev/null)
+  fi
   HTTP="$http"; BODY="$(tr -d '\n' < "$out")"
-  rm -f "$out"
+  rm -f "$out" ${body_file:+"$body_file"}
   printf '%s %s\n' "$HTTP" "$BODY"
 }
 
@@ -172,12 +182,16 @@ api_wk() {
   local key=$1 method=$2 path=$3 body=${4:-} out http
   throttle
   out=$(mktemp -t hos_apiwk.XXXXXX)
-  local -a args=(-sS -o "$out" -w '%{http_code}' -X "$method" "$COORDINATOR_URL$path" --max-time 90
-                 -H "Authorization: Bearer $key")
-  [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
-  http=$(curl "${args[@]}" 2>/dev/null)
+  local body_file=""
+  local -a args=(-sS -o "$out" -w '%{http_code}' -X "$method" "$COORDINATOR_URL$path" --max-time 90 -H @-)
+  if [[ -n "$body" ]]; then
+    body_file=$(mktemp -t hos_body.XXXXXX); chmod 600 "$body_file"; printf '%s' "$body" > "$body_file"
+    args+=(-H 'Content-Type: application/json' --data-binary @"$body_file")
+  fi
+  # The key through stdin, never on the command line (see `api`).
+  http=$(printf 'Authorization: Bearer %s\n' "$key" | curl "${args[@]}" 2>/dev/null)
   HTTP="$http"; BODY="$(tr -d '\n' < "$out")"
-  rm -f "$out"
+  rm -f "$out" ${body_file:+"$body_file"}
   printf '%s %s\n' "$HTTP" "$BODY"
 }
 
@@ -406,14 +420,19 @@ extension_op() {
 
 # store_policy <seed> <wallet_id> <rules-json> — encrypt, sign, put on chain.
 store_policy() {
-  local seed=$1 wid=$2 pol=$3 wk=${4:-} body enc encb64 sg sig_hex pub_hex store_args hdr
+  local seed=$1 wid=$2 pol=$3 wk=${4:-} body enc encb64 sg sig_hex pub_hex store_args hdr body_file
   # The wallet's own credential, through stdin: its near: bearer for `seed`,
   # or — a 4th argument — a wk_ of that wallet.
   if [[ -n "$wk" ]]; then hdr="Authorization: Bearer $wk"; else hdr=$(AUTH_FOR "$seed"); fi
-  body=$(jq -nc --arg wid "$wid" --argjson p "$pol" '$p + {wallet_id:$wid}')
+  # The policy can carry a secret of its own (a webhook URL with its token), so
+  # it never goes on a command line: into jq through stdin, to curl through a
+  # file only this user reads (stdin already carries the credential).
+  body=$(printf '%s' "$pol" | jq -c --arg wid "$wid" '. + {wallet_id:$wid}')
+  body_file=$(mktemp -t hos_policy.XXXXXX); chmod 600 "$body_file"; printf '%s' "$body" > "$body_file"
   throttle
   enc=$(printf '%s\n' "$hdr" | curl -sS -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" --max-time 60 \
-    -H @- -H 'Content-Type: application/json' -d "$body")
+    -H @- -H 'Content-Type: application/json' --data-binary @"$body_file")
+  rm -f "$body_file"
   encb64=$(jq -r '.encrypted_base64 // empty' <<<"$enc")
   [[ -n "$encb64" ]] || { warn "encrypt-policy failed: $(head -c 200 <<<"$enc")"; return 1; }
   throttle
@@ -454,7 +473,9 @@ store_policy() {
     if near_tty "near contract call-function as-transaction $CONTRACT_ID store_wallet_policy \
       json-args '$store_args' prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \
       sign-as $PARENT network-config $NETWORK sign-with-keychain send" >/dev/null 2>&1; then
-      sleep 4
+      # STORE_POLICY_NO_SETTLE=1: return as soon as the transaction is in, for a
+      # probe that acts before a final block holds the new record.
+      [[ -n "${STORE_POLICY_NO_SETTLE:-}" ]] || sleep 4
       return 0
     fi
     warn "store_wallet_policy attempt $attempt failed"
