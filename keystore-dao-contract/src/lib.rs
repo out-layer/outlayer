@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 // Collateral wrapper for TDX verification (from register-contract)
 mod collateral;
 use collateral::Collateral;
-pub mod event_log;
+pub use dstack_event_log as event_log;
 use event_log::{EventLogEntry, RegistrationFacts};
 
 pub(crate) mod migration;

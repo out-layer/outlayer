@@ -1387,6 +1387,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0bc8fbe9441c17c9f46f75dfe27fa1ddb6c68a461ccaed0481419219d4f10d3"
 
 [[package]]
+name = "dstack-event-log"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "near-sdk",
+ "schemars 0.8.22",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2494,6 +2504,7 @@ dependencies = [
  "anyhow",
  "borsh",
  "dcap-qvl",
+ "dstack-event-log",
  "getrandom 0.2.17",
  "hex",
  "near-sdk",

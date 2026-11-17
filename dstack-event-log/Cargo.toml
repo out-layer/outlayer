@@ -1,0 +1,20 @@
+[package]
+name = "dstack-event-log"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/out-layer/outlayer"
+license = "Apache-2.0"
+description = "Replay of a dstack CVM's RTMR3 boot event log, for the contracts that register TEE keys"
+
+[features]
+# The log builders the contracts' own tests use.
+test-helpers = []
+
+[dependencies]
+near-sdk = { version = "= 5.29.0", features = ["legacy"] }
+schemars = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
+near-sdk = { version = "= 5.29.0", features = ["legacy", "unit-testing"] }

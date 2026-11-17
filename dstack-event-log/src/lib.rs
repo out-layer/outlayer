@@ -1,4 +1,4 @@
-//! What a keystore's RTMR3 says about it: the dstack boot event log, replayed.
+//! What a dstack CVM's RTMR3 says about it: the dstack boot event log, replayed.
 //!
 //! RTMR3 of a dstack CVM is not a build hash. The guest OS extends it at boot with one event per
 //! fact — the app id, the hash of the app's compose (image digests and all), the instance id of
@@ -145,12 +145,12 @@ pub fn replay(log: &[EventLogEntry]) -> Result<(String, RegistrationFacts), Stri
     ))
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod tests {
     use super::*;
 
     /// A dstack event with the digest its fields give.
-    pub(crate) fn ev(imr: u32, event: &str, payload_hex: &str) -> EventLogEntry {
+    pub fn ev(imr: u32, event: &str, payload_hex: &str) -> EventLogEntry {
         let event_type = 0x0800_0001u32;
         let mut h = Sha384::new();
         h.update(event_type.to_le_bytes());
@@ -168,7 +168,7 @@ pub(crate) mod tests {
     }
 
     /// The boot log of a keystore CVM: `compose` and `instance` vary, the rest is fixed.
-    pub(crate) fn boot_log(compose: &str, instance: &str) -> Vec<EventLogEntry> {
+    pub fn boot_log(compose: &str, instance: &str) -> Vec<EventLogEntry> {
         vec![
             ev(0, "firmware", "00"),
             ev(3, "system-preparing", ""),
@@ -183,6 +183,13 @@ pub(crate) mod tests {
             ev(3, "system-ready", ""),
         ]
     }
+
+}
+
+#[cfg(test)]
+mod unit {
+    use super::tests::{boot_log, ev};
+    use super::*;
 
     const COMPOSE: &str = "cfcba6acbf261f883b9f380c49c1401917f5f4e8c46007cf2cb027d1ddb010be";
     const INSTANCE: &str = "cf657a49d37e8cb5902c2d9b6dccb7f1a424e03d";
