@@ -29,7 +29,7 @@
 //! drops the blob and returns the deposit to whoever stored it.
 //!
 //! Upgrade ABI — called by an earlier version on a later one, so every version keeps them:
-//! `migrate()` (`#[private]`, `#[init(ignore_state)]`, no arguments) and `gov_health()`; on a
+//! `migrate()` (`#[private]`, `#[init(ignore_state)]`, called with `{}`) and `gov_health()`; on a
 //! governed contract `upgrade()` / `upgrade_and_migrate()`, the wasm as raw input.
 
 use crate::*;
@@ -250,8 +250,12 @@ impl KeystoreDao {
     /// Of two approved proposals for one role, the newer decision wins: once a proposal has
     /// changed a role, an older proposal for the same role no longer executes. Otherwise a
     /// duplicate approved earlier could be executed by a single member after the majority
-    /// decided otherwise.
+    /// decided otherwise. The delay is ordered the same way: an older approved `SetDelay` must
+    /// not undo a newer one.
     fn role_key(action: &GovAction) -> Option<String> {
+        if matches!(action, GovAction::SetDelay { .. }) {
+            return Some("set_delay".to_string());
+        }
         Self::role_of(action).map(|role| match role {
             Role::Owner => format!("set_owner:{}", env::current_account_id()),
             Role::Governed { method, target } => format!("{}:{}", method, target),
@@ -691,6 +695,16 @@ impl KeystoreDao {
         require!(
             !matches!(p.action, GovAction::RevokeOsImage { .. } | GovAction::RevokeCompose { .. }),
             "A revocation of a keystore build cannot be cancelled by the owner; members can vote it down"
+        );
+        // The delay is the members' brake on everything else, the owner's cancel included: the
+        // owner cannot keep it short.
+        let raises_the_delay = matches!(
+            p.action,
+            GovAction::SetDelay { seconds } if seconds.saturating_mul(1_000_000_000) > self.gov_delay_ns
+        );
+        require!(
+            !raises_the_delay,
+            "A proposal that raises the delay cannot be cancelled by the owner; members can vote it down"
         );
         p.status = GovStatus::Cancelled;
         self.gov_put(&p);

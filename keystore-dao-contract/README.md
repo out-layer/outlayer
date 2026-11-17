@@ -47,7 +47,8 @@ delay are the root of trust. Every governance method is for DAO members only.
 - **The owner** (`owner_id`) cannot propose, vote or execute. It cancels a
   pending or approved proposal — except one that replaces a role (`SetOwner`, or a
   `Call` to `set_owner` / `set_governance` / `set_operator` on a governed
-  contract), which members can only vote down — takes a keystore's guest OS, compose or measurements
+  contract), one that revokes a keystore build, or a `SetDelay` that raises the delay,
+  which members can only vote down — takes a keystore's guest OS, compose or measurements
   off the approved lists without a vote, keeps
   the Intel collateral current, rejects a pending keystore registration, and deletes
   keystore registrations that have been pending for more than 48 h.
@@ -91,7 +92,7 @@ variant is never changed or removed — a later version adds `V2` and keeps
 reading `V1` — so every version reads what earlier ones wrote, and the DAO
 upgrades itself whatever is open.
 
-Every version keeps `migrate()` (no arguments) and `gov_health()`: an earlier
+Every version keeps `migrate()` (called with `{}`) and `gov_health()`: an earlier
 version calls them on a later one. `GovProposal` and `GovAction` are `V1`'s
 shape and do not change.
 
@@ -369,8 +370,9 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 - `new(owner_id, init_account_id, dao_members, mpc_contract_id, gov_delay_sec?)`
   — `dao_members` must be non-empty; `gov_delay_sec` defaults to 72 h on a
   `.near` account and 0 elsewhere.
-- `migrate()` — `#[private]`; reads the previous state layout and adds the
-  governance state (no proposals, no blobs, the default delay). Run once after
+- `migrate(gov_delay_sec?)` — `#[private]`; reads the previous state layout and adds the
+  governance state (no proposals, no blobs; the delay `gov_delay_sec`, or the default
+  without it). `SetDelay` changes the delay afterwards. Run once after
   deploying a build whose state layout changed; until then every method panics
   on deserialization.
 
@@ -378,7 +380,8 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 - `cancel(proposal_id)` — a pending or approved governance proposal, not one
   that replaces the owner or the governance (`SetOwner`, a `Call` to `set_owner` /
-  `set_governance`).
+  `set_governance`), revokes a keystore build, or raises the delay. Of two approved
+  `SetDelay` proposals the newer wins: an older one no longer executes after it.
 - `remove_approved_os_image(image)`, `remove_approved_compose(compose_hash)` —
   registered keystores keep their keys; revoke those with
   `propose_revoke_keystore_keys`.

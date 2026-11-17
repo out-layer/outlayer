@@ -697,6 +697,39 @@ fn collateral_above_the_bound_is_refused() {
 // ===== roles: the newer decision wins =====
 
 #[test]
+#[should_panic(expected = "which already changed it")]
+fn an_older_delay_change_does_not_undo_a_newer_one() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    let older = d.propose(GovAction::SetDelay { seconds: 0 });
+    let newer = d.propose(GovAction::SetDelay { seconds: 259_200 });
+    let _ = d.execute(newer);
+    assert_eq!(d.get_gov_delay_sec(), 259_200);
+    let _ = d.execute(older);
+}
+
+#[test]
+#[should_panic(expected = "raises the delay cannot be cancelled by the owner")]
+fn the_owner_cannot_cancel_a_raise_of_the_delay() {
+    let mut d = dao(&["m1.testnet", "m2.testnet"], 600);
+    at(a("m1.testnet"), 0);
+    let p = d.propose(GovAction::SetDelay { seconds: 259_200 });
+    at(a("owner.testnet"), 0);
+    d.cancel(p);
+}
+
+#[test]
+fn the_owner_cancels_a_delay_that_does_not_rise() {
+    let mut d = dao(&["m1.testnet", "m2.testnet"], 600);
+    at(a("m1.testnet"), 0);
+    let lower = d.propose(GovAction::SetDelay { seconds: 0 });
+    let same = d.propose(GovAction::SetDelay { seconds: 600 });
+    at(a("owner.testnet"), 0);
+    d.cancel(lower);
+    d.cancel(same);
+}
+
+#[test]
 fn an_older_approved_owner_change_does_not_execute_after_a_newer_one() {
     let mut d = dao(&["m1.testnet"], 0);
     at(a("m1.testnet"), 0);
