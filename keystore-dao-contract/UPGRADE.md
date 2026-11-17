@@ -11,7 +11,8 @@ steps for all of them:
 
 No account holds a key that can deploy code. A release reaches a contract only as an `Upgrade`
 proposal that names the sha256 of its wasm; members vote on that hash and one of them executes
-it after the delay (72 h on mainnet, 0 on testnet).
+it after the delay (72 h on mainnet by default; `get_gov_delay_sec` tells the delay in force —
+600 s on testnet since 2026-11-17).
 
 ## 1. A clean committed tree
 
@@ -94,10 +95,47 @@ near contract call-function as-read-only dao.outlayer.near get_blob json-args '{
 
 A hash nobody else can rebuild is a reason to vote against.
 
+### The code on an account, rebuilt from its commit
+
+The hash covers the commit: the build writes the repository and the commit into the wasm
+(NEP-330), so two commits give two hashes even when the contract's source is the same. Build the
+commit the code names, never your own `HEAD`.
+
+1. The commit the account's code was built from — its `source_code_snapshot` (`…?rev=<commit>`):
+
+   ```bash
+   near contract call-function as-read-only dao.outlayer.testnet contract_source_metadata json-args '{}' network-config testnet now
+   ```
+
+2. Build that commit in a separate worktree, which leaves your checkout as it is:
+
+   ```bash
+   git fetch origin
+   git worktree add --detach ~/check-build <commit>   # a NEW folder with that commit; refuses a folder that exists
+   (cd ~/check-build/keystore-dao-contract && cargo near build reproducible-wasm)
+   git worktree remove --force ~/check-build          # deletes that folder only; --force for the build's target/
+   ```
+
+   Your own checkout, its branches and uncommitted changes are not touched: `worktree remove`
+   refuses the main working tree, and a path that is not a worktree.
+
+3. Compare. near-cli shows the account's code as the **hex** sha256, the build prints both forms:
+
+   ```bash
+   near account view-account-summary dao.outlayer.testnet network-config testnet now   # "Contract (SHA-256 checksum hex)"
+   ```
+
+   The build's `SHA-256 checksum hex` equals it: the code on chain is that commit. A difference
+   means another commit, or a build not from that commit's clean tree.
+
+Example, 2026-11-17: `dao.outlayer.testnet` names `b4d277b`; its build gives hex
+`57f533f1aa202a53…` (bs58 `6vML3jVt…`), the hex near-cli shows for the account. The same source
+built at the next commits gives `6P3UWC79…` (`9133e0c`) and `4yCoCTYz…` (`ee2746d`).
+
 ## 6. Check
 
 ```bash
-near account view-account-summary dao.outlayer.testnet network-config testnet now     # code hash = the bs58 of step 2
+near account view-account-summary dao.outlayer.testnet network-config testnet now     # its hex = the hex of step 2
 near contract call-function as-read-only dao.outlayer.testnet gov_health json-args '{}' network-config testnet now
 near contract call-function as-read-only outlayer.testnet get_storage_version json-args '{}' network-config testnet now   # main contract: the release's version
 ```
