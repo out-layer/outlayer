@@ -182,7 +182,7 @@ prepare_and_store_policy() {
 coord_count() { # coord_count <fixed-string> — this run's coordinator log lines holding it
   local since=$(( $(date +%s) - RUN_START + 120 ))
   ssh -o ConnectTimeout=15 -o BatchMode=yes -o ControlMaster=no -o ControlPath=none "$COORD_SSH" \
-    "docker logs offchainvm-coordinator-testnet --since ${since}s 2>&1 | grep -F -- $(printf '%q' "$1") | wc -l" 2>/dev/null | tr -d ' \n'
+    "docker logs ${COORD_CONTAINER:-outlayer-testnet-api-coordinator-1} --since ${since}s 2>&1 | grep -F -- $(printf '%q' "$1") | wc -l" 2>/dev/null | tr -d ' \n'
 }
 synced_by_worker() { # synced_by_worker <wallet_id>
   local wid=$1 got="" i synced lazy

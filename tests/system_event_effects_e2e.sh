@@ -69,7 +69,7 @@ FUND="${FUND:-0.05}"
 SEND_YOCTO="1000000000000000000000"       # 0.001 NEAR
 ONLY="${ONLY:-}"
 COORD_SSH="${COORD_SSH:?COORD_SSH unset — put it in .env.nodes at the repo root}"
-COORD_CONTAINER="${COORD_CONTAINER:-offchainvm-coordinator-testnet}"
+COORD_CONTAINER="${COORD_CONTAINER:-outlayer-testnet-api-coordinator-1}"
 WORKER_SSH="${WORKER_SSH:-${DAL_HOST:+root@$DAL_HOST}}"
 : "${WORKER_SSH:?WORKER_SSH unset — put DAL_HOST in .env.nodes at the repo root}"
 WORKER_CVM="${WORKER_CVM:-testnet-worker-0178-1}"

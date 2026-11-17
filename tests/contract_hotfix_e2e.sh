@@ -63,7 +63,7 @@
 #   PSQL_CMD   a command taking one SELECT (coordinator DB)       — C4, bookkeeping, C1b legacy scan
 #   REDIS_CMD  a command taking redis-cli arguments (TTL/EXISTS/GET) — cache rows
 #   COORD_SSH  ssh target whose `docker logs $COORD_CONTAINER` is read
-#              (from .env.nodes; container default offchainvm-coordinator-testnet)
+#              (from .env.nodes; container default outlayer-testnet-api-coordinator-1)
 #   PAYMENT_KEY  OWNER_A's funded payment key (`owner:nonce:secret`) — the /call half
 #
 # Money: two FastFS uploads (~500 KB + ~65 KB), ~27 refused transactions (gas
@@ -89,7 +89,7 @@ OWNER_B="${OWNER_B:-a02.zt0.testnet}"
 DEPOSIT="${DEPOSIT:-0.1 NEAR}"
 REDIS_CMD="${REDIS_CMD:-}"
 COORD_SSH="${COORD_SSH:-}"
-COORD_CONTAINER="${COORD_CONTAINER:-offchainvm-coordinator-testnet}"
+COORD_CONTAINER="${COORD_CONTAINER:-outlayer-testnet-api-coordinator-1}"
 PAYMENT_KEY="${PAYMENT_KEY:-}"
 KEEP="${KEEP:-0}"
 RUN_START=$(date +%s)

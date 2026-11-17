@@ -75,7 +75,7 @@ PROJECT="${PROJECT:-$PARENT/test-secrets}"
 # test is what the enclave measures and not what a regex does in isolation.
 MATCHER="pat.$PARENT"
 PREFIX_TRAP="xpat.$PARENT"
-SUFFIX_TRAP="sub.pat.$PARENT"
+SUFFIX_TRAP="${SUFFIX_TRAP:-sub.pat.$PARENT}"
 # The pattern as an owner would write it: an exact account, dots escaped.
 PATTERN="pat\\.$(sed 's/\./\\./g' <<<"$PARENT")"
 
@@ -115,6 +115,9 @@ make_account() { # make_account <name> <parent> <amount>
   if account_is_on_chain "$1"; then note "$1 is already there"; return 0; fi
   local signer=with-keychain attempt
   [[ "$2" != "$PARENT" ]] && signer=with-legacy-keychain
+  # A key file for an account that is not on chain is what a failed create left behind;
+  # near-cli never overwrites it, so the account made now would keep a key nobody holds.
+  rm -f "$HOME/.near-credentials/$NETWORK/$1.json"
   # Two attempts: a parent made a moment ago by the line above may not yet
   # sign (its key and nonce are read from a node that has not caught up).
   for attempt in 1 2; do
@@ -135,7 +138,7 @@ if [[ -z "$PROJECT_VIEW" || "$PROJECT_VIEW" == "null" || "$PROJECT_VIEW" == "ERR
 fi
 note "project: $PROJECT"
 
-make_account "$MATCHER"     "$PARENT"  '1 NEAR'
+make_account "$MATCHER"     "$PARENT"  '2 NEAR'
 make_account "$PREFIX_TRAP" "$PARENT"  '1 NEAR'
 make_account "$SUFFIX_TRAP" "$MATCHER" '1 NEAR'
 

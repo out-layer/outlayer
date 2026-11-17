@@ -6,14 +6,15 @@
 # Exercises the EVM signing surface end-to-end (coordinator → keystore) with a
 # fresh, UNFUNDED wallet — no on-chain funds, no broadcast, read/sign only:
 #   1. one shared EVM address across all EVM chains (ethereum == polygon == base)
-#   2. POST /wallet/v1/evm/sign-typed-data  (EIP-712 v4) → 65-byte r‖s‖v sig
-#   3. POST /wallet/v1/evm/sign-message     (EIP-191)    → 65-byte r‖s‖v sig
-#   4. POST /wallet/v1/evm/sign-transaction (raw tx)     → 65-byte r‖s‖v sig
+#   2. POST /wallet/v1/evm/sign-typed-data  (EIP-712 v4) → a 65-byte r‖s‖v sig
+#   3. POST /wallet/v1/evm/sign-message     (EIP-191)    → a 65-byte r‖s‖v sig
+#   4. POST /wallet/v1/evm/sign-transaction (raw tx)     → a 65-byte r‖s‖v sig
 #      (a no-policy wallet is unrestricted, so raw-tx is allowed here)
+#   Each signature is checked against the wallet's own address: ecrecover over the EIP-712
+#   digest, the EIP-191 digest and keccak256 of the unsigned typed tx must give the address of
+#   test 1, and the same signature over a changed payload must not (tests/lib/sig_verify.py).
 #
 # NOT covered here (covered elsewhere, no extra infra needed):
-#   - ecrecover(signature) == derived address — proven by the keystore unit
-#     tests crypto.rs::evm_eip191/eip712/raw_transaction_sign_and_verify.
 #   - evm_sign / evm_sign.raw_tx capability GATING — proven by the
 #     shared-tee-helpers unit test
 #     wallet_policy.rs::evm_sign_capability_defaults_and_raw_tx_subflag.
@@ -87,6 +88,26 @@ assert_evm_sig() {
     else
         echo -e "  ${RED}FAIL${NC} $name (not 0x + 130 hex: ${sig:0:24}...)"
         FAILED=$((FAILED + 1))
+    fi
+}
+
+# assert_signed_by <kind> <address> <signature> <payload> <changed-payload> <name>: the signature
+# is the wallet's own — it recovers (EVM) or verifies (ed25519) to <address> over <payload>
+# (tests/lib/sig_verify.py) — and the same signature over <changed-payload> is NOT, so a check
+# that passes anything cannot pass here.
+SIG_VERIFY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/sig_verify.py"
+assert_signed_by() {
+    local kind="$1" addr="$2" sig="$3" payload="$4" changed="$5" name="$6" out
+    TOTAL=$((TOTAL + 1))
+    if ! out=$(python3 -I "$SIG_VERIFY" "$kind" "$addr" "$sig" "$payload" 2>&1); then
+        echo -e "  ${RED}FAIL${NC} $name — not the wallet's signature: $out"
+        FAILED=$((FAILED + 1))
+    elif python3 -I "$SIG_VERIFY" "$kind" "$addr" "$sig" "$changed" >/dev/null 2>&1; then
+        echo -e "  ${RED}FAIL${NC} $name — the check passed a changed payload too: it proves nothing"
+        FAILED=$((FAILED + 1))
+    else
+        echo -e "  ${GREEN}PASS${NC} $name ($out; a changed payload does not verify)"
+        PASSED=$((PASSED + 1))
     fi
 }
 
@@ -175,7 +196,10 @@ TYPED_BODY='{
 }'
 parse_response "$(curl_post "/wallet/v1/evm/sign-typed-data" "$TYPED_BODY")"
 assert_status "200" "$RESP_CODE" "POST /evm/sign-typed-data"
-assert_evm_sig "$(echo "$RESP_BODY" | jq -r '.signature')" "EIP-712 signature shape"
+SIG=$(echo "$RESP_BODY" | jq -r '.signature')
+assert_evm_sig "$SIG" "EIP-712 signature shape"
+assert_signed_by eip712 "$EVM_ADDR" "$SIG" "$(jq -c '.typed_data' <<<"$TYPED_BODY")" \
+    "$(jq -c '.typed_data.message.contents = "Hello, Eve!"' <<<"$TYPED_BODY")" "EIP-712 signature is the wallet's"
 echo ""
 
 # ============================================================================
@@ -185,7 +209,9 @@ echo ""
 echo "3. POST /wallet/v1/evm/sign-message (EIP-191)"
 parse_response "$(curl_post "/wallet/v1/evm/sign-message" '{"chain":"polygon","message":"Sign in to Polymarket"}')"
 assert_status "200" "$RESP_CODE" "POST /evm/sign-message"
-assert_evm_sig "$(echo "$RESP_BODY" | jq -r '.signature')" "EIP-191 signature shape"
+SIG=$(echo "$RESP_BODY" | jq -r '.signature')
+assert_evm_sig "$SIG" "EIP-191 signature shape"
+assert_signed_by eip191 "$EVM_ADDR" "$SIG" "Sign in to Polymarket" "Sign in to Polymarket!" "EIP-191 signature is the wallet's"
 echo ""
 
 # ============================================================================
@@ -200,7 +226,9 @@ UNSIGNED_TX="0x02f86c0180843b9aca00851bf08eb00082520894ababababababababababababa
 TX_BODY=$(printf '{"chain":"polygon","unsigned_tx":"%s"}' "$UNSIGNED_TX")
 parse_response "$(curl_post "/wallet/v1/evm/sign-transaction" "$TX_BODY")"
 assert_status "200" "$RESP_CODE" "POST /evm/sign-transaction (no policy ⇒ raw-tx unrestricted)"
-assert_evm_sig "$(echo "$RESP_BODY" | jq -r '.signature')" "raw-tx signature shape"
+SIG=$(echo "$RESP_BODY" | jq -r '.signature')
+assert_evm_sig "$SIG" "raw-tx signature shape"
+assert_signed_by evmtx "$EVM_ADDR" "$SIG" "$UNSIGNED_TX" "${UNSIGNED_TX%c0}c1" "raw-tx signature is the wallet's"
 echo ""
 
 # Capability gating (evm_sign disabled / raw_tx default-OFF) requires an

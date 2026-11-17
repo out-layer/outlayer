@@ -31,7 +31,7 @@
 # the `outlayer` CLI logged in on testnet (pays the FastFS uploads); near,
 # outlayer, jq, curl, shasum, cargo + wasm-tools (the build). The RPC is keyed
 # through tests/lib/rpc.sh. COORD_SSH (from .env.nodes) and
-# COORD_CONTAINER (default offchainvm-coordinator-testnet): the coordinator log
+# COORD_CONTAINER (default outlayer-testnet-api-coordinator-1): the coordinator log
 # V reads; unreadable → that half SKIPS, loudly.
 #
 # Money: four FastFS uploads (~300 KB each), three projects (A and B stay for
@@ -58,7 +58,7 @@ DEPOSIT="${DEPOSIT:-0.1 NEAR}"
 NAME_A="${NAME_A:-storage-scope-a}"
 NAME_B="${NAME_B:-storage-scope-b}"
 COORD_SSH="${COORD_SSH:-}"
-COORD_CONTAINER="${COORD_CONTAINER:-offchainvm-coordinator-testnet}"
+COORD_CONTAINER="${COORD_CONTAINER:-outlayer-testnet-api-coordinator-1}"
 PROBE_DIR="$REPO_ROOT/wasi-examples/signing-key-probe"
 VARIANTS="$PROBE_DIR/target/variants"
 BUILDS="encryption-storage encryption-storage-pred project-misspelled"
@@ -95,8 +95,17 @@ set_for() { printf -v "$(var_name "$1" "$2")" '%s' "$3"; }
 get_for() { local n; n=$(var_name "$1" "$2"); printf '%s' "${!n:-}"; }
 
 call() { # call <signer> <method> <args-json> <deposit> — the whole transcript
-  near contract call-function as-transaction "$CONTRACT_ID" "$2" json-args "$3" \
-    prepaid-gas '300.0 Tgas' attached-deposit "$4" sign-as "$1" network-config "$NETWORK" sign-with-legacy-keychain send 2>&1
+  # A nonce refusal means the transaction never reached a block: near-cli read the key's nonce
+  # from a node that had not seen this key's previous transaction yet. Sent again, it is the
+  # same call, not a second one.
+  local out attempt
+  for attempt in 1 2 3; do
+    out=$(near contract call-function as-transaction "$CONTRACT_ID" "$2" json-args "$3" \
+      prepaid-gas '300.0 Tgas' attached-deposit "$4" sign-as "$1" network-config "$NETWORK" sign-with-legacy-keychain send 2>&1)
+    grep -qE 'must be account\[access_key\]\.nonce|Transaction has expired' <<<"$out" || break
+    sleep 3
+  done
+  printf '%s\n' "$out"
 }
 succeeded() { grep -q 'succeeded' <<<"$1"; }
 why_of() { near_why "$1"; }

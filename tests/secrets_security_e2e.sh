@@ -399,9 +399,12 @@ else
   else
     fail "N1 the send failed without the contract refusing it: $(near_why "$TRY_OUT")"
   fi
-  [[ "$(row_of "$PROJECT" "$ROW")" == "$BEFORE" ]] \
-    && pass "N1 and the row is byte-identical" \
-    || fail "N1 the row changed under a refused update"
+  AFTER=$(row_of "$PROJECT" "$ROW")
+  if [[ "$AFTER" == "$BEFORE" ]]; then
+    pass "N1 and the row is byte-identical"
+  else
+    fail "N1 the row changed under a refused update: $(diff <(jq -S . <<<"$BEFORE") <(jq -S . <<<"$AFTER") | grep -E '^[<>]' | head -6 | tr '\n' ' ' | head -c 400)"
+  fi
 fi
 
 fi

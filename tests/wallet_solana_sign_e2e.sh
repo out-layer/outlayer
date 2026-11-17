@@ -12,10 +12,11 @@
 #   4. POST /wallet/v1/solana/sign-transaction with the same bytes → 64-byte
 #      base58 sig (a no-policy wallet is unrestricted, so raw-tx is allowed)
 #
+#   Each signature is checked against the wallet's own address: ed25519 over the exact message
+#   bytes with the key test 1 returned, and the same signature over changed bytes must not
+#   verify (tests/lib/sig_verify.py).
+#
 # NOT covered here (covered elsewhere, no extra infra needed):
-#   - byte-exact signature == @solana/web3.js/nacl over the same key — proven
-#     by the keystore unit test
-#     solana.rs::signatures_match_solana_tooling_byte_for_byte (pinned vectors).
 #   - solana_sign / solana_sign.raw_tx capability GATING — proven by the
 #     shared-tee-helpers unit test
 #     wallet_policy.rs::solana_sign_capability_defaults_and_raw_tx_subflag.
@@ -109,6 +110,26 @@ assert_solana_sig() {
     fi
 }
 
+# assert_signed_by <kind> <address> <signature> <payload> <changed-payload> <name>: the signature
+# is the wallet's own — it recovers (EVM) or verifies (ed25519) to <address> over <payload>
+# (tests/lib/sig_verify.py) — and the same signature over <changed-payload> is NOT, so a check
+# that passes anything cannot pass here.
+SIG_VERIFY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/sig_verify.py"
+assert_signed_by() {
+    local kind="$1" addr="$2" sig="$3" payload="$4" changed="$5" name="$6" out
+    TOTAL=$((TOTAL + 1))
+    if ! out=$(python3 -I "$SIG_VERIFY" "$kind" "$addr" "$sig" "$payload" 2>&1); then
+        echo -e "  ${RED}FAIL${NC} $name — not the wallet's signature: $out"
+        FAILED=$((FAILED + 1))
+    elif python3 -I "$SIG_VERIFY" "$kind" "$addr" "$sig" "$changed" >/dev/null 2>&1; then
+        echo -e "  ${RED}FAIL${NC} $name — the check passed a changed payload too: it proves nothing"
+        FAILED=$((FAILED + 1))
+    else
+        echo -e "  ${GREEN}PASS${NC} $name ($out; a changed payload does not verify)"
+        PASSED=$((PASSED + 1))
+    fi
+}
+
 curl_get() {
     curl -s -w "\n%{http_code}" -H "Authorization: Bearer $API_KEY" "${COORDINATOR_URL}$1"
 }
@@ -176,12 +197,17 @@ SIWS_MSG="example.com wants you to sign in with your Solana account:\n${SOL_ADDR
 MSG_BODY=$(printf '{"chain":"solana","message":"%s"}' "$SIWS_MSG")
 parse_response "$(curl_post "/wallet/v1/solana/sign-message" "$MSG_BODY")"
 assert_status "200" "$RESP_CODE" "POST /solana/sign-message (utf8)"
-assert_solana_sig "$(echo "$RESP_BODY" | jq -r '.signature')" "utf8 message signature shape"
+SIG=$(echo "$RESP_BODY" | jq -r '.signature')
+assert_solana_sig "$SIG" "utf8 message signature shape"
+MSG_HEX=$(jq -j '.message' <<<"$MSG_BODY" | xxd -p | tr -d '\n')
+assert_signed_by solana "$SOL_ADDR" "$SIG" "$MSG_HEX" "${MSG_HEX}00" "utf8 message signature is the wallet's"
 
 # Alias request: response `chain` must be canonicalized to `solana`.
 parse_response "$(curl_post "/wallet/v1/solana/sign-message" '{"chain":"sol","message":"deadbeef","encoding":"hex"}')"
 assert_status "200" "$RESP_CODE" "POST /solana/sign-message (hex, chain=sol)"
-assert_solana_sig "$(echo "$RESP_BODY" | jq -r '.signature')" "hex message signature shape"
+SIG=$(echo "$RESP_BODY" | jq -r '.signature')
+assert_solana_sig "$SIG" "hex message signature shape"
+assert_signed_by solana "$SOL_ADDR" "$SIG" "deadbeef" "deadbeee" "hex message signature is the wallet's"
 assert_equals "solana" "$(echo "$RESP_BODY" | jq -r '.chain')" "response chain canonicalized (sol → solana)"
 
 # Unknown encoding must be rejected, not sniffed.
@@ -220,7 +246,10 @@ echo "4. POST /wallet/v1/solana/sign-transaction (same bytes, no-policy wallet)"
 TX_BODY=$(printf '{"chain":"solana","unsigned_tx":"%s"}' "$TX_MSG_B64")
 parse_response "$(curl_post "/wallet/v1/solana/sign-transaction" "$TX_BODY")"
 assert_status "200" "$RESP_CODE" "POST /solana/sign-transaction (no policy ⇒ raw-tx unrestricted)"
-assert_solana_sig "$(echo "$RESP_BODY" | jq -r '.signature')" "tx signature shape"
+SIG=$(echo "$RESP_BODY" | jq -r '.signature')
+assert_solana_sig "$SIG" "tx signature shape"
+TX_HEX=$(base64 -d <<<"$TX_MSG_B64" | xxd -p | tr -d '\n')
+assert_signed_by solana "$SOL_ADDR" "$SIG" "$TX_HEX" "${TX_HEX%00}01" "tx signature is the wallet's (over the message bytes)"
 echo ""
 
 # Capability gating (solana_sign disabled / raw_tx default-OFF) requires an
