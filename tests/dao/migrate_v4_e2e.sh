@@ -13,7 +13,7 @@
 #
 # Get V4_WASM with `near contract download-wasm regular dao.outlayer.near save-to-file <path>
 # network-config mainnet now` (a read). NEW_WASM defaults to the built release DAO wasm.
-# FUNDER (default outlayer-elena.testnet) funds the account with 7.5 NEAR; it is deleted at the
+# FUNDER (default outlayer-elena.testnet) funds the account with 9 NEAR; it is deleted at the
 # end, the balance back to FUNDER.
 [ "${1:-}" = "--apply" ] || { sed -n 2,18p "$0"; exit 0; }
 shift
@@ -32,7 +32,7 @@ echo "  V4 wasm $(wasm_hash "$V4_WASM"), new wasm $(wasm_hash "$NEW_WASM"), acco
 cfg() { view "$ACC" get_config | python3 -I -c "import sys,json; print(json.load(sys.stdin).get('$1'))"; }
 
 step "M1 a V4 DAO"
-near account create-account fund-myself "$ACC" '7.5 NEAR' autogenerate-new-keypair save-to-legacy-keychain \
+near account create-account fund-myself "$ACC" '9 NEAR' autogenerate-new-keypair save-to-legacy-keychain \
     sign-as "$FUNDER" network-config "$NETWORK" sign-with-legacy-keychain send >/dev/null 2>&1 \
     || { bad "could not create $ACC"; summary; exit 1; }
 INIT=$(python3 -I -c 'import json,sys; print(json.dumps({"owner_id":sys.argv[1],"init_account_id":sys.argv[1],"dao_members":[sys.argv[1]],"mpc_contract_id":"v1.signer-prod.testnet"}))' "$FUNDER")
@@ -42,6 +42,11 @@ if near contract deploy "$ACC" use-file "$V4_WASM" with-init-call new json-args 
 else
     bad "the V4 deploy failed"
 fi
+# One approved measurement tuple, as the 20 on mainnet: V4 approved builds this way.
+M_A=$(python3 -I -c 'print("a"*96)')
+call "$FUNDER" "$ACC" add_approved_measurements "{\"measurements\":{\"mrtd\":\"$M_A\",\"rtmr0\":\"$M_A\",\"rtmr1\":\"$M_A\",\"rtmr2\":\"$M_A\",\"rtmr3\":\"$M_A\"}}" \
+    && [ "$(cfg approved_measurements_count)" = 1 ] && ok "V4: one measurement tuple approved by the owner" \
+    || bad "V4 add_approved_measurements: $(printf '%s' "$LAST_OUT" | grep -aE 'panicked|Error\(' | head -1 | cut -c1-200)"
 V4_NEXT=$(cfg next_proposal_id); V4_THR=$(cfg approval_threshold)
 [ "$(cfg dao_members_count)" = 1 ] && [ "$(cfg owner_id)" = "$FUNDER" ] \
     && ok "V4 config: 1 member, owner $FUNDER, next proposal $V4_NEXT" || bad "V4 config: $(view "$ACC" get_config | tr -d '\n ')"
@@ -66,13 +71,20 @@ fi
 [ "$(cfg next_proposal_id)" = "$V4_NEXT" ] && [ "$(cfg approval_threshold)" = "$V4_THR" ] \
     && [ "$(cfg init_account_id)" = "$FUNDER" ] && [ "$(cfg mpc_contract_id)" = "v1.signer-prod.testnet" ] \
     && ok "proposal counter, threshold, init account and MPC contract kept" || bad "config: $(view "$ACC" get_config | tr -d '\n ')"
-[ "$(cfg approved_measurements_count)" = 0 ] && ok "approved measurements emptied (builds are OS + compose now)" \
-    || bad "measurements left: $(cfg approved_measurements_count)"
+# V5 approves a build as OS + compose, and has none yet: a keystore registers only after both
+# are approved by vote.
+[ "$(cfg approved_os_images_count)" = 0 ] && [ "$(cfg approved_composes_count)" = 0 ] \
+    && ok "no build approved after the migration: OS images 0, composes 0" \
+    || bad "approved after migrate: os $(cfg approved_os_images_count), composes $(cfg approved_composes_count)"
 view "$ACC" gov_health >/dev/null && ok "gov_health answers" || bad "gov_health"
 
 step "M3 migrate runs once"
 expect_refused "Method migrate is private" "$STRANGER" "$ACC" migrate '{}' "300 Tgas"
-expect_refused "failed to read V4 state" "$ACC" "$ACC" migrate "{\"gov_delay_sec\":0}" "300 Tgas"
+if call "$ACC" "$ACC" migrate "{\"gov_delay_sec\":0}" "300 Tgas"; then
+    bad "migrate ran a second time"
+else
+    ok "a second migrate by the account itself is refused: $(printf '%s' "$LAST_OUT" | grep -aoE 'Smart contract panicked: [^"]*|ExecutionError\([^)]*' | head -1 | cut -c1-160)"
+fi
 [ "$(view "$ACC" get_gov_delay_sec | tr -d '\n ')" = "$DELAY" ] && ok "the delay is still $DELAY" || bad "delay changed"
 
 step "M4 governance on the migrated state"
