@@ -362,6 +362,30 @@ fn a_key_the_quote_does_not_carry_is_refused() {
     assert_refused(|| { submit(&mut d, &made_up, &f.quote, f.events.clone()); }, "Public key mismatch");
 }
 
+/// A key of small order has no secret, and near-crypto's verifier accepts signatures for it made
+/// without one: refused before the quote is read, whatever quote binds it.
+#[test]
+fn a_key_of_small_order_is_refused() {
+    let mut d = dao();
+    let f = dal();
+    let mut order8 = [
+        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
+        0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
+    ];
+    order8[31] |= 0x80;
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    for bytes in [[0u8; 32], one, order8] {
+        let k = PublicKey::from_parts(CurveType::ED25519, bytes.to_vec()).unwrap();
+        assert_refused(|| { submit(&mut d, &k, &f.quote, f.events.clone()); }, "small order");
+        assert_refused(|| { submit(&mut d, &k, "00", f.events.clone()); }, "small order");
+    }
+    assert!(d.get_proposals(0, 100).is_empty());
+    // The fixture's own key still registers.
+    submit(&mut d, &f.key, &f.quote, f.events.clone());
+    assert_eq!(d.get_proposals(0, 100).len(), 1);
+}
+
 // ===== the event log =====
 
 #[test]

@@ -548,6 +548,7 @@ impl KeystoreDao {
             "Only {} can submit registrations",
             self.init_account_id
         );
+        require_key_has_a_secret(&public_key);
 
         // Check if already approved
         assert!(
@@ -1826,6 +1827,19 @@ impl KeystoreDao {
     }
 }
 
+/// An ed25519 key of small order has no secret key, and a cofactorless verifier (near-crypto's)
+/// accepts signatures for it that need no secret: such a key is never added to the account,
+/// whatever quote binds it.
+fn require_key_has_a_secret(public_key: &PublicKey) {
+    if public_key.curve_type() == CurveType::ED25519 {
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&public_key.as_bytes()[1..33]);
+        require!(
+            !ed25519_small_order::is_small_order(&b),
+            "Refused: an ed25519 key of small order has no secret key"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

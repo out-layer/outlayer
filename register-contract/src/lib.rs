@@ -200,6 +200,11 @@ impl RegisterContract {
             "Only {} can call register_worker_key",
             self.init_worker_account
         );
+        require_key_has_a_secret(&public_key);
+        require!(
+            !removed_keys().contains(&env::sha256_array(public_key.as_bytes())),
+            "Refused: this key was removed from the worker account; a worker registers a new key"
+        );
 
         // Use ONLY cached collateral(s) (security: prevent custom collateral bypass).
         let collaterals = self.collaterals.clone();
@@ -436,9 +441,16 @@ impl RegisterContract {
         self.assert_governance();
         Self::validate_measurements(&measurements);
         let measurements = measurements.lowercase();
+        require!(
+            !removed_builds().contains(&build_id(&measurements)),
+            "Refused: this build was removed, and a removed build is not approved again; approve a new build"
+        );
 
         if clear_others.unwrap_or(false) {
             let count = self.approved_measurements.len();
+            for m in self.approved_measurements.iter().filter(|m| **m != measurements) {
+                removed_builds().insert(&build_id(m));
+            }
             self.approved_measurements.clear();
             env::log_str(&format!("Cleared {} existing measurement entries", count));
         }
@@ -459,7 +471,13 @@ impl RegisterContract {
     /// takes a right away, so it needs no vote.
     pub fn remove_approved_measurements(&mut self, measurements: ApprovedMeasurements) {
         self.assert_owner_or_governance();
+        Self::validate_measurements(&measurements);
         let measurements = measurements.lowercase();
+        // Only a build that is on the list is recorded as removed: a removal decides about an
+        // approved build, never bars one nobody has approved yet.
+        if self.approved_measurements.contains(&measurements) {
+            removed_builds().insert(&build_id(&measurements));
+        }
         self.approved_measurements.retain(|m| m != &measurements);
         env::log_str(&format!("Approved measurements removed. Remaining: {}", self.approved_measurements.len()));
     }
@@ -468,6 +486,9 @@ impl RegisterContract {
     pub fn clear_all_approved_measurements(&mut self) {
         self.assert_owner_or_governance();
         let count = self.approved_measurements.len();
+        for m in &self.approved_measurements {
+            removed_builds().insert(&build_id(m));
+        }
         self.approved_measurements.clear();
         env::log_str(&format!("Cleared all {} measurement entries", count));
     }
@@ -498,6 +519,7 @@ impl RegisterContract {
             // Each delete_key is an independent promise — if one key
             // doesn't exist, the others still get removed. Detached on purpose: we schedule
             // them all and return nothing (near-sdk >= 5.29 marks Promise #[must_use]).
+            removed_keys().insert(&env::sha256_array(key.as_bytes()));
             Promise::new(account.clone()).delete_key(key.clone()).detach();
         }
         env::log_str(&format!("Scheduled removal of {} worker key(s)", public_keys.len()));
@@ -639,6 +661,40 @@ impl RegisterContract {
 
 
 
+/// The keys `remove_worker_keys` took off this account, by the sha256 of their bytes: a removed
+/// key stays removed, whatever quote is sent for it again (a registration's quote is public on
+/// chain). A collection of its own beside the contract's state, so the state layout is unchanged.
+fn removed_keys() -> near_sdk::collections::LookupSet<[u8; 32]> {
+    near_sdk::collections::LookupSet::new(b"removed_worker_keys".to_vec())
+}
+
+/// The builds taken off the approved list by `remove_approved_measurements` or
+/// `clear_all_approved_measurements`, by [`build_id`]: a removed build is never approved again,
+/// so an approval decided before the removal cannot bring it back when it executes later. A fixed
+/// build is a new build, with its own measurements.
+fn removed_builds() -> near_sdk::collections::LookupSet<[u8; 32]> {
+    near_sdk::collections::LookupSet::new(b"removed_worker_builds".to_vec())
+}
+
+fn build_id(m: &ApprovedMeasurements) -> [u8; 32] {
+    let m = m.clone().lowercase();
+    env::sha256_array(format!("{}|{}|{}|{}|{}", m.mrtd, m.rtmr0, m.rtmr1, m.rtmr2, m.rtmr3).as_bytes())
+}
+
+/// An ed25519 key of small order has no secret key, and a cofactorless verifier (near-crypto's)
+/// accepts signatures for it that need no secret: such a key is never added to the account,
+/// whatever quote binds it.
+fn require_key_has_a_secret(public_key: &PublicKey) {
+    if public_key.curve_type() == CurveType::ED25519 {
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&public_key.as_bytes()[1..33]);
+        require!(
+            !ed25519_small_order::is_small_order(&b),
+            "Refused: an ed25519 key of small order has no secret key"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +718,71 @@ mod tests {
             rtmr2: "d".repeat(96),
             rtmr3: "e".repeat(96),
         }
+    }
+
+    /// A key of small order has no secret, and near-crypto's verifier accepts signatures for it
+    /// made without one: refused before the quote is read, whatever quote binds it.
+    #[test]
+    fn a_key_of_small_order_is_refused() {
+        let mut context = get_context();
+        context.predecessor_account_id(accounts(2));
+        testing_env!(context.build());
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
+        let mut order8 = [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98,
+            0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53,
+            0xfc, 0x05,
+        ];
+        order8[31] |= 0x80;
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let panic_of = |c: &mut RegisterContract, bytes: [u8; 32]| {
+            let k = PublicKey::from_parts(CurveType::ED25519, bytes.to_vec()).unwrap();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.register_worker_key(k, "00".into());
+            }));
+            let e = r.expect_err("register_worker_key returned");
+            e.downcast_ref::<String>().cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        };
+        for bytes in [[0u8; 32], one, order8] {
+            let msg = panic_of(&mut contract, bytes);
+            assert!(msg.contains("small order"), "{msg}");
+        }
+        // A key with a secret gets past the check, to the quote checks.
+        let msg = panic_of(&mut contract, [7u8; 32]);
+        assert!(!msg.contains("small order") && msg.contains("collateral"), "{msg}");
+    }
+
+    /// A key `remove_worker_keys` took off the account does not come back with its old quote.
+    #[test]
+    fn a_removed_key_is_not_registered_again() {
+        let mut context = get_context();
+        context.predecessor_account_id(accounts(4));
+        testing_env!(context.build());
+        let mut contract = RegisterContract::new(accounts(4), accounts(2), accounts(3), accounts(1));
+        let removed = PublicKey::from_parts(CurveType::ED25519, vec![7u8; 32]).unwrap();
+        let other = PublicKey::from_parts(CurveType::ED25519, vec![8u8; 32]).unwrap();
+        contract.remove_worker_keys(vec![removed.clone()]);
+
+        let mut context = get_context();
+        context.predecessor_account_id(accounts(2));
+        testing_env!(context.build());
+        let panic_of = |c: &mut RegisterContract, k: PublicKey| {
+            let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.register_worker_key(k, "00".into());
+            }))
+            .expect_err("register_worker_key returned");
+            e.downcast_ref::<String>().cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        };
+        let msg = panic_of(&mut contract, removed);
+        assert!(msg.contains("was removed"), "{msg}");
+        // Another key goes on to the quote checks.
+        let msg = panic_of(&mut contract, other);
+        assert!(!msg.contains("was removed") && msg.contains("collateral"), "{msg}");
     }
 
     #[test]

@@ -117,6 +117,33 @@ fn v3_state_migrates_to_v4() {
     assert_eq!(c.get_init_worker_account(), a("init.testnet"));
 }
 
+/// A removed build does not come back through an approval decided before the removal.
+#[test]
+#[should_panic(expected = "a removed build is not approved again")]
+fn a_removed_build_is_not_approved_again() {
+    let mut c = contract();
+    at("dao.testnet", 0);
+    c.add_approved_measurements(m('a'), None);
+    at("owner.testnet", 0);
+    c.remove_approved_measurements(m('A'));
+    at("dao.testnet", 0);
+    c.add_approved_measurements(m('a'), None);
+}
+
+#[test]
+#[should_panic(expected = "a removed build is not approved again")]
+fn a_cleared_build_is_not_approved_again() {
+    let mut c = contract();
+    at("dao.testnet", 0);
+    c.add_approved_measurements(m('a'), None);
+    c.add_approved_measurements(m('b'), Some(true));
+    assert_eq!(c.get_approved_measurements(), vec![m('b')]);
+    at("owner.testnet", 0);
+    c.clear_all_approved_measurements();
+    at("dao.testnet", 0);
+    c.add_approved_measurements(m('b'), None);
+}
+
 #[test]
 fn collateral_up_to_the_bound_is_stored() {
     let mut c = contract();
@@ -143,4 +170,23 @@ fn a_build_approved_in_uppercase_is_stored_in_lowercase_and_revoked_in_either_ca
     at("owner.testnet", 0);
     c.remove_approved_measurements(m('E'));
     assert!(c.get_approved_measurements().is_empty());
+}
+
+/// A removal decides about an approved build only: one nobody approved yet is not barred.
+#[test]
+fn removing_a_build_not_on_the_list_does_not_bar_it() {
+    let mut c = contract();
+    at("owner.testnet", 0);
+    c.remove_approved_measurements(m('c'));
+    at("dao.testnet", 0);
+    c.add_approved_measurements(m('c'), None);
+    assert!(c.is_measurements_approved(m('c')));
+}
+
+#[test]
+#[should_panic(expected = "expected 96 hex characters")]
+fn a_removal_names_well_formed_measurements() {
+    let mut c = contract();
+    at("owner.testnet", 0);
+    c.remove_approved_measurements(ApprovedMeasurements { mrtd: "x".into(), rtmr0: "x".into(), rtmr1: "x".into(), rtmr2: "x".into(), rtmr3: "x".into() });
 }

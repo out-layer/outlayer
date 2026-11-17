@@ -47,7 +47,9 @@ delay are the root of trust. Every governance method is for DAO members only.
 - **The owner** (`owner_id`) cannot propose, vote or execute. It cancels a
   pending or approved proposal — except one that replaces a role (`SetOwner`, or a
   `Call` to `set_owner` / `set_governance` / `set_operator` on a governed
-  contract), one that revokes a keystore build, or a `SetDelay` that raises the delay,
+  contract), one that revokes a keystore build, a `Call` that revokes a worker build or key
+  (`remove_approved_measurements`, `clear_all_approved_measurements`, `remove_worker_keys`),
+  or a `SetDelay` that raises the delay,
   which members can only vote down — takes a keystore's guest OS, compose or measurements
   off the approved lists without a vote, keeps
   the Intel collateral current, rejects a pending keystore registration, and deletes
@@ -206,6 +208,8 @@ keystore (Intel TDX)                     dao.outlayer.near                    MP
    public key, or SHA-256 of an ml-dsa-65 public key.
 3. The init account submits `submit_keystore_registration`. Only the init
    account may call it (it pays the gas). The contract:
+   - refuses an ed25519 key of small order (no secret key exists for it, and
+     near-crypto's verifier accepts signatures for it made without one);
    - refuses a key that is already approved;
    - picks the cached collateral whose FMSPC matches the quote and verifies the
      quote with `dcap-qvl` against it (no collateral may be passed in the call);
@@ -380,7 +384,9 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 - `cancel(proposal_id)` — a pending or approved governance proposal, not one
   that replaces the owner or the governance (`SetOwner`, a `Call` to `set_owner` /
-  `set_governance`), revokes a keystore build, or raises the delay. Of two approved
+  `set_governance`), revokes a keystore build, revokes a worker build or key (a `Call` to
+  `remove_approved_measurements`, `clear_all_approved_measurements` or `remove_worker_keys`),
+  or raises the delay. Of two approved
   `SetDelay` proposals the newer wins: an older one no longer executes after it.
 - `remove_approved_os_image(image)`, `remove_approved_compose(compose_hash)` —
   registered keystores keep their keys; revoke those with

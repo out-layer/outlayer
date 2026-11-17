@@ -42,6 +42,10 @@ and `mpc-primitives/` directories are not part of the contract build.
    (every 5 s, up to ~8 minutes) before spending gas.
 4. The init worker account calls `register_worker_key(public_key, tdx_quote_hex)` with
    300 TGas and no deposit. Only that account may call it. The contract:
+   - refuses an ed25519 key of small order (no secret key exists for it, and near-crypto's
+     verifier accepts signatures for it made without one);
+   - refuses a key `remove_worker_keys` took off the account: a removed key stays removed,
+     whatever quote is sent for it (a registration's quote is public on chain);
    - picks the cached collateral whose FMSPC matches the quote (no collateral may be passed
      in the call) and verifies the quote with `dcap-qvl` 0.3.11 at the block's timestamp;
    - refuses any TCB status other than `UpToDate`, and any quote with outstanding Intel
@@ -83,7 +87,9 @@ route. A suspected leak of the `init_worker_account` key also means rotating tha
 - `add_approved_measurements(measurements, clear_others?)` — `measurements` is
   `{mrtd, rtmr0, rtmr1, rtmr2, rtmr3}`, each exactly 96 hex characters, in either case:
   entries are stored, revoked and compared in lowercase, as a quote is read. `clear_others: true`
-  drops every other entry first. Adding an existing entry is a no-op.
+  drops every other entry first (each one counts as removed). Adding an existing entry is a
+  no-op. A build that was removed is refused: a removed build is never approved again, so an
+  approval decided before a removal cannot bring the build back.
 - `set_owner(new_owner_id)`, `set_governance(governance_id)` — the same names and arguments as
   on the main contract
 - `upgrade()` / `upgrade_and_migrate()` — the wasm as the raw input of the call (not JSON).
@@ -92,10 +98,12 @@ route. A suspected leak of the `init_worker_account` key also means rotating tha
 
 ### Owner or governance
 
-- `remove_approved_measurements(measurements)`, `clear_all_approved_measurements()`
+- `remove_approved_measurements(measurements)`, `clear_all_approved_measurements()` — the
+  builds they take off are recorded as removed and never approved again
 - `remove_worker_keys(public_keys)` — schedules one `DeleteKey` per key, each independent,
   so a missing key does not stop the others. The account holds only workers' function-call
-  keys, so the worst a removal does is stop a worker.
+  keys, so the worst a removal does is stop a worker. A removed key is recorded and never
+  registered again: the worker comes back only with a new key (delete its keypair file).
 
 ### Owner
 

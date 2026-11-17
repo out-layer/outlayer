@@ -402,6 +402,24 @@ fn the_owner_cannot_cancel_a_call_to_set_governance() {
 }
 
 #[test]
+#[should_panic(expected = "revocation of a worker build or key cannot be cancelled by the owner")]
+fn the_owner_cannot_cancel_a_call_to_remove_approved_measurements() {
+    cancel_call_as_owner("remove_approved_measurements");
+}
+
+#[test]
+#[should_panic(expected = "revocation of a worker build or key cannot be cancelled by the owner")]
+fn the_owner_cannot_cancel_a_call_to_clear_all_approved_measurements() {
+    cancel_call_as_owner("clear_all_approved_measurements");
+}
+
+#[test]
+#[should_panic(expected = "revocation of a worker build or key cannot be cancelled by the owner")]
+fn the_owner_cannot_cancel_a_call_to_remove_worker_keys() {
+    cancel_call_as_owner("remove_worker_keys");
+}
+
+#[test]
 fn the_owner_still_cancels_an_ordinary_call() {
     let mut d = dao(&["m1.testnet", "m2.testnet", "m3.testnet"], 0);
     at(a("m1.testnet"), 0);

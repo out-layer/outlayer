@@ -477,6 +477,11 @@ impl KeystoreDao {
     }
 }
 
+/// The register contract's methods that take a worker build or a worker's key off: a `Call` to
+/// one is a revocation, which the owner cannot cancel.
+const WORKER_REVOCATIONS: [&str; 3] =
+    ["remove_approved_measurements", "clear_all_approved_measurements", "remove_worker_keys"];
+
 #[near_bindgen]
 impl KeystoreDao {
     /// DAO member: propose a governance action. The proposer's vote is recorded with it, so
@@ -695,6 +700,16 @@ impl KeystoreDao {
         require!(
             !matches!(p.action, GovAction::RevokeOsImage { .. } | GovAction::RevokeCompose { .. }),
             "A revocation of a keystore build cannot be cancelled by the owner; members can vote it down"
+        );
+        // The same for a worker build and a worker's key: the members' way to take one off when
+        // the owner does not.
+        let revokes_a_worker = matches!(
+            &p.action,
+            GovAction::Call { method, .. } if WORKER_REVOCATIONS.contains(&method.as_str())
+        );
+        require!(
+            !revokes_a_worker,
+            "A revocation of a worker build or key cannot be cancelled by the owner; members can vote it down"
         );
         // The delay is the members' brake on everything else, the owner's cancel included: the
         // owner cannot keep it short.

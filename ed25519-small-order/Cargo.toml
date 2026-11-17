@@ -1,0 +1,13 @@
+[package]
+name = "ed25519-small-order"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/out-layer/outlayer"
+license = "Apache-2.0"
+description = "Refuses ed25519 public keys of small order, for the contracts that register TEE keys"
+
+[dependencies]
+
+[dev-dependencies]
+curve25519-dalek = "4.1"
+sha2 = "0.10"

@@ -894,6 +894,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519-small-order"
+version = "0.1.0"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2688,6 +2692,7 @@ dependencies = [
  "base64 0.21.7",
  "bs58 0.5.1",
  "ed25519-dalek",
+ "ed25519-small-order",
  "hex",
  "near-sdk",
  "near-workspaces",

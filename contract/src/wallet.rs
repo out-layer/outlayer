@@ -221,6 +221,12 @@ pub(crate) fn verify_wallet_signature(
             );
             let sig: [u8; 64] = sig_bytes.try_into().unwrap();
             let pk: [u8; 32] = pubkey_bytes.try_into().unwrap();
+            // A key of small order has no secret, and the host's check is cofactorless: it takes
+            // signatures for such a key that need none.
+            assert!(
+                !ed25519_small_order::is_small_order(&pk),
+                "Refused: an ed25519 wallet key of small order has no secret key"
+            );
             // ed25519_verify(signature, message, public_key) -> bool
             let valid = env::ed25519_verify(&sig, message_hash, &pk);
             assert!(valid, "Invalid Ed25519 wallet signature");
@@ -842,6 +848,34 @@ mod tests {
     use super::*;
     use near_sdk::test_utils::{accounts, VMContextBuilder};
     use near_sdk::testing_env;
+
+    /// The panic message of `f`, or None when it returned.
+    fn refusal_of(f: impl FnOnce()) -> Option<String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err().map(|e| {
+            e.downcast_ref::<String>().cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        })
+    }
+
+    /// A wallet key of small order has no secret, and the host's ed25519 check takes signatures
+    /// for it that need none: refused before the signature is checked. A real key still verifies.
+    #[test]
+    fn a_wallet_key_of_small_order_is_refused() {
+        testing_env!(VMContextBuilder::new().build());
+        let hash = [9u8; 32];
+        let zero_sig = hex::encode([0u8; 64]);
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        for k in [[0u8; 32], one] {
+            let msg = refusal_of(|| verify_wallet_signature(&format!("ed25519:{}", hex::encode(k)), &hash, &zero_sig));
+            assert!(msg.as_deref().unwrap_or("").contains("small order"), "{msg:?}");
+        }
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let sig = hex::encode(sk.sign(&hash).to_bytes());
+        verify_wallet_signature(&format!("ed25519:{}", hex::encode(sk.verifying_key().to_bytes())), &hash, &sig);
+    }
 
     /// One key, one spelling — whatever case it arrives in.
     ///
