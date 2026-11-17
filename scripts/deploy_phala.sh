@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 #
-# Automated deployment to Phala Cloud with TEE measurements whitelisting and DAO voting
+# NOT USED AND NOT TESTED. Production runs on our own TDX nodes (scripts/deploy_tdx.sh). This
+# script follows the same approval flow — a keystore build approved by DAO vote as its guest OS
+# (ApproveOsImage) and its compose hash (ApproveCompose), a worker build by a DAO Call to the
+# register contract's add_approved_measurements — but it has not been run against Phala since that
+# flow replaced the owner's measurement approvals. Unchecked: whether Phala's dstack writes the
+# RTMR3 events the DAO replays, and whether its attestation carries the compose the CVM runs.
+#
+# Automated deployment to Phala Cloud with DAO approval of the build and DAO voting
 #
 # Usage:
 #   ./scripts/deploy_phala.sh keystore [testnet|mainnet] [instance-name] --version vX.Y.Z
@@ -280,6 +287,7 @@ echo -e "${YELLOW}[5/7] Waiting for CVM to start and getting TEE measurements...
 MAX_ATTEMPTS=60
 ATTEMPT=0
 MRTD=""
+COMPOSE_HASH=""
 RTMR0=""
 RTMR1=""
 RTMR2=""
@@ -309,6 +317,12 @@ while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             RTMR1=$(jq -r '.tcb_info.rtmr1 // empty' "$ATTESTATION_TMP" 2>/dev/null || echo "")
             RTMR2=$(jq -r '.tcb_info.rtmr2 // empty' "$ATTESTATION_TMP" 2>/dev/null || echo "")
             RTMR3=$(jq -r '.tcb_info.rtmr3 // empty' "$ATTESTATION_TMP" 2>/dev/null || echo "")
+            # The compose hash dstack measures: sha256 of app_compose, read from the file (not
+            # through a shell variable, which corrupts its escapes).
+            COMPOSE_HASH=$(python3 -I -c 'import hashlib,json,sys
+t=json.load(open(sys.argv[1])).get("tcb_info") or {}
+h=t.get("compose_hash") or (hashlib.sha256(t["app_compose"].encode()).hexdigest() if t.get("app_compose") else "")
+print(h)' "$ATTESTATION_TMP" 2>/dev/null || echo "")
         fi
         rm -f "$ATTESTATION_TMP"
 
@@ -332,34 +346,46 @@ if [ -z "$RTMR3" ]; then
     exit 1
 fi
 
-# Step 6: Add TEE measurements to contract (if not already approved)
-echo -e "${YELLOW}[6/7] Checking if TEE measurements are already approved...${NC}"
-
-MEASUREMENTS_APPROVED=$(near contract call-function as-read-only "$DAO_CONTRACT" is_measurements_approved \
-    json-args "{\"measurements\": {\"mrtd\": \"$MRTD\", \"rtmr0\": \"$RTMR0\", \"rtmr1\": \"$RTMR1\", \"rtmr2\": \"$RTMR2\", \"rtmr3\": \"$RTMR3\"}}" \
-    network-config "$NETWORK" now 2>/dev/null | grep -o 'true\|false' | head -1 || echo "false")
-
-if [ "$MEASUREMENTS_APPROVED" = "true" ]; then
-    echo -e "${GREEN}✓ Measurements already approved, skipping${NC}"
-else
-    echo -e "${YELLOW}Measurements not approved, adding to contract...${NC}"
-
-    # If this is an additional instance (has INSTANCE_NAME), don't clear others
-    if [ -n "$INSTANCE_NAME" ]; then
-        CLEAR_OTHERS="false"
-    else
-        CLEAR_OTHERS="true"
+# Step 6: the build approved by the DAO (a proposal members vote on; mainnet prints the commands)
+echo -e "${YELLOW}[6/7] Checking that the build is approved...${NC}"
+GOV_DAO="dao.outlayer.${ACCOUNT_SUFFIX}"
+GOV_MEMBER="${GOV_MEMBER:-zavodil.${ACCOUNT_SUFFIX}}"
+# shellcheck source=lib/dao_gov.sh
+source "$(dirname "$0")/lib/dao_gov.sh"
+MEAS="{\"mrtd\":\"$MRTD\",\"rtmr0\":\"$RTMR0\",\"rtmr1\":\"$RTMR1\",\"rtmr2\":\"$RTMR2\",\"rtmr3\":\"$RTMR3\"}"
+# dao_drive: 0 executed, 2 waiting for votes or the delay (the commands are printed), 1 error.
+drive_or_stop() { # <what> <action json>
+    local rc=0
+    echo "  $1: through the DAO $GOV_DAO (member $GOV_MEMBER)"
+    dao_drive "$GOV_DAO" "$GOV_MEMBER" "$2" || rc=$?
+    if [ "$rc" -eq 2 ]; then
+        echo -e "${YELLOW}  Waiting for the DAO. Once executed, restart the CVM '$CVM_NAME' (phala cvms restart).${NC}"
+        exit 3
     fi
-
-    near contract call-function as-transaction "$DAO_CONTRACT" add_approved_measurements \
-        json-args "{\"measurements\": {\"mrtd\": \"$MRTD\", \"rtmr0\": \"$RTMR0\", \"rtmr1\": \"$RTMR1\", \"rtmr2\": \"$RTMR2\", \"rtmr3\": \"$RTMR3\"}, \"clear_others\": $CLEAR_OTHERS}" \
-        prepaid-gas '30.0 Tgas' \
-        attached-deposit '0 NEAR' \
-        sign-as "$SIGNER_ACCOUNT" \
-        network-config "$NETWORK" \
-        sign-with-keychain send
-
-    echo -e "${GREEN}✓ Measurements added to contract${NC}"
+    [ "$rc" -eq 0 ] || { echo -e "${RED}  approval through the DAO failed${NC}"; exit 1; }
+}
+if [ "$COMPONENT" = "keystore" ]; then
+    [ -n "$COMPOSE_HASH" ] || { echo -e "${RED}Error: no compose hash in the CVM's attestation${NC}"; exit 1; }
+    OS_TUPLE="{\"mrtd\":\"$MRTD\",\"rtmr0\":\"$RTMR0\",\"rtmr1\":\"$RTMR1\",\"rtmr2\":\"$RTMR2\"}"
+    OS_OK=$(near contract call-function as-read-only "$GOV_DAO" get_approved_os_images json-args '{}' network-config "$NETWORK" now 2>/dev/null \
+        | python3 -I -c 'import json,sys; print("true" if json.loads(sys.argv[1]) in json.load(sys.stdin) else "false")' "$OS_TUPLE" || echo false)
+    C_OK=$(near contract call-function as-read-only "$GOV_DAO" get_approved_composes json-args '{}' network-config "$NETWORK" now 2>/dev/null \
+        | python3 -I -c 'import json,sys; print("true" if sys.argv[1] in json.load(sys.stdin) else "false")' "$COMPOSE_HASH" || echo false)
+    echo -e "   guest OS approved: $OS_OK · compose $COMPOSE_HASH approved: $C_OK"
+    [ "$OS_OK" = true ] || drive_or_stop "guest OS" "{\"ApproveOsImage\":{\"image\":$OS_TUPLE}}"
+    [ "$C_OK" = true ] || drive_or_stop "compose" "{\"ApproveCompose\":{\"compose_hash\":\"$COMPOSE_HASH\"}}"
+    echo -e "${GREEN}✓ Keystore build approved${NC}"
+else
+    APPROVED=$(near contract call-function as-read-only "$DAO_CONTRACT" is_measurements_approved \
+        json-args "{\"measurements\":$MEAS}" network-config "$NETWORK" now 2>/dev/null | grep -o 'true\|false' | head -1 || echo "false")
+    if [ "$APPROVED" != "true" ]; then
+        drive_or_stop "worker build" "$(dao_measurements_action worker "$DAO_CONTRACT" "$MEAS")"
+        sleep 3
+        near contract call-function as-read-only "$DAO_CONTRACT" is_measurements_approved \
+            json-args "{\"measurements\":$MEAS}" network-config "$NETWORK" now 2>/dev/null | grep -q true \
+            || { echo -e "${RED}  the DAO executed the proposal, but $DAO_CONTRACT does not list the build${NC}"; exit 1; }
+    fi
+    echo -e "${GREEN}✓ Worker build approved${NC}"
 fi
 
 # Step 7: Restart CVM (and wait for proposal if keystore)
