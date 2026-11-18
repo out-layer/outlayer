@@ -279,7 +279,7 @@ for attempt in 1 2 3; do
   # under is never the one a final block already holds.
   TYPES=$([[ $((attempt % 2)) == 1 ]] && echo '["transfer","call"]' || echo '["transfer"]')
   NEXT=$(jq -c --argjson t "$TYPES" '.rules.transaction_types = $t' <<<"$POLICY_TWO")
-  STORE_POLICY_NO_SETTLE=1 store_policy "$SEED" "$WALLET_ID" "$NEXT" || { fail "V12 (try $attempt) the policy was not stored"; V12_DONE=1; break; }
+  STORE_POLICY_WAIT=optimistic store_policy "$SEED" "$WALLET_ID" "$NEXT" || { fail "V12 (try $attempt) the policy was not stored"; V12_DONE=1; break; }
   api - POST "/wallet/v1/reject/$AID" "$NO" >/dev/null
   FIRST_STATUS=$(jq -r '.status // empty' <<<"$BODY")
   if [[ "$HTTP" == 200 && "$FIRST_STATUS" == rejected ]]; then

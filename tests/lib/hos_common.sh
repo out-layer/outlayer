@@ -469,6 +469,43 @@ store_policy() {
   # judged against the PREVIOUS policy — the worst possible failure, because it
   # reads as a product defect in whichever case runs next.
   local attempt
+  # STORE_POLICY_WAIT=optimistic: return the moment the newest block shows the
+  # write — before a block holding it is final — for a probe that acts inside
+  # that window. near-cli's own `send` returns later, so the transaction is
+  # signed by near-cli (`display`), sent here without waiting, and the policy
+  # record is polled at the newest block until it carries this ciphertext.
+  if [[ "${STORE_POLICY_WAIT:-}" == optimistic ]]; then
+    local shown signed answer
+    for attempt in 1 2; do
+      shown=$(near --quiet contract call-function as-transaction "$CONTRACT_ID" store_wallet_policy \
+        json-args "$store_args" prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \
+        sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain display 2>&1)
+      signed=$(awk '/Signed transaction \(serialized as base64\):/{getline; print; exit}' <<<"$shown" | tr -d ' \r')
+      if [[ -n "$signed" ]]; then
+        answer=$(printf 'url = "%s"\n' "$RPC_URL" | curl -sS --max-time 60 -K - -H 'Content-Type: application/json' \
+          -d "$(jq -nc --arg t "$signed" '{jsonrpc:"2.0", id:1, method:"send_tx", params:{signed_tx_base64:$t, wait_until:"NONE"}}')")
+        if jq -e '.error' >/dev/null 2>&1 <<<"$answer"; then
+          warn "store_wallet_policy (optimistic) attempt $attempt: $(jq -c '.error.cause // .error' <<<"$answer" 2>/dev/null | head -c 200)"
+        else
+          local i got args_b64
+          args_b64=$(printf '{"wallet_pubkey":"ed25519:%s"}' "$pub_hex" | base64)
+          for i in $(seq 1 150); do
+            got=$(printf 'url = "%s"\n' "$RPC_URL" | curl -sS --max-time 5 -K - -H 'Content-Type: application/json' \
+              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"call_function\",\"finality\":\"optimistic\",\"account_id\":\"$CONTRACT_ID\",\"method_name\":\"get_wallet_policy\",\"args_base64\":\"$args_b64\"}}" 2>/dev/null \
+              | jq -r '.result.result | implode | fromjson | .encrypted_data // empty' 2>/dev/null)
+            [[ "$got" == "$encb64" ]] && return 0
+            perl -e 'select(undef,undef,undef,0.1)'
+          done
+          warn "store_wallet_policy (optimistic) attempt $attempt: the write did not show at the newest block in 30 s"
+          return 1
+        fi
+      else
+        warn "store_wallet_policy (optimistic) attempt $attempt: near-cli did not sign"
+      fi
+      sleep 5
+    done
+    return 1
+  fi
   for attempt in 1 2; do
     if near_tty "near contract call-function as-transaction $CONTRACT_ID store_wallet_policy \
       json-args '$store_args' prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \

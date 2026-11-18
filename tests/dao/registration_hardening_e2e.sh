@@ -100,11 +100,18 @@ if want H3; then
     step "H3 a removed build is not approved again"
     T=$(python3 -I -c 'import os,json; h=lambda: os.urandom(48).hex(); print(json.dumps({"mrtd":h(),"rtmr0":h(),"rtmr1":h(),"rtmr2":h(),"rtmr3":h()}))')
     listed() { view "$WORKER" is_measurements_approved "{\"measurements\":$T}" | tr -d '\n '; }
-    p=$(propose "$M1" "$(call_action "$WORKER" add_approved_measurements "{\"measurements\":$T,\"clear_others\":false}")"); vote "$M2" "$p" true
-    wait_exec "$p" && [ "$(listed)" = true ] && ok "#$p approved a throwaway build" || bad "#$p: $(gov_status "$p"), listed $(listed)"
+    # Built in steps: macOS bash 3.2 drops the `{` of an escaped-quote string inside a nested $(…).
+    ARGS="{\"measurements\":$T,\"clear_others\":false}"
+    ADD=$(call_action "$WORKER" add_approved_measurements "$ARGS")
+    python3 -I -c 'import json,sys,base64; json.loads(base64.b64decode(json.loads(sys.argv[1])["Call"]["args"]))' "$ADD" \
+        || { bad "the Call's arguments are not JSON"; summary; exit 1; }
+    p=$(propose "$M1" "$ADD"); vote "$M2" "$p" true
+    wait_exec "$p"
+    [ "$(listed)" = true ] && ok "#$p approved a throwaway build" \
+        || { bad "#$p: $(gov_status "$p"), listed $(listed) — the rest of H3 would prove nothing"; summary; exit 1; }
     call "$OWNER" "$WORKER" remove_approved_measurements "{\"measurements\":$T}" && [ "$(listed)" = false ] \
         && ok "the owner removed it" || bad "remove: listed $(listed)"
-    p=$(propose "$M1" "$(call_action "$WORKER" add_approved_measurements "{\"measurements\":$T,\"clear_others\":false}")"); vote "$M2" "$p" true
+    p=$(propose "$M1" "$ADD"); vote "$M2" "$p" true
     wait_exec "$p"
     [ "$(listed)" = false ] && ok "#$p ($(gov_status "$p")) did not bring it back: $(printf '%s' "$LAST_OUT" | grep -aoE 'a removed build is not approved again' | head -1)" \
         || bad "the removed build is approved again by #$p"

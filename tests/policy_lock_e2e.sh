@@ -70,11 +70,19 @@ vote() {
 
 # call <signer> <method> <args-json> <deposit> — a contract call; OUT, RC.
 OUT=""; RC=0
+# A transaction refused for its nonce was never applied — near-cli read the
+# key's nonce from a node a block behind — so it is sent again. Any other
+# refusal is the answer the probe judges, and is kept.
 call() {
-  OUT=$(near --quiet contract call-function as-transaction "$CONTRACT_ID" "$2" json-args "$3" \
-    prepaid-gas '100.0 Tgas' attached-deposit "$4" sign-as "$1" network-config "$NETWORK" \
-    sign-with-keychain send 2>&1); RC=$?
-  sleep 3
+  local attempt
+  for attempt in 1 2 3; do
+    OUT=$(near --quiet contract call-function as-transaction "$CONTRACT_ID" "$2" json-args "$3" \
+      prepaid-gas '100.0 Tgas' attached-deposit "$4" sign-as "$1" network-config "$NETWORK" \
+      sign-with-keychain send 2>&1); RC=$?
+    sleep 3
+    grep -q "Transaction nonce .* must be account\[access_key\].nonce" <<<"$OUT" || return 0
+    warn "$2: a stale nonce (attempt $attempt), sent again"
+  done
 }
 refused() { # refused <desc> <pattern> — the last call panicked naming <pattern>
   local why; why=$(near_why "$OUT")
@@ -125,12 +133,13 @@ LOCKED=$(jq -nc --arg a "$APPROVER" --arg b "$APPROVER2" \
 # The receiver's URL carries its token: it goes into the policy, never onto a
 # command line or the terminal.
 [[ -n "${HOOK_URL:-}" ]] && LOCKED=$(HOOK_URL="$HOOK_URL" jq -c '. + {webhook_url: env.HOOK_URL}' <<<"$LOCKED")
-# hook_saw <needle>… — one delivery in the receiver's log holds every needle
-# (read through stdin: its URL is a secret too).
+# hook_saw <event> <needle>… — one delivery in the receiver's log is of
+# <event> (the `x-event-type` header) and its body holds every needle (the log
+# is read through stdin: its URL is a secret too).
 hook_saw() {
-  local log
+  local event=$1 log; shift
   log=$(printf 'url = "%s"\n' "$HOOK_LOG_URL" | curl -sS --max-time 20 -K - 2>/dev/null) || return 1
-  jq -e --args '[.requests[]? | (.body // "") as $b | select(all($ARGS.positional[]; . as $n | $b | contains($n)))] | length > 0' "$@" <<<"$log" >/dev/null 2>&1
+  jq -e --arg e "$event" --args '[.requests[]? | select((.headers["x-event-type"] // "") == $e) | (.body // "") as $b | select(all($ARGS.positional[]; . as $n | $b | contains($n)))] | length > 0' "$@" <<<"$log" >/dev/null 2>&1
 }
 OPEN='{"rules":{"transaction_types":["transfer"]}}'
 OPEN_B='{"rules":{"transaction_types":["transfer","call"]}}'

@@ -403,14 +403,14 @@ impl RegistrationClient {
                 }
                 Ok(false) => {
                     if attempt == 1 {
-                        info!("⏳ Measurements not yet approved. Waiting for admin...");
+                        info!("⏳ Measurements not yet approved. Waiting for the DAO...");
                         info!("   MRTD:  {}", measurements.mrtd);
                         info!("   RTMR0: {}", measurements.rtmr0);
                         info!("   RTMR1: {}", measurements.rtmr1);
                         info!("   RTMR2: {}", measurements.rtmr2);
                         info!("   RTMR3: {}", measurements.rtmr3);
                         info!(
-                            "   To approve, run: near call {} add_approved_measurements '{{\"measurements\":{{\"mrtd\":\"{}\",\"rtmr0\":\"{}\",\"rtmr1\":\"{}\",\"rtmr2\":\"{}\",\"rtmr3\":\"{}\"}}}}' --accountId <owner>",
+                            "   Approved by a DAO Call to {} add_approved_measurements (scripts/deploy_tdx.sh proposes it), args: {{\"measurements\":{{\"mrtd\":\"{}\",\"rtmr0\":\"{}\",\"rtmr1\":\"{}\",\"rtmr2\":\"{}\",\"rtmr3\":\"{}\"}}}}",
                             self.operator_account_id,
                             measurements.mrtd, measurements.rtmr0, measurements.rtmr1,
                             measurements.rtmr2, measurements.rtmr3

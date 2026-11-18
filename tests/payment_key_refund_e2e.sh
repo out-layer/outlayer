@@ -102,13 +102,16 @@ view() { # view <contract> <method> <args-json>
 }
 call() { # call <signer> <contract> <method> <args-json> <deposit> [gas]
   local out i
-  for i in 1 2; do
+  for i in 1 2 3; do
     out=$(near contract call-function as-transaction "$2" "$3" json-args "$4" \
       prepaid-gas "${6:-100.0 Tgas}" attached-deposit "$5" sign-as "$1" network-config "$NETWORK" \
       sign-with-legacy-keychain send 2>&1)
     grep -q 'Transaction ID' <<<"$out" && break
-    grep -qiE 'error sending request|failed to fetch' <<<"$out" || break
-    sleep 5
+    # Resent: a send that never reached a contract — the RPC unreachable, or a nonce another send
+    # of the same key took a moment earlier (R2b/R4b send two transactions 2 s apart; the yield
+    # they race stays open ~200 blocks, so a resend a few seconds later is still inside it).
+    grep -qiE 'error sending request|failed to fetch|InvalidNonce|nonce' <<<"$out" || break
+    sleep 3
   done
   printf '%s\n' "$out"
 }
