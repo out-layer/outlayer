@@ -29,9 +29,16 @@ git push                    # the commit must be on GitHub for others to rebuild
 Docker must be running: the build runs in the image pinned in the contract's `Cargo.toml`
 (`[package.metadata.near.reproducible_build]`).
 
+Build the contract you release, from the repository root:
+
 ```bash
-(cd keystore-dao-contract && cargo near build reproducible-wasm)
+(cd keystore-dao-contract && cargo near build reproducible-wasm)   # dao
+(cd contract && cargo near build reproducible-wasm)                # main
+(cd register-contract && cargo near build reproducible-wasm)       # worker
 ```
+
+`build.sh` and `build-docker.sh` in these directories are local builds and give another hash: never
+release from them.
 
 It ends with the wasm's size and its sha256 in two forms:
 
@@ -52,17 +59,30 @@ container: run it again.
 the release out and upgrade from the copy:
 
 ```bash
-rm -rf ~/dao-release
 mkdir -p ~/dao-release
+
+# dao
 cp keystore-dao-contract/target/near/keystore_dao_contract.wasm ~/dao-release/
 shasum -a 256 ~/dao-release/keystore_dao_contract.wasm      # the hex from step 2
+
+# main
+cp contract/target/near/outlayer_contract.wasm ~/dao-release/
+shasum -a 256 ~/dao-release/outlayer_contract.wasm          # the hex from step 2
+
+# worker
+cp register-contract/target/near/register_contract.wasm ~/dao-release/
+shasum -a 256 ~/dao-release/register_contract.wasm          # the hex from step 2
 ```
 
 ## 4. Upgrade
 
 ```bash
-scripts/dao_upgrade.sh --network testnet --target dao --wasm ~/dao-release/keystore_dao_contract.wasm
+scripts/dao_upgrade.sh --network testnet --target dao    --wasm ~/dao-release/keystore_dao_contract.wasm
+scripts/dao_upgrade.sh --network testnet --target main   --wasm ~/dao-release/outlayer_contract.wasm
+scripts/dao_upgrade.sh --network testnet --target worker --wasm ~/dao-release/register_contract.wasm
 ```
+
+On mainnet: `--network mainnet`, plus `--member <your>.near` when the proposer is not `zavodil.near`.
 
 The script stores the wasm in the DAO as a blob, proposes `Upgrade{target, code_hash, migrate}`,
 collects the votes, executes the proposal and checks that the account runs the hash. Run it again
@@ -112,7 +132,9 @@ commit the code names, never your own `HEAD`.
    ```bash
    git fetch origin
    git worktree add --detach ~/check-build <commit>   # a NEW folder with that commit; refuses a folder that exists
-   (cd ~/check-build/keystore-dao-contract && cargo near build reproducible-wasm)
+   (cd ~/check-build/keystore-dao-contract && cargo near build reproducible-wasm)   # dao
+   (cd ~/check-build/contract && cargo near build reproducible-wasm)                # main
+   (cd ~/check-build/register-contract && cargo near build reproducible-wasm)       # worker
    git worktree remove --force ~/check-build          # deletes that folder only; --force for the build's target/
    ```
 
@@ -135,10 +157,21 @@ built at the next commits gives `6P3UWC79…` (`9133e0c`) and `4yCoCTYz…` (`ee
 ## 6. Check
 
 ```bash
+# dao
 near account view-account-summary dao.outlayer.testnet network-config testnet now     # its hex = the hex of step 2
 near contract call-function as-read-only dao.outlayer.testnet gov_health json-args '{}' network-config testnet now
-near contract call-function as-read-only outlayer.testnet get_storage_version json-args '{}' network-config testnet now   # main contract: the release's version
+
+# main
+near account view-account-summary outlayer.testnet network-config testnet now         # its hex = the hex of step 2
+near contract call-function as-read-only outlayer.testnet gov_health json-args '{}' network-config testnet now
+near contract call-function as-read-only outlayer.testnet get_storage_version json-args '{}' network-config testnet now   # the release's version
+
+# worker
+near account view-account-summary worker.outlayer.testnet network-config testnet now  # its hex = the hex of step 2
+near contract call-function as-read-only worker.outlayer.testnet gov_health json-args '{}' network-config testnet now
 ```
+
+On mainnet: `.near` accounts and `network-config mainnet`.
 
 ## Order: a DAO release that changes how keystores register
 
