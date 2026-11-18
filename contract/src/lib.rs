@@ -368,6 +368,20 @@ impl Default for ResourceLimits {
     }
 }
 
+impl ResourceLimits {
+    /// The limits a request runs with: each field the request leaves out takes
+    /// its default, so every field is `Some` in the stored request and in the
+    /// `execution_requested` payload the worker parses.
+    pub fn with_defaults(self) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_instructions: self.max_instructions.or(defaults.max_instructions),
+            max_memory_mb: self.max_memory_mb.or(defaults.max_memory_mb),
+            max_execution_seconds: self.max_execution_seconds.or(defaults.max_execution_seconds),
+        }
+    }
+}
+
 /// Execution request stored in contract
 #[derive(Clone, Debug)]
 #[near(serializers = [borsh, json])]

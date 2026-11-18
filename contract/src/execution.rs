@@ -65,8 +65,9 @@ impl Contract {
             crate::projects::assert_code_source(&resolved_source);
         }
 
-        // Use provided limits or defaults (for execute mode)
-        let limits = resource_limits.clone().unwrap_or_default();
+        // Use provided limits or defaults (for execute mode). A field left out
+        // takes its default: the worker parses every field as a number.
+        let limits = resource_limits.clone().unwrap_or_default().with_defaults();
 
         // The storage namespace is the contract's to name: the uuid of the
         // Project source, and none for code given inline. A caller's own
