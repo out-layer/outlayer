@@ -588,6 +588,10 @@ answers complete_https_call) — deploy the worker"
     "$(jq -nc --arg a "$PARENT" --arg pr "$ROW" '{input:{message:"probe"}, secrets_ref:{account_id:$a, profile:$pr}, use_bound_identity:true}')"
   if [[ "$RUN_OK" == "true" && "$(field .user)" == "true" ]]; then
     fail "S1 use_bound_identity admitted a wallet the row does not name"
+  elif grep -qiE "has no ACTIVE binding" <<<"$RUN_ERR"; then
+    # The row judges a binding that moves the name a guest acts as; a wallet without one is
+    # refused before any row is read, so there is nothing to judge here.
+    skip "S1 with use_bound_identity needs the AGENT_PAYMENT_KEY wallet to hold an ACTIVE binding (it has none)"
   else
     answered "S1 with use_bound_identity"
     grep -qiE "denied|permission|condition" <<<"$RUN_ERR" \

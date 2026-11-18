@@ -73,6 +73,7 @@ PROJECT="${PROJECT:-$CONNECTORS/connector-probe}"
 AMOUNT="${AMOUNT:-50000}"          # $0.05
 WITHDRAW="${WITHDRAW:-30000}"      # $0.03
 RACE_DELAY="${RACE_DELAY:-2}"      # s between the two sends of R2b and R4b: inside the yield, after admission
+RACE_KEY_FILE="${RACE_KEY_FILE:-}"  # access-key file of a SECOND full-access key of KEY_OWNER: the races' second send
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/scripts/.env}"
 CREDS_DIR="$HOME/.near-credentials/$NETWORK"
 DAY_NS=$((24 * 60 * 60 * 1000000000))
@@ -102,18 +103,27 @@ view() { # view <contract> <method> <args-json>
 }
 call() { # call <signer> <contract> <method> <args-json> <deposit> [gas]
   local out i
-  for i in 1 2 3; do
+  for i in 1 2; do
     out=$(near contract call-function as-transaction "$2" "$3" json-args "$4" \
       prepaid-gas "${6:-100.0 Tgas}" attached-deposit "$5" sign-as "$1" network-config "$NETWORK" \
       sign-with-legacy-keychain send 2>&1)
     grep -q 'Transaction ID' <<<"$out" && break
-    # Resent: a send that never reached a contract — the RPC unreachable, or a nonce another send
-    # of the same key took a moment earlier (R2b/R4b send two transactions 2 s apart; the yield
-    # they race stays open ~200 blocks, so a resend a few seconds later is still inside it).
-    grep -qiE 'error sending request|failed to fetch|InvalidNonce|nonce' <<<"$out" || break
-    sleep 3
+    # Resent only when the RPC was unreachable. Never on a taken nonce: R2b and R4b send their two
+    # transactions 2 s apart on purpose, and a resend lands after the race it is meant to test.
+    grep -qiE 'error sending request|failed to fetch' <<<"$out" || break
+    sleep 5
   done
   printf '%s\n' "$out"
+}
+# The race's second send, on its own key: two sends of one key a moment apart share a nonce, and
+# near-cli refuses the second before it reaches a contract. RACE_KEY_FILE is an access-key file
+# of a second full-access key of KEY_OWNER (the close attaches 1 yoctoNEAR); without one the
+# second send goes on the keychain key and a taken nonce is reported as such, never resent.
+call_race() { # call_race <signer> <contract> <method> <args-json> <deposit> [gas]
+  if [[ -z "${RACE_KEY_FILE:-}" ]]; then call "$@"; return; fi
+  near contract call-function as-transaction "$2" "$3" json-args "$4" \
+    prepaid-gas "${6:-100.0 Tgas}" attached-deposit "$5" sign-as "$1" network-config "$NETWORK" \
+    sign-with-access-key-file "$RACE_KEY_FILE" send 2>&1
 }
 succeeded() { grep -q 'succeeded' <<<"$1"; }
 tx_of() { grep -oE 'Transaction ID: *[1-9A-HJ-NP-Za-km-z]{40,50}' <<<"$1" | grep -oE '[1-9A-HJ-NP-Za-km-z]{40,50}' | head -1; }
@@ -324,13 +334,13 @@ if [[ "$MODE" == apply ]]; then
     log "R2b a second top-up, then close ${RACE_DELAY}s later while it is in flight"
     ( ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)" > "$RUN_TMP/r2b_topup.out" ) &
     sleep "$RACE_DELAY"
-    out=$(call "$KEY_OWNER" "$CONTRACT_ID" close_payment_key "$(jq -nc --argjson n "$NONCE" '{nonce:$n}')" '1 yoctoNEAR')
+    out=$(call_race "$KEY_OWNER" "$CONTRACT_ID" close_payment_key "$(jq -nc --argjson n "$NONCE" '{nonce:$n}')" '1 yoctoNEAR')
     wait
     tu=$(cat "$RUN_TMP/r2b_topup.out")
     TX=$(tx_of "$tu")
     [[ -n "$TX" ]] && pass "R2b second top-up sent ($TX)" || fail "R2b second top-up not sent: $(why_of "$tu")"
     if succeeded "$out"; then
-      warn "R2b window missed: the top-up had settled first and the close went through ($(tx_of "$out")) — R4 reads it as already closing, R4b is skipped"
+      fail "R2b window missed: the top-up had settled first and the close went through ($(tx_of "$out")) — the race was not run; R4 reads it as already closing, R4b is skipped"
       CLOSED_EARLY=true
     elif grep -q 'in flight' <<<"$out"; then
       pass "R2b close refused while the top-up is in flight: $(why_of "$out" | head -c 160)"
@@ -358,7 +368,8 @@ if [[ "$MODE" == apply ]]; then
       T4=$(token_balance)
       ( call "$KEY_OWNER" "$CONTRACT_ID" close_payment_key "$(jq -nc --argjson n "$NONCE" '{nonce:$n}')" '1 yoctoNEAR' > "$RUN_TMP/r4_close.out" ) &
       sleep "$RACE_DELAY"
-      tu=$(ft_call "$AMOUNT" "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)")
+      tu=$(call_race "$KEY_OWNER" "$TOKEN" ft_transfer_call \
+        "$(jq -nc --arg r "$CONTRACT_ID" --arg a "$AMOUNT" --arg m "$(jq -nc --argjson n "$NONCE" '{action:"top_up_payment_key", nonce:$n}|tojson' | jq -r .)" '{receiver_id:$r, amount:$a, msg:$m}')" '1 yoctoNEAR' '150.0 Tgas')
       wait
       out=$(cat "$RUN_TMP/r4_close.out")
       TX=$(tx_of "$out")
@@ -371,7 +382,7 @@ if [[ "$MODE" == apply ]]; then
         if has_failure "$fails" 'waiting for its answer'; then
           pass "R4b refused at admission while the close waits ($TU_TX)"
         elif has_failure "$fails" 'is closing since'; then
-          warn "R4b window missed: the close had settled first — refused as closing instead ($TU_TX)"
+          fail "R4b window missed: the close had settled first — refused as closing instead, the race was not run ($TU_TX)"
         else
           fail "R4b the top-up was refused by neither fence: $(short "$fails")"
         fi

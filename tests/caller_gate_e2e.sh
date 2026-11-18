@@ -131,8 +131,16 @@ set_for() { printf -v "$(var_of "$1" "$2")" '%s' "$3"; }
 get_for() { local n; n=$(var_of "$1" "$2"); printf '%s' "${!n:-}"; }
 
 call_on() { # call_on <signer> <receiver> <method> <args-json> <deposit>
-  near contract call-function as-transaction "$2" "$3" json-args "$4" \
-    prepaid-gas '300.0 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" sign-with-legacy-keychain send 2>&1
+  # A transaction refused before it reached a block (expired, or its nonce taken) changed nothing:
+  # it is sent again rather than read as the contract's answer.
+  local out try
+  for try in 1 2 3; do
+    out=$(near contract call-function as-transaction "$2" "$3" json-args "$4" \
+      prepaid-gas '300.0 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" sign-with-legacy-keychain send 2>&1)
+    grep -qE 'Transaction has expired|InvalidNonce|must be account\[access_key\]\.nonce' <<<"$out" || break
+    sleep 3
+  done
+  printf '%s\n' "$out"
 }
 
 WHOAMI='{"operation":"whoami"}'
