@@ -1297,3 +1297,93 @@ mod input_storage_and_callback_tests {
         );
     }
 }
+
+/// A `resource_limits` object with fields left out takes each missing field's
+/// default. The worker's `execution_requested` payload must carry concrete
+/// numbers: a `null` there fails the worker's `u64` fields and the request is
+/// dropped until it is refunded.
+#[cfg(test)]
+mod resource_limits_defaults_tests {
+    use crate::tests::{get_context, setup_contract};
+    use crate::*;
+    use near_sdk::test_utils::{accounts, get_logs};
+    use near_sdk::{testing_env, NearToken};
+
+    fn source() -> ExecutionSource {
+        ExecutionSource::GitHub {
+            repo: "github.com/test/repo".to_string(),
+            commit: "main".to_string(),
+            build_target: None,
+        }
+    }
+
+    /// The `resource_limits` object the `execution_requested` payload carries.
+    fn payload_resource_limits() -> serde_json::Value {
+        for log in get_logs() {
+            let Some(json) = log.strip_prefix("EVENT_JSON:") else { continue };
+            let event: serde_json::Value = serde_json::from_str(json).expect("event is JSON");
+            if event["event"] != "execution_requested" {
+                continue;
+            }
+            let request_data = event["data"][0]["request_data"].as_str().expect("request_data is a string");
+            let payload: serde_json::Value = serde_json::from_str(request_data).expect("request_data is JSON");
+            return payload["resource_limits"].clone();
+        }
+        panic!("no execution_requested event in the logs");
+    }
+
+    fn request(c: &mut Contract, limits: Option<ResourceLimits>) {
+        let deposit = c.estimate_execution_cost(None, None, None).0;
+        testing_env!(get_context(accounts(1), NearToken::from_yoctonear(deposit)).build());
+        c.request_execution(source(), limits, None, None, None, None, None);
+    }
+
+    fn limits(instructions: Option<u64>, memory_mb: Option<u32>, seconds: Option<u64>) -> ResourceLimits {
+        ResourceLimits {
+            max_instructions: instructions,
+            max_memory_mb: memory_mb,
+            max_execution_seconds: seconds,
+        }
+    }
+
+    #[test]
+    fn an_empty_object_takes_every_default_on_the_wire_and_on_record() {
+        let mut c = setup_contract();
+        request(&mut c, Some(limits(None, None, None)));
+
+        let d = ResourceLimits::default();
+        let stored = c.get_request(0).expect("admitted");
+        assert_eq!(stored.resource_limits.max_instructions, d.max_instructions);
+        assert_eq!(stored.resource_limits.max_memory_mb, d.max_memory_mb);
+        assert_eq!(stored.resource_limits.max_execution_seconds, d.max_execution_seconds);
+
+        assert_eq!(
+            payload_resource_limits(),
+            serde_json::json!({
+                "max_instructions": 1_000_000_000u64,
+                "max_memory_mb": 128,
+                "max_execution_seconds": 60
+            })
+        );
+    }
+
+    #[test]
+    fn a_partial_object_keeps_its_fields_and_defaults_the_rest() {
+        let mut c = setup_contract();
+        request(&mut c, Some(limits(Some(5_000_000), None, None)));
+
+        let stored = c.get_request(0).expect("admitted");
+        assert_eq!(stored.resource_limits.max_instructions, Some(5_000_000));
+        assert_eq!(stored.resource_limits.max_memory_mb, Some(128));
+        assert_eq!(stored.resource_limits.max_execution_seconds, Some(60));
+
+        assert_eq!(
+            payload_resource_limits(),
+            serde_json::json!({
+                "max_instructions": 5_000_000u64,
+                "max_memory_mb": 128,
+                "max_execution_seconds": 60
+            })
+        );
+    }
+}
