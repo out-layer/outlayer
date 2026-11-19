@@ -14,7 +14,7 @@
 #   X3  echo (P1)                   the caller and the input, with a block height
 #   X4  weather (P2, secrets)       London, a numeric temperature
 #   X5  multi-source oracle (P2)    a NEAR price > 0 aggregated from at least four exchanges
-#   X6  Ethereum API (P2, secrets)  a hex value from the provider
+#   X6  Ethereum API (P2, project, secrets) a hex value from the provider
 #   X7  project storage test (P2)   the project's own storage self-test: every check passed
 #   X8  Ethereum state proof (P2)   a Chainlink ETH/USD answer proven against Ethereum state, with its age
 #   X9  coin flip (proxy contract)  a Heads/Tails verdict from coin-toss.testnet
@@ -51,7 +51,7 @@ LIMITS='{"max_instructions":10000000000,"max_memory_mb":128,"max_execution_secon
 # The request_execution arguments of one WasmUrl example.
 wasm_args() { # hash build_target input secrets_profile response_format [url_hash | https://url]
   local secrets=null url="$FASTFS/${6:-$1}.wasm"
-  [[ "$6" == https://* ]] && url=$6
+  [[ "${6:-}" == https://* ]] && url=$6
   [[ -n "$4" ]] && secrets=$(jq -nc --arg p "$4" --arg a "$SECRETS_OWNER" '{profile:$p, account_id:$a}')
   jq -nc --arg url "$url" --arg h "$1" --arg t "$2" --arg i "$3" --argjson s "$secrets" \
     --arg f "$5" --argjson l "$LIMITS" \
@@ -125,17 +125,18 @@ if want X5; then
   echo "▶ X5 multi-source oracle (WASI P2)"
   INPUT='{"requests":[{"id":"eur_usd_rate","sources":[{"name":"custom","custom":{"url":"https://open.er-api.com/v6/latest/EUR","json_path":"rates.USD","value_type":"number","method":"GET","headers":[]}}]},{"id":"near_price","sources":[{"name":"coingecko","id":"near"},{"name":"binance","id":"NEARUSDT"},{"name":"huobi","id":"nearusdt"},{"name":"cryptocom","id":"NEAR_USDT"},{"name":"kucoin","id":"NEAR-USDT"},{"name":"gate","id":"near_usdt"},{"name":"pyth","id":"0xc415de8d2eba7db216527dff4b60e8f3a5311c740dadb233e13e12547e226750"}],"aggregation_method":"median","min_sources_num":4},{"id":"near_last_block_validator","sources":[{"name":"custom","custom":{"url":"https://api.nearblocks.io/v1/blocks/latest?limit=1","json_path":"blocks.0.author_account_id","value_type":"string","method":"GET","headers":[]}}]},{"id":"elden_ring_price_cents","sources":[{"name":"custom","custom":{"url":"https://store.steampowered.com/api/appdetails/?appids=1245620&cc=us","json_path":"1245620.data.price_overview.final","value_type":"number","method":"GET","headers":[]}}]}],"max_price_deviation_percent":10.0}'
   A=$(call "$CONTRACT_ID" request_execution \
-    "$(wasm_args feca3d1651885d39bde0e4e65fd4c2429a1a5dfbf50dc17e3685f84383bc8e1b wasm32-wasip2 "$INPUT" default Json)" '0.1 NEAR')
+    "$(wasm_args feca3d1651885d39bde0e4e65fd4c2429a1a5dfbf50dc17e3685f84383bc8e1b wasm32-wasip2 "$INPUT" "" Json)" '0.1 NEAR')
   judge X5 "a NEAR price > 0 from at least four exchanges" "$A" \
     '[.results[] | select(.id == "near_price")][0].data | (.value | type == "number" and . > 0) and (.sources | length >= 4)'
 fi
 
 if want X6; then
   echo "▶ X6 Ethereum API (WASI P2, secrets)"
-  INPUT='{"requests":[{"id":"alchemy","sources":[{"name":"custom","custom":{"url":"https://eth-mainnet.g.alchemy.com/v2","method":"POST","body":{"method":"eth_getBalance","params":["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045","latest"],"id":1,"jsonrpc":"2.0"},"json_path":"result","value_type":"string"}}]}],"max_price_deviation_percent":10.0}'
-  A=$(call "$CONTRACT_ID" request_execution \
-    "$(wasm_args 34907feceac091ba89f167a5cd408ebf6a6758b6ed1bde63020071788f722a35 wasm32-wasip2 "$INPUT" alchemy Json)" '0.1 NEAR')
-  judge X6 "a hex value from the provider" "$A" '.results[0].data.value | type == "string" and startswith("0x")'
+  INPUT='{"command":"fetch_custom_data","requests":[{"id":"alchemy","source":{"custom":{"url":"https://eth-mainnet.g.alchemy.com/v2","method":"POST","body":{"method":"eth_getBalance","params":["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045","latest"],"id":1,"jsonrpc":"2.0"},"json_path":"result","value_type":"string"}}}]}'
+  ARGS=$(jq -nc --argjson l "$LIMITS" --arg i "$INPUT" --arg o "$SECRETS_OWNER" \
+    '{source:{Project:{project_id:($o + "/ethereum-api"), version_key:null}}, resource_limits:$l, input_data:$i, secrets_ref:{profile:"alchemy", account_id:$o}, response_format:"Json"}')
+  A=$(call "$CONTRACT_ID" request_execution "$ARGS" '0.1 NEAR')
+  judge X6 "a hex value from the provider" "$A" '.results[0].value | type == "string" and startswith("0x")'
 fi
 
 if want X7; then
