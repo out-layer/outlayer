@@ -284,6 +284,16 @@ is answered from the condition itself, at any size.
 Decryption happens in the keystore TEE and the plaintext exists only inside the
 worker that runs your module. The coordinator never sees it.
 
+**Your credential goes only where you named.** Every caller the row admits runs
+your code with your key, so a destination that receives it is set by you: a
+host in the code, checked exactly before the credential is attached, and listed
+in `capabilities.network`, the limit the worker enforces whatever the code
+does. A URL or host from the call's input never receives a secret, in a header,
+the URL or the body; a connector that fetches a caller-chosen URL attaches no
+credential to that request. The same rule covers error messages and answers:
+one that echoes a secret publishes it. The general form, for projects that are
+not connectors, is in `wasi-examples/WASI_TUTORIAL.md` §3c.
+
 ### 4.2 The caller's credential (the agent's own)
 
 An agent may have a secret of its own that YOUR connector needs to act on its
@@ -835,6 +845,8 @@ access; one that echoed secrets would make every test run a leak.
    row's `AccessCondition` admits callers), the owner's (a row the call names
    in `secrets_ref`), or the agent's own (`X-Use-Owner-Secret`). Most
    connectors need none.
+   A secret goes only to a host fixed in the code and listed in
+   `capabilities.network` — never to a URL the input names (§4.1).
 7. Declare a `limits` entry for anything only you know is fragile.
 8. Handle errors. Read `NEAR_SENDER_ID` for who you act as and
    `NEAR_USER_ACCOUNT_ID` for who paid; never take either from the input.

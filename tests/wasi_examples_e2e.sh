@@ -49,10 +49,11 @@ FASTFS=https://wasmhub.testnet.fastfs.io/fastfs.testnet
 LIMITS='{"max_instructions":10000000000,"max_memory_mb":128,"max_execution_seconds":60}'
 
 # The request_execution arguments of one WasmUrl example.
-wasm_args() { # hash build_target input secrets_profile response_format [url_hash]
-  local secrets=null
+wasm_args() { # hash build_target input secrets_profile response_format [url_hash | https://url]
+  local secrets=null url="$FASTFS/${6:-$1}.wasm"
+  [[ "$6" == https://* ]] && url=$6
   [[ -n "$4" ]] && secrets=$(jq -nc --arg p "$4" --arg a "$SECRETS_OWNER" '{profile:$p, account_id:$a}')
-  jq -nc --arg url "$FASTFS/${6:-$1}.wasm" --arg h "$1" --arg t "$2" --arg i "$3" --argjson s "$secrets" \
+  jq -nc --arg url "$url" --arg h "$1" --arg t "$2" --arg i "$3" --argjson s "$secrets" \
     --arg f "$5" --argjson l "$LIMITS" \
     '{source:{WasmUrl:{url:$url, hash:$h, build_target:$t}}, resource_limits:$l, input_data:$i, secrets_ref:$s, response_format:$f}'
 }
@@ -98,9 +99,9 @@ fi
 
 if want X2; then
   echo "▶ X2 AI completions (WASI P2, a secret system prompt)"
-  INPUT='{"prompt":"What could the NEAR OutLayer project do?","history":[{"role":"user","content":"Tell me about NEAR"},{"role":"assistant","content":"NEAR is the most scalable Layer 1 blockchain."}],"model_name":"accounts/fireworks/models/gpt-oss-120b","openai_endpoint":"https://api.fireworks.ai/inference/v1/chat/completions","max_tokens":16384}'
+  INPUT='{"prompt":"What could the NEAR OutLayer project do?","history":[{"role":"user","content":"Tell me about NEAR"},{"role":"assistant","content":"NEAR is the most scalable Layer 1 blockchain."}],"model_name":"accounts/fireworks/models/gpt-oss-120b","max_tokens":16384}'
   A=$(call "$CONTRACT_ID" request_execution \
-    "$(wasm_args 41c1c7b3528565f3fd139943f439d61c0768e9abdb9b579bd0921ecbfcabeded wasm32-wasip2 "$INPUT" secret-system-prompt Text cbf80ed0080dd62f2041745cdc958ec0fbd192f33aeaa756f7873d742204b2f8)" '0.1 NEAR')
+    "$(wasm_args 142b02e8f18360900065b9397a385d1b374958405802fdb020fb301250c742ce wasm32-wasip2 "$INPUT" secret-system-prompt Text https://test.fastfs.io/outlayer-alice.testnet/outlayer.testnet/142b02e8f18360900065b9397a385d1b374958405802fdb020fb301250c742ce.wasm)" '0.1 NEAR')
   # The secret prompt makes every sentence start with "O": the answer proves the secret reached the run.
   judge X2 "an answer shaped by the secret prompt (starts with \"O\")" "$A" 'type == "string" and length > 40 and startswith("O")'
 fi

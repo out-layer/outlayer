@@ -899,6 +899,29 @@ refused by the keystore when secrets are stored and stripped at run time, so
 whatever your module reads under a system name came from the worker. The
 `PROTECTED_` prefix is reserved for secrets the keystore generates.
 
+**Where a secret may go: never where the input says.** The keystore hands a
+secret to the build its row names; from there your code alone decides where it
+travels. A URL, host or address taken from the input must never receive a
+secret — not in a header, not in the URL, not in the body. Anyone the row's
+condition admits (everyone, for `AllowAll`) can run your build with your key
+and name a server of their own, and the request carries the key there. A
+destination that receives a secret is one of:
+
+- **fixed by the author**: a constant in the code, or an allowlist the code
+  checks before it attaches the secret — exact hostnames, no suffix match
+  (`oracle-example`'s `API_KEY_HOSTS`);
+- **named by the secret's owner in the same row**: `OPENAI_ENDPOINT` stored
+  beside `OPENAI_API_KEY` (`ai-example`), which only the owner's own
+  `store_secrets` can change, and which the code refuses when the input tries
+  to name it;
+- **bounded by a connector's manifest** as well: `capabilities.network` is a
+  hard limit the worker enforces outside your code, so no input and no bug can
+  reach a host it does not list (`docs/CONNECTORS.md` §3).
+
+The input may choose what is asked — the prompt, the model, the city — never
+where a credential is sent. The same holds for every other way out: an error
+message, an answer or a log line that echoes a secret publishes it.
+
 ### 3d. Who may call your project
 
 A manifest's `callers` block decides which doors a run may come through —
