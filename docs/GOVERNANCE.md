@@ -15,25 +15,42 @@ it cannot change what the contracts are, and the DAO can replace it at any time.
 ## No full-access keys
 
 None of the three accounts has a full-access key. Nobody can deploy code to them, add a key, or
-sign arbitrary transactions as them. The keys that remain are narrow function-call keys, each
-installed by the contracts themselves:
+sign arbitrary transactions as them.
+
+### Function-call keys
+
+`list-keys` on these accounts still shows keys: function-call keys. Each is a service key for one
+narrow job. It signs calls only to the methods listed on it, on one named contract; it cannot
+deploy code, add or remove keys, or transfer NEAR, and its allowance pays only for the gas of
+those calls. A contract installs each of them, never a person:
 
 - **Workers on `worker.outlayer.near`.** Each worker's key is added only after its Intel TDX
   attestation is verified on chain against a build the DAO approved. The key may call only the
-  four methods a worker needs on `outlayer.near`: delivering results and settling payments.
+  four methods a worker needs on `outlayer.near`: delivering results and settling payments. Its
+  gas allowance is 10 NEAR.
 - **Keystores on `dao.outlayer.near`.** Each keystore's key is added only by a DAO vote on its
   verified attestation, and only for a build the DAO approved. It may call only `request_key`
   (obtain the master secret through NEAR MPC), `mark_vault_verified` and `ban_vault`.
 
-Read the keys yourself: `near account list-keys outlayer.near network-config mainnet now`.
+The set follows the running fleet: the keys on an account are those of the instances running
+now. A redeployed worker or keystore registers a new key, and the old one is removed as it is
+rotated out: a worker's by `remove_worker_keys`, a keystore's by a DAO vote
+(`propose_revoke_keystore_keys`).
+
+Read the keys yourself:
+
+```bash
+near account list-keys dao.outlayer.near network-config mainnet now
+near account list-keys outlayer.near network-config mainnet now
+near account list-keys worker.outlayer.near network-config mainnet now
+```
 
 ## The DAO
 
-- **Members.** Three accounts, each held by a different person. Any two of three approve a
-  proposal (`approval_threshold = members / 2 + 1`, recomputed when membership changes).
+- **Members.** Three accounts. Any two of three approve a proposal (`approval_threshold = members / 2 + 1`, recomputed when membership changes).
   `get_dao_members` on `dao.outlayer.near` lists them.
-- **Delay.** An approved proposal executes no earlier than 72 hours after the vote that approved
-  it. Anyone watching the chain has three days to see what is coming. One vote has no delay:
+- **Delay.** An approved proposal executes no earlier than 24 hours after the vote that approved
+  it. Anyone watching the chain has a day to see what is coming. One vote has no delay:
   admitting an instance of a keystore whose software the DAO already approved through such a
   proposal.
 - **Lifetime.** A proposal collects votes for at most 14 days. Once approved, it must be executed
@@ -71,8 +88,8 @@ Each of these is a narrow switch, not a change of rules:
 
 ## The operations owner
 
-`owner.outlayer.near` runs the parts that must happen quickly or routinely. Waiting three days for
-a vote would hurt users there: stopping a bad build at once, refreshing Intel's reference data
+`owner.outlayer.near` runs the parts that must happen quickly or routinely. Waiting a day for a
+vote would hurt users there: stopping a bad build at once, refreshing Intel's reference data
 every month, setting prices.
 
 Every owner power is either:
@@ -98,7 +115,7 @@ None of them touches code, keys, members, the delay or build approvals.
 | Main | `withdraw_platform_token` | Withdraw the platform's stablecoin revenue | Payment-key usage is settled off chain, so the platform's share is withdrawn by the owner |
 
 **Replacing the owner.** The DAO replaces the owner of any contract with one proposal, and the
-owner cannot cancel it. A lost or compromised owner key is a 72-hour problem, not a permanent one.
+owner cannot cancel it. A lost or compromised owner key is a 24-hour problem, not a permanent one.
 
 ## The worker operator
 `outlayer.near` accepts execution results only from `worker.outlayer.near`. That account holds no
@@ -106,7 +123,7 @@ full-access key, only the attested workers' keys described above. Which builds m
 the DAO's decision.
 
 ## Verifying it yourself
-- **Code.** `near contract view-account-summary <account>` shows the code hash; a reproducible
+- **Code.** `near account view-account-summary <account> network-config mainnet now` shows the code hash; a reproducible
   build of the release (`cargo near build reproducible-wasm`) gives the same sha256.
 - **Keys.** `list-keys` shows only function-call keys.
 - **Governance.** `get_governance` on `outlayer.near` and `worker.outlayer.near` returns

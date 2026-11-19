@@ -36,10 +36,15 @@
 #                       https://kms-v2.<site>.dstack.outlayer.ai:11102 for KMS v2. Changes the
 #                       measurements (RTMR3 carries the KMS), approved like any other. The
 #                       <site> must be the node's own (see node_kms_site); refused otherwise.
-#   --resume           keystore only: continue with the CVM [instance-name] as it is deployed — no
-#                       new deploy. For the second run after its measurements were approved by
-#                       DAO vote: a new deploy would be a new CVM with a new instance-id in RTMR3,
+#   --resume           continue with the CVM [instance-name] as it is deployed — no new deploy.
+#                       keystore: the second run after its measurements were approved by DAO
+#                       vote: a new deploy would be a new CVM with a new instance-id in RTMR3,
 #                       whose measurements the approved ones no longer match.
+#                       worker: run it any time after the deploy, as often as needed. It reads the
+#                       CVM's measurements, says where their approval stands (the proposal, when it
+#                       executes, the command that executes it), and once they are approved checks
+#                       that the worker registered, restarting it only if it gave up waiting. No
+#                       KMS check and no digest lookup: nothing is deployed.
 #   --print            DAO steps send nothing: the ready propose / vote / execute commands are
 #                       printed, one per member (DAO_CHAIN=print). Without it, on testnet, every DAO
 #                       step is sent with the members' keys found in the local legacy keychain.
@@ -72,6 +77,7 @@
 # Examples:
 #   ./scripts/deploy_tdx.sh worker   testnet --version 0.1.35 --node root@$DAL_HOST
 #   ./scripts/deploy_tdx.sh worker   testnet worker-b --version 0.1.35 --node root@$DAL_HOST
+#   ./scripts/deploy_tdx.sh worker   testnet worker-b --version 0.1.35 --node root@$DAL_HOST --resume
 #   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@$DAL_HOST
 set -euo pipefail
 
@@ -106,9 +112,13 @@ COMPONENT="${POS[0]:-}"; NETWORK="${POS[1]:-testnet}"; INSTANCE_NAME="${POS[2]:-
 
 case "$COMPONENT" in worker|keystore) ;; *) echo "component must be worker|keystore (got '$COMPONENT')" >&2; exit 1;; esac
 case "$NETWORK" in testnet|mainnet) ;; *) echo "network must be testnet|mainnet (got '$NETWORK')" >&2; exit 1;; esac
+WORKER_RESUME=false
 if $RESUME; then
-  [ "$COMPONENT" = keystore ] || { echo "--resume is for a keystore (a worker registers by itself once approved)" >&2; exit 1; }
   [ -n "$INSTANCE_NAME" ] || { echo "--resume needs the instance name of the deployed CVM" >&2; exit 1; }
+  if [ "$COMPONENT" = worker ]; then
+    [ -z "$OS_IMAGE" ] || { echo "worker --resume continues a deploy or an --os-image run: give it without --os-image" >&2; exit 1; }
+    WORKER_RESUME=true
+  fi
 fi
 [ -n "$DEPLOY_VERSION" ] || { echo "--version <ver> required (e.g. --version 0.1.35)" >&2; exit 1; }
 [ -n "$NODE" ] || { echo "--node <ssh-target> required (e.g. --node root@<node-ip>)" >&2; exit 1; }
@@ -259,6 +269,9 @@ node_run() {
 
 echo "== deploy_tdx: $COMPONENT $NETWORK  vm-label=$NAME  version=v$VER  node=$NODE =="
 
+if $WORKER_RESUME; then
+echo "[0-1] --resume: the CVM '$NAME' stays as deployed — no KMS check, no digest to resolve"
+else
 # [0] The node's KMS refuses every device but this node's: through it an approved build is
 # approved for this hardware only (deploy/self-hosted-tdx/tools/check-kms-binding.sh says why).
 # Read-only; a node that fails it gets no deploy.
@@ -291,8 +304,13 @@ if [ -z "$OS_IMAGE" ] && command -v gh >/dev/null 2>&1; then
     echo "  Sigstore attestation: NOT verified (continuing — verify manually before trusting)"
   fi
 fi
+fi  # worker --resume deploys nothing
 
 if $DRY_RUN; then
+  if $WORKER_RESUME; then
+    echo "(dry-run) would: read the measurements of the running CVM '$NAME' on $NODE -> their approval on $REGISTER (the DAO proposal, when it executes, the execute command) -> once approved, the worker's registration (restarted only if it gave up waiting)"
+    exit 0
+  fi
   if [ -n "$OS_IMAGE" ]; then
     gate=$([ "$COMPONENT" = worker ] && echo "approve on $REGISTER (signer $OWNER) -> wait for it to register" || echo "approve on $DAO by DAO vote ($(dao_chain_mode)) -> wait for its registration -> members vote ($(dao_chain_mode)) -> poll /health")
     echo "(dry-run) would: on $NODE, worker-ctl.sh set-image $NAME $OS_IMAGE (soft stop, resize --image, start) -> read measurements -> $gate"
@@ -323,6 +341,8 @@ if [ -n "$OS_IMAGE" ]; then
 # [2/5] upgrade: the existing CVM boots the new guest OS; env, disk and app-id are untouched
 echo "[2/5] Move CVM '$NAME' to $OS_IMAGE on the node (soft stop, resize --image, start)..."
 node_run "./worker-ctl.sh set-image $NAME $OS_IMAGE"
+elif $WORKER_RESUME; then
+echo "[2/5] --resume: no deploy"
 else
 # [2/5] deploy the CVM on the node (node-side deploy_tdx.sh derives the stable COMPOSE_NAME)
 echo "[2/5] Deploy CVM on node (reads node env: $REMOTE_DIR/worker/.env.${NETWORK}-worker-tdx — NOT your local copy)..."
@@ -378,9 +398,25 @@ fi  # deploy vs --os-image
 # loopback port), which answers for any booted CVM. The worker's own log carries them only on a
 # boot that registers a key, so a CVM whose key is already registered (an OS image upgrade)
 # logs nothing — the log is the fallback, not the source.
-echo "[3/5] Read TEE measurements from the CVM's guest agent (waiting for boot)..."
+echo "[3/5] Read TEE measurements from the CVM's guest agent$($WORKER_RESUME || echo " (waiting for boot)")..."
 MEAS=""
-for i in $(seq 1 20); do
+# A resumed CVM booted long ago: it is on this node and running, or there is nothing to wait for.
+if $WORKER_RESUME; then
+  VMS=$(node_run "./worker-ctl.sh status" 2>/dev/null | sed 's/│/|/g' || true)
+  ROW=$(printf '%s\n' "$VMS" | awk -F'|' -v want="$NAME" '{ n=$4; gsub(/[[:space:]]/, "", n); if (n == want) print }')
+  if [ -z "$ROW" ]; then
+    echo "  There is no CVM '$NAME' on $NODE. The $NETWORK workers there:" >&2
+    printf '%s\n' "$VMS" | awk -F'|' -v net="$NETWORK-worker-" '{ n=$4; s=$5; gsub(/[[:space:]]/, "", n); gsub(/[[:space:]]/, "", s); if (index(n, net) == 1) print "    " n "  (" s ")" }' >&2
+    exit 1
+  fi
+  printf '%s' "$ROW" | grep -q running || {
+    echo "  The CVM '$NAME' on $NODE is not running: $(printf '%s' "$ROW" | awk -F'|' '{ s=$5; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); print s }')" >&2
+    echo "  On the node: NAME=$NAME ./worker-ctl.sh start" >&2
+    exit 1
+  }
+fi
+MEAS_TRIES=$($WORKER_RESUME && echo 2 || echo 20)
+for i in $(seq 1 "$MEAS_TRIES"); do
   MEAS=$(agent_measurements || true)
   [ -n "$MEAS" ] && break
   LOGS=$(node_run "NAME=$NAME TAIL=600 ./worker-ctl.sh logs" 2>/dev/null || true)
@@ -392,6 +428,9 @@ for i in $(seq 1 20); do
   fi
   sleep 12
 done
+if [ -z "$MEAS" ] && $WORKER_RESUME; then
+  echo "  The CVM '$NAME' does not answer on $NODE: is it running? On the node: NAME=$NAME ./worker-ctl.sh status" >&2; exit 1
+fi
 [ -n "$MEAS" ] || { echo "  Could not read measurements after ~4min. Check: NAME=$NAME worker-ctl.sh follow" >&2; exit 1; }
 MRTD=$(printf '%s' "$MEAS" | grep -oE '"mrtd":"[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}')
 RTMR3=$(printf '%s' "$MEAS" | grep -oE '"rtmr3":"[a-f0-9]{96}"' | grep -oE '[a-f0-9]{96}')
@@ -409,8 +448,15 @@ elif dao_has_governance "$GOV_DAO"; then
   echo "  through the DAO $GOV_DAO (member $GOV_MEMBER)"
   rc=0; dao_drive "$GOV_DAO" "$GOV_MEMBER" "$(dao_measurements_action worker "$REGISTER" "$MEAS")" || rc=$?
   if [ "$rc" -eq 2 ]; then
-    echo "  The CVM '$NAME' is up; it registers once the proposal executes. If it gave up waiting by then,"
-    echo "  restart it: NAME=$NAME ./worker-ctl.sh restart (on $NODE)."
+    echo "  Next:"
+    echo "    1. Send the command above (the propose, a member's vote, or the execute once its time has come)."
+    echo "    2. Run this — nothing is redeployed; run it again as often as you like:"
+    echo "         $0 worker $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume"
+    echo "       Before the execute it shows when the proposal executes and the command that executes it;"
+    echo "       after it, it checks that the worker registered."
+    echo "  The CVM '$NAME' is up and registers by itself if the proposal executes within ~50 min of its"
+    echo "  first boot (it waits ~8 min per boot, and its container restarts 5 times). Later, --resume"
+    echo "  restarts it."
     exit 3
   fi
   [ "$rc" -eq 0 ] || { echo "  approval through the DAO failed" >&2; exit 1; }
@@ -428,35 +474,92 @@ else
   echo "  measurements approved (owner; the DAO has no governance yet)"
 fi
 
-# [5/5] wait for the worker to register. It polls is_measurements_approved every 5 s for ~8 min
+# [5/5] wait for the worker to come up. It polls is_measurements_approved every 5 s for ~8 min
 # (registration.rs wait_for_measurements_approval) and registers by itself once [4/5] approved,
 # so no restart is needed. Only a worker that gave up (approval later than its window: the
 # process exits) is restarted, once. A worker whose key is already on the contract (an OS image
-# upgrade keeps the disk, and the key on it) does not register again: it logs "Key registered and
-# ready for signing". Only lines of this deploy's boots count ($W_SINCE): the container log
-# survives a restart, and an earlier boot's success line says nothing about this one.
-worker_watch() { # rounds of 12 s → 0 registered, 1 error (exits), 2 undecided
+# upgrade keeps the disk, and the key on it) does not register again. Either way it is up only
+# once both TEE sessions are open (coordinator, then keystore): "TEE session registered with
+# keystore" is its last startup step. A stop past the registration (the startup attestation, a
+# session) is not cured by a restart: its cause is shown and the run ends. Only lines from this
+# run on count ($W_SINCE): the container log survives a restart, and an earlier boot's line says
+# nothing about this one (--resume reads the earlier boots first, below).
+W_UP="TEE session registered with keystore"
+W_FATAL="Failed to send startup attestation|Failed to register TEE session|Exceeded the prepaid gas|did not verify|No cached collateral"
+worker_fatal() { # <log lines> → the cause of the stop and what to do; exits 1
+  local cause
+  cause=$(printf '%s\n' "$1" | grep -E "$W_FATAL|failed: |❌" | tail -2 || true)
+  echo "  The worker stopped, and a restart does not cure it:" >&2
+  printf '%s\n' "${cause:-  (its log names no cause; on the node: NAME=$NAME ./worker-ctl.sh logs)}" | sed 's/^/    /' >&2
+  if printf '%s' "$cause" | grep -q "Signature verification failed"; then
+    echo "  The server refuses the session this worker signs: it is older than the worker. Deploy it" >&2
+    echo "  (the coordinator, or the keystore if the line names it), then restart this worker." >&2
+  fi
+  echo "  Once fixed, on $NODE: NAME=$NAME ./worker-ctl.sh restart — then run this --resume again." >&2
+  exit 1
+}
+worker_watch() { # rounds of 12 s → 0 up, 1 a stop a restart does not cure (exits), 2 undecided
   local i L
   for i in $(seq 1 "$1"); do
     L=$(node_run "NAME=$NAME TAIL=400 ./worker-ctl.sh logs" 2>/dev/null \
       | awk -v t="$W_SINCE" '/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && substr($0, 1, 19) >= t' || true)
-    if printf '%s' "$L" | grep -qE "Worker key registered successfully|Key registered and ready for signing"; then
-      echo "  REGISTERED:"; printf '%s' "$L" | grep -E "registered successfully|Key registered and ready|Transaction:" | tail -2
+    if printf '%s' "$L" | grep -qF "$W_UP"; then
+      echo "  UP:"; printf '%s' "$L" | grep -E "registered successfully|Key registered and ready|TEE session registered" | tail -3
       return 0
     fi
-    if printf '%s' "$L" | grep -qiE "Exceeded the prepaid gas|did not verify|No cached collateral"; then
-      echo "  registration error:"; printf '%s' "$L" | grep -iE "exceeded|verif|collateral" | tail -3 >&2; exit 1
-    fi
+    printf '%s' "$L" | grep -qE "$W_FATAL" && worker_fatal "$L"
     sleep 12
   done
   return 2
 }
-echo "[5/5] Wait for the worker to register (it does so by itself once the measurements are approved)..."
-if worker_watch 45; then
+FIRST_WATCH=45
+STAGE="[5/5] Wait for the worker to come up (it registers by itself once the measurements are approved)..."
+if $WORKER_RESUME; then
+  # Where the worker stands, from the last of its own lines that says so (the container log keeps
+  # every boot): up; in a boot that is starting (it logs "registration enabled", then checks the
+  # approval every 5 s, registers, opens its sessions); or stopped. A stop is final only once its
+  # container has used its restarts (compose: on-failure:5, each within seconds), so a stop is
+  # read twice: restarting the CVM under a boot that is sending its registration would orphan
+  # that key. A restart cures one stop only, the approval that came after the worker gave up
+  # waiting; any other stop is the operator's to fix, and its cause is shown.
+  WLOG=""; LAST=""
+  worker_read() {
+    WLOG=$(node_run "NAME=$NAME TAIL=400 ./worker-ctl.sh logs" 2>/dev/null || true)
+    LAST=$(printf '%s\n' "$WLOG" \
+      | grep -E "$W_UP|$W_FATAL|Worker stopped|Worker registration enabled|Measurements not yet approved|registered successfully|Key registered and ready|Registering TEE session" \
+      | tail -1 || true)
+  }
+  is_stop() { printf '%s' "$1" | grep -qE "$W_FATAL|Worker stopped"; }
+  worker_read
+  if is_stop "$LAST"; then sleep 15; worker_read; fi
+  if printf '%s' "$LAST" | grep -qF "$W_UP"; then
+    echo "[5/5] The worker is up:"
+    echo "  $LAST"
+    echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME ./worker-ctl.sh follow"
+    exit 0
+  elif is_stop "$LAST"; then
+    if printf '%s\n' "$WLOG" | grep -E "Measurements not approved after|$W_FATAL" | tail -1 | grep -q "Measurements not approved after"; then
+      FIRST_WATCH=0
+      STAGE="[5/5] The worker gave up waiting for the approval before it came, and its container is not restarting."
+    else
+      echo "[5/5]" >&2
+      worker_fatal "$WLOG"
+    fi
+  elif [ -n "$LAST" ]; then
+    FIRST_WATCH=10
+    STAGE="[5/5] The worker is in a boot that is starting; it sees the approval within seconds..."
+  fi
+fi
+echo "$STAGE"
+if worker_watch "$FIRST_WATCH"; then
   echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME ./worker-ctl.sh follow"
   exit 0
 fi
-echo "  not registered within ~9 min (its approval window has passed): restarting it once..."
+if [ "$FIRST_WATCH" -gt 0 ]; then
+  echo "  not up within ~$((FIRST_WATCH * 12 / 60 + 1)) min: restarting it once (soft)..."
+else
+  echo "  restarting it (soft)..."
+fi
 node_run "NAME=$NAME ./worker-ctl.sh restart" >/dev/null || true
 if worker_watch 20; then
   echo "Done. Manage: ssh $NODE -> su - $REMOTE_USER -> cd $REMOTE_DIR -> NAME=$NAME ./worker-ctl.sh follow"
