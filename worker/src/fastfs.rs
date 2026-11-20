@@ -100,6 +100,7 @@ impl FastFsClient {
             .client
             .call(access_key_query)
             .await
+            .map_err(crate::near_client::rpc_call_error)
             .context("Failed to query access key for FastFS")?;
 
         let current_nonce = match access_key_response.kind {
@@ -118,6 +119,7 @@ impl FastFsClient {
             .client
             .call(block_query)
             .await
+            .map_err(crate::near_client::rpc_call_error)
             .context("Failed to query block for FastFS")?;
 
         let block_hash = block.header.hash;
@@ -161,6 +163,7 @@ impl FastFsClient {
             .client
             .call(tx_request)
             .await
+            .map_err(crate::near_client::rpc_call_error)
             .context("Failed to broadcast FastFS transaction")?;
 
         // The file travels in the transaction's arguments and the indexer

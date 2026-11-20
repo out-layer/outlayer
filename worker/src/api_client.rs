@@ -730,9 +730,12 @@ impl ApiClient {
         match response.status() {
             StatusCode::OK => {
                 let body_text = response.text().await?;
-                tracing::debug!("📦 Poll response body: {}", body_text);
-                let request: ExecutionRequest = serde_json::from_str(&body_text)
-                    .context(format!("Failed to parse execution request JSON: {}", body_text))?;
+                // The body carries the task's input — private for an HTTPS
+                // call — so the log and the error name its size only.
+                tracing::debug!("📦 Poll response body: {} bytes", body_text.len());
+                let request: ExecutionRequest = serde_json::from_str(&body_text).with_context(|| {
+                    format!("Failed to parse execution request JSON ({} bytes)", body_text.len())
+                })?;
                 Ok(Some(request))
             }
             StatusCode::NO_CONTENT => Ok(None), // No request available

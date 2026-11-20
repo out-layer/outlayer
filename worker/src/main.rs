@@ -392,8 +392,12 @@ async fn main() -> Result<()> {
     }
 
     // Initialize compiled cache (requires secret key from registration/config)
-    // This caches pre-compiled wasmtime components for ~10x faster WASM startup
-    let compiled_cache: Option<Arc<Mutex<CompiledCache>>> = if config.wasm_cache_max_size_mb > 0 {
+    // This caches pre-compiled wasmtime components for ~10x faster WASM startup.
+    // Only a worker that executes has use for it — and only such a worker holds
+    // an operator key (a downloader or compiler holds none, see Config).
+    let compiled_cache: Option<Arc<Mutex<CompiledCache>>> = if config.wasm_cache_max_size_mb > 0
+        && config.capabilities.can_execute()
+    {
         // Get secret key bytes from operator signer
         let secret_key = &config.get_operator_signer().secret_key;
         let secret_key_bytes: [u8; 32] = match secret_key {
@@ -426,8 +430,11 @@ async fn main() -> Result<()> {
         } else {
             None
         }
-    } else {
+    } else if config.wasm_cache_max_size_mb == 0 {
         info!("⚡ Compiled cache disabled (WASM_CACHE_MAX_SIZE_MB=0)");
+        None
+    } else {
+        info!("⚡ Compiled cache off: this worker executes nothing");
         None
     };
 
@@ -3378,7 +3385,7 @@ async fn handle_execute_job(
             // Check if WASM execution actually succeeded (executor returns Ok even for WASM errors)
             if !execution_result.success {
                 let error_msg = execution_result.error.clone().unwrap_or_else(|| "Unknown error".to_string());
-                error!("❌ WASM execution failed: {}", error_msg);
+                error!("❌ WASM execution failed: {}", guest_text_for_log(&error_msg));
 
                 // HTTPS calls: report error to coordinator
                 if is_https_call {
@@ -3793,7 +3800,7 @@ async fn handle_execute_job(
         }
         Err(e) => {
             let error_msg = format!("Execution failed: {}", e);
-            error!("❌ {}", error_msg);
+            error!("❌ Execution failed: {}", guest_text_for_log(&error_msg));
 
             // Handle HTTPS call errors
             if is_https_call {
@@ -6197,5 +6204,26 @@ mod the_caller_gate_in_the_job_path {
         for foreign in ["input_data", "env_vars", "context.sender_id"] {
             assert!(!gate.contains(foreign), "{foreign} is not a fact of who called: {gate}");
         }
+    }
+}
+
+/// A guest's error text as the worker log shows it: its size and a short hash,
+/// never the text. The text is the guest's stderr (up to 1 MiB) or a preview
+/// of its input — private for an HTTPS call — and the log is read on the host.
+/// The caller still gets the whole text in the call's result; the hash ties a
+/// log line to the result it belongs to.
+fn guest_text_for_log(text: &str) -> String {
+    use sha2::Digest;
+    let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    format!("{} bytes, sha256 {}", text.len(), &digest[..12])
+}
+
+#[cfg(test)]
+mod guest_text_for_log_tests {
+    #[test]
+    fn the_log_names_the_text_and_does_not_hold_it() {
+        let line = super::guest_text_for_log("panicked: apikey=SECRET");
+        assert!(line.starts_with("23 bytes, sha256 "), "{line}");
+        assert!(!line.contains("SECRET"));
     }
 }

@@ -427,11 +427,17 @@ impl Config {
             .parse::<bool>()
             .unwrap_or(true);
 
-        // Set PRINT_WASM_STDERR=true to see WASM stderr in worker logs
-        let print_wasm_stderr = env::var("PRINT_WASM_STDERR")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse::<bool>()
-            .unwrap_or(false);
+        // Set PRINT_WASM_STDERR=true to see WASM stderr in worker logs — local
+        // development only (TEE_MODE=none). In a TEE the flag is ignored: a
+        // guest's stderr can carry a user's decrypted secret or private input,
+        // and the TEE's log is read on the host; the caller gets the text in
+        // its result either way. The flag is in the CVM's allowed envs, so an
+        // operator could set it without changing the measurement.
+        let print_wasm_stderr = tee_mode == "none"
+            && env::var("PRINT_WASM_STDERR")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .unwrap_or(false);
 
         // Worker capabilities - what this worker can do
         // Off unless asked for: a build runs the repository's own code (see

@@ -176,7 +176,8 @@ impl WasiHttpView for HostState {
             ))));
         }
 
-        let url = request.uri().to_string();
+        // For the log only: see `loggable_uri`.
+        let url = loggable_uri(request.uri());
         let host = request.uri().host().map(|h| h.to_string());
         let port = request
             .uri()
@@ -860,6 +861,26 @@ pub async fn execute(
     }
 }
 
+
+/// A guest request's URI as the worker log shows it: scheme, host, port and
+/// path, never the query — a guest's query string is where an API key or a
+/// user's decrypted secret travels (`?apikey=…`), and the log is read on the
+/// host. Telegram's Bot API carries the bot token in the path
+/// (`/bot<TOKEN>/sendMessage`), so for it the path goes too.
+fn loggable_uri(uri: &hyper::Uri) -> String {
+    let scheme = uri.scheme_str().unwrap_or("https");
+    let authority = uri.authority().map(|a| a.as_str()).unwrap_or("");
+    // Userinfo (`user:pass@host`) is a credential as well.
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let telegram = uri
+        .host()
+        .is_some_and(|h| h.trim_end_matches('.').eq_ignore_ascii_case("api.telegram.org"));
+    if telegram {
+        return format!("{scheme}://{authority}");
+    }
+    format!("{scheme}://{authority}{}", uri.path())
+}
+
 #[cfg(test)]
 mod request_timeout_tests {
     use super::request_timeout_secs;
@@ -873,5 +894,34 @@ mod request_timeout_tests {
         assert_eq!(request_timeout_secs(Some(120), Duration::from_secs(40)), 40, "never past the run's end");
         assert_eq!(request_timeout_secs(None, Duration::from_secs(10)), 10, "the default is cut the same way");
         assert_eq!(request_timeout_secs(Some(120), Duration::ZERO), 1, "at the end: one second, then it times out");
+    }
+}
+
+#[cfg(test)]
+mod loggable_uri_tests {
+    use super::loggable_uri;
+
+    fn log(uri: &str) -> String {
+        loggable_uri(&uri.parse::<hyper::Uri>().unwrap())
+    }
+
+    #[test]
+    fn the_log_keeps_the_path_and_never_the_query() {
+        assert_eq!(log("https://api.example.com/v1/quote?apikey=SECRET&x=1"), "https://api.example.com/v1/quote");
+        assert_eq!(log("http://10.0.0.1:8080/admin"), "http://10.0.0.1:8080/admin");
+        assert_eq!(log("https://user:pass@host.io/p?q=1"), "https://host.io/p");
+    }
+
+    #[test]
+    fn telegram_loses_its_path_where_the_bot_token_is() {
+        assert_eq!(log("https://api.telegram.org/bot123:ABC/sendMessage?chat_id=1"), "https://api.telegram.org");
+        // Any spelling of the host the guest may use.
+        for uri in [
+            "https://API.TELEGRAM.ORG/bot123:ABC/sendMessage",
+            "https://api.telegram.org./bot123:ABC/sendMessage",
+            "https://Api.Telegram.Org:443/bot123:ABC/getMe",
+        ] {
+            assert!(!log(uri).contains("bot123"), "{uri} -> {}", log(uri));
+        }
     }
 }

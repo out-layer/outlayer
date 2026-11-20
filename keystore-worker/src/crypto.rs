@@ -129,13 +129,16 @@ impl Keystore {
 
     /// Create keystore from master secret bytes
     pub fn from_master_secret(master_secret: &[u8; 32]) -> Result<Self> {
-        // Log hash of master secret for debugging (if enabled)
+        // The master secret's SHA-256, logged on purpose in production too: it is
+        // how an operator sees that this keystore holds the same master key as
+        // before, whichever way it got it. A hash of a 32-byte random secret
+        // reveals nothing of it.
         if std::env::var("LOG_MASTER_KEY_HASH").unwrap_or_else(|_| "false".to_string()) == "true" {
             let mut hasher = Sha256::new();
             hasher.update(master_secret);
             let hash = hasher.finalize();
             tracing::warn!("🔑 MASTER KEY HASH (SHA256): {}", hex::encode(hash));
-            tracing::warn!("   This is for debugging only! Remove LOG_MASTER_KEY_HASH in production!");
+            tracing::warn!("   Compare with the previous start: the same hash means the same master key.");
         }
 
         tracing::info!("Loaded keystore from default master secret");

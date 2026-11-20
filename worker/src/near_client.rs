@@ -190,23 +190,29 @@ where
     }
 }
 
+/// A failed [`JsonRpcClient::call`] as [`RpcError`]: a transport failure as its reason without
+/// the URL. For every client built with `JsonRpcClient::connect`, not only [`NearClient`]'s.
+pub(crate) fn rpc_call_error<E>(e: JsonRpcError<E>) -> RpcError<E> {
+    use near_jsonrpc_client::errors::{
+        JsonRpcTransportRecvError as Recv, JsonRpcTransportSendError as Send,
+        RpcTransportError as Transport,
+    };
+    match e {
+        JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e)))
+        | JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e))) => {
+            RpcError::Transport(crate::transport_error::reason(e))
+        }
+        other => RpcError::Rpc(other),
+    }
+}
+
 impl NearClient {
     /// [`JsonRpcClient::call`]; a transport failure comes back as its reason without the URL.
     pub(crate) async fn rpc<M>(&self, method: M) -> Result<M::Response, RpcError<M::Error>>
     where
         M: methods::RpcMethod,
     {
-        use near_jsonrpc_client::errors::{
-            JsonRpcTransportRecvError as Recv, JsonRpcTransportSendError as Send,
-            RpcTransportError as Transport,
-        };
-        self.client.call(method).await.map_err(|e| match e {
-            JsonRpcError::TransportError(Transport::SendError(Send::PayloadSendError(e)))
-            | JsonRpcError::TransportError(Transport::RecvError(Recv::PayloadRecvError(e))) => {
-                RpcError::Transport(crate::transport_error::reason(e))
-            }
-            other => RpcError::Rpc(other),
-        })
+        self.client.call(method).await.map_err(rpc_call_error)
     }
 
     /// Create a new NEAR client

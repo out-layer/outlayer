@@ -1610,6 +1610,9 @@ pub(super) async fn storage_encrypt_handler(
         format!("storage:wasm:{}:{}", req.wasm_hash, req.account_id)
     };
 
+    // The key NAME is logged on purpose: it shows how storage is used (a
+    // module writing a million names is visible, and what they are). The value
+    // is never logged.
     tracing::debug!(
         seed = %seed,
         project_uuid = ?req.project_uuid,
