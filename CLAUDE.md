@@ -174,7 +174,9 @@ cd contract && ./build.sh                # Build contract
 # Coordinator is in separate private repo: outlayer-coordinator
 cd worker && cargo run                   # Run worker
 # Dashboard: cd /Users/alice/projects/outlayer-dashboard && npm run dev
-# Its docs bundle is generated FROM this repo:
+# Its docs bundle (public/llms*.txt) is generated FROM this repo by the dashboard's
+# `llms` workflow, started by .github/workflows/dashboard-llms.yml when a push here
+# touches the docs; the dashboard's build only checks the committed files. By hand:
 #   LLMS_SOURCES_ROOT=/Users/alice/projects/near-offshore npm run llms
 cd keystore-worker && cargo run          # Run keystore
 

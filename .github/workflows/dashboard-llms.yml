@@ -1,0 +1,39 @@
+# The dashboard serves this repo's docs to agents as public/llms.txt and llms-full.txt
+# (out-layer/dashboard). When a push here changes one of those docs, this asks the
+# dashboard's `llms` workflow to regenerate them from this commit; that workflow commits
+# them there if they changed. Nothing runs on a timer.
+#
+# The paths are the sources in the dashboard's scripts/llms-manifest.mjs (and
+# .gitmodules, which it reads for example links). A source added there is added here.
+#
+# Secret DASHBOARD_LLMS_TOKEN: a fine-grained token with Actions: read and write on
+# out-layer/dashboard and nothing else — it can start a workflow there, not push code.
+name: dashboard-llms
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - API.md
+      - VAULTS.md
+      - VRF.md
+      - WORKER_ATTESTATION.md
+      - docs/**/*.md
+      - wasi-examples/*.md
+      - contract/README.md
+      - sdk/outlayer/README.md
+      - .gitmodules
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Regenerate the dashboard's llms files from this commit
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_LLMS_TOKEN }}
+        run: gh workflow run llms.yml --repo out-layer/dashboard --ref main -f source_ref=${{ github.sha }}
