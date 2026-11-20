@@ -233,10 +233,8 @@ impl Store for Shared {
             .filter(|r| &r.scope == scope)
             .map(|r| Stored {
                 id: r.task.id.clone(),
-                preparer: r.task.preparer.clone(),
                 kind: r.task.kind,
                 state: r.state,
-                expires_at: r.task.expires_at as i64,
                 sealed: r.sealed.clone(),
                 files: r.files.clone(),
             })

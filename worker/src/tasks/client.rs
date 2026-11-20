@@ -154,10 +154,8 @@ pub struct Prepared {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Stored {
     pub id: String,
-    pub preparer: String,
     pub kind: Kind,
     pub state: State,
-    pub expires_at: i64,
     #[serde(default, deserialize_with = "b64_opt")]
     pub sealed: Option<Vec<u8>>,
     /// The task's files as they are stored, in order; with one task read for

@@ -2644,8 +2644,11 @@ mod tests {
 /// out, and a refund claim waits a day to be made again.
 pub const MAX_RELAYED_REASON_JSON_BYTES: usize = 960;
 
-/// The yield payload's cap, and the envelope's share of it.
+/// The yield payload's cap, and the envelope's share of it: what the tests hold
+/// [`MAX_RELAYED_REASON_JSON_BYTES`] to.
+#[cfg(test)]
 const YIELD_PAYLOAD_CAP_BYTES: usize = 1024;
+#[cfg(test)]
 const YIELD_ERROR_ENVELOPE_BYTES: usize = r#"{"Error":{"message":""}}"#.len();
 
 /// The bytes `s` takes inside a JSON string, quotes not counted.
