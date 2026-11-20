@@ -23,9 +23,20 @@
 #   M9  confidential swap quote wNEAR → NPRO (HoS item 7): no_liquidity
 #   M10 public dry withdraw of 1 unit of ZEC to Zcash: upstream_rejected or
 #       no_liquidity, with 1Click's words
+#   M11 confidential dry withdraw of BSC USDT (`nep141:bnb-….omdep.near`) to
+#       bsc: the chain is the catalog's `bsc`, not the id's `bnb` — 200 or
+#       1Click's own refusal, never unsupported_chain
+#   M12 confidential dry withdraw to near of an asset from another chain: it
+#       arrives as NEAR's listing of its symbol — ZEC, BSC USDT, Polygon USDC
+#       and strkBTC (listed on near) are quoted with an amount_out
+#   M13 confidential dry withdraw of native BNB to near: NEAR lists no BNB —
+#       400 unsupported_token
+#
+# The confidential dry-run quotes without reading the balance, so M11–M13 name
+# assets the wallet does not hold.
 #
 # Public dry-runs count against the wallet's daily custody ceiling (M1 ×4, M7,
-# M10), confidential ones too (M2 ×4, M3); quotes do not.
+# M10), confidential ones too (M2 ×4, M3, M11, M12 ×4, M13); quotes do not.
 #
 # Run:
 #   ./tests/route_gaps_e2e.sh --apply
@@ -53,6 +64,12 @@ HOT_POL="nep245:v2_1.omni.hot.tg:137_2jwTGwKRX3AEe7tyzDrxtDjEFgSt"
 WNEAR="nep141:wrap.near"
 NPRO="nep141:npro.nearmobile.near"
 EVM_TO="0x000000000000000000000000000000000000dEaD"
+# 1Click refuses the burn address as a BSC recipient; a fresh one per run.
+EVM_LIVE_TO="0x$(openssl rand -hex 20)"
+BSC_USDT="nep141:bnb-0x55d398326f99059ff775485246999027b3197955.omdep.near"
+BNB="nep141:bnb.omdep.near"
+POL_USDC="nep141:pol-0x3c499c542cef5e3811e1192ce70d8cc03d5c3359.omdep.near"
+STRK_BTC="nep141:strk-0xe646ef2a705bf5147ceffc8dfbcc7bee4946b8f7.omdep.near"
 # A Move / Starknet address: 0x + 64 hex.
 HEX64_TO="0x$(printf '1%.0s' $(seq 1 64))"
 TYPED='^(no_liquidity|upstream_rejected|unsupported_token|insufficient_balance|storage_not_registered|recipient_not_found|policy_denied|invalid_request)$'
@@ -157,5 +174,29 @@ dry "$(wd_body zcash "$ZEC" 1 "${ZEC_TO:-t1KqzqoByrbAPWDAJgZvDxdqAPHJeLG8sHH}")"
 if assert_status "M10 answered" 200; then
   [[ "$(reason)" =~ ^(upstream_rejected|no_liquidity)$ ]] && pass "M10 $(reason): $(msg_of | head -c 120)" || fail "M10 reason '$(reason)': $(msg_of)"
 fi
+
+log "M11 confidential dry withdraw of BSC USDT to bsc"
+cdry "$(wd_body bsc "$BSC_USDT" 5000000000000000000 "$EVM_LIVE_TO")"
+if [[ "$HTTP" == 200 ]]; then pass "M11 quoted, amount_out $(jq -r '.amount_out // "none"' <<<"$BODY")"
+elif [[ "$(err_of)" == unsupported_chain ]]; then fail "M11 the asset's chain was read from its id: $(msg_of)"
+elif [[ "$(err_of)" =~ ^(no_liquidity|upstream_rejected)$ ]]; then pass "M11 assessed by 1Click: $(err_of) — $(msg_of | head -c 120)"
+elif [[ "$HTTP" == 503 ]]; then skip "M11 not assessed: $(err_of)"
+else fail "M11 HTTP $HTTP $(err_of): $(msg_of)"; fi
+
+# asset|amount|what it arrives as on near
+for row in "$ZEC|$AMOUNT|ZEC" "$BSC_USDT|5000000000000000000|NEAR USDT" "$POL_USDC|5000000|NEAR USDC" "$STRK_BTC|10000|strkBTC"; do
+  IFS='|' read -r asset amount as <<<"$row"
+  log "M12 confidential dry withdraw of $asset to near (arrives as $as)"
+  cdry "$(wd_body near "$asset" "$amount" "$NEAR_ACCOUNT_ID")"
+  if [[ "$HTTP" == 200 ]]; then
+    [[ "$(jq -r '.amount_out // ""' <<<"$BODY")" =~ ^[0-9]+$ ]] && pass "M12 $as quoted, amount_out $(jq -r .amount_out <<<"$BODY")" || fail "M12 $as no amount_out: $BODY"
+  elif [[ "$(err_of)" == no_liquidity ]]; then skip "M12 $as route not assessed: no_liquidity — $(msg_of | head -c 120)"
+  elif [[ "$HTTP" == 503 ]]; then skip "M12 $as not assessed: $(err_of)"
+  else fail "M12 $as HTTP $HTTP $(err_of): $(msg_of)"; fi
+done
+
+log "M13 confidential dry withdraw of native BNB to near"
+cdry "$(wd_body near "$BNB" 50000000000000000 "$NEAR_ACCOUNT_ID")"
+assert_status "M13 refused" 400 && assert_denied "M13 unsupported_token" unsupported_token
 
 verdict "route gaps (mainnet, dry)"

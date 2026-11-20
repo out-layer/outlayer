@@ -43,7 +43,8 @@
 #   WALLET_API_KEY   — override saved key (usually let setup save it)
 #   SHIELD_TOKEN     — default nep141:wrap.near
 #   SHIELD_AMOUNT    — default 10000000000000000000000 (0.01 wNEAR, 24 dec)
-#   WITHDRAW_CHAIN   — destination chain (default: solana); chain=near is rejected (use unshield)
+#   WITHDRAW_CHAIN   — destination chain (default: solana); chain=near delivers to a NEAR
+#                      account (to your own public balance: use unshield)
 #   WITHDRAW_TO      — destination-chain recipient address
 #   WITHDRAW_TOKEN   — confidential source asset to deliver (e.g. nep141:sol-…omft.near)
 #   WITHDRAW_AMOUNT  — amount in minimal units
@@ -614,7 +615,7 @@ case "$CMD" in
         echo "  unshield        — UNSHIELD back (asserts settlement)"
         echo "  balance         — show confidential balances"
         echo "  deposit-intent  — cross-chain DEPOSIT quote (returns a bridge deposit address)"
-        echo "  withdraw        — cross-chain WITHDRAW (needs WITHDRAW_TO; chain=near is rejected)"
+        echo "  withdraw        — cross-chain WITHDRAW (needs WITHDRAW_TO)"
         echo "  multisig        — MAINNET: confidential Trusted op under multisig → pending_approval →"
         echo "                    approve (NEP-413 vote) → asserts it LEAVES pending_approval (T9 analog)"
         echo "  status <id>     — poll a request to terminal status"
