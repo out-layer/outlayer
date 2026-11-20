@@ -389,12 +389,13 @@ fn validate_output(output: &[u8]) -> Result<()> {
         );
     }
 
-    if output.len() > 900 {
+    if output.len() >= 1024 {
         println!(
-            "Warning: Output is {} bytes (limit is 900 bytes for NEAR)",
+            "Note: output is {} bytes. Called from a NEAR contract, an output of 1024 bytes or more",
             output.len()
         );
-        println!("   Consider truncating your output to fit the limit.");
+        println!("   is stored until the request settles and paid from its deposit (0.00001 NEAR per byte,");
+        println!("   at most 1.5 MiB). Over HTTPS it is returned as is, up to 10 MiB.");
     }
 
     // Try to parse as JSON

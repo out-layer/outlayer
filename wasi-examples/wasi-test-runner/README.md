@@ -26,9 +26,8 @@ Passing here does not prove a module runs on OutLayer. The runner:
   no time limit, while the worker enforces both (`WASI_TUTORIAL.md`, Overview);
 - does not apply the worker's outbound-HTTP rules (no internal addresses, a
   manifest's network allowlist, the 30-second per-request timeout);
-- warns about output over 900 bytes, a limit OutLayer does not have: stdout
-  holds up to 10 MiB, and an on-chain answer of 1024 bytes or more is
-  delivered in two steps;
+- notes an output of 1024 bytes or more: stdout holds up to 10 MiB, and such
+  an answer to a contract is stored and paid for from the request's deposit;
 - sets none of the worker's environment variables: pass what your module
   reads with `--env`.
 
