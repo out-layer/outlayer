@@ -40,6 +40,9 @@
 //!   (`recovery.is_none()` precondition on both initiate methods).
 //! * `set_exit_window` only affects future unilateral recoveries — the
 //!   active recovery's `finalize_before` is frozen at initiate time.
+//! * Raising the exit window applies at once; lowering it applies only after
+//!   the window in force has elapsed. A stolen parent key therefore waits out
+//!   the window the customer chose, not the minimum.
 //! * `registered_tee_keys` is capped at [`MAX_REGISTERED_TEE_KEYS`] (32)
 //!   to bound state size against the permissionless `propose_tee_key`.
 //!
@@ -203,6 +206,21 @@ pub struct RecoveryState {
     pub trigger: RecoveryTrigger,
 }
 
+/// A lowering of the unilateral exit window that has not taken effect yet.
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+    JsonSchema,
+)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct PendingExitWindow {
+    /// The window, in seconds, that replaces the one in force.
+    pub secs: u64,
+    /// Block timestamp (nanoseconds) from which it is in force: the moment it
+    /// was requested plus the window in force at that moment.
+    pub effective_at: u64,
+}
+
 /// Snapshot of the vault state, returned by [`Vault::get_state`]. Used by
 /// off-chain verifiers (vault-checker WASI agent, end-user CLI).
 ///
@@ -229,7 +247,10 @@ pub struct VaultState {
     pub registered_tee_keys: Vec<PublicKey>,
     pub recovery: Option<RecoveryState>,
     pub unlocked: bool,
+    /// The exit window in force at the block the view ran at.
     pub unilateral_exit_window_secs: u64,
+    /// A lowering that is not in force yet, if any.
+    pub pending_exit_window: Option<PendingExitWindow>,
 }
 
 /// On-chain vault state.
@@ -288,7 +309,12 @@ pub struct Vault {
     /// `set_exit_window` within `MIN_UNILATERAL_EXIT_WINDOW_SECS` ..=
     /// `MAX_UNILATERAL_EXIT_WINDOW_SECS`. Has no effect on
     /// cessation-triggered recoveries (those are fixed 7 days).
+    ///
+    /// Read through [`Vault::exit_window_at`]: a matured
+    /// `pending_exit_window` supersedes this value.
     pub unilateral_exit_window_secs: u64,
+    /// A lowering requested by the parent, in force from its `effective_at`.
+    pub pending_exit_window: Option<PendingExitWindow>,
 }
 
 #[near_bindgen]
@@ -340,6 +366,7 @@ impl Vault {
             recovery: None,
             unlocked: false,
             unilateral_exit_window_secs: window,
+            pending_exit_window: None,
         }
     }
 
@@ -654,6 +681,7 @@ impl Vault {
         );
 
         let now = env::block_timestamp();
+        self.settle_exit_window(now);
         let finalize_after = now + (self.unilateral_exit_window_secs * SECOND_NS);
         self.recovery = Some(RecoveryState {
             initiated_at: now,
@@ -668,14 +696,32 @@ impl Vault {
     /// future `unilateral_initiate_recovery` calls — any in-flight
     /// recovery's `finalize_after`/`finalize_before` are frozen at
     /// initiate time.
+    ///
+    /// A window at least as long as the one in force applies at once and
+    /// drops a pending lowering. A shorter one applies after the window in
+    /// force has elapsed, and replaces a pending lowering: whoever holds the
+    /// parent key cannot shorten the wait the customer chose faster than
+    /// that wait itself.
     pub fn set_exit_window(&mut self, new_window_secs: u64) {
         require!(
             env::predecessor_account_id() == self.parent,
             "only the parent account can change the exit window"
         );
         Self::assert_exit_window_in_range(new_window_secs);
-        self.unilateral_exit_window_secs = new_window_secs;
-        env::log_str(&format!("exit_window_set_to_{}_secs", new_window_secs));
+        let now = env::block_timestamp();
+        self.settle_exit_window(now);
+        if new_window_secs >= self.unilateral_exit_window_secs {
+            self.unilateral_exit_window_secs = new_window_secs;
+            self.pending_exit_window = None;
+            env::log_str(&format!("exit_window_set_to_{}_secs", new_window_secs));
+        } else {
+            let effective_at = now + self.unilateral_exit_window_secs * SECOND_NS;
+            self.pending_exit_window = Some(PendingExitWindow { secs: new_window_secs, effective_at });
+            env::log_str(&format!(
+                "exit_window_lowering_to_{}_secs_effective_at_{}",
+                new_window_secs, effective_at
+            ));
+        }
     }
 
     // ===== Shared finalize (routes by recovery.trigger) =====
@@ -1000,6 +1046,7 @@ impl Vault {
     /// Full snapshot of the vault state, suitable for off-chain
     /// verification by the vault-checker WASI agent and end users.
     pub fn get_state(&self) -> VaultState {
+        let now = env::block_timestamp();
         VaultState {
             parent: self.parent.clone(),
             keystore_dao: self.keystore_dao.clone(),
@@ -1008,7 +1055,8 @@ impl Vault {
             registered_tee_keys: self.registered_tee_keys.clone(),
             recovery: self.recovery.clone(),
             unlocked: self.unlocked,
-            unilateral_exit_window_secs: self.unilateral_exit_window_secs,
+            unilateral_exit_window_secs: self.exit_window_at(now),
+            pending_exit_window: self.pending_exit_window.filter(|p| now < p.effective_at),
         }
     }
 
@@ -1026,8 +1074,9 @@ impl Vault {
         self.recovery.clone()
     }
 
+    /// The exit window in force at the block the view ran at.
     pub fn get_exit_window(&self) -> u64 {
-        self.unilateral_exit_window_secs
+        self.exit_window_at(env::block_timestamp())
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -1036,6 +1085,25 @@ impl Vault {
 }
 
 impl Vault {
+    /// The exit window in force at `now`: a pending lowering whose time has
+    /// come, the stored window otherwise.
+    fn exit_window_at(&self, now: u64) -> u64 {
+        match self.pending_exit_window {
+            Some(p) if now >= p.effective_at => p.secs,
+            _ => self.unilateral_exit_window_secs,
+        }
+    }
+
+    /// Make a pending lowering whose time has come the stored window.
+    fn settle_exit_window(&mut self, now: u64) {
+        if let Some(p) = self.pending_exit_window {
+            if now >= p.effective_at {
+                self.unilateral_exit_window_secs = p.secs;
+                self.pending_exit_window = None;
+            }
+        }
+    }
+
     /// Internal: validate that an exit-window proposal is in the allowed
     /// `[MIN_UNILATERAL_EXIT_WINDOW_SECS, MAX_UNILATERAL_EXIT_WINDOW_SECS]`
     /// range. Used by both `new()` and `set_exit_window`.
@@ -1453,16 +1521,112 @@ mod tests {
         let _ = Vault::new(tla, dao(), mpc(), None, None);
     }
 
+    /// A context for `alice` at block timestamp `now`.
+    fn at(now: u64) {
+        let mut b = ctx_for(alice());
+        b.block_timestamp(now);
+        testing_env!(b.build());
+    }
+
+    const T0: u64 = 1_700_000_000_000_000_000;
+
     #[test]
-    fn set_exit_window_updates_field() {
+    fn raising_the_exit_window_applies_at_once() {
         let mut v = fresh_vault();
-        testing_env!(ctx_for(alice()).build());
+        at(T0);
         v.set_exit_window(7 * DAY_SECS);
         assert_eq!(v.get_exit_window(), 7 * DAY_SECS);
         v.set_exit_window(MAX_UNILATERAL_EXIT_WINDOW_SECS);
         assert_eq!(v.get_exit_window(), MAX_UNILATERAL_EXIT_WINDOW_SECS);
+        assert_eq!(v.pending_exit_window, None);
+    }
+
+    #[test]
+    fn lowering_the_exit_window_waits_out_the_window_in_force() {
+        let mut v = fresh_vault();
+        at(T0);
+        v.set_exit_window(7 * DAY_SECS);
         v.set_exit_window(MIN_UNILATERAL_EXIT_WINDOW_SECS);
+
+        // Still the long window, in the view and for a recovery started now.
+        assert_eq!(v.get_exit_window(), 7 * DAY_SECS);
+        assert_eq!(
+            v.get_state().pending_exit_window,
+            Some(PendingExitWindow {
+                secs: MIN_UNILATERAL_EXIT_WINDOW_SECS,
+                effective_at: T0 + 7 * DAY_SECS * SECOND_NS,
+            })
+        );
+        v.unilateral_initiate_recovery();
+        assert_eq!(v.recovery.as_ref().unwrap().finalize_after, T0 + 7 * DAY_SECS * SECOND_NS);
+    }
+
+    #[test]
+    fn a_lowering_is_in_force_once_the_old_window_has_elapsed() {
+        let mut v = fresh_vault();
+        at(T0);
+        v.set_exit_window(7 * DAY_SECS);
+        v.set_exit_window(MIN_UNILATERAL_EXIT_WINDOW_SECS);
+
+        let one_ns_short = T0 + 7 * DAY_SECS * SECOND_NS - 1;
+        at(one_ns_short);
+        assert_eq!(v.get_exit_window(), 7 * DAY_SECS);
+
+        let later = T0 + 7 * DAY_SECS * SECOND_NS;
+        at(later);
         assert_eq!(v.get_exit_window(), MIN_UNILATERAL_EXIT_WINDOW_SECS);
+        assert_eq!(v.get_state().pending_exit_window, None);
+        v.unilateral_initiate_recovery();
+        assert_eq!(
+            v.recovery.as_ref().unwrap().finalize_after,
+            later + MIN_UNILATERAL_EXIT_WINDOW_SECS * SECOND_NS
+        );
+        assert_eq!(v.unilateral_exit_window_secs, MIN_UNILATERAL_EXIT_WINDOW_SECS);
+        assert_eq!(v.pending_exit_window, None);
+    }
+
+    #[test]
+    fn raising_drops_a_pending_lowering() {
+        let mut v = fresh_vault();
+        at(T0);
+        v.set_exit_window(7 * DAY_SECS);
+        v.set_exit_window(MIN_UNILATERAL_EXIT_WINDOW_SECS);
+        v.set_exit_window(7 * DAY_SECS);
+        assert_eq!(v.pending_exit_window, None);
+
+        at(T0 + 30 * DAY_SECS * SECOND_NS);
+        assert_eq!(v.get_exit_window(), 7 * DAY_SECS);
+    }
+
+    #[test]
+    fn a_second_lowering_replaces_the_first_and_restarts_its_wait() {
+        let mut v = fresh_vault();
+        at(T0);
+        v.set_exit_window(7 * DAY_SECS);
+        v.set_exit_window(3 * DAY_SECS);
+
+        let mid = T0 + 2 * DAY_SECS * SECOND_NS;
+        at(mid);
+        v.set_exit_window(2 * DAY_SECS);
+        assert_eq!(
+            v.pending_exit_window,
+            Some(PendingExitWindow { secs: 2 * DAY_SECS, effective_at: mid + 7 * DAY_SECS * SECOND_NS })
+        );
+        assert_eq!(v.get_exit_window(), 7 * DAY_SECS);
+    }
+
+    #[test]
+    fn a_matured_lowering_is_the_base_for_the_next_change() {
+        let mut v = fresh_vault();
+        at(T0);
+        v.set_exit_window(7 * DAY_SECS);
+        v.set_exit_window(2 * DAY_SECS);
+
+        // After the lowering matured, 3 days is a RAISE over 2 days: at once.
+        at(T0 + 7 * DAY_SECS * SECOND_NS);
+        v.set_exit_window(3 * DAY_SECS);
+        assert_eq!(v.unilateral_exit_window_secs, 3 * DAY_SECS);
+        assert_eq!(v.pending_exit_window, None);
     }
 
     #[test]
@@ -1718,6 +1882,10 @@ mod tests {
         v.set_exit_window(MIN_UNILATERAL_EXIT_WINDOW_SECS);
 
         assert_eq!(v.recovery.as_ref().unwrap().finalize_after, frozen_finalize_after);
-        assert_eq!(v.unilateral_exit_window_secs, MIN_UNILATERAL_EXIT_WINDOW_SECS);
+        assert_eq!(v.unilateral_exit_window_secs, 7 * DAY_SECS);
+        assert_eq!(
+            v.pending_exit_window.map(|p| p.secs),
+            Some(MIN_UNILATERAL_EXIT_WINDOW_SECS)
+        );
     }
 }

@@ -912,6 +912,109 @@ async fn set_exit_window_then_initiate_uses_new_window() -> Result<()> {
 }
 
 #[tokio::test]
+async fn lowering_the_exit_window_does_not_shorten_a_recovery_started_at_once() -> Result<()> {
+    // The vault starts on a 300 s window. The parent lowers it to the minimum
+    // and starts a recovery in the next transaction — what a holder of a
+    // stolen parent key would do. The recovery must wait the 300 s that were
+    // in force, not the minimum.
+    let long_window_secs: u64 = 300;
+    let s = Setup::new(Some(long_window_secs)).await?;
+
+    expect_success(
+        s.parent
+            .call(s.vault.id(), "set_exit_window")
+            .args_json(json!({ "new_window_secs": MIN_UNILATERAL_EXIT_WINDOW_SECS }))
+            .max_gas()
+            .transact()
+            .await?,
+    )?;
+
+    let in_force: u64 = s.vault.view("get_exit_window").await?.json()?;
+    assert_eq!(in_force, long_window_secs, "a lowering is not in force at once");
+    let state = s.vault_state().await?;
+    assert_eq!(
+        state["pending_exit_window"]["secs"].as_u64(),
+        Some(MIN_UNILATERAL_EXIT_WINDOW_SECS),
+        "the lowering is recorded as pending"
+    );
+
+    expect_success(
+        s.parent
+            .call(s.vault.id(), "unilateral_initiate_recovery")
+            .max_gas()
+            .transact()
+            .await?,
+    )?;
+
+    // Past the minimum, well short of the window in force.
+    fast_forward_secs(&s.worker, MIN_UNILATERAL_EXIT_WINDOW_SECS + 60).await?;
+    let outcome = s
+        .parent
+        .call(s.vault.id(), "finalize_recovery")
+        .args_json(json!({"new_parent_pubkey": test_recovery_pubkey().to_string()}))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(
+        outcome.is_failure(),
+        "a recovery started right after a lowering must wait the window that was in force"
+    );
+
+    // Past the 300 s that were in force.
+    fast_forward_secs(&s.worker, long_window_secs - MIN_UNILATERAL_EXIT_WINDOW_SECS).await?;
+    expect_success(
+        s.parent
+            .call(s.vault.id(), "finalize_recovery")
+            .args_json(json!({"new_parent_pubkey": test_recovery_pubkey().to_string()}))
+            .max_gas()
+            .transact()
+            .await?,
+    )?;
+    let state = s.vault_state().await?;
+    assert!(state["unlocked"].as_bool().unwrap());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lowering_is_in_force_after_the_old_window() -> Result<()> {
+    let long_window_secs: u64 = 300;
+    let s = Setup::new(Some(long_window_secs)).await?;
+
+    expect_success(
+        s.parent
+            .call(s.vault.id(), "set_exit_window")
+            .args_json(json!({ "new_window_secs": MIN_UNILATERAL_EXIT_WINDOW_SECS }))
+            .max_gas()
+            .transact()
+            .await?,
+    )?;
+
+    fast_forward_secs(&s.worker, long_window_secs + 10).await?;
+    let in_force: u64 = s.vault.view("get_exit_window").await?.json()?;
+    assert_eq!(in_force, MIN_UNILATERAL_EXIT_WINDOW_SECS);
+
+    expect_success(
+        s.parent
+            .call(s.vault.id(), "unilateral_initiate_recovery")
+            .max_gas()
+            .transact()
+            .await?,
+    )?;
+    fast_forward_secs(&s.worker, MIN_UNILATERAL_EXIT_WINDOW_SECS + 30).await?;
+    expect_success(
+        s.parent
+            .call(s.vault.id(), "finalize_recovery")
+            .args_json(json!({"new_parent_pubkey": test_recovery_pubkey().to_string()}))
+            .max_gas()
+            .transact()
+            .await?,
+    )?;
+    let state = s.vault_state().await?;
+    assert!(state["unlocked"].as_bool().unwrap());
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_exit_window_validates_range() -> Result<()> {
     // Bounds come from the imported MIN/MAX constants — values just
     // scale with the contract build.

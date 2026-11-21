@@ -65,11 +65,15 @@ delay are the root of trust. Every governance method is for DAO members only.
   180 TGas and every unused TGas of `execute`, so a larger wasm needs only more gas on
   `execute`. An `Upgrade` never targets the MPC contract; `SetOwner` never names this
   contract.
-- **Only keystore keys reach the master.** `request_key`, `mark_vault_verified`
-  and the self-call of `ban_vault` require the call to come from this account
-  AND be signed with a key in `approved_keystores` — a key installed by a
-  registration vote. No other key on the account, a full-access key included,
-  passes.
+- **Only keystore keys reach the master.** `request_key`, `request_escrow_key`,
+  `store_escrow`, `mark_vault_verified` and the self-call of `ban_vault` require
+  the call to come from this account AND be signed with a key in
+  `approved_keystores` — a key installed by a registration vote. No other key on
+  the account, a full-access key included, passes.
+- **`request_key` yields the default master and nothing else**: it takes the
+  empty derivation path and CKD domain 2 only. Every other path of this account
+  names an owner's escrow key, released under the rules of
+  [Owner exit](#owner-exit).
 
 ### Upgrades
 
@@ -367,6 +371,69 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 
 `mark_vault_verified` and `ban_vault` accept any approved keystore key equally.
 
+## Owner exit
+
+A NEAR account that owns agent wallets can leave OutLayer with its master
+through this contract, with no keystore alive (`src/exit.rs`).
+
+The keystore derives an owner's master inside the TEE from the default master
+and the **owner path** `owner:{account}:{generation}`, and stores here an
+**escrow** of it: the master encrypted under the MPC CKD key for that path, with
+this contract as the predecessor. The contract builds the path itself — from the
+caller's account, or from its stored record — and asks MPC for that key for two
+callers only: an approved keystore, until the generation's escrow is stored, to
+write it; and the owner, after the exit window, to open it. A successful claim moves the
+owner to the next generation; the keystore stops serving the one that left.
+
+| Method | Who | Effect |
+|---|---|---|
+| `register_exit_owner(exit_window_sec?)` | any account, with the registration fee attached (kept) | creates the caller's record at generation 1 |
+| `set_exit_window(exit_window_sec)` | the owner, 1 yocto | a window at least as long as the one in force applies at once; a shorter one applies after the window in force has elapsed |
+| `set_exit_approvers(approvers, threshold)` | the owner, 1 yocto | names the accounts whose quorum an exit needs. With no set in force: at once. With one in force: a pending action, in force once that set's quorum approved it. At most 16 accounts; an empty list with threshold 0 removes the set |
+| `initiate_exit()` | the owner, with the exit fee attached (kept) | starts an exit from the current generation; needs that generation's escrow |
+| `approve_exit(owner, nonce)` / `reject_exit(owner, nonce)` | an approver of that owner, 1 yocto | one vote on the pending action; one reject ends it |
+| `cancel_exit()` | the owner, 1 yocto | drops the pending action |
+| `claim_escrow_key(app_public_key)` | the owner, 1 yocto; MPC gets 100 TGas of the call's gas and the callback 30, so attach 300 TGas | inside the claim window, with the quorum when a set is in force: returns MPC's CKD answer for the generation being left, encrypted to `app_public_key` |
+| `request_escrow_key(owner, app_public_key)` | the contract account, signed with an approved keystore key | MPC's CKD answer for the owner's current generation; refused once its escrow is stored |
+| `store_escrow(owner, generation, ct, check)` | the same | stores the escrow; the first write stands, a later one answers `false` |
+| `get_exit_owner(account)` | view | generation, exit window in force and a pending lowering, approvers, the pending action, `claim_in_flight`, the current generation's `escrow_check` |
+| `get_escrow(account, generation)` | view | `{ct, check, domain_id}` |
+
+- **One pending action per owner**: an exit, or a change of the approver set.
+  While one is pending, starting the other is refused. An exit not claimed by
+  its `finalize_before` no longer counts and the next action replaces it.
+- **A claim is in flight from its call to its callback.** The claim marks the
+  record before it calls MPC, because MPC's answer exists in MPC's own receipt
+  whether or not the callback runs. While the mark stands, every method that
+  writes the record is refused, votes included, and `get_exit_owner` reports
+  `claim_in_flight`. The callback reads only whether MPC answered; it clears the
+  mark, and on success clears the pending exit and adds 1 to the generation. A
+  mark whose callback never ran stops counting after one hour.
+- **A generation's key is released to its owner once.** `claim_escrow_key`
+  returns MPC's answer as the transaction's result, and a claim that returned it
+  leaves nothing to claim again.
+- **A claim MPC did not answer is a failed claim.** The generation stays, the
+  exit stays pending and the keystore keeps serving; the owner claims again
+  inside the claim window. An answer MPC sends after its own timeout is in
+  MPC's transaction and not in the claim's: the owner — who passed the window
+  and the quorum to get that far — may then hold the key of a generation still
+  served, until the next claim moves it on. The same holds for a mark that
+  lapsed with no callback.
+- **Every owner and approver method takes a deposit** — a fee or 1 yocto — so a
+  function-call key on the account cannot call it.
+- **A wallet cannot be the caller.** The contract takes its caller for an owner,
+  and a wallet bound to an account acts as that account; the keystore's policy
+  engine refuses every call to this contract from a wallet, under any policy
+  (`KEYSTORE_DAO_CONTRACTS` in shared-tee-helpers), and a keystore starts only
+  under a DAO that list names.
+- **Timing follows the account**: on a `.near` account the exit window is
+  24–48 h (default 24 h) and the claim window 7 days; elsewhere 60 s–1 h and
+  10 minutes. `get_config().exit` shows the bounds and both fees.
+- **Governance and the exit.** An upgrade that changes these rules waits the
+  governance delay after the vote that approves it, and so does a proposal that
+  shortens the delay: an owner who wants out starts an exit within
+  `delay − their exit window` of that vote.
+
 ## Methods
 
 ### Init and migration
@@ -421,7 +488,10 @@ removed since are dropped on the next vote. `label` is at most 64 bytes,
 ### Contract account, signed with an approved keystore key
 
 - `request_key(request) -> CKDResponse` — `request` is
-  `{derivation_path, app_public_key, domain_id}`, forwarded to the MPC contract.
+  `{derivation_path, app_public_key, domain_id}`, forwarded to the MPC contract;
+  `derivation_path` must be empty and `domain_id` 2.
+- `request_escrow_key(owner, app_public_key)`, `store_escrow(owner, generation, ct, check)`
+  — see [Owner exit](#owner-exit)
 - `mark_vault_verified(vault_id)`, `ban_vault(vault_id, reason)`
 
 ### Views

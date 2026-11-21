@@ -19,7 +19,7 @@
 #                                         exact signed bytes (vs T5 which only checks the sig is PRESENT);
 #                                         tampered message/nonce fail; two scopes (distinct seeds) don't
 #                                         cross-verify  [ported from wallet_sign_message_roundtrip.sh]
-#   T14 api-key NEAR-signed derive     — PUT /api-key signed over `api-key:<seed>:<ts>`; binds; minted wk_
+#   T14 api-key NEAR-signed derive     — PUT /api-key signed over `api-key:<seed>:<ts>:<key_hash>`; binds; minted wk_
 #                                         works (/address + crypto-valid /sign-message); cross-account
 #                                         spoof → 4xx  [ported from api_key_signed_derive_e2e.sh]
 #   T15 vault-scope parity             — every address-returning endpoint agrees with /address; (vault
@@ -476,8 +476,12 @@ fi
 if want T1; then
   log "T1 [POLICY] /wallet/v1/auth-sign — bearer/register/api-key build+sign; jwt rejected"
   SEED="t1-$(date +%s)"
+  T1_KEY_HASH=$(printf 'wk_t1-%s' "$SEED" | shasum -a 256 | cut -d' ' -f1)
   for purpose in bearer register api-key; do
-    post POST /wallet/v1/auth-sign "$SEED" "$(jq -nc --arg p "$purpose" '{purpose:$p, seed:"agent-x"}')"
+    # An api-key challenge names the key it registers; the other purposes take no key_hash.
+    T1_REQ=$(jq -nc --arg p "$purpose" '{purpose:$p, seed:"agent-x"}')
+    [[ "$purpose" == "api-key" ]] && T1_REQ=$(jq -c --arg h "$T1_KEY_HASH" '. + {key_hash:$h}' <<<"$T1_REQ")
+    post POST /wallet/v1/auth-sign "$SEED" "$T1_REQ"
     if [[ "$HTTP" == "200" ]]; then
       AM=$(echo "$BODY" | jq -r '.auth_message // empty'); TS=$(echo "$BODY" | jq -r '.auth_timestamp // empty')
       SIG=$(echo "$BODY" | jq -r '.signature // empty'); PK=$(echo "$BODY" | jq -r '.public_key // empty')
@@ -486,11 +490,16 @@ if want T1; then
         pass "T1 $purpose → auth_message='$AM' (fresh ts=$TS, sig+pubkey present)"
         # auth string is domain-separated — it can never be a NEP-413 intents transfer.
         echo "$AM" | jq -e . >/dev/null 2>&1 && fail "T1 $purpose auth_message parsed as JSON — not domain-separated!" || pass "T1 $purpose message is a plain prefixed string, not a (fund) intent JSON"
-      else fail "T1 $purpose bad response: $BODY"; fi
-    else fail "T1 $purpose expected 200, got $HTTP: $BODY"; fi
+      else fail "T1 $purpose bad response (fields missing or of another form; body withheld: it holds a signature)"; fi
+    else fail "T1 $purpose expected 200, got $HTTP ($(jq -r '.error // "no error code"' <<<"$BODY" 2>/dev/null))"; fi
   done
+  [[ "$AM" == *":$T1_KEY_HASH" ]] && pass "T1 the api-key challenge names the key it registers" || fail "T1 the api-key challenge does not end with the key hash: $AM"
+  post POST /wallet/v1/auth-sign "$SEED" '{"purpose":"api-key","seed":"agent-x"}'
+  [[ "$HTTP" == "400" ]] && pass "T1 api-key without key_hash rejected (HTTP 400)" || fail "T1 api-key without key_hash should be 400, got $HTTP ($(jq -r '.error // "no error code"' <<<"$BODY" 2>/dev/null))"
+  post POST /wallet/v1/auth-sign "$SEED" "$(jq -nc --arg h "$T1_KEY_HASH" '{purpose:"bearer", seed:"agent-x", key_hash:$h}')"
+  [[ "$HTTP" == "400" ]] && pass "T1 key_hash on another purpose rejected (HTTP 400)" || fail "T1 bearer with key_hash should be 400, got $HTTP ($(jq -r '.error // "no error code"' <<<"$BODY" 2>/dev/null))"
   post POST /wallet/v1/auth-sign "$SEED" '{"purpose":"jwt","seed":"agent-x"}'
-  [[ "$HTTP" == "400" ]] && pass "T1 jwt purpose rejected (HTTP 400 — internal-only)" || fail "T1 jwt should be 400, got $HTTP: $BODY"
+  [[ "$HTTP" == "400" ]] && pass "T1 jwt purpose rejected (HTTP 400 — internal-only)" || fail "T1 jwt should be 400, got $HTTP ($(jq -r '.error // "no error code"' <<<"$BODY" 2>/dev/null))"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -815,7 +824,7 @@ fi
 # ════════════════════════════════════════════════════════════════════════════════
 # T14 — api-key NEAR-signed derive + refusals  [POLICY] (no funds)
 #       Ported from tests/api_key_signed_derive_e2e.sh. PUT /wallet/v1/api-key authenticated by a
-#       NEAR signature over `api-key:<seed>:<ts>` (built+signed by the parent key via
+#       NEAR signature over `api-key:<seed>:<ts>:<key_hash>[:<vault>]` (built+signed by the parent key via
 #       `customer-recovery sign-api-key-claim`). The coordinator verifies the sig, checks the pubkey
 #       is an access key on account_id, and (when vault_id is supplied) that account_id == vault.parent.
 #       Asserts:
@@ -967,7 +976,7 @@ if want T16; then
   LONG_BODY=$(jq -nc --arg s "$SEED_257" '{account_id:"spoof.testnet", seed:$s, key_hash:"0000000000000000000000000000000000000000000000000000000000000000", pubkey:"ed25519:11111111111111111111111111111111", message:"api-key:dummy:0", signature:"deadbeef"}')
   H_LONG=$(curl -sS -o /tmp/uop.body -w '%{http_code}' -X PUT "$COORDINATOR_URL/wallet/v1/api-key" -H 'Content-Type: application/json' -d "$LONG_BODY")
   [[ "$H_LONG" == "400" ]] && pass "T16a 257-char seed rejected (HTTP 400, max=256)" || fail "T16a 257-char seed should be 400, got $H_LONG: $(cat /tmp/uop.body | head -c160)"
-  # 256 → must clear the length gate. Sign a REAL parent-keyed claim (correct api-key:<seed>:<ts> +
+  # 256 → must clear the length gate. Sign a REAL parent-keyed claim (correct api-key:<seed>:<ts>:<key_hash> +
   # valid sig) so the request reaches binding; HTTP 200 proves a 256-char seed is within bound.
   SK_256=$(printf 'wk_%s' "$(head -c 32 /dev/urandom | xxd -p -c 64)")
   BODY_256=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-api-key-claim --account-id "$PARENT" --seed "$SEED_256" --sub-key "$SK_256" ${VAULT_ID:+--vault-id "$VAULT_ID"})

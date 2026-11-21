@@ -220,8 +220,8 @@ sleep 3
 if rpc_query "{\"request_type\":\"view_access_key\",\"finality\":\"final\",\"account_id\":\"$DAO\",\"public_key\":\"$KEY\"}" \
     | python3 -I -c 'import json,sys
 p=json.load(sys.stdin)["result"]["permission"]["FunctionCall"]
-sys.exit(0 if sorted(p["method_names"])==["ban_vault","mark_vault_verified","request_key"] and p["receiver_id"]==sys.argv[1] else 1)' "$DAO"; then
-    ok "the access key is on $DAO: receiver $DAO, request_key / mark_vault_verified / ban_vault"
+sys.exit(0 if sorted(p["method_names"])==["ban_vault","mark_vault_verified","request_escrow_key","request_key","store_escrow"] and p["receiver_id"]==sys.argv[1] else 1)' "$DAO"; then
+    ok "the access key is on $DAO: receiver $DAO, request_key / request_escrow_key / store_escrow / mark_vault_verified / ban_vault"
 else
     bad "no such access key on $DAO"
 fi

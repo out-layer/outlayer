@@ -652,6 +652,9 @@ enum Relay {
     /// Relayed only while the payment key exists at the final block: a key
     /// created and then deleted must not be created again.
     IfKeyExistsAtFinal,
+    /// The wallet's policy and freeze as the chain holds them AT THE EVENT'S
+    /// BLOCK are relayed: the whole state, whichever part the event changed.
+    WalletStateAtBlock,
     /// The wallet's policy and freeze AT THE FINAL BLOCK are relayed instead
     /// of the event's, which a newer event may have replaced.
     WalletStateAtFinal,
@@ -700,11 +703,14 @@ fn relay_decision(event: &ContractEvent, delivery: Delivery, age: Age) -> Relay 
             Some(true) => Relay::Drop("older than the yield window allows; the contract keeps the key closing — claim again"),
             None => Relay::Later("the chain tip could not be read to tell whether its yield is still open"),
         },
-        // Values the coordinator applies as they come.
+        // The event says a wallet changed; what is relayed is the wallet's
+        // whole state read from the chain, stamped with the block it was read
+        // at. The coordinator applies a state no older than the one it holds,
+        // so two workers and a late delivery cannot put an old state back.
         ContractEvent::WalletPolicyUpdated(_)
         | ContractEvent::WalletPolicyDeleted(_)
         | ContractEvent::WalletFrozenChanged(_) => match delivery {
-            Delivery::InOrder => Relay::AsIs,
+            Delivery::InOrder => Relay::WalletStateAtBlock,
             Delivery::OutOfOrder => Relay::WalletStateAtFinal,
         },
         // Keyed by receipt; the allowance adds and the expiry extends.
@@ -843,6 +849,94 @@ impl DeferredBlocks {
     }
 }
 
+/// One wallet whose state is still to be relayed from the final block.
+#[derive(Debug, Clone)]
+struct WalletResync {
+    /// The owner the last event named; a deletion relay carries it.
+    owner: String,
+    /// The latest block an unrelayed event of this wallet is in: a state read below it
+    /// does not hold what that event changed.
+    not_before: u64,
+    /// The block of the first event that is waiting, for giving up by age.
+    since: u64,
+    tries: usize,
+    next_try: tokio::time::Instant,
+}
+
+/// The wallets whose state could not be relayed when their event was delivered. One entry
+/// per wallet, however many of its events failed: what is relayed is the wallet's whole
+/// state at the final block, which holds all of them. Tried again on the pauses of the
+/// deferred blocks and given up at the same age.
+#[derive(Debug, Default)]
+struct WalletResyncs {
+    wallets: std::collections::BTreeMap<String, WalletResync>,
+}
+
+impl WalletResyncs {
+    /// The most wallets that wait at once; past it the one waiting longest is given up.
+    const MAX: usize = 500;
+
+    /// `wallet` has an event at `height` whose state is not relayed yet. Returns the wallet
+    /// given up to make room, if too many wait.
+    fn want(&mut self, wallet: String, owner: String, height: u64, now: tokio::time::Instant) -> Option<String> {
+        match self.wallets.get_mut(&wallet) {
+            Some(waiting) => {
+                waiting.not_before = waiting.not_before.max(height);
+                waiting.owner = owner;
+            }
+            None => {
+                self.wallets.insert(
+                    wallet,
+                    WalletResync { owner, not_before: height, since: height, tries: 0, next_try: now + DEFERRED_PAUSES[0] },
+                );
+            }
+        }
+        if self.wallets.len() > Self::MAX {
+            let oldest = self.wallets.iter().min_by_key(|(_, w)| w.since).map(|(k, _)| k.clone())?;
+            self.wallets.remove(&oldest);
+            return Some(oldest);
+        }
+        None
+    }
+
+    /// The wallets due by `now`, longest waiting first, at most `limit`.
+    fn due(&self, now: tokio::time::Instant, limit: usize) -> Vec<(String, WalletResync)> {
+        let mut due: Vec<_> = self.wallets.iter().filter(|(_, w)| w.next_try <= now).map(|(k, w)| (k.clone(), w.clone())).collect();
+        due.sort_by_key(|(_, w)| w.since);
+        due.truncate(limit);
+        due
+    }
+
+    /// The sync of `wallet` up to `not_before` is done. An event that arrived while it ran
+    /// asks for a later block and stays.
+    fn done(&mut self, wallet: &str, not_before: u64) {
+        if self.wallets.get(wallet).is_some_and(|w| w.not_before <= not_before) {
+            self.wallets.remove(wallet);
+        }
+    }
+
+    fn retry_later(&mut self, wallet: &str, now: tokio::time::Instant) {
+        if let Some(w) = self.wallets.get_mut(wallet) {
+            w.tries += 1;
+            w.next_try = now + DEFERRED_PAUSES[w.tries.min(DEFERRED_PAUSES.len() - 1)];
+        }
+    }
+
+    /// Drop the wallets that have waited longer than a deferred block is kept; returns them.
+    fn expire(&mut self, head: u64) -> Vec<String> {
+        let cutoff = head.saturating_sub(2 * DEFERRED_MAX_AGE_BLOCKS);
+        let gone: Vec<String> = self.wallets.iter().filter(|(_, w)| w.since < cutoff).map(|(k, _)| k.clone()).collect();
+        for wallet in &gone {
+            self.wallets.remove(wallet);
+        }
+        gone
+    }
+
+    fn len(&self) -> usize {
+        self.wallets.len()
+    }
+}
+
 /// What one read of a block found.
 enum Scan {
     Events(Vec<ContractEvent>),
@@ -922,6 +1016,8 @@ pub struct EventMonitor {
     shared_block_height: Arc<AtomicU64>,
     /// Receipts to this contract made by a `Delegate` action.
     delegated: std::sync::Mutex<DelegatedCalls>,
+    /// Wallets whose state is still to be relayed (see [`WalletResyncs`]).
+    wallet_resyncs: std::sync::Mutex<WalletResyncs>,
     /// Blocks the head moved past unread.
     deferred: DeferredBlocks,
     /// The last chain tip read, and when.
@@ -1048,6 +1144,7 @@ impl EventMonitor {
             event_filter_min_version: parsed_min_version,
             shared_block_height,
             delegated: std::sync::Mutex::new(DelegatedCalls::default()),
+            wallet_resyncs: std::sync::Mutex::new(WalletResyncs::default()),
             deferred: DeferredBlocks::default(),
             tip: std::sync::Mutex::new(None),
         })
@@ -1118,6 +1215,7 @@ impl EventMonitor {
 
         loop {
             self.serve_deferred().await;
+            self.serve_wallet_resyncs().await;
 
             let head = self.current_block;
             match self.scan_within(head, HEAD_BLOCK_BUDGET).await {
@@ -1311,6 +1409,42 @@ impl EventMonitor {
                         self.deferred.retry_later(height, Some(left.events), now);
                     }
                 },
+            }
+        }
+    }
+
+    /// Relay the state of the wallets that wait for it, from the final block, for at most
+    /// [`DEFERRED_TURN_BUDGET`]. The lock is never held across a request.
+    async fn serve_wallet_resyncs(&self) {
+        let started = tokio::time::Instant::now();
+        let (expired, due) = {
+            let mut waiting = self.wallet_resyncs.lock().unwrap_or_else(|e| e.into_inner());
+            (waiting.expire(self.current_block), waiting.due(started, DEFERRED_PER_TURN))
+        };
+        for wallet in expired {
+            error!("⚠️  Giving up the sync of wallet {} (too far behind the head): its state is NOT relayed", wallet);
+        }
+        for (wallet, want) in due {
+            if started.elapsed() >= DEFERRED_TURN_BUDGET {
+                break;
+            }
+            let synced = self
+                .relay_wallet_state(&wallet, &want.owner, &BlockReference::Finality(Finality::Final), want.not_before)
+                .await;
+            let mut waiting = self.wallet_resyncs.lock().unwrap_or_else(|e| e.into_inner());
+            match synced {
+                Ok(()) => {
+                    waiting.done(&wallet, want.not_before);
+                    info!("✅ Wallet {} synced from the final block (waiting: {})", wallet, waiting.len());
+                }
+                Err(e) if crate::api_client::TerminalRelay::is_terminal(&e) => {
+                    waiting.done(&wallet, want.not_before);
+                    error!("Wallet {} state REFUSED by the coordinator, giving up on it: {:#}", wallet, e);
+                }
+                Err(e) => {
+                    waiting.retry_later(&wallet, tokio::time::Instant::now());
+                    warn!("Wallet {} still not synced: {}", wallet, e);
+                }
             }
         }
     }
@@ -1512,19 +1646,41 @@ impl EventMonitor {
                 }
                 Ok(())
             }
-            Relay::WalletStateAtFinal => {
+            Relay::WalletStateAtBlock | Relay::WalletStateAtFinal => {
                 let (wallet_pubkey, owner) = match &event {
                     ContractEvent::WalletPolicyUpdated(e) => (e.wallet_pubkey.clone(), e.owner.clone()),
                     ContractEvent::WalletPolicyDeleted(e) => (e.wallet_pubkey.clone(), e.owner.clone()),
                     ContractEvent::WalletFrozenChanged(e) => (e.wallet_pubkey.clone(), e.owner.clone()),
-                    other => return Err(format!("WalletStateAtFinal is not a decision for {:?}", other)),
+                    other => return Err(format!("{:?} is not a decision for {:?}", decision, other)),
                 };
-                // The head has relayed every block below it in order; the
-                // state relayed now must be no older than those.
-                let not_before = height.max(self.current_block.saturating_sub(1));
-                self.relay_wallet_state_at_final(&wallet_pubkey, &owner, not_before)
-                    .await
-                    .map_err(|e| format!("wallet {} not synced from the final block: {}", wallet_pubkey, e))
+                let at = match decision {
+                    Relay::WalletStateAtBlock => BlockReference::BlockId(BlockId::Height(height)),
+                    _ => BlockReference::Finality(Finality::Final),
+                };
+                match self.relay_wallet_state(&wallet_pubkey, &owner, &at, height).await {
+                    Ok(()) => Ok(()),
+                    // The coordinator's answer: the same on every later delivery.
+                    Err(e) if crate::api_client::TerminalRelay::is_terminal(&e) => {
+                        error!("Wallet {} state at block {} REFUSED by the coordinator, giving up on it: {:#}", wallet_pubkey, height, e);
+                        Ok(())
+                    }
+                    // Not held and not redelivered with its block: the wallet is synced
+                    // from the final block on its own schedule ([`WalletResyncs`]), so one
+                    // wallet's failing relay neither holds the head nor fills the queue of
+                    // deferred blocks that every other user's events share.
+                    Err(e) => {
+                        warn!("Wallet {} not synced at block {} ({}); it is synced again from the final block", wallet_pubkey, height, e);
+                        let given_up = self
+                            .wallet_resyncs
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .want(wallet_pubkey, owner, height, tokio::time::Instant::now());
+                        if let Some(gone) = given_up {
+                            error!("⚠️  Giving up the sync of wallet {} (too many wallets wait): its state is NOT relayed", gone);
+                        }
+                        Ok(())
+                    }
+                }
             }
         }
     }
@@ -1564,20 +1720,10 @@ impl EventMonitor {
                     error!("Failed to handle refund_payment_key event: {}", e);
                 }
             }
-            ContractEvent::WalletPolicyUpdated(event) => {
-                if let Err(e) = self.handle_wallet_policy_updated(event).await {
-                    error!("Failed to handle wallet_policy_updated event: {}", e);
-                }
-            }
-            ContractEvent::WalletPolicyDeleted(event) => {
-                if let Err(e) = self.handle_wallet_policy_deleted(event).await {
-                    error!("Failed to handle wallet_policy_deleted event: {}", e);
-                }
-            }
-            ContractEvent::WalletFrozenChanged(event) => {
-                if let Err(e) = self.handle_wallet_frozen_changed(event).await {
-                    error!("Failed to handle wallet_frozen_changed event: {}", e);
-                }
+            ContractEvent::WalletPolicyUpdated(_)
+            | ContractEvent::WalletPolicyDeleted(_)
+            | ContractEvent::WalletFrozenChanged(_) => {
+                return Err(format!("a wallet event is relayed as the wallet's state, never as is: {:?}", event));
             }
             ContractEvent::SubscriptionPurchased(event) => {
                 // The one event where dropping the relay costs a
@@ -1607,21 +1753,31 @@ impl EventMonitor {
         Ok(())
     }
 
-    /// Relay the wallet's policy and freeze as the final block holds them,
-    /// instead of an event a newer one may have replaced: the coordinator
-    /// applies what it is sent. No policy on chain is a deletion. A final
-    /// block below `not_before` may predate what was already relayed, and is
-    /// no answer.
-    async fn relay_wallet_state_at_final(&self, wallet_pubkey: &str, event_owner: &str, not_before: u64) -> Result<()> {
-        let (policy, at) = self
-            .view_final("get_wallet_policy", &serde_json::json!({ "wallet_pubkey": wallet_pubkey }))
-            .await?;
+    /// Relay the wallet's policy and freeze as the chain holds them at `at`
+    /// — the whole state, stamped with the block it was read at; a block the
+    /// node does not serve is read at the final block instead. No policy on
+    /// chain is a deletion. A block below `not_before`, the event's own, does
+    /// not hold what the event changed and is no answer. `Err` is a failure a
+    /// later delivery can get past, or the coordinator's refusal
+    /// ([`crate::api_client::TerminalRelay`]).
+    async fn relay_wallet_state(&self, wallet_pubkey: &str, event_owner: &str, at: &BlockReference, not_before: u64) -> Result<()> {
+        let args = serde_json::json!({ "wallet_pubkey": wallet_pubkey });
+        let (policy, at) = match self.view_retrying("get_wallet_policy", &args, at).await {
+            Ok(read) => read,
+            // The event's block is one the node does not serve — not there yet, or dropped
+            // long ago, which is every block of a worker catching up from far behind. The
+            // final block holds a state no older; `not_before` holds it to that.
+            Err(ViewFailure::UnknownBlock(_) | ViewFailure::GarbageCollected(_)) if matches!(at, BlockReference::BlockId(_)) => {
+                self.view_final("get_wallet_policy", &args).await?
+            }
+            Err(failure) => anyhow::bail!("RPC view get_wallet_policy failed: {}", failure),
+        };
         if at < not_before {
-            anyhow::bail!("the RPC's final block {} is behind block {}", at, not_before);
+            anyhow::bail!("the RPC answered at block {}, behind block {}", at, not_before);
         }
         if policy.is_null() {
-            info!("🔁 Wallet {}: no policy at final block {}; relaying the deletion", wallet_pubkey, at);
-            return self.api_client.notify_wallet_policy_deleted(wallet_pubkey, event_owner).await;
+            info!("🔁 Wallet {}: no policy at block {}; relaying the deletion", wallet_pubkey, at);
+            return self.api_client.notify_wallet_policy_deleted(wallet_pubkey, event_owner, at).await;
         }
         let owner = policy.get("owner").and_then(Value::as_str).context("get_wallet_policy: no owner")?;
         let encrypted_data = policy
@@ -1629,9 +1785,9 @@ impl EventMonitor {
             .and_then(Value::as_str)
             .context("get_wallet_policy: no encrypted_data")?;
         let frozen = policy.get("frozen").and_then(Value::as_bool).context("get_wallet_policy: no frozen")?;
-        info!("🔁 Wallet {}: relaying the policy at final block {} (frozen={})", wallet_pubkey, at, frozen);
+        info!("🔁 Wallet {}: relaying the policy at block {} (frozen={})", wallet_pubkey, at, frozen);
         self.api_client
-            .notify_wallet_policy_updated(wallet_pubkey, owner, encrypted_data, frozen)
+            .notify_wallet_policy_updated(wallet_pubkey, owner, encrypted_data, frozen, at)
             .await
     }
 
@@ -2516,47 +2672,6 @@ impl EventMonitor {
             .await
     }
 
-    /// Handle WalletPolicyUpdated event — notify coordinator to sync authorized key hashes
-    async fn handle_wallet_policy_updated(&self, event: WalletPolicyUpdatedEvent) -> Result<()> {
-        info!(
-            "🔑 Processing WalletPolicyUpdated: wallet={} owner={} frozen={}",
-            event.wallet_pubkey, event.owner, event.frozen
-        );
-
-        self.api_client
-            .notify_wallet_policy_updated(
-                &event.wallet_pubkey,
-                &event.owner,
-                &event.encrypted_data,
-                event.frozen,
-            )
-            .await
-    }
-
-    /// Handle WalletPolicyDeleted event — notify coordinator to remove wallet keys
-    async fn handle_wallet_policy_deleted(&self, event: WalletPolicyDeletedEvent) -> Result<()> {
-        info!(
-            "🗑️ Processing WalletPolicyDeleted: wallet={} owner={}",
-            event.wallet_pubkey, event.owner
-        );
-
-        self.api_client
-            .notify_wallet_policy_deleted(&event.wallet_pubkey, &event.owner)
-            .await
-    }
-
-    /// Handle WalletFrozenChanged event — notify coordinator to update freeze status
-    async fn handle_wallet_frozen_changed(&self, event: WalletFrozenChangedEvent) -> Result<()> {
-        info!(
-            "🧊 Processing WalletFrozenChanged: wallet={} frozen={}",
-            event.wallet_pubkey, event.frozen
-        );
-
-        self.api_client
-            .notify_wallet_frozen_changed(&event.wallet_pubkey, &event.owner, event.frozen)
-            .await
-    }
-
     /// One view call of the contract at `at`: the parsed JSON answer and the
     /// height of the block the node answered at.
     async fn view_once(&self, method: &str, args: &Value, at: &BlockReference) -> Result<(Value, u64), ViewFailure> {
@@ -3366,6 +3481,7 @@ mod tests {
             event_filter_min_version: EventMonitor::parse_semver("1.0.0"),
             shared_block_height: Arc::new(AtomicU64::new(0)),
             delegated: std::sync::Mutex::new(DelegatedCalls::default()),
+            wallet_resyncs: std::sync::Mutex::new(WalletResyncs::default()),
             deferred: DeferredBlocks::default(),
             tip: std::sync::Mutex::new(None),
         }
@@ -3759,13 +3875,59 @@ mod late_and_out_of_order {
         }
     }
 
-    /// An older policy or freeze applied after a newer one would restore a
-    /// revoked key or unfreeze a wallet.
+    /// A wallet whose relay failed waits once, however many of its events failed, and what
+    /// it waits for is a state no older than its latest event.
     #[test]
-    fn a_wallet_event_out_of_order_relays_the_state_at_final() {
+    fn a_wallet_waits_for_its_sync_once_and_for_its_latest_event() {
+        let now = tokio::time::Instant::now();
+        let mut waiting = WalletResyncs::default();
+        for height in [100, 105, 103] {
+            assert_eq!(waiting.want("ed25519:a".into(), "alice.near".into(), height, now), None);
+        }
+        assert_eq!(waiting.len(), 1, "one wallet, three failed events, is one entry");
+        assert!(waiting.due(now, 10).is_empty(), "nothing is due before the first pause");
+        let due = waiting.due(now + DEFERRED_PAUSES[0], 10);
+        assert_eq!((due[0].1.not_before, due[0].1.since), (105, 100));
+        // A sync that read a state older than the latest event leaves the wallet waiting.
+        waiting.done("ed25519:a", 103);
+        assert_eq!(waiting.len(), 1);
+        waiting.done("ed25519:a", 105);
+        assert_eq!(waiting.len(), 0);
+    }
+
+    /// One wallet cannot crowd out the others: the bound is on wallets, and past it the
+    /// one that waited longest goes, not the newest.
+    #[test]
+    fn the_wallets_that_wait_are_bounded_and_given_up_by_age() {
+        let now = tokio::time::Instant::now();
+        let mut waiting = WalletResyncs::default();
+        for i in 0..WalletResyncs::MAX as u64 {
+            assert_eq!(waiting.want(format!("ed25519:{i}"), "o.near".into(), 1_000 + i, now), None);
+        }
+        // The same wallet again, a thousand times, takes no room.
+        for height in 0..1_000 {
+            assert_eq!(waiting.want("ed25519:7".into(), "o.near".into(), 5_000 + height, now), None);
+        }
+        assert_eq!(waiting.len(), WalletResyncs::MAX);
+        assert_eq!(waiting.want("ed25519:new".into(), "o.near".into(), 9_000, now), Some("ed25519:0".to_string()));
+        // By age: what waited longer than a deferred block is kept.
+        let head = 1_010 + 2 * DEFERRED_MAX_AGE_BLOCKS;
+        let gone = waiting.expire(head);
+        assert_eq!(gone.len(), 9, "wallets 1..=9 waited since blocks 1001..=1009");
+        assert!(!gone.contains(&"ed25519:new".to_string()));
+    }
+
+    /// An older policy or freeze applied after a newer one would restore a
+    /// revoked key or unfreeze a wallet: a wallet event is never relayed as it
+    /// says, only as the wallet's whole state read from the chain — a freeze
+    /// carries the policy, a policy carries the freeze.
+    #[test]
+    fn a_wallet_event_relays_the_wallets_state_read_from_the_chain() {
         for e in wallet_events() {
-            assert_eq!(relay_decision(&e, Delivery::InOrder, LATE), Relay::AsIs);
-            assert_eq!(relay_decision(&e, Delivery::OutOfOrder, ON_TIME), Relay::WalletStateAtFinal);
+            for age in [ON_TIME, LATE] {
+                assert_eq!(relay_decision(&e, Delivery::InOrder, age), Relay::WalletStateAtBlock);
+                assert_eq!(relay_decision(&e, Delivery::OutOfOrder, age), Relay::WalletStateAtFinal);
+            }
         }
     }
 

@@ -92,6 +92,7 @@ The base64url payload (padding optional) is a JSON object:
 | `timestamp` | Unix seconds, within ±30 s of the coordinator's clock |
 | `signature` | Raw ed25519 signature (not NEP-413), base58, of `auth:<seed>:<timestamp>` |
 | `vault_id` | Optional. Scopes the wallet to a per-customer vault; the signed message is then `auth:<seed>:<timestamp>:<vault_id>`, and `account_id` must be the vault's parent on chain |
+| `master` | Optional, `"owner"`. Scopes the wallet to `account_id` as an owner registered in the keystore DAO, in its current generation ([OWNER_EXIT.md](OWNER_EXIT.md)); the signed message is then `auth:<seed>:<timestamp>:@owner`. Not together with `vault_id` |
 
 The wallet is created on the first authenticated request; `POST /register` is optional for a `Bearer near:` client.
 
@@ -200,12 +201,12 @@ Sub-wallet `wallet_id = deterministic(parent_wallet_id, seed, parent's vault)`. 
   "seed": "sub-task-42",
   "key_hash": "sha256hex64chars...",
   "pubkey": "ed25519:<base58>",
-  "message": "api-key:sub-task-42:<timestamp>",
+  "message": "api-key:sub-task-42:<timestamp>:<key_hash>",
   "signature": "<base58>"
 }
 ```
 
-Timestamp within ±300 s, raw ed25519 signature, and `pubkey` must be a full-access key of `account_id` on every call. Optional `vault_id`: `account_id` must be the vault's parent. The wallet is `deterministic(account_id, seed, vault)` — the same wallet `Bearer near:` reaches for that account, seed and vault.
+The signed message names the key it registers: `api-key:<seed>:<timestamp>:<key_hash>`, and with a vault `api-key:<seed>:<timestamp>:<key_hash>:<vault_id>`. `key_hash` and `vault_id` in the message must equal the fields beside it, so a signed message registers that key, for that wallet, and nothing else. Timestamp within ±300 s, raw ed25519 signature, and `pubkey` must be a full-access key of `account_id` on every call. Optional `vault_id`: `account_id` must be the vault's parent. The wallet is `deterministic(account_id, seed, vault)` — the same wallet `Bearer near:` reaches for that account, seed and vault.
 
 ### Response (both modes)
 
@@ -257,7 +258,7 @@ requests.get(f"{API_BASE}/wallet/v1/balance",
 
 To produce OutLayer's `Bearer near:` / register / api-key auth signature **with the wallet's TEE key** (rather than a NEAR key you hold), call `POST /wallet/v1/auth-sign`.
 
-Request body: `{ "purpose": "bearer" | "register" | "api-key", "seed": "...", "vault_id": "..." }` (`vault_id` only for `bearer`). The keystore builds the exact domain-separated string with a fresh server timestamp and signs it raw ed25519. It moves no funds, so it is allowed on any wallet that is not frozen. Response:
+Request body: `{ "purpose": "bearer" | "register" | "api-key", "seed": "...", "vault_id": "...", "key_hash": "..." }`. `vault_id` is taken for `bearer` and `api-key`; `key_hash` — the sha256 of the key to register, 64 lower-case hex — is required for `api-key` and refused for the others. The keystore builds the exact domain-separated string with a fresh server timestamp and signs it raw ed25519. It moves no funds, so it is allowed on any wallet that is not frozen. Response:
 
 ```json
 {
@@ -467,7 +468,7 @@ def create_sub_agent_wallet(task_id: str, key_index: int = 0) -> tuple[str, str]
 
     # 2. Register its hash (idempotent)
     timestamp = int(time.time())
-    message = f"api-key:{seed}:{timestamp}"
+    message = f"api-key:{seed}:{timestamp}:{key_hash}"
     resp = requests.put(f"{API_BASE}/wallet/v1/api-key", json={
         "account_id": ACCOUNT_ID,
         "seed": seed,

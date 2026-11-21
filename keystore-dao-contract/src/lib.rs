@@ -16,10 +16,14 @@ pub(crate) mod migration;
 pub mod governance;
 pub use governance::{BlobInfo, GovAction, GovProposal, GovStatus};
 
+pub mod exit;
+
 #[cfg(test)]
 mod governance_tests;
 #[cfg(test)]
 mod registration_tests;
+#[cfg(test)]
+mod exit_tests;
 
 // Custom getrandom implementation for WASM (required by dcap-qvl)
 #[cfg(target_arch = "wasm32")]
@@ -108,6 +112,11 @@ enum StorageKey {
     /// Per keystore key, the id of its last registration: a second submission of a key whose
     /// registration is still pending answers with that id.
     RegistrationByKey,
+    /// Per owner account, its exit record (`exit.rs`). A collection under its own prefix,
+    /// outside the root struct.
+    ExitOwners,
+    /// Per owner path, the escrow of that generation's master (`exit.rs`).
+    ExitEscrows,
 }
 
 /// The guest OS of a CVM, as TDX measures it: the firmware (MRTD), its configuration (RTMR0),
@@ -1248,6 +1257,7 @@ impl KeystoreDao {
             "has_collateral": !self.collaterals.is_empty(),
             "collaterals_count": self.collaterals.len(),
             "gov_delay_sec": self.gov_delay_ns / 1_000_000_000,
+            "exit": Self::exit_config(),
         })
     }
 
@@ -1267,6 +1277,13 @@ impl KeystoreDao {
     /// The request must come from an approved keystore with a valid access key
     pub fn request_key(&self, request: CKDRequestArgs) -> PromiseOrValue<CKDResponse> {
         self.assert_approved_keystore_signer();
+        // This method yields the default master and nothing else: every other path of this
+        // account names an owner's escrow key, which `exit.rs` releases under its own rules.
+        require!(request.derivation_path.is_empty(), "request_key takes the empty derivation path only");
+        require!(
+            request.domain_id.0 == exit::CKD_DOMAIN_ID,
+            format!("request_key takes domain id {} only", exit::CKD_DOMAIN_ID)
+        );
 
         // Make cross-contract call to MPC contract
         // Attach all gas and 1 yoctoNEAR as required by MPC contract
@@ -1759,7 +1776,7 @@ impl KeystoreDao {
                 proposal.public_key.clone(),
                 Allowance::Unlimited,
                 env::current_account_id(),
-                "request_key,mark_vault_verified,ban_vault".to_string(),
+                "request_key,mark_vault_verified,ban_vault,request_escrow_key,store_escrow".to_string(),
             )
             .detach();
 

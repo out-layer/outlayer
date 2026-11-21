@@ -59,6 +59,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 
+mod owner_exit;
+
 const BLS12381G1_PUBLIC_KEY_SIZE: usize = 48;
 const OUTPUT_SECRET_SIZE: usize = 32;
 const APP_ID_DERIVATION_PREFIX: &str = "near-mpc v0.1.0 app_id derivation:";
@@ -127,7 +129,7 @@ struct CkdArgs {
     domain_id: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CkdResponse {
     big_y: String,
     big_c: String,
@@ -764,15 +766,15 @@ fn sign_api_key_claim_subcommand(
             .unwrap()
             .as_secs()
     });
-    let message = format!("api-key:{}:{}", seed, ts);
+    let mut hasher = Sha256::new();
+    hasher.update(sub_key.as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
+
+    let message = build_api_key_signed_message(seed, ts, &key_hash, vault_id);
 
     use ed25519_dalek::Signer;
     let signature = signing_key.sign(message.as_bytes());
     let signature_b58 = bs58::encode(signature.to_bytes()).into_string();
-
-    let mut hasher = Sha256::new();
-    hasher.update(sub_key.as_bytes());
-    let key_hash = hex::encode(hasher.finalize());
 
     // Build JSON exactly matching `outlayer-coordinator::wallet::types::ApiKeyRequest`.
     let mut body = serde_json::json!({
@@ -828,6 +830,37 @@ fn build_bearer_near_signed_message(seed: &str, ts: u64, vault_id: Option<&str>)
     }
 }
 
+/// What a `Bearer near:` message ends with to act as an owner registered in the keystore
+/// DAO: `"auth:<seed>:<timestamp>:@owner"`, with `"master": "owner"` in the token. `@` is not
+/// valid in an account id, so it is no vault's name.
+const BEARER_OWNER_MARKER: &str = "@owner";
+
+/// The message `PUT /wallet/v1/api-key` verifies: it names the key it registers and the
+/// vault the wallet is in. **Must stay byte-identical** to
+/// `shared-tee-helpers::wallet_policy::build_auth_message("api-key", …)`.
+fn build_api_key_signed_message(seed: &str, ts: u64, key_hash: &str, vault_id: Option<&str>) -> String {
+    match vault_id {
+        Some(vid) => format!("api-key:{}:{}:{}:{}", seed, ts, key_hash, vid),
+        None => format!("api-key:{}:{}:{}", seed, ts, key_hash),
+    }
+}
+
+#[cfg(test)]
+mod api_key_message_format_tests {
+    use super::build_api_key_signed_message;
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn it_names_the_key_and_the_vault() {
+        assert_eq!(build_api_key_signed_message("sub-1", 42, KEY, None), format!("api-key:sub-1:42:{KEY}"));
+        assert_eq!(
+            build_api_key_signed_message("sub-1", 42, KEY, Some("vault.alice.near")),
+            format!("api-key:sub-1:42:{KEY}:vault.alice.near")
+        );
+    }
+}
+
 #[cfg(test)]
 mod bearer_near_message_format_tests {
     use super::build_bearer_near_signed_message;
@@ -874,8 +907,12 @@ fn sign_bearer_near_subcommand(
     account_id: &str,
     seed: &str,
     vault_id: Option<&str>,
+    owner: bool,
     timestamp: Option<u64>,
 ) -> Result<()> {
+    if owner && vault_id.is_some() {
+        anyhow::bail!("--owner and --vault-id name two different scopes; pass one");
+    }
     use base64::Engine;
     let (signing_key, pubkey_b58) = parse_near_expanded_private_key(private_key)?;
 
@@ -885,7 +922,7 @@ fn sign_bearer_near_subcommand(
             .unwrap()
             .as_secs()
     });
-    let message = build_bearer_near_signed_message(seed, ts, vault_id);
+    let message = build_bearer_near_signed_message(seed, ts, if owner { Some(BEARER_OWNER_MARKER) } else { vault_id });
 
     use ed25519_dalek::Signer;
     let sig_b58 = bs58::encode(signing_key.sign(message.as_bytes()).to_bytes()).into_string();
@@ -899,6 +936,9 @@ fn sign_bearer_near_subcommand(
     });
     if let Some(v) = vault_id {
         payload["vault_id"] = serde_json::Value::String(v.to_string());
+    }
+    if owner {
+        payload["master"] = serde_json::Value::String("owner".to_string());
     }
     let json = serde_json::to_string(&payload)?;
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -1097,11 +1137,12 @@ fn require_https(url: &str, flag: &str) -> Result<()> {
         );
         return Ok(());
     }
+    // The URL is not quoted: it can carry an API key.
     anyhow::bail!(
-        "{} must be HTTPS (got '{}'). A plain-HTTP URL can be MITM'd to feed a \
+        "{} must be HTTPS. A plain-HTTP URL can be MITM'd to feed a \
          malicious derivation path or MPC share. If you really need HTTP for a \
          local test, use http://localhost or http://127.0.0.1.",
-        flag, url
+        flag
     )
 }
 
@@ -1127,6 +1168,9 @@ async fn main() -> Result<()> {
     // 30-line side path. If we ever grow more subcommands, switch
     // to clap's Subcommand enum.
     let argv: Vec<String> = std::env::args().collect();
+    if argv.len() >= 2 && argv[1] == "owner-exit" {
+        return owner_exit::run(&argv[2..]).await;
+    }
     if argv.len() == 2 && argv[1] == "generate-key" {
         return generate_key_subcommand();
     }
@@ -1261,6 +1305,7 @@ async fn main() -> Result<()> {
         let mut account_id: Option<String> = None;
         let mut seed: Option<String> = None;
         let mut vault_id: Option<String> = None;
+        let mut owner = false;
         let mut timestamp: Option<u64> = None;
         let mut i = 2;
         while i < argv.len() {
@@ -1269,6 +1314,7 @@ async fn main() -> Result<()> {
                 "--account-id" => { account_id = argv.get(i + 1).cloned(); i += 2; }
                 "--seed" => { seed = argv.get(i + 1).cloned(); i += 2; }
                 "--vault-id" => { vault_id = argv.get(i + 1).cloned(); i += 2; }
+                "--owner" => { owner = true; i += 1; }
                 "--timestamp" => {
                     timestamp = argv
                         .get(i + 1)
@@ -1278,7 +1324,7 @@ async fn main() -> Result<()> {
                 other => anyhow::bail!(
                     "unknown sign-bearer-near flag: {}\nUsage: customer-recovery sign-bearer-near \
                      --private-key <ed25519:base58> --account-id <acct> --seed <s> \
-                     [--vault-id <v>] [--timestamp <unix-s>]\n\
+                     [--vault-id <v> | --owner] [--timestamp <unix-s>]\n\
                      Prints base64url(json) ready to drop in 'Authorization: Bearer near:<TOKEN>'.",
                     other
                 ),
@@ -1288,7 +1334,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("sign-bearer-near: --private-key or $CUSTOMER_RECOVERY_PRIVATE_KEY required"))?;
         let a = account_id.ok_or_else(|| anyhow!("sign-bearer-near: --account-id required"))?;
         let s = seed.ok_or_else(|| anyhow!("sign-bearer-near: --seed required"))?;
-        return sign_bearer_near_subcommand(&pk, &a, &s, vault_id.as_deref(), timestamp);
+        return sign_bearer_near_subcommand(&pk, &a, &s, vault_id.as_deref(), owner, timestamp);
     }
     if argv.len() >= 2 && argv[1] == "compute-wallet-id" {
         let mut account_id: Option<String> = None;
@@ -1451,7 +1497,12 @@ async fn submit_mpc_call(
             public_key: signer.public_key.clone(),
         },
     };
-    let access_key_view = match client.call(access_key_query).await?.kind {
+    let access_key_view = match client
+        .call(access_key_query)
+        .await
+        .map_err(|e| anyhow!("the vault parent's access key could not be read: {}", owner_exit::rpc_why(&e)))?
+        .kind
+    {
         QueryResponseKind::AccessKey(v) => v,
         other => anyhow::bail!("unexpected access-key response: {other:?}"),
     };
@@ -1460,7 +1511,8 @@ async fn submit_mpc_call(
         .call(methods::block::RpcBlockRequest {
             block_reference: BlockReference::Finality(Finality::Final),
         })
-        .await?;
+        .await
+        .map_err(|e| anyhow!("the latest final block could not be read: {}", owner_exit::rpc_why(&e)))?;
 
     let serialized = serde_json::to_vec(&args)?;
     tracing::info!(
@@ -1492,7 +1544,7 @@ async fn submit_mpc_call(
             signed_transaction: signed,
         })
         .await
-        .context("broadcast_tx_commit")?;
+        .map_err(|e| anyhow!("broadcast_tx_commit: {}", owner_exit::rpc_why(&e)))?;
 
     match outcome.status {
         FinalExecutionStatus::SuccessValue(value) => {

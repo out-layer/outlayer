@@ -419,9 +419,9 @@ impl AppState {
     /// on the wallet path.
     pub async fn ensure_customer_loaded(
         &self,
-        customer: Option<&near_primitives::types::AccountId>,
+        customer: Option<&crate::crypto::Customer>,
     ) -> anyhow::Result<()> {
-        let Some(vault_id) = customer else {
+        let Some(customer) = customer else {
             return Ok(());
         };
 
@@ -435,25 +435,39 @@ impl AppState {
             anyhow::anyhow!(
                 "per-customer master requested for {} but worker is running \
                  without MPC CKD context (non-TEE mode)",
-                vault_id
+                customer
             )
         })?;
         let near_client = self.near_client.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "per-customer master requested for {} but near_client \
                  is not configured",
-                vault_id
+                customer
             )
         })?;
 
-        crate::mpc_ckd::ensure_customer_loaded(
-            &ctx.mpc_ckd_config,
-            near_client.as_ref(),
-            &ctx.mpc_ckd_config.keystore_dao_id,
-            &keystore_snapshot,
-            Some(vault_id),
-        )
-        .await
+        match customer {
+            crate::crypto::Customer::Vault(vault_id) => {
+                crate::mpc_ckd::ensure_customer_loaded(
+                    &ctx.mpc_ckd_config,
+                    near_client.as_ref(),
+                    &ctx.mpc_ckd_config.keystore_dao_id,
+                    &keystore_snapshot,
+                    Some(vault_id),
+                )
+                .await
+            }
+            crate::crypto::Customer::Owner { account, generation } => {
+                crate::mpc_ckd::ensure_owner_loaded(
+                    ctx,
+                    near_client.as_ref(),
+                    &keystore_snapshot,
+                    account,
+                    *generation,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -687,6 +701,11 @@ impl ApiError {
     pub fn from_customer_load(e: anyhow::Error) -> Self {
         if let Some(b) = e.downcast_ref::<crate::mpc_ckd::InsufficientVaultBalance>() {
             ApiError::PaymentRequired(b.to_string())
+        } else if let Some(refusal) = e.downcast_ref::<crate::mpc_ckd::OwnerNotServable>() {
+            match refusal {
+                crate::mpc_ckd::OwnerNotServable::EscrowMismatch { .. } => ApiError::InternalError(refusal.to_string()),
+                _ => ApiError::Forbidden(refusal.to_string()),
+            }
         } else {
             ApiError::BadRequest(format!("{:#}", e))
         }
@@ -1902,7 +1921,12 @@ async fn decrypt_secret_row(
         "Successfully decrypted secrets"
     );
 
-    Ok(OpenedRow { plaintext_secrets: plaintext_b64, admitted_by_name, vault: customer })
+    // A secret's scope comes from the contract's vault binding, which names an account.
+    let vault = customer.and_then(|c| match c {
+        crate::crypto::Customer::Vault(vault) => Some(vault),
+        crate::crypto::Customer::Owner { .. } => None,
+    });
+    Ok(OpenedRow { plaintext_secrets: plaintext_b64, admitted_by_name, vault })
 }
 
 /// Whether `condition`, which admitted `caller`, admitted them by name. A
@@ -2122,7 +2146,7 @@ async fn authorize_keys(state: &AppState, req: &KeyedDecryptRequest) -> Result<A
     }
     for vault in &vaults {
         state
-            .ensure_customer_loaded(Some(vault))
+            .ensure_customer_loaded(Some(&crate::crypto::Customer::Vault(vault.clone())))
             .await
             .map_err(|e| {
                 if let Some(not_servable) = e.downcast_ref::<crate::mpc_ckd::VaultNotServable>() {
@@ -2329,6 +2353,7 @@ async fn encrypt_handler(
     // back by the party that stored it, so the scope has to travel with every
     // step of a re-encryption, not just the first.
     let customer = extract_customer_from_header(&headers)?;
+    refuse_owner_scope(customer.as_ref())?;
 
     // Encrypt with derived key
     let keystore = state.keystore.read().await;
@@ -2409,6 +2434,7 @@ async fn decrypt_raw_handler(
     // stored under a vault fails to decrypt — loudly, which is the right
     // direction, but it means the scope has to be supplied.
     let customer = extract_customer_from_header(&headers)?;
+    refuse_owner_scope(customer.as_ref())?;
 
     // Decrypt with derived key
     let keystore = state.keystore.read().await;
@@ -2823,7 +2849,7 @@ async fn update_user_secrets_handler(
         .await
         .map_err(|e| ApiError::InternalError(format!(
             "lazy-load gate failed for existing vault {}: {}",
-            existing_customer.as_ref().map(|v| v.as_str()).unwrap_or("<none>"),
+            existing_customer.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "<none>".to_string()),
             e
         )))?;
 
@@ -3208,7 +3234,7 @@ fn verify_near_signature(
 /// customer's request to the wrong key-space.
 pub(crate) fn extract_customer_from_header(
     headers: &axum::http::HeaderMap,
-) -> Result<Option<near_primitives::types::AccountId>, ApiError> {
+) -> Result<Option<crate::crypto::Customer>, ApiError> {
     let Some(raw) = headers.get("X-Customer-Vault") else {
         return Ok(None);
     };
@@ -3220,13 +3246,13 @@ pub(crate) fn extract_customer_from_header(
         // Empty header is treated the same as no header (legacy path).
         return Ok(None);
     }
-    let vault_id: near_primitives::types::AccountId = s.parse().map_err(|e| {
+    let customer: crate::crypto::Customer = s.parse().map_err(|e| {
         ApiError::BadRequest(format!(
-            "X-Customer-Vault is not a valid NEAR AccountId ({}): {}",
+            "X-Customer-Vault is neither a vault account id nor an owner scope ({}): {}",
             s, e
         ))
     })?;
-    Ok(Some(vault_id))
+    Ok(Some(customer))
 }
 
 /// Parse an optional vault id from a string source.
@@ -3249,7 +3275,7 @@ pub(crate) fn extract_customer_from_header(
 /// the wrong key-space.
 fn parse_optional_vault_id(
     raw: Option<&str>,
-) -> Result<Option<near_primitives::types::AccountId>, ApiError> {
+) -> Result<Option<crate::crypto::Customer>, ApiError> {
     let Some(s) = raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -3259,7 +3285,7 @@ fn parse_optional_vault_id(
             s, e
         ))
     })?;
-    Ok(Some(vault_id))
+    Ok(Some(crate::crypto::Customer::Vault(vault_id)))
 }
 
 /// Validate the session and return the worker public key it was registered with.
@@ -3730,7 +3756,7 @@ async fn wallet_derive_address_handler(
 /// raw-transaction signing passes `true` (gated by `evm_sign.raw_tx`).
 async fn evm_sign_digest(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,
     chain: &str,
     sub_path: Option<&str>,
@@ -3922,7 +3948,7 @@ async fn wallet_evm_sign_transaction_handler(
 /// `raw_tx`-bypass through a message-signing path.
 async fn solana_sign_bytes(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,
     chain: &str,
     bytes: &[u8],
@@ -4346,6 +4372,10 @@ async fn wallet_sign_secret_store_handler(
     }
 
     validate_wallet_id(&req.wallet_id)?;
+    // The vault a secret is bound to on chain is a vault's account or nothing. It is signed
+    // as written, so anything else — a wallet's scope sent in its place — is refused here
+    // rather than signed into a message the contract will not rebuild.
+    parse_optional_vault_id(req.vault_id.as_deref())?;
     let customer = extract_customer_from_header(&headers)?;
     state
         .ensure_customer_loaded(customer.as_ref())
@@ -4390,7 +4420,7 @@ async fn wallet_sign_secret_store_handler(
         ))
     })?;
     keystore
-        .decrypt(customer.as_ref(), &secret_seed, &encrypted_bytes)
+        .decrypt(secret_scope(customer.as_ref()), &secret_seed, &encrypted_bytes)
         .map_err(|_| {
             ApiError::Forbidden(
                 "The secret did not decrypt under this agent's seed — refusing to sign. \
@@ -4639,6 +4669,14 @@ async fn wallet_sign_policy_handler(
     let locked_new = new_policy.approval.as_ref().and_then(|a| a.locked).unwrap_or(false);
     let policy_hash = shared_tee_helpers::wallet_policy::policy_canonical_hash_hex(&new_plain);
 
+    // A locked policy of an owner-scope wallet: the owner's exit must need the same quorum,
+    // or leaving would be the way round the lock.
+    if let Some(crate::crypto::Customer::Owner { account, .. }) = customer.as_ref() {
+        if let Some(quorum) = exit_quorum_of_locked(&new_policy).map_err(ApiError::BadRequest)? {
+            require_same_exit_quorum(&state, account, &quorum).await?;
+        }
+    }
+
     let seed = wallet_seed(&req.wallet_id, "near");
     let policy_pubkey = {
         let vk = keystore
@@ -4821,6 +4859,150 @@ async fn contract_vote_counts(
 /// independent backstop. Pure + unit-tested.
 fn is_trusted_recipient(recipient: &str) -> bool {
     matches!(recipient, "intents.near" | "intents.far")
+}
+
+/// Whether a NEP-413 `recipient` has the form NEP-641 gives an access-key authorization:
+/// `"<chain_id>: <signer_id>[ -> <id>]... @ <timestamp>"`.
+///
+/// A NEP-413 signature by an account's key over such a recipient IS that account's
+/// offchain authorization: of its own account with no path, and with a path — as an
+/// extension of every account named after it. A wallet bound to its owner's account through
+/// Agent Connect would sign as that account, off chain, where the fence on
+/// `w_execute_extension` sees nothing. `sign_message` never signs one; no policy opens it.
+///
+/// Read more loosely than the outline is written — a `:` and, after it, a `" @ "` followed
+/// by anything — and not as a resolver would parse it: what sits between and around the two
+/// marks is not judged, nor is the space the outline puts after the first, so no spelling
+/// of a chain id, an account or a timestamp slips a recipient of this outline past the
+/// refusal.
+fn is_offchain_authorization_recipient(recipient: &str) -> bool {
+    let Some((before_time, time)) = recipient.rsplit_once(" @ ") else {
+        return false;
+    };
+    !time.is_empty() && before_time.contains(':')
+}
+
+/// The approvers and threshold an owner's exit must need for `policy` to be locked on one of
+/// that owner's wallets. `None` for a policy that is not locked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExitQuorum {
+    approvers: std::collections::BTreeSet<near_primitives::types::AccountId>,
+    threshold: u32,
+}
+
+/// The most approvers the keystore DAO holds for one owner.
+const MAX_EXIT_APPROVERS: usize = 16;
+
+/// Read the exit quorum a locked policy stands for. Refused — with what to change — when the
+/// DAO could not hold an exit to the same people: an approver with no id, an id that is not
+/// an account id exactly as written (a policy vote matches the id by exact string, so any
+/// other spelling could never vote), a pinned key (the DAO takes any full-access key of the
+/// approver's account), or more approvers than the DAO holds.
+fn exit_quorum_of_locked(
+    policy: &shared_tee_helpers::wallet_policy::Policy,
+) -> Result<Option<ExitQuorum>, String> {
+    let Some(approval) = policy.approval.as_ref().filter(|a| a.locked.unwrap_or(false)) else {
+        return Ok(None);
+    };
+    let mut approvers = std::collections::BTreeSet::new();
+    for approver in approval.approvers.as_deref().unwrap_or(&[]) {
+        let Some(id) = approver.id.as_deref() else {
+            return Err("a locked policy on a wallet with an exit needs an account id on every approver".to_string());
+        };
+        let account: near_primitives::types::AccountId = id
+            .parse()
+            .ok()
+            .filter(|a: &near_primitives::types::AccountId| a.as_str() == id)
+            .ok_or_else(|| format!("approver '{id}' is not an account id as written"))?;
+        if approver.pubkey.is_some() {
+            return Err(format!(
+                "approver '{id}' is pinned to a key: on a wallet with an exit the approvers of a locked \
+                 policy vote on the exit with any full-access key of their account, so a pin cannot hold"
+            ));
+        }
+        approvers.insert(account);
+    }
+    if approvers.len() > MAX_EXIT_APPROVERS {
+        return Err(format!(
+            "a locked policy on a wallet with an exit takes at most {MAX_EXIT_APPROVERS} approvers"
+        ));
+    }
+    let threshold = approval.threshold.as_ref().map(|t| t.required()).unwrap_or(0);
+    let threshold = u32::try_from(threshold)
+        .map_err(|_| format!("approval.threshold {threshold} is not a number of approvers"))?;
+    Ok(Some(ExitQuorum { approvers, threshold }))
+}
+
+/// The exit quorum in force for an owner, from `get_exit_owner`'s answer.
+fn exit_quorum_on_chain(answer: &serde_json::Value) -> Result<ExitQuorum, String> {
+    let approvers = answer
+        .get("approvers")
+        .and_then(|v| v.as_array())
+        .ok_or("no approvers in the answer")?
+        .iter()
+        .map(|v| v.as_str().and_then(|s| s.parse().ok()).ok_or("an approver that is not an account id"))
+        .collect::<Result<std::collections::BTreeSet<near_primitives::types::AccountId>, _>>()?;
+    let threshold = answer
+        .get("threshold")
+        .and_then(|v| v.as_u64())
+        .and_then(|t| u32::try_from(t).ok())
+        .ok_or("no threshold in the answer")?;
+    Ok(ExitQuorum { approvers, threshold })
+}
+
+/// Refuse unless `owner`'s exit approvers in the keystore DAO are exactly `wanted`.
+async fn require_same_exit_quorum(
+    state: &AppState,
+    owner: &near_primitives::types::AccountId,
+    wanted: &ExitQuorum,
+) -> Result<(), ApiError> {
+    let ctx = state
+        .mpc_context
+        .get()
+        .ok_or_else(|| ApiError::InternalError("MPC CKD context not configured".to_string()))?;
+    let near_client = state
+        .near_client
+        .as_ref()
+        .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
+    let dao = &ctx.mpc_ckd_config.keystore_dao_id;
+    let answer = near_client
+        .view_call_json(dao, "get_exit_owner", serde_json::json!({ "account": owner }))
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("the owner's exit approvers could not be read from {dao}: {e:#}")))?;
+    let in_force = exit_quorum_on_chain(&answer)
+        .map_err(|e| ApiError::InternalError(format!("get_exit_owner({owner}) on {dao}: {e}")))?;
+    if &in_force != wanted {
+        return Err(ApiError::Forbidden(format!(
+            "a locked policy on this wallet needs the same quorum for its owner's exit: set the exit \
+             approvers of {owner} on {dao} to these {} account(s) with threshold {} first \
+             (set_exit_approvers), then store the policy",
+            wanted.approvers.len(),
+            wanted.threshold
+        )));
+    }
+    Ok(())
+}
+
+/// The scope a secret is sealed under for a wallet of scope `customer`. A vault wallet's
+/// secrets are sealed under the vault's master and leave with the vault's exit; every other
+/// wallet's — an owner-scope wallet's included — under the default master, and stay.
+fn secret_scope(customer: Option<&crate::crypto::Customer>) -> Option<&crate::crypto::Customer> {
+    match customer {
+        Some(crate::crypto::Customer::Owner { .. }) => None,
+        other => other,
+    }
+}
+
+/// `/encrypt` and `/decrypt-raw` work under the default master or a vault's. An owner's
+/// master seals that owner's wallet keys and policy and nothing a caller hands in.
+fn refuse_owner_scope(customer: Option<&crate::crypto::Customer>) -> Result<(), ApiError> {
+    match customer {
+        Some(crate::crypto::Customer::Owner { .. }) => Err(ApiError::BadRequest(
+            "this endpoint does not take an owner scope: data is sealed under the default master or a vault's"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 async fn verify_approvals(
@@ -5019,7 +5201,7 @@ async fn verify_approvals(
 /// both MUST use the identical string, so they share this helper.
 async fn derive_wallet_ed25519_pubkey(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,
 ) -> Result<String, ApiError> {
     let near_seed = wallet_seed(&wallet_id, "near");
@@ -5052,7 +5234,7 @@ async fn load_wallet_policy_for_update(
     state: &AppState,
     wallet_id: &str,
     wallet_pubkey: &str,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
 ) -> Result<(Option<shared_tee_helpers::wallet_policy::Policy>, PolicyMeta), ApiError> {
     let near_client = state.near_client.as_ref().ok_or_else(|| {
         ApiError::InternalError("NEAR client not configured".to_string())
@@ -5109,7 +5291,7 @@ async fn load_wallet_policy_for_update(
 async fn load_wallet_policy(
     state: &AppState,
     wallet_id: &str,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
 ) -> Result<Option<shared_tee_helpers::wallet_policy::Policy>, ApiError> {
     let near_client = state.near_client.as_ref().ok_or_else(|| {
         ApiError::InternalError("NEAR client not configured".to_string())
@@ -5178,7 +5360,7 @@ async fn load_wallet_policy(
 /// The wallet's implicit NEAR account id (hex of the derived ed25519 pubkey).
 async fn wallet_implicit_account(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,
 ) -> Result<String, ApiError> {
     let seed = wallet_seed(&wallet_id, "near");
@@ -5425,7 +5607,7 @@ fn sign_message_recipient_allowed(
 /// signature to a domain.
 async fn sign_nep413(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,
     // Connector scope from the signed canonical op, when there is one (§D1).
     // A connector-scoped signature comes from the connector's OWN key, so the
@@ -5469,7 +5651,7 @@ async fn sign_nep413(
 /// signed transaction. The signer is the wallet's implicit account.
 async fn sign_near_transaction<F>(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,
     request_hash: String,
     make_tx: F,
@@ -5710,7 +5892,7 @@ const AUTH_DEADLINE_HORIZON_MS: u64 = 7 * 86_400 * 1_000;
 
 async fn sign_built(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     req: &WalletSignRequest,
     request_hash: String,
 ) -> Result<Json<WalletSignResponse>, ApiError> {
@@ -5908,7 +6090,7 @@ async fn sign_built(
             resp.recipient = Some(recipient);
             Ok(Json(resp))
         }
-        Op::Auth { purpose, seed, vault_id } if purpose == "jwt" => {
+        Op::Auth { purpose, seed, vault_id, .. } if purpose == "jwt" => {
             // Confidential-intents JWT auth challenge. Unlike the raw schemes below, this
             // is a NEP-413 signature over `intents.near` — but the keystore BUILDS the
             // challenge itself with an EMPTY `intents` array (provably non-fund-moving),
@@ -5976,7 +6158,7 @@ async fn sign_built(
             resp.recipient = Some(recipient);
             Ok(Json(resp))
         }
-        Op::Auth { purpose, seed, vault_id } => {
+        Op::Auth { purpose, seed, vault_id, key_hash } => {
             // Construct the exact coordinator auth string (fresh timestamp) and sign it
             // RAW ed25519 — NOT NEP-413. The `auth:`/`register:`/`api-key:` prefix is
             // domain-separated from a 32-byte tx hash, so this can never forge a tx and
@@ -5990,6 +6172,7 @@ async fn sign_built(
                 seed,
                 now,
                 vault_id.as_deref(),
+                key_hash.as_deref(),
             )
             .map_err(ApiError::BadRequest)?;
 
@@ -6028,7 +6211,7 @@ async fn sign_built(
 /// would not reproduce.
 async fn sign_hash_pinned(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     req: &WalletSignRequest,
     policy: Option<&shared_tee_helpers::wallet_policy::Policy>,
     request_hash: String,
@@ -6107,6 +6290,16 @@ async fn sign_hash_pinned(
                     recipient
                 )));
             }
+            // Nor an offchain authorization of the wallet's account, with or without a
+            // policy: see `is_offchain_authorization_recipient`.
+            if is_offchain_authorization_recipient(recipient) {
+                return Err(ApiError::Forbidden(format!(
+                    "sign_message recipient '{}' has the form of a NEP-641 offchain authorization \
+                     (\"<chain>: <account>[ -> <account>] @ <time>\"); this wallet does not sign \
+                     authorizations for its own or a bound account",
+                    recipient
+                )));
+            }
             // Domain separation lives here: a default-DENY allowlist of auth recipients
             // (see `sign_message_recipient_allowed`).
             if !sign_message_recipient_allowed(policy, recipient) {
@@ -6175,7 +6368,7 @@ async fn sign_hash_pinned(
 /// signs the supplied NEP-413 artifact, trusting the generator.
 async fn sign_trusted(
     state: &AppState,
-    customer: Option<&near_primitives::types::AccountId>,
+    customer: Option<&crate::crypto::Customer>,
     req: &WalletSignRequest,
     request_hash: String,
 ) -> Result<Json<WalletSignResponse>, ApiError> {

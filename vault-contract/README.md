@@ -43,8 +43,13 @@ pub struct Vault {
     recovery:                     Option<RecoveryState>, // in-flight recovery (if any)
     unlocked:                     bool,             // true after finalize_recovery
     unilateral_exit_window_secs:  u64,              // configurable delay
+    pending_exit_window:          Option<{secs, effective_at}>, // a lowering not in force yet
 }
 ```
+
+The parent account stands above every wallet policy: a policy locked under its approvers'
+quorum does not restrain the parent's exit. An exit that needs several signers is a parent
+account that is itself a multisig.
 
 Key invariants enforced at runtime:
 
@@ -95,7 +100,7 @@ Key invariants enforced at runtime:
 |---|---|---|
 | `initiate_recovery() -> Promise` | **permissionless** (DAO gate inside `callback_initiate`) | Cessation flow. Cross-contract checks `keystore_dao.is_ceased() == true`; if false, the callback panics and no state mutates. On success, stores `RecoveryState { trigger: Cessation, finalize_after = now + 7d, finalize_before = finalize_after + 7d }`. |
 | `unilateral_initiate_recovery()` | parent only | Voluntary exit. No DAO involvement. Stores `RecoveryState { trigger: Unilateral, finalize_after = now + unilateral_exit_window_secs, finalize_before = finalize_after + 7d }`. The window is captured at initiate time — calling `set_exit_window` mid-recovery does NOT shorten the in-flight one. |
-| `set_exit_window(new_window_secs)` | parent only | Update `unilateral_exit_window_secs` for **future** recoveries. Must be in `[MIN, MAX]_UNILATERAL_EXIT_WINDOW_SECS`. |
+| `set_exit_window(new_window_secs)` | parent only | Change the unilateral exit window for **future** recoveries. Must be in `[MIN, MAX]_UNILATERAL_EXIT_WINDOW_SECS`. A window at least as long as the one in force applies at once and drops a pending lowering. A shorter one applies only after the window in force has elapsed, and replaces a pending lowering — a stolen parent key waits out the window the customer chose, not the minimum. |
 
 ### Recovery — finalize (atomic key-swap)
 
@@ -118,7 +123,7 @@ Key invariants enforced at runtime:
 | `get_state()` | `VaultState` — full snapshot for off-chain verifiers |
 | `get_registered_keys()` | `Vec<PublicKey>` — registered TEE keys (excluding `initial_tee_key`) |
 | `get_recovery_state()` | `Option<RecoveryState>` — in-flight recovery; **may be stale**, callers must compare `finalize_before` to current block timestamp |
-| `get_exit_window()` | `u64` — current `unilateral_exit_window_secs` |
+| `get_exit_window()` | `u64` — the exit window in force at the block the view runs at (a lowering whose time has come included) |
 | `is_unlocked()` | `bool` |
 
 ---
@@ -195,7 +200,8 @@ parses to drive keystore eviction and operator alerts:
 | `recovery_cancelled_dao_revoked` | `callback_finalize` (DAO revoked cessation) | Cessation cancelled during delay |
 | `vault_tee_key_added` | `callback_add_tee_key` success | Indexer tracks rotations |
 | `vault_tee_keys_cleared count=<n>` | `clear_unused_tee_keys` Promise | Suffix is dynamic |
-| `exit_window_set_to_<n>_secs` | `set_exit_window` | Suffix is dynamic |
+| `exit_window_set_to_<n>_secs` | `set_exit_window`, a window that applies at once | Suffix is dynamic |
+| `exit_window_lowering_to_<n>_secs_effective_at_<ns>` | `set_exit_window`, a shorter window | `<ns>` is the block timestamp from which it is in force |
 
 ---
 

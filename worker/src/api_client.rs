@@ -2237,12 +2237,17 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Relay a wallet's whole state — its policy and its freeze — as the chain held it at
+    /// `block`. The coordinator keeps the block of the last state it applied per wallet and
+    /// skips an older one, so a relay that arrives late does not put back what a newer one
+    /// replaced. A status that is the coordinator's answer is a [`TerminalRelay`].
     pub async fn notify_wallet_policy_updated(
         &self,
         wallet_pubkey: &str,
         owner: &str,
         encrypted_data: &str,
         frozen: bool,
+        block: u64,
     ) -> Result<()> {
         let url = format!("{}/internal/wallet-policy-sync", self.base_url);
 
@@ -2253,14 +2258,19 @@ impl ApiClient {
                 "owner": owner,
                 "encrypted_data": encrypted_data,
                 "frozen": frozen,
+                "block": block,
             }))
             .send()
             .await
             .context("Failed to notify wallet policy sync")?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Wallet policy sync failed: {}", error_text);
+        let status = response.status();
+        if !status.is_success() {
+            let message = format!("Wallet policy sync failed: {}", response.text().await.unwrap_or_default());
+            if relay_refused(status) {
+                return Err(anyhow::Error::new(TerminalRelay).context(message));
+            }
+            anyhow::bail!(message);
         }
 
         tracing::info!("✅ Wallet policy sync notified: wallet={}", wallet_pubkey);
@@ -2299,11 +2309,13 @@ impl ApiClient {
         Ok(body.code_hashes.into_iter().map(|r| r.code_hash).collect())
     }
 
-    /// Notify coordinator that a wallet policy was deleted on-chain.
+    /// Relay that the chain held no policy for the wallet at `block`. A status that is the
+    /// coordinator's answer is a [`TerminalRelay`].
     pub async fn notify_wallet_policy_deleted(
         &self,
         wallet_pubkey: &str,
         owner: &str,
+        block: u64,
     ) -> Result<()> {
         let url = format!("{}/internal/wallet-policy-delete", self.base_url);
 
@@ -2312,46 +2324,22 @@ impl ApiClient {
             .json(&serde_json::json!({
                 "wallet_pubkey": wallet_pubkey,
                 "owner": owner,
+                "block": block,
             }))
             .send()
             .await
             .context("Failed to notify wallet policy delete")?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Wallet policy delete failed: {}", error_text);
+        let status = response.status();
+        if !status.is_success() {
+            let message = format!("Wallet policy delete failed: {}", response.text().await.unwrap_or_default());
+            if relay_refused(status) {
+                return Err(anyhow::Error::new(TerminalRelay).context(message));
+            }
+            anyhow::bail!(message);
         }
 
         tracing::info!("✅ Wallet policy delete notified: wallet={}", wallet_pubkey);
-        Ok(())
-    }
-
-    /// Notify coordinator that a wallet's frozen status changed on-chain.
-    pub async fn notify_wallet_frozen_changed(
-        &self,
-        wallet_pubkey: &str,
-        owner: &str,
-        frozen: bool,
-    ) -> Result<()> {
-        let url = format!("{}/internal/wallet-frozen-change", self.base_url);
-
-        let response = self
-            .add_wallet_internal_auth(self.client.post(&url))
-            .json(&serde_json::json!({
-                "wallet_pubkey": wallet_pubkey,
-                "owner": owner,
-                "frozen": frozen,
-            }))
-            .send()
-            .await
-            .context("Failed to notify wallet frozen change")?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Wallet frozen change failed: {}", error_text);
-        }
-
-        tracing::info!("✅ Wallet frozen change notified: wallet={} frozen={}", wallet_pubkey, frozen);
         Ok(())
     }
 

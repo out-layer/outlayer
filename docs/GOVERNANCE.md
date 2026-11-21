@@ -49,8 +49,8 @@ near account list-keys worker.outlayer.near network-config mainnet now
 
 - **Members.** Three accounts. Any two of three approve a proposal (`approval_threshold = members / 2 + 1`, recomputed when membership changes).
   `get_dao_members` on `dao.outlayer.near` lists them.
-- **Delay.** An approved proposal executes no earlier than 24 hours after the vote that approved
-  it. Anyone watching the chain has a day to see what is coming. One vote has no delay:
+- **Delay.** An approved proposal executes no earlier than 72 hours after the vote that approved
+  it. Anyone watching the chain has three days to see what is coming. One vote has no delay:
   admitting an instance of a keystore whose software the DAO already approved through such a
   proposal.
 - **Lifetime.** A proposal collects votes for at most 14 days. Once approved, it must be executed
@@ -86,9 +86,23 @@ Each of these is a narrow switch, not a change of rules:
 - Mark an approved vault version deprecated.
 - Declare or revoke cessation of operations, which opens the vaults' own recovery path for their customers.
 
+### What the DAO does not decide: an owner's exit
+
+A NEAR account that owns wallets can register in the DAO contract and later leave with those
+wallets' keys ([OWNER_EXIT.md](OWNER_EXIT.md)). No member, no vote and no power of the
+operations owner takes part: the contract checks the owner's account, the exit window the
+owner chose, and — when the owner named approvers — their quorum. None of the brakes below
+reaches an owner's record, and cessation is not needed for it.
+
+What governance can do is change the contract. An upgrade that altered or removed the exit
+is an `Upgrade` proposal like any other: it runs no earlier than the delay after the vote
+that approves it, and a proposal that shortens the delay waits the delay too. With 72 hours
+and an exit window of at most 48, an owner who sees such a proposal has at least a day to
+start an exit that completes first.
+
 ## The operations owner
 
-`owner.outlayer.near` runs the parts that must happen quickly or routinely. Waiting a day for a
+`owner.outlayer.near` runs the parts that must happen quickly or routinely. Waiting three days for a
 vote would hurt users there: stopping a bad build at once, refreshing Intel's reference data
 every month, setting prices.
 
@@ -115,7 +129,7 @@ None of them touches code, keys, members, the delay or build approvals.
 | Main | `withdraw_platform_token` | Withdraw the platform's stablecoin revenue | Payment-key usage is settled off chain, so the platform's share is withdrawn by the owner |
 
 **Replacing the owner.** The DAO replaces the owner of any contract with one proposal, and the
-owner cannot cancel it. A lost or compromised owner key is a 24-hour problem, not a permanent one.
+owner cannot cancel it. A lost or compromised owner key is a 72-hour problem, not a permanent one.
 
 ## The worker operator
 `outlayer.near` accepts execution results only from `worker.outlayer.near`. That account holds no

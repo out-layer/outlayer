@@ -12,8 +12,8 @@
 use anyhow::{Context, Result};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng},
-    ChaCha20Poly1305, Nonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng, Payload},
+    ChaCha20Poly1305, Key, Nonce,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
 use hmac::{Hmac, Mac};
@@ -30,13 +30,131 @@ type HmacSha256 = Hmac<Sha256>;
 /// Maximum size for encrypted data (10 MB)
 const MAX_ENCRYPTED_SIZE: usize = 10 * 1024 * 1024;
 
+/// Whose master a key derives from, when it is not the default one.
+///
+/// * `Vault` — a per-customer vault contract's master, fetched from MPC through that vault.
+/// * `Owner` — the master of one generation of an owner registered in the keystore DAO,
+///   derived from the default master ([`Keystore::owner_master`]). Its text form is the
+///   OWNER PATH, `owner:{account}:{generation}`: the same string names that generation in
+///   the DAO contract, as its escrow's key and the CKD path of the escrow key.
+///
+/// `:` cannot occur in an account id, so the two text forms never overlap.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Customer {
+    Vault(AccountId),
+    Owner { account: AccountId, generation: u64 },
+}
+
+impl std::fmt::Display for Customer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Customer::Vault(vault) => write!(f, "{}", vault),
+            Customer::Owner { account, generation } => f.write_str(&owner_path(account, *generation)),
+        }
+    }
+}
+
+impl std::str::FromStr for Customer {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let Some(rest) = s.strip_prefix("owner:") else {
+            return Ok(Customer::Vault(s.parse().map_err(|e| anyhow::anyhow!("not an account id: {e}"))?));
+        };
+        let (account, generation) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("an owner scope is owner:<account>:<generation>"))?;
+        let account: AccountId = account.parse().map_err(|e| anyhow::anyhow!("not an account id: {e}"))?;
+        let generation: u64 = generation
+            .parse()
+            .ok()
+            .filter(|g: &u64| *g >= 1 && generation == g.to_string())
+            .ok_or_else(|| anyhow::anyhow!("a generation is a decimal number from 1, written canonically"))?;
+        Ok(Customer::Owner { account, generation })
+    }
+}
+
+impl From<AccountId> for Customer {
+    fn from(vault: AccountId) -> Self {
+        Customer::Vault(vault)
+    }
+}
+
+/// The string that names `account`'s `generation` everywhere: HKDF info of its master, CKD
+/// path and storage key of its escrow in the DAO contract, AEAD aad of the escrow.
+pub fn owner_path(account: &AccountId, generation: u64) -> String {
+    format!("owner:{}:{}", account, generation)
+}
+
+const OWNER_MASTER_SALT: &[u8] = b"outlayer/owner-master/v1";
+const OWNER_ESCROW_SALT: &[u8] = b"outlayer/owner-escrow/v1";
+const OWNER_ESCROW_CHECK_LABEL: &[u8] = b"owner-escrow-check/v1";
+
+/// An owner master sealed for the DAO contract: what `store_escrow` takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerEscrow {
+    /// ChaCha20-Poly1305 of the master: 32 bytes and the 16-byte tag.
+    pub ct: Vec<u8>,
+    /// Binds this exact `ct` to a holder of the master.
+    pub check: [u8; 32],
+}
+
+fn owner_escrow_cipher(escrow_key: &[u8; 32], path: &str) -> ChaCha20Poly1305 {
+    let hkdf = Hkdf::<Sha256>::new(Some(OWNER_ESCROW_SALT), escrow_key);
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf.expand(path.as_bytes(), key.as_mut())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    ChaCha20Poly1305::new(Key::from_slice(key.as_ref()))
+}
+
+/// The `check` of an escrow: `HMAC-SHA256(master, label || 0x00 || path || 0x00 || ct)`. A path
+/// holds no zero byte, so the three parts cannot run into each other.
+pub fn owner_escrow_check(master: &[u8; 32], path: &str, ct: &[u8]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(master).expect("HMAC can take key of any size");
+    mac.update(OWNER_ESCROW_CHECK_LABEL);
+    mac.update(&[0]);
+    mac.update(path.as_bytes());
+    mac.update(&[0]);
+    mac.update(ct);
+    mac.finalize().into_bytes().into()
+}
+
+/// Seal `master` under `escrow_key` — the 32-byte key MPC's CKD answer for `path` gives.
+///
+/// The AEAD key is `HKDF-SHA256(salt = "outlayer/owner-escrow/v1", ikm = escrow_key,
+/// info = path)`, the nonce is twelve zero bytes and the aad is `path`. A fixed nonce is
+/// sound because the key seals one message ever, and it makes every instance write the same
+/// bytes.
+pub fn seal_owner_escrow(escrow_key: &[u8; 32], master: &[u8; 32], path: &str) -> Result<OwnerEscrow> {
+    let ct = owner_escrow_cipher(escrow_key, path)
+        .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: master, aad: path.as_bytes() })
+        .map_err(|_| anyhow::anyhow!("sealing the owner escrow failed"))?;
+    let check = owner_escrow_check(master, path, &ct);
+    Ok(OwnerEscrow { ct, check })
+}
+
+/// Open an escrow with the key MPC's CKD answer for `path` gives: what an owner does after
+/// the exit, and what the writer does to its own escrow before it stores it.
+pub fn open_owner_escrow(escrow_key: &[u8; 32], ct: &[u8], path: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+    let plain = zeroize::Zeroizing::new(
+        owner_escrow_cipher(escrow_key, path)
+            .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: ct, aad: path.as_bytes() })
+            .map_err(|_| anyhow::anyhow!("the escrow does not open with this key for {path}"))?,
+    );
+    let master: [u8; 32] = plain
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("the escrow holds {} bytes, not a 32-byte master", plain.len()))?;
+    Ok(zeroize::Zeroizing::new(master))
+}
+
 /// A key was asked for under a vault whose master is not in memory: never
 /// loaded, or evicted since. The caller loads it (`mpc_ckd::add_customer`
 /// through the lazy-load gate) and asks again; nothing is ever derived from
 /// the default master in its place. Typed so a caller can tell this condition
 /// of the keystore's memory from every other derivation failure.
 #[derive(Debug)]
-pub struct VaultMasterNotLoaded(pub AccountId);
+pub struct VaultMasterNotLoaded(pub Customer);
 
 impl std::fmt::Display for VaultMasterNotLoaded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -84,12 +202,16 @@ pub struct Keystore {
     /// [`Keystore::add_customer`] (typically called from the
     /// `mpc_ckd.rs` lazy-load path after a fresh `vault.add_customer`
     /// MPC CKD round-trip).
-    masters: Arc<RwLock<HashMap<AccountId, [u8; 32]>>>,
+    masters: Arc<RwLock<HashMap<Customer, [u8; 32]>>>,
 
     /// Cache of derived keypairs. Keyed by `(customer, seed)` so
     /// customer A's keypair for `seed=alice/repo` cannot collide with
     /// customer B's keypair for the same seed.
-    keypair_cache: Arc<RwLock<HashMap<(Option<AccountId>, String), (SigningKey, VerifyingKey)>>>,
+    keypair_cache: Arc<RwLock<HashMap<(Option<Customer>, String), (SigningKey, VerifyingKey)>>>,
+
+    /// Per loaded owner generation, the `check` of the escrow this instance verified in the
+    /// DAO contract. The gate compares it with the chain on every operation.
+    owner_checks: Arc<RwLock<HashMap<Customer, [u8; 32]>>>,
 }
 
 impl Keystore {
@@ -108,6 +230,7 @@ impl Keystore {
         Self {
             default_master,
             masters: Arc::new(RwLock::new(HashMap::new())),
+            owner_checks: Arc::new(RwLock::new(HashMap::new())),
             keypair_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -146,6 +269,7 @@ impl Keystore {
         Ok(Self {
             default_master: *master_secret,
             masters: Arc::new(RwLock::new(HashMap::new())),
+            owner_checks: Arc::new(RwLock::new(HashMap::new())),
             keypair_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -175,6 +299,7 @@ impl Keystore {
     /// previously-cached keypairs (which would have been derived from
     /// a stale master) are dropped.
     pub fn add_customer(&self, customer: AccountId, master: [u8; 32]) {
+        let customer = Customer::Vault(customer);
         {
             let mut masters = self.masters.write().unwrap();
             masters.insert(customer.clone(), master);
@@ -192,6 +317,7 @@ impl Keystore {
     /// (race-attack ban, etc.). Subsequent derive_* calls for this
     /// customer will fail until `add_customer` is called again.
     pub fn evict_customer(&self, customer: &AccountId) {
+        let customer = &Customer::Vault(customer.clone());
         {
             let mut masters = self.masters.write().unwrap();
             masters.remove(customer);
@@ -203,7 +329,7 @@ impl Keystore {
     /// Returns `true` if a per-customer master is currently loaded.
     /// Used by the lazy-load gate to decide whether to skip MPC CKD.
     pub fn has_customer(&self, customer: &AccountId) -> bool {
-        self.masters.read().unwrap().contains_key(customer)
+        self.masters.read().unwrap().contains_key(&Customer::Vault(customer.clone()))
     }
 
     /// Vault ids whose master is currently in memory — addresses only, never key material.
@@ -212,13 +338,72 @@ impl Keystore {
     /// every restart, one on-chain CKD derivation per vault, so this is also the record of which
     /// vaults have paid that cost since this instance came up.
     pub fn loaded_customers(&self) -> Vec<AccountId> {
-        let mut ids: Vec<AccountId> = self.masters.read().unwrap().keys().cloned().collect();
+        let mut ids: Vec<AccountId> = self
+            .masters
+            .read()
+            .unwrap()
+            .keys()
+            .filter_map(|c| match c {
+                Customer::Vault(vault) => Some(vault.clone()),
+                Customer::Owner { .. } => None,
+            })
+            .collect();
         ids.sort();
         ids
     }
 
+    // =========================================================================
+    // Owner masters (the exit through the keystore DAO)
+    // =========================================================================
+
+    /// The master of `account`'s `generation`, derived from the default master. Every
+    /// instance that holds the default master derives the same one, so nothing about an
+    /// owner is fetched or stored to survive a restart.
+    ///
+    /// Full HKDF with its own salt: no input to the bare `HMAC(default_master, seed)`
+    /// derivations of this keystore reproduces it.
+    pub fn owner_master(&self, account: &AccountId, generation: u64) -> zeroize::Zeroizing<[u8; 32]> {
+        let hkdf = Hkdf::<Sha256>::new(Some(OWNER_MASTER_SALT), &self.default_master);
+        let mut master = zeroize::Zeroizing::new([0u8; 32]);
+        hkdf.expand(owner_path(account, generation).as_bytes(), master.as_mut())
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        master
+    }
+
+    /// Put `account`'s `generation` master in memory, for the derive_* methods to find
+    /// under `Customer::Owner`, together with the `check` of the escrow verified for it.
+    /// Idempotent.
+    pub fn load_owner(&self, account: &AccountId, generation: u64, escrow_check: [u8; 32]) {
+        let customer = Customer::Owner { account: account.clone(), generation };
+        let master = *self.owner_master(account, generation);
+        self.owner_checks.write().unwrap().insert(customer.clone(), escrow_check);
+        self.masters.write().unwrap().insert(customer, master);
+    }
+
+    /// The escrow `check` verified when `account`'s `generation` was loaded; `None` when it
+    /// is not in memory.
+    pub fn loaded_owner_check(&self, account: &AccountId, generation: u64) -> Option<[u8; 32]> {
+        let customer = Customer::Owner { account: account.clone(), generation };
+        if !self.masters.read().unwrap().contains_key(&customer) {
+            return None;
+        }
+        self.owner_checks.read().unwrap().get(&customer).copied()
+    }
+
+    /// Drop every generation of `account` and every keypair derived under it.
+    pub fn evict_owner(&self, account: &AccountId) {
+        let of_account = |c: &Customer| matches!(c, Customer::Owner { account: a, .. } if a == account);
+        self.masters.write().unwrap().retain(|c, _| !of_account(c));
+        self.owner_checks.write().unwrap().retain(|c, _| !of_account(c));
+        self.keypair_cache
+            .write()
+            .unwrap()
+            .retain(|(c, _), _| !c.as_ref().is_some_and(of_account));
+        tracing::info!(owner = %account, "Owner masters evicted");
+    }
+
     /// Drop every cache entry whose key references the given customer.
-    fn evict_customer_cache(&self, customer: &AccountId) {
+    fn evict_customer_cache(&self, customer: &Customer) {
         let mut cache = self.keypair_cache.write().unwrap();
         cache.retain(|(c, _), _| c.as_ref() != Some(customer));
     }
@@ -230,7 +415,7 @@ impl Keystore {
     /// * `Some(c)` ⇒ master from the `masters` map; a
     ///   [`VaultMasterNotLoaded`] if missing — the lazy-load layer must run
     ///   `add_customer` before invoking any derive_* method.
-    fn master_for(&self, customer: Option<&AccountId>) -> Result<[u8; 32]> {
+    fn master_for(&self, customer: Option<&Customer>) -> Result<[u8; 32]> {
         let masters = self.masters.read().unwrap();
         Self::master_from_loaded(self.default_master, &masters, customer)
     }
@@ -241,8 +426,8 @@ impl Keystore {
     /// discipline note there. One implementation so the two cannot answer differently.
     fn master_from_loaded(
         default_master: [u8; 32],
-        masters: &HashMap<AccountId, [u8; 32]>,
-        customer: Option<&AccountId>,
+        masters: &HashMap<Customer, [u8; 32]>,
+        customer: Option<&Customer>,
     ) -> Result<[u8; 32]> {
         match customer {
             None => Ok(default_master),
@@ -321,7 +506,7 @@ impl Keystore {
     /// and the migration plan template.
     pub fn derive_keypair(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<(SigningKey, VerifyingKey)> {
         let cache_key = (customer.cloned(), seed.to_string());
@@ -383,7 +568,7 @@ impl Keystore {
     /// Get Ed25519 public key for `(customer, seed)`.
     pub fn get_public_key_for_seed(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<VerifyingKey> {
         let (_signing_key, verifying_key) = self.derive_keypair(customer, seed)?;
@@ -396,7 +581,7 @@ impl Keystore {
     /// encryption keys are independent from Ed25519 signing keys.
     fn derive_x25519_keypair(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<(StaticSecret, X25519PublicKey)> {
         let master = self.master_for(customer)?;
@@ -448,7 +633,7 @@ impl Keystore {
     /// `derive_keypair`/`derive_x25519_keypair`/etc. for the same seed.
     pub fn derive_secret_string(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<String> {
         let master = self.master_for(customer)?;
@@ -509,7 +694,8 @@ impl Keystore {
         input: &crate::task_keys::TaskKeyInput,
         vault: Option<&AccountId>,
     ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
-        let master = zeroize::Zeroizing::new(self.master_for(vault)?);
+        let vault = vault.map(|v| Customer::Vault(v.clone()));
+        let master = zeroize::Zeroizing::new(self.master_for(vault.as_ref())?);
         let mut mac = <HmacSha256 as Mac>::new_from_slice(master.as_ref())
             .expect("HMAC can take key of any size");
         mac.update(input.as_bytes());
@@ -524,7 +710,8 @@ impl Keystore {
         vault: Option<&AccountId>,
         input: &crate::signing_keys::DerivationInput,
     ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
-        let master = zeroize::Zeroizing::new(self.master_for(vault)?);
+        let vault = vault.map(|v| Customer::Vault(v.clone()));
+        let master = zeroize::Zeroizing::new(self.master_for(vault.as_ref())?);
         let mut mac = <HmacSha256 as Mac>::new_from_slice(master.as_ref())
             .expect("HMAC can take key of any size");
         mac.update(input.as_bytes());
@@ -538,7 +725,7 @@ impl Keystore {
     /// can only encrypt, not decrypt. Only the TEE holds the private key.
     pub fn public_key_hex(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<String> {
         let (_, x25519_pub) = self.derive_x25519_keypair(customer, seed)?;
@@ -550,7 +737,7 @@ impl Keystore {
     #[allow(dead_code)]
     pub fn public_key_base58(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<String> {
         let verifying_key = self.get_public_key_for_seed(customer, seed)?;
@@ -570,7 +757,7 @@ impl Keystore {
     /// - Legacy:   [nonce (12) | ciphertext | tag (16)] (symmetric, pubkey as ChaCha20 key)
     pub fn decrypt(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
         encrypted_data: &[u8],
     ) -> Result<Vec<u8>> {
@@ -605,7 +792,7 @@ impl Keystore {
     /// Decrypt ECIES v1 format
     fn decrypt_ecies(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
         encrypted_data: &[u8],
     ) -> Result<Vec<u8>> {
@@ -634,7 +821,7 @@ impl Keystore {
     /// TODO: Remove after migration of all secrets to ECIES format
     fn decrypt_legacy(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
         encrypted_data: &[u8],
     ) -> Result<Vec<u8>> {
@@ -659,7 +846,7 @@ impl Keystore {
     /// Returns: `[0x01 | ephemeral_x25519_pubkey (32) | nonce (12) | ciphertext | auth_tag (16)]`.
     pub fn encrypt(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
         plaintext: &[u8],
     ) -> Result<Vec<u8>> {
@@ -711,7 +898,7 @@ impl Keystore {
     #[allow(dead_code)]
     pub fn sign(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
         message: &[u8],
     ) -> Result<Signature> {
@@ -723,7 +910,7 @@ impl Keystore {
     #[allow(dead_code)]
     pub fn verify(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
         message: &[u8],
         signature: &Signature,
@@ -750,7 +937,7 @@ impl Keystore {
     /// addition MUST follow.
     pub fn derive_secp256k1_keypair(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<(k256::ecdsa::SigningKey, k256::elliptic_curve::PublicKey<k256::Secp256k1>)> {
         let master = self.master_for(customer)?;
@@ -772,7 +959,7 @@ impl Keystore {
     /// `keccak256(uncompressed_pubkey[1..65])[12..32]`.
     pub fn derive_eth_address(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
     ) -> Result<(String, String)> {
         let (_, public_key) = self.derive_secp256k1_keypair(customer, seed)?;
@@ -817,7 +1004,7 @@ impl Keystore {
     /// is a pure function of `(master, seed, digest)`.
     pub fn sign_secp256k1_prehash(
         &self,
-        customer: Option<&AccountId>,
+        customer: Option<&Customer>,
         seed: &str,
         digest: &[u8; 32],
     ) -> Result<[u8; 65]> {
@@ -930,7 +1117,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut i = 0u64;
                     while !stop.load(Ordering::Relaxed) {
-                        let _ = keystore.derive_keypair(Some(&vault), &format!("wallet:{t}:{i}"));
+                        let _ = keystore.derive_keypair(Some(&Customer::Vault(vault.clone())), &format!("wallet:{t}:{i}"));
                         i += 1;
                     }
                 })
@@ -950,7 +1137,7 @@ mod tests {
                     .read()
                     .unwrap()
                     .keys()
-                    .filter(|(c, _)| c.as_ref() == Some(&vault))
+                    .filter(|(c, _)| c.as_ref() == Some(&Customer::Vault(vault.clone())))
                     .map(|(_, seed)| seed.clone())
                     .collect();
                 assert!(
@@ -1429,14 +1616,14 @@ mod tests {
     // deterministic, so the test is fully reproducible.
     use std::str::FromStr;
 
-    fn ks_with_two_customers() -> (Keystore, AccountId, AccountId) {
+    fn ks_with_two_customers() -> (Keystore, Customer, Customer) {
         let ks = Keystore::generate();
         let alice = AccountId::from_str("vault.alice.testnet").unwrap();
         let bob = AccountId::from_str("vault.bob.testnet").unwrap();
         // Use distinct, well-known masters so any leak surfaces.
         ks.add_customer(alice.clone(), [0xAA; 32]);
         ks.add_customer(bob.clone(), [0xBB; 32]);
-        (ks, alice, bob)
+        (ks, Customer::Vault(alice), Customer::Vault(bob))
     }
 
     #[test]
@@ -1561,7 +1748,7 @@ mod tests {
         // as the canonical path; all other derive_* paths funnel
         // through `master_for(customer)` which produces the same
         // error.
-        let result = ks.derive_keypair(Some(&alice), "wallet:abc:near");
+        let result = ks.derive_keypair(Some(&Customer::Vault(alice.clone())), "wallet:abc:near");
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
         assert!(
@@ -1618,8 +1805,8 @@ mod tests {
         ks1.add_customer(alice.clone(), alice_master);
 
         let seed = "wallet:abc:near";
-        let (sk1, vk1) = ks1.derive_keypair(Some(&alice), seed).unwrap();
-        let path_1 = ks1.derive_secret_string(Some(&alice), "anything").unwrap();
+        let (sk1, vk1) = ks1.derive_keypair(Some(&Customer::Vault(alice.clone())), seed).unwrap();
+        let path_1 = ks1.derive_secret_string(Some(&Customer::Vault(alice.clone())), "anything").unwrap();
 
         // Simulate restart: keep default_master; re-load alice's
         // master (in production this comes from MPC CKD).
@@ -1627,8 +1814,8 @@ mod tests {
         let ks2 = Keystore::from_master_secret_hex(&master_hex).unwrap();
         ks2.add_customer(alice.clone(), alice_master);
 
-        let (sk2, vk2) = ks2.derive_keypair(Some(&alice), seed).unwrap();
-        let path_2 = ks2.derive_secret_string(Some(&alice), "anything").unwrap();
+        let (sk2, vk2) = ks2.derive_keypair(Some(&Customer::Vault(alice.clone())), seed).unwrap();
+        let path_2 = ks2.derive_secret_string(Some(&Customer::Vault(alice.clone())), "anything").unwrap();
 
         assert_eq!(sk1.to_bytes(), sk2.to_bytes());
         assert_eq!(vk1.as_bytes(), vk2.as_bytes());
@@ -2220,7 +2407,7 @@ mod tests {
             .derive_signing_key_seed(Some(&vault), &input)
             .expect_err("an evicted vault must refuse, never fall back to the default master");
         match evicted.downcast_ref::<VaultMasterNotLoaded>() {
-            Some(VaultMasterNotLoaded(v)) => assert_eq!(v, &vault),
+            Some(VaultMasterNotLoaded(v)) => assert_eq!(v, &Customer::Vault(vault.clone())),
             None => panic!("an evicted vault must fail as not loaded: {evicted:#}"),
         }
     }
@@ -2470,4 +2657,177 @@ mod tests {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn a(s: &str) -> AccountId {
+        AccountId::from_str(s).unwrap()
+    }
+
+    fn keystore() -> Keystore {
+        Keystore::from_master_secret(&[0x11; 32]).unwrap()
+    }
+
+    fn owner(account: &str, generation: u64) -> Customer {
+        Customer::Owner { account: a(account), generation }
+    }
+
+    #[test]
+    fn a_scope_reads_back_what_it_writes() {
+        for scope in [Customer::Vault(a("vault.alice.near")), owner("alice.near", 1), owner("alice.near", 42)] {
+            assert_eq!(scope.to_string().parse::<Customer>().unwrap(), scope);
+        }
+        assert_eq!(owner("alice.near", 7).to_string(), "owner:alice.near:7");
+        assert_eq!("vault.alice.near".parse::<Customer>().unwrap(), Customer::Vault(a("vault.alice.near")));
+    }
+
+    #[test]
+    fn a_malformed_scope_is_refused_not_read_as_something_else() {
+        for bad in [
+            "owner:alice.near",
+            "owner:alice.near:",
+            "owner:alice.near:0",
+            "owner:alice.near:01",
+            "owner:alice.near:+1",
+            "owner:alice.near:1:2x",
+            "owner:Alice.near:1",
+            "owner::1",
+            "Owner:alice.near:1",
+            "",
+        ] {
+            assert!(bad.parse::<Customer>().is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_path_names_one_account_and_generation() {
+        assert_ne!(owner_path(&a("ab"), 11), owner_path(&a("ab1"), 1));
+        let ks = keystore();
+        assert_ne!(*ks.owner_master(&a("ab"), 11), *ks.owner_master(&a("ab1"), 1));
+    }
+
+    #[test]
+    fn an_owner_master_is_its_own() {
+        let ks = keystore();
+        let alice_1 = ks.owner_master(&a("alice.near"), 1);
+        assert_eq!(*alice_1, *ks.owner_master(&a("alice.near"), 1), "deterministic");
+        assert_ne!(*alice_1, *ks.owner_master(&a("alice.near"), 2), "per generation");
+        assert_ne!(*alice_1, *ks.owner_master(&a("bob.near"), 1), "per account");
+        assert_ne!(*alice_1, [0x11; 32], "not the default master");
+        assert_ne!(
+            *alice_1,
+            *Keystore::from_master_secret(&[0x22; 32]).unwrap().owner_master(&a("alice.near"), 1),
+            "depends on the default master"
+        );
+        // No bare HMAC of the default master over the same string gives it: the existing
+        // derivations are that HMAC, over strings a caller can choose.
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&[0x11; 32]).unwrap();
+        mac.update(b"owner:alice.near:1");
+        assert_ne!(alice_1.as_slice(), mac.finalize().into_bytes().as_slice());
+    }
+
+    #[test]
+    fn a_wallet_key_differs_by_scope() {
+        let ks = keystore();
+        ks.add_customer(a("vault.alice.near"), [0x33; 32]);
+        ks.load_owner(&a("alice.near"), 1, [0; 32]);
+        ks.load_owner(&a("alice.near"), 2, [0; 32]);
+        ks.load_owner(&a("bob.near"), 1, [0; 32]);
+        let seed = "wallet:abc:near";
+        let key = |c: Option<&Customer>| ks.derive_keypair(c, seed).unwrap().1.to_bytes();
+        let all = [
+            key(None),
+            key(Some(&Customer::Vault(a("vault.alice.near")))),
+            key(Some(&owner("alice.near", 1))),
+            key(Some(&owner("alice.near", 2))),
+            key(Some(&owner("bob.near", 1))),
+        ];
+        for (i, x) in all.iter().enumerate() {
+            for y in &all[i + 1..] {
+                assert_ne!(x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_derived_for_an_owner_that_is_not_loaded() {
+        let ks = keystore();
+        let err = ks.derive_keypair(Some(&owner("alice.near", 1)), "wallet:abc:near").unwrap_err();
+        assert!(err.downcast_ref::<VaultMasterNotLoaded>().is_some(), "{err}");
+    }
+
+    #[test]
+    fn evicting_an_owner_drops_every_generation_and_its_keys() {
+        let ks = keystore();
+        ks.load_owner(&a("alice.near"), 1, [1; 32]);
+        ks.load_owner(&a("alice.near"), 2, [2; 32]);
+        ks.load_owner(&a("bob.near"), 1, [3; 32]);
+        ks.derive_keypair(Some(&owner("alice.near", 1)), "wallet:abc:near").unwrap();
+        assert_eq!(ks.loaded_owner_check(&a("alice.near"), 2), Some([2; 32]));
+
+        ks.evict_owner(&a("alice.near"));
+        assert_eq!(ks.loaded_owner_check(&a("alice.near"), 1), None);
+        assert_eq!(ks.loaded_owner_check(&a("alice.near"), 2), None);
+        assert!(ks.derive_keypair(Some(&owner("alice.near", 1)), "wallet:abc:near").is_err());
+        assert_eq!(ks.loaded_owner_check(&a("bob.near"), 1), Some([3; 32]), "another owner stays");
+        assert!(ks.loaded_customers().is_empty(), "owners are not vaults");
+    }
+
+    #[test]
+    fn an_escrow_opens_with_its_key_and_path_only() {
+        let ks = keystore();
+        let account = a("alice.near");
+        let master = ks.owner_master(&account, 1);
+        let path = owner_path(&account, 1);
+        let key = [0x55; 32];
+
+        let escrow = seal_owner_escrow(&key, &master, &path).unwrap();
+        assert_eq!(escrow.ct.len(), 48);
+        assert_eq!(*open_owner_escrow(&key, &escrow.ct, &path).unwrap(), *master);
+        assert_eq!(escrow, seal_owner_escrow(&key, &master, &path).unwrap(), "every instance writes the same bytes");
+
+        assert!(open_owner_escrow(&[0x56; 32], &escrow.ct, &path).is_err(), "another key");
+        assert!(open_owner_escrow(&key, &escrow.ct, &owner_path(&account, 2)).is_err(), "another generation");
+        assert!(open_owner_escrow(&key, &escrow.ct, &owner_path(&a("bob.near"), 1)).is_err(), "another owner");
+        let mut tampered = escrow.ct.clone();
+        tampered[0] ^= 1;
+        assert!(open_owner_escrow(&key, &tampered, &path).is_err(), "a changed ciphertext");
+    }
+
+    #[test]
+    fn a_check_binds_the_ciphertext_the_path_and_the_master() {
+        let ks = keystore();
+        let account = a("alice.near");
+        let master = ks.owner_master(&account, 1);
+        let path = owner_path(&account, 1);
+        let escrow = seal_owner_escrow(&[0x55; 32], &master, &path).unwrap();
+
+        assert_eq!(escrow.check, owner_escrow_check(&master, &path, &escrow.ct));
+        let mut other_ct = escrow.ct.clone();
+        other_ct[5] ^= 1;
+        assert_ne!(escrow.check, owner_escrow_check(&master, &path, &other_ct));
+        assert_ne!(escrow.check, owner_escrow_check(&master, &owner_path(&account, 2), &escrow.ct));
+        assert_ne!(escrow.check, owner_escrow_check(&ks.owner_master(&account, 2), &path, &escrow.ct));
+    }
+
+    /// The vector the CLI's `exit claim` is held to: default master `11…11`, escrow key
+    /// `55…55`, owner `alice.near`, generation 1.
+    #[test]
+    fn the_escrow_format_is_pinned() {
+        let ks = keystore();
+        let account = a("alice.near");
+        let master = ks.owner_master(&account, 1);
+        let escrow = seal_owner_escrow(&[0x55; 32], &master, &owner_path(&account, 1)).unwrap();
+        assert_eq!(hex::encode(*master), PINNED_MASTER);
+        assert_eq!(hex::encode(&escrow.ct), PINNED_CT);
+        assert_eq!(hex::encode(escrow.check), PINNED_CHECK);
+    }
+
+    const PINNED_MASTER: &str = "f87a0234f26f41714588b8e9892402dd4384c6492282f17f573af5bff0d86ebf";
+    const PINNED_CT: &str = "166f4b556d5496ed4dfc7744fc1a05a560994b4abf650115fb576d370d19ec159cf9524a8c579f286ef683df604d5ca9";
+    const PINNED_CHECK: &str = "9f3b66c79132b41d9ac781a7c1f94ed511bac41c3b56597d003059f21d134581";
 }

@@ -161,7 +161,17 @@ The contract records `finalize_after = now + exit_window` and
 at deploy (`--exit-window`, default `24h`; the production contract
 accepts 1 day to 30 days). `outlayer vault set-exit-window` (parent
 only, same range) changes it for FUTURE recoveries; a recovery in
-flight keeps the timestamps it was initiated with.
+flight keeps the timestamps it was initiated with. A window at least
+as long as the one in force applies at once; a shorter one applies
+only after the window in force has elapsed, so a holder of the parent
+key cannot shorten the wait faster than the wait itself. A vault of
+the first contract version lowers its window at once: there the
+shortest window, one day, is what stands against a stolen parent key.
+
+The parent account stands above every wallet policy. A policy locked
+under its approvers' quorum (`approval.locked`) does not restrain the
+parent's exit; an exit that needs several signers is a parent account
+that is itself a multisig.
 
 #### A.3 Wait the exit window
 
@@ -394,6 +404,10 @@ A copy of the master taken before the exit is not affected by it — see
 
 You can deploy a **new** vault under the same parent at any time, on
 another sub-account name (`outlayer vault init --name <other>`).
+
+A wallet whose owner registered in the keystore DAO, with no vault,
+leaves by another road — [OWNER_EXIT.md](OWNER_EXIT.md). It yields the
+wallets' keys and not the secrets; a vault's exit yields both.
 
 ---
 

@@ -40,6 +40,39 @@ and the vault forwards the CKD request to MPC. The derivation path is an HMAC of
 default master, so nobody outside an approved keystore can request the same master
 first. Vault masters live in memory and are evicted when the vault leaves enclave control.
 
+An owner's master — the master of a NEAR account registered in the DAO contract for an
+[owner exit](../keystore-dao-contract/README.md#owner-exit) — is not fetched at all. It is
+`HKDF-SHA256(salt = "outlayer/owner-master/v1", ikm = default master, info = owner path)`,
+the owner path being `owner:{account}:{generation}`, so every approved keystore derives the
+same one and a restart costs nothing.
+
+What makes that master leave with its owner is its **escrow** in the DAO contract. On the
+first use of a generation the keystore asks the DAO for the generation's escrow key
+(`request_escrow_key` — MPC's CKD answer for the owner path, with the DAO as predecessor;
+the keystore verifies the answer against the path it built itself), seals the master, opens
+the result with the same key, stores it (`store_escrow`) and reads it back:
+
+```
+key   = HKDF-SHA256(salt = "outlayer/owner-escrow/v1", ikm = escrow key, info = owner path)
+ct    = ChaCha20-Poly1305(key, nonce = 12 zero bytes, aad = owner path, master)       // 48 bytes
+check = HMAC-SHA256(master, "owner-escrow-check/v1" || 0x00 || owner path || 0x00 || ct)
+```
+
+The escrow key is the 32 bytes the keystore gets from a CKD answer the same way as the
+default master (decrypt, verify against `MPC_PUBLIC_KEY`, HKDF). The key seals one message,
+hence the fixed nonce, and every keystore writes the same bytes. `crypto.rs` pins a vector.
+
+Before every operation of an owner's wallet the keystore reads the owner's record from the
+DAO contract (`get_exit_owner`), uncached, and serves only when the wallet's generation is
+the owner's current one, no claim of its key is in flight, and the escrow on chain is the
+one verified when the master was loaded. A generation the owner left answers 403 — its keys
+are the owner's.
+
+A wallet's scope — which master its keys derive from — arrives in `X-Customer-Vault`: a
+vault's account id, or an owner path. A secret is never sealed under an owner's master: the
+secrets of an owner's wallet are under the default master, and `/encrypt` and
+`/decrypt-raw` refuse an owner scope.
+
 The contract side, and what the DAO owner and the DAO account's full-access key can do at
 this stage, is in [keystore-dao-contract/README.md](../keystore-dao-contract/README.md).
 

@@ -849,7 +849,7 @@ mod wallet_sign_tests {
 
         // Keystore-side construction (fresh ts) for a bearer auth.
         let ts = 1_700_000_000u64;
-        let message = wallet_policy::build_auth_message("bearer", "default", ts, Some("v1.vault.near")).unwrap();
+        let message = wallet_policy::build_auth_message("bearer", "default", ts, Some("v1.vault.near"), None).unwrap();
         assert_eq!(message, "auth:default:1700000000:v1.vault.near");
 
         // RAW ed25519 over the message bytes (NOT NEP-413). The coordinator's
@@ -914,6 +914,132 @@ mod tests {
             approval_vote_message(VoteVerb::Approve, id, pub_a, hash),
             approval_vote_message(VoteVerb::Reject, id, pub_a, hash)
         );
+    }
+
+    #[test]
+    fn a_recipient_of_the_offchain_authorization_form_is_recognised() {
+        // The NEP's own example, and the shapes it allows: no path, one hop, several.
+        for yes in [
+            "mainnet: extension.near -> wallet.near -> v1.signer @ 2026-08-05T07:28:00Z",
+            "mainnet: 0123abcd @ 2026-08-05T07:28:00Z",
+            "testnet: agent.testnet -> user.testnet @ 2026-08-05T07:28:00Z",
+            // Loose on purpose: an outline is enough.
+            "x: a @ t",
+            "mainnet: a.near -> b.near @ not a time",
+            // No part between the marks is judged: an odd chain id, account or path still
+            // has the outline.
+            "mainnet: a near @ now",
+            "mainnet: a.near ->  @ now",
+            "main: net: a.near @ now",
+            "mainnet:a.near @ now",
+            "mainnet: a.near @ b.near @ now",
+        ] {
+            assert!(is_offchain_authorization_recipient(yes), "{yes:?}");
+        }
+        // What a login or an application passes as a recipient.
+        for no in [
+            "intents.near",
+            "app.example.com",
+            "https://app.example.com/login",
+            "My App",
+            "user@example.com",
+            "mainnet: a.near",
+            "a.near @ 2026-08-05T07:28:00Z",
+            "mainnet: a.near @ ",
+            "mainnet a.near @ now",
+            " @ ",
+            "",
+        ] {
+            assert!(!is_offchain_authorization_recipient(no), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn the_exit_quorum_of_a_locked_policy() {
+        let policy = |v: serde_json::Value| -> shared_tee_helpers::wallet_policy::Policy {
+            serde_json::from_value(v).unwrap()
+        };
+        let acc = |s: &str| -> near_primitives::types::AccountId { s.parse().unwrap() };
+
+        // Not locked: nothing to hold the exit to.
+        assert_eq!(exit_quorum_of_locked(&policy(serde_json::json!({}))).unwrap(), None);
+        assert_eq!(
+            exit_quorum_of_locked(&policy(serde_json::json!({
+                "approval": { "threshold": 1, "approvers": [{ "id": "bob.near" }] }
+            })))
+            .unwrap(),
+            None
+        );
+
+        // Locked: the set of ids, whatever their order and repeats, and the threshold.
+        let quorum = exit_quorum_of_locked(&policy(serde_json::json!({
+            "approval": { "locked": true, "threshold": { "required": 2 },
+                "approvers": [{ "id": "carol.near" }, { "id": "bob.near" }, { "id": "carol.near" }] }
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(quorum.approvers.into_iter().collect::<Vec<_>>(), vec![acc("bob.near"), acc("carol.near")]);
+        assert_eq!(quorum.threshold, 2);
+
+        // What the DAO could not hold an exit to.
+        let refused = |approvers: serde_json::Value| {
+            exit_quorum_of_locked(&policy(serde_json::json!({
+                "approval": { "locked": true, "threshold": 1, "approvers": approvers }
+            })))
+            .unwrap_err()
+        };
+        assert!(refused(serde_json::json!([{ "role": "signer" }])).contains("account id on every approver"));
+        assert!(refused(serde_json::json!([{ "id": " bob.near" }])).contains("as written"));
+        assert!(refused(serde_json::json!([{ "id": "Bob.near" }])).contains("as written"));
+        assert!(refused(serde_json::json!([{ "id": "bob.near", "pubkey": "ed25519:abc" }])).contains("pinned"));
+        let many: Vec<_> = (0..17).map(|i| serde_json::json!({ "id": format!("a{i}.near") })).collect();
+        assert!(refused(serde_json::json!(many)).contains("at most 16"));
+    }
+
+    #[test]
+    fn the_exit_quorum_in_force_is_read_from_the_dao() {
+        let answer = serde_json::json!({ "approvers": ["carol.near", "bob.near"], "threshold": 2, "generation": 1 });
+        let q = exit_quorum_on_chain(&answer).unwrap();
+        assert_eq!(q.approvers.len(), 2);
+        assert_eq!(q.threshold, 2);
+        // An owner with no approvers: an empty set, threshold 0 — never equal to a locked policy's.
+        let none = exit_quorum_on_chain(&serde_json::json!({ "approvers": [], "threshold": 0 })).unwrap();
+        assert!(none.approvers.is_empty() && none.threshold == 0);
+        assert!(exit_quorum_on_chain(&serde_json::Value::Null).is_err(), "an unregistered owner is not an empty quorum");
+        assert!(exit_quorum_on_chain(&serde_json::json!({ "approvers": ["Not An Account"], "threshold": 1 })).is_err());
+    }
+
+    #[test]
+    fn a_secret_is_sealed_under_a_vault_or_the_default_never_an_owner() {
+        use crate::crypto::Customer;
+        let vault = Customer::Vault("vault.alice.near".parse().unwrap());
+        let owner = Customer::Owner { account: "alice.near".parse().unwrap(), generation: 1 };
+        assert_eq!(secret_scope(None), None);
+        assert_eq!(secret_scope(Some(&vault)), Some(&vault));
+        assert_eq!(secret_scope(Some(&owner)), None);
+        assert!(refuse_owner_scope(None).is_ok());
+        assert!(refuse_owner_scope(Some(&vault)).is_ok());
+        assert!(matches!(refuse_owner_scope(Some(&owner)), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn the_scope_header_reads_a_vault_or_an_owner() {
+        use crate::crypto::Customer;
+        let with = |value: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("X-Customer-Vault", value.parse().unwrap());
+            extract_customer_from_header(&h)
+        };
+        assert_eq!(with("vault.alice.near").unwrap(), Some(Customer::Vault("vault.alice.near".parse().unwrap())));
+        assert_eq!(
+            with("owner:alice.near:3").unwrap(),
+            Some(Customer::Owner { account: "alice.near".parse().unwrap(), generation: 3 })
+        );
+        for bad in ["owner:alice.near", "owner:alice.near:0", "owner:ALICE:1", "not an account"] {
+            assert!(matches!(with(bad), Err(ApiError::BadRequest(_))), "{bad:?}");
+        }
+        // The body field names a vault account and nothing else.
+        assert!(parse_optional_vault_id(Some("owner:alice.near:1")).is_err());
     }
 
     #[test]
@@ -1747,7 +1873,7 @@ mod tests {
         let state = test_state();
         let vault = near_primitives::types::AccountId::from_str("vault.alice.testnet").unwrap();
         let err = state
-            .ensure_customer_loaded(Some(&vault))
+            .ensure_customer_loaded(Some(&crate::crypto::Customer::Vault(vault.clone())))
             .await
             .expect_err("must fail without MPC context");
         let msg = format!("{:#}", err);
@@ -1783,7 +1909,7 @@ mod tests {
             .add_customer(vault.clone(), [9u8; 32]);
 
         let err = state
-            .ensure_customer_loaded(Some(&vault))
+            .ensure_customer_loaded(Some(&crate::crypto::Customer::Vault(vault.clone())))
             .await
             .expect_err(
                 "cache hit must not short-circuit the MPC-context guard \
@@ -1828,7 +1954,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("X-Customer-Vault", "vault.alice.testnet".parse().unwrap());
         let result = extract_customer_from_header(&h).unwrap().unwrap();
-        assert_eq!(result.as_str(), "vault.alice.testnet");
+        assert_eq!(result.to_string(), "vault.alice.testnet");
     }
 
     #[test]
@@ -1836,7 +1962,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("X-Customer-Vault", "  vault.alice.testnet  ".parse().unwrap());
         let result = extract_customer_from_header(&h).unwrap().unwrap();
-        assert_eq!(result.as_str(), "vault.alice.testnet");
+        assert_eq!(result.to_string(), "vault.alice.testnet");
     }
 
     #[test]
@@ -1863,7 +1989,7 @@ mod tests {
     #[test]
     fn parse_optional_vault_id_valid() {
         let result = parse_optional_vault_id(Some("vault.alice.testnet")).unwrap().unwrap();
-        assert_eq!(result.as_str(), "vault.alice.testnet");
+        assert_eq!(result.to_string(), "vault.alice.testnet");
     }
 
     #[test]
@@ -2111,7 +2237,7 @@ mod tests {
 
         for vault in [&alice, &bob] {
             let err = state
-                .ensure_customer_loaded(Some(vault))
+                .ensure_customer_loaded(Some(&crate::crypto::Customer::Vault(vault.clone())))
                 .await
                 .expect_err(
                     "wrapper must require MPC context regardless of cache state",

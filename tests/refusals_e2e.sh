@@ -3,7 +3,7 @@
 # The endpoints that exist to say NO, and were never tested.
 #
 # `/wallet/v1/reject` is named in no test file in this repository. Neither are
-# `/internal/wallet-policy-delete` and `/internal/wallet-frozen-change`, which
+# `/internal/wallet-policy-delete` and `/internal/wallet-policy-sync`, which
 # change what a wallet is allowed to do at all. `/wallet/v1/delete` is
 # exercised, but only ever toward a beneficiary the policy permits — and it is
 # the one operation that moves the WHOLE balance in a single call, so the
@@ -23,7 +23,7 @@
 #       one. A well-formed signature is not a vote by itself
 #   N4  /internal/wallet-policy-delete without the internal token is refused,
 #       and so is a wrong token
-#   N5  /internal/wallet-frozen-change, same
+#   N5  /internal/wallet-policy-sync, same — a wallet's whole state, its freeze included
 #   N6  /wallet/v1/delete toward a beneficiary OUTSIDE allowed_recipients is
 #       refused — the whole balance, one call, one address rule
 #
@@ -288,8 +288,8 @@ internal_probe() { # internal_probe <probe> <path> <extra-body-json> <what>
 log "N4 /internal/wallet-policy-delete rejects an unauthenticated and a wrong-token caller"
 internal_probe N4 /internal/wallet-policy-delete '{}' "anyone could delete a wallet's policy"
 
-log "N5 /internal/wallet-frozen-change rejects the same"
-internal_probe N5 /internal/wallet-frozen-change '{"frozen":true}' "anyone could freeze a wallet"
+log "N5 /internal/wallet-policy-sync rejects the same"
+internal_probe N5 /internal/wallet-policy-sync '{"owner":"x.testnet","encrypted_data":"AA==","frozen":true,"block":1}' "anyone could freeze a wallet or replace its policy"
 
 # ── N6: delete moves everything, so its address rule matters most ────────────
 log "N6 /wallet/v1/delete toward a beneficiary outside the whitelist"

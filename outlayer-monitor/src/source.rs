@@ -461,7 +461,8 @@ pub(crate) fn parse_vault_log(
         "recovery_window_expired",
         "recovery_cancelled_dao_revoked",
         "vault_tee_key_added",
-        // `exit_window_set_to_<n>_secs` and
+        // `exit_window_set_to_<n>_secs`,
+        // `exit_window_lowering_to_<n>_secs_effective_at_<ns>` and
         // `vault_tee_keys_cleared count=<n>` — dynamic suffixes,
         // special-cased below.
     ];
@@ -472,6 +473,9 @@ pub(crate) fn parse_vault_log(
     }
     if trimmed.starts_with("exit_window_set_to_") && trimmed.ends_with("_secs") {
         return Some(("exit_window_set".to_string(), executor_id.to_string()));
+    }
+    if trimmed.starts_with("exit_window_lowering_to_") && trimmed.contains("_secs_effective_at_") {
+        return Some(("exit_window_lowering".to_string(), executor_id.to_string()));
     }
     if trimmed.starts_with("vault_tee_keys_cleared") {
         return Some(("vault_tee_keys_cleared".to_string(), executor_id.to_string()));
@@ -549,6 +553,23 @@ mod parse_vault_log_tests {
         assert_eq!(
             parse_vault_log("recovery_finalized_cessation", VAULT, DAO),
             Some(("recovery_finalized_cessation".into(), VAULT.into()))
+        );
+    }
+
+    #[test]
+    fn vault_emitted_exit_window_lowering() {
+        assert_eq!(
+            parse_vault_log(
+                "exit_window_lowering_to_86400_secs_effective_at_1700000000000000000",
+                VAULT,
+                DAO
+            ),
+            Some(("exit_window_lowering".into(), VAULT.into()))
+        );
+        // Not the line of a window that applies at once.
+        assert_eq!(
+            parse_vault_log("exit_window_set_to_86400_secs", VAULT, DAO),
+            Some(("exit_window_set".into(), VAULT.into()))
         );
     }
 

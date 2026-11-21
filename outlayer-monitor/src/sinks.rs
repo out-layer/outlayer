@@ -450,6 +450,13 @@ impl CoordinatorVaultEventForwarder {
                 let state = self.view_vault(&event.vault_id, "get_exit_window", serde_json::json!({})).await?;
                 return Ok(state.is_u64());
             }
+            "exit_window_lowering" => {
+                // A lowering leaves a pending value until it comes into
+                // force; by then a later change may have replaced it, so
+                // the cross-check is that the vault answers its state.
+                let state = self.view_vault(&event.vault_id, "get_state", serde_json::json!({})).await?;
+                return Ok(state.get("unilateral_exit_window_secs").map(|v| v.is_u64()).unwrap_or(false));
+            }
             "vault_tee_key_added" => {
                 // Confirm vault has at least one registered TEE key.
                 // We don't know which key was just added (the log

@@ -183,6 +183,45 @@ impl std::fmt::Display for VaultNotServable {
 
 impl std::error::Error for VaultNotServable {}
 
+/// Why an owner-scope wallet is not served. The first three are standing answers of the
+/// chain about the owner; the last is this service's failure.
+#[derive(Debug)]
+pub enum OwnerNotServable {
+    /// The account has no record in the keystore DAO.
+    NotRegistered(AccountId),
+    /// The owner left the generation the wallet belongs to, or a claim of its key is in
+    /// flight: the keys are, or are about to be, the owner's.
+    Exited { account: AccountId, generation: u64 },
+    /// The wallet names a generation the owner has not reached.
+    UnknownGeneration { account: AccountId, generation: u64, current: u64 },
+    /// The escrow on chain is not the one this keystore derives for the owner.
+    EscrowMismatch { account: AccountId, generation: u64 },
+}
+
+impl std::fmt::Display for OwnerNotServable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OwnerNotServable::NotRegistered(account) => {
+                write!(f, "{account} is not registered as an owner in the keystore DAO")
+            }
+            OwnerNotServable::Exited { account, generation } => write!(
+                f,
+                "the owner of this wallet ({account}) has exited generation {generation}; its keys were handed to the owner"
+            ),
+            OwnerNotServable::UnknownGeneration { account, generation, current } => write!(
+                f,
+                "{account} is in generation {current}, not {generation}: not a wallet of this owner"
+            ),
+            OwnerNotServable::EscrowMismatch { account, generation } => write!(
+                f,
+                "the escrow stored for {account} generation {generation} is not the one this keystore derives; nothing is served for this owner"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OwnerNotServable {}
+
 /// True iff a broadcast error is a NEAR `NotEnoughBalance` pre-inclusion
 /// rejection (the signer can't cover the tx gas prepayment). Deep-matches the
 /// exact nested shape produced by near-jsonrpc-client 0.22 / near-primitives
@@ -257,6 +296,22 @@ pub struct MpcCkdConfig {
     pub keystore_dao_id: AccountId,
 }
 
+/// The DAO this keystore answers to must be one the policy engine fences
+/// (`shared_tee_helpers::wallet_policy::KEYSTORE_DAO_CONTRACTS`). An owner's exit is a call
+/// to the DAO from the owner's account; a wallet bound to that account could make the
+/// call, and only the fence stops it. Under a DAO the fence does not name, an agent could
+/// start and claim its owner's exit — so such a keystore does not start.
+pub fn require_fenced_dao(keystore_dao_id: &AccountId) -> Result<()> {
+    anyhow::ensure!(
+        shared_tee_helpers::wallet_policy::is_keystore_dao_contract(keystore_dao_id.as_str()),
+        "KEYSTORE_DAO_CONTRACT {} is not a keystore DAO the wallet policy engine fences ({}): \
+         a wallet could call it in its owner's name. Add it to KEYSTORE_DAO_CONTRACTS in shared-tee-helpers first",
+        keystore_dao_id,
+        shared_tee_helpers::wallet_policy::KEYSTORE_DAO_CONTRACTS.join(", ")
+    );
+    Ok(())
+}
+
 impl MpcCkdConfig {
     /// Load configuration from environment variables. The RPC is the resolved one
     /// (`config::resolve_chain`), never read from the env here.
@@ -272,6 +327,7 @@ impl MpcCkdConfig {
         let keystore_dao_id: AccountId = keystore_dao_raw
             .parse()
             .with_context(|| format!("KEYSTORE_DAO_CONTRACT is not a valid NEAR AccountId: {}", keystore_dao_raw))?;
+        require_fenced_dao(&keystore_dao_id)?;
 
         Ok(Self {
             // CRITICAL: No fallback - must be explicitly configured
@@ -463,7 +519,7 @@ impl MpcCkdClient {
 
         // 3. Submit tx: signer → receiver_id, calling method_name(request_args).
         let response = self
-            .call_mpc_contract(signer, receiver_id, method_name, request_args)
+            .call_mpc_contract(signer, receiver_id, method_name, &request_args)
             .await?;
 
         // 4. Recompute app_id the same way MPC did — based on the SIGNER
@@ -503,6 +559,38 @@ impl MpcCkdClient {
             "✅ CKD secret successfully derived from MPC"
         );
         Ok(master_secret)
+    }
+
+    /// The key that seals the escrow of `account`'s `generation`: MPC's CKD answer for the
+    /// owner path with the keystore DAO as the predecessor, through the DAO's
+    /// `request_escrow_key`. The DAO builds the path from its own record of the owner; the
+    /// answer is verified here against the `app_id` of the path this keystore expects, so a
+    /// key for any other path does not pass.
+    ///
+    /// `signer` is the keystore's key on the DAO account. The DAO answers once per
+    /// generation: after the escrow is stored it refuses.
+    pub async fn request_owner_escrow_key(
+        &self,
+        signer: &near_crypto::InMemorySigner,
+        account: &AccountId,
+        generation: u64,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        let (ephemeral_private_key, ephemeral_public_key) = self.generate_ephemeral_key();
+        let app_public_key = self.g1_to_near_format(ephemeral_public_key);
+        let dao = signer.account_id.clone();
+        let response = self
+            .call_mpc_contract(
+                signer,
+                &dao,
+                "request_escrow_key",
+                &serde_json::json!({ "owner": account, "app_public_key": app_public_key }),
+            )
+            .await?;
+        let path = crate::crypto::owner_path(account, generation);
+        let app_id = derive_app_id(dao.as_str(), &path);
+        let secret =
+            self.decrypt_secret_and_verify(response.big_y, response.big_c, ephemeral_private_key, &app_id)?;
+        Ok(zeroize::Zeroizing::new(self.derive_strong_key(secret, b"")?))
     }
 
     /// Generate ephemeral BLS12-381 G1 keypair
@@ -580,7 +668,7 @@ impl MpcCkdClient {
         signer: &near_crypto::InMemorySigner,
         receiver_id: &AccountId,
         method_name: &str,
-        request: CkdRequestArgs,
+        request: &impl Serialize,
     ) -> Result<CkdResponse> {
         tracing::info!(
             signer = %signer.account_id,
@@ -590,7 +678,7 @@ impl MpcCkdClient {
         );
 
         // Serialize request to JSON
-        let args = serde_json::to_vec(&request)?;
+        let args = serde_json::to_vec(request)?;
 
         let mut invalid_nonce_retries = 0u32;
         let outcome = loop {
@@ -905,7 +993,8 @@ pub async fn check_access_key_methods(
 ) -> Result<()> {
     use near_primitives::views::{AccessKeyPermissionView, QueryRequest as Qr};
 
-    const REQUIRED: &[&str] = &["request_key", "mark_vault_verified", "ban_vault"];
+    const REQUIRED: &[&str] =
+        &["request_key", "mark_vault_verified", "ban_vault", "request_escrow_key", "store_escrow"];
 
     let client = crate::near::rpc_client(near_rpc_url);
     let request = methods::query::RpcQueryRequest {
@@ -1382,6 +1471,260 @@ async fn assert_serving_allowed(
 
     Ok(())
 }
+
+// =============================================================================
+// Owner scope: the exit through the keystore DAO
+// =============================================================================
+
+/// What the keystore DAO says about an owner, as far as the gate reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerOnChain {
+    pub generation: u64,
+    pub claim_in_flight: bool,
+    /// The current generation's escrow `check`; `None` until an escrow is stored.
+    pub escrow_check: Option<[u8; 32]>,
+}
+
+/// Read `get_exit_owner`'s answer: `null` is an account with no record. An answer of any
+/// other shape than the contract's is an error, never "no record".
+pub fn parse_exit_owner(answer: &serde_json::Value) -> Result<Option<OwnerOnChain>> {
+    if answer.is_null() {
+        return Ok(None);
+    }
+    let generation = answer
+        .get("generation")
+        .and_then(|v| v.as_u64())
+        .filter(|g| *g >= 1)
+        .ok_or_else(|| anyhow::anyhow!("get_exit_owner: no generation in {answer}"))?;
+    let claim_in_flight = answer
+        .get("claim_in_flight")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| anyhow::anyhow!("get_exit_owner: no claim_in_flight in {answer}"))?;
+    let escrow_check = match answer.get("escrow_check") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(decode_check(v).context("get_exit_owner: escrow_check")?),
+    };
+    Ok(Some(OwnerOnChain { generation, claim_in_flight, escrow_check }))
+}
+
+fn decode_check(v: &serde_json::Value) -> Result<[u8; 32]> {
+    let text = v.as_str().ok_or_else(|| anyhow::anyhow!("not a string"))?;
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text)
+        .context("not base64")?
+        .try_into()
+        .map_err(|b: Vec<u8>| anyhow::anyhow!("{} bytes, not 32", b.len()))
+}
+
+/// What to do for a wallet of `account`'s `generation`, given the chain and what is loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerVerdict {
+    /// Loaded, and the chain's escrow is the one verified at load.
+    Serve,
+    /// The generation has no escrow yet: write it, then load.
+    CreateEscrow,
+    /// An escrow is on chain and the generation is not loaded: verify it, then load.
+    VerifyEscrow([u8; 32]),
+}
+
+/// The gate's decision. Pure: the chain's answer and the loaded `check` in, a verdict out.
+pub fn judge_owner(
+    account: &AccountId,
+    generation: u64,
+    chain: Option<&OwnerOnChain>,
+    loaded_check: Option<[u8; 32]>,
+) -> std::result::Result<OwnerVerdict, OwnerNotServable> {
+    let Some(chain) = chain else {
+        return Err(OwnerNotServable::NotRegistered(account.clone()));
+    };
+    if chain.generation > generation || (chain.generation == generation && chain.claim_in_flight) {
+        return Err(OwnerNotServable::Exited { account: account.clone(), generation });
+    }
+    if chain.generation < generation {
+        return Err(OwnerNotServable::UnknownGeneration {
+            account: account.clone(),
+            generation,
+            current: chain.generation,
+        });
+    }
+    match (chain.escrow_check, loaded_check) {
+        (None, _) => Ok(OwnerVerdict::CreateEscrow),
+        (Some(on_chain), Some(loaded)) if on_chain == loaded => Ok(OwnerVerdict::Serve),
+        (Some(_), Some(_)) => Err(OwnerNotServable::EscrowMismatch { account: account.clone(), generation }),
+        (Some(on_chain), None) => Ok(OwnerVerdict::VerifyEscrow(on_chain)),
+    }
+}
+
+async fn read_exit_owner(
+    near_client: &crate::near::NearClient,
+    dao: &AccountId,
+    account: &AccountId,
+) -> Result<Option<OwnerOnChain>> {
+    let answer = near_client
+        .view_call_json(dao, "get_exit_owner", serde_json::json!({ "account": account }))
+        .await
+        .with_context(|| format!("get_exit_owner({account}) view-call failed"))?;
+    parse_exit_owner(&answer)
+}
+
+/// The gate before every operation of an owner-scope wallet. Reads the owner's record from
+/// the keystore DAO, uncached, and serves only the owner's current generation with an
+/// escrow on chain that is the one this keystore derives.
+///
+/// A generation with no escrow yet gets one here: the exit must be possible before the
+/// wallet's first address is handed out. A generation the owner left is evicted.
+pub async fn ensure_owner_loaded(
+    ctx: &crate::api::MpcContext,
+    near_client: &crate::near::NearClient,
+    keystore: &Keystore,
+    account: &AccountId,
+    generation: u64,
+) -> Result<()> {
+    let dao = &ctx.mpc_ckd_config.keystore_dao_id;
+    let chain = read_exit_owner(near_client, dao, account).await?;
+    let verdict = judge_owner(
+        account,
+        generation,
+        chain.as_ref(),
+        keystore.loaded_owner_check(account, generation),
+    );
+    match verdict {
+        Ok(OwnerVerdict::Serve) => Ok(()),
+        Ok(OwnerVerdict::VerifyEscrow(check)) => {
+            verify_and_load_owner(near_client, dao, keystore, account, generation, check).await
+        }
+        Ok(OwnerVerdict::CreateEscrow) => {
+            create_owner_escrow(ctx, near_client, keystore, account, generation).await
+        }
+        Err(refusal) => {
+            keystore.evict_owner(account);
+            Err(refusal.into())
+        }
+    }
+}
+
+/// Whether the escrow the DAO holds — its `ct`, its `check`, and the `check` the owner's
+/// record shows — is the escrow of `master` at `path`: the two checks are one, and it is
+/// the one this master gives for this ciphertext. Anything else is an escrow that would not
+/// hand the owner the master the wallets were derived from.
+fn escrow_is_of(master: &[u8; 32], path: &str, ct: &[u8], check: [u8; 32], check_in_record: [u8; 32]) -> bool {
+    check == check_in_record && check == crate::crypto::owner_escrow_check(master, path, ct)
+}
+
+/// Check the escrow stored for `account`'s `generation` against the master this keystore
+/// derives, and load the master on a match.
+async fn verify_and_load_owner(
+    near_client: &crate::near::NearClient,
+    dao: &AccountId,
+    keystore: &Keystore,
+    account: &AccountId,
+    generation: u64,
+    check_in_record: [u8; 32],
+) -> Result<()> {
+    let escrow = near_client
+        .view_call_json(
+            dao,
+            "get_escrow",
+            serde_json::json!({ "account": account, "generation": generation }),
+        )
+        .await
+        .with_context(|| format!("get_escrow({account}, {generation}) view-call failed"))?;
+    let ct = escrow
+        .get("ct")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("get_escrow: no ct in the answer"))
+        .and_then(|t| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, t).context("get_escrow: ct is not base64")
+        })?;
+    let check = decode_check(escrow.get("check").unwrap_or(&serde_json::Value::Null)).context("get_escrow: check")?;
+
+    let master = keystore.owner_master(account, generation);
+    if !escrow_is_of(&master, &crate::crypto::owner_path(account, generation), &ct, check, check_in_record) {
+        keystore.evict_owner(account);
+        return Err(OwnerNotServable::EscrowMismatch { account: account.clone(), generation }.into());
+    }
+    keystore.load_owner(account, generation, check);
+    Ok(())
+}
+
+/// Write the escrow of `account`'s `generation` and load the master: ask the DAO for the
+/// escrow key, seal the master, open the result with the same key, store it, read it back.
+///
+/// One writer at a time per owner in this process; another instance may win the write, in
+/// which case the DAO refuses ours and the stored escrow is verified like any other — the
+/// sealing is deterministic, so every instance writes the same bytes.
+async fn create_owner_escrow(
+    ctx: &crate::api::MpcContext,
+    near_client: &crate::near::NearClient,
+    keystore: &Keystore,
+    account: &AccountId,
+    generation: u64,
+) -> Result<()> {
+    let dao = &ctx.mpc_ckd_config.keystore_dao_id;
+    let per_owner_lock = {
+        let mut map = vault_load_locks().lock().await;
+        map.entry(account.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = per_owner_lock.lock().await;
+
+    let written = write_owner_escrow(ctx, near_client, keystore, account, generation).await;
+
+    // Whoever wrote it — this call, a concurrent one or another instance — what stands on
+    // chain now is what gets verified and loaded.
+    match read_exit_owner(near_client, dao, account).await? {
+        Some(OwnerOnChain { generation: g, claim_in_flight: false, escrow_check: Some(check) }) if g == generation => {
+            verify_and_load_owner(near_client, dao, keystore, account, generation, check).await
+        }
+        _ => Err(written
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("the escrow of {account} generation {generation} is not on chain after its write"))),
+    }
+}
+
+async fn write_owner_escrow(
+    ctx: &crate::api::MpcContext,
+    near_client: &crate::near::NearClient,
+    keystore: &Keystore,
+    account: &AccountId,
+    generation: u64,
+) -> Result<()> {
+    let dao = &ctx.mpc_ckd_config.keystore_dao_id;
+    let path = crate::crypto::owner_path(account, generation);
+    tracing::info!(owner = %account, generation, "Writing the owner's escrow to the keystore DAO");
+
+    // Both transactions are signed with the keystore's one key on the DAO account.
+    let _nonce = ctx.signer_nonce_lock.lock().await;
+    let escrow_key = MpcCkdClient::new(ctx.mpc_ckd_config.clone())
+        .request_owner_escrow_key(&ctx.keystore_dao_signer, account, generation)
+        .await
+        .with_context(|| format!("escrow key request failed for {account} generation {generation}"))?;
+
+    let master = keystore.owner_master(account, generation);
+    let escrow = crate::crypto::seal_owner_escrow(&escrow_key, &master, &path)?;
+    let opened = crate::crypto::open_owner_escrow(&escrow_key, &escrow.ct, &path)?;
+    anyhow::ensure!(*opened == *master, "the sealed escrow does not open to the master it was sealed from");
+
+    near_client
+        .submit_function_call(
+            &ctx.keystore_dao_signer,
+            dao,
+            "store_escrow",
+            serde_json::json!({
+                "owner": account,
+                "generation": generation,
+                "ct": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &escrow.ct),
+                "check": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, escrow.check),
+            }),
+            STORE_ESCROW_GAS,
+            0,
+        )
+        .await
+        .with_context(|| format!("store_escrow failed for {account} generation {generation}"))?;
+    Ok(())
+}
+
+const STORE_ESCROW_GAS: u64 = 30_000_000_000_000;
 
 #[cfg(test)]
 mod invalid_nonce_tests {
@@ -1933,5 +2276,130 @@ mod tests {
             res.expect("join")
                 .expect("cached fast-path must succeed without touching the network");
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_gate_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn alice() -> AccountId {
+        AccountId::from_str("alice.near").unwrap()
+    }
+
+    fn on_chain(generation: u64, claim_in_flight: bool, escrow_check: Option<[u8; 32]>) -> OwnerOnChain {
+        OwnerOnChain { generation, claim_in_flight, escrow_check }
+    }
+
+    #[test]
+    fn a_keystore_answers_only_to_a_dao_the_policy_engine_fences() {
+        for fenced in shared_tee_helpers::wallet_policy::KEYSTORE_DAO_CONTRACTS {
+            assert!(require_fenced_dao(&AccountId::from_str(fenced).unwrap()).is_ok(), "{fenced}");
+        }
+        for open in ["keystore-dao.outlayer.testnet", "dao.testoutlayerdao.testnet", "dao.outlayer.near.evil.near", "outlayer.near"] {
+            let refused = require_fenced_dao(&AccountId::from_str(open).unwrap()).unwrap_err().to_string();
+            assert!(refused.contains(open) && refused.contains("KEYSTORE_DAO_CONTRACTS"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn an_escrow_is_served_only_when_it_holds_this_master() {
+        let master = [0x11u8; 32];
+        let path = "owner:alice.near:1";
+        let escrow = crate::crypto::seal_owner_escrow(&[0x55; 32], &master, path).unwrap();
+        assert!(escrow_is_of(&master, path, &escrow.ct, escrow.check, escrow.check));
+        // The record shows another check than the escrow.
+        assert!(!escrow_is_of(&master, path, &escrow.ct, escrow.check, [0u8; 32]));
+        // A ciphertext the check was not made for.
+        let mut other_ct = escrow.ct.clone();
+        other_ct[0] ^= 1;
+        assert!(!escrow_is_of(&master, path, &other_ct, escrow.check, escrow.check));
+        // A check that agrees with the record and is not this master's: an escrow of another
+        // master, another owner, another generation.
+        let foreign = crate::crypto::seal_owner_escrow(&[0x55; 32], &[0x12u8; 32], path).unwrap();
+        assert!(!escrow_is_of(&master, path, &foreign.ct, foreign.check, foreign.check));
+        assert!(!escrow_is_of(&master, "owner:alice.near:2", &escrow.ct, escrow.check, escrow.check));
+        assert!(!escrow_is_of(&master, "owner:bob.near:1", &escrow.ct, escrow.check, escrow.check));
+    }
+
+    fn judge(generation: u64, chain: Option<OwnerOnChain>, loaded: Option<[u8; 32]>) -> std::result::Result<OwnerVerdict, String> {
+        judge_owner(&alice(), generation, chain.as_ref(), loaded).map_err(|e| format!("{e:?}"))
+    }
+
+    #[test]
+    fn an_account_with_no_record_is_not_served() {
+        assert!(judge(1, None, None).unwrap_err().starts_with("NotRegistered"));
+        assert!(judge(1, None, Some([1; 32])).unwrap_err().starts_with("NotRegistered"));
+    }
+
+    #[test]
+    fn a_generation_the_owner_left_is_not_served_whatever_is_loaded() {
+        for loaded in [None, Some([1; 32])] {
+            assert!(judge(1, Some(on_chain(2, false, Some([9; 32]))), loaded).unwrap_err().starts_with("Exited"));
+            assert!(judge(1, Some(on_chain(2, false, None)), loaded).unwrap_err().starts_with("Exited"));
+        }
+    }
+
+    #[test]
+    fn a_claim_in_flight_counts_as_left() {
+        assert!(judge(1, Some(on_chain(1, true, Some([1; 32]))), Some([1; 32])).unwrap_err().starts_with("Exited"));
+        assert!(judge(1, Some(on_chain(1, true, None)), None).unwrap_err().starts_with("Exited"));
+    }
+
+    #[test]
+    fn a_generation_the_owner_has_not_reached_is_not_a_wallet_of_theirs() {
+        assert!(judge(3, Some(on_chain(2, false, Some([1; 32]))), None).unwrap_err().starts_with("UnknownGeneration"));
+        // A claim in flight for generation 2 says nothing about a scope naming 3.
+        assert!(judge(3, Some(on_chain(2, true, None)), None).unwrap_err().starts_with("UnknownGeneration"));
+    }
+
+    #[test]
+    fn the_current_generation_is_served_created_or_verified() {
+        assert_eq!(judge(1, Some(on_chain(1, false, None)), None), Ok(OwnerVerdict::CreateEscrow));
+        assert_eq!(judge(1, Some(on_chain(1, false, Some([7; 32]))), None), Ok(OwnerVerdict::VerifyEscrow([7; 32])));
+        assert_eq!(judge(1, Some(on_chain(1, false, Some([7; 32]))), Some([7; 32])), Ok(OwnerVerdict::Serve));
+    }
+
+    #[test]
+    fn an_escrow_other_than_the_one_verified_at_load_is_a_mismatch() {
+        assert!(judge(1, Some(on_chain(1, false, Some([7; 32]))), Some([8; 32])).unwrap_err().starts_with("EscrowMismatch"));
+    }
+
+    #[test]
+    fn the_contracts_answer_is_read_strictly() {
+        assert_eq!(parse_exit_owner(&serde_json::Value::Null).unwrap(), None);
+        let check = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
+        let full = serde_json::json!({
+            "generation": 2, "exit_window_secs": 86400, "pending_exit_window": null,
+            "approvers": [], "threshold": 0, "pending": null,
+            "claim_in_flight": false, "escrow_check": check,
+        });
+        assert_eq!(parse_exit_owner(&full).unwrap(), Some(on_chain(2, false, Some([7; 32]))));
+
+        let mut no_escrow = full.clone();
+        no_escrow["escrow_check"] = serde_json::Value::Null;
+        assert_eq!(parse_exit_owner(&no_escrow).unwrap(), Some(on_chain(2, false, None)));
+
+        for (field, value) in [
+            ("generation", serde_json::json!(0)),
+            ("generation", serde_json::json!("2")),
+            ("claim_in_flight", serde_json::json!("no")),
+            ("escrow_check", serde_json::json!("not base64 !")),
+            ("escrow_check", serde_json::json!(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 31]))),
+        ] {
+            let mut bad = full.clone();
+            bad[field] = value;
+            assert!(parse_exit_owner(&bad).is_err(), "{field} must be refused");
+        }
+        let mut missing = full.clone();
+        missing.as_object_mut().unwrap().remove("claim_in_flight");
+        assert!(parse_exit_owner(&missing).is_err(), "a missing field is not `false`");
+    }
+
+    #[test]
+    fn a_refusal_reads_as_the_owner_needs_it() {
+        let exited = OwnerNotServable::Exited { account: alice(), generation: 1 };
+        assert!(exited.to_string().contains("its keys were handed to the owner"), "{exited}");
     }
 }

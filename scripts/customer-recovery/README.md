@@ -206,6 +206,44 @@ and pass it with `--derivation-path`.
 
 If the vault has no such transaction at all, no keystore ever derived its master: no wallet or secret was ever served under it, and there is nothing to recover.
 
+## Owner exit
+
+An owner registered in the keystore DAO, with no vault, leaves with
+`customer-recovery owner-exit` — the procedure is
+[`docs/OWNER_EXIT.md`](../../docs/OWNER_EXIT.md).
+
+| Command | Does |
+|---|---|
+| `owner-exit status --owner <account>` | the owner's record in the DAO: generation, exit window, approvers, a pending exit |
+| `owner-exit initiate --owner <account>` | starts an exit; attaches the DAO's exit fee |
+| `owner-exit cancel --owner <account>` | drops the pending action: an exit, or a change of the approvers |
+| `owner-exit claim --owner <account> --claim-file <path>` | after the exit window: asks the DAO for the escrow key, opens the escrow, prints `master_hex=…` |
+| `owner-exit open --claim-file <path>` | reads the claim's result from the chain by the transaction hash in the claim file, opens the escrow, prints `master_hex=…` |
+| `owner-exit wallets --owner <account> --generation <n>` | the wallets at numbered seeds, with their NEAR accounts |
+
+`--dao` (default `dao.outlayer.testnet`; mainnet `dao.outlayer.near`) and `--rpc-url`
+(default a testnet RPC) go with every command that reads the chain; `open` takes its DAO
+from the claim file and needs the RPC of that DAO's network. An RPC URL that carries an API key goes in
+`RPC_URL` in the environment instead. The owner's full-access key is
+`OWNER_PRIVATE_KEY`, MPC's key `MPC_PUBLIC_KEY`, the master for `wallets`
+`CUSTOMER_RECOVERY_MASTER` — in the environment, not on the command line.
+
+`claim` writes the claim file (mode 0600) before it sends the transaction: it holds the
+one-time key MPC's answer is encrypted to and the hash of the claim transaction, whose
+result on chain is that answer. A claim that returned the key is not made again; the claim file
+is what opens it, through `open` — from any RPC for the first days, and from an archival
+RPC after that, since an ordinary node drops a transaction's result. A claim refuses a path where a file
+exists — it may hold the key of an earlier claim — so each claim takes a new path. When
+`claim` ends without printing a master, run `open` on its file first: a transaction whose
+answer to the sender was lost may have gone through.
+
+The master is opened exactly as the keystore sealed it
+(`keystore-worker/src/crypto.rs`, `seal_owner_escrow`); a test holds this tool to the
+keystore's vector.
+
+`sign-bearer-near --owner` builds a `Bearer near:` token for an owner's scope, and
+`sign-api-key-claim` signs `api-key:<seed>:<timestamp>:<key_hash>[:<vault_id>]`.
+
 ## Caveats
 
 - Run the tool on a host you trust — the master and derived private keys are printed to stdout. Redirect them to a 0600 file; don't pipe them into a logger or a shared terminal.
