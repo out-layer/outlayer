@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use near_jsonrpc_client::errors::JsonRpcError;
-use near_jsonrpc_client::{methods, JsonRpcClient, MethodCallResult};
+use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_primitives::types::{AccountId, Balance, BlockReference, Gas};
 use serde_json::json;

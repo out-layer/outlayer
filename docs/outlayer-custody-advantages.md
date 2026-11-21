@@ -20,7 +20,7 @@ to us; its figures are our estimates, not measurements.
 | Concurrency | Money-moving operations on one wallet are serialized by the coordinator (velocity limits, NEAR nonces); separate wallets run in parallel | Per-account nonce commit serializes actions |
 | Action set | Programmable policy: capabilities, limits, whitelists, approvals, reject-if-transaction guards | `function_call` + `transfer` only, enforced at the type level |
 | Ownership transfer / resale | Not a native primitive | Native — compare-and-swap of the operating key |
-| Built-in recovery | Of the custody root: per-customer vaults with a unilateral exit (testnet). Of an agent's authority: by composition | Native policy engine — timelock, watcher quorum, attestation |
+| Built-in recovery | Of the custody root: an owner exit for any wallet owned by a NEAR account (the keystore DAO holds an escrow of its keys), and per-customer vaults with a unilateral exit that takes secrets too — [EXITS.md](EXITS.md). Of an agent's authority: by composition | Native policy engine — timelock, watcher quorum, attestation |
 | Human-readable identity | Implicit hex by default | Named (TLA sub-account, e.g. `agent.claude`) |
 | Verifiability of authority | Remote attestation of the measured code; on-chain approval of measurements | On-chain contract logic + MPC network |
 

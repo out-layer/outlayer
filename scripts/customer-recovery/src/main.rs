@@ -234,8 +234,8 @@ mod roundtrip_tests {
         let cipher = ChaCha20Poly1305::new((&chacha_key).into());
         // Fixed nonce only for determinism in the test.
         let nonce_bytes = [0xABu8; 12];
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
+        let nonce = Nonce::from(nonce_bytes);
+        let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap();
         let mut out = Vec::with_capacity(12 + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
@@ -281,7 +281,7 @@ mod roundtrip_tests {
         let cipher = ChaCha20Poly1305::new((&sym_key).into());
         let nonce_bytes = [0xABu8; 12];
         let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), &plaintext[..])
+            .encrypt(&Nonce::from(nonce_bytes), &plaintext[..])
             .unwrap();
 
         // Assemble the wire format:
@@ -331,7 +331,7 @@ mod roundtrip_tests {
         )
         .unwrap();
         let cipher = ChaCha20Poly1305::new((&chacha_key).into());
-        let nonce = Nonce::from_slice(&blob_raw[..12]);
+        let nonce = &Nonce::from(<[u8; 12]>::try_from(&blob_raw[..12]).expect("a slice of 12 bytes"));
         let pt = cipher.decrypt(nonce, &blob_raw[12..]).unwrap();
         assert_eq!(pt.as_slice(), plaintext);
     }
@@ -406,8 +406,8 @@ fn decrypt_secret_subcommand(
         let chacha_key = sk.verifying_key().to_bytes();
 
         let cipher = ChaCha20Poly1305::new((&chacha_key).into());
-        let nonce = Nonce::from_slice(&blob[..12]);
-        match cipher.decrypt(nonce, &blob[12..]) {
+        let nonce = Nonce::from(<[u8; 12]>::try_from(&blob[..12]).expect("a slice of 12 bytes"));
+        match cipher.decrypt(&nonce, &blob[12..]) {
             Ok(plaintext) => {
                 print!(
                     "{}",
@@ -484,9 +484,9 @@ fn decrypt_ecies_v1(master: &[u8], seed: &str, blob: &[u8]) -> Result<Vec<u8>> {
 
     // 5. AEAD decrypt.
     let cipher = ChaCha20Poly1305::new((&sym_key).into());
-    let nonce = Nonce::from_slice(&blob[33..45]);
+    let nonce = Nonce::from(<[u8; 12]>::try_from(&blob[33..45]).expect("a slice of 12 bytes"));
     let plaintext = cipher
-        .decrypt(nonce, &blob[45..])
+        .decrypt(&nonce, &blob[45..])
         .map_err(|e| anyhow!("ChaCha20-Poly1305 decrypt failed: {e}"))?;
     Ok(plaintext)
 }
@@ -611,7 +611,7 @@ fn verify_sign_message_subcommand(
     // which makes this tool's "looks good locally" miss a class of
     // signatures the server still refuses.
     verifying_key
-        .verify_strict(hash.as_slice(), &sig)
+        .verify_strict(&hash[..], &sig)
         .map_err(|e| anyhow!("ed25519 verify_strict failed: {e}"))?;
 
     println!("ok");
@@ -720,7 +720,7 @@ fn sign_nep413_subcommand(
     let hash = Sha256::digest(&data);
 
     use ed25519_dalek::Signer;
-    let sig = signing_key.sign(hash.as_slice());
+    let sig = signing_key.sign(&hash[..]);
     let sig_b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         sig.to_bytes(),

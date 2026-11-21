@@ -5,6 +5,10 @@ This document describes the **architecture**, the **trust model**,
 and the two **recovery procedures**. The customer-facing how-to is
 https://app.outlayer.ai/docs/vaults and `outlayer vault --help`; the
 step-by-step exit runbook is [`docs/LEAVING_OUTLAYER.md`](docs/LEAVING_OUTLAYER.md).
+A vault is not the only way to leave with a wallet's keys: any NEAR account can own its
+wallets' exit through the keystore DAO with one transaction
+([`docs/OWNER_EXIT.md`](docs/OWNER_EXIT.md)); what a vault adds is the secrets and an exit
+no upgrade can change ([`docs/EXITS.md`](docs/EXITS.md)).
 
 ## Why vaults exist
 

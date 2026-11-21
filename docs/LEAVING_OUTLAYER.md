@@ -5,6 +5,10 @@ vault out from under OutLayer's keystore and continuing to use the
 same wallet addresses and the same on-chain secrets without OutLayer
 infrastructure.
 
+A vault is one of two ways out. A wallet with no vault has an exit too, when its owner is
+a NEAR account registered in the keystore DAO — one transaction, no contract to deploy:
+[OWNER_EXIT.md](OWNER_EXIT.md). The two side by side: [EXITS.md](EXITS.md).
+
 It targets two audiences:
 
 1. **Customers** who have deployed a vault with `outlayer vault init`

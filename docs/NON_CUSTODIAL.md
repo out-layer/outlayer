@@ -190,8 +190,9 @@ full-access key of that account, which the enclave checks on chain.
 These describe who may authorise a transaction. The last column holds for
 operations the enclave builds itself; the five intents operations in
 section 11 rely on the coordinator for the message they sign, and the
-governance keys in section 11 sit outside this table. The next section is
-about where the root itself lives, which is a separate choice.
+governance keys in section 11 sit outside this table. The next two
+sections are about where the root itself lives and how its owner takes it
+out, which is a separate choice.
 
 > Availability: the first three configurations are live on mainnet.
 > Personal account binding and per-customer vaults are on testnet and
@@ -201,10 +202,14 @@ about where the root itself lives, which is a separate choice.
 
 By default a wallet's keys descend from a shared root held by
 DAO-approved enclaves. Convenient, and sufficient when the policy already
-prevents unilateral movement. It has one property worth naming: the path
-back to those keys runs through OutLayer's DAO.
+prevents unilateral movement. Its owner can still leave with the keys: a
+NEAR account that registers in the keystore DAO owns its wallets'
+master, an escrow of it sits in the DAO contract, and after a wait the
+owner chose the account claims it — section 8. What that exit keeps is a
+dependence on the DAO contract's code, which an upgrade could change
+after the governance delay.
 
-A vault removes that. You deploy a small contract on an account you
+A vault removes that too. You deploy a small contract on an account you
 create, and that contract becomes the issuer of your master secret:
 
 | Property | What enforces it |
@@ -223,18 +228,29 @@ counterparties to read before they deposit.
 ## 8. Leaving OutLayer
 
 A sovereignty claim is only worth what the exit procedure is worth, so
-ours is published as an operational runbook rather than a promise:
-[`LEAVING_OUTLAYER.md`](LEAVING_OUTLAYER.md).
+ours are published as operational runbooks rather than promises. There
+are two, and a wallet does not need a vault to have one:
 
-After running it you sign for the same wallet addresses with a key you
-re-derive locally, and you decrypt the secrets bound to the vault
-locally. Nothing changes address, and no value has to be moved to a new
-wallet first. What you give up is everything that is OutLayer: minting
-new wallets, issuing API keys, our execution layer.
+- the **owner exit**, for any wallet whose owner is a NEAR account
+  registered in the keystore DAO — one transaction to set up, 24–48 hours
+  to leave, the wallets' keys: [`OWNER_EXIT.md`](OWNER_EXIT.md);
+- the **vault exit**, for wallets and secrets under a vault of your own —
+  the keys and the secrets, under code no upgrade reaches:
+  [`LEAVING_OUTLAYER.md`](LEAVING_OUTLAYER.md).
 
-It requires no cooperation from us — not our API, not our dashboard, not
-our consent. The contract checks that the caller is the parent account
-and that the time window has elapsed, and those are the only conditions.
+[`EXITS.md`](EXITS.md) sets the two side by side.
+
+After running either you sign for the same wallet addresses with a key you
+re-derive locally; after a vault's you also decrypt the secrets bound to
+the vault locally. Nothing changes address, and no value has to be moved to a new
+wallet first. What you give up for those wallets is everything that is
+OutLayer: API keys, policies, our execution layer.
+
+Neither requires cooperation from us — not our API, not our dashboard, not
+our consent. The contract checks that the caller is the account that owns
+the exit and that the time window has elapsed — and, for an owner who
+named exit approvers, that their quorum agreed; those are the only
+conditions.
 We cannot cancel a recovery in progress. The runbook also lists what to
 store offline beforehand, because a few identifiers (the vault id, the
 wallet ids, the MPC verification key) are returned once and are needed to

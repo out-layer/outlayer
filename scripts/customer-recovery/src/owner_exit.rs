@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use blstrs::{G1Projective, Scalar};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
+    ChaCha20Poly1305, Nonce,
 };
 use clap::{Parser, Subcommand};
 use elliptic_curve::{Field, Group};
@@ -165,14 +165,14 @@ fn escrow_cipher(escrow_key: &[u8; 32], path: &str) -> ChaCha20Poly1305 {
     let hkdf = Hkdf::<Sha256>::new(Some(OWNER_ESCROW_SALT), escrow_key);
     let mut key = Zeroizing::new([0u8; 32]);
     hkdf.expand(path.as_bytes(), key.as_mut()).expect("32 bytes is a valid HKDF-SHA256 output length");
-    ChaCha20Poly1305::new(Key::from_slice(key.as_ref()))
+    ChaCha20Poly1305::new_from_slice(key.as_ref()).expect("a 32-byte key is a ChaCha20-Poly1305 key")
 }
 
 /// Open an escrow with the key MPC's answer for `path` gives.
 pub(super) fn open_escrow(escrow_key: &[u8; 32], ct: &[u8], path: &str) -> Result<Zeroizing<[u8; 32]>> {
     let plain = Zeroizing::new(
         escrow_cipher(escrow_key, path)
-            .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: ct, aad: path.as_bytes() })
+            .decrypt(&Nonce::from([0u8; 12]), Payload { msg: ct, aad: path.as_bytes() })
             .map_err(|_| anyhow!("the escrow does not open with this key for {path}"))?,
     );
     let master: [u8; 32] = plain

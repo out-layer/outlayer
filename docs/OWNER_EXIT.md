@@ -4,11 +4,12 @@ A wallet whose owner is a NEAR account registered in the keystore DAO contract c
 taken out of OutLayer by that owner: the owner ends up holding the keys, and needs no
 OutLayer service to get them — only NEAR and the NEAR MPC network.
 
-Two exits exist. They differ in what they yield and in who could ever take them away.
+Two exits exist. They differ in what they yield and in who could ever take them away;
+[EXITS.md](EXITS.md) sets them side by side with a wallet that has neither.
 
 | | Owner exit (this document) | Vault exit ([LEAVING_OUTLAYER.md](LEAVING_OUTLAYER.md)) |
 |---|---|---|
-| Set up by | one transaction to the keystore DAO, a fee | deploying a vault contract on a sub-account, 2.5 NEAR |
+| Set up by | one transaction to the keystore DAO, a fee of 0.05 NEAR | deploying a vault contract on a sub-account, 1 NEAR kept on it |
 | Yields | the wallets' keys | the wallets' keys and every secret bound to the vault |
 | Can it be removed | by an upgrade of the DAO contract, which waits the governance delay after the vote that approves it | no: a vault's code is fixed |
 | Wait | the owner's exit window, 24–48 h | the vault's exit window, 1–30 days |
