@@ -4663,9 +4663,10 @@ async fn wallet_sign_policy_handler(
                 e
             ))
         })?;
-    // A lock nobody could lift is refused before anything is read from the
-    // chain: the policy asking for it is wrong on its own terms.
-    shared_tee_helpers::wallet_policy::lock_is_satisfiable(&new_policy).map_err(ApiError::BadRequest)?;
+    // A policy that may not be stored — a lock nobody could lift, an approval
+    // rule nobody could read or meet — is refused before anything is read from
+    // the chain: the policy asking for it is wrong on its own terms.
+    shared_tee_helpers::wallet_policy::policy_is_storable(&new_policy).map_err(ApiError::BadRequest)?;
     let locked_new = new_policy.approval.as_ref().and_then(|a| a.locked).unwrap_or(false);
     let policy_hash = shared_tee_helpers::wallet_policy::policy_canonical_hash_hex(&new_plain);
 

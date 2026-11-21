@@ -87,6 +87,7 @@ SUITES=(
   "identity-https|hos_identity_e2e.sh|PARENT|the HTTPS half of use_bound_identity: unbound, pending, and a key that names no wallet are refused rather than answered with the caller's own name"
   "stuck-repair|stuck_request_repair_e2e.sh|PARENT PSQL_CMD|the lazy repair of rows left in processing, including the door's per-promise detail"
   "approvals|approval_flow_wk_e2e.sh|PARENT APPROVER|multisig approval over a wk_ credential"
+  "auto-approval|policy_auto_approval_e2e.sh|PARENT APPROVER|approval.auto_up_to (what runs without the approvers in a window) and addresses.unlisted=ask (a new address waits)"
   "refusals|refusals_e2e.sh|PARENT|the endpoints that exist to say no: /reject's signature binding, the internal endpoints' auth gate, and delete toward an address the policy does not list"
   "policy-sync|internal_policy_sync_e2e.sh|PARENT PSQL_CMD|the indexer policy sync through the TEE worker, for Bearer near: and wk_ vault wallets"
   "unified-op|unified_op_e2e.sh|PARENT|the canonical-op surface: auth-sign, approve/reject, sign_message, delete, negatives"

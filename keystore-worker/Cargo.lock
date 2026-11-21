@@ -4580,7 +4580,7 @@ dependencies = [
 [[package]]
 name = "shared-tee-helpers"
 version = "0.1.0"
-source = "git+https://github.com/out-layer/shared-tee-helpers?branch=main#9611af06f40e9112f02640fa9079801e8cbe1918"
+source = "git+https://github.com/out-layer/shared-tee-helpers?branch=main#a82c7f57cccd485ce23e7144727b1311776df30e"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4845,7 +4845,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

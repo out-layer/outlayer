@@ -6952,6 +6952,40 @@ mod policy_lock_tests {
         assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("approvers")), "{err:?}");
     }
 
+    /// An approval rule the engine could not read or meet is refused the same
+    /// way, locked or not; the same rules written so they can be applied sign.
+    #[tokio::test]
+    async fn an_approval_rule_that_cannot_be_applied_is_refused_before_the_chain_is_read() {
+        let (state, chain) = chain(None).await;
+        let quorum = json!({ "threshold": { "required": 1 }, "approvers": [{ "id": "a.testnet" }] });
+        let with = |rules: serde_json::Value, approval: serde_json::Value| {
+            json!({ "version": 1, "frozen": false, "rules": rules, "approval": approval })
+        };
+        let asking = json!({ "addresses": { "mode": "whitelist", "list": ["a.testnet"], "unlisted": "ask" } });
+        let up_to = |entry: serde_json::Value| {
+            let mut approval = quorum.clone();
+            approval["auto_up_to"] = entry;
+            approval
+        };
+        for (policy, names) in [
+            (with(json!({}), up_to(json!({ "daily": { "native": "0.5" } }))), "auto_up_to"),
+            (with(json!({}), up_to(json!({ "monthly": { "*": "5" } }))), "auto_up_to"),
+            (with(asking.clone(), json!({ "approvers": [{ "id": "a.testnet" }] })), "unlisted"),
+            (with(asking.clone(), json!({ "threshold": 2, "approvers": [{ "id": "a.testnet" }] })), "unlisted"),
+            (with(json!({ "addresses": { "mode": "blacklist", "list": [], "unlisted": "ask" } }), quorum.clone()), "unlisted"),
+            (with(json!({ "addresses": { "list": [], "unlisted": "prompt" } }), quorum.clone()), "unlisted"),
+        ] {
+            let data = blob(&state, &policy).await;
+            let err = sign(&state, request(&data, None)).await.expect_err("a rule that cannot be applied");
+            assert!(matches!(&err, ApiError::BadRequest(m) if m.contains(names)), "{policy}: {err:?}");
+        }
+        assert_eq!(asked_for(&chain, "get_wallet_policy"), 0, "refused before any read");
+
+        let good = with(asking, up_to(json!({ "daily": { "native": "5" } })));
+        let data = blob(&state, &good).await;
+        sign(&state, request(&data, None)).await.expect("both rules, written so they can be applied");
+    }
+
     /// Locking is a tightening the owner does alone — and the signed lock is
     /// the new policy's, read from the plaintext, not anything in the request.
     #[tokio::test]

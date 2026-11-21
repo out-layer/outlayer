@@ -35,7 +35,7 @@ A deterministic wallet is a wallet like any other; every `/wallet/v1/*` endpoint
 - **Cross-chain deposits and withdrawals** — `/wallet/v1/intents/deposit/cross-chain` and `/wallet/v1/intents/withdraw` through 1Click.
 - **On-chain calls** — NEAR contract calls (`/wallet/v1/call`).
 - **Token transfers** — native NEAR (`/wallet/v1/transfer`) and intents balances (`/wallet/v1/intents/transfer`).
-- **Policy engine** — capabilities, limits, whitelists, time windows, rate limit, multisig approval, freeze.
+- **Policy engine** — capabilities, limits, whitelists (a new address refused, or put to the approvers), time windows, rate limit, multisig approval (with an amount per window that runs without it), freeze.
 - **Webhooks** — the policy's `webhook_url` receives wallet events.
 - **Trial** — a wallet can claim a trial key (`POST /trial-key`) within its first days; the `trial` block of the `POST /register` response states the calls and days.
 

@@ -159,6 +159,33 @@ fund-moving operation stops and waits:
 }
 ```
 
+Two members narrow or widen what waits. `approval.auto_up_to` names, per
+window (`hourly`, `daily`, `monthly`) and token, a total that may leave
+without the approvers: a transfer or a withdrawal runs at once while what the
+wallet already spent in that window plus this amount stays at most the entry,
+and waits past it. It reads the spend counters the daily limit reads, so it has
+that limit's standing (see [Limits we state plainly](#11-limits-we-state-plainly)),
+and when the counters cannot be read the operation waits.
+`rules.addresses.unlisted: "ask"` makes a payment to an address off the
+whitelist wait for the approvers, who sign over that address, instead of being
+refused. Only a payment is asked about; everything else aimed off the list is
+refused, asking or not:
+
+| Aimed at an address off the list | With `unlisted: "ask"` |
+|---|---|
+| `transfer` (native NEAR) | waits for approval |
+| `withdraw` (out of NEAR Intents) | waits for approval |
+| `intents_transfer` (inside NEAR Intents) | waits for approval |
+| `cross_chain_withdraw` (to another chain; its capability must be on) | waits for approval |
+| `call` (a contract call, `w_execute_extension` and the accounts inside it included) | refused |
+| `delete` (the beneficiary) | refused |
+| `limit_order` (the recipient) | refused |
+| `intents_storage_deposit` (the token contract) | refused |
+| `confidential` (the recipient) | refused |
+
+A payment that asks is held to everything else first — its type, its token,
+the limits — and neither rule raises a limit.
+
 With this policy in place:
 
 - An API key can **propose** a transfer. The response is a pending

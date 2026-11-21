@@ -767,6 +767,7 @@ Multi-chain custody wallets for AI agents. The agent gets an API key, wallet key
 - **Contract** (`contract/src/wallet.rs`) — encrypted policy storage, freeze/unfreeze, on-chain signature verification
 - **Worker WASI** (`worker/src/outlayer_wallet/`) — `outlayer:wallet/api@0.1.0` host functions for WASI containers
 - **Dashboard** (`app/wallet/` in the dashboard repo) — policy management, approvals, audit log
+- **Policy engine** (`shared-tee-helpers/src/wallet_policy.rs`, compiled into the keystore and the coordinator) — one `evaluate` over the canonical op: freeze, transaction types, tokens, address list (`unlisted: "ask"` puts a payment off the list to the approvers), per-transaction and windowed limits, time, capabilities, approval threshold (`auto_up_to`: per window and token, the total that leaves without approvers). `policy_is_storable` holds a policy write to its lock and approval rules, in the coordinator's `encrypt-policy` and `sign-policy` and in the keystore's `sign-policy`
 
 ### Key Files
 
