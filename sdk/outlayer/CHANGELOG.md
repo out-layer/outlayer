@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3
+
+`encryption_keys::public_key` and `encryption_keys::open`: each encryption key
+has an X25519 public key a caller seals an input to, and `open` reads what was
+sealed. Both are new functions of `outlayer:encryption-keys@0.1.0`; a module
+that calls them runs only on workers that serve them. Modules that do not call
+them are unchanged.
+
 ## 0.2.1
 
 **Rebuild required if your module was built on 0.2.0 and uses storage.**

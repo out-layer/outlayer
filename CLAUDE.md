@@ -236,6 +236,17 @@ working until the next step lands (decided by Vadim, 2026-11-16, on keystore
 registration: one path with the boot event log, no legacy measurements path for
 keystores that have not been updated yet).
 
+## The keystore answers no one for free
+The keystore's listener is reachable from the internet and has no rate limit
+of its own. A route there is public only if answering it costs nothing an
+outsider could run up — no read of the chain, no vault load, no signature, no
+secret material: today `/health`, `/pubkey` (without a vault) and
+`/vrf/pubkey`. Every other route takes a worker or coordinator token, and what
+a client needs from it is asked through a coordinator route under the IP rate
+limit. A new keystore route goes into a token-gated group by default;
+`keystore-worker/src/api_tests.rs` (`public_routes`) pins the public list, and
+changing that test is the decision.
+
 ## A deploy is whole, and it succeeded
 Reason about the system as it runs after a complete deploy, not about the
 states in between.

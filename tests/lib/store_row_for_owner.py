@@ -32,7 +32,9 @@ def pubkey_for(api: str, project_id: str, profile: str, owner: str, secrets_json
         "accessor": {"type": "Project", "project_id": project_id},
         "owner": owner,
         "profile": profile,
-        "secrets_json": secrets_json,
+        # The names only: this request is not sealed, and the keystore reads
+        # nothing but the names.
+        "secrets_json": json.dumps({name: "" for name in json.loads(secrets_json)}),
     }).encode()
     # A User-Agent is NOT optional. Cloudflare fronts these hosts and answers a
     # header-less client with `403 error code: 1010` — which reads exactly like an

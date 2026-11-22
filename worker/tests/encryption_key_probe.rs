@@ -859,3 +859,76 @@ async fn the_storage_build_does_not_start_without_storage() {
     assert!(!refused.success, "a module importing near:storage ran without storage");
     assert!(refused.error.unwrap().contains("near:storage/api"));
 }
+
+/// What others seal to a key, as the guest sees it: `public-key` answers the
+/// pinned public half, the golden message every client's sealer is held to
+/// opens, a message sealed here by an independent implementation (the `hkdf`
+/// and `x25519-dalek` crates, not the host's own HKDF) opens, and everything
+/// that should not open is exactly `decryption failed` in a run that succeeds.
+#[tokio::test]
+async fn a_message_sealed_outside_the_run_opens_inside_it() {
+    /// `worker/src/encryption_keys`, `KEY_A_SEAL_PUBLIC` and the golden message.
+    const PUBLIC_A: &str = "d8dab3938ebf11fb0a976ee6464fca1dd8ae1ae2c089eb74f242b8785deead69";
+    const GOLDEN: &str =
+        "02a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a20982e4d1d0f68949731b656844b619291fe1168ba3cbfbff8e236533ad1d";
+
+    let wasm = probe("encryption");
+    let ask = |input: Value| {
+        let wasm = wasm.clone();
+        async move { answer(&wasm, enc_keys(&wasm), input).await }
+    };
+    let open = |path: &'static str, sealed: Vec<u8>, aad: &'static [u8]| {
+        ask(json!({ "operation": "enc_open", "path": path, "ciphertext_hex": hex::encode(sealed), "aad_hex": hex::encode(aad) }))
+    };
+
+    let public = ask(json!({ "operation": "enc_public_key", "path": "alpha" })).await;
+    assert_eq!(public["status"], "ok", "{public}");
+    assert_eq!(public["public_key"], PUBLIC_A);
+    let beta = ask(json!({ "operation": "enc_public_key", "path": "beta" })).await;
+    assert_ne!(beta["public_key"], PUBLIC_A, "another path is another key");
+
+    let golden = open("alpha", hex::decode(GOLDEN).unwrap(), b"outlayer-input").await;
+    assert_eq!(golden["status"], "ok", "{golden}");
+    assert_eq!(golden["plaintext"], hex::encode(br#"{"q":"hello"}"#));
+
+    // Sealed here, by another implementation of the same format.
+    let sealed = {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        let recipient: [u8; 32] = hex::decode(PUBLIC_A).unwrap().try_into().unwrap();
+        let ephemeral = x25519_dalek::StaticSecret::from([0x5a; 32]);
+        let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral).to_bytes();
+        let shared = ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(recipient));
+        let info = [b"outlayer:encryption-keys:v1:seal:kdf".as_slice(), &ephemeral_public, &recipient].concat();
+        let mut key = [0u8; 32];
+        hkdf::Hkdf::<sha2::Sha256>::new(None, shared.as_bytes()).expand(&info, &mut key).unwrap();
+        let ciphertext = aes_gcm::Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .encrypt(aes_gcm::Nonce::from_slice(&[0u8; 12]), Payload { msg: b"an input", aad: b"ctx" })
+            .unwrap();
+        [&[0x02u8][..], &ephemeral_public, &ciphertext].concat()
+    };
+    let opened = open("alpha", sealed.clone(), b"ctx").await;
+    assert_eq!(opened["status"], "ok", "{opened}");
+    assert_eq!(opened["plaintext"], hex::encode(b"an input"));
+
+    let mut tampered = sealed.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    let small_order = [&[0x02u8][..], &[0u8; 32], &[0u8; 24]].concat();
+    for (what, refused) in [
+        ("another aad", open("alpha", sealed.clone(), b"other").await),
+        ("another path", open("beta", sealed.clone(), b"ctx").await),
+        ("a tampered message", open("alpha", tampered, b"ctx").await),
+        ("a truncated message", open("alpha", sealed[..40].to_vec(), b"ctx").await),
+        ("a small-order ephemeral key", open("alpha", small_order, b"").await),
+        (
+            "decrypt on a sealed message",
+            ask(json!({ "operation": "decrypt", "path": "alpha", "ciphertext_hex": hex::encode(&sealed), "aad_hex": hex::encode(b"ctx") }))
+                .await,
+        ),
+    ] {
+        assert_eq!(refused["status"], "err", "{what}: {refused}");
+        assert_eq!(refused["message"], "decryption failed", "{what}");
+    }
+    let undeclared = ask(json!({ "operation": "enc_public_key", "path": "nope" })).await;
+    assert_eq!(undeclared["status"], "err", "{undeclared}");
+}

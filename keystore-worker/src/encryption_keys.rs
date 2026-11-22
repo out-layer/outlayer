@@ -53,6 +53,12 @@
 //! `encryption-key:` or `signing-key:` (`api.rs`, `DECLARED_KEY_ROOTS`), so no
 //! other seed this keystore derives starts with `encryption-key:v1:`.
 //!
+//! **The public half.** Each key has an X25519 pair derived from its 32 bytes
+//! ([`seal_public_of`]); `/encryption-pubkey` (`api.rs`) answers the public
+//! half without a run, for a key that names no vault. It derives the 32 bytes as
+//! a run would and lets none of them out: what leaves is a public key, which
+//! opens nothing.
+//!
 //! `v1` names the scheme: this string, `HMAC-SHA256` under the master, and 32
 //! bytes out. It never changes: changing it changes every key, and everything
 //! a key ever sealed would no longer open. A different scheme would be added
@@ -104,6 +110,24 @@ impl KeyDeclaration for EncryptionKeyRequest {
     fn vault(&self) -> Option<&str> {
         self.vault.as_deref()
     }
+}
+
+/// The label the X25519 secret of a key's sealing pair is derived under, and
+/// the worker's (`worker/src/encryption_keys`, `SEAL_SUBKEY_LABEL`).
+pub const SEAL_SUBKEY_LABEL: &[u8] = b"outlayer:encryption-keys:v1:seal";
+
+/// The X25519 public key others seal to for an encryption key: the public
+/// half of the pair whose secret is `HMAC-SHA256(key, SEAL_SUBKEY_LABEL)`,
+/// clamped. The worker's host derives the same pair from the same 32 bytes
+/// and opens with its secret; here only the public half is ever computed, so
+/// the key can be told to someone who is about to seal without a run. The two
+/// are pinned to one vector.
+pub fn seal_public_of(key: &[u8; 32]) -> [u8; 32] {
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC can take key of any size");
+    mac.update(SEAL_SUBKEY_LABEL);
+    let secret = zeroize::Zeroizing::new(<[u8; 32]>::from(mac.finalize().into_bytes()));
+    x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret)).to_bytes()
 }
 
 #[cfg(test)]

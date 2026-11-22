@@ -1091,7 +1091,7 @@ if want V4; then
       outlayer secrets set --project "$SECRET_PROJECT" --profile "$SECRET_PROFILE" --vault-id "$V4_VAULT" \
         "$(jq -nc --arg v "$EXPECTED_SECRET_VALUE" '{MY_TEST_SECRET:$v}')" >&2 || fail "V4a outlayer secrets set failed"
       PK_RESP=$(curl -sS -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/secrets/pubkey" -H 'Content-Type: application/json' -H "X-Customer-Vault: $V4_VAULT" \
-        -d "$(jq -nc --arg pid "$SECRET_PROJECT" --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{accessor:{type:"Project", project_id:$pid}, owner:$owner, profile:$profile, secrets_json:"{\"X\":\"y\"}"}')")
+        -d "$(jq -nc --arg pid "$SECRET_PROJECT" --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{accessor:{type:"Project", project_id:$pid}, owner:$owner, profile:$profile, secrets_json:"{\"X\":\"\"}"}')")
       PK_H=$(echo "$PK_RESP" | tail -1 | sed 's/HTTP://'); PK_B=$(echo "$PK_RESP" | sed '$d')
       KEYSTORE_PUBKEY=$(echo "$PK_B" | jq -r '.pubkey // empty')
       [[ "$PK_H" == "200" && -n "$KEYSTORE_PUBKEY" && "$KEYSTORE_PUBKEY" != "null" ]] && pass "V4a keystore encryption pubkey captured: $KEYSTORE_PUBKEY" || fail "V4a /secrets/pubkey failed (HTTP $PK_H): $(echo "$PK_B" | head -c160)"

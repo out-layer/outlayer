@@ -69,6 +69,30 @@ impl outlayer::encryption_keys::api::Host for EncryptionKeysHostState {
         );
         answer
     }
+
+    fn public_key(&mut self, path: String, vault: Option<String>) -> Result<Vec<u8>, String> {
+        let answer = self.keys.public_key(&path, vault.as_deref());
+        debug!(
+            path = ?shown(&path),
+            vault = ?vault.as_deref().map(shown),
+            ok = answer.is_ok(),
+            "encryption_keys::public_key"
+        );
+        answer
+    }
+
+    fn open(&mut self, path: String, vault: Option<String>, sealed: Vec<u8>, aad: Vec<u8>) -> Result<Vec<u8>, String> {
+        let answer = self.keys.open(&path, vault.as_deref(), &sealed, &aad);
+        debug!(
+            path = ?shown(&path),
+            vault = ?vault.as_deref().map(shown),
+            sealed_len = sealed.len(),
+            aad_len = aad.len(),
+            ok = answer.is_ok(),
+            "encryption_keys::open"
+        );
+        answer
+    }
 }
 
 /// Add the encryption-keys host functions to a component linker.
@@ -136,6 +160,11 @@ mod tests {
             assert_eq!(s.decrypt("records".into(), None, ct, b"other".to_vec()).unwrap_err(), "decryption failed");
             tag = s.mac("records".into(), None, b"name".to_vec()).unwrap();
             assert_eq!(tag.len(), 32);
+            let public: [u8; 32] = s.public_key("records".into(), None).unwrap().try_into().unwrap();
+            let sealed = crate::encryption_keys::seal_with(&[3u8; 32], &public, &plaintext, b"in").unwrap();
+            assert_eq!(s.open("records".into(), None, sealed.clone(), b"in".to_vec()).unwrap(), plaintext);
+            assert_eq!(s.open("records".into(), None, sealed, b"other".to_vec()).unwrap_err(), "decryption failed");
+            assert!(s.public_key("nope".into(), None).is_err());
             assert!(s.encrypt("nope".into(), None, vec![], vec![]).is_err());
             assert!(s.mac("records".into(), Some("vault.alice.near".into()), vec![]).is_err());
             assert!(s.encrypt("records".into(), None, vec![0; MAX_CRYPT_INPUT_BYTES + 1], vec![]).is_err());
@@ -143,6 +172,7 @@ mod tests {
         });
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("encryption_keys::encrypt") && logged.contains("records"), "{logged}");
+        assert!(logged.contains("encryption_keys::open") && logged.contains("encryption_keys::public_key"), "{logged}");
         assert!(!logged.contains(&KEY[..16]), "a key reached the log: {logged}");
         assert!(!logged.contains("PLAINTEXT-MARKER"), "a plaintext reached the log: {logged}");
         assert!(!logged.contains(&hex::encode(&tag)[..16]), "a tag reached the log: {logged}");

@@ -886,7 +886,7 @@ pub fn validate_request<D: KeyDeclaration>(
 /// `raw` as an account a key may belong to: not a placeholder the worker
 /// writes for a missing account, and a valid NEAR account id. `role` names the
 /// field in the refusal.
-fn real_account(family: KeyFamily, role: &str, raw: &str) -> Result<AccountId, String> {
+pub(crate) fn real_account(family: KeyFamily, role: &str, raw: &str) -> Result<AccountId, String> {
     let noun = family.a_noun();
     if PLACEHOLDER_CALLERS.contains(&raw) {
         return Err(format!(

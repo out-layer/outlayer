@@ -137,7 +137,7 @@ PUBKEY_RESP=$(curl -sS -w '\nHTTP_STATUS:%{http_code}' \
   -H 'Content-Type: application/json' \
   -H "X-Customer-Vault: $VAULT_ID" \
   -d "$(jq -n --arg pid "$SECRET_PROJECT" --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" \
-       '{accessor: {type: "Project", project_id: $pid}, owner: $owner, profile: $profile, secrets_json: "{\"X\":\"y\"}"}')")
+       '{accessor: {type: "Project", project_id: $pid}, owner: $owner, profile: $profile, secrets_json: "{\"X\":\"\"}"}')")
 PUBKEY_BODY=$(echo "$PUBKEY_RESP" | sed '$d')
 PUBKEY_STATUS=$(echo "$PUBKEY_RESP" | tail -1 | sed 's/HTTP_STATUS://')
 echo "/secrets/pubkey response: status=$PUBKEY_STATUS body=$PUBKEY_BODY" >&2

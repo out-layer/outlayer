@@ -1,6 +1,7 @@
 //! Encryption keys for OutLayer WASM components (feature `encryption-keys`)
 //!
-//! Symmetric keys that seal data only the component itself can open again. The
+//! Keys that seal data only the component itself can open again, each with a
+//! public half others seal to. The
 //! keystore derives each key inside the TEE, for this run only, under the same
 //! rules as [signing keys](https://docs.rs/outlayer/latest/outlayer/signing_keys/):
 //! the component names a key by `path` and the host encrypts, decrypts or
@@ -36,6 +37,20 @@
 //!   visible to the storage operator, a tag is not readable as a name.
 //!
 //! [`storage::sealed`](crate::storage::sealed) does both on top of raw storage.
+//!
+//! ## Input Sealed by a Caller
+//!
+//! Each key has an X25519 public key: [`public_key`] answers it inside a run,
+//! and `GET /keys/encryption-pubkey` answers the same bytes without one. A
+//! caller seals to it and sends the result as (part of) the input; [`open`]
+//! reads it, and nothing outside a run that holds the key can.
+//!
+//! - A key belongs to a caller, so what is sealed for one account does not
+//!   open in a run another account started.
+//! - Whoever can start a run as the same caller can have it open the same
+//!   message again: record what was acted on when once matters.
+//! - The public key is public: a sealed message says nothing about who sealed
+//!   it. Treat what it holds as input.
 //!
 //! ## Usage
 //!
@@ -112,4 +127,37 @@ pub fn decrypt(path: &str, vault: Option<&str>, ciphertext: &[u8], aad: &[u8]) -
 /// ```
 pub fn mac(path: &str, vault: Option<&str>, data: &[u8]) -> Result<Vec<u8>> {
     raw::mac(path, vault, data).map_err(EncryptionKeyError)
+}
+
+/// The X25519 public key (32 bytes) of the declared key at `path`
+///
+/// What a caller seals an input to. The same in every run that holds the key,
+/// and the same bytes `GET /keys/encryption-pubkey` answers for it.
+///
+/// # Example
+/// ```rust,ignore
+/// let public = encryption_keys::public_key("input", None)?;
+/// ```
+pub fn public_key(path: &str, vault: Option<&str>) -> Result<Vec<u8>> {
+    raw::public_key(path, vault).map_err(EncryptionKeyError)
+}
+
+/// Open a message sealed to [`public_key`]`(path, vault)`, bound to `aad`
+///
+/// `sealed` is `0x02 ‖ ephemeral X25519 public key (32 bytes) ‖ ciphertext ‖
+/// tag (16 bytes)`, 49 bytes longer than what it holds; at most 262144 bytes
+/// of plaintext and of `aad`. [`decrypt`] does not open these bytes, and
+/// `open` does not open what [`encrypt`] sealed.
+///
+/// # Returns
+/// * `Ok(plaintext)` - Opened
+/// * `Err(EncryptionKeyError)` - `"decryption failed"` for any failure to open,
+///   or the reason a call was refused, as for [`decrypt`]
+///
+/// # Example
+/// ```rust,ignore
+/// let input = encryption_keys::open("input", None, &sealed, b"")?;
+/// ```
+pub fn open(path: &str, vault: Option<&str>, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    raw::open(path, vault, sealed, aad).map_err(EncryptionKeyError)
 }

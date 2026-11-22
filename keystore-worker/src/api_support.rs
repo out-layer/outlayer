@@ -250,6 +250,30 @@ pub struct PubkeyResponse {
     pub pubkey: String,
 }
 
+/// Which encryption key's public half is asked for (`/encryption-pubkey`):
+/// the key a run of `project_id`, or a direct run of the build `wasm`, holds
+/// at `path` for `account_id` as its `caller`. Exactly one of `project_id` and
+/// `wasm`. Unknown fields are refused: a misspelled `caller` would otherwise
+/// answer the signer's key.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionPubkeyRequest {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub wasm: Option<String>,
+    #[serde(default)]
+    pub caller: crate::signing_keys::CallerKind,
+    pub account_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EncryptionPubkeyResponse {
+    /// X25519 public key, hex: what `public-key` answers inside the run.
+    pub pubkey: String,
+}
+
 /// Request to add generated secrets to existing encrypted secrets
 #[derive(Debug, Deserialize)]
 pub struct AddGeneratedSecretRequest {
@@ -354,6 +378,12 @@ pub struct UpdateUserSecretsRequest {
 pub struct UpdateUserSecretsResponse {
     /// Updated encrypted secrets (base64) for storing in contract
     pub encrypted_secrets_base64: String,
+
+    /// The vault whose master sealed them, `null` for the default master.
+    /// What the client passes to `store_secrets` as `vault_id`: the contract
+    /// binds a vault per accessor, so a row moved to a new accessor is bound
+    /// only by what the store names, and it must name the scope sealed under.
+    pub vault_id: Option<String>,
 
     /// Summary of changes
     pub summary: UpdateSummary,

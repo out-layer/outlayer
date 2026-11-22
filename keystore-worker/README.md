@@ -131,12 +131,20 @@ re-registers and retries.
 | `GET /vrf/pubkey` | none | VRF public key |
 | `POST /decrypt`, `/encrypt`, `/decrypt-raw`, `/storage/encrypt`, `/storage/decrypt`, `/vrf/generate` | worker token + TEE session | job secrets and declared keys; storage; VRF |
 | `POST /add_generated_secret`, `/update_user_secrets` | coordinator token | secrets generated inside the keystore; secret updates |
+| `POST /encryption-pubkey` | coordinator token | public key a client seals an input to (`outlayer:encryption-keys`, `open`) |
 | `POST /wallet/*` (derive-address, sign, evm/*, solana/*, sign-policy, sign-secret-store, sign-secret-delete, check-policy, encrypt-policy, decrypt-policy, derive-ephemeral-key) | coordinator token | custody wallets |
 | `POST /sign-vault-verification` | coordinator token | verifies a vault and submits `mark_vault_verified` on the DAO |
 | `POST /derive-vault-tee-key` | coordinator or worker token | public key a vault must carry for the keystore |
 | `POST /tee-challenge`, `/register-tee` | coordinator or worker token | TEE session |
 | `GET /admin/loaded-vaults` | coordinator or worker token | vault masters currently in memory |
 | `POST /admin/evict-customer`, `/admin/ban-vault` | worker token | drop a vault master; ban a vault on the DAO |
+
+**A route with no token costs nothing to answer.** The listener is reachable from the
+internet and has no rate limit of its own. The three routes above marked `none` derive or
+read nothing an outsider could run up: no read of the chain, no vault load, no signature.
+Anything that does one of those takes a token and is reached through the coordinator, which
+limits by IP. `api_tests::public_routes` pins the list; adding a public route is a decision
+made there.
 
 With TEE registration the port opens only once the master is loaded. Errors are
 `{"error": "<message>"}`.
@@ -150,11 +158,24 @@ With TEE registration the port opens only once the master is loaded. Errors are
 Returns `{"pubkey": "<hex>"}`, the X25519 public key of
 `HMAC-SHA256(master, "ecies:" || seed)`. Before deriving, the keystore parses
 `secrets_json` and refuses reserved names and the `PROTECTED_` prefix, which marks secrets
-generated inside the keystore. `secrets_json` carries the plaintext secrets: the dashboard
-sends it through the coordinator's `/secrets/pubkey`, so the coordinator relays them in the
-clear on the way to this check. The ciphertext the client then stores on the contract is
+generated inside the keystore. Only the names are read, so clients send each name with an
+empty value: the request is what the key is asked with, and nothing in it is sealed. The
+ciphertext the client then stores on the contract is
 ECIES: X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305,
 `[0x01 | ephemeral_pubkey(32) | nonce(12) | ciphertext | tag(16)]`.
+
+### `POST /encryption-pubkey`
+
+```json
+{"project_id": "alice.near/app", "caller": "signer", "account_id": "bob.near", "path": "input"}
+```
+
+or `"wasm": "<sha256>"` in place of `project_id` for a key bound to a build. Returns
+`{"pubkey": "<hex>"}`: the X25519 public half of the encryption key a run holds at `path`
+for that account — what `public-key` answers inside the run, and what a client seals an
+input to. The project's uuid is read from the contract on every request. `caller` is
+`signer` (default) or `predecessor`, as the manifest declares the key. A key that names a
+vault is not answered here; unknown fields are refused. Only the public half is computed.
 
 ### `POST /decrypt`
 

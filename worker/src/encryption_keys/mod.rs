@@ -33,6 +33,14 @@
 //! with a fixed label ([`MAC_SUBKEY_LABEL`]), never under the AEAD key itself.
 //! Inputs are capped at [`MAX_CRYPT_INPUT_BYTES`].
 //!
+//! **What others seal to a key.** Each key also has an X25519 pair, its secret
+//! derived from the 32 bytes under a label of its own ([`SEAL_SUBKEY_LABEL`]),
+//! so it is neither the AEAD key nor the `mac` subkey. `public_key` answers the
+//! public half; anyone holding it seals to it, and `open` is the only thing
+//! that reads the result — a run that holds the key. A sealed message is
+//! format [`SEALED_FORMAT`], a marker `decrypt` does not read, as `open` does
+//! not read `encrypt`'s: neither opens the other's bytes.
+//!
 //! **The keys live in the job's memory only.** They arrive in one response,
 //! are read straight into buffers wiped when dropped, travel into the one
 //! execution by value and are dropped with it. They are never cached across
@@ -85,6 +93,90 @@ pub const DECRYPTION_FAILED: &str = "decryption failed";
 /// The label the `mac` subkey is derived under: `HMAC-SHA256(key, label)`. A
 /// fixed constant of this format; changing it changes every tag ever made.
 pub const MAC_SUBKEY_LABEL: &[u8] = b"outlayer:encryption-keys:v1:mac";
+
+/// The first byte of a message sealed to a key's public half: `0x02 ||
+/// ephemeral X25519 public key (32) || ciphertext || tag (16)`, AES-256-GCM —
+/// with X25519 and HKDF-SHA256, what a browser's WebCrypto has, so a client
+/// seals without a library.
+pub const SEALED_FORMAT: u8 = 0x02;
+
+/// An X25519 public key.
+pub const SEAL_PUBLIC_LEN: usize = 32;
+
+/// Format marker, ephemeral public key and tag: what sealing adds.
+pub const SEALED_OVERHEAD: usize = 1 + SEAL_PUBLIC_LEN + TAG_LEN;
+
+/// The label the X25519 secret is derived under: `HMAC-SHA256(key, label)`,
+/// clamped as X25519 clamps every scalar. Changing it changes every public
+/// key, and nothing sealed to the old ones opens.
+pub const SEAL_SUBKEY_LABEL: &[u8] = b"outlayer:encryption-keys:v1:seal";
+
+/// Opens the HKDF `info` of a sealed message's AEAD key; the ephemeral and the
+/// recipient public keys follow it, so the key belongs to this one exchange.
+pub const SEAL_KDF_INFO: &[u8] = b"outlayer:encryption-keys:v1:seal:kdf";
+
+/// The X25519 public key of the pair derived from an encryption key's 32
+/// bytes. The keystore computes the same bytes when it is asked for the key a
+/// client seals to (`keystore-worker/src/encryption_keys.rs`), and the two are
+/// pinned to one vector.
+#[cfg(test)]
+pub fn seal_public_of(key: &[u8; 32]) -> [u8; SEAL_PUBLIC_LEN] {
+    x25519_dalek::PublicKey::from(&seal_secret_of(key)).to_bytes()
+}
+
+/// The X25519 secret of that pair, in a type that wipes itself when dropped.
+fn seal_secret_of(key: &[u8; 32]) -> x25519_dalek::StaticSecret {
+    x25519_dalek::StaticSecret::from(*hmac_sha256(key, SEAL_SUBKEY_LABEL))
+}
+
+/// The AES-256-GCM key of one sealed message: HKDF-SHA256 (RFC 5869, no
+/// salt, one block) over the X25519 shared secret, with [`SEAL_KDF_INFO`], the
+/// ephemeral public key and the recipient's as `info`.
+fn sealed_message_key(
+    shared: &[u8; 32],
+    ephemeral_public: &[u8; SEAL_PUBLIC_LEN],
+    recipient_public: &[u8; SEAL_PUBLIC_LEN],
+) -> Zeroizing<[u8; 32]> {
+    let prk = hmac_sha256(&[0u8; 32], shared);
+    let mut info = Vec::with_capacity(SEAL_KDF_INFO.len() + 2 * SEAL_PUBLIC_LEN + 1);
+    info.extend_from_slice(SEAL_KDF_INFO);
+    info.extend_from_slice(ephemeral_public);
+    info.extend_from_slice(recipient_public);
+    info.push(1);
+    hmac_sha256(&prk, &info)
+}
+
+/// Seal `plaintext` to the X25519 public key `recipient_public`, bound to
+/// `aad`, in format [`SEALED_FORMAT`], with `ephemeral_secret` as the sender's
+/// one-time X25519 secret. The message key is used for this message alone, so
+/// its nonce is all zeros. `None` when the recipient key is one no secret
+/// exists for (the shared secret is zero).
+///
+/// What a client does to seal; here for the tests that pin the format and for
+/// the vector the clients share.
+#[cfg(test)]
+pub fn seal_with(
+    ephemeral_secret: &[u8; 32],
+    recipient_public: &[u8; SEAL_PUBLIC_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Option<Vec<u8>> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    let ephemeral = x25519_dalek::StaticSecret::from(*ephemeral_secret);
+    let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral).to_bytes();
+    let shared = ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(*recipient_public));
+    if !shared.was_contributory() {
+        return None;
+    }
+    let key = sealed_message_key(shared.as_bytes(), &ephemeral_public, recipient_public);
+    let cipher = aes_gcm::Aes256Gcm::new(aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(key.as_ref()));
+    let sealed = cipher.encrypt(aes_gcm::Nonce::from_slice(&[0u8; 12]), Payload { msg: plaintext, aad }).ok()?;
+    let mut out = Vec::with_capacity(SEALED_OVERHEAD + plaintext.len());
+    out.push(SEALED_FORMAT);
+    out.extend_from_slice(&ephemeral_public);
+    out.extend_from_slice(&sealed);
+    Some(out)
+}
 
 /// One encryption key as the manifest declares it — and, unchanged, as the
 /// keystore is asked for it. Unknown fields and values are refused, as for a
@@ -154,6 +246,11 @@ struct Key {
     aead: Zeroizing<[u8; 32]>,
     /// `HMAC-SHA256(aead, MAC_SUBKEY_LABEL)`: the only key `mac` uses.
     mac: Zeroizing<[u8; 32]>,
+    /// `HMAC-SHA256(aead, SEAL_SUBKEY_LABEL)`, clamped: the X25519 secret
+    /// `open` uses. Wiped when dropped.
+    seal: x25519_dalek::StaticSecret,
+    /// Its public half: what `public_key` answers.
+    seal_public: [u8; SEAL_PUBLIC_LEN],
 }
 
 /// The encryption keys of one run, by path. Not `Clone`: there is one copy,
@@ -212,7 +309,9 @@ impl EncryptionKeys {
                 .decode32()
                 .ok_or_else(|| format!("the keystore's encryption key {:?} is not 32 bytes of hex", d.path))?;
             let mac = hmac_sha256(&aead, MAC_SUBKEY_LABEL);
-            out.insert(d.path.clone(), Key { declared: d.clone(), aead, mac });
+            let seal = seal_secret_of(&aead);
+            let seal_public = x25519_dalek::PublicKey::from(&seal).to_bytes();
+            out.insert(d.path.clone(), Key { declared: d.clone(), aead, mac, seal, seal_public });
         }
         if let Some(extra) = keys.keys().next() {
             return Err(format!(
@@ -331,6 +430,37 @@ impl EncryptionKeys {
         let key = self.get(path, vault)?;
         Self::within_cap("data", data.len(), MAX_CRYPT_INPUT_BYTES)?;
         Ok(hmac_sha256(&key.mac, data).to_vec())
+    }
+
+    /// The X25519 public key others seal to for the key at `path`: 32 bytes,
+    /// the same in every run that holds the key.
+    pub fn public_key(&self, path: &str, vault: Option<&str>) -> Result<Vec<u8>, String> {
+        Ok(self.get(path, vault)?.seal_public.to_vec())
+    }
+
+    /// Open a message sealed to the public key of the key at `path`, bound to
+    /// `aad`: format [`SEALED_FORMAT`]. Every failure to open is
+    /// [`DECRYPTION_FAILED`] and nothing more.
+    pub fn open(&self, path: &str, vault: Option<&str>, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        let key = self.get(path, vault)?;
+        Self::within_cap("sealed message", sealed.len(), MAX_CRYPT_INPUT_BYTES + SEALED_OVERHEAD)?;
+        Self::within_cap("aad", aad.len(), MAX_CRYPT_INPUT_BYTES)?;
+        if sealed.len() < SEALED_OVERHEAD || sealed[0] != SEALED_FORMAT {
+            return Err(DECRYPTION_FAILED.to_string());
+        }
+        let (ephemeral, ciphertext) = sealed[1..].split_at(SEAL_PUBLIC_LEN);
+        let ephemeral: [u8; SEAL_PUBLIC_LEN] = ephemeral.try_into().expect("split at the key's length");
+        let shared = key.seal.diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral));
+        // A point of small order gives the same all-zero secret to everyone.
+        if !shared.was_contributory() {
+            return Err(DECRYPTION_FAILED.to_string());
+        }
+        let message_key = sealed_message_key(shared.as_bytes(), &ephemeral, &key.seal_public);
+        let cipher = aes_gcm::Aes256Gcm::new(aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(message_key.as_ref()));
+        cipher
+            .decrypt(aes_gcm::Nonce::from_slice(&[0u8; 12]), Payload { msg: ciphertext, aad })
+            .map_err(|_| DECRYPTION_FAILED.to_string())
     }
 }
 
@@ -708,5 +838,91 @@ mod tests {
         for key in [KEY_A, KEY_B] {
             assert!(!shown.contains(&key[..16]), "{shown}");
         }
+    }
+
+    // ---- what others seal to a key -----------------------------------------
+
+    /// The public half of [`KEY_A`]'s X25519 pair, pinned in the keystore too
+    /// (`api_tests`, `the_public_key_without_a_run_is_the_runs_own`): both derive it, and a client seals to what
+    /// the keystore answers for a run the worker serves.
+    const KEY_A_SEAL_PUBLIC: &str = "d8dab3938ebf11fb0a976ee6464fca1dd8ae1ae2c089eb74f242b8785deead69";
+
+    fn keys_ab() -> (EncryptionKeys, EncryptionKeys) {
+        let one = |hex_key: &str| {
+            let d = declared(serde_json::json!([{ "path": "input" }]), project_run()).unwrap();
+            let k = serde_json::from_value(serde_json::json!({ "input": hex_key })).unwrap();
+            EncryptionKeys::from_keystore(&d, k).unwrap()
+        };
+        (one(KEY_A), one(KEY_B))
+    }
+
+    fn public_of(keys: &EncryptionKeys) -> [u8; 32] {
+        keys.public_key("input", None).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn the_public_key_is_pinned_and_is_neither_other_key() {
+        let (a, b) = keys_ab();
+        assert_eq!(hex::encode(public_of(&a)), KEY_A_SEAL_PUBLIC);
+        assert_eq!(public_of(&a), seal_public_of(&serde_json::from_value::<SeedHex>(serde_json::json!(KEY_A)).unwrap().decode32().unwrap()));
+        assert_ne!(public_of(&a), public_of(&b));
+        let key = a.keys.get("input").unwrap();
+        assert_ne!(key.seal.as_bytes(), key.aead.as_ref());
+        assert_ne!(key.seal.as_bytes(), key.mac.as_ref());
+        assert!(a.public_key("nope", None).is_err());
+        assert!(a.public_key("input", Some("vault.alice.near")).is_err());
+    }
+
+    #[test]
+    fn what_is_sealed_to_the_public_key_opens_only_with_its_key_and_aad() {
+        let (a, b) = keys_ab();
+        let sealed = seal_with(&[7u8; 32], &public_of(&a), b"the input", b"ctx").unwrap();
+        assert_eq!(sealed.len(), b"the input".len() + SEALED_OVERHEAD);
+        assert_eq!(sealed[0], SEALED_FORMAT);
+        assert_eq!(a.open("input", None, &sealed, b"ctx").unwrap(), b"the input");
+        assert_eq!(a.open("input", None, &sealed, b"other").unwrap_err(), DECRYPTION_FAILED);
+        assert_eq!(b.open("input", None, &sealed, b"ctx").unwrap_err(), DECRYPTION_FAILED);
+        let mut tampered = sealed.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_eq!(a.open("input", None, &tampered, b"ctx").unwrap_err(), DECRYPTION_FAILED);
+        assert_eq!(a.open("input", None, &sealed[..SEALED_OVERHEAD - 1], b"ctx").unwrap_err(), DECRYPTION_FAILED);
+        assert!(a.open("nope", None, &sealed, b"ctx").unwrap_err().contains("no encryption key"));
+        // An empty message is a message.
+        let empty = seal_with(&[9u8; 32], &public_of(&a), b"", b"").unwrap();
+        assert_eq!(a.open("input", None, &empty, b"").unwrap(), b"");
+    }
+
+    /// `encrypt`'s bytes and sealed bytes are two formats: neither call reads
+    /// the other's, whatever key is held.
+    #[test]
+    fn open_and_decrypt_do_not_read_each_others_format() {
+        let (a, _) = keys_ab();
+        let sealed = seal_with(&[7u8; 32], &public_of(&a), b"x", b"").unwrap();
+        assert_eq!(a.decrypt("input", None, &sealed, b"").unwrap_err(), DECRYPTION_FAILED);
+        let encrypted = a.encrypt("input", None, &[0u8; 64], b"").unwrap();
+        assert_eq!(a.open("input", None, &encrypted, b"").unwrap_err(), DECRYPTION_FAILED);
+    }
+
+    /// An ephemeral key of small order makes the shared secret zero for every
+    /// recipient: such a message is refused, sealed or opened.
+    #[test]
+    fn a_small_order_ephemeral_key_is_refused() {
+        let (a, _) = keys_ab();
+        assert!(seal_with(&[7u8; 32], &[0u8; 32], b"x", b"").is_none());
+        let mut forged = vec![SEALED_FORMAT];
+        forged.extend_from_slice(&[0u8; 32]);
+        forged.extend_from_slice(&[0u8; 17]);
+        assert_eq!(a.open("input", None, &forged, b"").unwrap_err(), DECRYPTION_FAILED);
+    }
+
+    /// The vector every client's sealer is held to (`sdk-js`
+    /// `tests/seal.test.ts`, `tests/lib/seal_to.mjs`): this ephemeral secret,
+    /// this recipient, these bytes.
+    #[test]
+    fn the_golden_sealed_message_opens() {
+        let (a, _) = keys_ab();
+        let sealed = seal_with(&[1u8; 32], &public_of(&a), b"{\"q\":\"hello\"}", b"outlayer-input").unwrap();
+        assert_eq!(hex::encode(&sealed), "02a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a20982e4d1d0f68949731b656844b619291fe1168ba3cbfbff8e236533ad1d");
+        assert_eq!(a.open("input", None, &sealed, b"outlayer-input").unwrap(), b"{\"q\":\"hello\"}");
     }
 }

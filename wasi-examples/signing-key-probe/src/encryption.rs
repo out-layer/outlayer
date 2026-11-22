@@ -1,5 +1,5 @@
 //! The encryption builds' operations: `encrypt`, `decrypt`, `mac`,
-//! `encrypt_and_decrypt`, `all_encryption_keys`, and the attacks on
+//! `enc_public_key`, `enc_open`, `encrypt_and_decrypt`, `all_encryption_keys`, and the attacks on
 //! `outlayer:encryption-keys` (`enc_attack`, `enc_attacks`).
 //!
 //! Every answer is the probe's usual `{status, message, …}`; a refusal from the
@@ -44,6 +44,17 @@ pub fn run(input: &Input) -> Value {
                 Err(e) => err(e),
             },
             Err(e) => err(e),
+        }),
+        "enc_public_key" => with_path(input, |path, vault| match encryption_keys::public_key(path, vault) {
+            Ok(key) => ok("the host answered with the public key", json!({ "path": path, "vault": vault, "public_key": hex::encode(key) })),
+            Err(e) => err(e),
+        }),
+        "enc_open" => with_path(input, |path, vault| match (hex_of(&input.ciphertext_hex), hex_of(&input.aad_hex)) {
+            (Ok(sealed), Ok(aad)) => match encryption_keys::open(path, vault, &sealed, &aad) {
+                Ok(pt) => ok(format!("opened {} bytes", pt.len()), json!({ "path": path, "vault": vault, "plaintext": hex::encode(pt) })),
+                Err(e) => err(e),
+            },
+            (Err(e), _) | (_, Err(e)) => err(e),
         }),
         "encrypt_and_decrypt" => with_path(input, |path, vault| encrypt_and_decrypt(path, vault, input)),
         "all_encryption_keys" => all_encryption_keys(),

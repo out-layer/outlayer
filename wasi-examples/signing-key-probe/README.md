@@ -174,6 +174,8 @@ The encryption builds add:
 | `encrypt` | `path`, `vault?`, `plaintext_hex`, `aad_hex?` | `ciphertext` (hex: `01 ‖ nonce ‖ ciphertext ‖ tag`) |
 | `decrypt` | `path`, `vault?`, `ciphertext_hex`, `aad_hex?` | `plaintext` (hex), or `err` `decryption failed` |
 | `mac` | `path`, `vault?`, `plaintext_hex` (the data) | `mac` (hex, 32 bytes) |
+| `enc_public_key` | `path`, `vault?` | `public_key`: the X25519 public key others seal to, hex |
+| `enc_open` | `path`, `vault?`, `ciphertext_hex` (a message sealed to that key), `aad_hex?` | `plaintext`, hex; `decryption failed` for anything that does not open |
 | `encrypt_and_decrypt` | `path`, `vault?`, `plaintext_hex`, `aad_hex?` | `round_trip`, `fresh_nonce`, `other_aad_refused`, `length`, `format` (the first byte is the `0x01` format marker), checked inside the guest |
 | `all_encryption_keys` | — | `keys: {path: {vault, mac}}`: the mac of a fixed string under every declared encryption key |
 | `enc_attack` | `name` | one of the encryption attacks below |

@@ -296,7 +296,8 @@ fn run(input: &Input, raw: &str) -> Value {
         },
         "attacks" => attacks(),
         #[cfg(feature = "enc-api")]
-        "encrypt" | "decrypt" | "mac" | "encrypt_and_decrypt" | "all_encryption_keys" | "enc_attack" | "enc_attacks" => {
+        "encrypt" | "decrypt" | "mac" | "enc_public_key" | "enc_open" | "encrypt_and_decrypt" | "all_encryption_keys" | "enc_attack"
+        | "enc_attacks" => {
             encryption::run(input)
         }
         #[cfg(feature = "storage-api")]

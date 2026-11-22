@@ -5501,6 +5501,76 @@ mod signing_keys_at_the_door {
         value[path].as_str().expect("the key by path").to_string()
     }
 
+    async fn seal_pubkey(state: &AppState, request: serde_json::Value) -> Result<String, ApiError> {
+        encryption_pubkey_handler(State(state.clone()), Json(serde_json::from_value(request).expect("a request")))
+            .await
+            .map(|Json(answer)| answer.pubkey)
+    }
+
+    /// The public key answered without a run is the public half of the key a
+    /// run holds: the worker pins the same bytes for the same key
+    /// (`worker/src/encryption_keys`, `KEY_A_SEAL_PUBLIC`), so what a client
+    /// seals to this answer opens in the run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_public_key_without_a_run_is_the_runs_own() {
+        let ks = crate::crypto::Keystore::from_master_secret(&pinned_master()).unwrap();
+        let (state, _) = world_with(ks).await;
+        let project = serde_json::json!({ "project_id": "alice.near/app", "account_id": "bob.near", "path": "records" });
+        assert_eq!(
+            seal_pubkey(&state, project.clone()).await.unwrap(),
+            "d8dab3938ebf11fb0a976ee6464fca1dd8ae1ae2c089eb74f242b8785deead69"
+        );
+        // The pinned 32 bytes of that key, through the same function.
+        let key: [u8; 32] =
+            hex::decode("4324b148cb409d9a56e27a37c0cfbc4787481db4dec90cfcd2219a091c4a5d0a").unwrap().try_into().unwrap();
+        assert_eq!(hex::encode(crate::encryption_keys::seal_public_of(&key)), seal_pubkey(&state, project.clone()).await.unwrap());
+
+        // Another caller kind, account, path or binding is another key.
+        let mut others = Vec::new();
+        for (field, value) in [("caller", "predecessor"), ("account_id", "carol.near"), ("path", "other")] {
+            let mut request = project.clone();
+            request[field] = value.into();
+            others.push(seal_pubkey(&state, request).await.unwrap());
+        }
+        others.push(
+            seal_pubkey(&state, serde_json::json!({ "wasm": H1, "account_id": "bob.near", "path": "records" })).await.unwrap(),
+        );
+        others.push(seal_pubkey(&state, project.clone()).await.unwrap());
+        let distinct: std::collections::BTreeSet<_> = others.iter().collect();
+        assert_eq!(distinct.len(), others.len(), "{others:?}");
+    }
+
+    /// What the route refuses: both bindings or neither, a project the
+    /// contract does not hold, a placeholder caller, a path of another shape,
+    /// and a field it does not know — `vault` among them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_public_key_route_refuses_what_names_no_one_key() {
+        let ks = crate::crypto::Keystore::from_master_secret(&pinned_master()).unwrap();
+        let (state, _) = world_with(ks).await;
+        let bad = |request: serde_json::Value| {
+            let state = state.clone();
+            async move { seal_pubkey(&state, request).await.expect_err("refused") }
+        };
+        for request in [
+            serde_json::json!({ "account_id": "bob.near", "path": "records" }),
+            serde_json::json!({ "project_id": "alice.near/app", "wasm": H1, "account_id": "bob.near", "path": "records" }),
+            serde_json::json!({ "project_id": "alice.near/nope", "account_id": "bob.near", "path": "records" }),
+            serde_json::json!({ "project_id": "alice.near/app", "account_id": "bob.near", "path": "Bad:Path" }),
+            serde_json::json!({ "wasm": "zz", "account_id": "bob.near", "path": "records" }),
+            serde_json::json!({ "wasm": H1, "account_id": "not an account", "path": "records" }),
+            serde_json::json!({ "wasm": H1, "account_id": "anonymous", "path": "records" }),
+        ] {
+            let err = bad(request.clone()).await;
+            assert!(matches!(err, ApiError::BadRequest(_)), "{request}: {err:?}");
+        }
+        for unknown in [
+            serde_json::json!({ "wasm": H1, "account_id": "bob.near", "path": "records", "vault": "vault.alice.near" }),
+            serde_json::json!({ "wasm": H1, "account_id": "bob.near", "path": "records", "caler": "predecessor" }),
+        ] {
+            assert!(serde_json::from_value::<EncryptionPubkeyRequest>(unknown.clone()).is_err(), "{unknown}");
+        }
+    }
+
     /// Encryption keys alone: the answer carries `encryption_keys` and nothing
     /// of the signing family, and the handler answers `crypto.rs`'s pinned
     /// vectors byte for byte.
@@ -7062,5 +7132,205 @@ mod policy_lock_tests {
             .await
             .expect_err("not an operation the wallet signs");
         assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("sign-policy")), "{err:?}");
+    }
+}
+
+/// An updated row is sealed under the vault the request names, else the one
+/// it is stored with — never the default master for a vault's row.
+#[cfg(test)]
+mod update_write_scope {
+    use super::*;
+    use crate::crypto::Customer;
+
+    fn vault(name: &str) -> Customer {
+        Customer::Vault(name.parse().unwrap())
+    }
+
+    #[test]
+    fn a_request_naming_no_vault_keeps_the_rows_own() {
+        let (a, b) = (vault("a.vault.near"), vault("b.vault.near"));
+        assert_eq!(write_scope(None, Some(&a)).map(ToString::to_string), Some("a.vault.near".into()));
+        assert_eq!(write_scope(Some(&b), Some(&a)).map(ToString::to_string), Some("b.vault.near".into()));
+        assert_eq!(write_scope(Some(&b), None).map(ToString::to_string), Some("b.vault.near".into()));
+        assert!(write_scope(None, None).is_none());
+    }
+}
+
+/// The keystore's listener is on the internet with no rate limit of its own.
+/// A route with no token must cost nothing to answer; anything that reads the
+/// chain, loads a vault, signs or touches a secret goes behind a token and
+/// the coordinator's limiter. A new public route is a decision, made here.
+#[cfg(test)]
+mod public_routes {
+    #[test]
+    fn the_public_routes_are_these_three() {
+        let src = include_str!("api.rs");
+        let start = src.find("    // Public routes (no auth required)").expect("the public block");
+        let block = &src[start..];
+        let block = &block[..block.find(".merge(worker_routes)").expect("the first merge")];
+        let routes: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(".route(\""))
+            .map(|rest| &rest[..rest.find('"').expect("a closing quote")])
+            .collect();
+        assert_eq!(routes, ["/health", "/pubkey", "/vrf/pubkey"], "a public keystore route was added or removed");
+    }
+
+    /// `/pubkey` names a vault only with a token: a vault's first load is
+    /// paid by the vault, and the public half of the route never causes one.
+    #[test]
+    fn the_public_pubkey_route_does_not_load_a_vault_without_a_token() {
+        let src = include_str!("api.rs");
+        let handler = &src[src.find("async fn pubkey_handler(").expect("the handler")..];
+        let gate = handler.find("customer.is_some() && !has_authenticated_caller").expect("the token gate");
+        let load = handler.find(".ensure_customer_loaded(").expect("the load");
+        assert!(gate < load, "the vault is loaded before the token is checked");
+    }
+}
+
+/// `update_user_secrets`, end to end against a chain, for a row a vault holds.
+#[cfg(test)]
+mod update_of_a_vault_row {
+    use super::*;
+    use crate::crypto::Customer;
+    use serde_json::json;
+
+    const VAULT: &str = "vault.alice.near";
+    const OWNER: &str = "bob.near";
+    const SEED: &str = "project:alice.near/app:bob.near";
+
+    /// A chain where `bob.near` holds a row bound to [`VAULT`], any key is a
+    /// full-access key of its account, and the DAO verifies the vault.
+    async fn chain(row_b64: String) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let row_b64 = row_b64.clone();
+                async move {
+                    let (params, id) = (body["params"].clone(), body["id"].clone());
+                    if params["request_type"] == "view_access_key" {
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "nonce": 1, "permission": "FullAccess", "block_height": 9,
+                            "block_hash": "11111111111111111111111111111111"}}));
+                    }
+                    let view = match params["method_name"].as_str().unwrap_or_default() {
+                        "get_secret_with_vault" => {
+                            json!({ "profile": { "encrypted_secrets": row_b64, "access": "AllowAll" }, "vault_id": VAULT })
+                        }
+                        "is_vault_verified" => json!(true),
+                        "get_state" => json!({ "parent": "alice.near", "unlocked": false }),
+                        other => panic!("the chain is not asked for {other}: {params}"),
+                    };
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "block_hash": "11111111111111111111111111111111", "block_height": 9, "logs": [],
+                        "result": view.to_string().into_bytes()}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn state_holding_the_vault() -> (AppState, Customer) {
+        let vault = Customer::Vault(VAULT.parse().unwrap());
+        let keystore = crate::crypto::Keystore::generate();
+        keystore.add_customer(VAULT.parse().unwrap(), [9u8; 32]);
+        let row = keystore.encrypt(Some(&vault), SEED, br#"{"OLD":"kept"}"#).unwrap();
+        let url = chain(base64::encode(row)).await;
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: url.clone().into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            near_contract_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
+        let state = AppState::new(keystore, config, Some(near_client));
+        let secret_key = near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519);
+        state.set_mpc_context(
+            crate::mpc_ckd::MpcCkdConfig {
+                mpc_contract_id: "v1.signer.test".parse().unwrap(),
+                mpc_domain_id: 2,
+                mpc_public_key: "unused".into(),
+                near_rpc_url: url,
+                keystore_dao_id: "dao.test".parse().unwrap(),
+            },
+            near_crypto::InMemorySigner { account_id: "dao.test".parse().unwrap(), public_key: secret_key.public_key(), secret_key },
+        );
+        (state, vault)
+    }
+
+    /// The owner's signed request to add `NEW`, naming `vault_id` or not, and
+    /// moving the row to `new_accessor` or not.
+    fn request(vault_id: Option<&str>, new_accessor: Option<serde_json::Value>) -> UpdateUserSecretsRequest {
+        let key = near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519);
+        let message = format!("Update Outlayer secrets for {OWNER}:default\nkeys:NEW");
+        let (nonce, recipient) = (base64::encode([7u8; 32]), "keystore.outlayer.near");
+        let (digest, _) = nep413_digest(&message, &nonce, recipient).unwrap();
+        serde_json::from_value(json!({
+            "accessor": { "type": "Project", "project_id": "alice.near/app" },
+            "new_accessor": new_accessor,
+            "profile": "default",
+            "owner": OWNER,
+            "mode": "append",
+            "secrets": { "NEW": "added" },
+            "signed_message": message,
+            "signature": key.sign(&digest).to_string(),
+            "public_key": key.public_key().to_string(),
+            "nonce": nonce,
+            "recipient": recipient,
+            "vault_id": vault_id,
+        }))
+        .expect("a request")
+    }
+
+    /// A request that names no vault re-seals the row under the vault it is
+    /// stored with — the contract keeps that binding when the store names
+    /// none — and says so, so the store can name it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_naming_no_vault_reseals_under_the_rows_vault() {
+        for named in [None, Some(VAULT)] {
+            let (state, vault) = state_holding_the_vault().await;
+            let Json(answer) = update_user_secrets_handler(State(state.clone()), Json(request(named, None)))
+                .await
+                .unwrap_or_else(|e| panic!("vault_id {named:?}: {e:?}"));
+            assert_eq!(answer.vault_id.as_deref(), Some(VAULT), "vault_id {named:?}");
+
+            let blob = base64::decode(&answer.encrypted_secrets_base64).unwrap();
+            let keystore = state.keystore.read().await;
+            let opened = keystore.decrypt(Some(&vault), SEED, &blob).expect("the vault's master opens the row");
+            let secrets: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+            assert_eq!(secrets, json!({ "OLD": "kept", "NEW": "added" }));
+            assert!(keystore.decrypt(None, SEED, &blob).is_err(), "the default master opens a vault's row");
+        }
+    }
+
+    /// A row moved to a new accessor is sealed under the old row's vault and
+    /// the answer names it: the contract binds a vault per accessor, so the
+    /// store of the new row is what binds it, and it must name this vault.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_moved_to_a_new_accessor_keeps_its_vault_and_the_answer_names_it() {
+        let hash = "ab".repeat(32);
+        let (state, vault) = state_holding_the_vault().await;
+        let moved = request(None, Some(json!({ "type": "WasmHash", "hash": hash })));
+        let Json(answer) = update_user_secrets_handler(State(state.clone()), Json(moved)).await.expect("the move");
+        assert_eq!(answer.vault_id.as_deref(), Some(VAULT));
+
+        let blob = base64::decode(&answer.encrypted_secrets_base64).unwrap();
+        let new_seed = format!("wasm_hash:{hash}:{OWNER}");
+        let keystore = state.keystore.read().await;
+        let opened = keystore.decrypt(Some(&vault), &new_seed, &blob).expect("the vault's master opens the moved row");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&opened).unwrap(), json!({ "OLD": "kept", "NEW": "added" }));
+        assert!(keystore.decrypt(Some(&vault), SEED, &blob).is_err(), "the moved row still opens under the old accessor");
+        assert!(keystore.decrypt(None, &new_seed, &blob).is_err(), "the default master opens the moved row");
     }
 }

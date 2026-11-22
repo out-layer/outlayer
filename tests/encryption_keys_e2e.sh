@@ -85,6 +85,14 @@
 #   E12 an encryption key of no caller (`caller: "none"`) → the run is
 #       refused before it starts, naming the value: no encryption key is one
 #       every caller drives
+#   E13 an input sealed outside a run: `GET /keys/encryption-pubkey` answers
+#       the key `public-key` answers inside the run; a message sealed to it
+#       (tests/lib/seal_to.mjs, held to the worker's vector) opens with `open`
+#       and is exactly `decryption failed` under another aad, tampered, at
+#       another path, for $CALLER2, and through `decrypt`; the v2 version opens
+#       it; another caller, caller kind or path has another key; a wasm key
+#       asked by hash is the run's and another build's differs; the route
+#       answers 400 to what names no one key
 #   SC  the storage cell (manifest `storage_account`), observed through the
 #       guest. SC3, a direct call: a record encryption-storage-pred writes,
 #       encryption-storage reads — one cell, the signer's. SC1, relayed through
@@ -1119,6 +1127,91 @@ if want E12; then
   log "E12 an encryption key of no caller is refused before the run starts"
   direct "$PARENT" encryption-none '{"operation":"all_encryption_keys"}'
   refused_without_keys "E12 the no-caller build" 'unknown variant `none`'
+fi
+
+# ── E13 an input sealed to a key's public half ──────────────────────────────
+
+# The public key a client seals to, asked without a run.
+seal_pubkey_of() { # seal_pubkey_of <query-string>
+  command curl -sS --max-time 30 "$COORDINATOR_URL/keys/encryption-pubkey?$1" 2>/dev/null | jq -r '.pubkey // empty' 2>/dev/null
+}
+
+if want E13; then
+  log "E13 an input sealed to a key's public half opens only in a run that holds the key"
+  SEALER="$(dirname "$0")/lib/seal_to.mjs"
+  if [[ "$(node "$SEALER" --self-test 2>&1)" != ok ]]; then
+    fail "E13 the sealer does not reproduce the worker's vector; nothing below would mean anything"
+  else
+    pass "E13 the sealer reproduces the worker's golden sealed message"
+    via_project "$PARENT" encryption '{"operation":"enc_public_key","path":"alpha"}'
+    PUB_RUN=""; ran_ok "E13 public-key in a run" && PUB_RUN=$(out_field .public_key)
+    PUB_API=$(seal_pubkey_of "project=$PARENT/$PROJECT_NAME&account=$PARENT&path=alpha")
+    if [[ ${#PUB_RUN} == 64 && "$PUB_RUN" == "$PUB_API" ]]; then
+      pass "E13 the key answered without a run is the one the run holds (${PUB_RUN:0:16}…)"
+    else
+      fail "E13 the key without a run (${PUB_API:0:16}…) is not the run's (${PUB_RUN:0:16}…)"
+    fi
+
+    SEAL_PT=$(hex_of '{"q":"sealed input"}'); SEAL_AAD=$(hex_of "outlayer-input")
+    SEALED=$(node "$SEALER" "$PUB_API" "$SEAL_PT" "$SEAL_AAD" 2>/dev/null)
+    if [[ -z "$SEALED" ]]; then
+      fail "E13 nothing was sealed (no key, or the sealer failed): the rows that open it are not run"
+    else
+    open_as() { # open_as <signer> <build> <path> <sealed> <aad>
+      via_project "$1" "$2" "$(jq -nc --arg p "$3" --arg c "$4" --arg a "$5" '{operation:"enc_open",path:$p,ciphertext_hex:$c,aad_hex:$a}')"
+    }
+    open_as "$PARENT" encryption alpha "$SEALED" "$SEAL_AAD"
+    if ran_ok "E13 open"; then
+      [[ "$(out_field .plaintext)" == "$SEAL_PT" ]] && pass "E13 the run opened what was sealed outside it"         || fail "E13 open answered other bytes: $(out_field .plaintext | head -c 80)"
+    fi
+    [[ ${#SEALED} == $(( ${#SEAL_PT} + 98 )) && "${SEALED:0:2}" == 02 ]]       && pass "E13 the sealed message is 0x02 and 49 bytes longer than the plaintext"       || fail "E13 the sealed message has another shape: ${#SEALED} hex chars, marker ${SEALED:0:2}"
+
+    open_as "$PARENT" encryption alpha "$SEALED" "$(hex_of "another")"
+    answered_err "E13 another aad" "decryption failed"
+    open_as "$PARENT" encryption alpha "$(flip_byte "$SEALED" -1)" "$SEAL_AAD"
+    answered_err "E13 a tampered message" "decryption failed"
+    open_as "$PARENT" encryption beta "$SEALED" "$SEAL_AAD"
+    answered_err "E13 another path" "decryption failed"
+    open_as "$CALLER2" encryption alpha "$SEALED" "$SEAL_AAD"
+    answered_err "E13 another caller" "decryption failed"
+    via_project "$PARENT" encryption "$(jq -nc --arg c "$SEALED" --arg a "$SEAL_AAD" '{operation:"decrypt",path:"alpha",ciphertext_hex:$c,aad_hex:$a}')"
+    answered_err "E13 decrypt does not read a sealed message" "decryption failed"
+
+    # bind project: the next version holds the same key and opens the same message.
+    open_as "$PARENT" encryption-v2 alpha "$SEALED" "$SEAL_AAD"
+    if ran_ok "E13 open in the v2 version"; then
+      [[ "$(out_field .plaintext)" == "$SEAL_PT" ]] && pass "E13 the v2 version opens it (bind project survives an upgrade)"         || fail "E13 the v2 version answered other bytes"
+    fi
+
+    fi
+
+    # Another caller, caller kind or path is another key.
+    PUB_C2=$(seal_pubkey_of "project=$PARENT/$PROJECT_NAME&account=$CALLER2&path=alpha")
+    PUB_PRED=$(seal_pubkey_of "project=$PARENT/$PROJECT_NAME&account=$PARENT&path=alpha&caller=predecessor")
+    PUB_BETA=$(seal_pubkey_of "project=$PARENT/$PROJECT_NAME&account=$PARENT&path=beta")
+    distinct=$(printf '%s\n' "$PUB_API" "$PUB_C2" "$PUB_PRED" "$PUB_BETA" | grep -cE '^[0-9a-f]{64}$')
+    unique=$(printf '%s\n' "$PUB_API" "$PUB_C2" "$PUB_PRED" "$PUB_BETA" | sort -u | grep -cE '^[0-9a-f]{64}$')
+    [[ "$distinct" == 4 && "$unique" == 4 ]] && pass "E13 another caller, caller kind or path has another public key"       || fail "E13 public keys are not four distinct keys ($distinct answered, $unique distinct)"
+
+    # bind wasm: the key belongs to the build.
+    direct "$PARENT" encryption-wasm '{"operation":"enc_public_key","path":"code"}'
+    PUB_W=""; ran_ok "E13 public-key of the wasm build" && PUB_W=$(out_field .public_key)
+    PUB_W_API=$(seal_pubkey_of "wasm=$(get_for hash encryption-wasm)&account=$PARENT&path=code")
+    PUB_W2_API=$(seal_pubkey_of "wasm=$(get_for hash encryption-wasm-v2)&account=$PARENT&path=code")
+    [[ ${#PUB_W} == 64 && "$PUB_W" == "$PUB_W_API" && "$PUB_W2_API" != "$PUB_W_API" && ${#PUB_W2_API} == 64 ]]       && pass "E13 a wasm key is the build's: asked by hash it is the run's, and another build has another"       || fail "E13 wasm keys: run ${PUB_W:0:16}… api ${PUB_W_API:0:16}… v2 ${PUB_W2_API:0:16}…"
+
+    # What the route refuses.
+    for q in "account=$PARENT&path=alpha" \
+             "project=$PARENT/$PROJECT_NAME&wasm=$(get_for hash encryption-wasm)&account=$PARENT&path=alpha" \
+             "project=$PARENT/no-such-project&account=$PARENT&path=alpha" \
+             "project=$PARENT/$PROJECT_NAME&account=$PARENT&path=Bad:Path" \
+             "project=$PARENT/$PROJECT_NAME&account=$PARENT&path=alpha&vault=vault.$PARENT" \
+             "project=$PARENT/$PROJECT_NAME&account=$PARENT&path=alpha&caler=predecessor" \
+             "project=$PARENT/$PROJECT_NAME&account=$PARENT&path=alpha&caller=none"; do
+      code=$(command curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$COORDINATOR_URL/keys/encryption-pubkey?$q" 2>/dev/null)
+      [[ "$code" == 400 ]] && pass "E13 refused with 400: ${q:0:70}" || fail "E13 answered $code, not 400: ${q:0:70}"
+    done
+  fi
 fi
 
 # ── E7 no key material anywhere ─────────────────────────────────────────────

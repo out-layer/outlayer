@@ -1,7 +1,7 @@
 package outlayer:encryption-keys@0.1.0;
 
-/// Encryption keys for OutLayer WASI components: symmetric keys that seal data
-/// only the component itself can open again.
+/// Encryption keys for OutLayer WASI components: keys that seal data only the
+/// component itself can open again, each with a public half others seal to.
 ///
 /// A component declares the keys it encrypts with in its `outlayer.manifest`
 /// custom section, at most five:
@@ -98,6 +98,38 @@ interface api {
     /// Deterministic: the same `data` under the same key is the same tag in
     /// every run that holds the key. At most 262144 bytes of data.
     mac: func(path: string, vault: option<string>, data: list<u8>) -> result<list<u8>, string>;
+
+    /// The X25519 public key (32 bytes) of the declared key at `path`: what
+    /// someone else seals to so that only a run holding this key can read it.
+    /// The same in every such run, and the same bytes the platform answers
+    /// for the key without a run (`GET /keys/encryption-pubkey`). Its secret
+    /// is derived from the key for this purpose alone — never the key
+    /// `encrypt` or `mac` uses.
+    public-key: func(path: string, vault: option<string>) -> result<list<u8>, string>;
+
+    /// Open a message sealed to `public-key(path, vault)`, bound to `aad`.
+    ///
+    /// Format `0x02`: `0x02 || ephemeral X25519 public key (32 bytes) ||
+    /// ciphertext || tag (16 bytes)` — 49 bytes longer than the plaintext.
+    /// The sender makes a one-time X25519 pair, derives the message key with
+    /// HKDF-SHA256 (no salt) over the shared secret with `info` =
+    /// `"outlayer:encryption-keys:v1:seal:kdf" || ephemeral public key ||
+    /// recipient public key`, and seals with AES-256-GCM under an all-zero
+    /// 12-byte nonce (the key is used once) — all of it in a browser's
+    /// WebCrypto. At most 262144 bytes of plaintext and of `aad`.
+    ///
+    /// A key that belongs to a caller opens only in that caller's runs, so a
+    /// message sealed for one account does not open in a run another account
+    /// started. Whoever can start a run as the same caller can have it open
+    /// the same message again: a module that must act on a message once
+    /// records what it has seen. Sealing proves nothing about the sender —
+    /// the public key is public — so what a sealed message says is input like
+    /// any other.
+    ///
+    /// Any failure to open is `err("decryption failed")` and nothing more, as
+    /// for `decrypt`; `decrypt` does not open these bytes and `open` does not
+    /// open `encrypt`'s.
+    open: func(path: string, vault: option<string>, sealed: list<u8>, aad: list<u8>) -> result<list<u8>, string>;
 }
 
 world encryption-keys-host {

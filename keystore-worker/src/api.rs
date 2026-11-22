@@ -122,6 +122,17 @@ const RESERVED_SECRET_KEYS: &[&str] = &[
     "OUTLAYER_SECRETS_PROFILE",
 ];
 
+/// The scope an updated row is sealed under: the vault the request names,
+/// else the one the row is stored with. The contract keeps a row's vault
+/// binding when a re-store names none, so a row re-sealed under the default
+/// master there would stay bound to a vault whose master cannot open it.
+fn write_scope<'a>(
+    named: Option<&'a crate::crypto::Customer>,
+    stored: Option<&'a crate::crypto::Customer>,
+) -> Option<&'a crate::crypto::Customer> {
+    named.or(stored)
+}
+
 /// Refuse a write that names one of [`RESERVED_SECRET_KEYS`].
 ///
 /// One function rather than the same filter written at each door: the list
@@ -739,9 +750,11 @@ impl IntoResponse for ApiError {
 /// Create the API router with all endpoints
 ///
 /// Route access levels:
-/// - Public (no auth): /health, /pubkey
+/// - Public (no auth): /health, /pubkey, /vrf/pubkey — and no other: see the
+///   rule where they are mounted
 /// - Worker-only (ALLOWED_WORKER_TOKEN_HASHES): /decrypt, /encrypt, /decrypt-raw, /storage/*
-/// - Coordinator-only (ALLOWED_COORDINATOR_TOKEN_HASHES): /add_generated_secret, /update_user_secrets, /wallet/*
+/// - Coordinator-only (ALLOWED_COORDINATOR_TOKEN_HASHES): /add_generated_secret, /update_user_secrets,
+///   /encryption-pubkey, /wallet/*
 pub fn create_router(state: AppState) -> Router {
     // Worker-only routes (for TEE workers)
     // These endpoints require valid worker token - coordinator CANNOT access them
@@ -767,6 +780,9 @@ pub fn create_router(state: AppState) -> Router {
     let coordinator_routes = Router::new()
         .route("/add_generated_secret", post(add_generated_secret_handler))
         .route("/update_user_secrets", post(update_user_secrets_handler)) // + NEP-413 signature
+        // The key a client seals an input to. It reads the chain on every
+        // request, so it is asked through the coordinator's rate limit.
+        .route("/encryption-pubkey", post(encryption_pubkey_handler))
         // Wallet endpoints (coordinator-only)
         .route("/wallet/derive-address", post(wallet_derive_address_handler))
         .route("/wallet/sign", post(wallet_sign_handler))
@@ -859,7 +875,12 @@ pub fn create_router(state: AppState) -> Router {
             tee_registration_auth_middleware,
         ));
 
-    // Public routes (no auth required)
+    // Public routes (no auth required). The keystore's listener is reachable
+    // from the internet and has no rate limit of its own, so a route stays
+    // here only if answering it costs nothing an outsider could run up: no
+    // read of the chain, no vault load, no signature, no secret material.
+    // Everything else takes a token and is reached through the coordinator,
+    // which limits by IP. `the_public_routes_are_these_three` pins the list.
     Router::new()
         .route("/health", get(health_handler))
         .route("/pubkey", post(pubkey_handler)) // Public for dashboard encryption
@@ -1033,6 +1054,75 @@ async fn pubkey_handler(
     );
 
     Ok(Json(PubkeyResponse { pubkey: pubkey_hex }))
+}
+
+/// The public key a client seals to for one encryption key, without a run.
+///
+/// Answers the X25519 public half of the key a run would hold: for
+/// `project_id`, the key bound to the project's on-chain uuid — read from the
+/// contract here, on every request and never cached, as a run's is — and for
+/// `wasm`, the key bound to that build. Nothing checks that the code declares
+/// the path: a key nobody holds opens nothing. A key that names a vault is not
+/// answered here — its public half comes from `public-key` inside a run — so
+/// this route never loads a vault's master, which the vault would pay for.
+///
+/// What leaves is a public key, and anyone may have it — but a project key
+/// costs a read of the chain, so the route takes the coordinator's token and
+/// is reached through `GET /keys/encryption-pubkey`, behind its rate limit.
+async fn encryption_pubkey_handler(
+    State(state): State<AppState>,
+    Json(req): Json<EncryptionPubkeyRequest>,
+) -> Result<Json<EncryptionPubkeyResponse>, ApiError> {
+    use crate::signing_keys::{Binding, DerivationInput, KeyKind, KeyPath, ProjectId, WasmSha256};
+
+    if !state.is_ready() {
+        return Err(ApiError::Unauthorized(
+            "Keystore not ready. Waiting for DAO approval and master key from MPC.".to_string(),
+        ));
+    }
+    let path = KeyPath::parse(&req.path).map_err(ApiError::BadRequest)?;
+    let account = crate::signing_keys::real_account(crate::signing_keys::KeyFamily::Encryption, "account_id", &req.account_id)
+        .map_err(ApiError::BadRequest)?;
+
+    let input = match (req.project_id.as_deref(), req.wasm.as_deref()) {
+        (Some(project_id), None) => {
+            let project = ProjectId::parse(project_id).map_err(ApiError::BadRequest)?;
+            let near_client = state
+                .near_client
+                .as_ref()
+                .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
+            let view = near_client
+                .view_call_json_at(
+                    near_client.contract_id(),
+                    "get_project",
+                    serde_json::json!({ "project_id": project.as_str() }),
+                    near_primitives::types::BlockReference::Finality(near_primitives::types::Finality::Final),
+                )
+                .await
+                .map_err(|e| {
+                    let said = crate::signing_keys::bounded(&format!("{e:#}"), crate::signing_keys::MOST_QUOTED_ERROR);
+                    tracing::warn!(project_id = %project.as_str(), "encryption-pubkey: the project could not be read: {said}");
+                    ApiError::InternalError(format!("the project could not be read: {said}"))
+                })?
+                .value;
+            project_owner(&view, &project).map_err(ApiError::BadRequest)?;
+            let uuid = project_uuid(&view, &project).map_err(ApiError::BadRequest)?;
+            DerivationInput::new(KeyKind::Encryption, Binding::Project(&uuid), req.caller, &account, &path)
+        }
+        (None, Some(wasm)) => {
+            let wasm = WasmSha256::parse(wasm).map_err(ApiError::BadRequest)?;
+            DerivationInput::new(KeyKind::Encryption, Binding::Wasm(&wasm), req.caller, &account, &path)
+        }
+        _ => return Err(ApiError::BadRequest("name exactly one of project_id and wasm".to_string())),
+    }
+    .map_err(ApiError::BadRequest)?;
+
+    let keystore = state.keystore.read().await;
+    let key = keystore
+        .derive_encryption_key(None, &input)
+        .map_err(|e| ApiError::InternalError(format!("Failed to derive the key: {}", e)))?;
+    let pubkey = hex::encode(crate::encryption_keys::seal_public_of(&key));
+    Ok(Json(EncryptionPubkeyResponse { pubkey }))
 }
 
 /// Convert keystore-worker's internally-tagged `SecretAccessor` to the
@@ -2660,9 +2750,10 @@ async fn update_user_secrets_handler(
     // is already written is the worker's second lock to neutralize.
     reject_reserved_secret_keys(req.secrets.keys().map(String::as_str))?;
 
-    // Vault scope from request body. The Append-mode decrypt
-    // and the final encrypt MUST run under the same scope, otherwise
-    // the round-trip would corrupt the user's data.
+    // The vault the request names for the new write. A request that names
+    // none keeps the row under the scope it is stored with (read from the
+    // chain below) — what `store_secrets(vault_id: null)` does to the row's
+    // binding, so the ciphertext and the binding stay one scope.
     let customer = parse_optional_vault_id(req.vault_id.as_deref())?;
     state
         .ensure_customer_loaded(customer.as_ref())
@@ -2825,7 +2916,11 @@ async fn update_user_secrets_handler(
     //   * vault→vault (rotation): existing has vault_id=Some(a),
     //     body sends Some(b). Decrypt under a, encrypt under b.
     //   * no migration: existing has vault_id=Some(a), body sends
-    //     Some(a). Decrypt and encrypt under a.
+    //     Some(a) or nothing. Decrypt and encrypt under a.
+    //   * a new accessor (`new_accessor`): the same rule — the new row is
+    //     sealed under the vault the body names, else the old row's. The
+    //     answer names that vault, and the client stores the new row with it:
+    //     the contract binds a vault per accessor.
     let near_client = state.near_client.as_ref()
         .ok_or_else(|| ApiError::InternalError("NEAR client not configured".to_string()))?;
 
@@ -3072,9 +3167,10 @@ async fn update_user_secrets_handler(
         );
     }
 
+    let sealed_under = write_scope(customer.as_ref(), existing_customer.as_ref());
     let keystore = state.keystore.read().await;
     let encrypted_bytes = keystore
-        .encrypt(customer.as_ref(), &encryption_seed, final_secrets_json.as_bytes())
+        .encrypt(sealed_under, &encryption_seed, final_secrets_json.as_bytes())
         .map_err(|e| ApiError::InternalError(format!("Failed to encrypt secrets: {}", e)))?;
     drop(keystore);
 
@@ -3100,6 +3196,7 @@ async fn update_user_secrets_handler(
 
     Ok(Json(UpdateUserSecretsResponse {
         encrypted_secrets_base64: encrypted_base64,
+        vault_id: sealed_under.map(ToString::to_string),
         summary,
     }))
 }
