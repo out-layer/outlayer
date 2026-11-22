@@ -221,9 +221,8 @@ governance keys in section 11 sit outside this table. The next two
 sections are about where the root itself lives and how its owner takes it
 out, which is a separate choice.
 
-> Availability: the first three configurations are live on mainnet.
-> Personal account binding and per-customer vaults are on testnet and
-> ship to mainnet with the next release.
+> Availability: all four configurations and per-customer vaults are live
+> on mainnet.
 
 ## 7. Per-customer vaults: your own custody root
 
