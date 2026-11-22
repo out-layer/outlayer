@@ -21,3 +21,4 @@ pub mod tasks;
 pub mod wasm_cache;
 pub mod compiled_cache;
 pub mod event_monitor;
+pub mod ops_events;

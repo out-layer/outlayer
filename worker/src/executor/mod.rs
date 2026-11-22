@@ -405,6 +405,7 @@ impl Executor {
                             }
                             Err(e) => {
                                 // If JSON parsing fails, return error
+                                crate::ops_events::record(crate::ops_events::Code::WasmExecFailed, crate::ops_events::Route::Execute);
                                 return Ok(ExecutionResult {
                                     success: false,
                                     output: None,
@@ -438,6 +439,17 @@ impl Executor {
             Err(e) => {
                 let error_str = e.to_string();
                 info!("WASM execution failed ({} bytes of error)", error_str.len());
+                // Every failure leaves here as `Ok(success: false)`, so the type is read here, while
+                // it is still known: a guest that ran and failed is the guest's; a binary that did
+                // not load, or the host failing around the run, is not.
+                crate::ops_events::record(
+                    if e.downcast_ref::<sandbox::RunFailed>().is_some() {
+                        crate::ops_events::Code::WasmExecFailed
+                    } else {
+                        crate::ops_events::Code::ExecutionError
+                    },
+                    crate::ops_events::Route::Execute,
+                );
 
                 // What the run consumed, as the executor counted it — never a
                 // number read out of the message, which carries the guest's

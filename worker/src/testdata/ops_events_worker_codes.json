@@ -1,0 +1,20 @@
+[
+  "compile_failed",
+  "coordinator_auth_refused",
+  "download_failed",
+  "events_abandoned",
+  "execution_error",
+  "guest_egress_not_allowed",
+  "guest_http_timeouts",
+  "guest_private_destination",
+  "keystore_server_error",
+  "keystore_session_failed",
+  "keystore_unreachable",
+  "main_loop_failed",
+  "main_loop_stalled",
+  "rpc_unreadable_block",
+  "wasm_cache_tampered",
+  "wasm_exec_failed",
+  "wasm_url_hash_mismatch",
+  "wasm_url_unavailable"
+]

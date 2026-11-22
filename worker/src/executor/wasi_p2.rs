@@ -85,6 +85,22 @@ fn request_timeout_secs(configured: Option<u64>, left: std::time::Duration) -> u
         .max(1)
 }
 
+/// Which guest-HTTP ops codes a run has counted (see `HostState::ops_guest_counted`).
+#[derive(Default)]
+struct GuestHttpCounted {
+    private_destination: std::sync::atomic::AtomicBool,
+    egress_not_allowed: std::sync::atomic::AtomicBool,
+}
+
+impl GuestHttpCounted {
+    /// Count `code` unless this run already did.
+    fn once(flag: &std::sync::atomic::AtomicBool, code: crate::ops_events::Code) {
+        if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::ops_events::record(code, crate::ops_events::Route::GuestHttp);
+        }
+    }
+}
+
 /// Host state for WASI P2 execution
 ///
 /// Contains WASI context, HTTP context, and optionally RPC proxy, storage, payment, VRF, and wallet state.
@@ -113,6 +129,9 @@ struct HostState {
     tasks_state: Option<TasksHostState>,
     /// Counter for timed-out HTTP requests (shared with spawned tasks)
     http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
+    /// The guest-HTTP ops codes this run has already counted: each is counted once per run, so a
+    /// guest looping on a refused request costs one event, not one per request.
+    ops_guest_counted: Arc<GuestHttpCounted>,
     /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
     engine_handle: &'static Engine,
     /// Outbound-domain allowlist for this execution (§C3). Layered ON TOP of
@@ -212,6 +231,7 @@ impl WasiHttpView for HostState {
             timeout_secs,
             &self.egress_log,
         ) {
+            GuestHttpCounted::once(&self.ops_guest_counted.egress_not_allowed, crate::ops_events::Code::GuestEgressNotAllowed);
             tracing::warn!(
                 host = %host.as_deref().unwrap_or(""),
                 "WASI HTTP blocked (not in manifest allowlist)"
@@ -221,6 +241,7 @@ impl WasiHttpView for HostState {
             ))));
         }
 
+        let ops_guest_counted = self.ops_guest_counted.clone();
         let handle = wasmtime_wasi::runtime::spawn(async move {
             // SSRF guard: a guest component must not reach internal / private /
             // link-local / cloud-metadata addresses from inside the keys-bearing
@@ -234,6 +255,7 @@ impl WasiHttpView for HostState {
                         match crate::net_guard::checked_addresses(addrs.collect()) {
                             Some(addrs) => (h.to_string(), addrs),
                             None => {
+                                GuestHttpCounted::once(&ops_guest_counted.private_destination, crate::ops_events::Code::GuestPrivateDestination);
                                 tracing::warn!("WASI HTTP blocked (internal/private destination): {:?}", url);
                                 return Ok(Err(
                                     wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(
@@ -273,6 +295,10 @@ impl WasiHttpView for HostState {
                         "WASI HTTP request timed out after {}s: {} (timeout count: {}/{})",
                         timeout_secs, url, count, HTTP_TIMEOUT_ABORT_THRESHOLD
                     );
+                    if count == HTTP_TIMEOUT_ABORT_THRESHOLD {
+                        // Once per run: the request that reaches the threshold ends it.
+                        crate::ops_events::record(crate::ops_events::Code::GuestHttpTimeouts, crate::ops_events::Route::GuestHttp);
+                    }
                     if count >= HTTP_TIMEOUT_ABORT_THRESHOLD {
                         tracing::error!("HTTP abuse detected: forcing WASI termination via epoch interrupt");
                         // Advance epoch well past any possible deadline to trigger trap.
@@ -705,6 +731,7 @@ pub async fn execute(
         encryption_keys_state,
         tasks_state,
         http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ops_guest_counted: Arc::new(GuestHttpCounted::default()),
         engine_handle: engine,
         network_policy,
         egress_log,

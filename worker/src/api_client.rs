@@ -2564,6 +2564,12 @@ impl ApiClient {
             .context("Failed to send heartbeat")?;
 
         if !response.status().is_success() {
+            if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                crate::ops_events::record(
+                    crate::ops_events::Code::CoordinatorAuthRefused,
+                    crate::ops_events::Route::Heartbeat,
+                );
+            }
             let error_text = response
                 .text()
                 .await
@@ -2571,6 +2577,29 @@ impl ApiClient {
             anyhow::bail!("Heartbeat failed: {}", error_text)
         }
 
+        Ok(())
+    }
+
+    /// Send what [`crate::ops_events`] counted since the last report that went
+    /// through. Only the status is returned on failure: the caller puts the
+    /// counts back and they go with the next report.
+    pub async fn report_ops_events(
+        &self,
+        report: &crate::ops_events::WireReport<'_>,
+    ) -> Result<()> {
+        let url = format!("{}/workers/ops-events", self.base_url);
+        // Its own short budget: the report goes from the heartbeat loop, and a slow coordinator
+        // must not hold the next heartbeat for the client's full timeout.
+        let response = self
+            .add_auth_headers(self.client.post(&url))
+            .timeout(Duration::from_secs(10))
+            .json(report)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("ops events report not sent: {}", e.without_url()))?;
+        if !response.status().is_success() {
+            anyhow::bail!("ops events report refused: {}", response.status());
+        }
         Ok(())
     }
 

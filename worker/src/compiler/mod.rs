@@ -474,11 +474,14 @@ impl Compiler {
             DOWNLOAD_TIMEOUT_SECONDS
         );
 
-        let mut response = fetch_checked(url).await?;
+        let mut response = fetch_checked(url).await.inspect_err(|_| {
+            crate::ops_events::record(crate::ops_events::Code::WasmUrlUnavailable, crate::ops_events::Route::Download);
+        })?;
 
         // The caller is told that the fetch failed, not what the server
         // answered: the status stays in the worker's log.
         if !response.status().is_success() {
+            crate::ops_events::record(crate::ops_events::Code::WasmUrlUnavailable, crate::ops_events::Route::Download);
             warn!("wasm_url fetch answered {} for {}", response.status(), url);
             anyhow::bail!("wasm_url could not be fetched");
         }
@@ -516,6 +519,7 @@ impl Compiler {
 
         // Nor the hash of what it served.
         if actual_hash != expected_hash {
+            crate::ops_events::record(crate::ops_events::Code::WasmUrlHashMismatch, crate::ops_events::Route::Download);
             warn!("wasm_url content hashes to {}, expected {} ({})", actual_hash, expected_hash, url);
             anyhow::bail!("wasm_url content does not match its hash");
         }

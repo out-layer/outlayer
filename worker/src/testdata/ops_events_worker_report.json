@@ -1,0 +1,16 @@
+{
+  "worker_name": "testnet-downloader-node1",
+  "worker_type": "downloader",
+  "events": [
+    {
+      "code": "download_failed",
+      "route": "download",
+      "count": 3
+    },
+    {
+      "code": "guest_private_destination",
+      "route": "guest_http",
+      "count": 1
+    }
+  ]
+}

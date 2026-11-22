@@ -1258,6 +1258,7 @@ impl EventMonitor {
                 }
                 Scan::Unreadable(why) => {
                     wait_for_block_count = 0;
+                    crate::ops_events::record(crate::ops_events::Code::RpcUnreadableBlock, crate::ops_events::Route::EventMonitor);
                     warn!("❌ Block {} not read within {:?}: {}", head, HEAD_BLOCK_BUDGET, why);
                     if let Some(readable) = self.probe_ahead(head).await {
                         // The blocks after it read: the problem is this block.
@@ -1357,6 +1358,9 @@ impl EventMonitor {
     }
 
     fn log_given_up(given_up: Option<GivenUp>, why: &str) {
+        if given_up.is_some() {
+            crate::ops_events::record(crate::ops_events::Code::EventsAbandoned, crate::ops_events::Route::EventMonitor);
+        }
         match given_up {
             None => {}
             Some((height, None)) => error!(

@@ -3,6 +3,7 @@ mod compiled_cache;
 mod compiler;
 mod config;
 mod event_monitor;
+mod ops_events;
 mod executor;
 mod net_guard;
 mod transport_error;
@@ -492,6 +493,16 @@ async fn main() -> Result<()> {
     let heartbeat_block_height = shared_block_height.clone();
     let heartbeat_last_poll_at = shared_last_poll_at.clone();
     let stale_threshold_secs = iteration_timeout_seconds(&config);
+    let ops_worker_type = config.worker_type_string();
+    // The coordinator refuses a report from a name outside `[a-z0-9_.-]{1,64}`;
+    // such a worker counts but does not send, and says so once.
+    let ops_reporting = ops_events::reportable_name(&heartbeat_worker_name);
+    if !ops_reporting {
+        warn!(
+            "Ops events are not reported: worker name {:?} is not [a-z0-9_.-]{{1,64}}",
+            heartbeat_worker_name
+        );
+    }
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         loop {
@@ -522,6 +533,20 @@ async fn main() -> Result<()> {
                 .await
             {
                 warn!("Failed to send heartbeat: {}", e);
+            }
+            if ops_reporting {
+                let tally = ops_events::take();
+                if !tally.is_empty() {
+                    let report = ops_events::WireReport {
+                        worker_name: &heartbeat_worker_name,
+                        worker_type: ops_worker_type,
+                        events: tally.events(),
+                    };
+                    if let Err(e) = heartbeat_api_client.report_ops_events(&report).await {
+                        warn!("{}", e);
+                        ops_events::restore(tally);
+                    }
+                }
             }
         }
     });
@@ -639,6 +664,8 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
+                        // Not counted here: a failed job is counted where it failed (compile,
+                        // download, execute), and a failed poll where it is made.
                         error!("Worker iteration failed: {}", e);
                         // Sleep before retry to avoid tight error loop
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -646,6 +673,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(_) => {
+                ops_events::record(ops_events::Code::MainLoopStalled, ops_events::Route::Poll);
                 error!("⏰ Worker iteration timed out after {}s — reconnecting", iteration_timeout.as_secs());
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
@@ -693,6 +721,7 @@ async fn worker_iteration(
     let task = api_client
         .poll_task(config.poll_timeout_seconds, &capabilities, &config.execute_excludes)
         .await
+        .inspect_err(|_| ops_events::record(ops_events::Code::MainLoopFailed, ops_events::Route::Poll))
         .context("Failed to poll for task")?;
     debug!("🔄 Poll returned: {}", if task.is_some() { "task received" } else { "no task" });
 
@@ -1590,6 +1619,7 @@ async fn fetch_wasm_bytes(
     info!("📥 Downloading WASM: checksum={} (cached since: {:?}) is_p2={}", wasm_checksum, created_at, is_p2);
     let bytes = api_client.download_wasm(wasm_checksum).await
         .map_err(|e| {
+            ops_events::record(ops_events::Code::DownloadFailed, ops_events::Route::Download);
             error!("❌ Failed to download WASM: {}", e);
             anyhow::anyhow!("Failed to download WASM: {}", e)
         })?;
@@ -1949,6 +1979,7 @@ async fn handle_compile_job(
             Ok((checksum, wasm_bytes, compile_time_ms, created_at, published_url))
         }
         Err(e) => {
+            ops_events::record(ops_events::Code::CompileFailed, ops_events::Route::Compile);
             let error_msg = e.to_string();
             warn!("❌ Compilation failed: {}", error_msg);
 

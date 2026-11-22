@@ -43,6 +43,7 @@ are enabled for arbitrary repositories is listed on
 | `near_client.rs` | Submits results on chain: `resolve_execution` for a small result, `submit_execution_output_and_resolve` for a large one; top-up and payment-key resumes |
 | `keystore_client.rs` | Secret decryption (`/decrypt`) against the keystore TEE |
 | `event_monitor.rs` | Optional: reads contract events from neardata and relays them to the coordinator |
+| `ops_events.rs` | Counts errors and attack signals as codes and reports them with the heartbeat (see [Ops events](#ops-events)) |
 | `outlayer_*`, `signing_keys/`, `encryption_keys/`, `tasks/` | Host interfaces for components (see [Host functions](#host-functions)) |
 
 ### Event monitor (`ENABLE_EVENT_MONITOR=true`)
@@ -193,6 +194,46 @@ interpolated into a shell word or a `sed` replacement.
 
 Compile jobs are never excluded: compiling reaches no venue. An empty list is
 the ordinary path and leaves the coordinator's blocking pop untouched.
+
+## Ops events
+
+The worker counts what failed, as codes, and sends the counts to the coordinator
+(`POST /workers/ops-events`) right after each 30 s heartbeat; monitoring shows them in the
+"Ops events" dashboard. A code is recorded where the failure is decided, never derived from a
+log line, and carries no text: the worker's own log at that time has the detail.
+
+| Code | Severity | Kind | Where |
+|---|---|---|---|
+| `compile_failed` | info | error | a guest repository did not build |
+| `wasm_exec_failed` | info | error | a guest ran and failed (trap, limits, output not in the declared format) |
+| `execution_error` | notice | error | a job did not run: its binary did not load, or the host failed around the run |
+| `download_failed` | warning | error | the coordinator's WASM cache did not hand over a binary |
+| `wasm_url_unavailable` | info | error | a caller's `wasm_url` did not answer with the file |
+| `wasm_url_hash_mismatch` | notice | error | a caller's `wasm_url` served bytes of another hash |
+| `wasm_cache_tampered` | warning | attack | a cached binary no longer matches the hash recorded when it was stored (never served) |
+| `rpc_unreadable_block` | warning | error | the event monitor could not read a block in time |
+| `events_abandoned` | critical | error | the event monitor gave up events: never delivered |
+| `main_loop_failed` | warning | error | the coordinator could not be polled for work |
+| `main_loop_stalled` | warning | error | an iteration ran past its timeout and was abandoned |
+| `coordinator_auth_refused` | critical | error | the coordinator answered the heartbeat 401/403 |
+| `keystore_unreachable` | critical | error | no keystore instance answered, or the one asked never replied |
+| `keystore_session_failed` | critical | error | a keystore refused this worker a TEE session |
+| `keystore_server_error` | warning | error | a keystore answered 5xx |
+| `guest_private_destination` | warning | attack | a guest tried an internal / private / link-local address |
+| `guest_egress_not_allowed` | notice | attack | a guest tried a host its manifest does not allow |
+| `guest_http_timeouts` | info | error | a guest's requests kept timing out and the run was ended for it (the run also counts as `wasm_exec_failed`) |
+
+A failure is counted once, where it is decided: a failed job is not counted again as a failed
+iteration, and the `guest_*` codes are counted at most once per run, however many requests a guest
+repeats. The report carries code, route and count only: the coordinator stamps the time it
+receives it, and assigns severity and kind from its own table (`WORKER_CODES` in
+`outlayer-coordinator/src/handlers/ops_events.rs`; the severities above are that table's), so a
+worker cannot claim how bad an event is. A code added here is added there first — both repos test
+`ops_events_worker_codes.json`, and the coordinator deploys before the worker. `route` is the worker operation (`poll`, `heartbeat`, `compile`, `download`, `execute`,
+`event_monitor`, `keystore`, `guest_http`). A report that fails stays in memory and goes with the
+next one; the codes × routes are fewer than the coordinator's 500-event cap, so the tally needs
+no cap of its own. A worker whose name the coordinator would refuse (`[a-z0-9_.-]{1,64}`) counts
+but does not send, and says so once at startup.
 
 ## Stopping
 

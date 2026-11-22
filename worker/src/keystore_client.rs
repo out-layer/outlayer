@@ -603,6 +603,7 @@ impl KeystoreClient {
     /// Record that instance `i` took a request and never answered it: this request fails, the
     /// next one goes elsewhere.
     fn stall(&self, i: usize, what: &str, error: &anyhow::Error) {
+        crate::ops_events::record(crate::ops_events::Code::KeystoreUnreachable, crate::ops_events::Route::Keystore);
         self.instances[i].mark_down();
         tracing::warn!(
             keystore = %self.instances[i].url,
@@ -616,6 +617,7 @@ impl KeystoreClient {
     /// not the instance hostnames: job errors reach the user, the hostnames belong in the worker
     /// log, which `leave` writes per instance.
     fn all_unreachable(what: &str, errors: Vec<anyhow::Error>) -> anyhow::Error {
+        crate::ops_events::record(crate::ops_events::Code::KeystoreUnreachable, crate::ops_events::Route::Keystore);
         let detail: Vec<String> = errors.iter().map(|e| format!("{e:#}")).collect();
         anyhow::anyhow!(
             "{} failed: every keystore instance is unreachable ({} tried: {})",
@@ -680,6 +682,7 @@ impl KeystoreClient {
             .map_err(|e| Self::send_error(e, "Failed to request TEE challenge from keystore"))?;
 
         if !response.status().is_success() {
+            crate::ops_events::record(crate::ops_events::Code::KeystoreSessionFailed, crate::ops_events::Route::Keystore);
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             return Err(CallError::Final(anyhow::anyhow!(
@@ -722,6 +725,7 @@ impl KeystoreClient {
             .map_err(|e| Self::send_error(e, "Failed to submit keystore TEE registration"))?;
 
         if !response.status().is_success() {
+            crate::ops_events::record(crate::ops_events::Code::KeystoreSessionFailed, crate::ops_events::Route::Keystore);
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             return Err(CallError::Final(anyhow::anyhow!(
@@ -877,6 +881,9 @@ impl KeystoreClient {
             let expired = reply.status == reqwest::StatusCode::FORBIDDEN
                 && Self::is_tee_session_expired(reply.status, &reply.text());
             if !expired {
+                if reply.status.is_server_error() {
+                    crate::ops_events::record(crate::ops_events::Code::KeystoreServerError, crate::ops_events::Route::Keystore);
+                }
                 self.settle_on(i);
                 return Ok(reply);
             }

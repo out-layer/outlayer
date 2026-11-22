@@ -116,15 +116,33 @@ fi
 
 echo
 echo "capturing into coordinator history: $COORDINATOR_URL/admin/collateral/check"
-RESPONSE=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/admin/collateral/check" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -w '\n%{http_code}' 2>&1) || {
+# The token reaches curl through a file descriptor, never its command line (which `ps` shows).
+auth_header() { printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN"; }
+capture() {
+  curl -sS -m 60 -X POST "$COORDINATOR_URL/admin/collateral/check" \
+    -H @<(auth_header) \
+    -w '\n%{http_code}' 2>&1
+}
+RESPONSE=$(capture) || {
     echo "⚠️  Coordinator unreachable — collateral IS on chain, capture it later" >&2
     exit 0
   }
 
 HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
 BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+# `reread: false`: a check (the collector's hourly one) read the chain moments ago and this answer
+# is the stored history, which may predate the version just published. The coordinator reads the
+# chain at most once per 30 s: ask again after that.
+if [ "$HTTP_CODE" = "200" ] && [ "$(printf '%s' "$BODY" | jq -r '.reread')" = "false" ]; then
+  echo "    the chain was read moments ago; asking again in 35 s so the new version is captured"
+  sleep 35
+  RESPONSE=$(capture) || {
+      echo "⚠️  Coordinator unreachable — collateral IS on chain, capture it later" >&2
+      exit 0
+    }
+  HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+  BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+fi
 
 if [ "$HTTP_CODE" != "200" ]; then
   echo "⚠️  Coordinator returned HTTP $HTTP_CODE — collateral IS on chain, capture it later" >&2

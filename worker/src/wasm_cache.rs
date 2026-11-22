@@ -213,6 +213,7 @@ impl WasmCache {
         // rewrite.
         let actual_hash = Self::compute_hash(&bytes);
         if actual_hash != entry.content_sha256 {
+            crate::ops_events::record(crate::ops_events::Code::WasmCacheTampered, crate::ops_events::Route::Download);
             warn!(
                 "⚠️ Cache integrity check failed for {}! Expected {}, got {}. File may be corrupted or tampered.",
                 checksum, entry.content_sha256, actual_hash
