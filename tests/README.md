@@ -39,7 +39,13 @@ and the rules every live run follows.
   statement on the coordinator's host; the database is not reachable from
   elsewhere.
 - **Webhooks**: `hook_receiver.sh ensure` gives a public receiver
-  (Cloudflare quick tunnel) for suites that need one.
+  (Cloudflare quick tunnel) for suites that need one. It verifies every
+  request under the webhook keys of the API `COORDINATOR_URL` names
+  (`GET /wallet/v1/webhook-keys`; testnet when unset), answers 401 to one
+  whose Ed25519 signature does not hold or whose timestamp is more than five
+  minutes off, and keeps the verdict in its log. A suite that waits for a
+  webhook fails on one that did not verify (`lib/webhook_verify.mjs` is the
+  check; `lib/tasks_hook.mjs` reads the log and applies it again).
 
 ## Runners
 

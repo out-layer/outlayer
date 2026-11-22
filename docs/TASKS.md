@@ -502,10 +502,31 @@ its id to whoever holds it (`GET /wallet/v1/approval/{id}`).
 An owner who named a URL is sent `task_created`, `task_approved` (with the
 `run` queued for it), `task_answered`, `task_failed` (with `failure_reason`)
 and `task_expired`, through the sender the wallet's webhooks use, with
-`X-Wallet-Id: owner:<account>` and `X-Webhook-Signature`: the HMAC-SHA256 of
-the body, in hex, under a secret of the owner's own. The secret is made when
-the URL is named and told to the owner once, in the answer to that call and in
-the dashboard; naming a URL again makes a new one.
+`X-Wallet-Id: owner:<account>`. Each request carries two signatures:
+
+- **OutLayer's Ed25519 signature** — `X-Webhook-Id` (a random UUID, the same
+  on each attempt of one delivery), `X-Webhook-Timestamp`, `X-Webhook-Key-Id`
+  and `X-Webhook-Signature-Ed25519`, over the delivery id, the timestamp, the
+  wallet id, the event type and the body. It is checked with the public keys
+  of `GET /wallet/v1/webhook-keys` and no secret. It says OutLayer sent the
+  event, not whose event it is: any owner may name any URL, and their events
+  arrive there correctly signed. A receiver that relies on it therefore also
+  checks that `X-Wallet-Id` is `owner:` and its own account, that the
+  timestamp is within five minutes — which bounds how long a captured request
+  can be sent again — and that it has not accepted this `X-Webhook-Id` before,
+  which is what refuses a repeat inside those five minutes. The four steps,
+  how to hold the keys and an example are in
+  [DETERMINISTIC_WALLETS.md](DETERMINISTIC_WALLETS.md#verifying-a-webhook).
+- **The owner's HMAC** — `X-Webhook-Signature`: the HMAC-SHA256 of the body,
+  in hex, under a secret of the owner's own. It holds only for events of the
+  owner who was told the secret, so it binds an event to its owner by itself;
+  it covers the body alone — no time and no delivery id — so a captured body
+  verifies whenever it is sent again. The secret is made when the URL is named
+  and told to the owner once, in the answer to that call and in the dashboard;
+  naming a URL again makes a new one.
+
+A receiver does the first with the `X-Wallet-Id` check, or both.
+
 A body says who asked whom, of what kind and when, and links to the inbox. It
 carries nothing of what the task shows. A notice is told as `task_created`
 with `"kind": "notice"`; the owner's Got it sends nothing.

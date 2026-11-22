@@ -336,7 +336,10 @@ contract itself.
   `recovery_window_expired`, `recovery_cancelled_dao_revoked`,
   `exit_window_set`, `vault_banned`, `vault_unbanned`,
   `vault_tee_key_added`) arrive through `outlayer-monitor` →
-  `/internal/vault-event`.
+  `/internal/vault-event`. Every one is signed with OutLayer's Ed25519
+  key; the receiver verifies it with the public keys of
+  `GET /wallet/v1/webhook-keys`
+  ([docs/DETERMINISTIC_WALLETS.md](docs/DETERMINISTIC_WALLETS.md#verifying-a-webhook)).
 
 ## Cross-references
 

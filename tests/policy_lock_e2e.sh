@@ -15,9 +15,17 @@
 #       deadline (expired, said before the signature check)
 #   L7  one vote keeps it pending; the second releases the signature on the
 #       request; the owner stores it — version 2, unlocked, still frozen
+#   L5w the held write is announced (`approval_needed`) to the webhook of the
+#       policy in force, judged as L7w judges
 #   L7w the first vote is announced (`approval_received`) to the webhook of the
-#       policy it was cast under (with HOOK_URL / HOOK_LOG_URL from
+#       policy it was cast under, in a request whose signature the receiver
+#       verified under this API's webhook-keys and which, being a wallet's
+#       event, carries the wallet's id and no `X-Webhook-Signature`; no
+#       webhook the receiver was sent failed that check (with HOOK_URL /
+#       HOOK_LOG_URL from
 #       `tests/hook_receiver.sh ensure`; skipped without them)
+#   L7s the signed write is announced (`policy_update_signed`), judged as
+#       L7w judges
 #   L8  the same signed write a second time is refused (version)
 #   L9  unfreeze works
 #   L10 the owner alone re-locks (version 3)
@@ -30,13 +38,17 @@
 #       approvers would no longer be approvers and their votes would be
 #       refused at the door, never reaching the keystore
 #   L13 the quorum unlocks the policy (version 5) and it deletes
+#   L14 a second wallet of PARENT names the same receiver: its held write is
+#       announced under ITS wallet id, verified, and a wait keyed on the first
+#       wallet's id does not take it; its policy is then unlocked and deleted
+#       (three more transactions of PARENT; skipped without a receiver)
 #
 # Not here: the keystore's direct refusals (unit-tested, keystore
 # `policy_lock_tests`), approval expiry (needs the database), a contract-wallet
 # approver (its own suite). Approvers vote by key from ~/.near-credentials.
 #
 # Run:
-#   tests/hook_receiver.sh ensure; set -a; source ~/.local/state/outlayer-hook/hook.env; set +a
+#   tests/hook_receiver.sh ensure; set -a; source "$(tests/hook_receiver.sh env-file)"; set +a
 #   PARENT=outlayer-alice.testnet APPROVER=outlayer-carol.testnet \
 #     APPROVER2=outlayer-daniel.testnet ./tests/policy_lock_e2e.sh --apply
 
@@ -134,12 +146,75 @@ LOCKED=$(jq -nc --arg a "$APPROVER" --arg b "$APPROVER2" \
 # command line or the terminal.
 [[ -n "${HOOK_URL:-}" ]] && LOCKED=$(HOOK_URL="$HOOK_URL" jq -c '. + {webhook_url: env.HOOK_URL}' <<<"$LOCKED")
 # hook_saw <event> <needle>… — one delivery in the receiver's log is of
-# <event> (the `x-event-type` header) and its body holds every needle (the log
-# is read through stdin: its URL is a secret too).
+# <event> (the `x-event-type` header), its body holds every needle, the
+# receiver verified its signature (`signature.ok`, lib/hook_receiver.mjs), it
+# was sent as this suite's wallet (`X-Wallet-Id` is WALLET_ID) and, a wallet's
+# event, it carries no `X-Webhook-Signature`. Left behind:
+#   HOOK_LOG_READ     false when the receiver's log could not be read
+#   HOOK_UNVERIFIED   why the receiver refused any webhook it was sent — a
+#                     signature that does not hold, a stale timestamp — empty
+#                     when it refused none
+#   HOOK_KEYS_FAILED  how many requests the receiver answered 503 because it
+#                     could not read the API's webhook-keys. That is the
+#                     receiver's failure, not a webhook's: the delivery is sent
+#                     again, so it is told apart from HOOK_UNVERIFIED
+#   HOOK_MISDRESSED   the verified webhooks that carry `X-Webhook-Signature`
+#                     without being an owner's (`signature.owner_hmac` against
+#                     `signature.owner_hmac_expected`), or are one and carry none
+# The log is read through stdin: its URL is a secret too.
+HOOK_LOG_READ=false
+HOOK_UNVERIFIED=""
+HOOK_KEYS_FAILED=0
+HOOK_MISDRESSED=""
 hook_saw() {
   local event=$1 log; shift
+  HOOK_LOG_READ=false
   log=$(printf 'url = "%s"\n' "$HOOK_LOG_URL" | curl -sS --max-time 20 -K - 2>/dev/null) || return 1
-  jq -e --arg e "$event" --args '[.requests[]? | select((.headers["x-event-type"] // "") == $e) | (.body // "") as $b | select(all($ARGS.positional[]; . as $n | $b | contains($n)))] | length > 0' "$@" <<<"$log" >/dev/null 2>&1
+  jq -e '.requests | type == "array"' >/dev/null 2>&1 <<<"$log" || return 1
+  HOOK_LOG_READ=true
+  HOOK_KEYS_FAILED=$(jq -r '[.requests[] | select(.method == "POST" and .signature.reason == "keys_unavailable")] | length' <<<"$log" 2>/dev/null)
+  HOOK_UNVERIFIED=$(jq -r '[.requests[] | select(.method == "POST" and (.headers["x-replayed-by-suite"] // "") == "" and .signature.ok != true and .signature.reason != "keys_unavailable") | "\(.headers["x-event-type"] // "no event type"): \(.signature.reason // "the receiver kept no verdict")"] | unique | join("; ")' <<<"$log" 2>/dev/null)
+  HOOK_MISDRESSED=$(jq -r '[.requests[] | select(.method == "POST" and (.headers["x-replayed-by-suite"] // "") == "" and .signature.ok == true and .signature.owner_hmac != .signature.owner_hmac_expected) | "\(.headers["x-event-type"] // "no event type") sent as \(.signature.wallet_id)"] | unique | join("; ")' <<<"$log" 2>/dev/null)
+  HOOK_WALLET_ID="$WALLET_ID" jq -e --arg e "$event" --args '[.requests[] | select((.headers["x-event-type"] // "") == $e and .signature.ok == true and .signature.owner_hmac == false and ((.headers["x-webhook-signature"] // "") == "") and .signature.wallet_id == env.HOOK_WALLET_ID) | (.body // "") as $b | select(all($ARGS.positional[]; . as $n | $b | contains($n)))] | length > 0' "$@" <<<"$log" >/dev/null 2>&1
+}
+# hook_ready <row> <what is not checked without it> — true when a receiver
+# that verifies this API's webhooks is in the environment; otherwise a SKIP,
+# or a failure when the receiver there verifies another API's.
+hook_ready() {
+  if [[ -z "${HOOK_URL:-}" || -z "${HOOK_LOG_URL:-}" ]]; then
+    skip "$1 no webhook receiver (HOOK_URL / HOOK_LOG_URL): $2 is not checked"
+    return 1
+  fi
+  if [[ "${HOOK_API_BASE:-}" != "$COORDINATOR_URL" ]]; then
+    fail "$1 the receiver verifies the webhooks of '${HOOK_API_BASE:-no API}', and this suite runs against $COORDINATOR_URL: run tests/hook_receiver.sh ensure with COORDINATOR_URL set to it, and source its env file again"
+    return 1
+  fi
+}
+# hook_await <row> <event> <needle> <what it shows> — waits 45 s for that
+# event of this suite's wallet in the receiver's log, and judges the log: the
+# event verified, sent as the wallet, without `X-Webhook-Signature`; no
+# webhook refused; none misdressed. A receiver that could not read the
+# webhook-keys is said so, apart from a webhook that failed.
+hook_await() {
+  local row=$1 event=$2 needle=$3 what=$4 saw=""
+  for _ in $(seq 1 9); do hook_saw "$event" "$needle" && { saw=1; break; }; sleep 5; done
+  if [[ -n "$saw" ]]; then
+    pass "$row $what: $event verified, sent as the wallet, no X-Webhook-Signature"
+  elif [[ "$HOOK_LOG_READ" != true ]]; then
+    fail "$row the receiver's log could not be read: no webhook was judged (is the receiver up? tests/hook_receiver.sh status)"
+    return 1
+  elif (( HOOK_KEYS_FAILED > 0 )); then
+    fail "$row no verified $event for $needle in 45 s, and THE RECEIVER could not read the API's webhook-keys: it answered $HOOK_KEYS_FAILED request(s) 503 without judging them. This is the receiver's failure, not a webhook's — check GET $COORDINATOR_URL/wallet/v1/webhook-keys from this machine, then run the row again"
+    return 1
+  else
+    fail "$row no $event for $needle that verifies, is sent as $WALLET_ID and carries no X-Webhook-Signature reached the webhook in 45 s"
+  fi
+  [[ -z "$HOOK_UNVERIFIED" ]] && pass "$row every webhook the receiver judged verifies under the API's webhook-keys" \
+    || fail "$row the receiver refused webhooks: $HOOK_UNVERIFIED"
+  [[ -z "$HOOK_MISDRESSED" ]] && pass "$row no wallet event carries X-Webhook-Signature" \
+    || fail "$row X-Webhook-Signature is where it must not be, or missing: $HOOK_MISDRESSED"
+  (( HOOK_KEYS_FAILED == 0 )) \
+    || warn "$row THE RECEIVER could not read the API's webhook-keys for $HOOK_KEYS_FAILED request(s) and answered them 503; the coordinator sent them again. The receiver's failure, not a webhook's: those attempts were not judged"
 }
 OPEN='{"rules":{"transaction_types":["transfer"]}}'
 OPEN_B='{"rules":{"transaction_types":["transfer","call"]}}'
@@ -190,6 +265,8 @@ if hold L5 "$OPEN"; then
   [[ "$(jq -r '.request_data.version' <<<"$BODY")" == 2 && "$(jq -r '.request_data.locked' <<<"$BODY")" == false ]] \
     && pass "L5 they vote on version 2, unlocked" || fail "L5 request_data $(jq -c '{version,locked}' <<<"$BODY")"
   [[ "$(jq -r '.required_approvals' <<<"$BODY")" == 2 ]] && pass "L5 2 approvals required" || fail "L5 required $(jq -r .required_approvals <<<"$BODY")"
+  hook_ready L5w "the held write's webhook (approval_needed)" \
+    && hook_await L5w approval_needed "$AID" "the held write was announced to the policy's webhook"
   api_policy_is L5 1 true true
 fi
 
@@ -208,14 +285,8 @@ if [[ -n "${AID:-}" ]]; then
   vote approve "$APPROVER"
   assert_status "L7 first vote" 200
   [[ "$(jq -r .status <<<"$BODY")" == pending ]] && pass "L7 pending at 1 of 2" || fail "L7 $(jq -c '{status,approved,required}' <<<"$BODY")"
-  if [[ -n "${HOOK_URL:-}" && -n "${HOOK_LOG_URL:-}" ]]; then
-    SAW=""
-    for _ in $(seq 1 9); do hook_saw approval_received "$AID" && { SAW=1; break; }; sleep 5; done
-    [[ -n "$SAW" ]] && pass "L7w the vote was announced to the policy's webhook" \
-      || fail "L7w no approval_received for $AID reached the webhook in 45 s"
-  else
-    skip "L7w no webhook receiver (HOOK_URL / HOOK_LOG_URL): the policy-update vote's webhook is not checked"
-  fi
+  hook_ready L7w "the policy-update vote's webhook (approval_received)" \
+    && hook_await L7w approval_received "$AID" "the vote was announced to the policy's webhook"
   api "$SEED" GET "/wallet/v1/requests/$RID" >/dev/null
   [[ "$(jq -r .status <<<"$BODY")" == pending_approval ]] && pass "L7 request still pending_approval" || fail "L7 request $(jq -r .status <<<"$BODY")"
 
@@ -225,6 +296,8 @@ if [[ -n "${AID:-}" ]]; then
   wait_request "$RID"
   if [[ "$ST" == success ]]; then
     pass "L7 the signature is on the request"
+    hook_ready L7s "the signed write's webhook (policy_update_signed)" \
+      && hook_await L7s policy_update_signed "$RID" "the signed write was announced to the policy's webhook"
     WRITE=$(jq -c '.result' <<<"$BODY")
     [[ "$(jq -r .version <<<"$WRITE")" == 2 && "$(jq -r .locked <<<"$WRITE")" == false ]] && pass "L7 signed version 2, unlocked" \
       || fail "L7 result $(jq -c '{version,locked}' <<<"$WRITE")"
@@ -309,5 +382,36 @@ if hold "L13" "$OPEN"; then
 fi
 call "$PARENT" delete_wallet_policy "$(jq -nc --arg k "$WALLET_PUBKEY" '{wallet_pubkey:$k}')" '0 NEAR'
 landed "L13 deleted" && { [[ "$(meta)" == null ]] && pass "L13 gone from the chain" || fail "L13 still on chain: $(meta | head -c 120)"; }
+
+# ── L14 ──────────────────────────────────────────────────────────────────────
+log "L14 a second wallet's webhook at the same receiver"
+if hook_ready L14 "a second wallet's event at the same receiver"; then
+  FIRST_WALLET_ID=$WALLET_ID
+  SEED="lock2-$(date +%s)-$$"
+  if read -r WALLET_ID ADDR < <(wallet_address "$SEED") && [[ -n "$WALLET_ID" && "$WALLET_ID" != "$FIRST_WALLET_ID" ]] \
+      && store_policy "$SEED" "$WALLET_ID" "$LOCKED"; then
+    pass "L14 a second wallet ($WALLET_ID) stores a locked policy naming the same receiver"
+    if hold L14 "$OPEN"; then
+      hook_await L14 approval_needed "$AID" "the second wallet's held write was announced under its own wallet id"
+      if WALLET_ID=$FIRST_WALLET_ID hook_saw approval_needed "$AID"; then
+        fail "L14 the second wallet's event was taken for the first wallet's ($FIRST_WALLET_ID)"
+      else
+        pass "L14 a wait keyed on the first wallet's id does not take the second wallet's event"
+      fi
+      # The second wallet's policy is unlocked and deleted, as L13 does.
+      quorum "L14" "$AID" "$RHASH"; wait_request "$RID"
+      if [[ "$ST" == success ]]; then
+        store_write "$(jq -c '.result' <<<"$BODY")"
+        landed "L14 the second wallet's policy unlocked"
+      else
+        fail "L14 unlock ended $ST: $(jq -c '.result' <<<"$BODY" | head -c 200) — the second wallet's locked policy stays on chain"
+      fi
+      call "$PARENT" delete_wallet_policy "$(jq -nc --arg k "$WALLET_PUBKEY" '{wallet_pubkey:$k}')" '0 NEAR'
+      landed "L14 the second wallet's policy deleted"
+    fi
+  else
+    fail "L14 the second wallet's locked policy was not stored"
+  fi
+fi
 
 verdict "policy lock"

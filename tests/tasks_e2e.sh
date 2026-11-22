@@ -177,6 +177,11 @@
 #   NT7  a notice reaches the owner's URL as task_created, kind notice, and
 #        nothing of what it shows; Got it sends no event (HOOK_URL)
 #   NT8  the proof holds for a notice: the run's answer names it with its hash
+#   W6   the receiver takes OutLayer's webhooks only: every webhook of this
+#        run verified under the API's webhook-keys; one of them sent again
+#        with another X-Wallet-Id, a changed body or no signature is 401;
+#        sent again as it was it is a repeat; sent again after its five
+#        minutes it is 401 stale_timestamp (HOOK_URL; after W1 or NT7)
 #   L5   the inbox API called in a loop: 429, with no number and no window.
 #        Runs last, and only when asked for by name: ONLY=L5
 #
@@ -203,8 +208,13 @@
 #   HOOK_URL, HOOK_LOG_URL   a public HTTPS receiver that answers 200 and
 #                        records what it is sent, and where its log is read
 #                        (W1, W3). The log's shape is in lib/tasks_hook.mjs:
-#                        [{"method", "headers": {…}, "body"}], or that list
-#                        under "requests"
+#                        [{"method", "headers": {…}, "body", "at"}], or that
+#                        list under "requests"; the body is the text that was
+#                        sent. Every request of the log is verified under
+#                        COORDINATOR_URL's webhook-keys, and one whose
+#                        signature does not hold fails the row that reads it.
+#                        W6 needs a receiver that refuses such a request
+#                        itself, as lib/hook_receiver.mjs does
 #   HOOK_REDIRECT_URL, HOOK_REDIRECT_LOG_URL   a second receiver, which
 #                        answers 307 to HOOK_URL, and its log (W3)
 #                        Without them the suite starts its own receiver
@@ -320,7 +330,7 @@ lacks() {
 # read as a webhook the platform never sent.
 HOOK_SUPPLIED=${HOOK_URL:+true}
 HOOK_STARTED=false
-HOOK_ENV_FILE="${HOOK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/outlayer-hook}/hook.env"
+HOOK_ENV_FILE=$(COORDINATOR_URL="$COORDINATOR_URL" "$SCRIPT_DIR/hook_receiver.sh" env-file)
 # receiver_ready <row> — true when the receiver answers; otherwise a SKIP that
 # says why. The suite's own receiver is made sure of (`ensure`) and its URLs
 # read again: a new one is at a new address.
@@ -332,7 +342,7 @@ receiver_ready() {
     skip "$row: the receiver HOOK_URL names does not answer (a quick tunnel is gone once the machine sleeps): run tests/hook_receiver.sh ensure and source its env file again, or leave HOOK_URL unset and the suite starts its own"
     return 1
   fi
-  if ! out=$("$SCRIPT_DIR/hook_receiver.sh" ensure 2>&1); then
+  if ! out=$(COORDINATOR_URL="$COORDINATOR_URL" "$SCRIPT_DIR/hook_receiver.sh" ensure 2>&1); then
     skip "$row: no webhook receiver came up: $(tail -1 <<<"$out")"
     return 1
   fi
@@ -591,13 +601,48 @@ relay_lacks() { # relay_lacks <row>
 # ── the receiver of events ───────────────────────────────────────────────────
 
 # hook_log <VARIABLE holding the URL of a receiver's log> [needle…] — what the
-# receiver was sent, in HOOK: the events, and the needles found in a body.
+# receiver was sent, in HOOK: the events, each with whether its signature
+# verifies under the API's webhook-keys, the requests whose signature does
+# not, and the needles found in a body.
 HOOK=""
 hook_log() {
   local name=$1; shift
   HOOK=$(HOOK_LOG_URL="${!name:?$name is not set: the URL the log of a receiver is read at}" \
+         COORDINATOR_URL="$COORDINATOR_URL" \
          node "$SCRIPT_DIR/lib/tasks_hook.mjs" events "$@" 2>/dev/null)
   [[ -n "$HOOK" ]] || HOOK='{"failed":"the log gave no answer"}'
+}
+# hook_replay <mode> — one webhook of the receiver's log sent to it again
+# (lib/tasks_hook.mjs, `replay`); what the receiver answered, in REPLAY.
+REPLAY=""
+hook_replay() {
+  REPLAY=$(HOOK_LOG_URL="$HOOK_LOG_URL" HOOK_URL="$HOOK_URL" COORDINATOR_URL="$COORDINATOR_URL" \
+           node "$SCRIPT_DIR/lib/tasks_hook.mjs" replay "$1" 2>/dev/null)
+  [[ -n "$REPLAY" ]] || REPLAY='{"failed":"the replay gave no answer"}'
+}
+replay() { jq -r "$1 | if . == null then \"\" else tostring end" <<<"$REPLAY" 2>/dev/null; }
+# judge_unverified <row> — no request of the log read into HOOK is a webhook
+# whose signature does not hold, and X-Webhook-Signature is on the owner's
+# events and on no wallet's. The requests are judged here, under the keys this
+# suite read itself; when those keys could not be read nothing was judged, and
+# the row fails saying so. A receiver that could not read the keys on its own
+# side (it answered 503, and the delivery was sent again) is told apart: its
+# failure, not a webhook's.
+judge_unverified() {
+  if [[ "$(jq -r '.status // ""' <<<"$HOOK")" != "200" ]]; then
+    fail "$1 no webhook was judged: $(jq -r '.failed // "the log gave no answer"' <<<"$HOOK") — the log, or GET $COORDINATOR_URL/wallet/v1/webhook-keys, could not be read from this machine; that is this suite's failure, not a webhook's"
+  elif [[ "$(jq -r '.unverified | length' <<<"$HOOK")" == "0" ]]; then
+    pass "$1 every webhook the receiver was sent verifies under the API's webhook-keys"
+  else
+    fail "$1 the receiver was sent webhooks whose signature does not hold: $(jq -c '[.unverified[] | {reason, event_type, wallet_id}] | unique' <<<"$HOOK")"
+  fi
+  if [[ "$(jq -r '.status // ""' <<<"$HOOK")" == "200" ]]; then
+    [[ "$(jq -r '.misdressed | length' <<<"$HOOK")" == "0" ]] \
+      && pass "$1 X-Webhook-Signature is on every owner's event and on no wallet's ($(jq -r '.wallet_events' <<<"$HOOK") wallet events in the log)" \
+      || fail "$1 X-Webhook-Signature is where it must not be, or missing: $(jq -c '[.misdressed[] | {reason, event_type, wallet_id}] | unique' <<<"$HOOK")"
+    [[ "$(jq -r '.receiver_keys_unavailable // 0' <<<"$HOOK")" == "0" ]] \
+      || warn "$1 THE RECEIVER could not read the API's webhook-keys for $(jq -r '.receiver_keys_unavailable' <<<"$HOOK") request(s) and answered them 503; the coordinator sent them again. The receiver's failure, not a webhook's: every request of the log was judged here all the same"
+  fi
 }
 # told <VARIABLE> <event> <task> <tries> [needle…] — waits, ten seconds a try,
 # for that event of that task; leaves it in EVENT.
@@ -616,17 +661,19 @@ told() {
 event() { jq -r "$1 | if . == null then \"\" else tostring end" <<<"$EVENT" 2>/dev/null; }
 # The names an event's body may hold: who asked whom, of what kind and when.
 EVENT_MEMBERS="expires_at failure_reason kind link owner preparer project_id project_uuid run state task_id type"
-# judge_event <row> <event> — the event in EVENT says who asked whom, is
-# signed, and holds no member beyond the ones an event has.
+# judge_event <row> <event> — the event in EVENT says who asked whom, carries
+# a signature that verifies under the API's webhook-keys and the owner's HMAC
+# beside it, and holds no member beyond the ones an event has.
 judge_event() {
   local extra
   extra=$(jq -r --arg known "$EVENT_MEMBERS" '.members - ($known | split(" ")) | join(" ")' <<<"$EVENT" 2>/dev/null)
   if [[ "$(event .owner)" == "$PARENT" && "$(event .preparer)" == "$AGENT_ACCOUNT" \
-        && "$(event .signed)" == "true" && "$(event .wallet_id)" == "owner:$PARENT" \
+        && "$(event .verified)" == "true" && "$(event .signed)" == "true" \
+        && "$(event .wallet_id)" == "owner:$PARENT" \
         && "$(event .event_type)" == "$2" && -z "$extra" ]]; then
-    pass "$1 $2: who asked whom, signed, sent as owner:$PARENT, and nothing else"
+    pass "$1 $2: who asked whom, verified under the webhook-keys, the owner's HMAC beside it, sent as owner:$PARENT, and nothing else"
   else
-    fail "$1 $2: owner=$(event .owner) preparer=$(event .preparer) signed=$(event .signed) sent as '$(event .wallet_id)' header '$(event .event_type)' unknown members '$extra'"
+    fail "$1 $2: owner=$(event .owner) preparer=$(event .preparer) verified=$(event .verified) refusal='$(event .refusal)' owner's HMAC=$(event .signed) sent as '$(event .wallet_id)' header '$(event .event_type)' unknown members '$extra'"
   fi
 }
 HOOK_NAMED=false
@@ -657,7 +704,7 @@ cleanup() {
     sign_in_on swept >/dev/null 2>&1 && owner raw DELETE /inbox/tasks "" swept >/dev/null 2>&1
   fi
   [[ "$HOOK_NAMED" == true ]] && owner webhook delete "$NOW_ON" >/dev/null 2>&1
-  [[ "$HOOK_STARTED" == true ]] && "$SCRIPT_DIR/hook_receiver.sh" stop >/dev/null 2>&1
+  [[ "$HOOK_STARTED" == true ]] && COORDINATOR_URL="$COORDINATOR_URL" "$SCRIPT_DIR/hook_receiver.sh" stop >/dev/null 2>&1
   # A row that stopped between a mute and its unmute leaves no mute behind.
   owner unmute agent "$AGENT_ACCOUNT" "$NOW_ON" >/dev/null 2>&1
   [[ -n "$PROJECT_UUID" ]] && owner unmute project "$PROJECT_UUID" "$NOW_ON" >/dev/null 2>&1
@@ -2210,6 +2257,7 @@ if want W1; then
       [[ "$(jq -r '.status // ""' <<<"$HOOK")" == "200" && "$(jq -r '.leaked | length' <<<"$HOOK")" == "0" ]] \
         && pass "W1 no body holds what the tasks showed" \
         || fail "W1 the receiver's log: $(jq -r '.failed // ""' <<<"$HOOK") $(jq -r '.leaked | length' <<<"$HOOK" 2>/dev/null) of what the tasks showed found in a body"
+      judge_unverified W1
       owner webhook delete a
       [[ "$(own .status)" == "200" && "$(own .url_set)" == "false" ]] && HOOK_NAMED=false || fail "W1 removing the webhook answered $(own .status)"
     else
@@ -2706,11 +2754,53 @@ if want NT7; then
         hook_log HOOK_LOG_URL
         AFTER=$(jq -r --arg t "$TOLD_TASK" '[.events[]? | select(.task_id == $t and .type != "task_created")] | length' <<<"$HOOK" 2>/dev/null)
         [[ "$AFTER" == "0" ]] && pass "NT7 Got it sends no event" || fail "NT7 events after Got it: $AFTER"
+        judge_unverified NT7
       else
         fail "NT7 notify: error='$(said .error | head -c 200)'"
       fi
     else
       fail "NT7 naming the URL answered $(own .status)"
+    fi
+  fi
+fi
+
+if want W6; then
+  log "W6 the receiver takes OutLayer's webhooks only"
+  if ! receiver_ready W6 || lacks W6 HOOK_URL HOOK_LOG_URL; then :
+  else
+    hook_log HOOK_LOG_URL
+    if [[ "$(jq -r '.status // ""' <<<"$HOOK")" != "200" ]]; then
+      fail "W6 the receiver's log could not be read: $(jq -r '.failed // "no answer"' <<<"$HOOK")"
+    elif [[ "$(jq -r '[.events[]? | select(.verified)] | length' <<<"$HOOK")" == "0" ]]; then
+      skip "W6 the receiver's log holds no verified webhook of this run to send again: run W1 or NT7 with it (a receiver started anew has an empty log)"
+    elif [[ "$(jq -r '.receiver_verifies' <<<"$HOOK")" != "true" ]]; then
+      judge_unverified W6
+      skip "W6 the receiver HOOK_URL names keeps no verdict of its own: what it refuses is not this suite's to judge"
+    else
+      judge_unverified W6
+      # replay_is <mode> <status> <reason> <repeat> <what it shows>
+      replay_is() {
+        hook_replay "$1"
+        if [[ -n "$(replay .skipped)" && "$1" == stale ]]; then
+          local wait_s=$(( 301 - $(replay '.age_sec // 0') )); (( wait_s > 0 )) || wait_s=1
+          if [[ "$HOOK_SUPPLIED" == true ]]; then
+            skip "W6 $5: $(replay .skipped). To have it judged, run W6 alone in $wait_s s or later, in this same shell (the receiver and its log stay): ONLY=W6 ./tests/tasks_e2e.sh --apply"
+          else
+            skip "W6 $5: $(replay .skipped). This run's own receiver stops, and its log goes, when the run ends. To have it judged, keep one running yourself: tests/hook_receiver.sh ensure; set -a; source \"\$(tests/hook_receiver.sh env-file)\"; set +a — then ONLY=W1,W6 ./tests/tasks_e2e.sh --apply, and $wait_s s or later after it, in the same shell: ONLY=W6 ./tests/tasks_e2e.sh --apply (the other four W6 rows skip in that second run: they need a webhook younger than five minutes)"
+          fi
+        elif [[ -n "$(replay .skipped)" ]]; then
+          skip "W6 $5: $(replay .skipped). To have it judged, run it with a row that sends a webhook: ONLY=W1,W6 ./tests/tasks_e2e.sh --apply"
+        elif [[ "$(replay .status)" == "$2" && "$(replay .reason)" == "$3" && "$(replay .repeat)" == "$4" ]]; then
+          pass "W6 $5: $2 ${3:-accepted}"
+        else
+          fail "W6 $5: answered '$(replay .status)' reason '$(replay .reason)' repeat '$(replay .repeat)' $(replay .failed)"
+        fi
+      }
+      replay_is swapped-wallet 401 bad_signature false "a webhook with another X-Wallet-Id is refused"
+      replay_is tampered-body 401 bad_signature false "a webhook with a changed body is refused"
+      replay_is no-signature 401 no_signature false "a webhook without its signature is refused"
+      replay_is again 200 "" true "a webhook sent again as it was is a repeat of a delivery already taken"
+      replay_is stale 401 stale_timestamp false "a webhook sent again after its five minutes is refused"
     fi
   fi
 fi

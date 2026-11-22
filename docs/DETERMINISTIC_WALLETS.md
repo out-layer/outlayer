@@ -36,10 +36,151 @@ A deterministic wallet is a wallet like any other; every `/wallet/v1/*` endpoint
 - **On-chain calls** — NEAR contract calls (`/wallet/v1/call`).
 - **Token transfers** — native NEAR (`/wallet/v1/transfer`) and intents balances (`/wallet/v1/intents/transfer`).
 - **Policy engine** — capabilities, limits, whitelists (a new address refused, or put to the approvers), time windows, rate limit, multisig approval (with an amount per window that runs without it), freeze.
-- **Webhooks** — the policy's `webhook_url` receives wallet events.
+- **Webhooks** — the policy's `webhook_url` receives wallet events, each signed with a key the receiver checks without a secret ([Webhooks](#webhooks)).
 - **Trial** — a wallet can claim a trial key (`POST /trial-key`) within its first days; the `trial` block of the `POST /register` response states the calls and days.
 
 Intents operations are mainnet only.
+
+## Webhooks
+
+OutLayer POSTs events to a URL its owner named. Every request is signed, and
+`X-Wallet-Id` says whose event it is:
+
+| URL | Events | `X-Wallet-Id` |
+|---|---|---|
+| `webhook_url` of a wallet's policy | `approval_needed`, `approval_received`, `request_completed`, `policy_update_signed` | the wallet's `wallet_id`, as registration answered it |
+| a vault's webhook URL (`POST /customer/register`, [VAULTS.md](../VAULTS.md)) | `vault_registered`, `vault_verified` and the vault's on-chain transitions | the `wallet_id` that registration answered |
+| `webhook_url` of `PUT /subscription/notifications` | `subscription_notification` | the payment key's owner account and its nonce, joined by a colon: `alice.near:3` |
+| an owner's URL ([TASKS.md](TASKS.md#events)) | `task_created`, `task_approved`, `task_answered`, `task_failed`, `task_expired` | `owner:` and the owner's account: `owner:alice.near` |
+
+The URL is an HTTPS URL on a public host; the sender follows no redirect and
+tries a delivery three times.
+
+### Verifying a webhook
+
+Every webhook, of every kind, is signed with OutLayer's Ed25519 key of the
+network. The public keys are served without authentication, so a receiver
+holds no secret:
+
+```
+GET /wallet/v1/webhook-keys
+{"keys": [{"id": "<16 hex>", "algorithm": "ed25519", "public_key": "<64 hex>", "public_key_near": "ed25519:<base58>"}]}
+```
+
+A key's `id` is the first 16 hex characters of the SHA-256 of its 32 public
+bytes. The first key signs. A second key, when present, is the one that signs
+next, listed ahead of its first signature. Mainnet (`api.outlayer.ai`) and
+testnet (`testnet-api.outlayer.ai`) have different keys.
+
+| Header | Value |
+|---|---|
+| `X-Webhook-Id` | The delivery's id: a random UUID in lower-case hyphenated text, the same on each attempt of one delivery. It says nothing else |
+| `X-Webhook-Timestamp` | Unix seconds at the moment of this attempt |
+| `X-Webhook-Key-Id` | The `id` of the key that signed |
+| `X-Webhook-Signature-Ed25519` | The signature, 128 hex characters |
+| `X-Wallet-Id` | Whose event it is (the table above) |
+| `X-Event-Type` | The event's name |
+
+The signature is over six parts joined by a newline, the last being the
+request body exactly as received — the bytes, not JSON parsed and written
+again:
+
+```
+outlayer-webhook-v1\n<X-Webhook-Id>\n<X-Webhook-Timestamp>\n<X-Wallet-Id>\n<X-Event-Type>\n<body>
+```
+
+A receiver accepts a request only when all of this holds:
+
+1. The key whose `id` is `X-Webhook-Key-Id` verifies the signature over those
+   bytes.
+2. `X-Wallet-Id` is one the receiver expects: its own wallet's id, or `owner:`
+   and its own account for an owner's events. A signature says OutLayer sent
+   the request; it does not say the event is the receiver's. Anyone may name
+   any URL as the webhook of a wallet of their own, and that wallet's events
+   arrive there correctly signed. Only `X-Wallet-Id`, which the signature
+   covers, tells them apart.
+3. `X-Webhook-Timestamp` is within five minutes of the receiver's clock. This
+   bounds how long a captured request can be sent again.
+4. The receiver has not accepted this `X-Webhook-Id` before. It remembers the
+   ids it accepted for at least those five minutes; inside them this, and
+   nothing in the signature, is what refuses a captured request sent again.
+
+Holding the keys:
+
+- Read `webhook-keys` again at least every ten minutes and replace the list
+  held with the answer. A key that is no longer in the answer is trusted no
+  more.
+- A request that names an `id` not in the list held is a reason to read the
+  list again — a new key may have been published — at most once a minute,
+  however many such requests arrive. The key id is read before any signature
+  is checked, so anyone can send one.
+- When the list cannot be read and none read in the last ten minutes is held,
+  refuse the request with an error status; the delivery is tried again.
+
+```js
+// Node 20+, no dependencies. `headers` has lower-case names, as Node gives them;
+// `rawBody` is a Buffer; `myWalletIds` lists the X-Wallet-Id values you expect.
+import { createPublicKey, verify } from 'node:crypto';
+
+const KEYS_URL = 'https://api.outlayer.ai/wallet/v1/webhook-keys';
+let keys = [], keysReadAt = 0, keysTriedAt = 0;
+const seen = new Map(); // delivery id -> when it was accepted
+
+// The keys: read again every 10 minutes and replaced, so a key that left the
+// list is gone; an unknown key id causes a read too. Never more than one read
+// a minute, and no keys younger than 10 minutes means no verdict.
+async function keysFor(keyId) {
+  const now = Date.now();
+  const due = now - keysReadAt >= 600_000 || !keys.some((k) => k.id === keyId);
+  if (due && now - keysTriedAt >= 60_000) {
+    keysTriedAt = now;
+    const response = await fetch(KEYS_URL).catch(() => null);
+    if (response?.ok) [keys, keysReadAt] = [(await response.json()).keys, now];
+  }
+  if (now - keysReadAt >= 600_000) throw new Error('webhook keys could not be read');
+  return keys;
+}
+
+async function isMyOutlayerWebhook(headers, rawBody, myWalletIds) {
+  const id = headers['x-webhook-id'] ?? '';
+  const timestamp = headers['x-webhook-timestamp'] ?? '';
+  const signature = headers['x-webhook-signature-ed25519'] ?? '';
+  const walletId = headers['x-wallet-id'] ?? '';
+  if (!id || !/^[0-9a-f]{128}$/i.test(signature) || !/^[0-9]{1,15}$/.test(timestamp)) return false;
+  const key = (await keysFor(headers['x-webhook-key-id'])).find(
+    (k) => k.id === headers['x-webhook-key-id'] && k.algorithm === 'ed25519',
+  );
+  if (!key) return false;
+  const signed = Buffer.concat([
+    Buffer.from(`outlayer-webhook-v1\n${id}\n${timestamp}\n${walletId}\n${headers['x-event-type']}\n`),
+    rawBody,
+  ]);
+  const publicKey = createPublicKey({
+    key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(key.public_key, 'hex')]),
+    format: 'der',
+    type: 'spki',
+  });
+  if (!verify(null, signed, publicKey, Buffer.from(signature, 'hex'))) return false; // 1
+  if (!myWalletIds.includes(walletId)) return false;                                  // 2
+  const now = Date.now();
+  if (Math.abs(now / 1000 - Number(timestamp)) > 300) return false;                   // 3
+  for (const [known, at] of seen) if (now - at > 300_000) seen.delete(known);
+  if (seen.has(id)) return false;                                                     // 4
+  seen.set(id, now);
+  return true;
+}
+```
+
+In TypeScript, `createWebhookKeyCache()` and
+`verifyWebhook({ headers, rawBody, keys, walletIds })` of `@outlayer/sdk` hold
+the keys this way and do steps 1 to 3; they answer the delivery id for step 4.
+
+A wallet's webhook carries no `X-Webhook-Signature` header. An owner's event
+carries one beside the Ed25519 signature: the HMAC-SHA256 of the body under
+the owner's own secret ([TASKS.md](TASKS.md#events)).
+
+A verified webhook is a signal. Where money depends on it, read the request
+(`GET /wallet/v1/requests/{request_id}`) and act on that answer.
 
 ## Architecture
 
