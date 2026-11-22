@@ -161,9 +161,13 @@ fund-moving operation stops and waits:
 
 Two members narrow or widen what waits. `approval.auto_up_to` names, per
 window (`hourly`, `daily`, `monthly`) and token, a total that may leave
-without the approvers: a transfer or a withdrawal runs at once while what the
+without the approvers: a native NEAR transfer, a withdrawal out of NEAR
+Intents or a transfer inside it runs at once while what the
 wallet already spent in that window plus this amount stays at most the entry,
-and waits past it. It reads the spend counters the daily limit reads, so it has
+and waits past it. A token other than NEAR is covered only when it leaves the
+intents balance: sent from the wallet's NEAR account it is a contract call,
+which always waits. NEAR on the account is `native` and NEAR inside intents is
+`nep141:wrap.near`; each needs its own entry, in the limits as well. It reads the spend counters the daily limit reads, so it has
 that limit's standing (see [Limits we state plainly](#11-limits-we-state-plainly)),
 and when the counters cannot be read the operation waits.
 `rules.addresses.unlisted: "ask"` makes a payment to an address off the
