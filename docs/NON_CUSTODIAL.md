@@ -399,10 +399,12 @@ Every use of them is a public NEAR transaction.
   can obtain the shared master secret outside any enclave.
 - **One account approves builds.** Enclave measurements are approved by
   the DAO owner alone, and the DAO has one member.
-- **Contracts upgrade by key.** The policy contract (`outlayer.near`), the
-  DAO contract and the worker registration contract are each redeployed
-  with a full-access key, without a vote or a delay. A redeploy of the
-  policy contract can rewrite or remove any stored policy.
+- **Contracts upgrade by key.** The policy contract (`outlayer.near`) and
+  the DAO contract are each redeployed with a full-access key, without a
+  vote or a delay. A redeploy of the policy contract can rewrite or remove
+  any stored policy. The worker registration contract
+  (`worker.outlayer.near`) holds no full-access key and upgrades only
+  through a DAO proposal.
 
 Before significant funds go through, these move to the DAO: the
 full-access keys are removed, measurement approval, membership changes and

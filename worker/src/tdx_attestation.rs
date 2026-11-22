@@ -21,6 +21,76 @@ pub fn refuse_small_order_binding(binding: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
+/// The 64 bytes a task's quote carries as report_data: the SHA-256 of the task's fields, then
+/// 32 zero bytes. Strings and hashes go in as their UTF-8 text, integers as 8 little-endian
+/// bytes, and an absent field adds nothing. Verifiers outside this repository recompute these
+/// bytes from a published record (WORKER_ATTESTATION.md, Stage 3), so the order and the
+/// encoding of every field are fixed; `task_report_data_tests` holds one mainnet record.
+#[allow(clippy::too_many_arguments)]
+pub fn task_report_data(
+    task_type: &str,
+    task_id: i64,
+    repo: Option<&str>,
+    commit: Option<&str>,
+    build_target: Option<&str>,
+    wasm_hash: Option<&str>,
+    input_hash: Option<&str>,
+    output_hash: &str,
+    block_height: Option<u64>,
+    caller_account_id: Option<&str>,
+    project_id: Option<&str>,
+    secrets_ref: Option<&str>,
+    timestamp: i64,
+    attached_usd: Option<&str>,
+) -> [u8; 64] {
+    let mut hasher = Sha256::new();
+
+    // Original fields
+    hasher.update(task_type.as_bytes());
+    hasher.update(&task_id.to_le_bytes());
+    if let Some(r) = repo {
+        hasher.update(r.as_bytes());
+    }
+    if let Some(c) = commit {
+        hasher.update(c.as_bytes());
+    }
+    if let Some(bt) = build_target {
+        hasher.update(bt.as_bytes());
+    }
+    if let Some(wh) = wasm_hash {
+        hasher.update(wh.as_bytes());
+    }
+    if let Some(ih) = input_hash {
+        hasher.update(ih.as_bytes());
+    }
+    hasher.update(output_hash.as_bytes());
+    if let Some(bh) = block_height {
+        hasher.update(&bh.to_le_bytes());
+    }
+
+    // V1 fields: caller, project, secrets, timestamp, payment
+    if let Some(caller) = caller_account_id {
+        hasher.update(caller.as_bytes());
+    }
+    if let Some(pid) = project_id {
+        hasher.update(pid.as_bytes());
+    }
+    if let Some(sref) = secrets_ref {
+        hasher.update(sref.as_bytes());
+    }
+    hasher.update(&timestamp.to_le_bytes());
+    if let Some(usd) = attached_usd {
+        hasher.update(usd.as_bytes());
+    }
+
+    let task_hash = hasher.finalize();
+
+    // Create report_data: [task_hash (32 bytes)][zeros (32 bytes)]
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&task_hash);
+    report_data
+}
+
 // TDX Quote v4 = Header (48 bytes) + TD10 Report Body (584 bytes) + Auth Data
 // Absolute offsets for measurements within the raw quote bytes:
 const MEASUREMENT_SIZE: usize = 48; // Each measurement is 48 bytes (96 hex chars)
@@ -184,52 +254,22 @@ impl TdxClient {
         timestamp: i64,
         attached_usd: Option<&str>,
     ) -> Result<String> {
-        // Build report_data from all task parameters (V1 format)
-        let mut hasher = Sha256::new();
-
-        // Original fields
-        hasher.update(task_type.as_bytes());
-        hasher.update(&task_id.to_le_bytes());
-        if let Some(r) = repo {
-            hasher.update(r.as_bytes());
-        }
-        if let Some(c) = commit {
-            hasher.update(c.as_bytes());
-        }
-        if let Some(bt) = build_target {
-            hasher.update(bt.as_bytes());
-        }
-        if let Some(wh) = wasm_hash {
-            hasher.update(wh.as_bytes());
-        }
-        if let Some(ih) = input_hash {
-            hasher.update(ih.as_bytes());
-        }
-        hasher.update(output_hash.as_bytes());
-        if let Some(bh) = block_height {
-            hasher.update(&bh.to_le_bytes());
-        }
-
-        // V1 fields: caller, project, secrets, timestamp, payment
-        if let Some(caller) = caller_account_id {
-            hasher.update(caller.as_bytes());
-        }
-        if let Some(pid) = project_id {
-            hasher.update(pid.as_bytes());
-        }
-        if let Some(sref) = secrets_ref {
-            hasher.update(sref.as_bytes());
-        }
-        hasher.update(&timestamp.to_le_bytes());
-        if let Some(usd) = attached_usd {
-            hasher.update(usd.as_bytes());
-        }
-
-        let task_hash = hasher.finalize();
-
-        // Create report_data: [task_hash (32 bytes)][zeros (32 bytes)]
-        let mut report_data = [0u8; 64];
-        report_data[..32].copy_from_slice(&task_hash);
+        let report_data = task_report_data(
+            task_type,
+            task_id,
+            repo,
+            commit,
+            build_target,
+            wasm_hash,
+            input_hash,
+            output_hash,
+            block_height,
+            caller_account_id,
+            project_id,
+            secrets_ref,
+            timestamp,
+            attached_usd,
+        );
 
         match self.tee_mode.as_str() {
             "outlayer_tee" => {
@@ -353,5 +393,67 @@ mod small_order_tests {
         }
         let real = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes();
         assert!(refuse_small_order_binding(&real).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod task_report_data_tests {
+    use super::task_report_data;
+
+    /// Mainnet request 3000 (job 1366380, transaction
+    /// HCg8VWbhtuH8B5pqTru2d4TV355EX5tAQUjpxdjZ2Coc), as served by
+    /// `GET /attestations/by-request/3000`. The expected bytes are report_data of the quote in
+    /// that record, so a change to the order or the encoding of a field fails here.
+    #[test]
+    fn a_mainnet_record_recomputes_to_its_quote() {
+        let report_data = task_report_data(
+            "execute",
+            1366380,
+            None,
+            None,
+            Some("wasm32-wasip2"),
+            Some("7848be7da1912588fc708fca488f032422e5b4088a3ffea018becd9a3a5664f4"),
+            Some("ce05a2d132fd4e214b1c25935e5da5fde6c7991c49267b164a19ea56ea83d607"),
+            "0dd2c6a04df67b506ee84ef0aef1ec315bf635e5ad6fa122289f0725fdc324d8",
+            Some(224188236),
+            Some("allwinner.near"),
+            None,
+            None,
+            1794471458,
+            Some("0"),
+        );
+        assert_eq!(
+            hex::encode(&report_data[..32]),
+            "fd9e8e53f747fc957f5e1ee134a579c8a5b746429867fde8d891d214412308b3"
+        );
+        assert_eq!(report_data[32..], [0u8; 32]);
+    }
+
+    /// Every field is part of the hash: changing any one changes the bytes.
+    #[test]
+    fn every_field_changes_the_bytes() {
+        let all = |f: usize| {
+            let s = |i: usize, v: &'static str| if f == i { "x" } else { v };
+            task_report_data(
+                s(0, "execute"),
+                if f == 1 { 2 } else { 1 },
+                Some(s(2, "repo")),
+                Some(s(3, "commit")),
+                Some(s(4, "target")),
+                Some(s(5, "wasm")),
+                Some(s(6, "input")),
+                s(7, "output"),
+                Some(if f == 8 { 2 } else { 1 }),
+                Some(s(9, "caller")),
+                Some(s(10, "project")),
+                Some(s(11, "secrets")),
+                if f == 12 { 2 } else { 1 },
+                Some(s(13, "usd")),
+            )
+        };
+        let base = all(usize::MAX);
+        for field in 0..14 {
+            assert_ne!(all(field), base, "field {field}");
+        }
     }
 }
