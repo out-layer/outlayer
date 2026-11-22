@@ -59,6 +59,7 @@ container: run it again.
 the release out and upgrade from the copy:
 
 ```bash
+rm -rf ~/dao-release
 mkdir -p ~/dao-release
 
 # dao
