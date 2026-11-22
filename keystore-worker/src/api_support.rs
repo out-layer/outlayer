@@ -1293,8 +1293,9 @@ pub(super) async fn admin_ban_vault_handler(
 
     // 2. Submit ban_vault tx, serialized through signer_nonce_lock to
     //    avoid racing /sign-vault-verification on the keystore-DAO
-    //    access key's nonce.
-    let outcome = {
+    //    access key's nonce. The lock covers the send alone; the wait
+    //    for a final block runs after it is released.
+    let sent = {
         let _guard = ctx.signer_nonce_lock.lock().await;
         near_client
             .submit_function_call(
@@ -1306,6 +1307,10 @@ pub(super) async fn admin_ban_vault_handler(
                 0,
             )
             .await
+    };
+    let outcome = match sent {
+        Ok(executed) => near_client.wait_until_final(executed).await,
+        Err(e) => Err(e),
     }
     .map_err(|e| {
         tracing::error!(
@@ -1361,9 +1366,9 @@ pub(super) async fn admin_ban_vault_handler(
 ///    using the worker's approved access key on the keystore-dao
 ///    contract (set up at TEE registration time).
 /// 3. Returns the tx hash once the transaction is in a final block
-///    ([`crate::near::NearClient::submit_function_call`] waits for it), so
-///    an `is_vault_verified` read made after the answer sees the vault
-///    verified.
+///    ([`crate::near::NearClient::wait_until_final`], after the nonce lock
+///    is released), so an `is_vault_verified` read made after the answer
+///    sees the vault verified.
 ///
 /// **Critically NOT done here:** MPC CKD for the vault's master.
 /// That's lazy on first wallet-request via [`crate::mpc_ckd::add_customer`]
@@ -1457,10 +1462,10 @@ pub(super) async fn sign_vault_verification_handler(
     // 2. Submit mark_vault_verified tx, serializing through the
     //    per-signer nonce lock so concurrent /sign-vault-verification
     //    calls (and /admin/ban-vault) don't race for the same nonce.
-    //    The lock is held until the call returns, which is once the
-    //    transaction is final: two or three blocks after it executed.
-    //    300 TGas, no deposit.
-    let outcome = {
+    //    The lock covers the send alone; the answer waits, without it,
+    //    until the transaction is final: two or three blocks after it
+    //    executed. 300 TGas, no deposit.
+    let sent = {
         let _guard = ctx.signer_nonce_lock.lock().await;
         near_client
             .submit_function_call(
@@ -1472,6 +1477,10 @@ pub(super) async fn sign_vault_verification_handler(
                 0,
             )
             .await
+    };
+    let outcome = match sent {
+        Ok(executed) => near_client.wait_until_final(executed).await,
+        Err(e) => Err(e),
     }
     .map_err(|e| {
         tracing::error!(

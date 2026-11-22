@@ -60,6 +60,7 @@ use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 
 mod owner_exit;
+mod wallet_keys;
 
 const BLS12381G1_PUBLIC_KEY_SIZE: usize = 48;
 const OUTPUT_SECRET_SIZE: usize = 32;
@@ -165,25 +166,6 @@ fn warn_sensitive_stdout(what: &str) {
     );
 }
 
-/// `customer-recovery derive-wallet-key --master <hex> --wallet-id <uuid>`
-/// — given the per-vault master recovered from MPC CKD, re-derive
-/// the NEAR wallet keypair that OutLayer's keystore-worker would
-/// have minted for `(vault, wallet_id)`. This is the final step of
-/// the sovereign-exit chain: after the on-chain `finalize_recovery`,
-/// the user has the master locally — but the WALLET they were using
-/// was minted by the keystore from that master + a UUID. Without
-/// re-deriving that wallet's private key, the customer has the
-/// secrets but no direct path to the on-chain wallet balance.
-///
-/// Derivation matches keystore-worker's `Keystore::derive_keypair`
-/// (`keystore-worker/src/crypto.rs:284`):
-///     seed       = "wallet:{wallet_id}:near"
-///     hmac_out   = HMAC-SHA256(master, seed)
-///     secret_key = ed25519::SecretKey::from_bytes(hmac_out[..32])
-///
-/// The wallet's NEAR account id is the hex-encoded pubkey (implicit
-/// account format). Output as JSON for easy `jq` consumption by
-/// `tests/sovereignty_e2e.sh`.
 /// `customer-recovery decrypt-secret --master <hex> --seed <s>
 /// --ciphertext-base64 <b64>` — locally decrypt a secret that was
 /// stored on-chain via `outlayer secrets set`. Used by
@@ -1063,60 +1045,6 @@ mod compute_wallet_id_tests {
     }
 }
 
-fn derive_wallet_key_subcommand(master_hex: &str, wallet_id: &str) -> Result<()> {
-    use hmac::{Hmac, Mac};
-    use zeroize::Zeroizing;
-    type HmacSha256 = Hmac<sha2::Sha256>;
-
-    // Wrap master + derived seed in Zeroizing so the buffers are wiped
-    // on drop even if the function panics. Rust does not zero memory
-    // by default — without this, a core dump or swap-out persists the
-    // 32-byte master / 32-byte signing seed.
-    let master = Zeroizing::new(
-        hex::decode(master_hex.trim())
-            .context("--master must be hex-encoded (32 bytes)")?,
-    );
-    if master.len() != 32 {
-        anyhow::bail!("--master must decode to 32 bytes, got {}", master.len());
-    }
-
-    let seed = format!("wallet:{}:near", wallet_id);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&master)
-        .expect("HMAC can take a key of any size");
-    mac.update(seed.as_bytes());
-    let derived = mac.finalize().into_bytes();
-
-    let mut secret_bytes = Zeroizing::new([0u8; 32]);
-    secret_bytes.copy_from_slice(&derived[..32]);
-
-    // near-crypto's ED25519 SecretKey wants a 64-byte expanded form
-    // (32 seed + 32 pubkey). Build it via ed25519-dalek so the seed
-    // expansion matches what keystore-worker does on the signing side.
-    let ed_sk = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
-    let ed_pk_bytes = ed_sk.verifying_key().to_bytes();
-
-    let mut full_secret = Zeroizing::new([0u8; 64]);
-    full_secret[..32].copy_from_slice(&*secret_bytes);
-    full_secret[32..].copy_from_slice(&ed_pk_bytes);
-
-    let private_key = format!(
-        "ed25519:{}",
-        bs58::encode(&full_secret).into_string()
-    );
-    let public_key = format!("ed25519:{}", bs58::encode(&ed_pk_bytes).into_string());
-    let near_address = hex::encode(ed_pk_bytes);
-
-    let json = serde_json::json!({
-        "wallet_id": wallet_id,
-        "near_address": near_address,
-        "public_key": public_key,
-        "private_key": private_key,
-    });
-    warn_sensitive_stdout(&format!("the wallet ({}) private key", near_address));
-    println!("{}", serde_json::to_string_pretty(&json)?);
-    Ok(())
-}
-
 /// Reject non-HTTPS URLs at the boundary. Recovery is a one-shot
 /// operation where any MITM on the response wire can silently misdirect
 /// derivation (wrong `derivation_path` from NEARblocks, fake MPC share
@@ -1358,37 +1286,43 @@ async fn main() -> Result<()> {
         return compute_wallet_id_subcommand(&a, &s, vault_id.as_deref());
     }
     if argv.len() >= 2 && argv[1] == "derive-wallet-key" {
-        // Parse `--master <hex> --wallet-id <uuid>` from the tail of
-        // argv. Hand-rolled to avoid restructuring the top-level clap
-        // (see comment above). Order doesn't matter; both flags
-        // required.
+        // `derive-wallet-key --wallet-id <id> [--master <hex>] [--chain <c>]… [--sub-path <p>]…
+        // [--checks <n>]` — see `wallet_keys`. Hand-rolled like the other side paths.
+        const USAGE: &str = "Usage: customer-recovery derive-wallet-key --wallet-id <id> [--master <hex>] \
+            [--chain near|evm|solana|all]... [--sub-path <p>]... [--checks <n>]";
         let mut master_hex: Option<String> = None;
         let mut wallet_id: Option<String> = None;
+        let mut chains: Vec<String> = Vec::new();
+        let mut sub_paths: Vec<String> = Vec::new();
+        let mut checks: Option<u64> = None;
         let mut i = 2;
         while i < argv.len() {
-            match argv[i].as_str() {
-                "--master" => {
-                    master_hex = argv.get(i + 1).cloned();
-                    i += 2;
+            let flag = argv[i].as_str();
+            let value = argv
+                .get(i + 1)
+                .cloned()
+                .ok_or_else(|| anyhow!("derive-wallet-key: {flag} takes a value\n{USAGE}"))?;
+            match flag {
+                "--master" => master_hex = Some(value),
+                "--wallet-id" => wallet_id = Some(value),
+                "--chain" => chains.push(value),
+                "--sub-path" => sub_paths.push(value),
+                "--checks" => {
+                    checks = Some(value.parse().map_err(|_| {
+                        anyhow!("derive-wallet-key: --checks takes a count of payment checks, got '{value}'")
+                    })?)
                 }
-                "--wallet-id" => {
-                    wallet_id = argv.get(i + 1).cloned();
-                    i += 2;
-                }
-                other => anyhow::bail!(
-                    "unknown derive-wallet-key flag: {}\nUsage: customer-recovery derive-wallet-key --master <hex> --wallet-id <uuid>",
-                    other
-                ),
+                other => anyhow::bail!("unknown derive-wallet-key flag: {other}\n{USAGE}"),
             }
+            i += 2;
         }
-        let master = flag_or_env(master_hex, "CUSTOMER_RECOVERY_MASTER")
-            .ok_or_else(|| {
+        let master = zeroize::Zeroizing::new(
+            flag_or_env(master_hex, "CUSTOMER_RECOVERY_MASTER").ok_or_else(|| {
                 anyhow!("derive-wallet-key: --master <hex> or $CUSTOMER_RECOVERY_MASTER required")
-            })?;
-        let wallet = wallet_id.ok_or_else(|| {
-            anyhow!("derive-wallet-key: --wallet-id <uuid> required")
-        })?;
-        return derive_wallet_key_subcommand(&master, &wallet);
+            })?,
+        );
+        let wallet = wallet_id.ok_or_else(|| anyhow!("derive-wallet-key: --wallet-id <id> required"))?;
+        return wallet_keys::run(&master, &wallet, &chains, &sub_paths, checks);
     }
 
     tracing_subscriber::fmt()

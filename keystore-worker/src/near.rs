@@ -215,7 +215,21 @@ fn build_rpc_client(rpc_url: &str, timeout_secs: u64) -> RpcClient {
 // `api.rs::accessor_to_contract_json`, which uses
 // `crate::utils::normalize_repo_url` exclusively.
 
-/// Result of a successful function-call transaction submission.
+/// A function-call transaction that executed and succeeded, its block not known to be final
+/// yet: what [`NearClient::submit_function_call`] returns. The only way to its hash and its
+/// value is [`NearClient::wait_until_final`], so a caller answers about the write only once
+/// a view at final finality sees it.
+#[derive(Debug)]
+#[must_use = "a write is done when its block is final: pass it to `NearClient::wait_until_final`"]
+pub struct ExecutedCall {
+    tx_hash: near_primitives::hash::CryptoHash,
+    signer: AccountId,
+    receiver_id: AccountId,
+    method_name: String,
+    success_value: Vec<u8>,
+}
+
+/// Result of a successful function-call transaction, in a final block.
 #[derive(Debug, Clone)]
 pub struct FunctionCallOutcome {
     /// Base58-encoded NEAR tx hash. Suitable for log/explorer use.
@@ -858,9 +872,11 @@ impl NearClient {
     }
 
     /// Submit a function-call transaction signed by `signer`, calling
-    /// `receiver.method(args)`. Returns the tx hash + raw success-value bytes
-    /// once the transaction is in a FINAL block: a view made after it, by
-    /// this client or by the coordinator, sees what it wrote.
+    /// `receiver.method(args)`. Returns once the transaction has executed
+    /// and succeeded, two or three blocks before its block is final: the
+    /// caller passes the [`ExecutedCall`] to [`Self::wait_until_final`]
+    /// before it reads back or answers, so a view made after it, by this
+    /// client or by the coordinator, sees what it wrote.
     ///
     /// Used by `/sign-vault-verification` (and future `/admin/ban-vault`)
     /// to land a tx via the worker's approved access key on the
@@ -875,10 +891,12 @@ impl NearClient {
     /// only one wins. The loser surfaces an opaque `InvalidNonce`.
     /// Callers using a SHARED signer (e.g. `MpcContext::keystore_dao_signer`,
     /// which is bound to one access key on keystore-dao) MUST acquire
-    /// the corresponding `MpcContext::signer_nonce_lock` for the
-    /// build+broadcast critical section. Callers with a per-call
-    /// fresh signer (e.g. `mpc_ckd::add_customer`'s vault signer)
-    /// don't need the lock — each vault has its own access key.
+    /// the corresponding `MpcContext::signer_nonce_lock` for this call —
+    /// the build, sign, broadcast and nonce retry — and release it before
+    /// [`Self::wait_until_final`]: the nonce was spent when the broadcast
+    /// answered, and the next send reads it at optimistic finality.
+    /// Callers with a per-call fresh signer (e.g. `mpc_ckd::add_customer`'s
+    /// vault signer) don't need the lock — each vault has its own access key.
     pub async fn submit_function_call(
         &self,
         signer: &near_crypto::InMemorySigner,
@@ -887,7 +905,7 @@ impl NearClient {
         args: serde_json::Value,
         gas: u64,
         deposit: u128,
-    ) -> Result<FunctionCallOutcome> {
+    ) -> Result<ExecutedCall> {
         use near_primitives::transaction::{Action, FunctionCallAction, Transaction, TransactionV0};
         use near_primitives::types::Finality;
 
@@ -987,19 +1005,13 @@ impl NearClient {
         };
 
         match &outcome.status {
-            near_primitives::views::FinalExecutionStatus::SuccessValue(value) => {
-                // `broadcast_tx_commit` answers once the transaction has executed, two or
-                // three blocks before its block is final, and every view of this client —
-                // and of the coordinator — reads at final finality. The call is done when
-                // such a read sees what it wrote.
-                self.wait_until_final(tx_hash, &signer.account_id)
-                    .await
-                    .with_context(|| format!("{receiver_id}.{method_name} executed in {tx_hash}, and is not final yet"))?;
-                Ok(FunctionCallOutcome {
-                    tx_hash: tx_hash.to_string(),
-                    success_value: value.clone(),
-                })
-            }
+            near_primitives::views::FinalExecutionStatus::SuccessValue(value) => Ok(ExecutedCall {
+                tx_hash,
+                signer: signer.account_id.clone(),
+                receiver_id: receiver_id.clone(),
+                method_name: method_name.to_string(),
+                success_value: value.clone(),
+            }),
             near_primitives::views::FinalExecutionStatus::Failure(err) => {
                 anyhow::bail!("{receiver_id}.{method_name} tx failed: {err:?}")
             }
@@ -1009,9 +1021,21 @@ impl NearClient {
         }
     }
 
-    /// Wait until the transaction `tx_hash` of `sender` is in a FINAL block: a view at final
-    /// finality made after this sees what the transaction wrote.
-    async fn wait_until_final(&self, tx_hash: near_primitives::hash::CryptoHash, sender: &AccountId) -> Result<()> {
+    /// Wait until an executed call is in a FINAL block, and hand back its hash and value.
+    /// `broadcast_tx_commit` answers once the transaction has executed, two or three blocks
+    /// before its block is final, and every view of this client — and of the coordinator —
+    /// reads at final finality: the write is done when such a read sees it. Takes no lock: a
+    /// caller holding `signer_nonce_lock` for the send releases it before this.
+    pub async fn wait_until_final(&self, executed: ExecutedCall) -> Result<FunctionCallOutcome> {
+        let ExecutedCall { tx_hash, signer, receiver_id, method_name, success_value } = executed;
+        self.wait_for_final_block(tx_hash, &signer)
+            .await
+            .with_context(|| format!("{receiver_id}.{method_name} executed in {tx_hash}, and is not final yet"))?;
+        Ok(FunctionCallOutcome { tx_hash: tx_hash.to_string(), success_value })
+    }
+
+    /// Ask for the status of `tx_hash` of `sender` until a node says its block is FINAL.
+    async fn wait_for_final_block(&self, tx_hash: near_primitives::hash::CryptoHash, sender: &AccountId) -> Result<()> {
         use near_jsonrpc_client::errors::{JsonRpcError, JsonRpcServerError, JsonRpcServerResponseStatusError};
         use near_jsonrpc_primitives::types::transactions::{RpcTransactionError, TransactionInfo};
         use near_primitives::views::TxExecutionStatus;
@@ -1028,8 +1052,9 @@ impl NearClient {
                 Ok(Err(e)) => e,
                 Err(_) => anyhow::bail!("not final after {} s", FINALITY_WAIT.as_secs()),
             };
-            // A node that gave up waiting (its own timeout, a 408), one that has not seen the
-            // transaction yet behind a load balancer, or no answer at all says nothing about it: the transaction
+            // A node that gave up waiting (its own timeout, a 408), one that is unavailable (a
+            // 503), one that has not seen the transaction yet behind a load balancer, or no answer
+            // at all says nothing about it: the transaction
             // has executed, so it is asked again until the deadline. Any other answer is the
             // error.
             let says_nothing = match error.rpc() {
@@ -1041,9 +1066,11 @@ impl NearClient {
                         Some(RpcTransactionError::UnknownTransaction { .. }) | Some(RpcTransactionError::TimeoutError)
                     ) || matches!(
                         rpc,
+                        // The client reports a 408 and a 503 as these two, not as a status.
                         JsonRpcError::ServerError(JsonRpcServerError::ResponseStatusError(
-                            JsonRpcServerResponseStatusError::Unexpected { status }
-                        )) if *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                            JsonRpcServerResponseStatusError::TimeoutError
+                                | JsonRpcServerResponseStatusError::ServiceUnavailable
+                        ))
                     )
                 }
             };
@@ -1231,20 +1258,21 @@ mod tests {
 
     /// A JSON-RPC endpoint that answers the `tx` requests it gets with `answers`, in order,
     /// and counts them. One connection per request (the client is told to close).
-    fn tx_status_server(answers: Vec<&'static str>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    fn tx_status_server(answers: Vec<(&'static str, &'static str)>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = asked.clone();
         std::thread::spawn(move || {
-            for (body, stream) in answers.into_iter().zip(listener.incoming()) {
+            for ((status, body), stream) in answers.into_iter().zip(listener.incoming()) {
                 let mut stream = stream.expect("accept");
                 let mut buf = [0u8; 8192];
                 let _ = stream.read(&mut buf);
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let reply = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
                     body.len(),
                     body
                 );
@@ -1263,29 +1291,80 @@ mod tests {
         "dao.outlayer.testnet".parse().unwrap()
     }
 
-    /// A node that has not seen the transaction, or gave up waiting, is asked again; the
-    /// wait ends when one says the block is final.
+    fn executed() -> ExecutedCall {
+        ExecutedCall {
+            tx_hash: near_primitives::hash::CryptoHash::default(),
+            signer: sender(),
+            receiver_id: sender(),
+            method_name: "store_escrow".to_string(),
+            success_value: b"\"ok\"".to_vec(),
+        }
+    }
+
+    /// A node that has not seen the transaction, gave up waiting (its own timeout or a 408),
+    /// or is unavailable (503) is asked again; the wait ends when one says the block is final.
     #[tokio::test]
     async fn the_finality_wait_asks_again_until_a_node_says_final() {
-        let (url, asked) = tx_status_server(vec![TX_UNKNOWN, TX_TIMEOUT, TX_FINAL]);
+        let (url, asked) = tx_status_server(vec![
+            ("200 OK", TX_UNKNOWN),
+            ("408 Request Timeout", ""),
+            ("503 Service Unavailable", ""),
+            ("200 OK", TX_TIMEOUT),
+            ("200 OK", TX_FINAL),
+        ]);
         let client = NearClient::new(&url, "outlayer.testnet").expect("client");
-        client
-            .wait_until_final(near_primitives::hash::CryptoHash::default(), &sender())
-            .await
-            .expect("final on the third answer");
-        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let outcome = client.wait_until_final(executed()).await.expect("final on the fifth answer");
+        assert_eq!(outcome.tx_hash, near_primitives::hash::CryptoHash::default().to_string());
+        assert_eq!(outcome.success_value, b"\"ok\"".to_vec());
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// Every write with the keystore's one DAO key holds `signer_nonce_lock` for its send
+    /// alone: the block that holds the guard closes before the wait for a final block, so a
+    /// second write can take the lock while the first waits, and every caller waits before
+    /// it reads back or answers.
+    #[test]
+    fn the_nonce_lock_is_released_before_the_finality_wait() {
+        let api_support = include_str!("api_support.rs");
+        let mpc_ckd = include_str!("mpc_ckd.rs");
+        for (text, from) in [
+            (api_support, "pub(super) async fn admin_ban_vault_handler("),
+            (api_support, "pub(super) async fn sign_vault_verification_handler("),
+            (mpc_ckd, "async fn write_owner_escrow("),
+        ] {
+            let at = text.find(from).unwrap_or_else(|| panic!("{from} is gone"));
+            let body = &text[at..at + text[at..].find("\n}\n").expect("the function's end")];
+            let lock = body.find("signer_nonce_lock.lock().await").unwrap_or_else(|| panic!("{from} takes no nonce lock"));
+            let mut depth = 0i32;
+            let released = body[lock..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth < 0).then_some(lock + i)
+                })
+                .unwrap_or_else(|| panic!("{from}: the block holding the guard never closes"));
+            let send = body.find(".submit_function_call(").unwrap_or_else(|| panic!("{from} sends nothing"));
+            let wait = body.find(".wait_until_final(").unwrap_or_else(|| panic!("{from} never waits for a final block"));
+            assert!(lock < send && send < released, "{from}: the send runs under the lock");
+            assert!(released < wait, "{from}: the lock is released before the wait for a final block");
+        }
+        assert_eq!(api_support.matches(".submit_function_call(").count(), 2, "a new sender is a new row above");
+        assert_eq!(mpc_ckd.matches(".submit_function_call(").count(), 1, "a new sender is a new row above");
+        assert!(!include_str!("api.rs").contains(".submit_function_call("));
     }
 
     /// Any other answer of the node is the error, at once.
     #[tokio::test]
     async fn the_finality_wait_ends_on_an_answer_about_the_transaction() {
-        let (url, asked) = tx_status_server(vec![TX_INVALID, TX_FINAL]);
+        let (url, asked) = tx_status_server(vec![("200 OK", TX_INVALID), ("200 OK", TX_FINAL)]);
         let client = NearClient::new(&url, "outlayer.testnet").expect("client");
-        let e = client
-            .wait_until_final(near_primitives::hash::CryptoHash::default(), &sender())
-            .await
-            .expect_err("an invalid transaction is not waited on");
+        let e = client.wait_until_final(executed()).await.expect_err("an invalid transaction is not waited on");
         assert!(format!("{e:#}").contains("could not say whether the transaction is final"), "{e:#}");
+        assert!(format!("{e:#}").contains("dao.outlayer.testnet.store_escrow executed in"), "{e:#}");
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

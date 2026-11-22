@@ -29,6 +29,9 @@
 #   L8  the same signed write a second time is refused (version)
 #   L9  unfreeze works
 #   L10 the owner alone re-locks (version 3)
+#   L10t a transfer under the locked policy is held, executed after both votes,
+#       and announced (`request_completed`) to the policy's webhook, judged as
+#       L7w judges (0.02 NEAR sent to the wallet; skipped without a receiver)
 #   L11 a reject by one approver ends the write: rejected, no signature
 #   L12 three writes held over the same version: A and B gather their quorum
 #       and are both signed; A (still locked, same approvers) stores, B is
@@ -78,6 +81,16 @@ vote() {
     '{signature:$s, public_key:$pk, account_id:$a, nonce:$n}')
   [[ "$verb" == reject ]] && body=$(jq -c '. + {reason:"e2e"}' <<<"$body")
   api - POST "/wallet/v1/$verb/$AID" "$body" >/dev/null
+}
+
+# quorum <desc> <aid> <hash> — both approvers vote YES; a vote the coordinator
+# refuses is a failure here, not a silent miss.
+quorum() {
+  local desc=$1 who; AID=$2; RHASH=$3
+  for who in "$APPROVER" "$APPROVER2"; do
+    vote approve "$who"
+    [[ "$HTTP" == 200 ]] || fail "$desc vote by $who → HTTP $HTTP: $(head -c 160 <<<"$BODY")"
+  done
 }
 
 # call <signer> <method> <args-json> <deposit> — a contract call; OUT, RC.
@@ -324,6 +337,30 @@ landed "L9 unfrozen" && meta_is L9 2 false false
 log "L10 the owner alone re-locks"
 if store_policy "$SEED" "$WALLET_ID" "$LOCKED"; then pass "L10 stored"; meta_is L10 3 true; else fail "L10 re-lock not stored"; fi
 
+# ── L10t ─────────────────────────────────────────────────────────────────────
+# A transfer under the locked policy: held for its two approvers, executed after
+# their votes, and announced as `request_completed` to the policy's webhook.
+log "L10t a transfer under the lock is held, executed after two votes, and announced"
+if hook_ready L10t "the executed transfer's webhook (request_completed)"; then
+  if fund_account "$ADDR" 0.02; then
+    api "$SEED" POST /wallet/v1/transfer \
+      "$(jq -nc --arg to "$PARENT" '{chain:"near", to:$to, amount:"1000000000000000000000"}')" >/dev/null
+    T_AID=$(jq -r '.approval_id // empty' <<<"$BODY"); T_RID=$(jq -r '.request_id // empty' <<<"$BODY")
+    if [[ -z "$T_AID" || -z "$T_RID" ]]; then
+      fail "L10t the transfer was not held for approval: HTTP $HTTP $(jq -r '.message // .error // ""' <<<"$BODY" | head -c 160)"
+    else
+      pass "L10t held: approval $T_AID, request $T_RID"
+      api - GET "/wallet/v1/approval/$T_AID" >/dev/null
+      WPK=$(jq -r '.wallet_pubkey' <<<"$BODY")
+      quorum L10t "$T_AID" "$(jq -r '.request_hash' <<<"$BODY")"
+      wait_request "$T_RID"
+      [[ "$ST" == success ]] && pass "L10t the transfer executed after both votes" \
+        || fail "L10t the transfer ended $ST: $(jq -c '.result' <<<"$BODY" | head -c 200)"
+      hook_await L10t request_completed "$T_RID" "the executed transfer was announced to the policy's webhook"
+    fi
+  else fail "L10t the wallet could not be funded for the transfer"; fi
+fi
+
 # ── L11 ──────────────────────────────────────────────────────────────────────
 log "L11 a reject ends the write"
 if hold L11 "$OPEN"; then
@@ -341,15 +378,6 @@ log "L12 three writes over version 4"
 hold "L12 A" "$LOCKED_B"; A_AID=$AID; A_RID=$RID; A_HASH=$RHASH
 hold "L12 B" "$OPEN_B";   B_AID=$AID; B_RID=$RID; B_HASH=$RHASH
 hold "L12 C" "$OPEN_C";   C_AID=$AID; C_RID=$RID; C_HASH=$RHASH
-# quorum <desc> <aid> <hash> — both approvers vote YES; a vote the coordinator
-# refuses is a failure here, not a silent miss.
-quorum() {
-  local desc=$1 who; AID=$2; RHASH=$3
-  for who in "$APPROVER" "$APPROVER2"; do
-    vote approve "$who"
-    [[ "$HTTP" == 200 ]] || fail "$desc vote by $who → HTTP $HTTP: $(head -c 160 <<<"$BODY")"
-  done
-}
 if [[ -n "${A_AID:-}" && -n "${B_AID:-}" && -n "${C_AID:-}" ]]; then
   quorum "L12 A" "$A_AID" "$A_HASH"; wait_request "$A_RID"; A_ST=$ST; A_WRITE=$(jq -c '.result' <<<"$BODY")
   quorum "L12 B" "$B_AID" "$B_HASH"; wait_request "$B_RID"; B_ST=$ST; B_WRITE=$(jq -c '.result' <<<"$BODY")

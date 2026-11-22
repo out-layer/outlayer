@@ -27,9 +27,9 @@
 #   G6  /admin/earnings counts the converted trial once, at its trial
 #       allowance, plus each ledger row; /admin/connector-calls shows the
 #       converted trial's call paid_by_grant
-#   G7  (HOOK_URL from tests/hook_receiver.sh) a one-day gift onto wallet B's
-#       trial, its webhook named → within three minutes `subscription_notification`
-#       reason `expiring` reaches the receiver, verifies under the API's
+#   G7  (HOOK_URL from tests/hook_receiver.sh) a gift of one minimal unit onto
+#       wallet B's trial, its webhook named → within three minutes
+#       `subscription_notification` reason `low_allowance` reaches the receiver, verifies under the API's
 #       webhook-keys, is sent as `<owner>:0` and carries no X-Webhook-Signature
 #   G8  amount_usd cap+1 / "0" / "abc" → 400 naming GIFT_SUBSCRIPTION_USD; days
 #       0 / 3651 → 400; the key untouched
@@ -225,7 +225,7 @@ if [[ "$APPLY" != true ]]; then
     • G4 gift one idle, test-minted customer key (nonce ≥ 1, no allowance) twice
     • G9 a refused gift on a key holding more than the cap (409, nothing written)
     • S5 LONG=1: the second trial's calls to exhaustion, then 402 trial_exhausted
-    • G7 (with a webhook receiver) a one-day gift onto the second wallet's trial, its webhook named and cleared; waits up to 3 min for the warning
+    • G7 (with a webhook receiver) a gift of one minimal unit onto the second wallet's trial, its webhook named and cleared; waits up to 3 min for the warning
     • D2/D3/D4 describe 404s, 70 describe GETs for the 429, a scan of the refusals
 EOF
   [[ -n "$ADMIN_TOKEN" ]] || { fail "preflight: no admin bearer"; }
@@ -734,11 +734,13 @@ else
 fi
 
 # ── G7: the warning of a converted trial reaches its webhook, signed ────────
-# A gift of one day makes wallet B's trial a subscription that lapses inside
-# the warning window, so the next sweep (every minute) sends `expiring` to the
-# key's webhook. No money moves: the gift is an admin grant. Run last of the
-# rows that use wallet B: the gift converts its trial.
-log "G7 a converted trial about to lapse is warned at its webhook"
+# A gift of one minimal unit makes wallet B's trial a subscription whose
+# allowance is below any low-allowance threshold, so the next sweep (every
+# minute) sends `low_allowance` to the key's webhook. A shorter gift would not
+# do: a gift never moves the end of a key earlier, and a trial ends later than
+# the expiry warning's window. No money moves: the gift is an admin grant. Run
+# last of the rows that use wallet B: the gift converts its trial.
+log "G7 a converted trial whose allowance runs low is warned at its webhook"
 hook_log() { printf 'url = "%s"\n' "$HOOK_LOG_URL" | curl -sS --max-time 20 -K - 2>/dev/null; }
 if [[ -z "${HOOK_URL:-}" || -z "${HOOK_LOG_URL:-}" ]]; then
   skip "G7 no webhook receiver (HOOK_URL / HOOK_LOG_URL) — COORDINATOR_URL=$COORDINATOR_URL tests/hook_receiver.sh ensure; set -a; source \"\$(tests/hook_receiver.sh env-file)\"; set +a"
@@ -748,11 +750,11 @@ elif [[ -z "$B_PK" ]]; then
   skip "G7 wallet B has no trial key of its own (its secret is needed to name the webhook)"
 else
   G7_WALLET="$B_ACC:0"
-  gift "$(jq -nc --arg o "$B_ACC" '{owner: $o, nonce: 0, days: 1}')"
+  gift "$(jq -nc --arg o "$B_ACC" '{owner: $o, nonce: 0, amount_usd: "1"}')"
   if [[ "$HTTP" != 200 || "$(j .trial_converted)" != true ]]; then
-    fail "G7 a one-day gift onto wallet B's trial → HTTP $HTTP: $(short)"
+    fail "G7 a gift of one minimal unit onto wallet B's trial → HTTP $HTTP: $(short)"
   else
-    pass "G7 wallet B's trial is a subscription that ends $(j .expires_at)"
+    pass "G7 wallet B's trial is a subscription with an allowance of $(j .allowance_available_usd) minimal unit(s)"
     req pk "$B_PK" PUT /subscription/notifications "$(jq -nc --arg u "$HOOK_URL" '{webhook_url: $u}')"
     if [[ "$HTTP" != 200 ]]; then
       fail "G7 naming the webhook → HTTP $HTTP: $(short)"
@@ -783,9 +785,9 @@ else
         [[ "$(jq -r '.headers["x-webhook-signature"] // ""' <<<"$seen")" == "" ]] \
           && pass "G7 it carries no X-Webhook-Signature" || fail "G7 it carries X-Webhook-Signature, which only an owner's event does"
         told=$(jq -r '.body // ""' <<<"$seen" | jq -c '{type, reason, owner, nonce}' 2>/dev/null)
-        [[ "$told" == "$(jq -nc --arg o "$B_ACC" '{type: "subscription_notification", reason: "expiring", owner: $o, nonce: 0}')" ]] \
-          && pass "G7 the body names the key and the reason: expiring" \
-          || fail "G7 the body says ${told:-nothing readable}, expected reason expiring for $B_ACC nonce 0"
+        [[ "$told" == "$(jq -nc --arg o "$B_ACC" '{type: "subscription_notification", reason: "low_allowance", owner: $o, nonce: 0}')" ]] \
+          && pass "G7 the body names the key and the reason: low_allowance" \
+          || fail "G7 the body says ${told:-nothing readable}, expected reason low_allowance for $B_ACC nonce 0"
       fi
     fi
     # The tunnel behind HOOK_URL does not outlive the receiver: the target is cleared.
@@ -856,7 +858,7 @@ fi
 skip "D4 the coordinator-log count (grep -ci apikey) — needs the coordinator host's log"
 
 # ── what this suite cannot reach ────────────────────────────────────────────
-skip "G7 the low-allowance and exhausted warnings — unit tests (reason_for, a_converted_trial_is_pointed_at_another_key); live they need an allowance spent to the threshold"
+skip "G7 the expiring and exhausted warnings — unit tests (reason_for, a_converted_trial_is_pointed_at_another_key); live they need a key that ends within the warning window, or an allowance spent to zero with no balance"
 skip "G12 a purchase onto an expired key — unit tests with TEST_DATABASE_URL on a scratch DB; not reachable live on demand"
 skip "S6 dashboard /subscription on nonce 0 — after the dashboard deploy, in a browser"
 skip "D5 dashboard /connectors/<id> retry/not-published states — after the dashboard deploy, in a browser"

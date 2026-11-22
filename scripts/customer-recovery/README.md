@@ -94,10 +94,32 @@ Emits a fresh ed25519 keypair as `{public_key, private_key}` JSON (the format `n
 ```bash
 customer-recovery derive-wallet-key \
     --master <hex_64> \
-    --wallet-id <uuid>
+    --wallet-id <uuid> \
+    [--chain near|evm|solana|all]... [--sub-path <p>]... [--checks <n>]
 ```
 
-`--master` may come from `CUSTOMER_RECOVERY_MASTER` instead. Re-derives the NEAR keypair of a custody wallet minted under the vault (`POST /register {"vault_id": "..."}`). Output JSON:
+`--master` may come from `CUSTOMER_RECOVERY_MASTER` instead. Re-derives the keys of a custody wallet from the master it was minted under — a vault's (`POST /register {"vault_id": "..."}`) or an exited owner's generation (`owner-exit claim`).
+
+- `--chain` (repeatable): `near`; `evm`, or any EVM network name the keystore takes (`ethereum`, `base`, `hyperevm`, …) — one key for all of them; `solana` or `sol`; `all` for the three.
+- `--sub-path <p>` (repeatable): an EVM sub-key. Refused unless it matches `[a-z0-9][a-z0-9._-]{0,63}`, the keystore's rule. A connector's path is `connector.<connector_id>.<label>`: Hyperliquid's `connector.hyperliquid.trading`, Polymarket's `connector.polymarket.trading`.
+- `--checks <n>`: the NEAR keys of payment checks 0 … n−1, numbered in the order the wallet created them; a check's funds sit in `intents.near` under its account.
+
+With any of these flags, the output is one entry per key — the wallet's own keys (near, evm, solana), then each sub-key in the order given, then the checks:
+
+```json
+{
+  "wallet_id": "...",
+  "keys": [
+    { "chain": "near", "seed": "wallet:<id>:near", "address": "<hex>", "public_key": "ed25519:<base58>", "private_key": "ed25519:<base58>" },
+    { "chain": "evm", "seed": "wallet:<id>:evm", "address": "0x<hex>", "public_key": "secp256k1:<hex>", "private_key": "0x<hex>" },
+    { "chain": "solana", "seed": "wallet:<id>:solana", "address": "<base58>", "public_key": "<base58>", "private_key": "<base58>" },
+    { "chain": "evm", "sub_path": "connector.hyperliquid.trading", "seed": "subkey:<id>:evm:connector.hyperliquid.trading", "address": "0x<hex>", "public_key": "secp256k1:<hex>", "private_key": "0x<hex>" },
+    { "chain": "near", "check": 0, "seed": "wallet:<id>:near:check:0", "address": "<hex>", "public_key": "ed25519:<base58>", "private_key": "ed25519:<base58>" }
+  ]
+}
+```
+
+Without them, the NEAR key alone:
 
 ```json
 {
@@ -108,13 +130,9 @@ customer-recovery derive-wallet-key \
 }
 ```
 
-Recipe (matches `keystore-worker/src/crypto.rs::derive_keypair`):
-```
-secret_bytes = HMAC-SHA256(per_vault_master, "wallet:{wallet_id}:near")[..32]
-ed25519      = SigningKey::from_bytes(secret_bytes)
-```
+Private keys are in the form each chain's wallets import: NEAR `ed25519:<base58 of seed ‖ public key>` (near-cli); EVM `0x` + the 32-byte scalar (MetaMask and every EVM wallet); Solana base58 of the 64-byte `seed ‖ public key` keypair (Phantom, Solflare, Backpack; solana-cli's keypair file holds the same 64 bytes as a JSON array). Addresses and public keys are in the form `GET /wallet/v1/address` serves them, except NEAR's public key, which is `ed25519:<base58>` here and `ed25519:<hex>` there.
 
-`near_address` MUST equal the `near_account_id` the coordinator returned at registration. A mismatch means the recipe has diverged from the keystore — file a bug.
+Each address MUST equal the one OutLayer gave you for that wallet — the NEAR one the `near_account_id` returned at registration. A mismatch means the recipe has diverged from the keystore — file a bug. `src/wallet_keys.rs` holds a vector the keystore's own test (`keystore-worker/src/api_tests.rs`, `recovery_tool_vector`) asserts too.
 
 ### `compute-wallet-id`
 
@@ -158,15 +176,17 @@ Plaintext is UTF-8 JSON (`{"KEY":"value", ...}`).
 
 ## Reproducing your wallet addresses
 
-Every wallet key the keystore serves is `HMAC-SHA256(master, seed)[..32]` used as the key material, with these seeds (`keystore-worker/src/api.rs::wallet_seed`):
+Every wallet key the keystore serves is `HMAC-SHA256(master, seed)[..32]` used as the key material, with these seeds (`keystore-worker/src/api.rs::wallet_seed`, `subkey_seed`; `keystore-worker/src/ephemeral_keys.rs`):
 
-| Chain | Seed | Key / address |
+| Key | Seed | Key / address |
 |---|---|---|
 | NEAR | `wallet:{wallet_id}:near` | ed25519 seed; implicit account = hex(public key) |
 | EVM (every EVM chain, one address) | `wallet:{wallet_id}:evm` | secp256k1 secret scalar; address = last 20 bytes of keccak256(uncompressed public key) |
-| Solana | `wallet:{wallet_id}:solana` | ed25519 seed |
+| Solana | `wallet:{wallet_id}:solana` | ed25519 seed; address = base58(public key) |
+| EVM sub-key | `subkey:{wallet_id}:evm:{sub_path}` | as EVM |
+| Payment check `n` | `wallet:{wallet_id}:near:check:{n}` | as NEAR |
 
-`derive-wallet-key` implements the NEAR row only.
+`derive-wallet-key` implements every row.
 
 ### Verification recipe
 

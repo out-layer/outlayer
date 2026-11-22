@@ -75,7 +75,7 @@ pub fn ephemeral_key_routes() -> Router<AppState> {
 // Handler
 // ============================================================================
 
-async fn derive_ephemeral_key_handler(
+pub(crate) async fn derive_ephemeral_key_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<DeriveEphemeralKeyRequest>,

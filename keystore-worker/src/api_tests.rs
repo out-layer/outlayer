@@ -933,6 +933,13 @@ mod tests {
             "main: net: a.near @ now",
             "mainnet:a.near @ now",
             "mainnet: a.near @ b.near @ now",
+            // The form without a time: chain id, then accounts.
+            "mainnet: a.near",
+            "mainnet: extension.near -> wallet.near -> v1.signer",
+            "testnet: 0123abcd",
+            "main: net: a.near",
+            // Whatever only looks like it is refused as well.
+            "Login: alice",
         ] {
             assert!(is_offchain_authorization_recipient(yes), "{yes:?}");
         }
@@ -943,8 +950,11 @@ mod tests {
             "https://app.example.com/login",
             "My App",
             "user@example.com",
-            "mainnet: a.near",
             "a.near @ 2026-08-05T07:28:00Z",
+            "mainnet: A.near",
+            "mainnet: a.near -> ",
+            "mainnet: a near",
+            "Order #42: paid in full",
             "mainnet: a.near @ ",
             "mainnet a.near @ now",
             " @ ",
@@ -7332,5 +7342,219 @@ mod update_of_a_vault_row {
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&opened).unwrap(), json!({ "OLD": "kept", "NEW": "added" }));
         assert!(keystore.decrypt(Some(&vault), SEED, &blob).is_err(), "the moved row still opens under the old accessor");
         assert!(keystore.decrypt(None, &new_seed, &blob).is_err(), "the default master opens the moved row");
+    }
+}
+
+/// The vector `scripts/customer-recovery` (`wallet_keys::tests`) is held to.
+///
+/// An owner who leaves with a master derives every key of a wallet with the recovery tool,
+/// with no keystore to ask. These are the keystore's own answers for master `11…11` and one
+/// wallet id, through the handlers that serve them: `derive-address` for the wallet's NEAR,
+/// EVM (any EVM name) and Solana (`sol` too) keys and an EVM sub-key, and
+/// `derive-ephemeral-key` for payment checks 0 and 7. The tool's test asserts the same
+/// literals: a change to a seed or a curve on either side fails both.
+#[cfg(test)]
+mod recovery_tool_vector {
+    use super::*;
+
+    const WALLET: &str = "9c3c9e10-1c1f-4f5e-9c4a-1d7b9a8f3c20";
+    const SUB_PATH: &str = "connector.hyperliquid.trading";
+    const NEAR_ADDRESS: &str = "11d8a01bd1ec8da7e9657fc667def1b119c9134d9f0bd598d0e892acbb509dfb";
+    const EVM_ADDRESS: &str = "0x67f9b3a0e9b86bbe94467bb1de36c260e278c00d";
+    const EVM_PUBLIC_KEY: &str = "secp256k1:03e643b847b56471ee68bafba8c9339ae5e8a8a5851baa64638afc136799305873";
+    const SOLANA_ADDRESS: &str = "4DzrREz9YM3DZACSLDjkFiWziMsAkMUCr53wnerAm6PD";
+    const SUB_ADDRESS: &str = "0x1b75687a0450a6629f889f18c8b597a48a63afa7";
+    const SUB_PUBLIC_KEY: &str = "secp256k1:03a9da0d0b49df5a17141b677f19103367d078b54305f595cfc55813cdcf4ca525";
+    const CHECK0_ADDRESS: &str = "bc5d6d6f64c649aa870de36fb2bb0b87fdd37558b0160361dc792e56b7e6991e";
+    const CHECK7_ADDRESS: &str = "88d52f62edc329eec3513eacfab405ad6d634140fad7d734daa7bf8507d82540";
+
+    fn state() -> AppState {
+        let config = crate::config::Config {
+            server_addr: "127.0.0.1:0".parse().unwrap(),
+            near_network: "testnet".into(),
+            near_rpc_url: "http://127.0.0.1:1".into(),
+            allowed_worker_token_hashes: vec![],
+            allowed_coordinator_token_hashes: vec![],
+            tee_mode: crate::config::TeeMode::None,
+            operator_account_id: None,
+            near_contract_id: None,
+            keystore_key_type: near_crypto::KeyType::ED25519,
+            tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+        };
+        AppState::new(crate::crypto::Keystore::from_master_secret(&[0x11; 32]).unwrap(), config, None)
+    }
+
+    async fn address(chain: &str, sub_path: Option<&str>) -> (String, String) {
+        let r = wallet_derive_address_handler(
+            axum::extract::State(state()),
+            axum::http::HeaderMap::new(),
+            axum::Json(WalletDeriveAddressRequest {
+                wallet_id: WALLET.to_string(),
+                chain: chain.to_string(),
+                sub_path: sub_path.map(str::to_string),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("derive-address {chain} {sub_path:?} refused"));
+        (r.0.address, r.0.public_key)
+    }
+
+    async fn check(n: u64) -> String {
+        let r = crate::ephemeral_keys::derive_ephemeral_key_handler(
+            axum::extract::State(state()),
+            axum::http::HeaderMap::new(),
+            axum::Json(crate::ephemeral_keys::DeriveEphemeralKeyRequest {
+                wallet_id: WALLET.to_string(),
+                chain: "near".to_string(),
+                sub_path: format!("check:{n}"),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("derive-ephemeral-key check:{n} refused"));
+        r.0.implicit_account_id
+    }
+
+    #[tokio::test]
+    async fn the_recovery_tool_derives_these_keys() {
+        let near = address("near", None).await;
+        assert_eq!(near, (NEAR_ADDRESS.to_string(), format!("ed25519:{NEAR_ADDRESS}")), "near");
+        for c in ["ethereum", "base", "hyperevm"] {
+            assert_eq!(address(c, None).await, (EVM_ADDRESS.to_string(), EVM_PUBLIC_KEY.to_string()), "{c}");
+        }
+        for c in ["solana", "sol"] {
+            assert_eq!(address(c, None).await, (SOLANA_ADDRESS.to_string(), SOLANA_ADDRESS.to_string()), "{c}");
+        }
+        assert_eq!(
+            address("base", Some(SUB_PATH)).await,
+            (SUB_ADDRESS.to_string(), SUB_PUBLIC_KEY.to_string()),
+            "sub-key"
+        );
+        assert_eq!(check(0).await, CHECK0_ADDRESS, "check 0");
+        assert_eq!(check(7).await, CHECK7_ADDRESS, "check 7");
+    }
+}
+
+/// A wallet whose master leaves with an exit acts through Agent Connect only on the account
+/// that master leaves to.
+#[cfg(test)]
+mod extension_principal {
+    use super::*;
+    use crate::crypto::Customer;
+    use near_primitives::types::AccountId;
+    use shared_tee_helpers::wallet_policy::Op;
+
+    fn account(s: &str) -> AccountId {
+        s.parse().unwrap()
+    }
+
+    fn call(to: &str, method: &str) -> Op {
+        Op::Call {
+            to: to.into(),
+            method: method.into(),
+            args_base64: "e30=".into(),
+            gas: "30000000000000".into(),
+            deposit: "1".into(),
+        }
+    }
+
+    fn owner() -> Customer {
+        Customer::Owner { account: account("alice.near"), generation: 2 }
+    }
+
+    #[test]
+    fn an_owner_wallet_acts_only_on_its_owner() {
+        let alice = account("alice.near");
+        let ext = |to| extension_beyond_principal(Some(&owner()), Some(&alice), &call(to, "w_execute_extension"));
+        assert_eq!(ext("alice.near"), None);
+        assert_eq!(
+            ext("bob.near").as_deref(),
+            Some(
+                "A wallet whose keys leave with an exit acts through w_execute_extension only on the \
+                 account they leave to. This wallet's keys leave with its owner's exit, to \
+                 'alice.near': 'bob.near' is not that account"
+            )
+        );
+        assert!(ext("agent.tla").is_some(), "a leased account is never the owner's");
+    }
+
+    #[test]
+    fn a_vault_wallet_acts_only_on_the_vault_parent() {
+        let vault = Customer::Vault(account("vault.alice.near"));
+        let alice = account("alice.near");
+        let ext = |to, parent: Option<&AccountId>| {
+            extension_beyond_principal(Some(&vault), parent, &call(to, "w_execute_extension"))
+        };
+        assert_eq!(ext("alice.near", Some(&alice)), None);
+        let refused = ext("bob.near", Some(&alice)).expect("another account");
+        assert!(
+            refused.contains("the exit of vault 'vault.alice.near', to its parent 'alice.near'")
+                && refused.contains("'bob.near' is not that account"),
+            "{refused}"
+        );
+        // A vault whose state names no parent acts on no account, its own included.
+        for to in ["alice.near", "vault.alice.near"] {
+            let refused = ext(to, None).expect("no parent, no account");
+            assert!(refused.contains("whose state names no parent"), "{refused}");
+        }
+    }
+
+    /// A wallet that can leave signs no raw NEAR payload; other raw chains, and wallets that
+    /// cannot leave, are not judged here (their policy decides).
+    #[test]
+    fn a_wallet_that_can_leave_signs_no_raw_near() {
+        let raw = |chain: &str| Op::Raw { chain: chain.into(), payload_hash: "00".repeat(32), label: None };
+        let vault = Customer::Vault(account("vault.alice.near"));
+        for chain in ["near", "NEAR", "Near"] {
+            let refused = raw_near_in_exit_scope(Some(&owner()), &raw(chain)).expect("refused for an owner wallet");
+            assert!(refused.contains("signs no raw NEAR payload") && refused.contains("alice.near"), "{refused}");
+            assert!(raw_near_in_exit_scope(Some(&vault), &raw(chain)).is_some(), "refused for a vault wallet");
+        }
+        assert_eq!(raw_near_in_exit_scope(None, &raw("near")), None);
+        assert_eq!(raw_near_in_exit_scope(Some(&owner()), &raw("ethereum")), None);
+        assert_eq!(raw_near_in_exit_scope(Some(&owner()), &call("bob.near", "ft_transfer")), None);
+    }
+
+    /// The default master never leaves; and only the extension door acts AS another
+    /// account — a plain call or transfer to one acts as the wallet itself.
+    #[test]
+    fn only_the_extension_door_of_a_wallet_that_can_leave_is_judged() {
+        let alice = account("alice.near");
+        assert_eq!(extension_beyond_principal(None, None, &call("bob.near", "w_execute_extension")), None);
+        assert_eq!(extension_beyond_principal(Some(&owner()), Some(&alice), &call("bob.near", "ft_transfer")), None);
+        assert_eq!(
+            extension_beyond_principal(
+                Some(&owner()),
+                Some(&alice),
+                &Op::Transfer { to: "bob.near".into(), amount: "1".into() }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_vault_parent_is_read_off_get_state() {
+        let state = serde_json::json!({ "parent": "alice.near", "unlocked": false });
+        assert_eq!(crate::mpc_ckd::vault_parent(&state), Some(account("alice.near")));
+        assert_eq!(crate::mpc_ckd::vault_parent(&serde_json::json!({ "unlocked": false })), None);
+        assert_eq!(crate::mpc_ckd::vault_parent(&serde_json::json!({ "parent": 7 })), None);
+        assert_eq!(crate::mpc_ckd::vault_parent(&serde_json::json!({ "parent": "Not An Account" })), None);
+    }
+
+    /// Both the signature and its pre-flight refuse, before the policy is read: the rule is
+    /// not the owner's to relax, and a pre-flight that allowed it would mint an approval
+    /// that cannot be signed.
+    #[test]
+    fn sign_and_check_policy_refuse_before_the_policy_is_read() {
+        let src = include_str!("api.rs");
+        for handler in ["async fn wallet_sign_handler(", "async fn wallet_check_policy_handler("] {
+            let body = &src[src.find(handler).expect("the handler")..];
+            let body = &body[..body.find("\n}\n").expect("the handler's end")];
+            let load = body.find("let principal = state\n        .ensure_customer_loaded(").expect("the principal");
+            let rule = body
+                .find("extension_beyond_principal(customer.as_ref(), principal.as_ref(), &req.op)")
+                .unwrap_or_else(|| panic!("{handler} does not apply the rule"));
+            let policy = body.find("load_wallet_policy(").expect("the policy read");
+            assert!(load < rule && rule < policy, "{handler}: the rule runs out of order");
+        }
     }
 }

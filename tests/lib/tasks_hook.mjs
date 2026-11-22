@@ -29,7 +29,7 @@
 //
 //   {"status", "requests", "events": [ … ], "leaked": [ … ], "unverified": [ … ],
 //    "misdressed": [ … ], "wallet_events", "replays", "receiver_verifies",
-//    "receiver_keys_unavailable"}
+//    "receiver_keys_unavailable", "under_retired_key"}
 //
 // An event is a request whose body is an object with a `type` and a `task_id`:
 // its `type`, `task_id`, `owner`, `preparer`, `kind`, `state`, `run`, `link`,
@@ -39,7 +39,9 @@
 // and its `X-Wallet-Id` and `X-Event-Type`.
 // `unverified` lists every POST of the log whose signature does not hold —
 // an event or not — as {"reason", "webhook_id", "wallet_id", "event_type"}:
-// a suite fails on one. `misdressed` lists, in the same shape, every verified
+// a suite fails on one. A POST signed under a key that has left webhook-keys,
+// which the receiver verified when it arrived, is counted in
+// `under_retired_key` instead: the key held then, today's list cannot say. `misdressed` lists, in the same shape, every verified
 // POST that carries `X-Webhook-Signature` without being an owner's event
 // (`X-Wallet-Id` `owner:<account>`), or is one and carries none; a suite
 // fails on one too. `wallet_events` counts the verified POSTs that are not an
@@ -158,6 +160,7 @@ const commands = {
     const misdressed = [];
     let walletEvents = 0;
     let replays = 0;
+    let underRetiredKey = 0;
     for (const request of log.requests) {
       const { text, parsed } = bodyOf(request);
       for (const needle of needles) {
@@ -168,6 +171,12 @@ const commands = {
         continue;
       }
       const verdict = judge({ headers: request.headers, rawBody: text, keys, at: receivedAt(request) });
+      // Signed under a key that has since left webhook-keys, and verified by the receiver
+      // when it arrived: the delivery held then; today's list cannot judge it again.
+      if (isPost(request) && !verdict.ok && verdict.reason === 'unknown_key' && request.signature?.ok === true) {
+        underRetiredKey += 1;
+        continue;
+      }
       if (isPost(request) && !verdict.ok) {
         unverified.push({ reason: verdict.reason, webhook_id: verdict.id, wallet_id: verdict.wallet_id, event_type: verdict.event_type });
       }
@@ -204,6 +213,7 @@ const commands = {
       events,
       leaked: [...leaked],
       unverified,
+      under_retired_key: underRetiredKey,
       misdressed,
       wallet_events: walletEvents,
       replays,

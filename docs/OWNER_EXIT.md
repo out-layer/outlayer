@@ -102,7 +102,10 @@ chain. An owner whose wallets need different approver sets uses different accoun
 ## Leaving
 
 Before the exit: withdraw from Polymarket and Hyperliquid, and reclaim open payment
-checks. Their funds sit under keys of their own, which the steps below do not derive.
+checks, while OutLayer does it for the wallet. After the exit their keys come from the
+master too (`derive-wallet-key` below: the venues' EVM sub-keys
+`connector.hyperliquid.trading` and `connector.polymarket.trading`, and the checks' NEAR
+keys), but moving those funds then takes the venue's or NEAR Intents' own tools.
 
 The tool is [`scripts/customer-recovery`](../scripts/customer-recovery/README.md). Pass the
 owner's key in the environment, never on the command line.
@@ -144,8 +147,14 @@ With the master, the wallets:
 export CUSTOMER_RECOVERY_MASTER=<master_hex>
 customer-recovery owner-exit wallets $C --generation 1
 #   seed=0 wallet_id=… near_account=… on_chain=true
-customer-recovery derive-wallet-key --wallet-id <wallet_id>
+customer-recovery derive-wallet-key --wallet-id <wallet_id> --chain all
 ```
+
+`derive-wallet-key --chain all` prints every key of the wallet: NEAR, EVM (one key for
+every EVM network) and Solana, each with its address, public key and private key in the
+form that chain's wallets import. `--sub-path <p>` (repeatable) adds an EVM sub-key, and
+`--checks <n>` the keys of payment checks 0 to n−1. Without these flags it prints the NEAR
+key alone. The seeds and formats: [LEAVING_OUTLAYER.md](LEAVING_OUTLAYER.md#b2-re-derive-each-wallets-keys).
 
 `wallets` walks the numbered seeds from 0 and stops after five in a row with no NEAR
 account on chain. A wallet that never held NEAR — used only on another chain, or never
@@ -160,11 +169,53 @@ funded — has no such account: it is not listed and counts toward the five. A w
   — to a request by the owner's own `Bearer near:` signature the answer then is 409 — and
   ends if MPC does not answer the claim. This follows the generation in the DAO, which moves
   when the claim's callback sees MPC's answer.
+- No payment key of the wallets of the generation left spends: not the nonce-0 key —
+  its trial, sponsored or gift credit ends with the exit — and not a funded key. A call and
+  a subscription bought with a key's balance answer `403` with `reason: "wallet_exited"`;
+  the same while a claim is in flight (then with `terminal: false`), and `503` when the
+  chain does not answer whether the wallet is still in custody. The run of an approved task
+  answers nothing: the task fails `preparer_key_unavailable`, or `queue_unavailable` when
+  that read fails. A call admitted before the exit settles as it would have. The money
+  on a funded key is the wallet's, and the wallet's NEAR account — whose key
+  `derive-wallet-key` gives — takes it back on chain: `outlayer login` with that account
+  and key, `outlayer keys close <nonce>` (`close_payment_key`), and 24 hours later
+  `outlayer keys claim <nonce>` (`claim_payment_key_refund`). A stablecoin balance
+  deposited on the account comes back with the contract's `withdraw_balance`. Allowance,
+  grants and trial credit are not refunded.
 - The owner's next wallet is created in the next generation: a new wallet id, new
   addresses, its own escrow.
 - Secrets are untouched. A project's secrets belong to the owner's account and its
   applications keep reading them. An agent's secret filed under a wallet that left stays on
   chain as ciphertext; its deletion is signed by the wallet's key, which the owner holds.
+
+## A wallet with an exit is bound only to its owner's account
+
+A wallet's NEAR key is the executor of the account it is bound to through Agent Connect
+(`PUT /wallet/v1/binding`), and that key leaves with the owner's master. A binding to any
+other account would hand that account to whoever holds the master after the exit. So an
+owner's wallet is bound to the owner's own account, in the `personal_account` mode, and
+to nothing else:
+
+- `PUT /wallet/v1/binding` with any other `asset_account_id` answers 400: "A wallet whose
+  keys leave with an exit is bound only to the account they leave to. This wallet's keys
+  leave with its owner's exit, to '<owner>': '<account>' is not that account".
+- `kind=hos_lease` is refused for an owner's wallet whatever the account: a leased account
+  is never the owner's own. A leased account is bound to a wallet with no owner and no
+  vault.
+- The keystore holds the same line on its own: it signs no `w_execute_extension` of an
+  owner's wallet whose receiver is not the owner's account, under any policy and whatever
+  binding is recorded.
+- An owner's wallet signs no raw NEAR payload (`raw_sign` on `near`), whatever its policy
+  lists: 32 bytes signed with the wallet's NEAR key are any NEAR transaction, this one
+  included, and the keystore cannot read them. NEAR is signed through `call`, `transfer` and
+  the intents operations, which the keystore reads.
+
+An account can give a wallet's NEAR account rights over itself without OutLayer: an
+extension that names the wallet's address is that account owner's own transaction, and
+nothing here stops it. Before the exit the keystore still signs nothing of the wallet that
+acts on such an account. After it, the wallet's key is the owner's, and so is whatever that
+key may do on the account that named it. Do not give an account to the address of a wallet
+whose keys can leave unless the account is the wallet owner's own.
 
 ## A wallet never calls the keystore DAO
 
@@ -176,8 +227,9 @@ claim the owner's exit. The keystore therefore signs no call to the keystore DAO
 exit call is a transaction the owner signs with the account's own key.
 
 For the same reason `sign-message` signs no message whose recipient has the form NEP-641
-gives an account's off-chain authorization (`<chain>: <account>[ -> …] @ <time>`): such a
-signature would be the bound account's word, given off chain.
+gives an account's off-chain authorization (`<chain>: <account>[ -> …] @ <time>`, or the same
+without ` @ <time>`): such a signature would be the bound account's word, given off chain. A
+recipient that only looks like one — `Login: alice` — is refused as well.
 
 A keystore starts only under a DAO this rule names.
 

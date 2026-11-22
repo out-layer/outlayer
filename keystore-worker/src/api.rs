@@ -249,7 +249,9 @@ fn bearer_token_hash(headers: &axum::http::HeaderMap) -> Option<String> {
 /// with this signer must serialize through `signer_nonce_lock` —
 /// otherwise concurrent callers race to read the same nonce, build
 /// txs with the same `nonce + 1`, and only one wins; the loser
-/// surfaces an opaque `InvalidNonce` 500.
+/// surfaces an opaque `InvalidNonce` 500. The lock covers the send
+/// (`submit_function_call`) and no more: the wait for the write's
+/// final block (`wait_until_final`) runs after it is released.
 ///
 /// CKD calls FROM a vault account (Layer 2 of the per-vault master derivation) use a DIFFERENT
 /// signer (the vault's TEE function-call key) and don't share this lock.
@@ -413,8 +415,11 @@ impl AppState {
     ///     completed) — covered by the cold-path gate.
     ///   * the MPC CKD round-trip fails.
     ///
-    /// `customer = None` always returns `Ok(())` immediately (legacy
-    /// default-master path).
+    /// Returns the scope's PRINCIPAL — the account its master is handed to
+    /// on exit: an owner path's account, a vault's parent as the vault's
+    /// `get_state` (read by the gate on every call) names it. `None` for no
+    /// customer, which returns immediately (default-master path), and for a
+    /// vault whose state names no parent.
     ///
     /// **No cache short-circuit at this layer.** Every signing op
     /// delegates straight into [`crate::mpc_ckd::ensure_customer_loaded`],
@@ -431,9 +436,9 @@ impl AppState {
     pub async fn ensure_customer_loaded(
         &self,
         customer: Option<&crate::crypto::Customer>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<near_primitives::types::AccountId>> {
         let Some(customer) = customer else {
-            return Ok(());
+            return Ok(None);
         };
 
         // Snapshot the keystore. Cloning is cheap (Arc-shared internal
@@ -476,7 +481,8 @@ impl AppState {
                     account,
                     *generation,
                 )
-                .await
+                .await?;
+                Ok(Some(account.clone()))
             }
         }
     }
@@ -4960,7 +4966,8 @@ fn is_trusted_recipient(recipient: &str) -> bool {
 }
 
 /// Whether a NEP-413 `recipient` has the form NEP-641 gives an access-key authorization:
-/// `"<chain_id>: <signer_id>[ -> <id>]... @ <timestamp>"`.
+/// `"<chain_id>: <signer_id>[ -> <id>]... @ <timestamp>"`, or the same without a time
+/// (near/intents #337), `"<chain_id>: <signer_id>[ -> <id>]..."`.
 ///
 /// A NEP-413 signature by an account's key over such a recipient IS that account's
 /// offchain authorization: of its own account with no path, and with a path — as an
@@ -4968,16 +4975,23 @@ fn is_trusted_recipient(recipient: &str) -> bool {
 /// Agent Connect would sign as that account, off chain, where the fence on
 /// `w_execute_extension` sees nothing. `sign_message` never signs one; no policy opens it.
 ///
-/// Read more loosely than the outline is written — a `:` and, after it, a `" @ "` followed
-/// by anything — and not as a resolver would parse it: what sits between and around the two
-/// marks is not judged, nor is the space the outline puts after the first, so no spelling
-/// of a chain id, an account or a timestamp slips a recipient of this outline past the
-/// refusal.
+/// Read more loosely than the outline is written, and not as a resolver would parse it:
+/// * a `:` before a last `" @ "` with anything after it — what sits between and around the
+///   two marks is not judged, nor the space after the first;
+/// * or, with no time, account ids joined with `" -> "` after the last `": "`. An account id
+///   holds no `:`, so the last `": "` is the one before the accounts whatever the chain id
+///   holds.
+/// A recipient that only looks like this — `"Login: alice"` — is refused too: a refusal costs
+/// an application one recipient, a signature costs the owner's account.
 fn is_offchain_authorization_recipient(recipient: &str) -> bool {
-    let Some((before_time, time)) = recipient.rsplit_once(" @ ") else {
-        return false;
-    };
-    !time.is_empty() && before_time.contains(':')
+    if let Some((before_time, time)) = recipient.rsplit_once(" @ ") {
+        if !time.is_empty() && before_time.contains(':') {
+            return true;
+        }
+    }
+    recipient.rsplit_once(": ").is_some_and(|(_, accounts)| {
+        accounts.split(" -> ").all(|a| a.parse::<near_primitives::types::AccountId>().is_ok())
+    })
 }
 
 /// The approvers and threshold an owner's exit must need for `policy` to be locked on one of
@@ -5101,6 +5115,77 @@ fn refuse_owner_scope(customer: Option<&crate::crypto::Customer>) -> Result<(), 
         )),
         _ => Ok(()),
     }
+}
+
+/// SECURITY: a wallet whose master leaves with an exit acts through Agent Connect only on
+/// the account that master leaves to.
+///
+/// A `w_execute_extension` makes its receiver — the account the wallet is bound to — act
+/// on whatever the request says; the wallet's NEAR key is that account's executor. The
+/// wallet of an owner path or a vault has that key derived from a master handed out on
+/// exit: the owner's to the owner account, the vault's to `vault.parent` (`principal`,
+/// what [`AppState::ensure_customer_loaded`] returned). On any other account the exit
+/// would carry that account with it, past every rule signed here. So the receiver must be
+/// the principal, whatever the policy and whatever binding the coordinator recorded; a
+/// vault whose state names no parent acts on no account. A wallet under the default
+/// master, whose keys never leave, is not judged here.
+///
+/// The reason is returned rather than an error: the signing path answers it as a 403, the
+/// pre-flight as `allowed: false`, in the same words.
+fn extension_beyond_principal(
+    customer: Option<&crate::crypto::Customer>,
+    principal: Option<&near_primitives::types::AccountId>,
+    op: &shared_tee_helpers::wallet_policy::Op,
+) -> Option<String> {
+    let shared_tee_helpers::wallet_policy::Op::Call { to, method, .. } = op else {
+        return None;
+    };
+    if method != "w_execute_extension" {
+        return None;
+    }
+    let leaves_to = match (customer?, principal) {
+        (_, Some(p)) if p.as_str() == to.as_str() => return None,
+        (crate::crypto::Customer::Owner { account, .. }, _) => format!("its owner's exit, to '{account}'"),
+        (crate::crypto::Customer::Vault(vault), Some(p)) => {
+            format!("the exit of vault '{vault}', to its parent '{p}'")
+        }
+        (crate::crypto::Customer::Vault(vault), None) => {
+            format!("the exit of vault '{vault}', whose state names no parent")
+        }
+    };
+    Some(format!(
+        "A wallet whose keys leave with an exit acts through w_execute_extension only on the \
+         account they leave to. This wallet's keys leave with {leaves_to}: '{to}' is not that \
+         account"
+    ))
+}
+
+/// A raw NEAR signature for a wallet whose keys leave with an exit: refused.
+///
+/// `Op::Raw` on `near` brings 32 bytes, and a NEAR signature over any 32 bytes is a signature
+/// over any NEAR transaction — the keystore cannot see what it is. For a wallet that can leave,
+/// that would let the wallet act through an extension on any account or call the keystore DAO,
+/// past every refusal the other doors hold. Such a wallet signs NEAR only through the doors the
+/// keystore reads; after the exit its owner holds the key itself.
+fn raw_near_in_exit_scope(
+    customer: Option<&crate::crypto::Customer>,
+    op: &shared_tee_helpers::wallet_policy::Op,
+) -> Option<String> {
+    let shared_tee_helpers::wallet_policy::Op::Raw { chain, .. } = op else {
+        return None;
+    };
+    if !chain.eq_ignore_ascii_case("near") {
+        return None;
+    }
+    let leaves = match customer? {
+        crate::crypto::Customer::Owner { account, .. } => format!("its owner's exit, to '{account}'"),
+        crate::crypto::Customer::Vault(vault) => format!("the exit of vault '{vault}'"),
+    };
+    Some(format!(
+        "A wallet whose keys leave with an exit signs no raw NEAR payload: 32 bytes signed with \
+         its NEAR key are any NEAR transaction, and the keystore cannot read them. This wallet's \
+         keys leave with {leaves}; sign NEAR through call, transfer or the intents operations"
+    ))
 }
 
 async fn verify_approvals(
@@ -5878,10 +5963,15 @@ async fn wallet_sign_handler(
         ));
     }
     let customer = extract_customer_from_header(&headers)?;
-    state
+    let principal = state
         .ensure_customer_loaded(customer.as_ref())
         .await
         .map_err(ApiError::from_customer_load)?;
+    if let Some(reason) = extension_beyond_principal(customer.as_ref(), principal.as_ref(), &req.op)
+        .or_else(|| raw_near_in_exit_scope(customer.as_ref(), &req.op))
+    {
+        return Err(ApiError::Forbidden(reason));
+    }
 
     // The canonical hash the keystore signs under — derived from the op, never trusted
     // from the coordinator. Approver signatures must cover exactly this.
@@ -6393,7 +6483,7 @@ async fn sign_hash_pinned(
             if is_offchain_authorization_recipient(recipient) {
                 return Err(ApiError::Forbidden(format!(
                     "sign_message recipient '{}' has the form of a NEP-641 offchain authorization \
-                     (\"<chain>: <account>[ -> <account>] @ <time>\"); this wallet does not sign \
+                     (\"<chain>: <account>[ -> <account>][ @ <time>]\"); this wallet does not sign \
                      authorizations for its own or a bound account",
                     recipient
                 )));
@@ -6617,12 +6707,28 @@ async fn wallet_check_policy_handler(
     }
     validate_wallet_id(&req.wallet_id)?;
     let customer = extract_customer_from_header(&headers)?;
-    state
+    let principal = state
         .ensure_customer_loaded(customer.as_ref())
         .await
         .map_err(ApiError::from_customer_load)?;
 
     let request_hash = wallet_policy::request_hash(&req.op);
+
+    // The signing path's own refusal, answered the same way here: a pre-flight that said
+    // "allowed" would mint an approval nobody can sign.
+    if let Some(reason) = extension_beyond_principal(customer.as_ref(), principal.as_ref(), &req.op)
+        .or_else(|| raw_near_in_exit_scope(customer.as_ref(), &req.op))
+    {
+        return Ok(Json(WalletCheckPolicyResponse {
+            allowed: false,
+            frozen: false,
+            requires_approval: None,
+            required_approvals: None,
+            reason: Some(reason),
+            request_hash: Some(request_hash),
+            webhook_url: None,
+        }));
+    }
 
     // Decrypt the policy: inline override (TEST-ONLY) or fetch+decrypt from chain.
     //

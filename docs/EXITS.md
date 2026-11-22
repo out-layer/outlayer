@@ -44,8 +44,18 @@ consent: each is a contract on NEAR, the NEAR MPC network, and a tool you run yo
   wait in force has passed: a stolen key cannot shorten the time its victim has to react.
 - After the exit OutLayer no longer serves those wallets, and the wallet's policy no
   longer applies: the keys are the owner's, and so is every decision.
+- No payment key of those wallets spends after the exit — the nonce-0 key's trial,
+  sponsored or gift credit ends there — and each answers `403 wallet_exited`. The money on
+  a funded key comes back on chain, signed by the wallet's NEAR account with its derived
+  key: `outlayer keys close <nonce>`, then a day later `outlayer keys claim <nonce>`; a
+  deposited stablecoin balance comes back with the contract's `withdraw_balance`.
 - Funds held by a venue under a key of its own — a Polymarket or Hyperliquid account — are
   withdrawn before leaving.
+- An exit carries no account but the one it leaves to. A wallet's NEAR key is the executor
+  of the account it is bound to through Agent Connect, so a wallet with an exit is bound
+  only to the owner account (owner exit) or the vault's parent (vault exit), and never to a
+  leased account; a leased account is bound to a wallet with no owner. The keystore signs
+  no extension call of such a wallet on any other account.
 
 ## What an exit is not
 

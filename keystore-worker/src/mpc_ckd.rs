@@ -1284,6 +1284,9 @@ pub async fn add_customer(
 ///     3. If both checks pass, take the per-vault load lock + call
 ///        [`add_customer`] to populate the cache.
 ///
+/// Returns the vault's parent as the `get_state` read above names it
+/// ([`vault_parent`]); `None` for no customer, or a state that names none.
+///
 /// **Why on-chain verify before MPC**: the MPC call burns gas from
 /// the vault's balance; without this gate a malicious caller could
 /// trigger MPC bills on arbitrary vault ids by spamming requests
@@ -1294,9 +1297,9 @@ pub async fn ensure_customer_loaded(
     keystore_dao_id: &AccountId,
     keystore: &Keystore,
     customer: Option<&AccountId>,
-) -> Result<()> {
+) -> Result<Option<AccountId>> {
     let Some(vault_id) = customer else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Per-call gate: ALWAYS check on-chain state before serving, even
@@ -1311,13 +1314,12 @@ pub async fn ensure_customer_loaded(
     // signs with — they are issued concurrently, so the gate costs one
     // round-trip of latency rather than two. See `assert_serving_allowed`
     // for why an unknown vault deliberately keeps the sequential path.
-    assert_serving_allowed(near_client, keystore_dao_id, vault_id, keystore).await?;
+    let parent = assert_serving_allowed(near_client, keystore_dao_id, vault_id, keystore).await?;
 
-    if keystore.has_customer(vault_id) {
-        return Ok(());
+    if !keystore.has_customer(vault_id) {
+        add_customer(config, keystore, vault_id).await?;
     }
-
-    add_customer(config, keystore, vault_id).await
+    Ok(parent)
 }
 
 /// Verify on-chain that we are still allowed to serve secrets bound
@@ -1362,7 +1364,7 @@ async fn assert_serving_allowed(
     keystore_dao_id: &AccountId,
     vault_id: &AccountId,
     keystore: &Keystore,
-) -> Result<()> {
+) -> Result<Option<AccountId>> {
     let verified_call = near_client.view_call_json(
         keystore_dao_id,
         "is_vault_verified",
@@ -1469,7 +1471,15 @@ async fn assert_serving_allowed(
         return Err(VaultNotServable::Unlocked(vault_id.clone()).into());
     }
 
-    Ok(())
+    Ok(vault_parent(&state))
+}
+
+/// The parent a vault's `get_state` names: the account its master leaves to on
+/// the vault's exit. The contract sets it once, at `new`. `None` when the
+/// answer names none or names something that is not an account id; serving
+/// does not depend on it, only what is decided by the parent does.
+pub(crate) fn vault_parent(state: &serde_json::Value) -> Option<AccountId> {
+    state.get("parent")?.as_str()?.parse().ok()
 }
 
 // =============================================================================
@@ -1694,10 +1704,10 @@ async fn write_owner_escrow(
     tracing::info!(owner = %account, generation, "Writing the owner's escrow to the keystore DAO");
 
     // Both transactions are signed with the keystore's one key on the DAO account, so the
-    // nonce lock is held from the first to the second and no longer.
-    // `submit_function_call` returns once the write is final, so the read-back that follows
-    // in `create_owner_escrow` sees it.
-    {
+    // nonce lock is held from the first to the second's broadcast and no longer. The wait for
+    // the write's final block runs after it is released, and before the read-back that follows
+    // in `create_owner_escrow`, which then sees the write.
+    let executed = {
         let _nonce = ctx.signer_nonce_lock.lock().await;
         let escrow_key = MpcCkdClient::new(ctx.mpc_ckd_config.clone())
             .request_owner_escrow_key(&ctx.keystore_dao_signer, account, generation)
@@ -1724,8 +1734,12 @@ async fn write_owner_escrow(
                 0,
             )
             .await
-            .with_context(|| format!("store_escrow failed for {account} generation {generation}"))?;
-    }
+            .with_context(|| format!("store_escrow failed for {account} generation {generation}"))?
+    };
+    near_client
+        .wait_until_final(executed)
+        .await
+        .with_context(|| format!("store_escrow failed for {account} generation {generation}"))?;
     Ok(())
 }
 

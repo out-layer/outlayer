@@ -102,7 +102,8 @@ What it is not:
    its operation is priced zero — a priced one fails the task
    `operation_priced` — and its compute is paid by the agent's payment key,
    as any call of the agent's is, up to the compute limit of the run that
-   prepared the task. A key that cannot pay for it fails the task
+   prepared the task. A key that cannot pay for it — a key of a wallet whose
+   keys left custody with an exit included — fails the task
    `preparer_key_unavailable`; nothing is charged to the owner.
 
 ### Telling the owner something

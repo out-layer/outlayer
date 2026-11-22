@@ -151,6 +151,24 @@ made only after both pass, so the master is first derived after
 answers `423 Locked` for an unlocked vault, `403` for an unverified
 one.
 
+The same two checks stand before every spend by a payment key of a
+vault's wallet — a call, a subscription purchase, the run of an
+approved task — and a vault the gate refuses spends nothing. A served
+vault is remembered for 30 s, only after `get_state` answered
+`unlocked: false`. A call and a purchase answer `403` with
+`reason: "wallet_exited"`, and `503` when a read fails. The run of an
+approved task answers nothing: the task fails `preparer_key_unavailable`,
+or `queue_unavailable` when a read fails. Closing the key
+(`close_payment_key`, `outlayer keys close <nonce>`), claiming its
+refund a day later (`claim_payment_key_refund`, `outlayer keys claim
+<nonce>`) and `withdraw_balance` stay open to the wallet's NEAR
+account, whose key the vault's master gives. After the vault's exit the
+parent holds the master. A vault the DAO does not verify is not
+unlocked and not served: its keys spend again if the DAO verifies it
+again, and until then the master — and with it the wallet's NEAR key —
+comes only from the vault's recovery
+([`docs/LEAVING_OUTLAYER.md`](docs/LEAVING_OUTLAYER.md), Phases A and B).
+
 ## Trust model
 
 ### What the vault guarantees
@@ -217,6 +235,28 @@ That is the sovereignty feature working as designed. For end-users:
   the full exit window of warning before the customer gains control.
 - A `parent` controlled by a multisig or a contract shifts the trust
   from "the customer" to "the customer's signers".
+
+### A vault wallet is bound only to the parent
+
+A wallet's NEAR key is the executor of the account it is bound to
+through Agent Connect (`PUT /wallet/v1/binding`), and every key of a
+vault wallet leaves with the vault's master to `parent`. A vault wallet
+is therefore bound to `parent` itself, in the `personal_account` mode,
+and to no other account: the coordinator refuses any other
+`asset_account_id` (400, naming the parent), and refuses
+`kind=hos_lease` outright — a leased account is never the parent's own.
+The keystore holds the same line on its own: it signs no
+`w_execute_extension` of a vault wallet whose receiver is not the
+`parent` named by the vault's `get_state` — the answer its serving gate
+reads on every request — under any policy and whatever binding is
+recorded.
+
+A vault wallet also signs no raw NEAR payload (`raw_sign` on `near`),
+whatever its policy lists: 32 bytes signed with its NEAR key are any
+NEAR transaction, and the keystore cannot read them. And an account
+that names a vault wallet's address in its own extensions, outside
+OutLayer, hands itself to whoever holds the vault's master after the
+exit — name it only from `parent`'s own account.
 
 ### Duplicate-derivation monitor
 

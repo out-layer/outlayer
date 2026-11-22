@@ -51,6 +51,11 @@ What the exit does **not** do:
 - **The wallet policy no longer applies.** Limits, allowlists and
   approvals were enforced by the keystore before it signed. A key you
   hold locally signs anything.
+- **It carries no account but yours.** A vault wallet's NEAR key is
+  the executor of any account bound to it through Agent Connect, so a
+  vault wallet is bound only to the vault's `parent`, and never to a
+  leased (`hos_lease`) account
+  ([VAULTS.md](../VAULTS.md#a-vault-wallet-is-bound-only-to-the-parent)).
 
 ---
 
@@ -65,9 +70,9 @@ Do this once when you deploy each vault and store the result offline:
    finalize any recovery. Treat it like a cold-storage wallet.
 3. **`wallet_id`** (UUID) and **`near_account_id`** of every custody
    wallet minted under the vault. `POST /register {"vault_id": "..."}`
-   returns them once; save the response. A wallet's NEAR key is
-   `HMAC-SHA256(per_vault_master, "wallet:<wallet_id>:near")`, so
-   without the UUID you cannot reach a specific wallet's key. Wallets
+   returns them once; save the response. Every key of a wallet is
+   `HMAC-SHA256(per_vault_master, <seed>)` with the wallet id in the
+   seed (B.2), so without the UUID you cannot reach a wallet's keys. Wallets
    created by a signed claim (`PUT /wallet/v1/api-key` or `Bearer
    near:` with a `vault_id`) have a deterministic id you can recompute
    offline with `customer-recovery compute-wallet-id --account-id
@@ -295,51 +300,82 @@ encrypted under it.
 
 #### B.2 Re-derive each wallet's keys
 
-For every NEAR wallet you minted under the vault:
+For every wallet you minted under the vault:
 
 ```bash
 ./scripts/customer-recovery/target/release/customer-recovery derive-wallet-key \
     --master "$MASTER_HEX" \
-    --wallet-id "<the UUID you saved at registration>"
+    --wallet-id "<the UUID you saved at registration>" \
+    --chain all
 ```
 
-Output is JSON:
+Output is JSON, one entry per key:
 
 ```json
 {
   "wallet_id": "...",
-  "near_address": "<hex>",
-  "public_key": "ed25519:...",
-  "private_key": "ed25519:..."
+  "keys": [
+    { "chain": "near",   "seed": "wallet:<id>:near",   "address": "<hex>",   "public_key": "ed25519:<base58>",  "private_key": "ed25519:<base58>" },
+    { "chain": "evm",    "seed": "wallet:<id>:evm",    "address": "0x<hex>", "public_key": "secp256k1:<hex>",   "private_key": "0x<hex>" },
+    { "chain": "solana", "seed": "wallet:<id>:solana", "address": "<base58>", "public_key": "<base58>",         "private_key": "<base58>" }
+  ]
 }
 ```
 
-`near_address` MUST equal the `near_account_id` the coordinator
-returned at registration. If it differs, the derivation recipe and the
-keystore have diverged — file a bug.
+What it derives, and the flags that pick it:
+
+| Flag | Key | Seed | Address | `private_key` (the form wallets import) |
+|---|---|---|---|---|
+| `--chain near` | NEAR | `wallet:<wallet_id>:near` | implicit account: hex of the ed25519 public key | `ed25519:<base58 of seed ‖ public key>` — near-cli, NEAR wallets |
+| `--chain evm` (or any EVM network name: `ethereum`, `base`, …) | EVM, one key for every EVM network | `wallet:<wallet_id>:evm` | `0x` + last 20 bytes of keccak256(uncompressed public key), lower case | `0x` + the 32-byte secp256k1 scalar — MetaMask and every EVM wallet |
+| `--chain solana` (or `sol`) | Solana | `wallet:<wallet_id>:solana` | base58 of the ed25519 public key | base58 of the 64-byte `seed ‖ public key` keypair — Phantom, Solflare, Backpack; solana-cli's keypair file is the same 64 bytes as a JSON array |
+| `--sub-path <p>` (repeatable) | EVM sub-key | `subkey:<wallet_id>:evm:<p>` | as EVM | as EVM |
+| `--checks <n>` | payment checks 0 … n−1 | `wallet:<wallet_id>:near:check:<i>` | NEAR implicit account | as NEAR |
+
+`--chain all` is the first three rows; `--chain` repeats. Every key is
+`HMAC-SHA256(master, seed)` used as the key material: an ed25519 seed
+for NEAR and Solana, a secp256k1 scalar (big-endian) for EVM
+(keystore `api.rs::wallet_seed`, `subkey_seed`,
+`ephemeral_keys.rs`, `crypto.rs`). The EVM and sub-key `public_key`
+is the compressed point, `secp256k1:<hex>`, as `GET
+/wallet/v1/address` serves it; the NEAR `public_key` is NEAR's
+`ed25519:<base58>`, where that endpoint serves `ed25519:<hex>` of the
+same key.
+
+- **Sub-keys.** A sub-key is a separate EVM address of the wallet. Its
+  path is what the integration used: a connector's is
+  `connector.<connector_id>.<label>` — Hyperliquid's account is
+  `connector.hyperliquid.trading`, Polymarket's
+  `connector.polymarket.trading`. A path is taken exactly as the
+  keystore takes it, `[a-z0-9][a-z0-9._-]{0,63}`; any other is refused.
+  The master cannot list the paths a wallet used: pass each one.
+- **Payment checks.** A check's funds sit in `intents.near` under the
+  check's own NEAR implicit account until someone claims them. The
+  checks of a wallet are numbered from 0 in the order they were
+  created; `--checks <n>` derives the first n. The same key was given
+  to the check's recipient, who can claim it first.
+
+Without `--chain`, `--sub-path` or `--checks`, the tool prints the NEAR
+key alone, as `{wallet_id, near_address, public_key, private_key}`.
+
+The NEAR `address` MUST equal the `near_account_id` the coordinator
+returned at registration, and every other address the one `GET
+/wallet/v1/address?chain=<chain>[&sub_path=<p>]` served. If one
+differs, the derivation recipe and the keystore have diverged — file a
+bug.
 
 You can now sign any NEAR transaction as that wallet:
 
 ```bash
-near tokens "<near_address>" send-near alice.near '0.01 NEAR' \
+near tokens "<near address>" send-near alice.near '0.01 NEAR' \
     network-config mainnet \
     sign-with-plaintext-private-key 'ed25519:...' send
 ```
 
 Balances held for the wallet in other contracts (for example
 `intents.near`) belong to the same account and move with transactions
-signed by this key.
-
-`derive-wallet-key` covers the NEAR key only. The wallet's other chain
-keys use the same master with these seeds (keystore
-`api.rs::wallet_seed`, `crypto.rs`); the tool has no subcommand for
-them, so derive them with any HMAC-SHA256 implementation:
-
-| Chain | Seed | Key |
-|---|---|---|
-| NEAR | `wallet:<wallet_id>:near` | ed25519 seed = HMAC output |
-| EVM (all EVM chains, one address) | `wallet:<wallet_id>:evm` | secp256k1 secret scalar = HMAC output (big-endian) |
-| Solana | `wallet:<wallet_id>:solana` | ed25519 seed = HMAC output |
+signed by this key. The EVM and Solana keys import into any wallet of
+their chain.
 
 #### B.3 Decrypt each on-chain secret
 
@@ -403,6 +439,26 @@ A copy of the master taken before the exit is not affected by it — see
 - **`/call/<owner>/<project>` with vault-bound secrets** — refused with
   HTTP 423. Execution that does not use vault-bound secrets is
   unaffected.
+- **Spending with the payment keys of the vault's wallets** — every key
+  a wallet of the vault owns, the nonce-0 key (trial, sponsored or gift
+  credit, which ends here) and funded keys alike, answers `403` with
+  `reason: "wallet_exited"` to a call and a subscription purchase. The
+  run of an approved task answers nothing: the task fails
+  `preparer_key_unavailable`, or `queue_unavailable` when the chain does
+  not answer whether the wallet is still in custody. The money on a
+  funded key stays the wallet's: sign as the wallet's NEAR account with
+  the key re-derived in B.2 (`outlayer login` with that account and
+  key), run `outlayer keys close <nonce>` (`close_payment_key`), and
+  24 hours later `outlayer keys claim <nonce>` (`claim_payment_key_refund`).
+  A stablecoin balance deposited on the account comes back with the
+  contract's `withdraw_balance`. Allowance, grants and trial credit are
+  not refunded.
+
+  The same keys spend nothing while the keystore DAO does not verify
+  the vault (`403 wallet_exited` with `terminal: false`: they spend
+  again if the DAO verifies it again). The vault is then not served, so
+  the wallet's NEAR key comes only from the master this exit recovers:
+  Phase A, then B.1 and B.2, then the same close and claim.
 - **The dashboard** shows the vault as `UNLOCKED (recovered)`. Unlock
   is one-way: no method re-locks a vault.
 

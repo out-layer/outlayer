@@ -561,7 +561,7 @@ fn print_master(owner: &str, generation: u64, master: &[u8; 32]) {
     println!("master_hex={}", hex::encode(master));
     println!();
     println!("# A wallet's id: customer-recovery compute-wallet-id --account-id {owner} --seed <seed> --vault-id {}", owner_path(owner, generation));
-    println!("# Its key:       customer-recovery derive-wallet-key --master <master_hex> --wallet-id <id>");
+    println!("# Its keys:      customer-recovery derive-wallet-key --master <master_hex> --wallet-id <id> --chain all");
 }
 
 pub(super) async fn run(args: &[String]) -> Result<()> {
