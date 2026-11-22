@@ -354,7 +354,11 @@ async fn wait_for_tx(client: &JsonRpcClient, tx_hash: CryptoHash, sender: &Accou
     }
 }
 
-/// Send one function call from the owner and return what the transaction returned.
+/// How long an executed transaction is given to reach a final block.
+const FINALITY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Send one function call from the owner and return what the transaction returned, once the
+/// transaction is in a final block.
 async fn call(
     client: &JsonRpcClient,
     signer: &InMemorySigner,
@@ -365,6 +369,7 @@ async fn call(
     deposit: u128,
 ) -> Result<Vec<u8>> {
     let signed = sign_call(client, signer, contract, method, args, gas, deposit).await?;
+    let tx_hash = signed.get_hash();
     let outcome = client
         .call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest { signed_transaction: signed })
         .await
@@ -386,7 +391,20 @@ async fn call(
             ),
         })?;
     match outcome.status {
-        FinalExecutionStatus::SuccessValue(value) => Ok(value),
+        // The node answers once the transaction has executed, a few blocks before its block
+        // is final, and every read of this tool is at final finality: the call is done when
+        // `status`, run next, shows what it did.
+        FinalExecutionStatus::SuccessValue(value) => {
+            match wait_for_tx(client, tx_hash, &signer.account_id, FINALITY_WAIT).await? {
+                TxResult::Returned(_) => Ok(value),
+                TxResult::Failed(why) => bail!("{method} on {contract} failed: {why}"),
+                TxResult::NotThere => bail!(
+                    "{method} on {contract} executed in {tx_hash}, and its block is not final after {} s. \
+                     Run `owner-exit status` in a moment: it shows the change once the block is final",
+                    FINALITY_WAIT.as_secs()
+                ),
+            }
+        }
         FinalExecutionStatus::Failure(err) => bail!("{method} on {contract} failed: {err:?}"),
         other => bail!("{method} on {contract} ended as {other:?}"),
     }

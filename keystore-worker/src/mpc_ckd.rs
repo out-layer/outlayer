@@ -1693,34 +1693,39 @@ async fn write_owner_escrow(
     let path = crate::crypto::owner_path(account, generation);
     tracing::info!(owner = %account, generation, "Writing the owner's escrow to the keystore DAO");
 
-    // Both transactions are signed with the keystore's one key on the DAO account.
-    let _nonce = ctx.signer_nonce_lock.lock().await;
-    let escrow_key = MpcCkdClient::new(ctx.mpc_ckd_config.clone())
-        .request_owner_escrow_key(&ctx.keystore_dao_signer, account, generation)
-        .await
-        .with_context(|| format!("escrow key request failed for {account} generation {generation}"))?;
+    // Both transactions are signed with the keystore's one key on the DAO account, so the
+    // nonce lock is held from the first to the second and no longer.
+    // `submit_function_call` returns once the write is final, so the read-back that follows
+    // in `create_owner_escrow` sees it.
+    {
+        let _nonce = ctx.signer_nonce_lock.lock().await;
+        let escrow_key = MpcCkdClient::new(ctx.mpc_ckd_config.clone())
+            .request_owner_escrow_key(&ctx.keystore_dao_signer, account, generation)
+            .await
+            .with_context(|| format!("escrow key request failed for {account} generation {generation}"))?;
 
-    let master = keystore.owner_master(account, generation);
-    let escrow = crate::crypto::seal_owner_escrow(&escrow_key, &master, &path)?;
-    let opened = crate::crypto::open_owner_escrow(&escrow_key, &escrow.ct, &path)?;
-    anyhow::ensure!(*opened == *master, "the sealed escrow does not open to the master it was sealed from");
+        let master = keystore.owner_master(account, generation);
+        let escrow = crate::crypto::seal_owner_escrow(&escrow_key, &master, &path)?;
+        let opened = crate::crypto::open_owner_escrow(&escrow_key, &escrow.ct, &path)?;
+        anyhow::ensure!(*opened == *master, "the sealed escrow does not open to the master it was sealed from");
 
-    near_client
-        .submit_function_call(
-            &ctx.keystore_dao_signer,
-            dao,
-            "store_escrow",
-            serde_json::json!({
-                "owner": account,
-                "generation": generation,
-                "ct": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &escrow.ct),
-                "check": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, escrow.check),
-            }),
-            STORE_ESCROW_GAS,
-            0,
-        )
-        .await
-        .with_context(|| format!("store_escrow failed for {account} generation {generation}"))?;
+        near_client
+            .submit_function_call(
+                &ctx.keystore_dao_signer,
+                dao,
+                "store_escrow",
+                serde_json::json!({
+                    "owner": account,
+                    "generation": generation,
+                    "ct": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &escrow.ct),
+                    "check": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, escrow.check),
+                }),
+                STORE_ESCROW_GAS,
+                0,
+            )
+            .await
+            .with_context(|| format!("store_escrow failed for {account} generation {generation}"))?;
+    }
     Ok(())
 }
 

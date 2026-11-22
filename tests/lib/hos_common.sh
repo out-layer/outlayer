@@ -109,11 +109,10 @@ hos_require() {
   [[ -f "$CREDS_DIR/$PARENT.json" ]] || { echo "✗ creds missing: $CREDS_DIR/$PARENT.json" >&2; exit 1; }
   PARENT_PRIVKEY=$(jq -r '.private_key' "$CREDS_DIR/$PARENT.json")
   RECOVERY_BIN="$REPO_ROOT/scripts/customer-recovery/target/release/customer-recovery"
-  if [[ ! -x "$RECOVERY_BIN" ]]; then
-    note "building customer-recovery (bearer-token signer)"
-    (cd "$REPO_ROOT/scripts/customer-recovery" && cargo build --release --quiet) \
-      || { echo "✗ customer-recovery build failed" >&2; exit 1; }
-  fi
+  # Built on every run: cargo does nothing when the binary is up to date, and a binary
+  # older than its source would test code that is no longer there.
+  (cd "$REPO_ROOT/scripts/customer-recovery" && cargo build --release --quiet) \
+    || { echo "✗ customer-recovery build failed" >&2; exit 1; }
 }
 
 # ── coordinator client, throttled ────────────────────────────────────────────

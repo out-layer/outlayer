@@ -1360,9 +1360,10 @@ pub(super) async fn admin_ban_vault_handler(
 /// 2. If everything passes, submits `keystore_dao.mark_vault_verified(vault_id)`
 ///    using the worker's approved access key on the keystore-dao
 ///    contract (set up at TEE registration time).
-/// 3. Returns the broadcast tx hash. The agent does NOT need to wait
-///    for finality on the worker side — `broadcast_tx_commit` already
-///    waits, and the response only returns once the tx is final.
+/// 3. Returns the tx hash once the transaction is in a final block
+///    ([`crate::near::NearClient::submit_function_call`] waits for it), so
+///    an `is_vault_verified` read made after the answer sees the vault
+///    verified.
 ///
 /// **Critically NOT done here:** MPC CKD for the vault's master.
 /// That's lazy on first wallet-request via [`crate::mpc_ckd::add_customer`]
@@ -1456,9 +1457,8 @@ pub(super) async fn sign_vault_verification_handler(
     // 2. Submit mark_vault_verified tx, serializing through the
     //    per-signer nonce lock so concurrent /sign-vault-verification
     //    calls (and /admin/ban-vault) don't race for the same nonce.
-    //    Lock is held only across the build+broadcast critical
-    //    section; the response wait is inside broadcast_tx_commit so
-    //    we cannot release earlier without losing the tx_hash.
+    //    The lock is held until the call returns, which is once the
+    //    transaction is final: two or three blocks after it executed.
     //    300 TGas, no deposit.
     let outcome = {
         let _guard = ctx.signer_nonce_lock.lock().await;

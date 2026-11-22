@@ -250,8 +250,10 @@ else fail "D1 the record is $(record | head -c 300)"; fi
 refused "D1 a second registration" "already registered" "$OWNER" register_exit_owner "$(W "$MIN_W")" "$FEE"
 
 log "D2 what an ordinary account cannot do"
+# No deposit: the method takes none, and a call with one is refused for that before the
+# caller is looked at.
 refused "D2 store_escrow from an ordinary account" "approved-keystore access key" "$STRANGER" store_escrow \
-  "$(jq -nc --arg o "$OWNER" '{owner:$o, generation:1, ct:"AAAA", check:"AAAA"}')"
+  "$(jq -nc --arg o "$OWNER" '{owner:$o, generation:1, ct:"AAAA", check:"AAAA"}')" '0 NEAR'
 if [[ "$(near_view "$DAO" get_escrow "$(jq -nc --arg a "$OWNER" '{account:$a, generation:1}')")" == null ]]; then
   pass "D2 no escrow was stored by it"
 else fail "D2 an ordinary account stored an escrow"; fi
@@ -270,6 +272,18 @@ taken "D3 lowered again, left to take effect" "$OWNER" set_exit_window "$(W "$MI
 # ── W1–W3: wallets ───────────────────────────────────────────────────────────
 log "W1 the owner's signature creates the wallet"
 create_wallet "$LINK0" "$OWNER_CREDS"
+# The FIRST wallet of a generation is the one whose request writes the escrow. A refusal
+# that says the escrow is "not on chain after its write" is the keystore reading its own
+# write back too early: it is a failure of this row, and the request is sent once more
+# after the escrow shows on chain, so that the rows below still run.
+if [[ "$HTTP" != 200 && "$(jq -r '.message // ""' <<<"$BODY")" == *"is not on chain after its write"* ]]; then
+  fail "W1 the first owner-wallet request answered $HTTP $(why) — the escrow was written; the keystore did not see its own write"
+  for _ in $(seq 1 15); do
+    [[ "$(near_view "$DAO" get_escrow "$(jq -nc --arg a "$OWNER" '{account:$a, generation:1}')")" != null ]] && break
+    sleep 2
+  done
+  create_wallet "$LINK0" "$OWNER_CREDS"
+fi
 if [[ "$HTTP" == 200 && "$(jq -r '[.owner, .generation, .seed] | @json' <<<"$BODY")" == "[\"$OWNER\",1,\"0\"]" ]]; then
   WALLET0=$(jq -r .wallet_id <<<"$BODY"); ACCOUNT0=$(jq -r .near_account_id <<<"$BODY")
   pass "W1 wallet created: generation 1, seed 0"
@@ -282,7 +296,8 @@ ESCROW=$(near_view "$DAO" get_escrow "$(jq -nc --arg a "$OWNER" '{account:$a, ge
 if [[ "$(jq -r '[(.ct|length > 0), (.check|length > 0), .domain_id] | @json' <<<"$ESCROW")" == "[true,true,2]" ]]; then
   pass "W1 the generation's escrow is on chain"
 else fail "W1 no escrow on chain for a wallet that exists"; fi
-if [[ "$(rec .escrow_check)" == "$(jq -r .check <<<"$ESCROW")" ]]; then pass "W1 the record shows the escrow's check"
+RCHECK=$(rec '.escrow_check // empty')
+if [[ -n "$RCHECK" && "$RCHECK" == "$(jq -r '.check // empty' <<<"$ESCROW")" ]]; then pass "W1 the record shows the escrow's check"
 else fail "W1 escrow_check differs from the escrow"; fi
 
 log "W2 what a link cannot do"
@@ -315,7 +330,8 @@ if [[ "$HTTP" == 200 ]]; then pass "W3 and for the second"; else fail "W3 auth-s
 if ! { fund_account "$ACCOUNT0" 0.05 && fund_account "$ACCOUNT1" 0.01; }; then fail "W3 the wallets could not be funded"; fi
 
 # ── X1–X4: the exit ──────────────────────────────────────────────────────────
-finalize_after() { rec '.pending.kind.Exit.finalize_after / 1e9 | floor'; }
+# 0 when no exit is pending: every reader of it then fails its own row, with no jq error.
+finalize_after() { rec '(.pending.kind.Exit.finalize_after // 0) / 1e9 | floor'; }
 wait_for_window() {
   local after now
   after=$(finalize_after); now=$(date +%s)
@@ -373,10 +389,16 @@ if [[ "$(jq -r .near_address <<<"$DERIVED")" == "$ACCOUNT0" ]]; then
   IMPLICIT=$ACCOUNT0
   ( umask 077; jq -c --arg a "$IMPLICIT" '{account_id:$a, public_key, private_key}' <<<"$DERIVED" > "$CREDS_DIR/$IMPLICIT.json" )
   BEFORE=$(account_field "$IMPLICIT" amount)
-  near --quiet tokens "$IMPLICIT" send-near "$PARENT" '0.01 NEAR' network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
-  sleep 3
-  if [[ "$(account_field "$IMPLICIT" amount)" != "$BEFORE" ]]; then pass "X3 a transfer signed with the derived key landed"
-  else fail "X3 the derived key's transfer did not land"; fi
+  # near-cli's `send` returns once the transaction is final: a read after it sees it.
+  if ! [[ "$BEFORE" =~ ^[0-9]+$ ]]; then fail "X3 the wallet's balance could not be read before the transfer"
+  elif ! near --quiet tokens "$IMPLICIT" send-near "$PARENT" '0.01 NEAR' network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1; then
+    fail "X3 the transfer signed with the derived key was refused"
+  else
+    AFTER=$(account_field "$IMPLICIT" amount)
+    if [[ "$AFTER" =~ ^[0-9]+$ ]] && python3 -I -c 'import sys; sys.exit(0 if int(sys.argv[2]) <= int(sys.argv[1]) - 10**22 else 1)' "$BEFORE" "$AFTER"; then
+      pass "X3 a transfer signed with the derived key landed"
+    else fail "X3 the derived key's transfer did not land (balance before ${#BEFORE} digits, after: ${AFTER:-unreadable})"; fi
+  fi
 else fail "X3 the derived key is not the wallet's"; fi
 unset DERIVED
 
@@ -474,8 +496,9 @@ log "Q2 an exit under the set — the wallet's policy is locked to the same two"
 T0=$(date +%s)
 if OUT=$(exit_tool initiate); then pass "Q2 the exit is started"; else fail "Q2 initiate: $(near_why "$OUT")"; fi
 LEFT=$(( $(finalize_after) - T0 ))
-if (( LEFT <= MIN_W + 30 )); then pass "Q2 the lowered window is in force now (${LEFT}s)"; else fail "Q2 the exit waits ${LEFT}s after the lowering took effect"; fi
-NONCE=$(rec .pending.nonce)
+if (( LEFT > 0 && LEFT <= MIN_W + 30 )); then pass "Q2 the lowered window is in force now (${LEFT}s)"; else fail "Q2 the exit waits ${LEFT}s after the lowering took effect"; fi
+NONCE=$(rec '.pending.nonce // empty')
+[[ -n "$NONCE" ]] || { fail "Q2 the record shows no pending exit after it was started"; verdict owner_exit; exit 1; }
 refused "Q2 a change of the set while an exit is pending" "an action is already pending" "$OWNER" set_exit_approvers "$(SET 1 "$APPROVER1")"
 refused "Q2 a vote for another nonce" "no pending action with this nonce" "$APPROVER1" approve_exit "$(VOTE $((NONCE + 1)))"
 refused "Q2 a stranger's vote" "not an approver of this owner" "$STRANGER" approve_exit "$(VOTE "$NONCE")"

@@ -148,6 +148,12 @@ pub fn rpc_client(rpc_url: &str) -> RpcClient {
     build_rpc_client(rpc_url, 30)
 }
 
+/// How long a transaction that has executed is given to reach a final block: finality
+/// follows execution by two or three blocks.
+const FINALITY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long to wait before asking again about a transaction a node had no answer for.
+const FINALITY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Transaction-path RPC client: `broadcast_tx_commit`.
 ///
 /// Deliberately far more patient than [`rpc_client`]. The MPC CKD call returns its result as
@@ -852,8 +858,9 @@ impl NearClient {
     }
 
     /// Submit a function-call transaction signed by `signer`, calling
-    /// `receiver.method(args)`. Waits for finality (`broadcast_tx_commit`)
-    /// and returns the tx hash + raw success-value bytes.
+    /// `receiver.method(args)`. Returns the tx hash + raw success-value bytes
+    /// once the transaction is in a FINAL block: a view made after it, by
+    /// this client or by the coordinator, sees what it wrote.
     ///
     /// Used by `/sign-vault-verification` (and future `/admin/ban-vault`)
     /// to land a tx via the worker's approved access key on the
@@ -981,6 +988,13 @@ impl NearClient {
 
         match &outcome.status {
             near_primitives::views::FinalExecutionStatus::SuccessValue(value) => {
+                // `broadcast_tx_commit` answers once the transaction has executed, two or
+                // three blocks before its block is final, and every view of this client —
+                // and of the coordinator — reads at final finality. The call is done when
+                // such a read sees what it wrote.
+                self.wait_until_final(tx_hash, &signer.account_id)
+                    .await
+                    .with_context(|| format!("{receiver_id}.{method_name} executed in {tx_hash}, and is not final yet"))?;
                 Ok(FunctionCallOutcome {
                     tx_hash: tx_hash.to_string(),
                     success_value: value.clone(),
@@ -992,6 +1006,55 @@ impl NearClient {
             other => {
                 anyhow::bail!("{receiver_id}.{method_name} tx unexpected status: {other:?}")
             }
+        }
+    }
+
+    /// Wait until the transaction `tx_hash` of `sender` is in a FINAL block: a view at final
+    /// finality made after this sees what the transaction wrote.
+    async fn wait_until_final(&self, tx_hash: near_primitives::hash::CryptoHash, sender: &AccountId) -> Result<()> {
+        use near_jsonrpc_client::errors::{JsonRpcError, JsonRpcServerError, JsonRpcServerResponseStatusError};
+        use near_jsonrpc_primitives::types::transactions::{RpcTransactionError, TransactionInfo};
+        use near_primitives::views::TxExecutionStatus;
+
+        let deadline = tokio::time::Instant::now() + FINALITY_WAIT;
+        loop {
+            let request = methods::tx::RpcTransactionStatusRequest {
+                transaction_info: TransactionInfo::TransactionId { tx_hash, sender_account_id: sender.clone() },
+                wait_until: TxExecutionStatus::Final,
+            };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let error = match tokio::time::timeout(left, self.rpc_client_tx.call(request)).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) => e,
+                Err(_) => anyhow::bail!("not final after {} s", FINALITY_WAIT.as_secs()),
+            };
+            // A node that gave up waiting (its own timeout, a 408), one that has not seen the
+            // transaction yet behind a load balancer, or no answer at all says nothing about it: the transaction
+            // has executed, so it is asked again until the deadline. Any other answer is the
+            // error.
+            let says_nothing = match error.rpc() {
+                // No answer reached us: only a status read is repeated, never the send.
+                None => true,
+                Some(rpc) => {
+                    matches!(
+                        rpc.handler_error(),
+                        Some(RpcTransactionError::UnknownTransaction { .. }) | Some(RpcTransactionError::TimeoutError)
+                    ) || matches!(
+                        rpc,
+                        JsonRpcError::ServerError(JsonRpcServerError::ResponseStatusError(
+                            JsonRpcServerResponseStatusError::Unexpected { status }
+                        )) if *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    )
+                }
+            };
+            if !says_nothing {
+                return Err(anyhow::Error::from(error)).context("the node could not say whether the transaction is final");
+            }
+            if tokio::time::Instant::now() + FINALITY_POLL >= deadline {
+                anyhow::bail!("not final after {} s", FINALITY_WAIT.as_secs());
+            }
+            // The next block is about a second away; asking sooner gets the same answer.
+            tokio::time::sleep(FINALITY_POLL).await;
         }
     }
 
@@ -1165,6 +1228,66 @@ mod tests {
 
     /// An endpoint nothing listens on, with a key in its query string.
     const KEYED_DEAD_URL: &str = "http://127.0.0.1:9/?apiKey=SECRET";
+
+    /// A JSON-RPC endpoint that answers the `tx` requests it gets with `answers`, in order,
+    /// and counts them. One connection per request (the client is told to close).
+    fn tx_status_server(answers: Vec<&'static str>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        std::thread::spawn(move || {
+            for (body, stream) in answers.into_iter().zip(listener.incoming()) {
+                let mut stream = stream.expect("accept");
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    const TX_UNKNOWN: &str = r#"{"jsonrpc":"2.0","id":"dontcare","error":{"name":"HANDLER_ERROR","cause":{"name":"UNKNOWN_TRANSACTION","info":{"requested_transaction_hash":"11111111111111111111111111111111"}},"code":-32000,"message":"Server error","data":"unknown"}}"#;
+    const TX_TIMEOUT: &str = r#"{"jsonrpc":"2.0","id":"dontcare","error":{"name":"HANDLER_ERROR","cause":{"name":"TIMEOUT_ERROR"},"code":-32000,"message":"Server error","data":"timeout"}}"#;
+    const TX_INVALID: &str = r#"{"jsonrpc":"2.0","id":"dontcare","error":{"name":"HANDLER_ERROR","cause":{"name":"INVALID_TRANSACTION","info":{"InvalidNonce":{"tx_nonce":1,"ak_nonce":2}}},"code":-32000,"message":"Server error","data":"invalid"}}"#;
+    const TX_FINAL: &str = r#"{"jsonrpc":"2.0","id":"dontcare","result":{"final_execution_status":"FINAL"}}"#;
+
+    fn sender() -> AccountId {
+        "dao.outlayer.testnet".parse().unwrap()
+    }
+
+    /// A node that has not seen the transaction, or gave up waiting, is asked again; the
+    /// wait ends when one says the block is final.
+    #[tokio::test]
+    async fn the_finality_wait_asks_again_until_a_node_says_final() {
+        let (url, asked) = tx_status_server(vec![TX_UNKNOWN, TX_TIMEOUT, TX_FINAL]);
+        let client = NearClient::new(&url, "outlayer.testnet").expect("client");
+        client
+            .wait_until_final(near_primitives::hash::CryptoHash::default(), &sender())
+            .await
+            .expect("final on the third answer");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Any other answer of the node is the error, at once.
+    #[tokio::test]
+    async fn the_finality_wait_ends_on_an_answer_about_the_transaction() {
+        let (url, asked) = tx_status_server(vec![TX_INVALID, TX_FINAL]);
+        let client = NearClient::new(&url, "outlayer.testnet").expect("client");
+        let e = client
+            .wait_until_final(near_primitives::hash::CryptoHash::default(), &sender())
+            .await
+            .expect_err("an invalid transaction is not waited on");
+        assert!(format!("{e:#}").contains("could not say whether the transaction is final"), "{e:#}");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     /// A transport error from the RPC client names neither the URL nor its key,
     /// in `Display` (what bodies and warn logs carry) or `Debug`.
