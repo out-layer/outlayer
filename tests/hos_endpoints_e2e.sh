@@ -555,7 +555,7 @@ api "$SEED_BODY" DELETE /wallet/v1/binding >/dev/null 2>&1 || true
 # carry, and a version whose grants never bounded token movement.
 log "E18 admin lists: versions, wallet builds, the watchdog"
 if [[ -n "${ADMIN_TOKEN:-}" ]]; then
-  adm() { curl -sS --max-time 60 -X "$1" "$COORDINATOR_URL$2" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  adm() { curl -sS --max-time 60 -X "$1" "$COORDINATOR_URL$2" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
             -H 'Content-Type: application/json' ${3:+--data-binary "$3"} 2>/dev/null; }
   V=$(adm GET /admin/hos-impl-versions)
   [[ "$(jq -r '[.versions[].impl_version] | index(6) != null and index(7) != null' <<<"$V")" == "true" ]] \

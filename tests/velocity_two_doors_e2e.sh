@@ -267,7 +267,7 @@ https_spend() { # https_spend <amount>
 }
 guest_spend() { # guest_spend <amount> — the same money, moved from inside the enclave
   curl -sS -m 300 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-    -H "X-Payment-Key: $PAYMENT_KEY" -H "$WID_HDR" -H 'Content-Type: application/json' \
+    -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") -H "$WID_HDR" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg t "$RECIPIENT" --arg a "$1" \
           '{input:{operation:"transfer", to:$t, amount:$a}}')"
 }

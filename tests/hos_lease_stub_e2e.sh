@@ -107,10 +107,9 @@ pass "both stub instances are deployed and initialised"
 # makes: the code-hash allowlist below, the webhook zone in §W.
 adm() {
   local m=$1 p=$2 b=${3:-}
-  local -a a=(-sS -o /dev/null -w '%{http_code}' -X "$m" "$COORDINATOR_URL$p"
-              -H "Authorization: Bearer ${ADMIN_TOKEN:-}" --max-time 60)
+  local -a a=(-sS -o /dev/null -w '%{http_code}' -X "$m" "$COORDINATOR_URL$p" --max-time 60)
   [[ -n "$b" ]] && a+=(-H 'Content-Type: application/json' --data-binary "$b")
-  curl "${a[@]}" 2>/dev/null
+  curl "${a[@]}" -H @<(printf '%s\n' "Authorization: Bearer ${ADMIN_TOKEN:-}") 2>/dev/null
 }
 STUB_HASH=""
 for _ in 1 2 3 4 5 6; do
@@ -120,7 +119,7 @@ for _ in 1 2 3 4 5 6; do
 done
 if [[ -n "${ADMIN_TOKEN:-}" ]]; then
   curl -s --max-time 30 -X POST "$COORDINATOR_URL/admin/hos-impl-code-hashes" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+    -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg h "$STUB_HASH" '{code_hash:$h, note:"hos-status-stub test fixture, tests/hos-status-stub"}')" >/dev/null \
     && note "stub code hash $STUB_HASH is on the coordinator's allowlist" \
     || warn "could not register the stub's code hash $STUB_HASH"

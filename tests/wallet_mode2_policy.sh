@@ -98,7 +98,7 @@ curl_get() {
     local api_key="$1"
     local path="$2"
     curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer $api_key" \
+        -H @<(printf '%s\n' "Authorization: Bearer $api_key") \
         "${COORDINATOR_URL}${path}"
 }
 
@@ -115,7 +115,7 @@ curl_post() {
     curl -s -w "\n%{http_code}" \
         -X POST \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $api_key" \
+        -H @<(printf '%s\n' "Authorization: Bearer $api_key") \
         ${extra_headers[@]+"${extra_headers[@]}"} \
         -d "$body" \
         "${COORDINATOR_URL}${path}"

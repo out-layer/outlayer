@@ -48,7 +48,7 @@ probe() {
   throttle
   out=$(mktemp -t hos_ident.XXXXXX)
   HTTP=$(curl -sS -o "$out" -w '%{http_code}' -m 300 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-    -H "X-Payment-Key: $pk" -H 'Content-Type: application/json' \
+    -H @<(printf '%s\n' "X-Payment-Key: $pk") -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg o "$op" --argjson f "$flag" '{input:{operation:$o}, use_bound_identity:$f}')" 2>/dev/null)
   BODY="$(tr -d '\n' < "$out")"; rm -f "$out"
   # The handle the API gives a client, and the only one it gives: §I7 walks the
@@ -67,7 +67,7 @@ WID=$(jq -r '.wallet_id // empty' <<<"$BODY"); EXEC=$(jq -r '.address // empty' 
 [[ -n "$WID" ]] || { echo "✗ /address failed: $BODY" >&2; exit 1; }
 note "wallet $WID / executor $EXEC"
 
-CLAIM=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/trial-key" -H "Authorization: Bearer $WK" \
+CLAIM=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/trial-key" -H @<(printf '%s\n' "Authorization: Bearer $WK") \
   -H 'Content-Type: application/json' -d '{}' 2>/dev/null)
 PK=$(jq -r '.payment_key // empty' <<<"$CLAIM")
 

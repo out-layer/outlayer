@@ -119,11 +119,11 @@ if [[ "$MODE" == "--create" ]]; then
   pass "wallet $PREDEPLOY_WALLET_ID  addr=$PREDEPLOY_WALLET_ADDR  api_key: ${#PREDEPLOY_WK} chars"
 fi
 
-AUTH=(-H "Authorization: Bearer ${PREDEPLOY_WK:?fixture holds no key}")
+AUTH_HDR="Authorization: Bearer ${PREDEPLOY_WK:?fixture holds no key}"
 
 if [[ "$MODE" == "--create" ]]; then
   log "Store the policy: whitelist [$PARENT], approver $APPROVER, 0.05 NEAR per transaction"
-  ADDR_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" "${AUTH[@]}")
+  ADDR_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H @<(printf '%s\n' "$AUTH_HDR"))
   WALLET_PUBKEY_HEX="ed25519:$(echo "$ADDR_RESP" | jq -r '.public_key' | sed 's/^ed25519://')"
   BODY=$(jq -nc --arg wid "$PREDEPLOY_WALLET_ID" --arg p "$PARENT" --arg a "$APPROVER" --arg pk "$APPROVER_PUBKEY" \
     --arg per_tx "$NEAR_05" '{
@@ -135,11 +135,11 @@ if [[ "$MODE" == "--create" ]]; then
       },
       approval: {threshold: {required: 1}, approvers: [{id: $a, pubkey: $pk}]}
     }')
-  ENC=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" "${AUTH[@]}" \
+  ENC=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" -H @<(printf '%s\n' "$AUTH_HDR") \
     -H 'Content-Type: application/json' -d "$BODY")
   B64=$(echo "$ENC" | jq -r '.encrypted_base64 // empty')
   [[ -n "$B64" ]] || fail "encrypt-policy: $(echo "$ENC" | head -c 300)"
-  SIGN=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" "${AUTH[@]}" \
+  SIGN=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" -H @<(printf '%s\n' "$AUTH_HDR") \
     -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg ed "$B64" --arg c "$PARENT" '{encrypted_data: $ed, caller: $c}')")
   SIG=$(echo "$SIGN" | jq -r '.signature_hex // empty')
@@ -154,7 +154,7 @@ if [[ "$MODE" == "--create" ]]; then
     prepaid-gas '100.0 Tgas' attached-deposit '0.1 NEAR' \\
     sign-as $PARENT network-config $NETWORK sign-with-keychain send" || fail "store_wallet_policy failed"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    READ=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" "${AUTH[@]}")
+    READ=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" -H @<(printf '%s\n' "$AUTH_HDR"))
     [[ "$(echo "$READ" | jq -r '.rules.addresses.list[0] // empty')" == "$PARENT" ]] && break
     sleep 3
   done
@@ -184,7 +184,7 @@ fi
 # ─── The questions, the same on both sides of the release ────────
 
 transfer() {  # $1 = to, $2 = yocto; prints "<http>\n<body>"
-  curl -sS -w '\n%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/transfer" "${AUTH[@]}" \
+  curl -sS -w '\n%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/transfer" -H @<(printf '%s\n' "$AUTH_HDR") \
     -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg to "$1" --arg a "$2" '{chain: "near", to: $to, amount: $a}')"
 }
@@ -199,7 +199,7 @@ refused_with() {  # $1 = label, $2 = to, $3 = yocto, $4 = words of the refusal
 }
 
 log "B0 the policy is the one stored before the release"
-READ=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" "${AUTH[@]}")
+READ=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" -H @<(printf '%s\n' "$AUTH_HDR"))
 VERSION=$(echo "$READ" | jq -r '.version // empty')
 [[ "$VERSION" == "$PREDEPLOY_POLICY_VERSION" ]] || \
   fail "B0: the policy is version '$VERSION', the fixture stored version '$PREDEPLOY_POLICY_VERSION' — it was rewritten, so it is no longer a pre-release policy"

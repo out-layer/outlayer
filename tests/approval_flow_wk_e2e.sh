@@ -129,7 +129,7 @@ fi
 # /register doesn't echo vault_id in the response by current API shape —
 # verify the binding via the /address endpoint (which DOES expose vault_id).
 ADDR_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" \
-  -H "Authorization: Bearer $WK_API_KEY")
+  -H @<(printf '%s\n' "Authorization: Bearer $WK_API_KEY"))
 GOT_VAULT=$(echo "$ADDR_RESP" | jq -r '.vault_id // empty')
 [[ "$GOT_VAULT" == "$VAULT_ID" ]] || \
   fail "/address vault_id mismatch: got '$GOT_VAULT', expected '$VAULT_ID'. /register response (key removed): $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG_RESP" 2>/dev/null | head -c 300)"
@@ -163,14 +163,14 @@ POLICY_BODY=$(jq -nc \
                 approvers: [ { id: $approver, pubkey: $approver_pub } ] }
   }')
 ENC_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" \
-  -H "Authorization: Bearer $WK_API_KEY" \
+  -H @<(printf '%s\n' "Authorization: Bearer $WK_API_KEY") \
   -H 'Content-Type: application/json' \
   -d "$POLICY_BODY")
 ENCRYPTED_B64=$(echo "$ENC_RESP" | jq -r '.encrypted_base64 // empty')
 [[ -n "$ENCRYPTED_B64" && "$ENCRYPTED_B64" != "null" ]] || fail "/encrypt-policy: $ENC_RESP"
 
 SIGN_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" \
-  -H "Authorization: Bearer $WK_API_KEY" \
+  -H @<(printf '%s\n' "Authorization: Bearer $WK_API_KEY") \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg ed "$ENCRYPTED_B64" --arg c "$PARENT" '{encrypted_data: $ed, caller: $c}')")
 SIG_HEX=$(echo "$SIGN_RESP" | jq -r '.signature_hex // empty')
@@ -197,7 +197,7 @@ pass "policy stored on chain"
 
 log "4. Transfer 0.01 NEAR (approval-gated by policy) → pending_approval"
 T_RESP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/transfer" \
-  -H "Authorization: Bearer $WK_API_KEY" \
+  -H @<(printf '%s\n' "Authorization: Bearer $WK_API_KEY") \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg to "$PARENT" '{chain: "near", to: $to, amount: "10000000000000000000000"}')")
 echo "$T_RESP" | jq . >&2
@@ -214,7 +214,7 @@ fi
 # it was just given must be in it, with the counts the detail page shows.
 log "4.1 GET /wallet/v1/pending_approvals with the same wk_ lists it"
 LIST_RESP=$(curl -sS -w '\nHTTP:%{http_code}' "$COORDINATOR_URL/wallet/v1/pending_approvals" \
-  -H "Authorization: Bearer $WK_API_KEY")
+  -H @<(printf '%s\n' "Authorization: Bearer $WK_API_KEY"))
 LIST_CODE=$(echo "$LIST_RESP" | tail -n1 | sed 's/HTTP://')
 LIST_BODY=$(echo "$LIST_RESP" | sed '$d')
 LISTED=$(echo "$LIST_BODY" | jq -r --arg id "$APPROVAL_ID" '[.approvals[]? | select(.approval_id == $id)] | length' 2>/dev/null || echo 0)
@@ -261,7 +261,7 @@ TX_HASH=""
 for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 3
   S=$(curl -sS "$COORDINATOR_URL/wallet/v1/requests/$REQUEST_ID" \
-    -H "Authorization: Bearer $WK_API_KEY")
+    -H @<(printf '%s\n' "Authorization: Bearer $WK_API_KEY"))
   ST=$(echo "$S" | jq -r '.status')
   echo "  attempt $attempt: status=$ST" >&2
   case "$ST" in

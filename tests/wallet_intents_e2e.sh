@@ -96,7 +96,7 @@ NC='\033[0m'
 curl_get() {
     local path="$1"
     curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer $WALLET_API_KEY" \
+        -H @<(printf '%s\n' "Authorization: Bearer $WALLET_API_KEY") \
         "${COORDINATOR_URL}${path}"
 }
 
@@ -111,7 +111,7 @@ curl_post() {
     curl -s -w "\n%{http_code}" \
         -X POST \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $WALLET_API_KEY" \
+        -H @<(printf '%s\n' "Authorization: Bearer $WALLET_API_KEY") \
         ${extra_headers[@]+"${extra_headers[@]}"} \
         -d "$body" \
         "${COORDINATOR_URL}${path}"
@@ -144,7 +144,7 @@ cmd_setup() {
     check_coordinator
 
     if [ -n "${WALLET_API_KEY:-}" ]; then
-        echo "Using existing API key: ${WALLET_API_KEY:0:10}..."
+        echo "Using existing API key: ${WALLET_API_KEY:0:4}..."
         echo ""
     else
         echo "Registering new wallet..."
@@ -162,7 +162,7 @@ cmd_setup() {
         NEAR_ADDRESS=$(echo "$RESP_BODY" | jq -r '.near_account_id')
 
         echo -e "Wallet ID: ${GREEN}$WALLET_ID${NC}"
-        echo -e "API Key:   ${YELLOW}$WALLET_API_KEY${NC}"
+        echo -e "API Key:   ${YELLOW}${WALLET_API_KEY:0:4}… (${#WALLET_API_KEY} chars)${NC}"
         save_state
         echo -e "${CYAN}Saved state to $STATE_FILE (chmod 600).${NC}"
         echo -e "${CYAN}Subsequent commands (call/withdraw/status) auto-load this — no need to re-paste the key.${NC}"
@@ -188,47 +188,51 @@ cmd_setup() {
     echo "============================================="
     echo " Next steps:"
     echo ""
+    echo " 0. The commands below read the key from the environment; load it from the state file:"
+    echo ""
+    echo "    set -a; source $STATE_FILE; set +a"
+    echo ""
     echo " 1. Send NEAR to the implicit address (for gas + wrapping):"
     echo ""
     echo "    near send ${YOUR_ACCOUNT} $NEAR_ADDRESS 0.1 --networkId $NETWORK"
     echo ""
     echo " 2. (Optional) Set a policy via dashboard:"
     echo ""
-    echo "    https://app.outlayer.ai/wallet?key=$WALLET_API_KEY"
+    echo "    https://app.outlayer.ai/wallet — with the key WALLET_API_KEY in $STATE_FILE"
     echo ""
     echo " 3. Get wallet address:"
     echo ""
-    echo "    curl -s -H 'Authorization: Bearer $WALLET_API_KEY' '${COORDINATOR_URL}/wallet/v1/address?chain=near' | jq ."
+    echo "    curl -s -H @<(printf '%s\\n' \"Authorization: Bearer \$WALLET_API_KEY\") '${COORDINATOR_URL}/wallet/v1/address?chain=near' | jq ."
     echo ""
     echo " 4. Call contract (wrap NEAR via $WRAP_CONTRACT near_deposit):"
     echo ""
-    echo "    curl -s -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer $WALLET_API_KEY' \\"
+    echo "    curl -s -X POST -H 'Content-Type: application/json' -H @<(printf '%s\\n' \"Authorization: Bearer \$WALLET_API_KEY\") \\"
     echo "      -d '{\"receiver_id\":\"$WRAP_CONTRACT\",\"method_name\":\"near_deposit\",\"args\":{},\"deposit\":\"10000000000000000000000\"}' \\"
     echo "      '${COORDINATOR_URL}/wallet/v1/call' | jq ."
     echo ""
     echo " 5. Check available tokens:"
     echo ""
-    echo "    curl -s -H 'Authorization: Bearer $WALLET_API_KEY' '${COORDINATOR_URL}/wallet/v1/tokens' | jq ."
+    echo "    curl -s -H @<(printf '%s\\n' \"Authorization: Bearer \$WALLET_API_KEY\") '${COORDINATOR_URL}/wallet/v1/tokens' | jq ."
     echo ""
     echo " 6. Withdraw via intents (dry-run):"
     echo ""
-    echo "    curl -s -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer $WALLET_API_KEY' \\"
+    echo "    curl -s -X POST -H 'Content-Type: application/json' -H @<(printf '%s\\n' \"Authorization: Bearer \$WALLET_API_KEY\") \\"
     echo "      -d '{\"to\":\"${YOUR_ACCOUNT}\",\"amount\":\"1000000000000000000000\",\"token\":\"$WRAP_CONTRACT\",\"chain\":\"near\"}' \\"
     echo "      '${COORDINATOR_URL}/wallet/v1/intents/withdraw/dry-run' | jq ."
     echo ""
     echo " 7. Withdraw via intents (real):"
     echo ""
-    echo "    curl -s -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer $WALLET_API_KEY' \\"
+    echo "    curl -s -X POST -H 'Content-Type: application/json' -H @<(printf '%s\\n' \"Authorization: Bearer \$WALLET_API_KEY\") \\"
     echo "      -d '{\"to\":\"${YOUR_ACCOUNT}\",\"amount\":\"1000000000000000000000\",\"token\":\"$WRAP_CONTRACT\",\"chain\":\"near\"}' \\"
     echo "      '${COORDINATOR_URL}/wallet/v1/intents/withdraw' | jq ."
     echo ""
     echo " 8. Check request status (replace REQUEST_ID):"
     echo ""
-    echo "    curl -s -H 'Authorization: Bearer $WALLET_API_KEY' '${COORDINATOR_URL}/wallet/v1/requests/REQUEST_ID' | jq ."
+    echo "    curl -s -H @<(printf '%s\\n' \"Authorization: Bearer \$WALLET_API_KEY\") '${COORDINATOR_URL}/wallet/v1/requests/REQUEST_ID' | jq ."
     echo ""
     echo " 9. Get audit log:"
     echo ""
-    echo "    curl -s -H 'Authorization: Bearer $WALLET_API_KEY' '${COORDINATOR_URL}/wallet/v1/audit?limit=50' | jq ."
+    echo "    curl -s -H @<(printf '%s\\n' \"Authorization: Bearer \$WALLET_API_KEY\") '${COORDINATOR_URL}/wallet/v1/audit?limit=50' | jq ."
     echo "============================================="
     echo ""
 }
@@ -249,7 +253,7 @@ cmd_call() {
     WALLET_API_KEY="${WALLET_API_KEY:?Set WALLET_API_KEY=wk_... (from setup output)}"
     CALL_DEPOSIT="${CALL_DEPOSIT:-10000000000000000000000}"  # 0.01 NEAR
 
-    echo "API Key: ${WALLET_API_KEY:0:10}..."
+    echo "API Key: ${WALLET_API_KEY:0:4}..."
     echo "Wrap contract: $WRAP_CONTRACT"
     echo "Deposit: $CALL_DEPOSIT yoctoNEAR"
     echo ""
@@ -362,7 +366,7 @@ cmd_call() {
         echo -e "${GREEN} CALL SUCCEEDED — NEAR wrapped into wNEAR${NC}"
         echo ""
         echo " Now you can test intents withdraw:"
-        echo "   WALLET_API_KEY=$WALLET_API_KEY WITHDRAW_TO=${YOUR_ACCOUNT} ./tests/wallet_intents_e2e.sh withdraw"
+        echo "   WITHDRAW_TO=${YOUR_ACCOUNT} ./tests/wallet_intents_e2e.sh withdraw"
     elif [ "$STATUS" = "pending_approval" ]; then
         echo -e "${YELLOW} CALL REQUIRES APPROVAL (check /wallet/v1/pending_approvals)${NC}"
     else
@@ -390,7 +394,7 @@ cmd_withdraw() {
     WITHDRAW_TOKEN="${WITHDRAW_TOKEN:-$WRAP_CONTRACT}"
     WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-1000000000000000000000}"
 
-    echo "API Key: ${WALLET_API_KEY:0:10}..."
+    echo "API Key: ${WALLET_API_KEY:0:4}..."
     echo ""
 
     # 1. Get wallet address
@@ -555,7 +559,7 @@ cmd_show() {
         echo -e "${CYAN}State file:   $STATE_FILE${NC}"
         echo -e "Wallet ID:    ${GREEN}${WALLET_ID:-?}${NC}"
         echo -e "NEAR account: ${GREEN}${NEAR_ADDRESS:-?}${NC}"
-        echo -e "API key:      ${YELLOW}${WALLET_API_KEY}${NC}"
+        echo -e "API key:      ${YELLOW}${WALLET_API_KEY:0:4}… (${#WALLET_API_KEY} chars, in $STATE_FILE)${NC}"
         echo -e "Coordinator:  ${COORDINATOR_URL}"
     else
         echo -e "${YELLOW}No saved state. Run \`$0 setup\` first.${NC}"
@@ -568,7 +572,7 @@ cmd_reset() {
         echo -e "Saved wallet (about to be forgotten):"
         echo -e "  Wallet ID:    ${WALLET_ID:-?}"
         echo -e "  NEAR account: ${NEAR_ADDRESS:-?}"
-        echo -e "  API key:      ${WALLET_API_KEY:0:14}…"
+        echo -e "  API key:      ${WALLET_API_KEY:0:4}…"
         echo ""
         echo -e "${YELLOW}WARNING: the API key controls the funds custodied on this account.${NC}"
         echo -e "${YELLOW}Any NEAR/wNEAR/intents balance left on it will be UNRECOVERABLE${NC}"

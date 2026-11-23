@@ -144,7 +144,7 @@ prepare_and_store_policy() {
     }')
   local enc
   enc=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" \
-    -H "Authorization: Bearer $bearer" \
+    -H @<(printf '%s\n' "Authorization: Bearer $bearer") \
     -H 'Content-Type: application/json' \
     -d "$body")
   local enc_b64
@@ -153,7 +153,7 @@ prepare_and_store_policy() {
 
   local sig_resp
   sig_resp=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" \
-    -H "Authorization: Bearer $bearer" \
+    -H @<(printf '%s\n' "Authorization: Bearer $bearer") \
     -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg ed "$enc_b64" --arg c "$PARENT" '{encrypted_data: $ed, caller: $c}')")
   local sig_hex
@@ -207,7 +207,7 @@ TOKEN_A=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-b
  --account-id "$PARENT" --seed "$SEED_A" \
   --vault-id "$VAULT_ID")
 ADDR_RESP_A=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" \
-  -H "Authorization: Bearer near:$TOKEN_A")
+  -H @<(printf '%s\n' "Authorization: Bearer near:$TOKEN_A"))
 SUB_PUB_A=$(echo "$ADDR_RESP_A" | jq -r '.public_key')
 WALLET_ID_A=$(echo "$ADDR_RESP_A" | jq -r '.wallet_id')
 SUB_ADDR_A=$(echo "$ADDR_RESP_A" | jq -r '.address')
@@ -238,7 +238,7 @@ WALLET_ID_B=$(echo "$REG_B" | jq -r '.wallet_id')
 SUB_ADDR_B=$(echo "$REG_B" | jq -r '.near_account_id')
 [[ -n "$WK_B" && "$WK_B" != "null" ]] || fail "Scenario B /register failed: $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG_B" 2>/dev/null | head -c 300)"
 ADDR_RESP_B=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" \
-  -H "Authorization: Bearer $WK_B")
+  -H @<(printf '%s\n' "Authorization: Bearer $WK_B"))
 SUB_PUB_B=$(echo "$ADDR_RESP_B" | jq -r '.public_key')
 pass "Scenario B sub-wallet: $SUB_ADDR_B (wallet_id=$WALLET_ID_B)"
 

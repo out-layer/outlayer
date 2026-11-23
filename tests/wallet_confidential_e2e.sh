@@ -98,7 +98,7 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC
 # ============================================================================
 
 curl_get() {
-    curl -s -w "\n%{http_code}" -H "Authorization: Bearer $WALLET_API_KEY" "${COORDINATOR_URL}${1}"
+    curl -s -w "\n%{http_code}" -H @<(printf '%s\n' "Authorization: Bearer $WALLET_API_KEY") "${COORDINATOR_URL}${1}"
 }
 
 curl_post() {
@@ -107,7 +107,7 @@ curl_post() {
     [ -n "$idem_key" ] && extra_headers+=(-H "X-Idempotency-Key: $idem_key")
     curl -s -w "\n%{http_code}" -X POST \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $WALLET_API_KEY" \
+        -H @<(printf '%s\n' "Authorization: Bearer $WALLET_API_KEY") \
         ${extra_headers[@]+"${extra_headers[@]}"} \
         -d "$body" "${COORDINATOR_URL}${path}"
 }
@@ -361,7 +361,7 @@ cmd_show() {
     echo "State file: $STATE_FILE"
     echo "WALLET_ID:    ${WALLET_ID:-<none>}"
     echo "NEAR_ADDRESS: ${NEAR_ADDRESS:-<none>}"
-    echo "API key:      ${WALLET_API_KEY:0:10}${WALLET_API_KEY:+…}"
+    echo "API key:      ${WALLET_API_KEY:0:4}${WALLET_API_KEY:+…}"
 }
 
 cmd_reset() {

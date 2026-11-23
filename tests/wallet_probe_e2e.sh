@@ -211,7 +211,7 @@ probe() {
   local out http
   out=$(mktemp -t walletprobe.XXXXXX)
   http=$(curl -sS -m 300 -o "$out" -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
-    -H "X-Payment-Key: $PAYMENT_KEY" -H 'Content-Type: application/json' "$@" -d "$input")
+    -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") -H 'Content-Type: application/json' "$@" -d "$input")
   printf '%s %s\n' "$http" "$(tr -d '\n' < "$out")"
   rm -f "$out"
 }
@@ -496,7 +496,7 @@ HOLD_BODY=$(jq -nc --arg t "$RECIPIENT" --arg a "$XFER_YOCTO" '{chain:"near", to
 hold_loop() {
   while [[ -f "$HOLD_FLAG" ]]; do
     curl -sS -m 60 -X POST "$COORDINATOR_URL/wallet/v1/transfer" \
-      -H "$HOLD_AUTH" -H 'Content-Type: application/json' -d "$HOLD_BODY" >/dev/null 2>&1
+      -H @<(printf '%s\n' "$HOLD_AUTH") -H 'Content-Type: application/json' -d "$HOLD_BODY" >/dev/null 2>&1
   done
 }
 # RETRIED, because the race is genuinely about even.

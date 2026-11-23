@@ -166,7 +166,7 @@ earnings_of() { view get_developer_earnings "$(jq -nc --arg id "$1" '{account_id
 # so a section can be run on its own — `ONLY=C5` must not depend on C3 having
 # executed the definition.
 probe() {
-  curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $PAYMENT_KEY" \
+  curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") \
     -H 'Content-Type: application/json' -d "{\"input\":{\"operation\":\"$1\"}}"
 }
 
@@ -426,8 +426,8 @@ if want C3; then
       # second read moves the period under the comparison, and the delta stops
       # being about the call.
       SINCE=$(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
-      report() { curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE" -H "Authorization: Bearer $ADMIN_TOKEN"; }
-      SUBBED=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $PAYMENT_KEY" \
+      report() { curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN"); }
+      SUBBED=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") \
                  | jq -r '(.has_subscription == true) and (.expired == false)')
 
       R0=$(report)
@@ -474,7 +474,7 @@ if want C4; then
     # against the chain, which is where that money actually is — the report is
     # a record of what the contract did, and the contract is the ledger.
     FROM="${FROM:-$(date -u -v-3H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)}"
-    REPORT=$(curl -s "$COORDINATOR_URL/admin/earnings?from=$FROM" -H "Authorization: Bearer $ADMIN_TOKEN")
+    REPORT=$(curl -s "$COORDINATOR_URL/admin/earnings?from=$FROM" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN"))
     R_GROSS=$(echo "$REPORT" | jq -r '.earned.gross_usd // "0"')
     R_SHARE=$(echo "$REPORT" | jq -r '.earned.developer_share_usd // "0"')
     R_TOTAL=$(echo "$REPORT" | jq -r '.earned.total_usd // "0"')
@@ -510,7 +510,7 @@ if want C5; then
   elif [[ "$APPLY" != true ]]; then
     printf '\033[90m  (dry-run) the fee on top of compute, and the reservation coming back\033[0m\n' >&2
   else
-    status() { curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $PAYMENT_KEY"; }
+    status() { curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY"); }
     S0=$(status)
     if [[ "$(echo "$S0" | jq -r '.has_subscription')" == true ]]; then
       note "C5 SKIPPED: this key has a subscription, so its calls cost it nothing — use a money-only key"
@@ -521,11 +521,11 @@ if want C5; then
       # fee has to be measured against. Without this baseline "the balance went
       # down" says nothing about whether the operation was charged for.
       probe ping >/dev/null; sleep 6
-      BAL_PING=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $PAYMENT_KEY" | jq -r '.balance')
+      BAL_PING=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") | jq -r '.balance')
       COMPUTE=$(( BAL0 - BAL_PING ))
 
       R=$(probe secret); sleep 6
-      S2=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $PAYMENT_KEY")
+      S2=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY"))
       BAL2=$(echo "$S2" | jq -r '.balance')
       PAID=$(( BAL_PING - BAL2 ))
 
@@ -569,7 +569,7 @@ if want C5; then
       # this checkable at all.
       if [[ -n "$ADMIN_TOKEN" ]]; then
         CID=$(echo "$R" | jq -r '.call_id // empty')
-        ROW_CHARGED=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=20" -H "Authorization: Bearer $ADMIN_TOKEN" \
+        ROW_CHARGED=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=20" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
                         | jq -r --arg c "$CID" 'first(.calls[]|select(.call_id==$c)) | .charged_usd // empty')
         if [[ -z "$ROW_CHARGED" ]]; then
           note "C5 the charge cross-check SKIPPED — the call is not in the log yet"
@@ -599,7 +599,7 @@ if want C6 && agent_secret_mode C6; then
   else
     log "C6 the owner's secret"
     agent_probe() {
-      curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $AGENT_PAYMENT_KEY" \
+      curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $AGENT_PAYMENT_KEY") \
         "$@" -H 'Content-Type: application/json' -d '{"input":{"operation":"secret"}}'
     }
     # Fresh values each run, and the expectation is computed from them rather
@@ -674,7 +674,7 @@ if want C8; then
     printf '\033[90m  (dry-run) the egress audit and the connector-call log\033[0m\n' >&2
   else
     log "C8 the egress audit and the call log"
-    EG=$(curl -s "$COORDINATOR_URL/admin/egress-audit?project_id=$PROJECT" -H "Authorization: Bearer $ADMIN_TOKEN")
+    EG=$(curl -s "$COORDINATOR_URL/admin/egress-audit?project_id=$PROJECT" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN"))
     REFUSED=$(echo "$EG" | jq -r '.hosts[] | select(.host=="example.com") | .refused // 0')
     ALLOWED=$(echo "$EG" | jq -r '.hosts[] | select(.host=="rpc.testnet.fastnear.com") | (.attempts - .refused)')
     [[ "${REFUSED:-0}" -gt 0 ]] \
@@ -685,7 +685,7 @@ if want C8; then
       && pass "C8 the allowed destination is logged too ($ALLOWED reached)" \
       || fail "C8 the declared host has no allowed attempt recorded: $(echo "$EG" | head -c 200)"
 
-    CALLS=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=20" -H "Authorization: Bearer $ADMIN_TOKEN")
+    CALLS=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=20" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN"))
     ROW=$(echo "$CALLS" | jq -c --arg p "$PROJECT" 'first(.calls[] | select(.project_id==$p))')
     if [[ -n "$ROW" && "$ROW" != "null" ]]; then
       # The log exists to answer "who ran what, and what were they charged".
@@ -733,13 +733,13 @@ if want C9; then
   elif [[ "$APPLY" != true ]]; then
     printf '\033[90m  (dry-run) C9 phase %s\033[0m\n' "$C9_PHASE" >&2
   else
-    money() { curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $PAYMENT_KEY" | jq -r "$1"; }
+    money() { curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") | jq -r "$1"; }
     # The call's own row, which is the only account of it that separates money
     # SPENT from money merely RESERVED. `/subscription/status`'s `balance` nets
     # the reservation out, so measuring a charge with it reports a call that is
     # still running as one that took the money.
     call_row() {
-      curl -s "$COORDINATOR_URL/admin/connector-calls?limit=100" -H "Authorization: Bearer $ADMIN_TOKEN" \
+      curl -s "$COORDINATOR_URL/admin/connector-calls?limit=100" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
         | jq -c --arg c "$1" 'first(.calls[] | select(.call_id==$c)) // empty'
     }
     case "$C9_PHASE" in
@@ -750,14 +750,14 @@ if want C9; then
         else
         # `burn` so that if a worker DID pick it up the difference is obvious in
         # the numbers rather than hidden in rounding.
-        R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $PAYMENT_KEY" \
+        R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") \
               -H 'Content-Type: application/json' -d '{"input":{"operation":"burn","rounds":50}}')
         CID=$(echo "$R" | jq -r '.call_id // empty' 2>/dev/null)
         if [[ -z "$CID" ]]; then
           # No JSON came back — the connection died before the coordinator
           # answered. Fall back to the newest row for this key, which is the
           # call just made.
-          CID=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=5" -H "Authorization: Bearer $ADMIN_TOKEN" \
+          CID=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=5" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
                   | jq -r '.calls[0].call_id // empty')
           warn "C9 the request returned no JSON — the connection died before the coordinator answered"
         fi
@@ -805,7 +805,7 @@ if want C9; then
             sleep 5
           done
           ROW=$(call_row "$CID")
-          ROWS=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=100" -H "Authorization: Bearer $ADMIN_TOKEN" \
+          ROWS=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=100" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
                    | jq --arg c "$CID" '[.calls[] | select(.call_id==$c)] | length')
           WD=$(money '.withdrawable'); BAL=$(money '.balance')
 
@@ -829,10 +829,10 @@ if want C9; then
         # so the two numbers cannot be confused for one another. With `secret`
         # (fee 10000) a charge of 10000 would say nothing about WHICH of them
         # was taken.
-        R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $PAYMENT_KEY" \
+        R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") \
               -H 'Content-Type: application/json' -d '{"input":{"operation":"fetch"}}')
         CID=$(echo "$R" | jq -r '.call_id // empty' 2>/dev/null)
-        [[ -n "$CID" ]] || CID=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=5" -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.calls[0].call_id // empty')
+        [[ -n "$CID" ]] || CID=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=5" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") | jq -r '.calls[0].call_id // empty')
         for _ in $(seq 1 12); do
           [[ "$(call_row "$CID" | jq -r '.status // "missing"')" == "pending" ]] || break
           sleep 5
@@ -884,7 +884,7 @@ if want C10; then
   else
     log "C10 the trial key"
     T_WK=$(curl -s -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d '{}' | jq -r '.api_key // empty')
-    T_CLAIM=$(curl -s -X POST "$COORDINATOR_URL/trial-key" -H "Authorization: Bearer $T_WK" -H 'Content-Type: application/json' -d '{}')
+    T_CLAIM=$(curl -s -X POST "$COORDINATOR_URL/trial-key" -H @<(printf '%s\n' "Authorization: Bearer $T_WK") -H 'Content-Type: application/json' -d '{}')
     T_PK=$(echo "$T_CLAIM" | jq -r '.payment_key // empty')
 
     if [[ "$(echo "$T_CLAIM" | jq -r '.reason // empty')" == "trial_unavailable" ]]; then
@@ -911,11 +911,11 @@ if want C10; then
       # decides whether curation costs us money on every free call.
       if [[ -n "$ADMIN_TOKEN" ]]; then
         SINCE=$(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
-        rep() { curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE" -H "Authorization: Bearer $ADMIN_TOKEN"; }
+        rep() { curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN"); }
         R0=$(rep)
         A0=$(echo "$R0" | jq -r '.earned.by_source.https.developer_share_usd // "0"')
         G0=$(echo "$R0" | jq -r '.given.spent_from_grants_usd // "0"')
-        curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $T_PK" \
+        curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $T_PK") \
           -H 'Content-Type: application/json' -d '{"input":{"operation":"secret"}}' >/dev/null
         A1=$A0; G1=$G0
         for _ in $(seq 1 20); do
@@ -936,7 +936,7 @@ if want C10; then
 
       # The scope is the whole of what a trial may reach.
       OUT=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$COORDINATOR_URL/call/zavodil.testnet/some-other-project" \
-              -H "X-Payment-Key: $T_PK" -H 'Content-Type: application/json' -d '{"input":{}}')
+              -H @<(printf '%s\n' "X-Payment-Key: $T_PK") -H 'Content-Type: application/json' -d '{"input":{}}')
       [[ "$OUT" == "403" ]] \
         && pass "C10 a project outside the namespace is refused (403)" \
         || fail "C10 a project outside the namespace answered $OUT, not 403"
@@ -949,7 +949,7 @@ if want C10; then
       # front of it. What must never happen is a second key, so that is what
       # this asserts.
       AGAIN=$(curl -s -o "$RUN_TMP"/c10_again -w '%{http_code}' -X POST "$COORDINATOR_URL/trial-key" \
-                -H "Authorization: Bearer $T_WK" -H 'Content-Type: application/json' -d '{}')
+                -H @<(printf '%s\n' "Authorization: Bearer $T_WK") -H 'Content-Type: application/json' -d '{}')
       SECOND_KEY=$(jq -r '.payment_key // empty' "$RUN_TMP"/c10_again 2>/dev/null)
       if [[ -n "$SECOND_KEY" ]]; then
         fail "C10 a SECOND trial key was handed out — one per account is not being held"
@@ -977,7 +977,7 @@ if want C11; then
     #    money printer: claim, forward to an account you control, repeat.
     if [[ -n "$TRIAL_KEY" ]]; then
       RC=$(curl -s -o "$RUN_TMP"/c11_a -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
-             -H "X-Payment-Key: $TRIAL_KEY" -H 'X-Attached-Deposit: 50000' \
+             -H @<(printf '%s\n' "X-Payment-Key: $TRIAL_KEY") -H 'X-Attached-Deposit: 50000' \
              -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
       if [[ "$RC" == "403" ]] && grep -qi "deposit" "$RUN_TMP"/c11_a; then
         pass "C11 a trial key cannot send a deposit to an author (403)"
@@ -992,12 +992,12 @@ if want C11; then
     #    and their author is paid out of that price; an extra payment on the
     #    side would be a second, unpriced channel to the same account.
     if [[ -n "$PAYMENT_KEY" && -n "$ADMIN_TOKEN" ]]; then
-      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $PAYMENT_KEY" \
+      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") \
             -H 'X-Attached-Deposit: 50000' -H 'Content-Type: application/json' \
             -d '{"input":{"operation":"ping"}}')
       CID=$(echo "$R" | jq -r '.call_id // empty')
       sleep 6
-      ROW=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=20" -H "Authorization: Bearer $ADMIN_TOKEN" \
+      ROW=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=20" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
               | jq -c --arg c "$CID" 'first(.calls[]|select(.call_id==$c)) // empty')
       CHARGED=$(echo "$ROW" | jq -r '.charged_usd // "?"')
       # `ping` is free, so anything above the compute would be the deposit
@@ -1016,7 +1016,7 @@ if want C11; then
     #    one must be told, not handed a different kind of key in silence.
     if [[ -n "$AGENT_WALLET_KEY" ]]; then
       RC=$(curl -s -o "$RUN_TMP"/c11_c -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/create-payment-key" \
-             -H "Authorization: Bearer $AGENT_WALLET_KEY" -H 'Content-Type: application/json' \
+             -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WALLET_KEY") -H 'Content-Type: application/json' \
              -d '{"agent":true,"initial_deposit_usdc":"0.10"}')
       if [[ "$RC" == 4?? ]] && grep -qi "no longer issued" "$RUN_TMP"/c11_c; then
         pass "C11 agent:true is refused and says why ($RC)"
@@ -1075,7 +1075,7 @@ if want C12 && agent_secret_mode C12; then
     # its own secret" and reported a working stack as broken. The two are the
     # same identity to the keystore: `agent_secrets_ref` keys off the payment
     # key's `owner`, and that owner is the wallet's own account.
-    MINE=$(secret_seen -H "X-Payment-Key: $AGENT_PAYMENT_KEY")
+    MINE=$(secret_seen -H @<(printf '%s\n' "X-Payment-Key: $AGENT_PAYMENT_KEY"))
     if [[ "$MINE" == yes ]]; then
       pass "C12 the agent the secret is named after does read it"
     else
@@ -1088,12 +1088,12 @@ if want C12 && agent_secret_mode C12; then
     #    and would be refused by the keystore even if one existed under this
     #    name, because the profile it may read is its own.
     OTHER_WK=$(curl -s -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d '{}' | jq -r '.api_key // empty')
-    OTHER_CLAIM=$(curl -s -X POST "$COORDINATOR_URL/trial-key" -H "Authorization: Bearer $OTHER_WK" -H 'Content-Type: application/json' -d '{}')
+    OTHER_CLAIM=$(curl -s -X POST "$COORDINATOR_URL/trial-key" -H @<(printf '%s\n' "Authorization: Bearer $OTHER_WK") -H 'Content-Type: application/json' -d '{}')
     OTHER_PK=$(echo "$OTHER_CLAIM" | jq -r '.payment_key // empty')
     if [[ -z "$OTHER_PK" ]]; then
       note "C12 the other-agent check SKIPPED — could not fund a second agent ($(echo "$OTHER_CLAIM" | jq -r '.reason // "?"'))"
     else
-      THEIRS=$(secret_seen -H "X-Payment-Key: $OTHER_PK")
+      THEIRS=$(secret_seen -H @<(printf '%s\n' "X-Payment-Key: $OTHER_PK"))
       case "$THEIRS" in
         no)  pass "C12 a DIFFERENT agent of the same person sees nothing" ;;
         yes) fail "C12 another agent reached this secret — the name is not binding" ;;
@@ -1106,7 +1106,7 @@ if want C12 && agent_secret_mode C12; then
     #    secrets through the body — pointing it at an agent's would be
     #    inventing a meaning nobody asked for.
     if [[ -n "$PAYMENT_KEY" ]]; then
-      OWNERS=$(secret_seen -H "X-Payment-Key: $PAYMENT_KEY")
+      OWNERS=$(secret_seen -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY"))
       case "$OWNERS" in
         no)  pass "C12 the person who PAID for the secret cannot read it through their own key" ;;
         yes) fail "C12 an ordinary payment key reached an agent's secret" ;;
@@ -1120,9 +1120,9 @@ if want C12 && agent_secret_mode C12; then
     #    different connector is a different secret — one sealed for one cannot
     #    be opened for the other.
     K1=$(curl -s -G "$COORDINATOR_URL/wallet/v1/agent-secret/pubkey" --data-urlencode "project_id=$PROJECT" \
-           -H "Authorization: Bearer $AGENT_WALLET_KEY" | jq -r '.pubkey // empty')
+           -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WALLET_KEY") | jq -r '.pubkey // empty')
     K2=$(curl -s -G "$COORDINATOR_URL/wallet/v1/agent-secret/pubkey" --data-urlencode "project_id=$PROJECT-other" \
-           -H "Authorization: Bearer $AGENT_WALLET_KEY" | jq -r '.pubkey // empty')
+           -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WALLET_KEY") | jq -r '.pubkey // empty')
     [[ -n "$K1" && -n "$K2" && "$K1" != "$K2" ]] \
       && pass "C12 the same agent under another project gets a different key" \
       || fail "C12 two projects share one key for this agent ($K1 / $K2)"
@@ -1138,7 +1138,7 @@ if want C12 && agent_secret_mode C12; then
       sleep 5
       # The agent's own payment key, as in the first check: a `wk_` buys
       # nothing and is refused as `wk_is_not_a_payer` before the guest runs.
-      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $AGENT_PAYMENT_KEY" \
+      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $AGENT_PAYMENT_KEY") \
             -H 'X-Use-Owner-Secret: 1' -H 'Content-Type: application/json' \
             -d '{"input":{"operation":"secret"}}')
       STILL=$(echo "$R" | jq -r '.output.secrets[]? | select(.key=="PROBE_TOKEN") | .sha256_prefix')
@@ -1164,13 +1164,13 @@ if want C12 && agent_secret_mode C12; then
     # 5. Nothing hands out plaintext. The pubkey endpoint answers with a public
     #    key and a name; the store endpoint takes ciphertext or nothing.
     PUB=$(curl -s -G "$COORDINATOR_URL/wallet/v1/agent-secret/pubkey" --data-urlencode "project_id=$PROJECT" \
-            -H "Authorization: Bearer $AGENT_WALLET_KEY")
+            -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WALLET_KEY"))
     EXTRA=$(echo "$PUB" | jq -r 'keys - ["pubkey","seed","agent_account"] | join(",")')
     [[ -z "$EXTRA" ]] \
       && pass "C12 the pubkey endpoint returns a key and a name, nothing else" \
       || fail "C12 the pubkey endpoint also returned: $EXTRA"
     RC=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/agent-secret" \
-           -H "Authorization: Bearer $AGENT_WALLET_KEY" -H 'Content-Type: application/json' \
+           -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WALLET_KEY") -H 'Content-Type: application/json' \
            -d "$(jq -nc --arg p "$PROJECT" '{project_id:$p, encrypted_secrets_base64:""}')")
     [[ "$RC" == 4?? ]] \
       && pass "C12 storing without ciphertext is refused ($RC) — this process must never see a plaintext credential" \
@@ -1196,7 +1196,7 @@ if want C13; then
     printf '\033[90m  (dry-run) a call on an expired subscription falls back to the money balance\033[0m\n' >&2
   else
     log "C13 an expired subscription falls back to the balance"
-    ST=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $EXPIRED_SUB_KEY")
+    ST=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $EXPIRED_SUB_KEY"))
     EXPIRED=$(echo "$ST" | jq -r '.expired'); AVAIL=$(echo "$ST" | jq -r '.allowance_available_usd // "0"')
     BAL0=$(echo "$ST" | jq -r '.balance')
 
@@ -1209,18 +1209,18 @@ if want C13; then
         && pass "C13 an expired subscription offers no allowance at all" \
         || fail "C13 the expired subscription still reports $AVAIL available"
 
-      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $EXPIRED_SUB_KEY" \
+      R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $EXPIRED_SUB_KEY") \
             -H 'Content-Type: application/json' -d '{"input":{"operation":"secret"}}')
       CID=$(echo "$R" | jq -r '.call_id // empty')
       if [[ -z "$CID" ]]; then
         fail "C13 the call did not run: $(echo "$R" | head -c 160)"
       else
         sleep 8
-        ROW=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=30" -H "Authorization: Bearer $ADMIN_TOKEN" \
+        ROW=$(curl -s "$COORDINATOR_URL/admin/connector-calls?limit=30" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
                 | jq -c --arg c "$CID" 'first(.calls[]|select(.call_id==$c)) // empty')
         FROM_ALLOW=$(echo "$ROW" | jq -r '.from_allowance')
         CHARGED=$(echo "$ROW" | jq -r '.charged_usd // "?"')
-        BAL1=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $EXPIRED_SUB_KEY" | jq -r '.balance')
+        BAL1=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $EXPIRED_SUB_KEY") | jq -r '.balance')
 
         [[ "$FROM_ALLOW" == false ]] \
           && pass "C13 the call is paid from the BALANCE, not from a dead allowance (charged $CHARGED)" \
@@ -1254,7 +1254,7 @@ if want C14; then
     #    an allowance pays for the call and there is nothing to refuse.
     if [[ -n "$EMPTY_KEY" ]]; then
       RC=$(curl -s -o "$RUN_TMP"/c14_a -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
-             -H "X-Payment-Key: $EMPTY_KEY" -H 'Content-Type: application/json' \
+             -H @<(printf '%s\n' "X-Payment-Key: $EMPTY_KEY") -H 'Content-Type: application/json' \
              -d '{"input":{"operation":"secret"}}')
       if [[ "$RC" == "402" ]] && grep -qi "insufficient balance" "$RUN_TMP"/c14_a; then
         pass "C14 a key with nothing in it is refused with 402 ($(jq -r '.error' "$RUN_TMP"/c14_a 2>/dev/null | head -c 60))"
@@ -1269,7 +1269,7 @@ if want C14; then
     #    it has to sit below compute plus the fee, not below the fee alone.
     if [[ -n "$CAPPED_KEY" ]]; then
       RC=$(curl -s -o "$RUN_TMP"/c14_c -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" \
-             -H "X-Payment-Key: $CAPPED_KEY" -H 'Content-Type: application/json' \
+             -H @<(printf '%s\n' "X-Payment-Key: $CAPPED_KEY") -H 'Content-Type: application/json' \
              -d '{"input":{"operation":"secret"}}')
       if [[ "$RC" == "400" ]] && grep -qi "max per call exceeded" "$RUN_TMP"/c14_c; then
         pass "C14 a call over the key's max_per_call is refused ($(jq -r '.error' "$RUN_TMP"/c14_c 2>/dev/null | head -c 60))"
@@ -1306,7 +1306,7 @@ if want C14; then
     #    That is why this needs a second project rather than the probe.
     if [[ -n "$SUB_KEY" && -n "$ORDINARY_PROJECT" ]]; then
       RC=$(curl -s -o "$RUN_TMP"/c14_d -w '%{http_code}' --max-time 45 -X POST "$COORDINATOR_URL/call/$ORDINARY_PROJECT" \
-             -H "X-Payment-Key: $SUB_KEY" -H 'X-Attached-Deposit: 50000' \
+             -H @<(printf '%s\n' "X-Payment-Key: $SUB_KEY") -H 'X-Attached-Deposit: 50000' \
              -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
       if [[ "$RC" == "402" ]] && grep -q "allowance_no_deposit" "$RUN_TMP"/c14_d; then
         pass "C14 an allowance cannot be paid to a developer (402 allowance_no_deposit)"
@@ -1325,10 +1325,10 @@ if want C14; then
     #    one with NO money on it: a key that also holds a balance pays the call
     #    from that instead of refusing.
     if [[ -n "$SUB_KEY" ]]; then
-      LEFT=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $SUB_KEY" | jq -r '.allowance_available_usd // 0')
+      LEFT=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $SUB_KEY") | jq -r '.allowance_available_usd // 0')
       BIG=$(( LEFT * 5 + 1000000 ))
       RC=$(curl -s -o "$RUN_TMP"/c14_e -w '%{http_code}' --max-time 45 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-             -H "X-Payment-Key: $SUB_KEY" -H "X-Compute-Limit: $BIG" \
+             -H @<(printf '%s\n' "X-Payment-Key: $SUB_KEY") -H "X-Compute-Limit: $BIG" \
              -H 'Content-Type: application/json' -d '{"input":{"operation":"secret"}}')
       if [[ "$RC" == "402" ]] && grep -q "insufficient_allowance" "$RUN_TMP"/c14_e; then
         pass "C14 a job larger than the allowance is refused before it starts (asked $BIG, had $LEFT)"
@@ -1344,7 +1344,7 @@ if want C14; then
     #    clamped and the call runs. Spends one of the trial's calls.
     if [[ -n "$TRIAL_KEY" ]]; then
       RC=$(curl -s -o "$RUN_TMP"/c14_f -w '%{http_code}' --max-time 60 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-             -H "X-Payment-Key: $TRIAL_KEY" -H "X-Compute-Limit: 1000000000" \
+             -H @<(printf '%s\n' "X-Payment-Key: $TRIAL_KEY") -H "X-Compute-Limit: 1000000000" \
              -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
       if [[ "$RC" == "200" ]]; then
         pass "C14 a trial call asking for an oversized compute budget is clamped and runs"
@@ -1390,7 +1390,7 @@ if want C15; then
     # not these calls, whatever else shares the window.
     SINCE15=$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
     author_share_now() {
-      curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE15" -H "Authorization: Bearer $ADMIN_TOKEN" \
+      curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE15" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN") \
         | jq -r '.earned.developer_share_usd'
     }
     SHARE_BEFORE=$(author_share_now)
@@ -1410,9 +1410,9 @@ if want C15; then
         # is shown, calls. What neither may do — reach the author — is judged
         # below from the ledger, for both.
         C15_READ=$([[ "$CRED" == TRIAL ]] && echo '.trial.calls_used // 0' || echo '.allowance_available_usd // 0')
-        A=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $KEY" | jq -r "$C15_READ")
+        A=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $KEY") | jq -r "$C15_READ")
         RC=$(curl -s -o "$RUN_TMP"/c15_r -w '%{http_code}' --max-time 60 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-          -H "X-Payment-Key: $KEY" -H 'Content-Type: application/json' \
+          -H @<(printf '%s\n' "X-Payment-Key: $KEY") -H 'Content-Type: application/json' \
           -d "{\"input\":{\"operation\":\"$OP\"}}")
         # A call that never ran spends nothing, and "spent nothing" is exactly
         # what this section reads as "the fee was not charged". They have to be
@@ -1424,7 +1424,7 @@ if want C15; then
         fi
         C15_RAN=$((C15_RAN + 1))
         sleep 5
-        B=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $KEY" | jq -r "$C15_READ")
+        B=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $KEY") | jq -r "$C15_READ")
         if [[ "$CRED" == TRIAL ]]; then
           [[ $(( B - A )) -eq 1 ]] \
             && pass "C15 TRIAL $OP counted as one trial call ($A → $B)" \
@@ -1454,7 +1454,7 @@ if want C15; then
       # a failure: the delta was right and the run had simply not happened.
       note "C15 the ledger check SKIPPED — none of the six calls ran (set TRIAL_KEY and/or SUB_KEY)"
     else
-      R15=$(curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE15" -H "Authorization: Bearer $ADMIN_TOKEN")
+      R15=$(curl -s "$COORDINATOR_URL/admin/earnings?from=$SINCE15" -H @<(printf '%s\n' "Authorization: Bearer $ADMIN_TOKEN"))
       SHARE_AFTER=$(echo "$R15" | jq -r '.earned.developer_share_usd')
       SPENT15=$(echo "$R15" | jq -r '(.given.spent_from_grants_usd|tonumber) + (.given.spent_from_subscriptions_usd|tonumber)')
       CREDITED=$(( SHARE_AFTER - SHARE_BEFORE ))
@@ -1502,7 +1502,7 @@ if want C16; then
 
     fire() { # fire <key> <outfile> — returns as soon as the call is ACCEPTED
       curl -s -o "$2" -w '%{http_code}' --max-time 60 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-        -H "X-Payment-Key: $1" -H 'Content-Type: application/json' \
+        -H @<(printf '%s\n' "X-Payment-Key: $1") -H 'Content-Type: application/json' \
         -d '{"input":{"operation":"secret"},"async":true}'
     }
 
@@ -1513,7 +1513,7 @@ if want C16; then
       local cid
       cid=$(jq -r '.call_id // empty' "$1" 2>/dev/null)
       [[ -z "$cid" ]] && return 1
-      [[ "$(curl -s "$COORDINATOR_URL/calls/$cid" -H "X-Payment-Key: $2" | jq -r '.status')" == "pending" ]]
+      [[ "$(curl -s "$COORDINATOR_URL/calls/$cid" -H @<(printf '%s\n' "X-Payment-Key: $2") | jq -r '.status')" == "pending" ]]
     }
 
     # Wait for it to stop running. Each part of this section arranges a call to
@@ -1531,7 +1531,7 @@ if want C16; then
       return 1
     }
 
-    SUB_MONEY=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $SUB_KEY" | jq -r '.balance')
+    SUB_MONEY=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $SUB_KEY") | jq -r '.balance')
 
     # 1. A second call on the SUBSCRIPTION while the first is still running.
     RC_A=$(fire "$SUB_KEY" "$RUN_TMP"/c16_a)
@@ -1607,7 +1607,7 @@ if want C17; then
     if [[ -z "$RENEW_KEY" || -z "$CALLER" ]]; then
       note "C17 renewal SKIPPED — set RENEW_KEY (a key with a LIVE subscription) and CALLER to spend a plan on it"
     else
-      B=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $RENEW_KEY")
+      B=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $RENEW_KEY"))
       T0=$(echo "$B" | jq -r '.allowance_total_usd'); S0=$(echo "$B" | jq -r '.allowance_spent_usd')
       E0=$(echo "$B" | jq -r '.expires_at')
       NONCE=$(echo "$RENEW_KEY" | cut -d: -f2)
@@ -1645,7 +1645,7 @@ if want C17; then
       fi
       sleep 14
 
-      A=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $RENEW_KEY")
+      A=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $RENEW_KEY"))
       T1=$(echo "$A" | jq -r '.allowance_total_usd'); S1=$(echo "$A" | jq -r '.allowance_spent_usd')
       E1=$(echo "$A" | jq -r '.expires_at')
 
@@ -1736,7 +1736,7 @@ if want C18 && agent_secret_mode C18; then
     # Which agent this wk_ speaks for on this project.
     agent_of() { # agent_of <wk_> <project>
       curl -s "$COORDINATOR_URL/wallet/v1/agent-secret/pubkey?project_id=$2" \
-        -H "Authorization: Bearer $1" | jq -r '.agent_account // empty'
+        -H @<(printf '%s\n' "Authorization: Bearer $1") | jq -r '.agent_account // empty'
     }
 
     # The ciphertext currently stored for <agent> under <project>, off the chain.
@@ -1787,7 +1787,7 @@ if want C18 && agent_secret_mode C18; then
     write_as_payer() { # write_as_payer <wk_> <payer> <project> <ciphertext>
       local prep args
       prep=$(curl -s -X POST "$COORDINATOR_URL/wallet/v1/agent-secret/prepare" \
-               -H "Authorization: Bearer $1" -H 'Content-Type: application/json' \
+               -H @<(printf '%s\n' "Authorization: Bearer $1") -H 'Content-Type: application/json' \
                -d "$(jq -nc --arg p "$3" --arg c "$4" --arg pay "$2" \
                      '{project_id:$p, encrypted_secrets_base64:$c, payer:$pay}')")
       args=$(echo "$prep" | jq -c '.args // empty')
@@ -1815,7 +1815,7 @@ if want C18 && agent_secret_mode C18; then
 
     mint_key() { # mint_key <parent_wk> <seed> <key_hash> → wallet_id
       curl -s -X PUT "$COORDINATOR_URL/wallet/v1/api-key" \
-        -H "Authorization: Bearer $1" -H 'Content-Type: application/json' \
+        -H @<(printf '%s\n' "Authorization: Bearer $1") -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg s "$2" --arg kh "$3" '{seed:$s, key_hash:$kh}')" \
         | jq -r '.wallet_id // empty'
     }
@@ -1838,7 +1838,7 @@ if want C18 && agent_secret_mode C18; then
         pass "C18 a secret is on chain under the fresh agent ($AGENT)"
 
         RV=$(curl -s -o "$RUN_TMP"/c18_rv -w '%{http_code}' -X DELETE \
-               "$COORDINATOR_URL/wallet/v1/api-key/$H_A" -H "Authorization: Bearer $WK_B")
+               "$COORDINATOR_URL/wallet/v1/api-key/$H_A" -H @<(printf '%s\n' "Authorization: Bearer $WK_B"))
         # The answer is READ, not discarded. A revoke that quietly refuses —
         # "cannot revoke the last active key" is a real answer here — would
         # leave everything below measuring the key that was supposed to be gone.
@@ -1846,7 +1846,7 @@ if want C18 && agent_secret_mode C18; then
           fail "C18 the revoke was refused ($RV): $(head -c 140 "$RUN_TMP"/c18_rv)"
         else
           OLD_RC=$(curl -s -o /dev/null -w '%{http_code}' \
-                     "$COORDINATOR_URL/wallet/v1/address?chain=near" -H "Authorization: Bearer $WK_A")
+                     "$COORDINATOR_URL/wallet/v1/address?chain=near" -H @<(printf '%s\n' "Authorization: Bearer $WK_A"))
           [[ "$OLD_RC" == 401 ]] \
             && pass "C18 the rotated-out wk_ is refused (401)" \
             || fail "C18 the old wk_ still answers $OLD_RC — nothing was rotated, so what follows proves nothing"
@@ -1941,7 +1941,7 @@ if want C19 && agent_secret_mode C19; then
     # not JSON at all — jq's complaint would otherwise be printed as if the test
     # itself had gone wrong.
     C19_PUBKEY=$(curl -s "$COORDINATOR_URL/wallet/v1/agent-secret/pubkey?wasm_hash=$C19_HASH" \
-                   -H "Authorization: Bearer $AGENT_WALLET_KEY")
+                   -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WALLET_KEY"))
     C19_AGENT=$(echo "$C19_PUBKEY" | jq -r '.agent_account // empty' 2>/dev/null)
     C19_SEED=$(echo "$C19_PUBKEY" | jq -r '.seed // empty' 2>/dev/null)
 
@@ -2035,7 +2035,7 @@ if want C7; then
     else
       pass "C7 /register offers the trial in calls and days: $OFFER"
     fi
-    CLAIM=$(curl -sS --max-time 60 -X POST "$COORDINATOR_URL/trial-key" -H "Authorization: Bearer $T_WK")
+    CLAIM=$(curl -sS --max-time 60 -X POST "$COORDINATOR_URL/trial-key" -H @<(printf '%s\n' "Authorization: Bearer $T_WK"))
     T_KEY=$(jq -r '.payment_key // empty' <<<"$CLAIM")
     T_CALLS=$(jq -r '.calls // empty' <<<"$CLAIM")
     C7_WHY=$(jq -r '.reason // empty' <<<"$CLAIM" 2>/dev/null)
@@ -2048,7 +2048,7 @@ if want C7; then
     else
       ran=0
       for _ in $(seq 1 "$T_CALLS"); do
-        R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $T_KEY" \
+        R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $T_KEY") \
               -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
         [[ "$(jq -r '.status // empty' <<<"$R")" == "completed" ]] && ran=$((ran + 1))
       done
@@ -2056,7 +2056,7 @@ if want C7; then
         || fail "C7 only $ran of the trial's $T_CALLS calls ran"
 
       C7_BODY="$RUN_TMP/c7_over"
-      CODE=$(curl -s -o "$C7_BODY" -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $T_KEY" \
+      CODE=$(curl -s -o "$C7_BODY" -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $T_KEY") \
                -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
       OVER=$(cat "$C7_BODY")
       if [[ "$CODE" == "402" && "$(jq -r '.reason' <<<"$OVER")" == "trial_exhausted" && "$(jq -r '.terminal' <<<"$OVER")" == "true" \
@@ -2066,12 +2066,12 @@ if want C7; then
         fail "C7 call $((T_CALLS + 1)) should be 402 trial_exhausted/terminal/used=limit=$T_CALLS, got HTTP $CODE: $(head -c 200 <<<"$OVER")"
       fi
       # A refused attempt is not a call: asking again must not move `used` past the limit.
-      AGAIN=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $T_KEY" \
+      AGAIN=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $T_KEY") \
                 -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
       [[ "$(jq -r '.used' <<<"$AGAIN")" == "$T_CALLS" ]] && pass "C7 a refused attempt does not count: still $T_CALLS of $T_CALLS" \
         || fail "C7 a refusal moved the count: $(jq -c '{used,limit}' <<<"$AGAIN")"
 
-      ST=$(curl -s "$COORDINATOR_URL/subscription/status" -H "X-Payment-Key: $T_KEY")
+      ST=$(curl -s "$COORDINATOR_URL/subscription/status" -H @<(printf '%s\n' "X-Payment-Key: $T_KEY"))
       if [[ "$(jq -r '.trial.calls_left' <<<"$ST")" == "0" ]] && ! jq -e 'has("allowance_total_usd") or has("allowance_available_usd")' <<<"$ST" >/dev/null; then
         pass "C7 /subscription/status reports the trial in calls (calls_left 0) and shows no allowance figures"
       else
@@ -2085,7 +2085,7 @@ if want C7; then
       elif [[ -n "$AGENT_PAYMENT_KEY" ]]; then
         refused=0
         for _ in $(seq 1 $((T_CALLS + 2))); do
-          R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H "X-Payment-Key: $AGENT_PAYMENT_KEY" \
+          R=$(curl -s -X POST "$COORDINATOR_URL/call/$PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $AGENT_PAYMENT_KEY") \
                 -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
           [[ "$(jq -r '.status // empty' <<<"$R")" == "completed" ]] || refused=$((refused + 1))
         done

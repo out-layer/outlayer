@@ -68,7 +68,7 @@ pass "legacy /register returned api_key (${#API_KEY} chars) wallet_id=$WALLET_ID
 
 log "POST /wallet/v1/sign-message — keystore should derive from default master"
 SIGN=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" \
-  -H "Authorization: Bearer $API_KEY" \
+  -H @<(printf '%s\n' "Authorization: Bearer $API_KEY") \
   -H 'Content-Type: application/json' \
   -d '{"message":"backward-compat-check","recipient":"verifier.testnet","nonce_base64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
 echo "$SIGN" | jq . >&2
@@ -89,7 +89,7 @@ pass "default-master signed pre-flight message (pubkey=$PUB, sig_len=${#SIG})"
 log "GET /wallet/v1/address — confirm the same default-master address"
 ADDR2=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" \
   --data-urlencode "chain=near" \
-  -H "Authorization: Bearer $API_KEY" \
+  -H @<(printf '%s\n' "Authorization: Bearer $API_KEY") \
   | jq -r '.address // empty')
 [[ "$ADDR2" == "$ADDR" ]] || \
   fail "/wallet/v1/address returned $ADDR2 but /register said $ADDR — \

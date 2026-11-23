@@ -139,7 +139,7 @@ spend() {
   local auth=$1 amount=$2 out=$3 body meta http secs
   body=$(jq -nc --arg to "$PARENT" --arg a "$amount" '{chain:"near", to:$to, amount:$a}')
   meta=$(curl -sS -o "$out.body" -w '%{http_code} %{time_total}' -X POST "$COORDINATOR_URL/wallet/v1/transfer" \
-    -H "$auth" -H 'Content-Type: application/json' -d "$body")
+    -H @<(printf '%s\n' "$auth") -H 'Content-Type: application/json' -d "$body")
   http=${meta%% *}; secs=${meta##* }
   printf '%s %s\n' "$http" "$(tr -d '\n' < "$out.body")" > "$out"
   printf '%s\n' "$secs" > "$out.time"

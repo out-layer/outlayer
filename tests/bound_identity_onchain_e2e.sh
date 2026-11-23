@@ -568,7 +568,7 @@ if [[ -z "$API_KEY" ]]; then
 else
   https_whoami() { # https_whoami [extra curl args...]
     curl -s -X POST -H 'Content-Type: application/json' \
-      -H "X-Payment-Key: $API_KEY" "$@" \
+      -H @<(printf '%s\n' "X-Payment-Key: $API_KEY") "$@" \
       -d '{"input":{"operation":"whoami"},"use_bound_identity":true}' \
       "$COORDINATOR_URL/call/${PROJECT%%/*}/${PROJECT##*/}"
   }

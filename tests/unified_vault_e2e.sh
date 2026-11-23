@@ -553,7 +553,7 @@ store_agent_secret_cli() {
 # agent_secret_pubkey <wk_> <project_id> → the endpoint's JSON ("{}" on any error).
 agent_secret_pubkey() {
   curl -sS -G "$COORDINATOR_URL/wallet/v1/agent-secret/pubkey" \
-    --data-urlencode "project_id=$2" -H "Authorization: Bearer $1" 2>/dev/null || echo '{}'
+    --data-urlencode "project_id=$2" -H @<(printf '%s\n' "Authorization: Bearer $1") 2>/dev/null || echo '{}'
 }
 
 # view_contract <method> <args_json> → the view's JSON text ("null" on any error).
@@ -861,16 +861,16 @@ if want V1; then
       ISO_SEED="v1-iso-$(date +%s)-$$"
 
       # 1a: same seed, different vault scope → DIFFERENT derived address.
-      ADDR_A=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VA")" | jq -r '.address // empty')
-      ADDR_B=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VB")" | jq -r '.address // empty')
+      ADDR_A=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VA")") | jq -r '.address // empty')
+      ADDR_B=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VB")") | jq -r '.address // empty')
       [[ -n "$ADDR_A" && -n "$ADDR_B" ]] || fail "V1a /address returned empty for one scope (A='$ADDR_A' B='$ADDR_B')"
       note "V1a addrA=$ADDR_A addrB=$ADDR_B"
       [[ "$ADDR_A" != "$ADDR_B" ]] && pass "V1a distinct vault scopes → distinct addresses (per-vault master honored)" \
         || fail "V1a ISOLATION BROKEN: both vaults derived the same address $ADDR_A (same master for distinct scopes)"
 
       # 1b: the two scopes sign with DIFFERENT public keys (independent keys, not just distinct addrs).
-      SM_A=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VA")" -H 'Content-Type: application/json' -d '{"message":"v1-isolation-check","recipient":"iso-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
-      SM_B=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VB")" -H 'Content-Type: application/json' -d '{"message":"v1-isolation-check","recipient":"iso-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
+      SM_A=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VA")") -H 'Content-Type: application/json' -d '{"message":"v1-isolation-check","recipient":"iso-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
+      SM_B=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VB")") -H 'Content-Type: application/json' -d '{"message":"v1-isolation-check","recipient":"iso-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
       PUB_A=$(echo "$SM_A" | jq -r '.public_key // empty'); PUB_B=$(echo "$SM_B" | jq -r '.public_key // empty')
       [[ -n "$PUB_A" && -n "$PUB_B" ]] || fail "V1b sign-message returned no pubkey for one scope (A='$PUB_A' B='$PUB_B')"
       [[ "$PUB_A" != "$PUB_B" ]] && pass "V1b signing pubkeys differ ($PUB_A vs $PUB_B)" \
@@ -878,7 +878,7 @@ if want V1; then
 
       # 1c: X-Customer-Vault header IGNORED — scope A token + header→B must still return A's address.
       ADDR_PROBE=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" \
-        -H "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VA")" -H "X-Customer-Vault: $V1_VB" | jq -r '.address // empty')
+        -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token_v "$ISO_SEED" "$V1_VA")") -H "X-Customer-Vault: $V1_VB" | jq -r '.address // empty')
       note "V1c /address (scope A, header→B) = $ADDR_PROBE (expect A=$ADDR_A)"
       [[ "$ADDR_PROBE" == "$ADDR_A" ]] && pass "V1c X-Customer-Vault header IGNORED — vault scope is auth-bound, not request-driven" \
         || fail "V1c HEADER NOT IGNORED: scope A returned $ADDR_PROBE (vault B's master?) instead of $ADDR_A"
@@ -927,7 +927,7 @@ if want V2; then
       allvault=true
       for i in $(seq 1 "$N_WALLETS"); do
         idx=$((i-1))
-        GOT_VAULT=$(curl -sS -H "Authorization: Bearer ${V2_WK[$idx]}" "$COORDINATOR_URL/wallet/v1/address?chain=near" | jq -r '.vault_id // empty')
+        GOT_VAULT=$(curl -sS -H @<(printf '%s\n' "Authorization: Bearer ${V2_WK[$idx]}") "$COORDINATOR_URL/wallet/v1/address?chain=near" | jq -r '.vault_id // empty')
         [[ "$GOT_VAULT" == "$VAULT_ID" ]] || { fail "V2c wallet #$i /address vault_id='$GOT_VAULT' != '$VAULT_ID'"; allvault=false; }
       done
       [[ "$allvault" == true ]] && pass "V2c all $N_WALLETS wallets report vault_id=$VAULT_ID"
@@ -938,9 +938,9 @@ if want V2; then
       # Recipe (agent-custody skill): sub_key = wk_ + sha256("<seed>:0:<parent_key>"); key_hash = sha256(sub_key).
       SUB_KEY="wk_$(printf '%s:0:%s' "$SUB_SEED" "$PARENT_KEY" | shasum -a 256 | awk '{print $1}')"
       KEY_HASH=$(printf '%s' "$SUB_KEY" | shasum -a 256 | awk '{print $1}')
-      curl -sS -X PUT "$COORDINATOR_URL/wallet/v1/api-key" -H "Authorization: Bearer $PARENT_KEY" -H 'Content-Type: application/json' \
+      curl -sS -X PUT "$COORDINATOR_URL/wallet/v1/api-key" -H @<(printf '%s\n' "Authorization: Bearer $PARENT_KEY") -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg s "$SUB_SEED" --arg kh "$KEY_HASH" '{seed:$s, key_hash:$kh}')" >/dev/null
-      SUB_RESP=$(curl -sS -H "Authorization: Bearer $SUB_KEY" "$COORDINATOR_URL/wallet/v1/address?chain=near")
+      SUB_RESP=$(curl -sS -H @<(printf '%s\n' "Authorization: Bearer $SUB_KEY") "$COORDINATOR_URL/wallet/v1/address?chain=near")
       SUB_VAULT=$(echo "$SUB_RESP" | jq -r '.vault_id // empty'); SUB_ADDR=$(echo "$SUB_RESP" | jq -r '.address // empty')
       [[ "$SUB_VAULT" == "$VAULT_ID" ]] && pass "V2d sub-agent inherits vault_id=$VAULT_ID" || fail "V2d sub-agent vault_id='$SUB_VAULT' != '$VAULT_ID': $(echo "$SUB_RESP" | head -c160)"
       [[ -n "$SUB_ADDR" && "$SUB_ADDR" != "${V2_ADDR[0]}" ]] && pass "V2d sub-agent address differs from parent #1 (derivation fanned out)" || fail "V2d sub-agent address '$SUB_ADDR' == parent #1 '${V2_ADDR[0]}' — no fan-out"
@@ -976,8 +976,8 @@ if want V3; then
       pass "V3 throwaway vault $V3_VAULT deployed"
 
       # Bearer-near helpers scoped to V3_VAULT (return "body\nHTTP:<code>"; caller splits).
-      v3_addr() { local seed=$1 r; r=$(curl -sS -w '\nHTTP:%{http_code}' -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "Authorization: Bearer near:$(mk_token_v "$seed" "$V3_VAULT")"); echo "$r"; }
-      v3_sign() { local seed=$1 msg=$2; curl -sS -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer near:$(mk_token_v "$seed" "$V3_VAULT")" -H 'Content-Type: application/json' -d "$(jq -nc --arg m "$msg" '{message:$m, recipient:"v3-recov.testnet", nonce:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')"; }
+      v3_addr() { local seed=$1 r; r=$(curl -sS -w '\nHTTP:%{http_code}' -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token_v "$seed" "$V3_VAULT")")); echo "$r"; }
+      v3_sign() { local seed=$1 msg=$2; curl -sS -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token_v "$seed" "$V3_VAULT")") -H 'Content-Type: application/json' -d "$(jq -nc --arg m "$msg" '{message:$m, recipient:"v3-recov.testnet", nonce:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')"; }
 
       # 3a: mint 3 distinct users; capture pre-recovery addresses (the derive-sub-wallets work).
       declare -a V3_SEEDS=() V3_ADDRS=()
@@ -1096,7 +1096,7 @@ if want V4; then
       KEYSTORE_PUBKEY=$(echo "$PK_B" | jq -r '.pubkey // empty')
       [[ "$PK_H" == "200" && -n "$KEYSTORE_PUBKEY" && "$KEYSTORE_PUBKEY" != "null" ]] && pass "V4a keystore encryption pubkey captured: $KEYSTORE_PUBKEY" || fail "V4a /secrets/pubkey failed (HTTP $PK_H): $(echo "$PK_B" | head -c160)"
       log "V4a PRE-RECOVERY /call/$SECRET_PROJECT (expect '$EXPECTED_SECRET_VALUE')"
-      PRE_CALL=$(curl -sS --max-time 90 -X POST "$COORDINATOR_URL/call/$SECRET_PROJECT" -H "X-Payment-Key: $SECRET_PAYMENT_KEY" -H 'Content-Type: application/json' \
+      PRE_CALL=$(curl -sS --max-time 90 -X POST "$COORDINATOR_URL/call/$SECRET_PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $SECRET_PAYMENT_KEY") -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{input:{command:"get_secret", keys:["MY_TEST_SECRET"]}, secrets_ref:{account_id:$owner, profile:$profile}, async:false}')" 2>&1 || echo '')
       echo "$PRE_CALL" | head -10 >&2
       if echo "$PRE_CALL" | grep -qF "\"value\":\"$EXPECTED_SECRET_VALUE\""; then pass "V4a /call returned the expected secret pre-recovery — keystore can decrypt"; else fail "V4a /call did not return MY_TEST_SECRET=$EXPECTED_SECRET_VALUE pre-recovery: $(echo "$PRE_CALL" | head -c200)"; fi
@@ -1116,7 +1116,7 @@ if want V4; then
       # 4c: POST-RECOVERY the same /call must FAIL to return the secret value (server-side cutoff — the
       # keystore can no longer decrypt via the per-vault master once unlocked == true).
       log "V4c POST-RECOVERY /call/$SECRET_PROJECT (expect refusal / no secret)"
-      POST_CALL_OUT=$(curl -sS --max-time 90 -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/call/$SECRET_PROJECT" -H "X-Payment-Key: $SECRET_PAYMENT_KEY" -H 'Content-Type: application/json' \
+      POST_CALL_OUT=$(curl -sS --max-time 90 -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/call/$SECRET_PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $SECRET_PAYMENT_KEY") -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{input:{command:"get_secret", keys:["MY_TEST_SECRET"]}, secrets_ref:{account_id:$owner, profile:$profile}, async:false}')" 2>&1 || echo '')
       POST_CALL_H=$(echo "$POST_CALL_OUT" | tail -1 | sed 's/HTTP://'); POST_CALL_B=$(echo "$POST_CALL_OUT" | sed '$d')
       echo "$POST_CALL_B" | head -10 >&2
@@ -1198,7 +1198,7 @@ if want V5; then
       else
         fail "V5a /register did not return api_key+wallet_id+near_account_id: $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG" 2>/dev/null | head -c200)"
       fi
-      SR=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer $V5_WK" -H 'Content-Type: application/json' -d '{"message":"v5-preflight","recipient":"v5-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
+      SR=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer $V5_WK") -H 'Content-Type: application/json' -d '{"message":"v5-preflight","recipient":"v5-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
       V5_PRESIG=$(echo "$SR" | jq -r '.signature // empty')
       [[ -n "$V5_PRESIG" && "$V5_PRESIG" != null ]] && pass "V5a PRE-RECOVERY keystore signed (sig len=${#V5_PRESIG})" || fail "V5a /sign-message returned no signature pre-recovery: $(echo "$SR" | head -c160)"
 
@@ -1220,7 +1220,7 @@ if want V5; then
       finalize_and_assert_unlocked "$V5_VAULT" "$V5_NEWPUB" "V5b" || true
 
       # 5c: POST-RECOVERY /sign-message must FAIL (vault unlocked → keystore refuses to sign).
-      PSR=$(curl -sS -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer $V5_WK" -H 'Content-Type: application/json' -d '{"message":"v5-postflight","recipient":"v5-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
+      PSR=$(curl -sS -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer $V5_WK") -H 'Content-Type: application/json' -d '{"message":"v5-postflight","recipient":"v5-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
       PSR_H=$(echo "$PSR" | tail -1 | sed 's/HTTP://'); PSR_B=$(echo "$PSR" | sed '$d')
       PSR_SIG=$(echo "$PSR_B" | jq -r '.signature // empty' 2>/dev/null || echo "")
       { [[ "$PSR_H" -ge 400 ]] || [[ -z "$PSR_SIG" || "$PSR_SIG" == "null" ]]; } && pass "V5c keystore refused signing post-recovery (HTTP $PSR_H) — sovereignty cutoff confirmed" \
@@ -1385,7 +1385,7 @@ if want V6 && agent_secret_mode V6; then
         V6_STORED_CT=$(agent_secret_view "$V6_AGENT" | jq -r '.profile.encrypted_secrets // empty')
         V6_READABLE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
           "$COORDINATOR_URL/wallet/v1/agent-secret/prepare" \
-          -H "Authorization: Bearer $V6_WK" -H 'Content-Type: application/json' \
+          -H @<(printf '%s\n' "Authorization: Bearer $V6_WK") -H 'Content-Type: application/json' \
           -d "$(jq -nc --arg p "$CONNECTOR_PROJECT_ID" --arg c "$V6_STORED_CT" --arg payer "$PARENT" \
                 '{project_id:$p, encrypted_secrets_base64:$c, payer:$payer}')")
         if [[ "$V6_READABLE" == 2?? ]]; then
@@ -1458,7 +1458,7 @@ if want V6 && agent_secret_mode V6; then
         note "V6 agent C: $V6_AGENT_C"
         V6_CT=$(agent_secret_view "$V6_AGENT_C" | jq -r '.profile.encrypted_secrets // empty')
         V6_PREP=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/agent-secret/prepare" \
-          -H "Authorization: Bearer $V6_WK_C" -H 'Content-Type: application/json' \
+          -H @<(printf '%s\n' "Authorization: Bearer $V6_WK_C") -H 'Content-Type: application/json' \
           -d "$(jq -nc --arg p "$CONNECTOR_PROJECT_ID" --arg c "$V6_CT" --arg payer "$PARENT" \
                 '{project_id:$p, encrypted_secrets_base64:$c, payer:$payer}')")
         V6_ARGS=$(echo "$V6_PREP" | jq -c '.args // empty')
@@ -1494,7 +1494,7 @@ if want V6 && agent_secret_mode V6; then
           # the transaction.
           V6_OTHER_PAYER="not-the-payer.$PARENT"
           V6_OTHER=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/agent-secret/prepare" \
-            -H "Authorization: Bearer $V6_WK_C" -H 'Content-Type: application/json' \
+            -H @<(printf '%s\n' "Authorization: Bearer $V6_WK_C") -H 'Content-Type: application/json' \
             -d "$(jq -nc --arg p "$CONNECTOR_PROJECT_ID" --arg c "$V6_CT" --arg payer "$V6_OTHER_PAYER" \
                   '{project_id:$p, encrypted_secrets_base64:$c, payer:$payer}')" | jq -c '.args // empty')
           if [[ -z "$V6_OTHER" ]]; then

@@ -165,16 +165,16 @@ req() {
   BODY="$(tr -d '\n' < "$out" 2>/dev/null)"
 }
 # nreq <seed> <METHOD> <path> [body] — the same under a near: bearer for <seed>
-# (a short-lived signature, on argv like hos_common's), the body through a file.
+# (a short-lived signature, through a file descriptor), the body through a file.
 nreq() {
   local seed=$1 method=$2 path=$3 body=${4:-} out="$RUN_TMP/body"
   throttle
-  local -a args=(-sS -o "$out" -w '%{http_code}' -X "$method" --max-time 150 -H "Authorization: Bearer near:$(mk_token "$seed")")
+  local -a args=(-sS -o "$out" -w '%{http_code}' -X "$method" --max-time 150)
   if [[ -n "$body" ]]; then
     ( umask 077; printf '%s' "$body" > "$RUN_TMP/req" )
     args+=(-H 'Content-Type: application/json' --data-binary @"$RUN_TMP/req")
   fi
-  HTTP=$(curl "${args[@]}" "$COORDINATOR_URL$path" 2>/dev/null)
+  HTTP=$(curl "${args[@]}" -H @<(printf '%s\n' "Authorization: Bearer near:$(mk_token "$seed")") "$COORDINATOR_URL$path" 2>/dev/null)
   rm -f "$RUN_TMP/req"
   BODY="$(tr -d '\n' < "$out" 2>/dev/null)"
 }

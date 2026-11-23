@@ -289,7 +289,7 @@ https_post() {
   throttle
   local raw
   raw=$(curl -sS --max-time 90 -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/call/$project" \
-    -H "X-Payment-Key: $key" -H 'Content-Type: application/json' "$@" --data-binary "$body" 2>&1)
+    -H @<(printf '%s\n' "X-Payment-Key: $key") -H 'Content-Type: application/json' "$@" --data-binary "$body" 2>&1)
   HTTP_CODE=${raw##*HTTP:}; ANS=${raw%$'\n'HTTP:*}
   # The envelope is `{call_id, status, output, …}` on a run and `{error, …}` on a
   # refusal — there is no `success` field. `status: completed` is the run that

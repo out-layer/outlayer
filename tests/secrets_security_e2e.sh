@@ -296,7 +296,7 @@ answered() {
     for i in $(seq 1 20); do
       sleep 3
       polled=$(curl -sS --max-time 20 -w '\nHTTP:%{http_code}' "$COORDINATOR_URL/calls/$cid" \
-        ${POLL_KEY:+-H "X-Payment-Key: $POLL_KEY"} 2>/dev/null)
+        -H @<(printf '%s\n' "${POLL_KEY:+X-Payment-Key: $POLL_KEY}") 2>/dev/null)
       poll_http=${polled##*HTTP:}
       if [[ "$poll_http" != 2* ]]; then
         skip "$label: the call's status could not be read (HTTP $poll_http) — this row measures settlement, and that needs the key owning the call"
@@ -505,7 +505,7 @@ else
     STATUS=""; POLLED=""
     for i in $(seq 1 30); do
       sleep 3
-      POLLED=$(curl -sS --max-time 20 "$COORDINATOR_URL/calls/$CID" -H "X-Payment-Key: $OWNER_PAYMENT_KEY" 2>/dev/null)
+      POLLED=$(curl -sS --max-time 20 "$COORDINATOR_URL/calls/$CID" -H @<(printf '%s\n' "X-Payment-Key: $OWNER_PAYMENT_KEY") 2>/dev/null)
       STATUS=$(jq -r '.status // ""' <<<"$POLLED" 2>/dev/null)
       [[ "$STATUS" == "completed" || "$STATUS" == "failed" ]] && break
     done
@@ -843,7 +843,7 @@ else
       secrets_ref:{profile:$pr, account_id:$o},
       resource_limits:{max_instructions:1000000000,max_memory_mb:128,max_execution_seconds:30}}')
   D2_ANS=$(curl -sS --max-time 180 -X POST "$COORDINATOR_URL/wallet/v1/call" \
-    -H "Authorization: Bearer $AGENT_WK" -H 'Content-Type: application/json' \
+    -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg c "$CONTRACT_ID" --argjson a "$D2_ARGS" \
       '{receiver_id:$c, method_name:"request_execution", args:$a,
         gas:"300000000000000", deposit:"100000000000000000000000"}')" 2>&1)
@@ -999,11 +999,11 @@ else
   C8_N="${C8_N:-8}"
   for i in $(seq 1 "$C8_N"); do
     curl -sS --max-time 90 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-      -H "X-Payment-Key: $AGENT_PAYMENT_KEY" -H 'Content-Type: application/json' \
+      -H @<(printf '%s\n' "X-Payment-Key: $AGENT_PAYMENT_KEY") -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg o "$PARENT" '{input:{message:"c8"}, secrets_ref:{profile:"c8a", account_id:$o}}')" \
       > "$C8_DIR/a.$i" 2>&1 &
     curl -sS --max-time 90 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-      -H "X-Payment-Key: $AGENT2_PAYMENT_KEY" -H 'Content-Type: application/json' \
+      -H @<(printf '%s\n' "X-Payment-Key: $AGENT2_PAYMENT_KEY") -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg o "$PARENT" '{input:{message:"c8"}, secrets_ref:{profile:"c8b", account_id:$o}}')" \
       > "$C8_DIR/b.$i" 2>&1 &
   done
@@ -1321,7 +1321,7 @@ else
     fail "W1 no envelope could be sealed for owner=$AGENT_ACCOUNT — the keystore's pubkey for that owner is what the row needs"
   else
     W1_ANS=$(curl -sS --max-time 120 -X POST "$COORDINATOR_URL/wallet/v1/call" \
-      -H "Authorization: Bearer $AGENT_WK" -H 'Content-Type: application/json' \
+      -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg c "$CONTRACT_ID" --arg pj "$PROJECT" --arg pr "$W1_PROFILE" \
                --arg b "$W1_BLOB" --arg a "$AGENT_ACCOUNT" \
         '{receiver_id:$c, method_name:"store_secrets",
@@ -1361,7 +1361,7 @@ else
       fi
 
       curl -sS --max-time 120 -X POST "$COORDINATOR_URL/wallet/v1/call" \
-        -H "Authorization: Bearer $AGENT_WK" -H 'Content-Type: application/json' \
+        -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg c "$CONTRACT_ID" --arg pj "$PROJECT" --arg pr "$W1_PROFILE" \
           '{receiver_id:$c, method_name:"delete_secrets",
             args:{accessor:{Project:{project_id:$pj}}, profile:$pr},
@@ -1609,7 +1609,7 @@ else
 
     E1_ID=$(jq -r '.call_id // empty' <<<"$ANS" 2>/dev/null)
     if [[ -n "$E1_ID" ]]; then
-      E1_RECORD=$(curl -sS --max-time 60 -H "X-Payment-Key: $AGENT_PAYMENT_KEY" "$COORDINATOR_URL/calls/$E1_ID" 2>/dev/null)
+      E1_RECORD=$(curl -sS --max-time 60 -H @<(printf '%s\n' "X-Payment-Key: $AGENT_PAYMENT_KEY") "$COORDINATOR_URL/calls/$E1_ID" 2>/dev/null)
       grep -qF "$E1_CANARY" <<<"$E1_RECORD" \
         && fail "E1 THE VALUE IS IN THE STORED CALL RECORD ($E1_ID)" \
         || pass "E1 the stored call record does not carry it"
@@ -1887,7 +1887,7 @@ else
   POLL_KEY="$AGENT_PAYMENT_KEY"
 
   D7_BEFORE=$(curl -sS --max-time 60 "$COORDINATOR_URL/wallet/v1/binding" \
-    -H "Authorization: Bearer $AGENT_WK" 2>/dev/null | jq -r '.binding_status // "none"')
+    -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") 2>/dev/null | jq -r '.binding_status // "none"')
   if [[ "$D7_BEFORE" == "active" ]]; then
     pass "D7 the wallet starts with an ACTIVE binding"
   else
@@ -1900,9 +1900,9 @@ else
   fi
 
   curl -sS --max-time 60 -X DELETE "$COORDINATOR_URL/wallet/v1/binding" \
-    -H "Authorization: Bearer $AGENT_WK" >/dev/null 2>&1
+    -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") >/dev/null 2>&1
   D7_AFTER=$(curl -sS --max-time 60 "$COORDINATOR_URL/wallet/v1/binding" \
-    -H "Authorization: Bearer $AGENT_WK" 2>/dev/null | jq -r '.binding_status // .error // "?"')
+    -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") 2>/dev/null | jq -r '.binding_status // .error // "?"')
   if [[ "${D7_SKIP:-0}" == "1" ]]; then
     note "D7 the binding reads '$D7_AFTER' — there was none to remove, so this says nothing"
   else

@@ -137,8 +137,8 @@ WALLET_ID=$(echo "$REG_RESP"  | jq -r '.wallet_id // empty')
 WALLET_ADDR=$(echo "$REG_RESP" | jq -r '.near_account_id // empty')
 [[ -n "$WK_API_KEY" && -n "$WALLET_ADDR" ]] || \
   fail "/register failed: $(jq -c 'del(.api_key, .handoff_url)' <<<"$REG_RESP" 2>/dev/null | head -c 300)"
-AUTH=(-H "Authorization: Bearer $WK_API_KEY")
-ADDR_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" "${AUTH[@]}")
+AUTH_HDR="Authorization: Bearer $WK_API_KEY"
+ADDR_RESP=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H @<(printf '%s\n' "$AUTH_HDR"))
 WALLET_PUBKEY_HEX="ed25519:$(echo "$ADDR_RESP" | jq -r '.public_key' | sed 's/^ed25519://')"
 pass "wallet $WALLET_ID  addr=$WALLET_ADDR  api_key: ${#WK_API_KEY} chars"
 
@@ -160,7 +160,7 @@ encrypt_policy() {
   body=$(jq -nc --arg wid "$WALLET_ID" --argjson rules "$rules" --argjson approval "$approval" \
     '{wallet_id: $wid, rules: $rules} + (if $approval == null then {} else {approval: $approval} end)')
   curl -sS -w '\n%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/encrypt-policy" \
-    "${AUTH[@]}" -H 'Content-Type: application/json' -d "$body"
+    -H @<(printf '%s\n' "$AUTH_HDR") -H 'Content-Type: application/json' -d "$body"
 }
 
 APPROVERS=$(jq -nc --arg a "$APPROVER" --arg pk "$APPROVER_PUBKEY" '[{id: $a, pubkey: $pk}]')
@@ -203,7 +203,7 @@ store_policy() {  # $1 = rules, $2 = approval
   out=$(encrypt_policy "$1" "$2"); code=$(echo "$out" | tail -n1); enc=$(echo "$out" | sed '$d')
   b64=$(echo "$enc" | jq -r '.encrypted_base64 // empty')
   [[ "$code" == "200" && -n "$b64" ]] || fail "encrypt-policy HTTP $code: $(echo "$enc" | head -c 300)"
-  sign=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" "${AUTH[@]}" \
+  sign=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-policy" -H @<(printf '%s\n' "$AUTH_HDR") \
     -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg ed "$b64" --arg c "$PARENT" '{encrypted_data: $ed, caller: $c}')")
   sig=$(echo "$sign" | jq -r '.signature_hex // empty')
@@ -222,7 +222,7 @@ store_policy() {  # $1 = rules, $2 = approval
 policy_reads() {
   local read
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    read=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" "${AUTH[@]}")
+    read=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" -H @<(printf '%s\n' "$AUTH_HDR"))
     [[ "$(echo "$read" | jq -r "$1 // empty")" == "$2" ]] && return 0
     sleep 3
   done
@@ -244,7 +244,7 @@ pass "policy 1 on chain, and read back with both rules"
 
 # POST a transfer; prints "<http>\n<body>".
 transfer() {  # $1 = to, $2 = yocto
-  curl -sS -w '\n%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/transfer" "${AUTH[@]}" \
+  curl -sS -w '\n%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/transfer" -H @<(printf '%s\n' "$AUTH_HDR") \
     -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg to "$1" --arg a "$2" '{chain: "near", to: $to, amount: $a}')"
 }
@@ -252,7 +252,7 @@ transfer() {  # $1 = to, $2 = yocto
 wait_done() {  # $1 = request_id
   local s st
   for _ in $(seq 1 20); do
-    s=$(curl -sS "$COORDINATOR_URL/wallet/v1/requests/$1" "${AUTH[@]}")
+    s=$(curl -sS "$COORDINATOR_URL/wallet/v1/requests/$1" -H @<(printf '%s\n' "$AUTH_HDR"))
     st=$(echo "$s" | jq -r '.status')
     case "$st" in
       completed|success) echo "$s" | jq -r '.result.tx_hash // .result.transaction_hash // empty'; return 0;;
@@ -337,7 +337,7 @@ X_BODY=$(jq -nc --arg to "0x1111111111111111111111111111111111111111" '{
     message: {from: "0x2222222222222222222222222222222222222222", to: $to, value: "1000000", validAfter: "0", validBefore: "9999999999", nonce: "0x0000000000000000000000000000000000000000000000000000000000000001"}
   }
 }')
-X_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/evm/sign-typed-data" "${AUTH[@]}" \
+X_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/evm/sign-typed-data" -H @<(printf '%s\n' "$AUTH_HDR") \
   -H 'Content-Type: application/json' -d "$X_BODY")
 [[ "$X_CODE" == "403" ]] || fail "X1: expected 403 under a policy with evm_sign off, got HTTP $X_CODE"
 pass "X1 → 403: no EIP-3009 signature under this policy"
@@ -403,7 +403,7 @@ reject_it "P2"
 
 # POST any wallet operation; prints "<http>\n<body>".
 wallet_post() {  # $1 = path, $2 = body
-  curl -sS -w '\n%{http_code}' -X POST "$COORDINATOR_URL$1" "${AUTH[@]}" -H 'Content-Type: application/json' -d "$2"
+  curl -sS -w '\n%{http_code}' -X POST "$COORDINATOR_URL$1" -H @<(printf '%s\n' "$AUTH_HDR") -H 'Content-Type: application/json' -d "$2"
 }
 # An operation that must wait; sets APPROVAL_ID.
 op_must_wait() {  # $1 = label, $2 = path, $3 = body
@@ -426,7 +426,7 @@ op_refused_for_address() {  # $1 = label, $2 = path, $3 = body
 
 # The wallet has spent today, so the read must state the day's spend; the hour's
 # is absent only when the hour turned over since.
-USAGE=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" "${AUTH[@]}" | jq -c '.usage // {}')
+USAGE=$(curl -sS "$COORDINATOR_URL/wallet/v1/policy" -H @<(printf '%s\n' "$AUTH_HDR") | jq -c '.usage // {}')
 [[ "$(echo "$USAGE" | jq -r '.daily.native.spent // empty')" =~ ^[0-9]+$ ]] || \
   fail "the policy read does not state the day's native spend: $USAGE"
 SPENT_HOUR=$(echo "$USAGE" | jq -r '.hourly.native.spent // "0"')

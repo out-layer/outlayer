@@ -48,7 +48,7 @@ echo "▶ Fixture: a fresh wallet, funded"
 REG=$(curl -sS --max-time 30 -X POST "$COORDINATOR_URL/register")
 KEY=$(jq -r '.api_key // empty' <<<"$REG"); WALLET_ID=$(jq -r '.wallet_id // empty' <<<"$REG")
 [[ -n "$KEY" && -n "$WALLET_ID" ]] || { fail "register: $(head -c 200 <<<"$REG")"; finish; }
-ADDR=$(curl -sS --max-time 30 -H "Authorization: Bearer $KEY" "$COORDINATOR_URL/wallet/v1/address?chain=near" | jq -r '.address // empty')
+ADDR=$(curl -sS --max-time 30 -H @<(printf '%s\n' "Authorization: Bearer $KEY") "$COORDINATOR_URL/wallet/v1/address?chain=near" | jq -r '.address // empty')
 [[ -n "$ADDR" ]] || { fail "no NEAR address for the wallet"; finish; }
 echo "• wallet $WALLET_ID, NEAR account $ADDR"
 # A plain transfer transaction: `near tokens send-near` asks on a TTY before it funds an
@@ -76,7 +76,7 @@ ARGS=$(jq -nc --argjson src "$SOURCE" --arg i "$(jq -nc --argjson s "$SLEEP_SECO
 BODY=$(jq -nc --arg r "$CONTRACT_ID" --argjson a "$ARGS" --arg d "$DEP_Y" \
   '{receiver_id:$r, method_name:"request_execution", args:$a, gas:"300000000000000", deposit:$d}')
 OUT=$(curl -sS --max-time 400 -w '\n%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/call" \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$BODY")
+  -H @<(printf '%s\n' "Authorization: Bearer $KEY") -H 'Content-Type: application/json' -d "$BODY")
 CODE=$(tail -1 <<<"$OUT"); ANS=$(sed '$d' <<<"$OUT")
 STATUS=$(jq -r '.status // empty' <<<"$ANS" 2>/dev/null); RID=$(jq -r '.request_id // empty' <<<"$ANS" 2>/dev/null)
 POLL=$(jq -r '.poll_url // empty' <<<"$ANS" 2>/dev/null); TX=$(jq -r '.tx_hash // empty' <<<"$ANS" 2>/dev/null)
@@ -104,7 +104,7 @@ echo "• row: $ROW · native usage today: ${USAGE:-none}"
 echo "▶ U3 the poll_url settles it from the chain"
 SETTLED=""
 for _ in $(seq 1 40); do
-  SETTLED=$(curl -sS --max-time 60 -H "Authorization: Bearer $KEY" "$COORDINATOR_URL$POLL" | jq -r '.status // empty')
+  SETTLED=$(curl -sS --max-time 60 -H @<(printf '%s\n' "Authorization: Bearer $KEY") "$COORDINATOR_URL$POLL" | jq -r '.status // empty')
   [[ "$SETTLED" == "success" || "$SETTLED" == "failed" ]] && break
   sleep 6
 done

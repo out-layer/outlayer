@@ -94,7 +94,7 @@ req() { # req <method> <path> <auth-header|""> <json-body|"">
   out=$(mktemp -t refusals_out.XXXXXX)
   if [[ -n "$auth" ]]; then
     code=$(curl -sS -o "$out" -w '%{http_code}' -X "$m" "$COORDINATOR_URL$path" \
-      -H "$auth" -H 'Content-Type: application/json' ${body:+-d "$body"})
+      -H @<(printf '%s\n' "$auth") -H 'Content-Type: application/json' ${body:+-d "$body"})
   else
     code=$(curl -sS -o "$out" -w '%{http_code}' -X "$m" "$COORDINATOR_URL$path" \
       -H 'Content-Type: application/json' ${body:+-d "$body"})

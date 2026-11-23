@@ -149,7 +149,7 @@ call() {
   out=$(mktemp -t callcred.XXXXXX)
   if [[ -n "$header" ]]; then
     http=$(curl -sS -m 300 -o "$out" -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$project" \
-      -H "$header" -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
+      -H @<(printf '%s\n' "$header") -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
   else
     http=$(curl -sS -m 300 -o "$out" -w '%{http_code}' -X POST "$COORDINATOR_URL/call/$project" \
       -H 'Content-Type: application/json' -d '{"input":{"operation":"ping"}}')
@@ -188,7 +188,7 @@ done
 # observation: the same `wk_` is shown to authenticate a wallet route in the
 # same run. Without that, a broken token would produce this result too.
 log "K2 a wk_ authenticates a wallet but pays for nothing"
-R=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' "$COORDINATOR_URL/wallet/v1/address?chain=near" -H "$WK")
+R=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' "$COORDINATOR_URL/wallet/v1/address?chain=near" -H @<(printf '%s\n' "$WK"))
 if [[ "$R" == "200" ]]; then
   pass "K2 the wk_ is live: /wallet/v1/address answers 200 with it"
 else
@@ -276,7 +276,7 @@ fi
 
 # ── the two keys ─────────────────────────────────────────────────────────────
 log "Claiming the trial and creating a funded key"
-R=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/trial-key" -H "$WK")
+R=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/trial-key" -H @<(printf '%s\n' "$WK"))
 TRIAL_ANSWER="$R"
 TRIAL=$(jq -r '.payment_key // empty' <<<"$R")
 TRIAL_SCOPE=$(jq -r '(.project_ids // []) | join(",")' <<<"$R")

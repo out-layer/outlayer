@@ -90,7 +90,7 @@ assert_json_not_empty() {
 curl_get() {
     local path="$1"
     curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer $API_KEY" \
+        -H @<(printf '%s\n' "Authorization: Bearer $API_KEY") \
         "${COORDINATOR_URL}${path}"
 }
 
@@ -106,7 +106,7 @@ curl_post() {
     curl -s -w "\n%{http_code}" \
         -X POST \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $API_KEY" \
+        -H @<(printf '%s\n' "Authorization: Bearer $API_KEY") \
         ${extra_headers[@]+"${extra_headers[@]}"} \
         -d "$body" \
         "${COORDINATOR_URL}${path}"

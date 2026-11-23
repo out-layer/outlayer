@@ -97,7 +97,7 @@ call() {
   local op=$1 extra=${2:-'{}'} out
   out=$(mktemp -t probeops.XXXXXX)
   RC=$(curl -s -o "$out" -w '%{http_code}' -m 120 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-        -H "X-Payment-Key: $PAYMENT_KEY" -H "X-Attached-Deposit: $DEPOSIT" \
+        -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") -H "X-Attached-Deposit: $DEPOSIT" \
         -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg o "$op" --argjson e "$extra" '{input: ({operation:$o} + $e)}')")
   BODY="$(tr -d '\n' < "$out")"; rm -f "$out"
@@ -362,7 +362,7 @@ fi
 rows_call() { # rows_call <body-members-json> — env op with these members in the body
   local out; out=$(mktemp -t proberows.XXXXXX)
   RC=$(curl -s -o "$out" -w '%{http_code}' -m 120 -X POST "$COORDINATOR_URL/call/$PROJECT" \
-        -H "X-Payment-Key: $PAYMENT_KEY" -H "X-Attached-Deposit: $DEPOSIT" -H 'Content-Type: application/json' \
+        -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") -H "X-Attached-Deposit: $DEPOSIT" -H 'Content-Type: application/json' \
         -d "$(jq -nc --argjson m "$1" '{input:{operation:"env"}} + $m')")
   BODY="$(tr -d '\n' < "$out")"; rm -f "$out"
 }

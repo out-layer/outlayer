@@ -53,12 +53,12 @@ log()  { echo; echo "── $*"; }
 post() {
   local out
   out=$(curl -s -w '\n%{http_code}' -X POST "$API$1" \
-    -H "Authorization: Bearer $WALLET_API_KEY" -H 'Content-Type: application/json' -d "$2")
+    -H @<(printf '%s\n' "Authorization: Bearer $WALLET_API_KEY") -H 'Content-Type: application/json' -d "$2")
   HTTP=$(tail -n1 <<<"$out"); BODY=$(sed '$d' <<<"$out")
 }
 get() {
   local out
-  out=$(curl -s -w '\n%{http_code}' "$API$1" -H "Authorization: Bearer $WALLET_API_KEY")
+  out=$(curl -s -w '\n%{http_code}' "$API$1" -H @<(printf '%s\n' "Authorization: Bearer $WALLET_API_KEY"))
   HTTP=$(tail -n1 <<<"$out"); BODY=$(sed '$d' <<<"$out")
 }
 # view <contract> <method> <args-json> → the view's JSON value

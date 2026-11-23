@@ -857,7 +857,7 @@ if want T14; then
 
   # ── 14b: the minted wk_ works — /address agrees on scope; /sign-message returns a crypto-valid sig ──
   if [[ "$H14" == "200" && -n "$WALLET_ID_14" ]]; then
-    ADDR14=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "Authorization: Bearer $SUB_KEY")
+    ADDR14=$(curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H @<(printf '%s\n' "Authorization: Bearer $SUB_KEY"))
     ADDR14_VAULT=$(echo "$ADDR14" | jq -r '.vault_id // empty')
     if [[ -n "$VAULT_ID" ]]; then
       [[ "$ADDR14_VAULT" == "$VAULT_ID" ]] && pass "T14b minted wk_ /address reports vault_id=$VAULT_ID" || fail "T14b /address vault_id='$ADDR14_VAULT' != '$VAULT_ID': $ADDR14"
@@ -865,7 +865,7 @@ if want T14; then
       [[ -n "$(echo "$ADDR14" | jq -r '.address // empty')" ]] && pass "T14b minted wk_ /address resolves (default scope)" || fail "T14b /address gave no address: $ADDR14"
     fi
     MSG14="t14-apik-rt-$(date +%s)"
-    SR14=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer $SUB_KEY" -H 'Content-Type: application/json' \
+    SR14=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer $SUB_KEY") -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg m "$MSG14" '{message:$m, recipient:"verifier-apik.testnet", nonce:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')")
     S14=$(echo "$SR14" | jq -r '.signature // empty'); P14=$(echo "$SR14" | jq -r '.public_key // empty'); N14=$(echo "$SR14" | jq -r '.nonce // empty')
     if [[ -n "$S14" ]] && "$RECOVERY_BIN" verify-sign-message --pubkey "$P14" --message "$MSG14" --recipient "verifier-apik.testnet" --nonce-base64 "$N14" --signature "$S14" >/dev/null 2>&1; then
@@ -914,10 +914,10 @@ fi
 if want T15; then
   log "T15 [POLICY] vault-scope parity + cache-poisoning regression"
   # acct_via <path-kind> <token> → echoes the .account_id a given endpoint reports for a Bearer-near token.
-  addr_via_address() { curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H "Authorization: Bearer near:$1" | jq -r '.address // empty'; }
-  acct_balance_native()  { curl -sS -G "$COORDINATOR_URL/wallet/v1/balance" --data-urlencode "chain=near" -H "Authorization: Bearer near:$1" | jq -r '.account_id // empty'; }
-  acct_balance_intents() { curl -sS -G "$COORDINATOR_URL/wallet/v1/balance" --data-urlencode "token=nep141:usdt.tether-token.near" --data-urlencode "source=intents" -H "Authorization: Bearer near:$1" | jq -r '.account_id // empty'; }
-  acct_sign_message()    { curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H "Authorization: Bearer near:$1" -H 'Content-Type: application/json' -d "$(jq -nc --arg m "parity-$(date +%s%N)" '{message:$m, recipient:"parity-verifier.testnet", nonce:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')" | jq -r '.account_id // empty'; }
+  addr_via_address() { curl -sS -G "$COORDINATOR_URL/wallet/v1/address" --data-urlencode "chain=near" -H @<(printf '%s\n' "Authorization: Bearer near:$1") | jq -r '.address // empty'; }
+  acct_balance_native()  { curl -sS -G "$COORDINATOR_URL/wallet/v1/balance" --data-urlencode "chain=near" -H @<(printf '%s\n' "Authorization: Bearer near:$1") | jq -r '.account_id // empty'; }
+  acct_balance_intents() { curl -sS -G "$COORDINATOR_URL/wallet/v1/balance" --data-urlencode "token=nep141:usdt.tether-token.near" --data-urlencode "source=intents" -H @<(printf '%s\n' "Authorization: Bearer near:$1") | jq -r '.account_id // empty'; }
+  acct_sign_message()    { curl -sS -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer near:$1") -H 'Content-Type: application/json' -d "$(jq -nc --arg m "parity-$(date +%s%N)" '{message:$m, recipient:"parity-verifier.testnet", nonce:"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')" | jq -r '.account_id // empty'; }
 
   # ── 15a: endpoint parity — fresh seed, fresh token, every endpoint must agree with /address ──
   SEED_P="t15-parity-$(date +%s)-$$"; TOK_P=$(mk_token "$SEED_P" "$VAULT_ID")

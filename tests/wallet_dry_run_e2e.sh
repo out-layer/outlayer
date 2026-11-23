@@ -92,7 +92,7 @@ skip() {
 
 curl_post() {
     curl -s -w "\n%{http_code}" -X POST -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $API_KEY" -d "$2" "${COORDINATOR_URL}$1"
+        -H @<(printf '%s\n' "Authorization: Bearer $API_KEY") -d "$2" "${COORDINATOR_URL}$1"
 }
 
 parse_response() {

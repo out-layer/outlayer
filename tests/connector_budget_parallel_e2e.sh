@@ -65,7 +65,7 @@ skip() { echo "  SKIP  $*"; SKIP=$((SKIP + 1)); }
 probe() {
   local input="$1"
   curl -s --max-time 90 "$COORDINATOR_URL/call/$PROBE" \
-    -H "X-Payment-Key: $PAYMENT_KEY" -H "Content-Type: application/json" \
+    -H @<(printf '%s\n' "X-Payment-Key: $PAYMENT_KEY") -H "Content-Type: application/json" \
     -d "{\"input\": $input}"
 }
 
@@ -204,7 +204,7 @@ elif [[ -z "$GMAIL_PAYMENT_KEY" || -z "$GMAIL_WALLET_ID" || -z "$GMAIL_TEST_TO" 
 else
   gmail() {
     curl -s --max-time 90 "$COORDINATOR_URL/call/$GMAIL" \
-      -H "X-Payment-Key: $GMAIL_PAYMENT_KEY" -H "X-Wallet-Id: $GMAIL_WALLET_ID" \
+      -H @<(printf '%s\n' "X-Payment-Key: $GMAIL_PAYMENT_KEY") -H "X-Wallet-Id: $GMAIL_WALLET_ID" \
       -H "X-Use-Owner-Secret: 1" -H "Content-Type: application/json" -d "{\"input\": $1}"
   }
   # The connector answers an envelope {success, operation, error, output,
