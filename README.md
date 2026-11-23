@@ -10,6 +10,8 @@
 
 Every execution returns an Intel TDX attestation that binds the result to the WASM hash, the input and the measured worker that ran it.
 
+Live on mainnet: 1.5M attested executions, self-hosted Intel TDX servers, five curated connectors (Hyperliquid, Polymarket, Mercury, GitHub, Gmail).
+
 ## Quick links
 
 - **Dashboard & docs**: [app.outlayer.ai](https://app.outlayer.ai) (no API is served from this host)
@@ -26,39 +28,14 @@ Every execution returns an Intel TDX attestation that binds the result to the WA
 
 - **Two doors, one runtime.** A call over HTTPS and a call from a NEAR contract (`request_execution` on `outlayer.near`, the result comes back in the contract's callback) run the same program in the same enclave. Either way the result comes with an attestation, kept by the coordinator and readable through the API; an on-chain call also gets its result written to `outlayer.near` by the worker's registered key.
 - **Many programs, no permission needed.** Workers run any number of WASI programs side by side, each run isolated from the others. A program is a `.wasm` file named by its sha256, and publishing one asks nobody: its author can be you, a partner or a stranger. It gets the same primitives through host functions: secrets, keys and verifiable randomness straight from the keystore, the wallet through the coordinator's wallet API, which is the same path and the same policy check as an agent's own call.
-- **Secrets open the outside world.** A program calls any HTTPS API: NEAR AI inference, a bank, an exchange, a mailbox. The credential is a secret stored encrypted on chain, which the keystore opens only for the code and the caller its owner named. So a user lends a secret to an agent without handing it over, and takes it back with one transaction.
-- **The agent asks, the owner answers.** An operation the policy sends for approval waits for the owner's wallet signature. A program can also leave its owner a task: confirm this action, supply this value. The owner reads it in one inbox and signs once, and a run of the agent carries out that exact action.
+- **Secrets open the outside world.** A program calls any HTTPS API: NEAR AI inference, a bank, an exchange, a mailbox. The credential is a secret stored encrypted on chain, which the keystore opens only for the callers its owner named. A user lends their own secret, an API key or a login, to an agent: for good, until a date they pick, or only to one exact build of the code. The program the agent calls uses it inside the enclave; the agent itself never receives it, and the user takes it back with one transaction.
+- **The agent prepares, the owner approves, it runs.** What the agent may not do alone, it hands to its owner ready to go: "I've prepared a $2,000 invoice to Acme", "this email to the client", "a payment to a new address". The owner reads exactly what will happen in one inbox, on the site or at their own webhook, and approves with one wallet signature: no transaction, no fee. The platform then runs the agent at once, and that exact action executes in the agent's name. The agent can also ask for a value or a file, and leave notices of what it did. A payment the wallet policy holds for approval works the same way: the owner's signature over that exact operation releases it.
 - **One place signs.** Every signature, asked for over the API or by a program, is made by the keystore, after it has read the wallet's policy from the chain.
 - **Two sources of the master secret.** By default the keystore derives every key from a master that NEAR MPC issues through `dao.outlayer.near`. With a vault, a contract on your own account is the issuer: the vault's wallets and secrets derive from a master of your own, and you can take it out.
 - **The chain is the source of truth.** The coordinator routes and meters. It holds no wallet keys, and no signing decision reads its database.
+- **The owner acts on chain.** Policy, freeze, secrets and exit are transactions from the owner's account to a contract.
 
-What happens when an agent pays:
-
-```mermaid
-sequenceDiagram
-  participant A as Agent
-  participant C as Coordinator
-  participant K as Keystore (TDX)
-  participant N as outlayer.near
-  participant O as Owner
-  A->>C: transfer 50 USDC to bob.near
-  C->>K: operation + wallet id
-  K->>N: read the encrypted policy (view call)
-  K->>K: decrypt, evaluate: type, token, limits, whitelist, freeze
-  alt inside the policy
-    K-->>C: derive the key, sign
-    C-->>A: tx hash
-  else needs approval
-    K-->>C: pending approval
-    C-->>A: pending_approval
-    O->>C: NEP-413 signature over this exact operation
-    C->>K: operation + approvals
-    K->>K: verify the approvers' signatures, sign
-  else outside the policy
-    K-->>C: refused, nothing is signed
-    C-->>A: policy_denied
-  end
-```
+![What happens when an agent pays](docs/images/agent-pays.svg)
 
 ## What you get
 
@@ -77,7 +54,7 @@ One policy per wallet, stored encrypted in `outlayer.near`, changed only by its 
 - **What the wallet may do at all.** Transaction types (transfer, contract call, withdraw, swap, account deletion) and capabilities (cross-chain withdraw, limit order, payment check, confidential intents, EVM signing, Solana signing, raw signing). The capabilities are off by default under a policy.
 - **Limits.** Per transaction and per hour, day and month, per token. An hourly rate limit. Time windows.
 - **Addresses.** Whitelist or blacklist of recipients.
-- **Approvals.** M-of-N approvers sign a NEP-413 message over the exact operation with their own wallets. The enclave verifies the signatures itself; the coordinator only carries them.
+- **Approvals.** M-of-N approvers sign a NEP-413 message over the exact operation with their own wallets. The enclave verifies the signatures itself; the coordinator only carries them. An amount per hour, day or month can go out without approval, and a payment to an address off the whitelist can wait for the approvers instead of being refused.
 - **Lock.** A locked policy changes only with its approvers' quorum, so one controller cannot rewrite two-of-two into one-of-one.
 - **Freeze.** One transaction from the controller straight to the contract. It needs nothing from OutLayer's API.
 
@@ -147,6 +124,16 @@ By default an agent acts as its own implicit account. With account binding it ac
 - **No builds in the enclave.** The TEE workers that run code and receive secrets never compile. They run a WASM binary whose sha256 they measure and report to the keystore with every secret decryption.
 - **Every execution** returns an attestation. `outlayer-verify` re-checks its chain to Intel's root on your own machine.
 
+## When to use OutLayer
+
+- the agent acts often, and a transaction per signature would be too slow or too expensive;
+- one agent identity must work on NEAR, EVM and Solana;
+- the rules are richer than "who may sign" and must be exact where the key is;
+- logic has to run next to the key: a venue integration, a strategy, an oracle, a signer for your own protocol;
+- you need it now, with payments, secrets and storage already built.
+
+It composes with other layers. An OutLayer wallet is an ordinary NEAR account, so a naming, recovery or timelock layer that targets NEAR accounts can sit above it.
+
 ## Using it
 
 ### A wallet for an agent
@@ -195,7 +182,7 @@ A request names the code as a registered project, or as a WASM file by URL and s
 
 ## Trust model
 
-**What is trusted.** Intel TDX and its attestation chain. NEAR MPC, for the master secret. The keystore DAO, for which builds may hold it. The coordinator, for authenticating API keys, counting cumulative limits (daily, hourly and monthly caps can overshoot under a burst of concurrent requests), and supplying the solver-quoted message for swaps, cross-chain withdrawals, confidential intents, limit orders and payment checks. Per-transaction limits, approvals, whitelists and freeze are exact and decided only in the enclave.
+**What is trusted.** Intel TDX and its attestation chain. NEAR MPC, for the master secret. The keystore DAO, for which builds may hold it. The coordinator, for authenticating API keys, counting cumulative limits (daily, hourly and monthly caps can overshoot under a burst of concurrent requests), and supplying the solver-quoted message for swaps, cross-chain withdrawals, confidential intents, limit orders and payment checks. Per-transaction limits, approvals, whitelists and freeze are exact and decided only in the enclave. The coordinator moves into a TDX enclave of its own, attested and approved like the workers and keystores, once its active development settles; until then it stays a trusted, non-attested component.
 
 **Hosts.** Workers and keystores run in Intel TDX confidential VMs on OutLayer's own bare-metal servers, deployed with [`deploy/self-hosted-tdx`](deploy/self-hosted-tdx/README.md). No third-party cloud service is in the attestation path.
 

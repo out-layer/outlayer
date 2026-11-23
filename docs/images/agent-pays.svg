@@ -1,0 +1,64 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='1420' height='888' viewBox='0 0 1420 888'>
+<defs><marker id='ae' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='8' markerHeight='8' orient='auto'><path d='M0,0 L10,5 L0,10 z' fill='#374151'/></marker></defs>
+<rect x='0' y='0' width='1420' height='888' fill='#ffffff'/>
+<text x='710.0' y='34' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='18' font-weight='bold' fill='#111'>What happens when an agent pays</text>
+<line x1='130' y1='92' x2='130' y2='814' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='430' y1='92' x2='430' y2='814' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='760' y1='92' x2='760' y2='814' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='1060' y1='92' x2='1060' y2='814' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='1290' y1='92' x2='1290' y2='814' stroke='#cbd5e1' stroke-width='1.5'/>
+<rect x='55.0' y='48' width='150' height='44' rx='6' fill='#dbeafe' stroke='#2563eb' stroke-width='1.5'/>
+<text x='130' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Agent</text>
+<rect x='355.0' y='48' width='150' height='44' rx='6' fill='#f3f4f6' stroke='#6b7280' stroke-width='1.5'/>
+<text x='430' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Coordinator</text>
+<rect x='655.0' y='48' width='210' height='44' rx='6' fill='#dcfce7' stroke='#16a34a' stroke-width='1.5'/>
+<text x='760' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Keystore (Intel TDX)</text>
+<rect x='985.0' y='48' width='150' height='44' rx='6' fill='#fef3c7' stroke='#d97706' stroke-width='1.5'/>
+<text x='1060' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>outlayer.near</text>
+<rect x='1215.0' y='48' width='150' height='44' rx='6' fill='#ede9fe' stroke='#7c3aed' stroke-width='1.5'/>
+<text x='1290' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Owner</text>
+<rect x='55.0' y='814' width='150' height='44' rx='6' fill='#dbeafe' stroke='#2563eb' stroke-width='1.5'/>
+<text x='130' y='841' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Agent</text>
+<rect x='355.0' y='814' width='150' height='44' rx='6' fill='#f3f4f6' stroke='#6b7280' stroke-width='1.5'/>
+<text x='430' y='841' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Coordinator</text>
+<rect x='655.0' y='814' width='210' height='44' rx='6' fill='#dcfce7' stroke='#16a34a' stroke-width='1.5'/>
+<text x='760' y='841' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Keystore (Intel TDX)</text>
+<rect x='985.0' y='814' width='150' height='44' rx='6' fill='#fef3c7' stroke='#d97706' stroke-width='1.5'/>
+<text x='1060' y='841' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>outlayer.near</text>
+<rect x='1215.0' y='814' width='150' height='44' rx='6' fill='#ede9fe' stroke='#7c3aed' stroke-width='1.5'/>
+<text x='1290' y='841' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Owner</text>
+<rect x='40' y='292' width='1340' height='502' fill='none' stroke='#9ca3af' stroke-width='1.2' stroke-dasharray='4,3' rx='4'/>
+<rect x='40' y='292' width='44' height='22' fill='#f3f4f6' stroke='#9ca3af' stroke-width='1.2'/>
+<text x='62' y='308' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='12' font-weight='bold' fill='#374151'>alt</text>
+<text x='100' y='308' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='bold' fill='#374151'>[inside the policy]</text>
+<line x1='40' y1='408' x2='1380' y2='408' stroke='#9ca3af' stroke-width='1.2' stroke-dasharray='4,3'/>
+<text x='100' y='425' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='bold' fill='#374151'>[needs approval]</text>
+<line x1='40' y1='674' x2='1380' y2='674' stroke='#9ca3af' stroke-width='1.2' stroke-dasharray='4,3'/>
+<text x='100' y='691' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='bold' fill='#374151'>[outside the policy]</text>
+<line x1='130' y1='130' x2='430' y2='130' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='280.0' y='122' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>transfer 50 USDC to bob.near</text>
+<line x1='430' y1='176' x2='760' y2='176' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='595.0' y='168' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>operation + wallet id</text>
+<line x1='760' y1='222' x2='1060' y2='222' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='910.0' y='214' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>read the encrypted policy (a free view call)</text>
+<path d='M 760,260 h 40 v 18 h -36' fill='none' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='810' y='273' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>decrypt, evaluate: type, token, limits, whitelist, freeze</text>
+<line x1='760' y1='350' x2='430' y2='350' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)' stroke-dasharray='6,4'/>
+<text x='595.0' y='342' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>derive the key, sign</text>
+<line x1='430' y1='396' x2='130' y2='396' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)' stroke-dasharray='6,4'/>
+<text x='280.0' y='388' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>tx hash</text>
+<line x1='760' y1='466' x2='430' y2='466' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)' stroke-dasharray='6,4'/>
+<text x='595.0' y='458' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>pending approval</text>
+<line x1='430' y1='512' x2='130' y2='512' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)' stroke-dasharray='6,4'/>
+<text x='280.0' y='504' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>pending_approval</text>
+<line x1='1290' y1='558' x2='430' y2='558' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='860.0' y='550' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>NEP-413 signature over this exact operation</text>
+<line x1='430' y1='604' x2='760' y2='604' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='595.0' y='596' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>operation + approvals</text>
+<path d='M 760,642 h 40 v 18 h -36' fill='none' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='810' y='655' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>verify the approvers&#x27; signatures, then sign</text>
+<line x1='760' y1='732' x2='430' y2='732' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)' stroke-dasharray='6,4'/>
+<text x='595.0' y='724' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>refused, nothing is signed</text>
+<line x1='430' y1='778' x2='130' y2='778' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)' stroke-dasharray='6,4'/>
+<text x='280.0' y='770' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>policy_denied</text>
+</svg>
