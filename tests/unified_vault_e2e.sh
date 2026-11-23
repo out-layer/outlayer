@@ -895,7 +895,7 @@ if want V2; then
     for i in $(seq 1 "$N_WALLETS"); do
       RESP=$(curl -sS -X POST "$COORDINATOR_URL/register" -H 'Content-Type: application/json' -d "$(jq -nc --arg v "$VAULT_ID" '{vault_id:$v}')")
       WK=$(echo "$RESP" | jq -r '.api_key // empty'); WID=$(echo "$RESP" | jq -r '.wallet_id // empty'); ADDR=$(echo "$RESP" | jq -r '.near_account_id // empty')
-      if [[ -z "$WK" || "$WK" != wk_* ]]; then fail "V2 /register #$i returned no wk_ api_key: $(jq -c 'del(.api_key, .handoff_url)' <<<"$RESP" 2>/dev/null | head -c160)"; ok=false; break; fi
+      if [[ -z "$WK" || "$WK" != wk_* || -z "$WID" || ! "$ADDR" =~ ^[0-9a-f]{64}$ ]]; then fail "V2 /register #$i returned no wk_ api_key, wallet_id and near_account_id: $(jq -c 'del(.api_key, .handoff_url)' <<<"$RESP" 2>/dev/null | head -c160)"; ok=false; break; fi
       V2_WK+=("$WK"); V2_WID+=("$WID"); V2_ADDR+=("$ADDR")
       note "V2 wallet #$i: wallet_id=$WID addr=$ADDR"
     done
@@ -990,16 +990,17 @@ if want V3; then
         [[ -n "$V3_NEWPUB" && -n "$V3_NEWPRIV" ]] || fail "V3 generate-key produced no keypair"
         finalize_and_assert_unlocked "$V3_VAULT" "$V3_NEWPUB" "V3b" || true
 
-        # 3c: POST-RECOVERY the keystore REFUSES — both /address (derive) and /sign-message (sign) must
-        # fail (assert_serving_allowed rejects on unlocked == true). bn_address returns non-zero on a
-        # non-200, so capture its rc; bn_sign must yield no signature.
-        PA=$(v3_addr "${V3_SEEDS[0]}"); PAH=$(echo "$PA" | tail -1 | sed 's/HTTP://')
-        [[ "$PAH" != "200" ]] && pass "V3c POST-RECOVERY /address refused (HTTP $PAH) — keystore evicted master, refuses to derive" \
-          || fail "V3c POST-RECOVERY /address STILL returned 200 — cutoff broken: $(echo "$PA" | sed '$d' | head -c160)"
+        # 3c: POST-RECOVERY the keystore REFUSES — both /address (derive) and /sign-message (sign) — and
+        # says why: the vault is unlocked. Any other refusal (a 401 of a bad token, a 5xx, no answer) is
+        # not the cutoff and fails the row.
+        PA=$(v3_addr "${V3_SEEDS[0]}"); PAH=$(echo "$PA" | tail -1 | sed 's/HTTP://'); PAB=$(echo "$PA" | sed '$d')
+        [[ "$PAH" == "400" ]] && grep -qF "vault $V3_VAULT is unlocked (recovery completed)" <<<"$PAB" \
+          && pass "V3c POST-RECOVERY /address refused (HTTP 400): the vault is unlocked, its master is not served" \
+          || fail "V3c POST-RECOVERY /address: expected 400 naming the unlocked vault, got HTTP $PAH: $(head -c160 <<<"$PAB")"
         PS=$(v3_sign "${V3_SEEDS[0]}" "v3-post-recovery-attempt"); PSH=$(echo "$PS" | tail -1 | sed 's/HTTP://'); PSB=$(echo "$PS" | sed '$d')
-        PSSIG=$(echo "$PSB" | jq -r '.signature // empty' 2>/dev/null || echo "")
-        { [[ "$PSH" -ge 400 ]] || [[ -z "$PSSIG" || "$PSSIG" == "null" ]]; } && pass "V3c POST-RECOVERY /sign-message refused (HTTP $PSH) — OutLayer cannot sign for this vault" \
-          || fail "V3c POST-RECOVERY keystore STILL signed (HTTP $PSH sig=${PSSIG:0:20}) — cutoff broken"
+        [[ "$PSH" == "400" ]] && grep -qF "vault $V3_VAULT is unlocked (recovery completed)" <<<"$PSB" \
+          && pass "V3c POST-RECOVERY /sign-message refused (HTTP 400): the vault is unlocked, OutLayer cannot sign for it" \
+          || fail "V3c POST-RECOVERY /sign-message: expected 400 naming the unlocked vault, got HTTP $PSH: $(head -c160 <<<"$PSB")"
 
         # 3d: MPC-CKD recover the per-vault master from the NEW parent key, then re-derive EACH user
         # OFFLINE (compute-wallet-id → derive-wallet-key) and assert the offline near_address MATCHES the
@@ -1197,9 +1198,9 @@ if want V5; then
       # 5c: POST-RECOVERY /sign-message must FAIL (vault unlocked → keystore refuses to sign).
       PSR=$(curl -sS -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/wallet/v1/sign-message" -H @<(printf '%s\n' "Authorization: Bearer $V5_WK") -H 'Content-Type: application/json' -d '{"message":"v5-postflight","recipient":"v5-verifier.testnet","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}')
       PSR_H=$(echo "$PSR" | tail -1 | sed 's/HTTP://'); PSR_B=$(echo "$PSR" | sed '$d')
-      PSR_SIG=$(echo "$PSR_B" | jq -r '.signature // empty' 2>/dev/null || echo "")
-      { [[ "$PSR_H" -ge 400 ]] || [[ -z "$PSR_SIG" || "$PSR_SIG" == "null" ]]; } && pass "V5c keystore refused signing post-recovery (HTTP $PSR_H) — sovereignty cutoff confirmed" \
-        || fail "V5c POST-RECOVERY keystore STILL signed (HTTP $PSR_H sig=${PSR_SIG:0:20}) — cutoff broken"
+      [[ "$PSR_H" == "400" ]] && grep -qF "vault $V5_VAULT is unlocked (recovery completed)" <<<"$PSR_B" \
+        && pass "V5c keystore refused signing post-recovery (HTTP 400): the vault is unlocked" \
+        || fail "V5c POST-RECOVERY /sign-message: expected 400 naming the unlocked vault, got HTTP $PSR_H: $(head -c160 <<<"$PSR_B")"
 
       # 5d: MPC-CKD recover master → derive-wallet-key (uses the /register wallet_id directly) → assert the
       # derived near_address == the keystore's near_account_id → REAL send-near signed by the LOCAL key.

@@ -204,8 +204,9 @@ if run("R4"):
         wk2 = derive_wk(M2, s)
         st, r = api("PUT", "/wallet/v1/api-key", PK2, {"seed": c["sh"], "key_hash": sha(wk2)})
         ok(st == 200 and r.get("wallet_id") == c["wid"] and r.get("near_account_id") == c["addr"], f"R4 {s[:13]} PUT v2 -> {st}: same wallet")
-        st, _ = api("DELETE", f"/wallet/v1/api-key/{sha(c['wk1'])}", PK2)
-        ok(st == 400, f"R4 {s[:13]} the parent cannot revoke the child's key -> {st}")
+        st, r = api("DELETE", f"/wallet/v1/api-key/{sha(c['wk1'])}", PK2)
+        ok(st == 400 and "Key not found or already revoked" in str(r.get("message") if isinstance(r, dict) else r),
+           f"R4 {s[:13]} the parent cannot revoke the child's key (not in its wallet) -> {st}")
         st, r = api("DELETE", f"/wallet/v1/api-key/{sha(c['wk1'])}", wk2)
         ok(st == 200 and isinstance(r, dict) and r.get("revoked") is True, f"R4 {s[:13]} DELETE v1 with the v2 key -> {st}")
         st, _, _ = address(c["wk1"])
@@ -224,8 +225,9 @@ if run("R4"):
     c = child[FUNDED]
     st, r = api("PUT", "/wallet/v1/api-key", PK2, {"seed": c["sh"], "key_hash": sha(c["wk2"])})
     ok(st == 200 and r.get("wallet_id") == c["wid"], f"R4 PUT of the registered v2 hash again -> {st}")
-    st, _ = api("DELETE", f"/wallet/v1/api-key/{sha(c['wk1'])}", c["wk2"])
-    ok(st == 400, f"R4 DELETE of the already revoked v1 hash again -> {st}")
+    st, r = api("DELETE", f"/wallet/v1/api-key/{sha(c['wk1'])}", c["wk2"])
+    ok(st == 400 and "Key not found or already revoked" in str(r.get("message") if isinstance(r, dict) else r),
+       f"R4 DELETE of the already revoked v1 hash again (already revoked) -> {st}")
     st, _ = api("DELETE", f"/wallet/v1/api-key/{sha(c['wk2'])}", c["wk2"])
     ok(st == 409, f"R4 the last key of a wallet cannot be revoked -> {st}")
     st, _ = api("PUT", "/wallet/v1/api-key", PK1, {"seed": sha("acct:anyone"), "key_hash": sha("wk_x")})
