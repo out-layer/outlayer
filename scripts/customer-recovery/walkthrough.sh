@@ -29,8 +29,10 @@
 #      Saved to ~/.outlayer-recovery/<vault_id>.json, mode 0600.
 #
 #   2. Initiate unilateral recovery. The vault timer starts counting
-#      down `unilateral_exit_window_secs` (default 24h; the customer
-#      can shorten via `set-exit-window` BEFORE running this script).
+#      down `unilateral_exit_window_secs` (default 24h). A shorter
+#      window (`SHORTEN_EXIT_WINDOW_TO`) applies only after the window
+#      in force has elapsed; until then the script stops before
+#      initiating, so the recovery is not started on the longer one.
 #      Idempotent: if a previous run left a recovery in progress,
 #      we detect it and skip the call (the timer is already set).
 #
@@ -212,16 +214,26 @@ if [[ "$VAULT_PARENT" != "$LOGGED_IN_ACCOUNT" ]]; then
   exit 1
 fi
 
-# Optional: shorten the exit window before initiating. Useful when
-# the default is 24h+ and you want to drive a sovereignty drill in
-# minutes. Set `SHORTEN_EXIT_WINDOW_TO=60s` (or 5m, 1h, …) to apply.
-# Has no effect if a recovery is already in progress (set-exit-window
-# only affects future initiations).
+# Optional: shorten the exit window before initiating. Set
+# `SHORTEN_EXIT_WINDOW_TO=60s` (or 5m, 1h, …). The vault applies a shorter
+# window only after the window in force has elapsed (a vault of the first
+# contract version applies it at once); while it is pending, the script
+# stops here (exit 1, nothing initiated) and says when to run it again. Has no effect if a recovery is
+# already in progress (set-exit-window only affects future initiations).
+# A drill in minutes needs a vault deployed with that window
+# (`outlayer vault init --exit-window 60s` on the testnet test-timing build).
 if [[ -n "${SHORTEN_EXIT_WINDOW_TO:-}" && "$CURRENT_RECOVERY" == "null" && "$ALREADY_UNLOCKED" != "true" ]]; then
   echo "          shortening exit window to $SHORTEN_EXIT_WINDOW_TO before initiate"
   outlayer vault set-exit-window "$VAULT_ID" "$SHORTEN_EXIT_WINDOW_TO"
   # Re-read state so subsequent reads see the new window.
   CURRENT_STATE=$(read_vault_state)
+  PENDING_AT_NS=$(echo "$CURRENT_STATE" | jq -r '.pending_exit_window.effective_at // empty')
+  if [[ -n "$PENDING_AT_NS" ]]; then
+    echo "          the vault keeps $(echo "$CURRENT_STATE" | jq -r '.unilateral_exit_window_secs')s in force; the shorter window applies at unix time $((PENDING_AT_NS / 1000000000))."
+    echo "          not initiating now: a recovery started now would run on the longer window."
+    echo "          run this script again after that time, or without SHORTEN_EXIT_WINDOW_TO to recover on the window in force."
+    exit 1
+  fi
 fi
 
 if [[ "$ALREADY_UNLOCKED" == "true" ]]; then
