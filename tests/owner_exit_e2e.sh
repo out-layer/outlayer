@@ -38,7 +38,7 @@
 #   E11 a funded payment key of the owner's wallet — bought with PARENT's testnet stablecoin;
 #       the NEAR-deposit route swaps through Intents, which testnet lacks — runs a call
 #   E10 sign-message refuses a NEP-641 recipient (`<chain>: <account>[ -> …][ @ <time>]`)
-#       with its own words; an ordinary recipient is refused for another reason
+#       with its own words; an ordinary recipient is signed (wallet 0 has no policy)
 #   B1  `PUT /wallet/v1/binding` with the owner's wallet: to another account (personal mode)
 #       and in the leased mode (another account, the owner's own) refused with the
 #       coordinator's words; the owner's own account in the personal mode taken, pending,
@@ -482,26 +482,29 @@ else fail "E4 PUT /wallet/v1/api-key with the owner's wallet key: $HTTP $(why)";
 # what is kept here. Addresses and public keys only: nothing here is a secret.
 log "A1 the addresses OutLayer serves for wallet 0"
 A1_SUB_PATH="owner-exit.a1"
-# served <query> — the address and public key `GET /wallet/v1/address?<query>` answers for
-# wallet 0, as "address public_key"; nothing when it refuses.
+# served <query> — what `GET /wallet/v1/address?<query>` answers for wallet 0, as
+# "address public_key sub_path" ("-" for a field it leaves out); "- - - <status> <why>" when
+# it refuses. It runs in a command substitution, so its answer is all the caller sees of
+# the request: HTTP and BODY stay the subshell's.
 served() {
   api_wk "$KEY0" GET "/wallet/v1/address?$1" >/dev/null
-  [[ "$HTTP" == 200 ]] && jq -r '"\(.address // "") \(.public_key // "")"' <<<"$BODY"
+  if [[ "$HTTP" == 200 ]]; then jq -r '"\(.address // "-") \(.public_key // "-") \(.sub_path // "-")"' <<<"$BODY"
+  else echo "- - - $HTTP $(why)"; fi
 }
-read -r SERVED_NEAR _ <<<"$(served chain=near)"
+read -r SERVED_NEAR _ _ WHY <<<"$(served chain=near)"
 [[ "$SERVED_NEAR" == "$ACCOUNT0" ]] && pass "A1 near: the wallet's account" \
-  || fail "A1 near: ${SERVED_NEAR:-nothing} ($HTTP $(why)), the wallet is $ACCOUNT0"
-read -r SERVED_EVM SERVED_EVM_PK <<<"$(served chain=base)"
+  || fail "A1 near: $SERVED_NEAR ${WHY:+($WHY)}, the wallet is $ACCOUNT0"
+read -r SERVED_EVM SERVED_EVM_PK _ WHY <<<"$(served chain=base)"
 [[ "$SERVED_EVM" =~ ^0x[0-9a-f]{40}$ && "$SERVED_EVM_PK" == secp256k1:* ]] && pass "A1 evm (base): $SERVED_EVM" \
-  || fail "A1 evm (base): ${SERVED_EVM:-nothing} ($HTTP $(why))"
-read -r SERVED_SOL SERVED_SOL_PK <<<"$(served chain=solana)"
+  || fail "A1 evm (base): $SERVED_EVM ${WHY:+($WHY)}"
+read -r SERVED_SOL SERVED_SOL_PK _ WHY <<<"$(served chain=solana)"
 [[ "$SERVED_SOL" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ && "$SERVED_SOL_PK" == "$SERVED_SOL" ]] && pass "A1 solana: $SERVED_SOL" \
-  || fail "A1 solana: ${SERVED_SOL:-nothing} ($HTTP $(why))"
-read -r SERVED_SUB SERVED_SUB_PK <<<"$(served "chain=base&sub_path=$A1_SUB_PATH")"
-if [[ "$SERVED_SUB" =~ ^0x[0-9a-f]{40}$ && "$SERVED_SUB_PK" == secp256k1:* && "$(jq -r '.sub_path // ""' <<<"$BODY")" == "$A1_SUB_PATH" ]]; then
+  || fail "A1 solana: $SERVED_SOL ${WHY:+($WHY)}"
+read -r SERVED_SUB SERVED_SUB_PK SERVED_SUB_PATH WHY <<<"$(served "chain=base&sub_path=$A1_SUB_PATH")"
+if [[ "$SERVED_SUB" =~ ^0x[0-9a-f]{40}$ && "$SERVED_SUB_PK" == secp256k1:* && "$SERVED_SUB_PATH" == "$A1_SUB_PATH" ]]; then
   [[ "$SERVED_SUB" != "$SERVED_EVM" ]] && pass "A1 evm sub-key $A1_SUB_PATH: $SERVED_SUB, not the wallet's own" \
     || fail "A1 the sub-key $A1_SUB_PATH is served at the wallet's own EVM address"
-else fail "A1 evm sub-key $A1_SUB_PATH: ${SERVED_SUB:-nothing} ($HTTP $(why))"; fi
+else fail "A1 evm sub-key $A1_SUB_PATH: $SERVED_SUB, sub_path $SERVED_SUB_PATH ${WHY:+($WHY)}"; fi
 
 # ── E7: a NEAR-signed api-key claim is held to what it signs ─────────────────
 log "E7 a signed api-key claim is held to the key and the vault it names"
@@ -591,9 +594,9 @@ else fail "E11 no funded key could be made for the owner's wallet"; fi
 
 # ── E10: the owner's wallet signs no offchain authorization ──────────────────
 # A NEP-413 signature over a NEP-641 recipient would be the account's own word, given off
-# chain. The keystore refuses one under any policy, with or without the time; another
-# recipient is refused for another reason here (no policy lists it: the default-deny
-# `allowed_recipients`), so the words tell the two refusals apart.
+# chain. The keystore refuses one under any policy, with or without the time. Wallet 0 has
+# no policy here, so any other recipient is signed: the refusal is the NEP-641 rule's own,
+# not a refusal of every recipient.
 log "E10 sign-message refuses a NEP-641 recipient, with and without its time"
 e10_sign() { api_wk "$KEY0" POST /wallet/v1/sign-message "$(jq -nc --arg r "$1" '{message:"e10", recipient:$r}')" >/dev/null; }
 for R in "testnet: $OWNER @ $(date -u +%Y-%m-%dT%H:%M:%SZ)" "testnet: $OWNER" "testnet: $OWNER -> $ACCOUNT0"; do
@@ -602,8 +605,8 @@ for R in "testnet: $OWNER @ $(date -u +%Y-%m-%dT%H:%M:%SZ)" "testnet: $OWNER" "t
   else fail "E10 \"$R\": $HTTP $(why)"; fi
 done
 e10_sign "app.example.testnet"
-if [[ "$HTTP" == 403 ]] && grep -qF "is not in the policy's allowed_recipients" <<<"$BODY" && ! grep -qF "NEP-641" <<<"$BODY"; then
-  pass "E10 an ordinary recipient is refused by the policy's allowlist: the NEP-641 rule did not take it"
+if [[ "$HTTP" == 200 && "$(jq -r '.signature // ""' <<<"$BODY")" == ed25519:* && "$(jq -r '.account_id // ""' <<<"$BODY")" == "$ACCOUNT0" ]]; then
+  pass "E10 an ordinary recipient is signed by wallet 0, which has no policy: the NEP-641 rule refuses only its own form"
 else fail "E10 an ordinary recipient: $HTTP $(why)"; fi
 
 # ── B1–B2: a wallet that can leave acts only on its owner's account ──────────
