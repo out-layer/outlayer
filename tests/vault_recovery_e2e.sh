@@ -166,7 +166,7 @@ scenario_unilateral() {
   # and to call `unlocked_add_key` post-recovery.
   run "near account create-account fund-myself \\
         $vault_account \\
-        '2 NEAR' \\
+        '2.5 NEAR' \\
         autogenerate-new-keypair save-to-keychain \\
         sign-as $PARENT \\
         network-config testnet \\

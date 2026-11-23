@@ -87,8 +87,10 @@ def near(*args):
                or re.search(r"^(Error|error):.{0,200}", out, re.M))
         if p.returncode == 0 and not why:
             return True, ""
-        # A stale block hash or a lost receipt is the RPC's, not the contract's: once more.
-        if attempt == 1 and why and re.search(r"expired|Tx not found|TIMEOUT|timed out", why.group(0)):
+        # A stale block hash, a lost receipt or a nonce taken by the previous transaction of the
+        # same key (not yet final when this one was signed) is the RPC's, not the contract's: once more.
+        if attempt == 1 and (why and re.search(r"expired|Tx not found|TIMEOUT|timed out", why.group(0))
+                             or re.search(r"Transaction nonce \(\d+\) must be account\[access_key\]\.nonce|InvalidNonce", out)):
             time.sleep(5); continue
         return False, why.group(0) if why else f"rc={p.returncode}"
 
@@ -114,7 +116,9 @@ def store_policy(key, wallet_id, policy):
     POLICY_PUBKEYS.add(sg["public_key_hex"])
     done, why = call_contract("store_wallet_policy", {"wallet_pubkey": "ed25519:" + sg["public_key_hex"],
                                                       "encrypted_data": enc["encrypted_base64"],
-                                                      "wallet_signature": sg["signature_hex"]}, deposit="0.1 NEAR")
+                                                      "wallet_signature": sg["signature_hex"],
+                                                      "version": sg["version"], "locked": sg["locked"],
+                                                      "valid_until": sg["valid_until"]}, deposit="0.1 NEAR")
     return done, why
 
 def wait_key(key, want=200, secs=240):

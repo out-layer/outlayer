@@ -190,8 +190,8 @@ if [[ "$APPLY" != true ]]; then
   warn "       V6 a secret CREATED for an agent under the shared vault: key fetched under the agent's own auth + scope-specific → agent-pays store → an unfunded agent refused actionably → \$PARENT pays via store_agent_secret → vault/audience/ciphertext/name/payer each altered and REFUSED, untouched call lands[VAULT/FUNDS]"
   warn "Without MPC_PUBLIC_KEY (default-vault mode) V1–V6 are SKIP-noted (no per-vault to deploy)."
   warn "V6 COST: 0.3 NEAR funding one agent wallet + three 0.1 NEAR storage deposits that only the agent itself could reclaim — the suite does not."
-  warn "EXIT WINDOW: the SHARED/V1 vaults deploy with --exit-window 24h (CLI rejects <24h) and are NEVER finalized — they stay reusable. V3/V4/V5"
-  warn "       each set a 60s window via a DIRECT set_exit_window contract call (CLI init/set-exit-window reject <24h; the testnet test-timing build allows 60s),"
+  warn "EXIT WINDOW: the SHARED/V1 vaults deploy with --exit-window 24h and are NEVER finalized — they stay reusable. V3/V4/V5"
+  warn "       deploy with --exit-window 60s (the testnet vault build is test-timing: its minimum is 60s; a lowering later would wait out the window in force),"
   warn "       then finalize_recovery in the SAME run after the ~70s window elapses. finalize_recovery is IRREVERSIBLE — V3/V4/V5 use THROWAWAY vaults"
   warn "       (v3v/v4v/v5v.\$PARENT) that are RETIRED (unlocked, OutLayer-side TEE keys deleted) the instant they run; NEVER pointed at vault.\$PARENT."
   warn "       --apply REUSES vault.\$PARENT if already on chain (e.g. vault.zavodil.testnet) — no new stake; a first deploy LOCKS ~0.1 NEAR/vault the sub-wallet sweep does NOT reclaim."
@@ -676,10 +676,12 @@ NEARBLOCKS_URL="${NEARBLOCKS_URL:-https://api-testnet.nearblocks.io}"
 # --apply-GATED: in dry-run this is never called (the V1–V5 bodies are all under VAULT_MODE, which is
 # false without --apply), but guard anyway so an accidental dry-run call deploys nothing.
 # Reuse-or-deploy: view_account first; if it exists, resume idempotently and return; else init with
-# --exit-window 24h (60s is INVALID — the CLI only accepts 24h/7d/30d). Same init+resume race handling
-# as the shared vault block. Used by V1 (two scopes) / V3 / V4 / V5 (each needs its own vault).
+# --exit-window <window> (default 24h). V3/V4/V5 pass 60s: the vault refuses to lower a window before
+# the one in force has elapsed, so the window a recovery runs on is the one the vault is born with;
+# 60s is the minimum of the testnet test-timing build. Same init+resume race handling as the shared
+# vault block. Used by V1 (two scopes) / V3 / V4 / V5 (each needs its own vault).
 deploy_throwaway_vault() {
-  local name=$1 id rc out
+  local name=$1 window=${2:-24h} id rc out
   id="$name.$PARENT"
   if [[ "$APPLY" != true ]]; then
     note "dry-run: NOT deploying throwaway vault $id (would lock NEAR)" >&2
@@ -692,9 +694,9 @@ deploy_throwaway_vault() {
     echo "$id"
     return 0
   fi
-  log "Deploy throwaway vault $id (--name $name --exit-window 24h)" >&2
+  log "Deploy throwaway vault $id (--name $name --exit-window $window)" >&2
   rc=0
-  out=$(outlayer vault init --name "$name" --exit-window 24h 2>&1) || rc=$?
+  out=$(outlayer vault init --name "$name" --exit-window "$window" 2>&1) || rc=$?
   if [[ $rc -ne 0 ]] && echo "$out" | grep -q "outlayer vault resume"; then
     for _ in 1 2 3 4 5; do sleep 6; if outlayer vault resume "$id" >&2; then rc=0; break; fi; done
   fi
@@ -738,29 +740,10 @@ assert_recovery_in_flight() {
   return 1
 }
 
-# set_exit_window_60s <vault_id> <label> — shrink the throwaway vault's unilateral exit window to 60s
-# via a DIRECT parent-signed contract call. The `outlayer vault init`/`set-exit-window` CLI reject any
-# value < 24h, but the TESTNET vault WASM is the `test-timing` build whose MIN_UNILATERAL_EXIT_WINDOW_SECS
-# is 60 (VERIFIED live — it logs `exit_window_set_to_60_secs`). MUST be called BEFORE
-# initiate-unilateral-recovery: the contract freezes `finalize_after = now + unilateral_exit_window_secs`
-# at INITIATE time (set_exit_window does NOT retro-shrink an in-flight recovery — see vault-contract
-# lib.rs unilateral_initiate_recovery / set_exit_window). set_exit_window is parent-gated, so the PARENT
-# keychain signs it. Only meaningful for V3/V4/V5 (the finalize tests); --apply-gated by its callers.
-set_exit_window_60s() {
-  local vid=$1 label=$2
-  log "$label set unilateral exit window → 60s on $vid (direct set_exit_window — CLI rejects <24h; test-timing build min is 60s)"
-  near_tty "near contract call-function as-transaction \"$vid\" set_exit_window json-args '{\"new_window_secs\":60}' prepaid-gas '30 Tgas' attached-deposit '0 NEAR' sign-as \"$PARENT\" network-config \"$NETWORK\" sign-with-keychain send" \
-    || fail "$label set_exit_window(60) failed on $vid (is the deployed WASM the test-timing build? mainnet build rejects <24h)"
-  # Let the parent access-key nonce propagate before the caller's back-to-back initiate tx — set_exit_window
-  # (near-cli) and initiate-unilateral-recovery (outlayer CLI) share the PARENT key; without a gap the 2nd
-  # fetches a stale access-key nonce → InvalidNonce. vault_initiate_retry below is the belt to this suspenders.
-  sleep 4
-}
-
 # vault_initiate_retry <vault_id> <label> — initiate-unilateral-recovery, retrying on the parent-key nonce
-# race: set_exit_window (near-cli) + initiate (outlayer CLI) are back-to-back txs from the SAME parent key,
-# so the 2nd can read a stale access-key nonce → InvalidNonce. Retry up to 5× with a settle; any
-# non-nonce error fails loudly. Freezing finalize_after at initiate is unaffected (the 60s window persists).
+# race: the vault deploy and initiate (outlayer CLI) are back-to-back txs from the SAME parent key, so the
+# 2nd can read a stale access-key nonce → InvalidNonce. Retry up to 5× with a settle; any non-nonce error
+# fails loudly. finalize_after is frozen at initiate from the window in force (60s).
 vault_initiate_retry() {
   local vid=$1 label=$2 i out rc
   for i in 1 2 3 4 5; do
@@ -968,9 +951,8 @@ if want V3; then
   if [[ "$VAULT_MODE" == true ]]; then
     log "V3 [VAULT/POLICY] Bearer-near sovereign exit — FULL single-run (derive → 60s window → finalize → keystore refuses → MPC-CKD offline re-derive matches)"
     warn "V3 finalize_recovery is IRREVERSIBLE — it RETIRES this throwaway vault (unlocked, OutLayer-side TEE keys deleted). NEVER pointed at vault.\$PARENT (uses v3v.\$PARENT)."
-    # Distinct VALID subaccount name (v3v.$PARENT); --apply-gated, deploy/reuse, exit-window 24h init
-    # (the CLI rejects <24h); V3 shrinks it to 60s via a direct set_exit_window call before initiate.
-    V3_VAULT=$(deploy_throwaway_vault "v3v$RUN_TAG") || fail "V3 deploy vault"
+    # Distinct VALID subaccount name (v3v.$PARENT); --apply-gated, deploy/reuse, born with a 60s window.
+    V3_VAULT=$(deploy_throwaway_vault "v3v$RUN_TAG" 60s) || fail "V3 deploy vault"
     if [[ -n "${V3_VAULT:-}" ]]; then
       THROWAWAY_VAULTS+=("$V3_VAULT")
       pass "V3 throwaway vault $V3_VAULT deployed"
@@ -997,9 +979,7 @@ if want V3; then
         PRS=$(echo "$PRB" | jq -r '.signature // empty')
         [[ "$PRH" == "200" && -n "$PRS" && "$PRS" != "null" ]] && pass "V3a PRE-RECOVERY keystore signed for user #1 (sig len=${#PRS})" || fail "V3a pre-recovery sign failed (HTTP $PRH): $(echo "$PRB" | head -c160)"
 
-        # 3b: 60s window (direct set_exit_window) → initiate → assert in-flight → wait window → finalize.
-        # set_exit_window MUST precede initiate (finalize_after is frozen at initiate from the window).
-        set_exit_window_60s "$V3_VAULT" "V3"
+        # 3b: initiate on the vault's 60s window → assert in-flight → wait window → finalize.
         log "V3 initiate unilateral recovery"
         vault_initiate_retry "$V3_VAULT" "V3"
         assert_recovery_in_flight "$V3_VAULT" "V3b"
@@ -1078,9 +1058,8 @@ if want V4; then
   else
     log "V4 [VAULT/POLICY] detach secret-decrypt — FULL single-run (pre-recovery decrypt → 60s window → finalize → /call refused → on-chain ciphertext re-derive + local decrypt match) (project=$SECRET_PROJECT)"
     warn "V4 finalize_recovery is IRREVERSIBLE — it RETIRES this throwaway vault (unlocked, OutLayer-side TEE keys deleted). NEVER pointed at vault.\$PARENT (uses v4v.\$PARENT)."
-    # Distinct VALID subaccount name (v4v.$PARENT); --apply-gated, deploy/reuse (exit-window 24h init —
-    # CLI rejects <24h); V4 shrinks it to 60s via direct set_exit_window before initiate.
-    V4_VAULT=$(deploy_throwaway_vault "v4v$RUN_TAG") || fail "V4 deploy vault"
+    # Distinct VALID subaccount name (v4v.$PARENT); --apply-gated, deploy/reuse, born with a 60s window.
+    V4_VAULT=$(deploy_throwaway_vault "v4v$RUN_TAG" 60s) || fail "V4 deploy vault"
     if [[ -n "${V4_VAULT:-}" ]]; then
       THROWAWAY_VAULTS+=("$V4_VAULT")
       pass "V4 throwaway vault $V4_VAULT deployed"
@@ -1101,9 +1080,7 @@ if want V4; then
       echo "$PRE_CALL" | head -10 >&2
       if echo "$PRE_CALL" | grep -qF "\"value\":\"$EXPECTED_SECRET_VALUE\""; then pass "V4a /call returned the expected secret pre-recovery — keystore can decrypt"; else fail "V4a /call did not return MY_TEST_SECRET=$EXPECTED_SECRET_VALUE pre-recovery: $(echo "$PRE_CALL" | head -c200)"; fi
 
-      # 4b: 60s window (direct set_exit_window) → initiate → assert in-flight → wait window → finalize.
-      # set_exit_window MUST precede initiate (finalize_after is frozen at initiate from the window).
-      set_exit_window_60s "$V4_VAULT" "V4"
+      # 4b: initiate on the vault's 60s window → assert in-flight → wait window → finalize.
       log "V4 initiate unilateral recovery"
       vault_initiate_retry "$V4_VAULT" "V4"
       assert_recovery_in_flight "$V4_VAULT" "V4b"
@@ -1185,7 +1162,7 @@ if want V5; then
     CUR_TEST="V5"
     log "V5 [VAULT/FUNDS] wk_-path sovereign exit — FULL single-run (register → 60s window → finalize → keystore refuses → MPC-CKD re-derive → REAL on-chain send-near by recovered key)"
     warn "V5 finalize_recovery is IRREVERSIBLE — it RETIRES this throwaway vault (unlocked, OutLayer-side TEE keys deleted). NEVER pointed at vault.\$PARENT (uses v5v.\$PARENT)."
-    V5_VAULT=$(deploy_throwaway_vault "v5v$RUN_TAG") || fail "V5 deploy vault"
+    V5_VAULT=$(deploy_throwaway_vault "v5v$RUN_TAG" 60s) || fail "V5 deploy vault"
     if [[ -n "${V5_VAULT:-}" ]]; then
       THROWAWAY_VAULTS+=("$V5_VAULT")
       pass "V5 throwaway vault $V5_VAULT deployed"
@@ -1207,9 +1184,7 @@ if want V5; then
       # tx needing funds is 5d's LOCAL-key send — funding only after the derived key is in hand means an
       # early failure (before recovery) can never strand gas on an unrecoverable wallet.
 
-      # 5b: 60s window (direct set_exit_window) → initiate → assert in-flight → wait window → finalize.
-      # set_exit_window MUST precede initiate (finalize_after is frozen at initiate from the window).
-      set_exit_window_60s "$V5_VAULT" "V5"
+      # 5b: initiate on the vault's 60s window → assert in-flight → wait window → finalize.
       log "V5 initiate unilateral recovery"
       vault_initiate_retry "$V5_VAULT" "V5"
       assert_recovery_in_flight "$V5_VAULT" "V5b"
