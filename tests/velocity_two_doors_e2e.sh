@@ -197,10 +197,17 @@ note "wallet $WALLET_ID at $ADDRESS"
 
 if [[ "$MINTED" == true ]]; then
   log "Funding a wallet of this run's own"
-  near --quiet contract call-function as-transaction "$TOKEN_CONTRACT" storage_deposit \
+  # A failed send is named here and judged below, by what the chain holds: the
+  # CLI can also give up on a transaction that lands.
+  fund() { # fund <what> <near-cli arguments…>
+    local what=$1 out rc=0; shift
+    out=$(near "$@" 2>&1) || rc=$?
+    (( rc == 0 )) || warn "$what failed (rc=$rc): $(near_why "$out")"
+  }
+  fund storage_deposit --quiet contract call-function as-transaction "$TOKEN_CONTRACT" storage_deposit \
     json-args "$(jq -nc --arg a "$ADDRESS" '{account_id:$a, registration_only:true}')" \
     prepaid-gas '30.0 Tgas' attached-deposit '0.00125 NEAR' \
-    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send
   # Wait for the registration to be VISIBLE: an `ft_transfer` to an account the
   # token has not registered yet is refused by the token, and the two sends
   # otherwise race on one access key.
@@ -215,12 +222,12 @@ if [[ "$MINTED" == true ]]; then
   done
   [[ -n "$REGISTERED" ]] \
     || { echo "✗ $TOKEN_CONTRACT never registered $ADDRESS — the funding transfer below would be refused by the token, not by us" >&2; exit 1; }
-  near --quiet contract call-function as-transaction "$TOKEN_CONTRACT" ft_transfer \
+  fund ft_transfer --quiet contract call-function as-transaction "$TOKEN_CONTRACT" ft_transfer \
     json-args "$(jq -nc --arg a "$ADDRESS" --arg m "$FUND_USDC_MINIMAL" '{receiver_id:$a, amount:$m}')" \
     prepaid-gas '30.0 Tgas' attached-deposit '1 yoctoNEAR' \
-    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
-  near --quiet tokens "$PARENT" send-near "$ADDRESS" "$FUND_NEAR NEAR" \
-    network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+    sign-as "$PARENT" network-config "$NETWORK" sign-with-keychain send
+  fund send-near --quiet tokens "$PARENT" send-near "$ADDRESS" "$FUND_NEAR NEAR" \
+    network-config "$NETWORK" sign-with-keychain send
   FUNDED=""
   for _ in $(seq 1 10); do
     sleep 3
