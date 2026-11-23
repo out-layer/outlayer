@@ -44,7 +44,7 @@ Inputs:
 | `--signer-private-key` / `VAULT_PRIVATE_KEY` | The private half of the key installed by `outlayer vault finalize-recovery <vault> <new_parent_pubkey>` — typically generated with `customer-recovery generate-key` before finalize |
 | `--mpc-public-key` / `MPC_PUBLIC_KEY` | The MPC network's `bls12381g2:...` key for domain 2. Public, read it from the MPC contract: `near contract call-function as-read-only v1.signer public_key json-args '{"domain_id": 2}' network-config mainnet now` (testnet: `v1.signer-prod.testnet`) |
 | `--derivation-path` OR `--from-chain` | Either pass the path, or let the tool find it on NEARblocks (below) |
-| `--mpc-contract`, `--mpc-domain-id`, `--rpc-url`, `--nearblocks-url` | Defaults are testnet: `v1.signer-prod.testnet`, `2`, `https://rpc.testnet.fastnear.com`, `https://api-testnet.nearblocks.io`. Mainnet: `v1.signer`, `2`, a mainnet RPC, `https://api.nearblocks.io` |
+| `--mpc-contract`, `--mpc-domain-id`, `--rpc-url` / `RPC_URL`, `--nearblocks-url` | An RPC URL that carries an API key goes in `RPC_URL`, not on the command line. Defaults are testnet: `v1.signer-prod.testnet`, `2`, `https://rpc.testnet.fastnear.com`, `https://api-testnet.nearblocks.io`. Mainnet: `v1.signer`, `2`, a mainnet RPC, `https://api.nearblocks.io` |
 
 URLs must be HTTPS (plain HTTP is accepted only for `localhost` / `127.0.0.1`).
 

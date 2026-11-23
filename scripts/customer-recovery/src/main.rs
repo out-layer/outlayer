@@ -81,7 +81,7 @@ struct Cli {
     vault_id: AccountId,
 
     /// Vault's FullAccess private key in `ed25519:base58` form.
-    #[arg(long, env = "VAULT_PRIVATE_KEY")]
+    #[arg(long, env = "VAULT_PRIVATE_KEY", hide_env_values = true)]
     signer_private_key: String,
 
     /// Derivation path the keystore used. Either pass it directly here
@@ -109,8 +109,8 @@ struct Cli {
     #[arg(long, default_value = "2")]
     mpc_domain_id: u64,
 
-    /// NEAR RPC URL.
-    #[arg(long, default_value = "https://rpc.testnet.fastnear.com")]
+    /// NEAR RPC URL. One that carries an API key goes in `RPC_URL`, not on the command line.
+    #[arg(long, env = "RPC_URL", hide_env_values = true, default_value = "https://rpc.testnet.fastnear.com")]
     rpc_url: String,
 
     /// NEARblocks-compatible API base for `--from-chain` lookup.

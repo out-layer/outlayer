@@ -322,10 +322,10 @@ echo "          (uses the customer-recovery binary built in step 0)"
 # from its own environment block.
 env VAULT_PRIVATE_KEY="$(jq -r '.private_key' "$KEY_FILE")" \
   MPC_PUBLIC_KEY="$MPC_PUBLIC_KEY" \
+  RPC_URL="$RPC_URL" \
   "$RECOVERY_BIN" \
     --vault-id "$VAULT_ID" \
     --from-chain \
-    --rpc-url "$RPC_URL" \
     --mpc-contract "$MPC_CONTRACT_ID" \
     --nearblocks-url "$NEARBLOCKS_URL"
 

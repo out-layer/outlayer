@@ -71,12 +71,9 @@
 #   signs via its keychain.
 #
 # ── NOT coordinator-reachable on testnet (documented) ────────────────────────────
-#   * V4's secret /call decrypt path requires a pre-deployed WASI project + a production payment key.
-#     The reachable subset (pubkey capture → pre-recovery decrypt-success → finalize → post-recovery
-#     decrypt-refusal → on-chain ciphertext re-derive == keystore pubkey + local decrypt) is gated on
-#     the V4-specific env (SECRET_PROJECT / SECRET_OWNER / SECRET_PROFILE / EXPECTED_SECRET_VALUE /
-#     SECRET_PAYMENT_KEY). Absent any of them V4 cleanly SKIP-notes — V3/V5 already prove the
-#     keystore-level cutoff via the same per-vault-master code path (wallet sign/derive).
+#   * V4 needs a project built from `wasi-examples/test-secrets-example` (SECRET_PROJECT; on testnet
+#     outlayer-alice.testnet/test-secrets) and a payment key of $PARENT (SECRET_PAYMENT_KEY). Without the
+#     key V4 cleanly SKIP-notes.
 #   * NEAR Intents (regular + confidential) are MAINNET-ONLY — not exercised here (this is a vault
 #     surface, not an intents surface); the sweep's intents-withdraw leg is a no-op off mainnet.
 #
@@ -84,8 +81,8 @@
 #   PARENT          vault owner, logged into outlayer-cli [creds in ~/.near-credentials/$NETWORK]
 #   MPC_PUBLIC_KEY  bls12381g2:base58 — REQUIRED to run V1–V5 (vault mode). Without it, V1–V5 SKIP.
 #   ONLY            optional comma list to run a subset, e.g. ONLY=V1,V3
-#   (V4 only)       SECRET_PROJECT=<owner>/<name>  SECRET_OWNER=<acct>  SECRET_PROFILE=<profile>
-#                   EXPECTED_SECRET_VALUE=<literal>  SECRET_PAYMENT_KEY=<X-Payment-Key>
+#   (V4 only)       SECRET_PAYMENT_KEY=<a payment key of PARENT>; SECRET_PROJECT=<owner>/<name>
+#                   (testnet defaults to outlayer-alice.testnet/test-secrets; no mainnet default)
 #   (V6 only)       CONNECTOR_PROJECT_ID=<owner>/<name> — a project that EXISTS on chain (testnet
 #                   defaults to connectors.outlayer.testnet/connector-probe; no mainnet default)
 #                   OUTLAYER_BIN=<path> — a CLI with `secrets set-for-agent`, if not on PATH
@@ -118,6 +115,8 @@ CONNECTOR_PROJECT_ID="${CONNECTOR_PROJECT_ID:-$([ "$NETWORK" = testnet ] && echo
 # V6 drives the real user path (`outlayer secrets set-for-agent`). Override to
 # run a build that is not on PATH.
 OUTLAYER_BIN="${OUTLAYER_BIN:-outlayer}"
+SECRET_PROJECT="${SECRET_PROJECT:-}"
+[[ -z "$SECRET_PROJECT" && "$NETWORK" == testnet ]] && SECRET_PROJECT="outlayer-alice.testnet/test-secrets"
 # Every `outlayer` call in this suite targets the network the suite is running
 # against. Left unset, the CLI reads ~/.outlayer/default-network — whatever the
 # operator last logged into, which on the paying paths decides which chain a
@@ -184,9 +183,9 @@ if [[ "$APPLY" != true ]]; then
   warn "VAULT suite (V1,V2,V3,V4,V5,V6) — ALL gated on MPC_PUBLIC_KEY (vault mode):"
   warn "       V1 multi-customer vault isolation: two scopes (vault.\$PARENT + vaultb.\$PARENT) → distinct addrs; X-Customer-Vault ignored[VAULT/POLICY]"
   warn "       V2 N wallets per one vault (vault.\$PARENT): distinct wallet_id+addr each; sub-agent inherits binding[VAULT/POLICY]"
-  warn "       V3 Bearer-near sovereign exit: derive 3 users → set 60s window → initiate → wait window → finalize_recovery → keystore REFUSES → MPC-CKD master recover → offline re-derive all 3 addrs MATCH[VAULT/POLICY]"
-  warn "       V4 detach secret-decrypt: pre-recovery decrypt → set 60s window → initiate → wait → finalize → post-recovery /call REFUSED → on-chain ciphertext re-derive + local decrypt == EXPECTED (gated on SECRET_* env)[VAULT/POLICY]"
-  warn "       V5 wk_-path sovereign exit: register wk_ → set 60s window → initiate → wait → finalize → keystore REFUSES → MPC-CKD re-derive same addr → REAL on-chain send-near by recovered key LANDS[VAULT/FUNDS]"
+  warn "       V3 Bearer-near sovereign exit: derive 3 users → 60s window → initiate → wait window → finalize_recovery → keystore REFUSES → MPC-CKD master recover → offline re-derive all 3 addrs MATCH[VAULT/POLICY]"
+  warn "       V4 detach secret-decrypt: read before → 60s window → initiate → wait → finalize → post-recovery /call REFUSED → local decrypt of the chain's ciphertext (gated on SECRET_PAYMENT_KEY)[VAULT/POLICY]"
+  warn "       V5 wk_-path sovereign exit: register wk_ → 60s window → initiate → wait → finalize → keystore REFUSES → MPC-CKD re-derive same addr → REAL on-chain send-near by recovered key LANDS[VAULT/FUNDS]"
   warn "       V6 a secret CREATED for an agent under the shared vault: key fetched under the agent's own auth + scope-specific → agent-pays store → an unfunded agent refused actionably → \$PARENT pays via store_agent_secret → vault/audience/ciphertext/name/payer each altered and REFUSED, untouched call lands[VAULT/FUNDS]"
   warn "Without MPC_PUBLIC_KEY (default-vault mode) V1–V6 are SKIP-noted (no per-vault to deploy)."
   warn "V6 COST: 0.3 NEAR funding one agent wallet + three 0.1 NEAR storage deposits that only the agent itself could reclaim — the suite does not."
@@ -705,6 +704,18 @@ deploy_throwaway_vault() {
   echo "$id"
 }
 
+# recover_master <vault_id> <new-parent-private-key> <label> → MASTER (empty on failure): the per-vault
+# master through MPC CKD. The key and the keyed RPC go through the environment, and the tool's output —
+# which holds the master — is never shown: a failed run leaves it in a 0600 file.
+recover_master() {
+  local out rc=0; out=$(mktemp -t vault_recover.XXXXXX); chmod 600 "$out"; MASTER=""
+  VAULT_PRIVATE_KEY="$2" RPC_URL="$RPC_URL" "$RECOVERY_BIN" --vault-id "$1" --from-chain \
+    --mpc-contract "$MPC_CONTRACT_ID" --nearblocks-url "$NEARBLOCKS_URL" >"$out" 2>&1 || rc=$?
+  [[ $rc -eq 0 ]] && MASTER=$(grep -oE '^master_hex=[0-9a-f]{64}$' "$out" | cut -d= -f2)
+  if [[ -n "$MASTER" ]]; then rm -f -- "$out"; pass "$3 per-vault master recovered locally (64 hex chars)"
+  else fail "$3 customer-recovery gave no master (rc=$rc; its output is in $out, mode 0600)"; return 1; fi
+}
+
 # mk_token_v <seed> <vault_id|''> → Bearer-near token under an ARBITRARY vault scope (mk_token always
 # uses the shared VAULT_ID; the isolation/recovery tests need tokens under their own throwaway vaults).
 mk_token_v() { local v=(); [[ -n "${2:-}" ]] && v=(--vault-id "$2"); CUSTOMER_RECOVERY_PRIVATE_KEY="$PARENT_PRIVKEY" "$RECOVERY_BIN" sign-bearer-near --account-id "$PARENT" --seed "$1" ${v[@]+"${v[@]}"}; }
@@ -1006,24 +1017,16 @@ if want V3; then
         # OFFLINE (compute-wallet-id → derive-wallet-key) and assert the offline near_address MATCHES the
         # keystore's pre-recovery address. The tipbot value-prop: leave OutLayer, recover all users.
         log "V3d recover per-vault master via MPC CKD (new parent key) + offline re-derive all 3 users"
-        V3_REC_RC=0
-        V3_REC_OUT=$(VAULT_PRIVATE_KEY="$V3_NEWPRIV" "$RECOVERY_BIN" --vault-id "$V3_VAULT" --from-chain \
-          --rpc-url "$RPC_URL" --mpc-contract "$MPC_CONTRACT_ID" --nearblocks-url "$NEARBLOCKS_URL" 2>&1) || V3_REC_RC=$?
-        echo "$V3_REC_OUT" >&2
-        [[ $V3_REC_RC -eq 0 ]] || fail "V3d customer-recovery exited $V3_REC_RC"
-        V3_MASTER=$(echo "$V3_REC_OUT" | awk -F= '/^master_hex=/{print $2; exit}')
-        if [[ -n "$V3_MASTER" && ${#V3_MASTER} -eq 64 ]]; then
-          pass "V3d per-vault master recovered locally (64 hex chars)"
+        if recover_master "$V3_VAULT" "$V3_NEWPRIV" "V3d"; then
           v3derok=true
           for i in 0 1 2; do
             WID=$("$RECOVERY_BIN" compute-wallet-id --account-id "$PARENT" --seed "${V3_SEEDS[$i]}" --vault-id "$V3_VAULT")
-            DERA=$("$RECOVERY_BIN" derive-wallet-key --master "$V3_MASTER" --wallet-id "$WID" | jq -r '.near_address')
+            DERA=$(CUSTOMER_RECOVERY_MASTER="$MASTER" "$RECOVERY_BIN" derive-wallet-key --wallet-id "$WID" | jq -r '.near_address')
             note "V3d user $((i+1)): offline=$DERA keystore=${V3_ADDRS[$i]}"
             [[ "$DERA" == "${V3_ADDRS[$i]}" ]] || { fail "V3d user $((i+1)) DERIVATION MISMATCH: offline=$DERA vs keystore=${V3_ADDRS[$i]}"; v3derok=false; }
           done
           [[ "$v3derok" == true ]] && pass "V3d ALL 3 users re-derived offline; addresses match the keystore exactly — sovereign exit proven"
-        else
-          fail "V3d no master_hex (got '${V3_MASTER:0:16}', len ${#V3_MASTER})"
+          MASTER=""
         fi
       fi
     fi
@@ -1038,48 +1041,48 @@ fi
 #       THROWAWAY vault it RETIRES. Asserts:
 #         4a  PRE-RECOVERY: capture the keystore encryption pubkey for (project, vault) via
 #             /secrets/pubkey (only possible while locked — the cryptographic ground truth); and a
-#             /call decrypt returns the EXPECTED secret value (keystore decrypts via per-vault master);
+#             /call returns the secret's value (keystore decrypts via per-vault master);
 #         4b  finalize_recovery flips vault.unlocked == true;
-#         4c  POST-RECOVERY: the same /call must FAIL to return the secret value (server-side cutoff);
-#         4d  recover master via MPC CKD; fetch the on-chain ciphertext (get_secrets view); locally
-#             decrypt-secret with (master, seed) → plaintext == EXPECTED_SECRET_VALUE — proving the
-#             derivation chain matches the keystore's encrypt side.
-#       GATED on V4-specific env (SECRET_PROJECT/SECRET_OWNER/SECRET_PROFILE/EXPECTED_SECRET_VALUE/
-#       SECRET_PAYMENT_KEY) being set AND a pre-deployed WASI project. Absent any of them V4 cleanly
-#       SKIP-notes — V3/V5 already cover the keystore-level cutoff via the wallet sign/derive path,
-#       which shares the same per-vault-master code. The local chacha_key-vs-pubkey comparison the
-#       source notes is un-portable (derive-wallet-key uses a wallet seed shape, not the secrets seed
-#       shape), so the reachable proof is the decrypt round-trip in 4d.
+#         4c  the same /call is refused with 423 naming the unlocked vault; a call without the secret runs;
+#         4d  recover master via MPC CKD and decrypt the on-chain ciphertext with it: the value is the one
+#             stored, and another master does not open it.
+#       The project is `wasi-examples/test-secrets-example` (it reports the value of SECRET).
 # ════════════════════════════════════════════════════════════════════════════════
 if want V4; then
   if [[ "$VAULT_MODE" != true ]]; then
     note "V4 SKIPPED (vault mode off): secret detach needs a DEPLOYED vault + per-vault-master secret — set MPC_PUBLIC_KEY"
-  elif [[ -z "${SECRET_PROJECT:-}" || -z "${SECRET_OWNER:-}" || -z "${SECRET_PROFILE:-}" || -z "${EXPECTED_SECRET_VALUE:-}" || -z "${SECRET_PAYMENT_KEY:-}" ]]; then
-    note "V4 SKIPPED — needs SECRET_PROJECT + SECRET_OWNER + SECRET_PROFILE + EXPECTED_SECRET_VALUE + SECRET_PAYMENT_KEY (a pre-deployed WASI project + payment key). The keystore-level cutoff is covered by V3/V5."
+  elif [[ -z "$SECRET_PROJECT" || -z "${SECRET_PAYMENT_KEY:-}" ]]; then
+    note "V4 SKIPPED — needs SECRET_PAYMENT_KEY, a payment key of $PARENT (and SECRET_PROJECT off testnet)"
   else
-    log "V4 [VAULT/POLICY] detach secret-decrypt — FULL single-run (pre-recovery decrypt → 60s window → finalize → /call refused → on-chain ciphertext re-derive + local decrypt match) (project=$SECRET_PROJECT)"
+    log "V4 [VAULT/POLICY] detach secret-decrypt — FULL single-run (read before → 60s window → finalize → /call refused → local decrypt of the chain's ciphertext) (project=$SECRET_PROJECT)"
     warn "V4 finalize_recovery is IRREVERSIBLE — it RETIRES this throwaway vault (unlocked, OutLayer-side TEE keys deleted). NEVER pointed at vault.\$PARENT (uses v4v.\$PARENT)."
+    V4_PROFILE="v4-$RUN_TAG"; V4_VALUE="v4-$(openssl rand -hex 8)"
+    V4_ROW=$(jq -nc --arg pid "$SECRET_PROJECT" --arg o "$PARENT" --arg f "$V4_PROFILE" '{accessor:{Project:{project_id:$pid}}, profile:$f, owner:$o}')
+    # v4_call secret|control → V4_H, V4_B. `secret` names the row, `control` runs without one. A call the
+    # queue did not answer in time says nothing either way: it is asked again.
+    v4_call() {
+      local body='{"input":{"message":"v4"},"async":false}' raw t
+      [[ "$1" == secret ]] && body=$(jq -c --arg o "$PARENT" --arg f "$V4_PROFILE" '. + {secrets_ref:{account_id:$o, profile:$f}}' <<<"$body")
+      for t in 1 2 3 4; do
+        raw=$(curl -sS --max-time 95 -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/call/$SECRET_PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $SECRET_PAYMENT_KEY") -H 'Content-Type: application/json' --data-binary "$body" 2>/dev/null) || true
+        V4_H=${raw##*HTTP:}; V4_B=${raw%$'\n'HTTP:*}
+        case "$V4_H" in 000|52?) note "V4 no answer to a call (HTTP $V4_H, try $t/4)";; *) return 0;; esac
+      done
+    }
+    v4_value() { jq -r '(.output | if type=="string" then fromjson else . end) | .secrets[]? | select(.key=="SECRET") | .value // empty' <<<"$V4_B" 2>/dev/null; }
     # Distinct VALID subaccount name (v4v.$PARENT); --apply-gated, deploy/reuse, born with a 60s window.
     V4_VAULT=$(deploy_throwaway_vault "v4v$RUN_TAG" 60s) || fail "V4 deploy vault"
     if [[ -n "${V4_VAULT:-}" ]]; then
       THROWAWAY_VAULTS+=("$V4_VAULT")
       pass "V4 throwaway vault $V4_VAULT deployed"
 
-      # 4a: capture keystore encryption pubkey (PRE-RECOVERY ground truth) + store a vault-bound secret + pre-recovery /call.
-      # Bind a fresh secret to THIS throwaway vault under SECRET_PROFILE so the decrypt path uses V4_VAULT's master.
-      log "V4a store secret MY_TEST_SECRET (profile=$SECRET_PROFILE, vault=$V4_VAULT) under $SECRET_PROJECT"
-      outlayer secrets set --project "$SECRET_PROJECT" --profile "$SECRET_PROFILE" --vault-id "$V4_VAULT" \
-        "$(jq -nc --arg v "$EXPECTED_SECRET_VALUE" '{MY_TEST_SECRET:$v}')" >&2 || fail "V4a outlayer secrets set failed"
-      PK_RESP=$(curl -sS -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/secrets/pubkey" -H 'Content-Type: application/json' -H "X-Customer-Vault: $V4_VAULT" \
-        -d "$(jq -nc --arg pid "$SECRET_PROJECT" --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{accessor:{type:"Project", project_id:$pid}, owner:$owner, profile:$profile, secrets_json:"{\"X\":\"\"}"}')")
-      PK_H=$(echo "$PK_RESP" | tail -1 | sed 's/HTTP://'); PK_B=$(echo "$PK_RESP" | sed '$d')
-      KEYSTORE_PUBKEY=$(echo "$PK_B" | jq -r '.pubkey // empty')
-      [[ "$PK_H" == "200" && -n "$KEYSTORE_PUBKEY" && "$KEYSTORE_PUBKEY" != "null" ]] && pass "V4a keystore encryption pubkey captured: $KEYSTORE_PUBKEY" || fail "V4a /secrets/pubkey failed (HTTP $PK_H): $(echo "$PK_B" | head -c160)"
-      log "V4a PRE-RECOVERY /call/$SECRET_PROJECT (expect '$EXPECTED_SECRET_VALUE')"
-      PRE_CALL=$(curl -sS --max-time 90 -X POST "$COORDINATOR_URL/call/$SECRET_PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $SECRET_PAYMENT_KEY") -H 'Content-Type: application/json' \
-        -d "$(jq -nc --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{input:{command:"get_secret", keys:["MY_TEST_SECRET"]}, secrets_ref:{account_id:$owner, profile:$profile}, async:false}')" 2>&1 || echo '')
-      echo "$PRE_CALL" | head -10 >&2
-      if echo "$PRE_CALL" | grep -qF "\"value\":\"$EXPECTED_SECRET_VALUE\""; then pass "V4a /call returned the expected secret pre-recovery — keystore can decrypt"; else fail "V4a /call did not return MY_TEST_SECRET=$EXPECTED_SECRET_VALUE pre-recovery: $(echo "$PRE_CALL" | head -c200)"; fi
+      # 4a: a secret bound to THIS vault, read by a run while the vault is served.
+      log "V4a store a secret (profile=$V4_PROFILE, vault=$V4_VAULT) under $SECRET_PROJECT"
+      outlayer secrets set --project "$SECRET_PROJECT" --profile "$V4_PROFILE" --vault-id "$V4_VAULT" \
+        "$(jq -nc --arg v "$V4_VALUE" '{SECRET:$v}')" >&2 || fail "V4a outlayer secrets set failed"
+      v4_call secret
+      [[ "$V4_H" == 200 && "$(v4_value)" == "$V4_VALUE" ]] && pass "V4a before the exit the run reads the secret" \
+        || fail "V4a before the exit the run did not read the secret (HTTP $V4_H): $(jq -r '.error // .message // .status // empty' <<<"$V4_B" 2>/dev/null | head -c160)"
 
       # 4b: initiate on the vault's 60s window → assert in-flight → wait window → finalize.
       log "V4 initiate unilateral recovery"
@@ -1091,52 +1094,32 @@ if want V4; then
       [[ -n "$V4_NEWPUB" && -n "$V4_NEWPRIV" ]] || fail "V4 generate-key produced no keypair"
       finalize_and_assert_unlocked "$V4_VAULT" "$V4_NEWPUB" "V4b" || true
 
-      # 4c: POST-RECOVERY the same /call must FAIL to return the secret value (server-side cutoff — the
-      # keystore can no longer decrypt via the per-vault master once unlocked == true).
-      log "V4c POST-RECOVERY /call/$SECRET_PROJECT (expect refusal / no secret)"
-      POST_CALL_OUT=$(curl -sS --max-time 90 -w '\nHTTP:%{http_code}' -X POST "$COORDINATOR_URL/call/$SECRET_PROJECT" -H @<(printf '%s\n' "X-Payment-Key: $SECRET_PAYMENT_KEY") -H 'Content-Type: application/json' \
-        -d "$(jq -nc --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{input:{command:"get_secret", keys:["MY_TEST_SECRET"]}, secrets_ref:{account_id:$owner, profile:$profile}, async:false}')" 2>&1 || echo '')
-      POST_CALL_H=$(echo "$POST_CALL_OUT" | tail -1 | sed 's/HTTP://'); POST_CALL_B=$(echo "$POST_CALL_OUT" | sed '$d')
-      echo "$POST_CALL_B" | head -10 >&2
-      if echo "$POST_CALL_B" | grep -qF "\"value\":\"$EXPECTED_SECRET_VALUE\""; then
-        fail "V4c POST-RECOVERY /call STILL returned the secret value — server-side secret cutoff is broken"
-      fi
-      pass "V4c /call refused to return the secret post-recovery (HTTP $POST_CALL_H) — secret cutoff confirmed"
+      # 4c: the same call is refused, and says why; a call without the secret still runs, so the refusal is
+      # the vault's and not the project's or the key's.
+      v4_call secret
+      if grep -qF "$V4_VALUE" <<<"$V4_B"; then fail "V4c after the exit /call STILL returned the secret value"
+      elif [[ "$V4_H" == 423 ]] && grep -qF "Vault $V4_VAULT is unlocked" <<<"$V4_B"; then pass "V4c after the exit /call is refused (HTTP 423), naming the unlocked vault"
+      else fail "V4c after the exit: expected 423 naming the unlocked vault, got HTTP $V4_H: $(jq -r '.error // .message // .status // empty' <<<"$V4_B" 2>/dev/null | head -c160)"; fi
+      v4_call control
+      [[ "$V4_H" == 200 && "$(jq -r '.status // empty' <<<"$V4_B" 2>/dev/null)" == completed ]] && pass "V4c a call without the secret still runs" \
+        || fail "V4c a call without the secret: HTTP $V4_H"
 
-      # 4d: recover master via MPC CKD; fetch on-chain ciphertext (get_secrets view); locally decrypt with
-      # (master, seed) → plaintext == EXPECTED_SECRET_VALUE. Proves the local derivation chain matches the
-      # keystore's encrypt side. Seed shape mirrors keystore-worker for Project accessors.
-      SECRET_SEED="project:${SECRET_PROJECT}:${SECRET_OWNER}"
-      log "V4d recover per-vault master via MPC CKD + read on-chain ciphertext + local decrypt (seed=$SECRET_SEED)"
-      V4_REC_RC=0
-      V4_REC_OUT=$(VAULT_PRIVATE_KEY="$V4_NEWPRIV" "$RECOVERY_BIN" --vault-id "$V4_VAULT" --from-chain \
-        --rpc-url "$RPC_URL" --mpc-contract "$MPC_CONTRACT_ID" --nearblocks-url "$NEARBLOCKS_URL" 2>&1) || V4_REC_RC=$?
-      echo "$V4_REC_OUT" >&2
-      [[ $V4_REC_RC -eq 0 ]] || fail "V4d customer-recovery exited $V4_REC_RC"
-      V4_MASTER=$(echo "$V4_REC_OUT" | awk -F= '/^master_hex=/{print $2; exit}')
-      if [[ -n "$V4_MASTER" && ${#V4_MASTER} -eq 64 ]]; then
-        pass "V4d per-vault master recovered locally (64 hex chars)"
-        # Fetch the encrypted ciphertext from the contract via get_secrets (accessor enum: {Project:{project_id}}).
-        GET_ARGS=$(jq -nc --arg pid "$SECRET_PROJECT" --arg owner "$SECRET_OWNER" --arg profile "$SECRET_PROFILE" '{accessor:{Project:{project_id:$pid}}, profile:$profile, owner:$owner}')
-        GET_ARGS_B64=$(printf '%s' "$GET_ARGS" | base64 | tr -d '\n')
-        SECRETS_VIEW=$(curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
-          -d "$(jq -nc --arg a "$CONTRACT_ID" --arg ab "$GET_ARGS_B64" '{jsonrpc:"2.0",id:1,method:"query",params:{request_type:"call_function",finality:"final",account_id:$a,method_name:"get_secrets",args_base64:$ab}}')")
-        ENCRYPTED_B64=$(echo "$SECRETS_VIEW" | jq -r '.result.result | implode' 2>/dev/null | jq -r '.encrypted_secrets // empty' 2>/dev/null)
-        if [[ -n "$ENCRYPTED_B64" && "$ENCRYPTED_B64" != "null" ]]; then
-          pass "V4d fetched on-chain ciphertext (${#ENCRYPTED_B64} chars base64)"
-        else
-          fail "V4d get_secrets returned no encrypted_secrets: $(echo "$SECRETS_VIEW" | head -c200)"
-        fi
-        V4_DEC_RC=0
-        V4_DECRYPTED=$("$RECOVERY_BIN" decrypt-secret --master "$V4_MASTER" --seed "$SECRET_SEED" --ciphertext-base64 "$ENCRYPTED_B64" 2>&1) || V4_DEC_RC=$?
-        echo "V4d decrypt output: $V4_DECRYPTED" >&2
-        [[ $V4_DEC_RC -eq 0 ]] || fail "V4d local decrypt failed (rc=$V4_DEC_RC) — derivation chain gap. keystore_pubkey=$KEYSTORE_PUBKEY master=$V4_MASTER seed=$SECRET_SEED"
-        V4_DEC_VALUE=$(echo "$V4_DECRYPTED" | jq -r '.MY_TEST_SECRET // empty' 2>/dev/null || echo "")
-        [[ "$V4_DEC_VALUE" == "$EXPECTED_SECRET_VALUE" ]] && pass "V4d local decryption matches: MY_TEST_SECRET='$V4_DEC_VALUE' — full sovereignty over secrets confirmed" \
-          || fail "V4d decrypt mismatch: expected '$EXPECTED_SECRET_VALUE', got '$V4_DEC_VALUE'"
-      else
-        fail "V4d no master_hex (got '${V4_MASTER:0:16}', len ${#V4_MASTER})"
+      # 4d: recover master via MPC CKD; decrypt the chain's ciphertext locally. Seed shape mirrors
+      # keystore-worker for Project accessors. Another master must not open it.
+      if recover_master "$V4_VAULT" "$V4_NEWPRIV" "V4d"; then
+        V4_CIPHER=$(curl -s "$RPC_URL" -X POST -H 'Content-Type: application/json' \
+          -d "$(jq -nc --arg a "$CONTRACT_ID" --arg g "$(printf '%s' "$V4_ROW" | base64 | tr -d '\n')" '{jsonrpc:"2.0",id:1,method:"query",params:{request_type:"call_function",finality:"final",account_id:$a,method_name:"get_secrets",args_base64:$g}}')" \
+          | jq -r '.result.result | implode' 2>/dev/null | jq -r '.encrypted_secrets // empty' 2>/dev/null)
+        v4_open() { CUSTOMER_RECOVERY_MASTER="$1" "$RECOVERY_BIN" decrypt-secret --seed "project:$SECRET_PROJECT:$PARENT" --ciphertext-base64 "$V4_CIPHER" 2>/dev/null | jq -r '.SECRET // empty' 2>/dev/null; }
+        if [[ -n "$V4_CIPHER" && "$(v4_open "$MASTER")" == "$V4_VALUE" ]]; then
+          pass "V4d the recovered master decrypts the chain's ciphertext"
+          [[ "$(v4_open "$(openssl rand -hex 32)")" != "$V4_VALUE" ]] && pass "V4d another master does not" || fail "V4d another master decrypts it"
+        else fail "V4d the recovered master does not decrypt the chain's ciphertext (${#V4_CIPHER} chars)"; fi
+        MASTER=""
       fi
+      V4_NEWPRIV=""; V4_KEY=""
+      outlayer secrets delete --project "$SECRET_PROJECT" --profile "$V4_PROFILE" >/dev/null 2>&1 \
+        || warn "V4 the secret row (profile $V4_PROFILE) was not deleted: its storage deposit stays"
     fi
   fi
 fi
@@ -1205,22 +1188,19 @@ if want V5; then
       # 5d: MPC-CKD recover master → derive-wallet-key (uses the /register wallet_id directly) → assert the
       # derived near_address == the keystore's near_account_id → REAL send-near signed by the LOCAL key.
       log "V5d recover per-vault master via MPC CKD + re-derive wallet key + sovereign on-chain tx"
-      V5_REC_RC=0
-      V5_REC_OUT=$(VAULT_PRIVATE_KEY="$V5_NEWPRIV" "$RECOVERY_BIN" --vault-id "$V5_VAULT" --from-chain \
-        --rpc-url "$RPC_URL" --mpc-contract "$MPC_CONTRACT_ID" --nearblocks-url "$NEARBLOCKS_URL" 2>&1) || V5_REC_RC=$?
-      echo "$V5_REC_OUT" >&2
-      [[ $V5_REC_RC -eq 0 ]] || fail "V5d customer-recovery exited $V5_REC_RC"
-      V5_MASTER=$(echo "$V5_REC_OUT" | awk -F= '/^master_hex=/{print $2; exit}')
-      if [[ -n "$V5_MASTER" && ${#V5_MASTER} -eq 64 ]]; then
-        pass "V5d per-vault master recovered locally (64 hex chars)"
-        V5_DERIVED=$("$RECOVERY_BIN" derive-wallet-key --master "$V5_MASTER" --wallet-id "$V5_WID")
-        V5_DER_ADDR=$(echo "$V5_DERIVED" | jq -r '.near_address'); V5_DER_PRIV=$(echo "$V5_DERIVED" | jq -r '.private_key')
+      if recover_master "$V5_VAULT" "$V5_NEWPRIV" "V5d"; then
+        V5_DERIVED=$(CUSTOMER_RECOVERY_MASTER="$MASTER" "$RECOVERY_BIN" derive-wallet-key --wallet-id "$V5_WID"); MASTER=""
+        V5_DER_ADDR=$(echo "$V5_DERIVED" | jq -r '.near_address')
+        # near-cli signs with the derived key from a 0600 key file, never from its command line. The file is
+        # removed once the wallet is drained; a failure before that leaves it as the way to the funds.
+        V5_KEY_FILE="$CREDS_DIR/$V5_ADDR.json"
+        ( umask 077; jq -c --arg a "$V5_ADDR" '{account_id:$a, public_key, private_key}' <<<"$V5_DERIVED" > "$V5_KEY_FILE" ); V5_DERIVED=""
         [[ "$V5_DER_ADDR" == "$V5_ADDR" ]] && pass "V5d local derivation matches keystore: $V5_DER_ADDR" \
           || fail "V5d DERIVATION MISMATCH: local=$V5_DER_ADDR vs keystore=$V5_ADDR"
 
         # 5d-fund: NOW the derived key is in hand — fund the wallet 0.05 NEAR so the sovereign tx has gas
         # (covers the 0.001 send + fees + the final delete-account reclaim). MONEY=true from here: a failure
-        # mid-flight halts the suite, and the wallet is recoverable via the just-derived key ($V5_DER_PRIV).
+        # mid-flight halts the suite, and the wallet is recoverable via the just-derived key ($V5_KEY_FILE).
         MONEY=true
         log "V5d fund the wallet ($V5_ADDR) with 0.05 NEAR from $PARENT (for the sovereign tx + reclaim)"
         fund_near "$V5_ADDR" "0.05 NEAR" || fail "V5d funding the wallet from $PARENT failed"
@@ -1234,18 +1214,16 @@ if want V5; then
         # outlayer vault send-near subcommand exists — use `near tokens send-near` via near_tty, exactly
         # like the legacy sovereignty_e2e.sh proof).
         log "V5d SOVEREIGN TX — locally-derived key signs send-near 0.001 NEAR → $PARENT"
-        near_tty "near tokens \"$V5_ADDR\" send-near \"$PARENT\" '0.001 NEAR' network-config \"$NETWORK\" sign-with-plaintext-private-key '$V5_DER_PRIV' send" \
+        near_tty "near tokens \"$V5_ADDR\" send-near \"$PARENT\" '0.001 NEAR' network-config \"$NETWORK\" sign-with-legacy-keychain send" \
           || fail "V5d sovereign send-near with the locally-derived key failed — the wallet is NOT recoverable end-to-end"
         pass "V5d sovereign tx landed — wallet $V5_ADDR is controlled by the customer-held key, independent of OutLayer"
 
         # 5d-reclaim: drain the funded wallet back to BENEFICIARY with the RECOVERED key (leak-free cleanup;
         # also a second proof the local key has full authority). The keystore can't do this post-finalize.
         log "V5d reclaim — delete the funded wallet to $BENEFICIARY using the recovered key (no leak)"
-        near_tty "near account delete-account \"$V5_ADDR\" beneficiary \"$BENEFICIARY\" network-config \"$NETWORK\" sign-with-plaintext-private-key '$V5_DER_PRIV' send" \
-          || warn "V5d delete-account reclaim failed — $V5_ADDR may retain residual NEAR (recover via the recovered key)"
+        if near_tty "near account delete-account \"$V5_ADDR\" beneficiary \"$BENEFICIARY\" network-config \"$NETWORK\" sign-with-legacy-keychain send"; then rm -f -- "${V5_KEY_FILE:?}"
+        else warn "V5d delete-account reclaim failed — $V5_ADDR may retain residual NEAR (its key: $V5_KEY_FILE)"; fi
         MONEY=false; CUR_TEST=""
-      else
-        fail "V5d no master_hex (got '${V5_MASTER:0:16}', len ${#V5_MASTER})"
       fi
     fi
   else
