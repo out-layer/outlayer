@@ -70,6 +70,7 @@ Network is the suite's default; most take `NETWORK` / `COORDINATOR_URL`.
 | `unified_vault_e2e.sh` — vault isolation, sovereign exit, secret decrypt before/after recovery (V1–V6) | testnet |
 | `wallet_confidential_e2e.sh` — confidential intents deep-dive | **mainnet, real funds** |
 | `route_gaps_e2e.sh` — withdraw and swap routes, dry and quoted only | mainnet, moves nothing |
+| `withdraw_terms_e2e.sh` — how a withdrawal and a swap are sized (exact input, floor, exact output), the quote's figures, `memo` and unknown fields refused | mainnet; pays nothing unless `TERMS_MONEY=1`: previews, and real calls that must be refused before signing — each sized for the day a refusal breaks (its header names what would move), with the balance checked at the end |
 | `money_settlement_step{1,2,3}_e2e.sh` — settlement after a coordinator release | **mainnet, real funds** |
 | `approval_flow_wk_e2e.sh`, `approval_votes_e2e.sh`, `contract_wallet_votes_e2e.sh`, `full_access_key_e2e.sh` — who may approve, and with which key | testnet |
 | `velocity_accounting_e2e.sh`, `velocity_two_doors_e2e.sh`, `wallet_concurrent_spend_e2e.sh`, `custody_limit_e2e.sh` — limits and counters | testnet |
