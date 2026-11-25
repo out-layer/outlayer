@@ -4971,9 +4971,8 @@ fn is_trusted_recipient(recipient: &str) -> bool {
 ///
 /// A NEP-413 signature by an account's key over such a recipient IS that account's
 /// offchain authorization: of its own account with no path, and with a path — as an
-/// extension of every account named after it. A wallet bound to its owner's account through
-/// Agent Connect would sign as that account, off chain, where the fence on
-/// `w_execute_extension` sees nothing. `sign_message` never signs one; no policy opens it.
+/// extension of every account named after it. `sign_message` never signs one; no policy
+/// opens it.
 ///
 /// Read more loosely than the outline is written, and not as a resolver would parse it:
 /// * a `:` before a last `" @ "` with anything after it — what sits between and around the
@@ -5115,49 +5114,6 @@ fn refuse_owner_scope(customer: Option<&crate::crypto::Customer>) -> Result<(), 
         )),
         _ => Ok(()),
     }
-}
-
-/// SECURITY: a wallet whose master leaves with an exit acts through Agent Connect only on
-/// the account that master leaves to.
-///
-/// A `w_execute_extension` makes its receiver — the account the wallet is bound to — act
-/// on whatever the request says; the wallet's NEAR key is that account's executor. The
-/// wallet of an owner path or a vault has that key derived from a master handed out on
-/// exit: the owner's to the owner account, the vault's to `vault.parent` (`principal`,
-/// what [`AppState::ensure_customer_loaded`] returned). On any other account the exit
-/// would carry that account with it, past every rule signed here. So the receiver must be
-/// the principal, whatever the policy and whatever binding the coordinator recorded; a
-/// vault whose state names no parent acts on no account. A wallet under the default
-/// master, whose keys never leave, is not judged here.
-///
-/// The reason is returned rather than an error: the signing path answers it as a 403, the
-/// pre-flight as `allowed: false`, in the same words.
-fn extension_beyond_principal(
-    customer: Option<&crate::crypto::Customer>,
-    principal: Option<&near_primitives::types::AccountId>,
-    op: &shared_tee_helpers::wallet_policy::Op,
-) -> Option<String> {
-    let shared_tee_helpers::wallet_policy::Op::Call { to, method, .. } = op else {
-        return None;
-    };
-    if method != "w_execute_extension" {
-        return None;
-    }
-    let leaves_to = match (customer?, principal) {
-        (_, Some(p)) if p.as_str() == to.as_str() => return None,
-        (crate::crypto::Customer::Owner { account, .. }, _) => format!("its owner's exit, to '{account}'"),
-        (crate::crypto::Customer::Vault(vault), Some(p)) => {
-            format!("the exit of vault '{vault}', to its parent '{p}'")
-        }
-        (crate::crypto::Customer::Vault(vault), None) => {
-            format!("the exit of vault '{vault}', whose state names no parent")
-        }
-    };
-    Some(format!(
-        "A wallet whose keys leave with an exit acts through w_execute_extension only on the \
-         account they leave to. This wallet's keys leave with {leaves_to}: '{to}' is not that \
-         account"
-    ))
 }
 
 /// A raw NEAR signature for a wallet whose keys leave with an exit: refused.
@@ -5963,13 +5919,11 @@ async fn wallet_sign_handler(
         ));
     }
     let customer = extract_customer_from_header(&headers)?;
-    let principal = state
+    state
         .ensure_customer_loaded(customer.as_ref())
         .await
         .map_err(ApiError::from_customer_load)?;
-    if let Some(reason) = extension_beyond_principal(customer.as_ref(), principal.as_ref(), &req.op)
-        .or_else(|| raw_near_in_exit_scope(customer.as_ref(), &req.op))
-    {
+    if let Some(reason) = raw_near_in_exit_scope(customer.as_ref(), &req.op) {
         return Err(ApiError::Forbidden(reason));
     }
 
@@ -5977,32 +5931,15 @@ async fn wallet_sign_handler(
     // from the coordinator. Approver signatures must cover exactly this.
     let request_hash = wallet_policy::request_hash(&req.op);
 
-    // K8: the nested request of `w_execute_extension` is parsed by a decoder
-    // chosen in THIS image. If the account moved to a schema this build has no
-    // decoder for, the parse would still succeed and mean something else — so
-    // the policy below would be enforced against effects that are not the
-    // request's. Refuse before that can happen, and before the key is touched.
-    if let shared_tee_helpers::wallet_policy::Op::Call { method, .. } = &req.op {
-        if let Err(reason) = shared_tee_helpers::binding::signing_version_gate(
-            method,
-            req.binding_kind.as_deref(),
-            req.decoder_version,
-        ) {
-            return Err(ApiError::Forbidden(reason));
-        }
-    }
-
     // 1. Evaluate the on-chain policy. The keystore enforces the STATELESS subset
     //    (usage = None); the coordinator enforces stateful velocity. No policy on-chain
     //    → single-sig wallet → the owner's rules are empty.
     //
     //    Evaluated even then, because a few of the engine's rules are not the
-    //    owner's to relax. `w_execute_extension` is the one that matters: it
-    //    denies account-CONTROL operations (`add_extension` hands a stranger
-    //    the whole lane) and anything whose effects cannot be stated. Those
-    //    hold for every wallet — and a wallet with no policy is the state every
-    //    wallet is in right after registration, so gating them behind "has a
-    //    policy" would leave the default open.
+    //    owner's to relax: a call to the wallet contract's extension method, to
+    //    the keystore DAO or to the intents contract. Those hold for every
+    //    wallet, and a wallet with no policy is the state every wallet is in
+    //    right after registration.
     //
     //    What it is evaluated AGAINST is `policy_to_judge_by`, not an empty
     //    policy: rules, the approval block and `frozen` are all inert when
@@ -6484,7 +6421,7 @@ async fn sign_hash_pinned(
                 return Err(ApiError::Forbidden(format!(
                     "sign_message recipient '{}' has the form of a NEP-641 offchain authorization \
                      (\"<chain>: <account>[ -> <account>][ @ <time>]\"); this wallet does not sign \
-                     authorizations for its own or a bound account",
+                     authorizations for its own or another account",
                     recipient
                 )));
             }
@@ -6636,9 +6573,9 @@ async fn sign_trusted(
 /// not do.
 ///
 /// An absent policy is still EVALUATED rather than short-circuited to `Allow`,
-/// because one rule is not the owner's to relax: `w_execute_extension` denies
-/// account-control operations and effects that cannot be stated, on every
-/// wallet. The capabilities named below do not touch it.
+/// because some rules are not the owner's to relax (a call to the wallet
+/// contract's extension method, to the keystore DAO, to the intents contract).
+/// The capabilities named below do not touch them.
 ///
 /// Both doors go through here so the substitution is made once and can be
 /// tested once.
@@ -6707,7 +6644,7 @@ async fn wallet_check_policy_handler(
     }
     validate_wallet_id(&req.wallet_id)?;
     let customer = extract_customer_from_header(&headers)?;
-    let principal = state
+    state
         .ensure_customer_loaded(customer.as_ref())
         .await
         .map_err(ApiError::from_customer_load)?;
@@ -6716,9 +6653,7 @@ async fn wallet_check_policy_handler(
 
     // The signing path's own refusal, answered the same way here: a pre-flight that said
     // "allowed" would mint an approval nobody can sign.
-    if let Some(reason) = extension_beyond_principal(customer.as_ref(), principal.as_ref(), &req.op)
-        .or_else(|| raw_near_in_exit_scope(customer.as_ref(), &req.op))
-    {
+    if let Some(reason) = raw_near_in_exit_scope(customer.as_ref(), &req.op) {
         return Ok(Json(WalletCheckPolicyResponse {
             allowed: false,
             frozen: false,
@@ -6762,11 +6697,10 @@ async fn wallet_check_policy_handler(
     };
 
     // No policy on-chain → judged by the stand-in (`policy_to_judge_by`), not a
-    // short-circuit to "allowed": `w_execute_extension` is denied for
-    // account-control operations and for effects that cannot be stated,
-    // whatever the owner did or did not configure. Returning early here would
-    // also let the pre-flight answer "allowed" for a request the signing path
-    // then refuses, which is exactly the split this endpoint exists to avoid.
+    // short-circuit to "allowed": some refusals hold whatever the owner did or
+    // did not configure. Returning early here would also let the pre-flight
+    // answer "allowed" for a request the signing path then refuses, which is
+    // exactly the split this endpoint exists to avoid.
     //
     // The pre-flight and the signing path MUST make this substitution the same
     // way, which is why both call the one function.
@@ -6779,26 +6713,6 @@ async fn wallet_check_policy_handler(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // K8, same gate as the signing path — a pre-flight that answered
-    // differently would tell a caller "allowed" and then refuse the signature.
-    if let shared_tee_helpers::wallet_policy::Op::Call { method, .. } = &req.op {
-        if let Err(reason) = shared_tee_helpers::binding::signing_version_gate(
-            method,
-            req.binding_kind.as_deref(),
-            req.decoder_version,
-        ) {
-            return Ok(Json(WalletCheckPolicyResponse {
-                allowed: false,
-                frozen: false,
-                requires_approval: None,
-                required_approvals: None,
-                reason: Some(reason),
-                request_hash: Some(request_hash),
-                webhook_url: None,
-            }));
-        }
-    }
-
     let usage = req.usage.as_ref().map(wallet_policy::Usage::from_current_usage);
     let decision = wallet_policy::evaluate(&policy, &req.op, usage.as_ref(), now);
 
