@@ -141,7 +141,13 @@ BAL=$(intents_usdc); is_int "$BAL" || BAL=0
 echo "wallet's Solana address $SOL_ADDR | intents USDC $BAL"
 FUNDED=0; le "$WITHDRAW_IN" "$BAL" && FUNDED=1
 
-wbody() { jq -nc --arg to "$SOL_ADDR" --arg t "$USDC" "$1 + {chain:\"solana\",to:\$to,token:\$t}"; }
+# wbody '<jq object>' [--arg name value …]: a withdrawal body to the wallet's own Solana address.
+# The object is SINGLE-quoted and its values arrive by --arg: bash 3.2 brace-expands
+# {a,b} inside "$(… "{…}")", which splits the program and sends an empty body.
+wbody() {
+  local obj=$1; shift
+  jq -nc --arg to "$SOL_ADDR" --arg t "$USDC" "$@" "$obj"' + {chain:"solana",to:$to,token:$t}'
+}
 
 # ── B1 ───────────────────────────────────────────────────────────────────────
 log "B1 a withdrawal with a memo is refused, on every route"
@@ -200,7 +206,7 @@ for junk in "+1" "01"; do
   [[ "$HTTP" == 400 && "$(f .message)" == "amount_out must be"* ]] && pass "B4 swap quote amount_out '$junk'" || fail "B4 amount_out '$junk' HTTP $HTTP $(head -c 200 <<<"$BODY")"
   post /wallet/v1/intents/swap/quote "$(jq -nc --arg i "$USDC" --arg o "$WNEAR" --arg a "$junk" '{token_in:$i,token_out:$o,amount_in:"300000",min_amount_out:$a}')"
   [[ "$HTTP" == 400 && "$(f .message)" == "min_amount_out must be"* ]] && pass "B4 swap quote min_amount_out '$junk'" || fail "B4 min_amount_out '$junk' HTTP $HTTP $(head -c 200 <<<"$BODY")"
-  post /wallet/v1/intents/withdraw/dry-run "$(wbody "{amount:\"$junk\"}")"
+  post /wallet/v1/intents/withdraw/dry-run "$(wbody '{amount:$a}' --arg a "$junk")"
   [[ "$HTTP" == 200 && "$(f .would_succeed)" != true && "$(f .reason)" == invalid_request ]] \
     && pass "B4 withdraw dry-run amount '$junk': invalid_request" || fail "B4 dry-run '$junk' HTTP $HTTP $(head -c 200 <<<"$BODY")"
 done
@@ -257,7 +263,7 @@ if [[ "$FUNDED" != 1 ]]; then
   log "W1–W4, R1–R5 skipped: the dry-run reads the balance first, and the wallet holds $BAL USDC in intents (needs $WITHDRAW_IN)"
 else
   log "W1 a cross-chain withdraw dry-run, exact input"
-  post /wallet/v1/intents/withdraw/dry-run "$(wbody "{amount:\"$WITHDRAW_IN\"}")"
+  post /wallet/v1/intents/withdraw/dry-run "$(wbody '{amount:$a}' --arg a "$WITHDRAW_IN")"
   W_GUAR=$(f .min_amount_out)
   if [[ "$HTTP" == 200 && "$(f .would_succeed)" == true ]] && is_int "$W_GUAR"; then
     [[ "$(f .amount_in)" == "$WITHDRAW_IN" ]] && pass "W1 amount_in is the input asked" || fail "W1 amount_in $(f .amount_in)"
@@ -269,7 +275,7 @@ else
   fi
 
   log "W2 the same, exact output"
-  post /wallet/v1/intents/withdraw/dry-run "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"$WITHDRAW_IN\"}")"
+  post /wallet/v1/intents/withdraw/dry-run "$(wbody '{amount_out:$o,max_amount_in:$m}' --arg o "$WITHDRAW_OUT" --arg m "$WITHDRAW_IN")"
   W_NEED=$(f .amount_in)
   if [[ "$HTTP" == 200 && "$(f .would_succeed)" == true ]] && is_int "$W_NEED"; then
     [[ "$(f .amount_out)" == "$WITHDRAW_OUT" && "$(f .min_amount_out)" == "$WITHDRAW_OUT" ]] \
@@ -280,25 +286,25 @@ else
   else
     fail "W2 HTTP $HTTP $(head -c 300 <<<"$BODY")"; W_NEED=""
   fi
-  post /wallet/v1/intents/withdraw/dry-run "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"1\"}")"
+  post /wallet/v1/intents/withdraw/dry-run "$(wbody '{amount_out:$o,max_amount_in:$m}' --arg o "$WITHDRAW_OUT" --arg m "1")"
   [[ "$HTTP" == 200 && "$(f .would_succeed)" != true && "$(f .reason)" == above_max_amount_in && -n "$(f .amount_in)" ]] \
     && pass "W2 a ceiling of 1: would not succeed, above_max_amount_in, figures in the body" || fail "W2 ceiling 1: HTTP $HTTP $(head -c 300 <<<"$BODY")"
 
   log "W3 a floor above the guarantee"
   if [[ -n "$W_GUAR" ]]; then
     FLOOR=$(echo "$W_GUAR * 2" | bc)
-    post /wallet/v1/intents/withdraw/dry-run "$(wbody "{amount:\"$WITHDRAW_IN\",min_amount_out:\"$FLOOR\"}")"
+    post /wallet/v1/intents/withdraw/dry-run "$(wbody '{amount:$a,min_amount_out:$f}' --arg a "$WITHDRAW_IN" --arg f "$FLOOR")"
     [[ "$HTTP" == 200 && "$(f .would_succeed)" != true && "$(f .reason)" == below_min_amount_out ]] \
       && pass "W3 below_min_amount_out" || fail "W3 HTTP $HTTP $(head -c 300 <<<"$BODY")"
   else
     skip "W3 needs W1's guarantee"
   fi
-  post /wallet/v1/intents/withdraw/dry-run "$(wbody "{amount:\"$WITHDRAW_IN\",min_amount_out:\"1\"}")"
+  post /wallet/v1/intents/withdraw/dry-run "$(wbody '{amount:$a,min_amount_out:$f}' --arg a "$WITHDRAW_IN" --arg f "1")"
   [[ "$HTTP" == 200 && "$(f .would_succeed)" == true ]] && pass "W3 a floor of 1 is met" || fail "W3 floor 1: HTTP $HTTP $(head -c 300 <<<"$BODY")"
 
   log "W4 the ceiling of an exact output is held in full"
   OVER=$(echo "$BAL + 1" | bc)
-  post /wallet/v1/intents/withdraw/dry-run "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"$OVER\"}")"
+  post /wallet/v1/intents/withdraw/dry-run "$(wbody '{amount_out:$o,max_amount_in:$m}' --arg o "$WITHDRAW_OUT" --arg m "$OVER")"
   [[ "$HTTP" == 200 && "$(f .would_succeed)" != true && "$(f .reason)" == insufficient_balance ]] \
     && pass "W4 a ceiling of balance + 1: insufficient_balance" || fail "W4 HTTP $HTTP $(head -c 300 <<<"$BODY")"
 
@@ -314,7 +320,7 @@ else
   fi
 
   log "R2 the real cross-chain withdraw, exact output under a ceiling of 1"
-  post /wallet/v1/intents/withdraw "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"1\"}")" "terms-r2-$(uuidgen)"
+  post /wallet/v1/intents/withdraw "$(wbody '{amount_out:$o,max_amount_in:$m}' --arg o "$WITHDRAW_OUT" --arg m "1")" "terms-r2-$(uuidgen)"
   if [[ "$HTTP" == 400 && "$(f .error)" == above_max_amount_in ]] && is_int "$(f .quoted_amount_in)"; then
     pass "R2 400 above_max_amount_in, quoted_amount_in $(f .quoted_amount_in)"
   else fail "R2 expected 400 above_max_amount_in, got HTTP $HTTP: $(head -c 300 <<<"$BODY")"; fi
@@ -327,7 +333,7 @@ else
 
   log "R4 the real cross-chain withdraw with a floor twice the guarantee"
   if [[ -n "$W_GUAR" ]]; then
-    post /wallet/v1/intents/withdraw "$(wbody "{amount:\"$WITHDRAW_IN\",min_amount_out:\"$(echo "$W_GUAR * 2" | bc)\"}")" "terms-r4-$(uuidgen)"
+    post /wallet/v1/intents/withdraw "$(wbody '{amount:$a,min_amount_out:$f}' --arg a "$WITHDRAW_IN" --arg f "$(echo "$W_GUAR * 2" | bc)")" "terms-r4-$(uuidgen)"
     if [[ "$HTTP" == 400 && "$(f .error)" == below_min_amount_out ]] && is_int "$(f .quoted_min_amount_out)"; then
       pass "R4 400 below_min_amount_out, quoted_min_amount_out $(f .quoted_min_amount_out)"
     else fail "R4 expected 400 below_min_amount_out, got HTTP $HTTP: $(head -c 300 <<<"$BODY")"; fi
@@ -336,7 +342,7 @@ else
   fi
 
   log "R5 a refusal met in the background is written to the request"
-  post /wallet/v1/intents/withdraw "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"1\",async:true}")" "terms-r5-$(uuidgen)"
+  post /wallet/v1/intents/withdraw "$(wbody '{amount_out:$o,max_amount_in:$m,async:true}' --arg o "$WITHDRAW_OUT" --arg m "1")" "terms-r5-$(uuidgen)"
   RID=$(f .request_id)
   if [[ "$HTTP" == 400 && "$(f .error)" == above_max_amount_in ]]; then
     pass "R5 refused in the call itself: 400 above_max_amount_in"
@@ -355,14 +361,14 @@ fi
 
 # ── C1 ───────────────────────────────────────────────────────────────────────
 log "C1 the confidential previews, exact output"
-post /wallet/v1/confidential/withdraw/dry-run "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"$WITHDRAW_IN\"}")"
+post /wallet/v1/confidential/withdraw/dry-run "$(wbody '{amount_out:$o,max_amount_in:$m}' --arg o "$WITHDRAW_OUT" --arg m "$WITHDRAW_IN")"
 if [[ "$HTTP" == 503 ]]; then
   skip "C1 confidential intents are off on this deployment"
 else
   if [[ "$HTTP" == 200 && "$(f .amount_out)" == "$WITHDRAW_OUT" && "$(f .min_amount_out)" == "$WITHDRAW_OUT" ]] && is_int "$(f .amount_in)"; then
     pass "C1 withdraw dry-run: exactly $WITHDRAW_OUT out for $(f .amount_in) in"
   else fail "C1 withdraw dry-run HTTP $HTTP $(head -c 300 <<<"$BODY")"; fi
-  post /wallet/v1/confidential/withdraw/dry-run "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"1\"}")"
+  post /wallet/v1/confidential/withdraw/dry-run "$(wbody '{amount_out:$o,max_amount_in:$m}' --arg o "$WITHDRAW_OUT" --arg m "1")"
   [[ "$HTTP" == 200 && "$(f .reason)" == above_max_amount_in ]] && pass "C1 a ceiling of 1: above_max_amount_in" || fail "C1 ceiling 1: HTTP $HTTP $(head -c 300 <<<"$BODY")"
   post /wallet/v1/confidential/swap/quote "$(jq -nc --arg i "$USDC" --arg o "$WNEAR" --arg a "$SWAP_OUT" '{token_in:$i,token_out:$o,amount_out:$a,max_amount_in:"100000000"}')"
   [[ "$HTTP" == 200 && "$(f .amount_out)" == "$SWAP_OUT" ]] && is_int "$(f .amount_in)" \
@@ -407,7 +413,7 @@ else
   post /wallet/v1/confidential/swap "$(jq -nc --arg i "$USDC" --arg o "$WNEAR" --arg a "$SWAP_OUT" '{token_in:$i,token_out:$o,amount_out:$a,max_amount_in:"1"}')" "terms-c2s-$(uuidgen)"
   [[ "$HTTP" == 400 && "$(f .error)" == above_max_amount_in ]] && is_int "$(f .quoted_amount_in)" \
     && pass "C2 swap: 400 above_max_amount_in, quoted_amount_in $(f .quoted_amount_in)" || fail "C2 swap HTTP $HTTP $(head -c 300 <<<"$BODY")"
-  post /wallet/v1/confidential/withdraw "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"1\"}")" "terms-c2w-$(uuidgen)"
+  post /wallet/v1/confidential/withdraw "$(wbody '{amount_out:$o,max_amount_in:$m}' --arg o "$WITHDRAW_OUT" --arg m "1")" "terms-c2w-$(uuidgen)"
   [[ "$HTTP" == 400 && "$(f .error)" == above_max_amount_in ]] && is_int "$(f .quoted_amount_in)" \
     && pass "C2 withdraw: 400 above_max_amount_in, quoted_amount_in $(f .quoted_amount_in)" || fail "C2 withdraw HTTP $HTTP $(head -c 300 <<<"$BODY")"
   C_AFTER=$(conf_usdc)
@@ -446,7 +452,7 @@ else
   log "M2 an exact-output withdraw: $WITHDRAW_OUT USDC to $SOL_ADDR"
   BEFORE=$(intents_usdc)
   CEIL=$(echo "$W_NEED * 101 / 100" | bc)
-  post /wallet/v1/intents/withdraw "$(wbody "{amount_out:\"$WITHDRAW_OUT\",max_amount_in:\"$CEIL\",async:true}")" "terms-m2-$(uuidgen)"
+  post /wallet/v1/intents/withdraw "$(wbody '{amount_out:$o,max_amount_in:$m,async:true}' --arg o "$WITHDRAW_OUT" --arg m "$CEIL")" "terms-m2-$(uuidgen)"
   RID=$(f .request_id); echo "  answer: HTTP $HTTP status $(f .status) request $RID (ceiling $CEIL)"
   if [[ -n "$RID" ]]; then
     STARTED=$(date +%s)
