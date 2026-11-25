@@ -28,9 +28,11 @@
 #       bytes, `evm_address` = keccak256(pk)[12:] computed HERE; a signature over
 #       a 32-byte prehash recovers HERE (coincurve) to that key, low s, v ∈ {0,1}
 #   S14 sign_and_verify evm: verified, recovered, low_s, tampered_rejected
-#   S15 one prehash signs the same twice; $CALLER2 gets another evm key
+#   S15 one prehash signs the same twice; $CALLER2 gets another evm key; a
+#       second version (`project-secp-v2`) keeps evm
 #   S16 alpha in project-secp is alpha in project
-#   S17 `wasm-secp` run from its URL gets code-evm; as a project version: refused
+#   S17 `wasm-secp` run from its URL gets code-evm; as a project version: refused;
+#       `wasm-secp-v2`, another sha256, gets another code-evm
 #   S18 host_nep413 answers exactly what sign_nep413 does (with and without a
 #       callback_url) and verifies HERE
 #   S19 secp and NEP-413 attacks: wrong prehash length, wrong key type, bad
@@ -76,8 +78,8 @@
 #
 # Env: OFFLINE=1 (dry run only: no chain reads; ignored with --apply).
 #
-# Money: twelve FastFS uploads (~230 KB each), project storage, and one on-chain
-# run per probe at $DEPOSIT (~27 runs; a relayed run's unused deposit comes
+# Money: fourteen FastFS uploads (~230 KB each), project storage, and one on-chain
+# run per probe at $DEPOSIT (~29 runs; a relayed run's unused deposit comes
 # back to its signer, as a direct run's does).
 #
 # Run:
@@ -752,7 +754,7 @@ fi
 #
 # Builds `project-secp` (evm secp256k1 + alpha ed25519, bind project; a version
 # of the project) and `wasm-secp` (code-evm secp256k1, bind wasm; run from its
-# URL). Every signature is checked here with coincurve and pycryptodome — not
+# URL), and the `v2` of each: the same manifest, another sha256. Every signature is checked here with coincurve and pycryptodome — not
 # the worker's library, not the guest's.
 
 secp_check() { # secp_check <pk_hex_64_bytes> <prehash_hex> <sig_hex_65_bytes> — "ok|<why>"
@@ -794,7 +796,7 @@ fi
 
 if [[ "$SECP_READY" == true ]]; then
   log "S13–S19 upload and publish the secp256k1 builds"
-  for v in project-secp wasm-secp; do
+  for v in project-secp project-secp-v2 wasm-secp wasm-secp-v2; do
     set_for hash "$v" "$(sha_of "$VARIANTS/signing-key-probe-$v.wasm")"
     url=$(fastfs_upload "$VARIANTS/signing-key-probe-$v.wasm" "$(get_for hash "$v")") || { fail "S13 upload of $v never served its bytes"; SECP_READY=false; break; }
     set_for url "$v" "$url"
@@ -805,7 +807,9 @@ fi
 if [[ "$SECP_READY" == true ]]; then
   H_PS=$(get_for hash project-secp); U_PS=$(get_for url project-secp)
   H_WS=$(get_for hash wasm-secp); U_WS=$(get_for url wasm-secp)
-  for v in project-secp wasm-secp; do
+  H_PS2=$(get_for hash project-secp-v2)
+  H_WS2=$(get_for hash wasm-secp-v2); U_WS2=$(get_for url wasm-secp-v2)
+  for v in project-secp project-secp-v2 wasm-secp; do
     [[ -n "$(version_on_chain "$(get_for hash "$v")")" ]] && continue
     call "$PARENT" add_version "$(jq -nc --arg n "$PROJECT_NAME" --argjson s "$(wasm_src "$(get_for url "$v")" "$(get_for hash "$v")")" \
       '{project_name:$n, source:$s, set_active:false}')" '0.1 NEAR' >/dev/null
@@ -852,7 +856,12 @@ if [[ "$SECP_READY" == true ]]; then
     remember_keys
     [[ -n "$EVM_PK" && "$(out_field .public_key)" =~ ^[0-9a-f]{128}$ && "$(out_field .public_key)" != "$EVM_PK" ]] && pass "S15 $CALLER2 gets another evm key" || fail "S15 $CALLER2's evm key is '$(out_field .public_key)', $PARENT's is $EVM_PK"
   fi
-  skip "S15 a second project version keeping evm: needs a second secp256k1 project build (not built); S5 covers the rule for ed25519"
+  run_src "$PARENT" "$(project_src "$H_PS2")" '{"operation":"public_key","path":"evm"}'
+  if ran_ok "S15 v2 public_key evm"; then
+    remember_keys
+    [[ "$(out_field .build)" == "signing-key-probe build 2" ]] && pass "S15 the v2 bytes ran ($(out_field .build))" || fail "S15 the run was not v2: build '$(out_field .build)'"
+    [[ -n "$EVM_PK" && "$(out_field .public_key)" == "$EVM_PK" ]] && pass "S15 a second version (${H_PS2:0:12}) keeps evm" || fail "S15 a new version got another evm key: $(out_field .public_key)"
+  fi
 
   # ── S16 adding a secp256k1 key disturbs no ed25519 key ──
   log "S16 alpha in project-secp is alpha in project"
@@ -871,7 +880,11 @@ if [[ "$SECP_READY" == true ]]; then
   fi
   run_src "$PARENT" "$(project_src "$H_WS")" '{"operation":"public_key","path":"code-evm"}'
   refused_without_keys "S17 wasm-secp run as a project version" 'bind|wasm|project|signing key'
-  skip "S17 a new hash → a new code-evm key: needs a second wasm-secp build (not built); S6 covers the rule for ed25519"
+  run_src "$PARENT" "$(wasm_src "$U_WS2" "$H_WS2")" '{"operation":"public_key","path":"code-evm"}'
+  if ran_ok "S17 v2 public_key code-evm"; then
+    remember_keys
+    [[ -n "${CODE_EVM:-}" && "$(out_field .public_key)" =~ ^[0-9a-f]{128}$ && "$(out_field .public_key)" != "$CODE_EVM" ]] && pass "S17 another build (${H_WS2:0:12}), another code-evm key" || fail "S17 two builds got one code-evm key: $(out_field .public_key)"
+  fi
 
   # ── S18 the host's sign-nep413 is the guest's NEP-413 ──
   log "S18 host_nep413 equals sign_nep413, verified here"

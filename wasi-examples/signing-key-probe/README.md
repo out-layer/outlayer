@@ -35,7 +35,9 @@ One manifest per build, picked by a cargo feature (`manifests/`):
 | `signing-key-probe-wasm-v2.wasm` | `wasm,v2` | the same | a direct run — another build, another key |
 | `signing-key-probe-project-vault.wasm` | `project-vault` | `alpha`, and `treasury` with vault `vault.alice.near` | the worker's component tests |
 | `signing-key-probe-project-secp.wasm` | `project-secp` | `evm` (`secp256k1`) and `alpha` (`ed25519`) — `bind: "project"` | a project version (WasmUrl) |
+| `signing-key-probe-project-secp-v2.wasm` | `project-secp,v2` | the same | a second version of that project |
 | `signing-key-probe-wasm-secp.wasm` | `wasm-secp` | `code-evm` (`secp256k1`) — `bind: "wasm"` | a direct run of its wasm URL |
+| `signing-key-probe-wasm-secp-v2.wasm` | `wasm-secp,v2` | the same | a direct run — another build, another key |
 | `signing-key-probe-encryption.wasm` | `encryption` | signing `alpha`; encryption `alpha`, `beta` — `bind: "project"` | a project version (WasmUrl) |
 | `signing-key-probe-encryption-v2.wasm` | `encryption,v2` | the same | a second version of that project |
 | `signing-key-probe-encryption-storage.wasm` | `encryption-storage` | the `encryption` build's keys, and `near:storage` | a version of the same project |
