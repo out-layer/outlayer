@@ -186,7 +186,7 @@ A request names the code as a registered project, or as a WASM file by URL and s
 
 **Hosts.** Workers and keystores run in Intel TDX confidential VMs on OutLayer's own bare-metal servers, deployed with [`deploy/self-hosted-tdx`](deploy/self-hosted-tdx/README.md). No third-party cloud service is in the attestation path.
 
-**Governance.** The keystore DAO (`dao.outlayer.near`) has three members and decides two of three. It approves keystore and worker builds and governs the three contracts, none of which carries a full-access key; every change of code or approved builds waits a 72-hour public delay. See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
+**Governance.** The keystore DAO (`dao.outlayer.near`) has three members and decides two of three. It approves keystore and worker builds and governs the three contracts; proposals that change code or approved builds wait a 72-hour public delay. See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
 
 What each party can and cannot do, and every limit stated plainly: [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md).
 

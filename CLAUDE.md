@@ -54,10 +54,11 @@ When writing WASI containers:
 
 ### NEAR Contract Development
 1. Use `cargo near build` (never raw `cargo build --target wasm32-unknown-unknown`)
-2. Create `rust-toolchain.toml` with `channel = "1.85.0"`
+2. A contract's toolchain is its own: the `rust-toolchain.toml` and the
+   reproducible-build image pinned in its `Cargo.toml`. Do not change them in
+   passing; a new contract takes the newest pair already used here
 3. Add `schemars = "0.8"` and derive `JsonSchema` on all public API types
 4. Use `#[schemars(with = "String")]` for AccountId fields
-5. Use near-sdk 5.9.0
 
 ### OutLayer URLs
 - **API Base**: `https://api.outlayer.ai` (for HTTPS API calls)

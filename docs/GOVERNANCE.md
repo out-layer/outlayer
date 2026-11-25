@@ -1,8 +1,8 @@
 # Governance
 
-OutLayer's three on-chain contracts are governed by a DAO. No account holds a key that can
-change their code. The DAO members decide together, and every change of the rules, of the code
-or of the software that may hold the master secret waits out a public delay.
+OutLayer's three on-chain contracts are governed by a DAO. Its members decide together, and every
+DAO proposal that changes the rules, the code or the software that may hold the master secret
+waits out a public delay.
 An operations owner runs day-to-day settings. It can apply the brakes and adjust parameters, but
 it cannot change what the contracts are, and the DAO can replace it at any time.
 
@@ -12,14 +12,9 @@ it cannot change what the contracts are, and the DAO can replace it at any time.
 | Main | `outlayer.near` | Execution requests, payments, projects, secrets, wallet policies |
 | Register | `worker.outlayer.near` | The TEE workers: which builds may run, and their keys |
 
-## No full-access keys
+## Function-call keys
 
-None of the three accounts has a full-access key. Nobody can deploy code to them, add a key, or
-sign arbitrary transactions as them.
-
-### Function-call keys
-
-`list-keys` on these accounts still shows keys: function-call keys. Each is a service key for one
+`list-keys` on these accounts shows function-call keys. Each is a service key for one
 narrow job. It signs calls only to the methods listed on it, on one named contract; it cannot
 deploy code, add or remove keys, or transfer NEAR, and its allowance pays only for the gas of
 those calls. A contract installs each of them, never a person:
@@ -32,8 +27,8 @@ those calls. A contract installs each of them, never a person:
   verified attestation, and only for a build the DAO approved. It may call only `request_key`
   (obtain the master secret through NEAR MPC), `mark_vault_verified` and `ban_vault`.
 
-The set follows the running fleet: the keys on an account are those of the instances running
-now. A redeployed worker or keystore registers a new key, and the old one is removed as it is
+The set follows the running fleet: the function-call keys on an account are those of the
+instances running now. A redeployed worker or keystore registers a new key, and the old one is removed as it is
 rotated out: a worker's by `remove_worker_keys`, a keystore's by a DAO vote
 (`propose_revoke_keystore_keys`).
 
@@ -61,7 +56,7 @@ near account list-keys worker.outlayer.near network-config mainnet now
   governance account, an operator, a membership), an older one can no longer execute after a newer
   one has.
 
-### What only the DAO can do
+### What the DAO decides
 
 | Action | How |
 |---|---|
@@ -78,7 +73,7 @@ near account list-keys worker.outlayer.near network-config mainnet now
 | Revoke keystore keys | `propose_revoke_keystore_keys`, decided by the members' vote |
 
 A `Call` proposal can reach only a contract the DAO governs, and never the DAO itself or the MPC
-contract. Code changes only as an `Upgrade`, by its hash.
+contract. A proposal changes code only as an `Upgrade`, by its hash.
 
 ### What any single member can do
 Each of these is a narrow switch, not a change of rules:
@@ -139,7 +134,7 @@ the DAO's decision.
 ## Verifying it yourself
 - **Code.** `near account view-account-summary <account> network-config mainnet now` shows the code hash; a reproducible
   build of the release (`cargo near build reproducible-wasm`) gives the same sha256.
-- **Keys.** `list-keys` shows only function-call keys.
+- **Keys.** `list-keys` shows the keys on each account.
 - **Governance.** `get_governance` on `outlayer.near` and `worker.outlayer.near` returns
   `dao.outlayer.near`.
 - **Members and delay.** On the DAO: `get_dao_members`, `get_gov_delay_sec`, `get_config`.
