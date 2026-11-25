@@ -1907,7 +1907,7 @@ else
     note "D7 the binding reads '$D7_AFTER' — there was none to remove, so this says nothing"
   else
     [[ "$D7_AFTER" != "active" ]] \
-      && pass "D7 the binding is gone ($D7_AFTER) — the extension has been removed" \
+      && pass "D7 OutLayer's side of the binding is closed ($D7_AFTER); the extension on the account is the owner's to remove" \
       || fail "D7 the binding is STILL active after DELETE; the rest of this row would prove nothing"
   fi
 

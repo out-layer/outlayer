@@ -673,9 +673,9 @@ else
 fi
 
 # ── SP13 ─────────────────────────────────────────────────────────────────────
+LIMIT=$($HAVE_SQL && q "SELECT max_count FROM operation_limits WHERE operation = 'custody:*' AND applies = 'unpaid'" | tr -d ' ')
 if [[ "$CEILING" == 1 ]]; then
   log "SP13 the custody ceiling: a lifting code lifts it, a plain code and a bare trial do not"
-  LIMIT=$($HAVE_SQL && q "SELECT max_count FROM operation_limits WHERE operation = 'custody:*' AND applies = 'unpaid'" | tr -d ' ')
   if [[ ! "$LIMIT" =~ ^[0-9]+$ ]]; then
     skip "SP13 no custody:* unpaid rule on testnet (or no PSQL_CMD)"
   else
@@ -702,7 +702,8 @@ if [[ "$CEILING" == 1 ]]; then
     done
   fi
 else
-  skip "SP13 custody ceiling — CEILING=1 (spends NEAR, ~$((3 * 101)) transfers)"
+  if [[ "$LIMIT" =~ ^[0-9]+$ ]]; then cost="$((3 * (LIMIT + 1))) transfers"; else cost="3×(limit+1) transfers, limit = custody:* unpaid in operation_limits"; fi
+  skip "SP13 custody ceiling — CEILING=1 (spends NEAR, $cost)"
 fi
 
 verdict
