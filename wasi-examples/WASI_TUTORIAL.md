@@ -388,7 +388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 **Note**: `signer_account_id()` reads `NEAR_SENDER_ID` and returns:
 - `Some(account_id)` when called via blockchain transaction (the transaction's signer; for a meta-transaction, the account that signed the delegate action)
 - `Some(payment_key_owner)` when called via HTTPS API — every HTTPS call carries a payment key
-- the bound account instead, when the request sets `use_bound_identity` (Agent Connect)
+- the account of the caller's wallet contract instead, when the request sets `use_bound_identity`
 - `None` only outside OutLayer (e.g. local wasmtime)
 
 `predecessor_account_id()` (`NEAR_PREDECESSOR_ID`) names the account that
@@ -767,11 +767,6 @@ if !error.is_empty() {
         "policy_denied" | "wallet_frozen" => {
             return Ok(json!({ "needs_owner": true, "reason": error }))
         }
-        // Agent Connect refused before signing, so no gas was spent.
-        // `terminal=true` means the same request will never work.
-        "agent_connect_denied" if error.contains("terminal=true") => {
-            return Ok(json!({ "needs_owner": true, "reason": error }))
-        }
         _ => return Err(error.into()),
     }
 }
@@ -783,7 +778,7 @@ let moved: serde_json::Value = serde_json::from_str(&result)?; // fails obscurel
 ```
 
 Codes worth knowing: `no_wallet`, `wallet_busy`, `policy_denied`,
-`wallet_frozen`, `agent_connect_denied`, `insufficient_balance`. A failure that is not one of
+`wallet_frozen`, `insufficient_balance`. A failure that is not one of
 ours arrives verbatim rather than dressed in an invented code.
 
 **A wallet runs one money operation at a time.** Two of your own calls in

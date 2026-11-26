@@ -244,8 +244,8 @@ the input can.
   the caller in them from the host, never from the input: the account that
   paid is `NEAR_USER_ACCOUNT_ID` (`env::var`), the account the run acts as
   is `NEAR_SENDER_ID` (`env::signer_account_id()`) — the same account,
-  except under Agent Connect's bound identity, where it is the bound
-  agent's (`WASM_ENV_VARS.md`) — every caller can make it sign whatever the module will sign for
+  except with `use_bound_identity`, where it is the account of the caller's
+  wallet contract (`WASM_ENV_VARS.md`) — every caller can make it sign whatever the module will sign for
   any of them. The environment is input too: a caller names secret rows of
   its own for the run (`secrets_ref`, `secrets_refs`), and their variables
   are the caller's. Take what a `none` key signs from the input, the code,

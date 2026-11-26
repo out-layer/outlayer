@@ -16,7 +16,7 @@ fn get_context(predecessor: AccountId) -> VMContextBuilder {
 
 #[test]
 fn test_estimate_storage_cost() {
-    let mut context = get_context(accounts(1));
+    let context = get_context(accounts(1));
     testing_env!(context.build());
 
     let contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
@@ -404,7 +404,7 @@ fn test_delete_refunds_exact_amount() {
 
 #[test]
 fn test_access_condition_size_affects_cost() {
-    let mut context = get_context(accounts(1));
+    let context = get_context(accounts(1));
     testing_env!(context.build());
 
     let contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
@@ -1074,7 +1074,7 @@ fn every_door_refuses_a_malformed_build_leaf() {
     // condition before storing it — so the refusal must arrive there too,
     // before a wallet prompt rather than after one.
     let priced = refusal_from(|| {
-        let mut context = get_context(accounts(1));
+        let context = get_context(accounts(1));
         testing_env!(context.build());
         let contract = Contract::new(accounts(0), Some(accounts(0)), None, None);
         contract.estimate_storage_cost(

@@ -1000,7 +1000,6 @@ mod project_pricing_tests {
 
 mod subscription_sale_tests {
     use crate::payment::{plan_for_sale, SubscriptionPlan};
-    use crate::*;
     use near_sdk::json_types::U128;
 
     fn plan(index: u8, name: &str, price_usd: u128, active: bool) -> SubscriptionPlan {
@@ -1433,7 +1432,6 @@ mod ft_transfer_action_tests {
 mod store_agent_secret_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use near_sdk::serde_json::json;
     use sha2::{Digest, Sha256};
 
     fn wallet() -> (SigningKey, String, AccountId) {
