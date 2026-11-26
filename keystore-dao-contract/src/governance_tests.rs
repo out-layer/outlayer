@@ -1259,6 +1259,53 @@ fn the_build_is_approved_and_revoked_by_governance_and_removed_by_the_owner() {
     assert!(refused(|| { register(&mut d, 8, measured(&log), log); }));
 }
 
+fn wallet_code(byte: u8) -> Base58CryptoHash {
+    Base58CryptoHash::from([byte; 32])
+}
+
+#[test]
+fn a_wallet_contract_build_is_approved_and_revoked_by_governance_and_removed_by_the_owner() {
+    let mut d = dao(&["m1.testnet"], 0);
+    assert!(d.get_approved_wallet_contracts().is_empty());
+
+    at(a("m1.testnet"), 0);
+    for byte in [1, 2, 1] {
+        let p = d.propose(GovAction::ApproveWalletContract { code_hash: wallet_code(byte) });
+        let _ = d.execute(p);
+    }
+    // a later build stands beside the earlier one, each once, as NEAR spells a code hash
+    assert_eq!(
+        d.get_approved_wallet_contracts(),
+        vec![String::from(&wallet_code(1)), String::from(&wallet_code(2))]
+    );
+    assert_eq!(String::from(&wallet_code(1)), "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi");
+
+    let p = d.propose(GovAction::RevokeWalletContract { code_hash: wallet_code(1) });
+    let _ = d.execute(p);
+    assert_eq!(d.get_approved_wallet_contracts(), vec![String::from(&wallet_code(2))]);
+
+    at(owner(), 0);
+    d.remove_approved_wallet_contract(wallet_code(2));
+    assert!(d.get_approved_wallet_contracts().is_empty());
+}
+
+#[test]
+fn a_wallet_contract_build_waits_out_the_delay() {
+    let mut d = dao(&["m1.testnet"], 3_600);
+    at(a("m1.testnet"), 10);
+    let id = d.propose(GovAction::ApproveWalletContract { code_hash: wallet_code(1) });
+    assert!(refused(|| { let _ = d.execute(id); }));
+    assert!(d.get_approved_wallet_contracts().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "Only owner")]
+fn only_the_owner_removes_an_approved_wallet_contract() {
+    let mut d = dao(&["m1.testnet"], 0);
+    at(a("m1.testnet"), 0);
+    d.remove_approved_wallet_contract(wallet_code(1));
+}
+
 #[test]
 #[should_panic(expected = "Only owner")]
 fn only_the_owner_removes_an_approved_compose() {

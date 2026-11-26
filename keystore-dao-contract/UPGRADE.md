@@ -189,6 +189,20 @@ registration go in one order, and nothing in the code bridges a wrong one:
 Between 1 and 3 no keystore of the previous release can register again: a restart of one stays
 down until it is replaced by the new release. Do not restart keystores in that window.
 
+## Order: the wallet contract builds keystores sign for
+
+A keystore with on-chain custody reads `get_approved_wallet_contracts` from the DAO on every
+request about a wallet contract, and nothing in it bridges a DAO that has no such method:
+
+1. **The DAO first**: the release that carries `ApproveWalletContract`. No migration: the list
+   is a collection under its own prefix and starts empty.
+2. **The build of the wallet contract, by vote**: `ApproveWalletContract { code_hash }` with the
+   code hash of the published global contract; on mainnet it waits out the delay.
+3. **Then the keystores** of the release that reads the list.
+
+Until 2 has executed, every request about a wallet contract is refused with "does not run the
+published build"; wallets in TEE custody are not touched by any of it.
+
 ## If it fails
 
 The deploy, the new code's `migrate()` and `gov_health()` are one atomic batch: when any of them

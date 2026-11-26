@@ -18,6 +18,8 @@ pub use governance::{BlobInfo, GovAction, GovProposal, GovStatus};
 
 pub mod exit;
 
+mod wallet_contracts;
+
 #[cfg(test)]
 mod governance_tests;
 #[cfg(test)]
@@ -117,6 +119,8 @@ enum StorageKey {
     ExitOwners,
     /// Per owner path, the escrow of that generation's master (`exit.rs`).
     ExitEscrows,
+    /// The wallet contract builds keystores sign for (`wallet_contracts.rs`), one list.
+    ApprovedWalletContracts,
 }
 
 /// The guest OS of a CVM, as TDX measures it: the firmware (MRTD), its configuration (RTMR0),

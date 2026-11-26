@@ -98,10 +98,12 @@ other wallet is refused with `400 bad_request` on every route below.
   is in a third byte format. A pair with equal keys is refused by the contract.
 - **A wallet contract has no extension.** An extension has full control of a
   wallet contract, so the enclave signs for no wallet contract that has one.
-- **One build, by its code hash.** The account uses a global contract by its
-  code hash, so the installing transaction carries no code. The enclave reads
-  the account's code hash before every signature and signs for the configured
-  build only. The published build on testnet is
+- **A build the DAO approved, by its code hash.** The account uses a global
+  contract by its code hash, so the installing transaction carries no code.
+  The enclave reads the account's code hash before every signature and signs
+  only for a build on the keystore DAO's list (`ApproveWalletContract`, a vote
+  with the DAO's delay). An account stays on the build it was installed with,
+  so a later build is approved beside the earlier one. The published build is
   `651XC7DH8J4Xczf8JKXH9pyveBY8ZuNCfy5HZ3SvuSiL`.
 
 ## 4. Setup
@@ -657,9 +659,13 @@ seed is `HMAC-SHA256(key = "outlayer/agent-key/v1", signature ‖ message)`.
 
 ## 13. Operator configuration
 
-| Component | Setting | Meaning |
-|---|---|---|
-| Keystore | `WALLET_CONTRACT_CODE_HASH` (base58) | the code hash of the published build of the two-key wallet contract. The enclave signs for an account only when its code hash equals this value. Without it the keystore's `/wallet/contract/*` routes refuse |
+The keystore takes no setting for on-chain custody. The builds of the wallet
+contract it signs for are the keystore DAO's list
+(`get_approved_wallet_contracts`): a build is added by an
+`ApproveWalletContract` vote and taken off by `RevokeWalletContract`, or at
+once by the DAO's owner (`remove_approved_wallet_contract`). The DAO contract
+that carries the list is upgraded before a keystore that reads it starts, and
+the build is approved before the first setup.
 
 The keystore's four routes take a coordinator or worker token, as every
 keystore route that reads the chain or derives a key:
@@ -672,7 +678,7 @@ keystore route that reads the chain or derives a key:
 | `/wallet/contract/identity` | worker | whether a caller's wallet is the one an account is the wallet contract of |
 
 An account is admitted as a wallet's wallet contract when, as the chain
-answers at the moment of the request, it runs the configured build, has no
+answers at the moment of the request, it runs an approved build, has no
 extension, accepts signatures, and holds a pair whose second key is this
 wallet's enclave key. The account's own access keys and its balance are the
 owner's and are not looked at.

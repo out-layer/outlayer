@@ -127,6 +127,10 @@ pub enum GovAction {
     /// owner (fast path).
     ApproveCompose { compose_hash: String },
     RevokeCompose { compose_hash: String },
+    /// Approve a build of the wallet contract by its code hash: keystores sign for accounts
+    /// that run it (`wallet_contracts.rs`). Revoking one is also open to the owner (fast path).
+    ApproveWalletContract { code_hash: Base58CryptoHash },
+    RevokeWalletContract { code_hash: Base58CryptoHash },
 }
 
 impl GovAction {
@@ -144,6 +148,8 @@ impl GovAction {
             GovAction::RevokeOsImage { .. } => "revoke_os_image",
             GovAction::ApproveCompose { .. } => "approve_compose",
             GovAction::RevokeCompose { .. } => "revoke_compose",
+            GovAction::ApproveWalletContract { .. } => "approve_wallet_contract",
+            GovAction::RevokeWalletContract { .. } => "revoke_wallet_contract",
         }
     }
 }
@@ -341,6 +347,8 @@ impl KeystoreDao {
             GovAction::ApproveCompose { compose_hash } | GovAction::RevokeCompose { compose_hash } => {
                 Self::validate_compose_hash(compose_hash);
             }
+            // A code hash is 32 bytes by its type; nothing else is asked of it.
+            GovAction::ApproveWalletContract { .. } | GovAction::RevokeWalletContract { .. } => {}
             GovAction::AddMember { member } => {
                 require!(!self.dao_members.contains(member), "Already a DAO member");
             }
@@ -638,6 +646,14 @@ impl KeystoreDao {
                 v.retain(|c| *c != compose_hash);
                 Self::set_composes(&v);
                 env::log_str(&format!("compose_revoked {} total={}", compose_hash, v.len()));
+                PromiseOrValue::Value(true)
+            }
+            GovAction::ApproveWalletContract { code_hash } => {
+                Self::approve_wallet_contract(code_hash);
+                PromiseOrValue::Value(true)
+            }
+            GovAction::RevokeWalletContract { code_hash } => {
+                Self::drop_wallet_contract(code_hash, "wallet_contract_revoked");
                 PromiseOrValue::Value(true)
             }
             GovAction::AddMember { member } => {

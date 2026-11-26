@@ -142,12 +142,6 @@ async fn load_admitted(
     account: &str,
     tee: &ed25519_dalek::VerifyingKey,
 ) -> Result<(AccountId, Admitted), ApiError> {
-    let code_hash = state.config.wallet_contract_code_hash.ok_or_else(|| {
-        ApiError::Unavailable(
-            "On-chain custody is not set up on this keystore: WALLET_CONTRACT_CODE_HASH is not set"
-                .to_string(),
-        )
-    })?;
     let account: AccountId = account
         .parse()
         .map_err(|_| ApiError::BadRequest(format!("`{account}` is not a NEAR account id")))?;
@@ -164,9 +158,29 @@ async fn load_admitted(
         .ok_or_else(|| {
             ApiError::Forbidden(format!("`{account}` runs no contract, so it is not a wallet contract"))
         })?;
-    // An account that runs another contract is refused before any of its
+    // The builds this keystore signs for are the keystore DAO's list, read
+    // on every request: a build the DAO took off it is refused from the next
+    // one. An account that runs anything else is refused before any of its
     // methods is called.
-    if observed_code_hash != code_hash {
+    let dao = &state
+        .mpc_context
+        .get()
+        .ok_or_else(|| ApiError::InternalError("MPC CKD context not configured".to_string()))?
+        .mpc_ckd_config
+        .keystore_dao_id;
+    let approved: Vec<String> = serde_json::from_value(
+        near.view_call_json(dao, "get_approved_wallet_contracts", serde_json::json!({}))
+            .await
+            .map_err(|e| {
+                ApiError::Unavailable(format!("the approved wallet contracts could not be read from {dao}: {e:#}"))
+            })?,
+    )
+    .map_err(|_| ApiError::InternalError(format!("`get_approved_wallet_contracts` on {dao} answered in another shape")))?;
+    let is_approved = approved
+        .iter()
+        .filter_map(|b58| shared_tee_helpers::code_hash::parse_code_hash_base58(b58))
+        .any(|hash| hash == observed_code_hash);
+    if !is_approved {
         return Err(ApiError::Forbidden(format!(
             "`{account}`: {}",
             shared_tee_helpers::custody_core::admit::Fault::CodeHash
@@ -187,7 +201,7 @@ async fn load_admitted(
         .map_err(|_| malformed("w_is_signature_allowed"))?,
     };
 
-    let admitted = admit(&code_hash, tee.as_bytes(), &observed)
+    let admitted = admit(&observed_code_hash, tee.as_bytes(), &observed)
         .map_err(|fault| ApiError::Forbidden(format!("`{account}`: {fault}")))?;
     Ok((account, admitted))
 }

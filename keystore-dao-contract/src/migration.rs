@@ -134,6 +134,7 @@ pub struct KeystoreDaoV4 {
     pub next_proposal_id: u64,
     pub votes: LookupMap<(u64, AccountId), bool>,
     pub approved_keystores: UnorderedSet<PublicKey>,
+    #[allow(dead_code)] // read by its place in the stored layout
     pub approved_measurements: Vec<ApprovedMeasurements>,
     pub collaterals: Vec<String>,
     pub ceased_operations: bool,

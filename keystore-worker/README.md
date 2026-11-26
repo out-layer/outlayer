@@ -337,8 +337,9 @@ no caller-written seed may start at (`DECLARED_KEY_ROOTS`). It is derived in
 An owner who leaves derives the same key from their master
 (`custody_core::keys::tee_key`).
 
-`WALLET_CONTRACT_CODE_HASH` (base58) is the code hash of the published build
-of that contract; without it the three `/wallet/contract/*` routes refuse.
+The builds of that contract the keystore signs for are the keystore DAO's list
+(`get_approved_wallet_contracts`, set by `ApproveWalletContract`), read on
+every request; an account that runs any other code is refused.
 
 ### Signing keys
 

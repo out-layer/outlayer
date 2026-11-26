@@ -18,7 +18,6 @@ fn state() -> AppState {
         near_contract_id: None,
         keystore_key_type: near_crypto::KeyType::ED25519,
         tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
-        wallet_contract_code_hash: None,
     };
     AppState::new(Keystore::from_master_secret(&[0x11; 32]).unwrap(), config, None)
 }
@@ -226,6 +225,8 @@ mod at_the_door {
     #[derive(Clone)]
     struct Chain {
         code_hash: [u8; 32],
+        /// The builds the keystore DAO approved, as it lists them.
+        approved: Vec<String>,
         public_key: String,
         extensions: Vec<String>,
         signature_allowed: bool,
@@ -253,6 +254,7 @@ mod at_the_door {
         let pair = PublicKeyPair { agent: agent_key().verifying_key().to_bytes(), tee: tee.to_bytes() };
         let chain = Arc::new(Mutex::new(Chain {
             code_hash: CODE_HASH,
+            approved: vec![bs58::encode(CODE_HASH).into_string()],
             public_key: pair.to_string(),
             extensions: Vec::new(),
             signature_allowed: true,
@@ -285,6 +287,7 @@ mod at_the_door {
                         "get_exit_owner" => json!({
                             "generation": 1, "claim_in_flight": false,
                             "escrow_check": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ESCROW_CHECK)}),
+                        "get_approved_wallet_contracts" => json!(chain.approved),
                         "w_public_key" => json!(chain.public_key),
                         "w_extensions" => json!(chain.extensions),
                         "w_is_signature_allowed" => json!(chain.signature_allowed),
@@ -310,7 +313,6 @@ mod at_the_door {
 
         let config = crate::config::Config {
             near_rpc_url: url.clone().into(),
-            wallet_contract_code_hash: Some(CODE_HASH),
             ..state().config
         };
         let near_client = crate::near::NearClient::new(&url, "outlayer.testnet").unwrap();
@@ -444,6 +446,9 @@ mod at_the_door {
         let honest = stand.chain.lock().unwrap().clone();
         let cases = [
             (Chain { code_hash: [0; 32], ..honest.clone() }, "published build"),
+            // the DAO took the build off its list, or never approved one
+            (Chain { approved: Vec::new(), ..honest.clone() }, "published build"),
+            (Chain { approved: vec![bs58::encode([7u8; 32]).into_string()], ..honest.clone() }, "published build"),
             (Chain { extensions: vec![OWNER.to_string()], ..honest.clone() }, "extension"),
             (Chain { signature_allowed: false, ..honest.clone() }, "does not accept signatures"),
             (Chain { public_key: "not a pair".to_string(), ..honest.clone() }, "not a pair of keys"),
@@ -476,6 +481,16 @@ mod at_the_door {
             .await;
             assert!(matches!(identity, Err(ApiError::Forbidden(_))), "{why}");
         }
+    }
+
+    /// An account stays on the build it was installed with, so the DAO lists a
+    /// later build beside it and both are served.
+    #[tokio::test]
+    async fn a_build_is_served_while_it_is_one_of_the_approved() {
+        let stand = stand().await;
+        stand.chain.lock().unwrap().approved =
+            vec![bs58::encode([7u8; 32]).into_string(), bs58::encode(CODE_HASH).into_string()];
+        prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.expect("one of the approved builds");
     }
 
     #[tokio::test]

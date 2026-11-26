@@ -46,11 +46,6 @@ pub struct Config {
     /// Which WORKER signature schemes this keystore accepts for TEE-session challenge-response.
     /// Set via TEE_ALLOWED_KEY_TYPES, e.g. "ed25519,ml-dsa-65". Default: ed25519 only.
     pub tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes,
-
-    /// The code hash of the published two-key wallet contract: the one build an account must
-    /// run for the keystore to sign as its TEE key (`crate::custody`). Set via
-    /// WALLET_CONTRACT_CODE_HASH (base58); without it the wallet-contract routes refuse.
-    pub wallet_contract_code_hash: Option<[u8; 32]>,
 }
 
 /// A NEAR RPC URL that may carry an API key. It is never printed: `Debug` shows the origin and
@@ -309,14 +304,6 @@ impl Config {
             &std::env::var("TEE_ALLOWED_KEY_TYPES").unwrap_or_else(|_| "ed25519".to_string()),
         );
 
-        let wallet_contract_code_hash = match std::env::var("WALLET_CONTRACT_CODE_HASH") {
-            Ok(text) if !text.trim().is_empty() => Some(
-                shared_tee_helpers::code_hash::parse_code_hash_base58(text.trim())
-                    .context("Invalid WALLET_CONTRACT_CODE_HASH: expected 32 bytes in base58")?,
-            ),
-            _ => None,
-        };
-
         Ok(Config {
             server_addr,
             near_network,
@@ -328,7 +315,6 @@ impl Config {
             operator_account_id: chain.operator_account_id,
             keystore_key_type,
             tee_allowed_key_types,
-            wallet_contract_code_hash,
         })
     }
 

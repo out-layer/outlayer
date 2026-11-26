@@ -69,6 +69,7 @@ near account list-keys worker.outlayer.near network-config mainnet now
 | Add or remove a DAO member | `AddMember`, `RemoveMember`. The last member cannot be removed |
 | Change the delay | `SetDelay`, at most 30 days |
 | Approve the software a keystore may run (the builds that may obtain the master secret) | `ApproveCompose`: the hash of the release's exact software, rebuilt by anyone from the published compose. `ApproveOsImage`: the guest OS it runs under. Both wait out the delay |
+| Approve a build of the wallet contract that keystores sign for (on-chain custody) | `ApproveWalletContract`: the code hash of the build. A later build is approved beside the earlier ones, since an account stays on the build it was installed with. `RevokeWalletContract` takes one off. Both wait out the delay |
 | Admit one keystore instance | A vote on its registration. The contract verifies the instance's Intel TDX attestation, checks that it runs an approved OS and an approved release, and records which instance it is. The vote names the key it installs, so it cannot land on another instance's registration. Every instance takes its own vote; the build is checked again when the vote reaches quorum |
 | Approve a worker build | A `Call` to `add_approved_measurements` on the register |
 | Replace the operations owner of any contract | `SetOwner`, or a `Call` to `set_owner` |
@@ -115,6 +116,7 @@ None of them touches code, keys, members, the delay or build approvals.
 | Contract | Owner method | What it does | Why the owner has it |
 |---|---|---|---|
 | DAO | `remove_approved_compose`, `remove_approved_os_image` | Revoke keystore builds | The fast brake on a bad build: no keystore of it registers again until the DAO approves a build |
+| DAO | `remove_approved_wallet_contract` | Take a wallet contract build off the list | The fast brake on a bad build: keystores stop signing for its accounts at once. It moves nothing: what lies on them moves by their own keys or through the owner's exit |
 | DAO | `reject_registration` | Reject a keystore registration still waiting for votes | Stops a suspicious instance at once. It installs nothing and approves nothing |
 | DAO | `remove_stale_proposals` | Delete registrations pending for more than 48 hours | Cleanup of instances that stopped waiting |
 | DAO | `cancel` | Cancel a pending or approved proposal | A brake on a mistaken proposal. It cannot cancel a proposal that replaces an owner, a governance account or an operator — the owner cannot keep itself in place |

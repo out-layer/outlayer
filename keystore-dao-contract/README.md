@@ -41,7 +41,7 @@ delay are the root of trust. Every governance method is for DAO members only.
   governed one), `Call{target, method, args, deposit, gas_tgas}` (a method on a
   governed contract; never this contract, never the MPC contract),
   `ApproveOsImage`, `RevokeOsImage`, `ApproveCompose`, `RevokeCompose`,
-  `AddMember`, `RemoveMember`, `SetDelay`, `SetOwner`. `ApproveMeasurements` /
+  `ApproveWalletContract`, `RevokeWalletContract`, `AddMember`, `RemoveMember`, `SetDelay`, `SetOwner`. `ApproveMeasurements` /
   `RevokeMeasurements` are no longer taken (a keystore build is its guest OS and
   its compose); a stored one still reads and does not execute.
 - **The owner** (`owner_id`) cannot propose, vote or execute. It cancels a
@@ -295,6 +295,23 @@ takes either off the list at once (`remove_approved_os_image`,
 `remove_approved_compose`): no keystore of it registers from then on, one whose
 registration waits for votes included.
 
+### The wallet contract builds keystores sign for
+
+An agent in on-chain custody keeps its balance on an account that runs a wallet
+contract, and a keystore gives its half of a signature only to an account whose
+code hash is on the DAO's list. Keystores read the list on every request.
+
+| What | Action | Changes |
+|---|---|---|
+| A build of the wallet contract: `code_hash`, as NEAR reports it for an account (base58) | `ApproveWalletContract` / `RevokeWalletContract` | per build of the wallet contract |
+
+It is a list and not one value: an account stays on the build it was installed
+with, so a later build is approved beside the earlier one. A build taken off the
+list is refused from the next request; what lies on its accounts moves by their
+own keys or through the owner's exit. The owner takes one off at once
+(`remove_approved_wallet_contract`). `get_approved_wallet_contracts()` reads the
+list.
+
 An approved build says which code runs in the TD, not whose instance it is: the
 keystore's environment (which workers and which coordinator it serves) is not
 measured, and anyone with a TDX host can start the same build with their own.
@@ -458,6 +475,8 @@ owner to the next generation; the keystore stops serving the one that left.
 - `remove_approved_os_image(image)`, `remove_approved_compose(compose_hash)` —
   registered keystores keep their keys; revoke those with
   `propose_revoke_keystore_keys`.
+- `remove_approved_wallet_contract(code_hash)` — keystores stop signing for the
+  accounts that run that build of the wallet contract.
 - `update_collateral(collateral, index)` — `collateral` is the
   `QuoteCollateralV3` JSON as a string; `index` is the slot, `0` or `1` (at most
   two slots, one per platform FMSPC), at most 128 KiB each. A slot is replaced
@@ -504,6 +523,7 @@ owner to the next generation; the keystore stops serving the one that left.
 - `is_keystore_approved(public_key)` — `public_key` as a string; an unparsable
   key returns `false`
 - `get_approved_keystores(from_index, limit)`
+- `get_approved_wallet_contracts()` — the wallet contract builds keystores sign for
 - `get_approved_os_images()`, `get_approved_composes()`,
   `is_build_approved(measurements, compose_hash)` — hex accepted in either case and
   stored, revoked and compared in lowercase, as a quote is read
