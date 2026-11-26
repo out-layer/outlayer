@@ -344,7 +344,7 @@ token's own for a token. A token is its id inside NEAR Intents
 | `relayed` | the transaction `tx_hash` was sent and its outcome is not recorded | reads the operation; the read settles it |
 | `success` | the request executed on chain. For a swap or a withdrawal to another chain it says the input reached 1Click's deposit address; `route_status` on a read follows the route | — |
 | `failed` | the chain refused; `result` carries the chain's failure | reads the failure; the same thing again is another operation under another id |
-| `closed` | ended with nothing sent, for `reason`: the vote was rejected or expired, an approval was not used within its 24 hours, a prepared request was not relayed within ten minutes, or its transaction never reached the chain in that time | reads the reason; the same thing again is another operation under another id |
+| `closed` | ended with nothing sent, for `reason`: the vote was rejected or expired, an approval was not used within its 24 hours, a prepared request was not relayed within ten minutes, its transaction never reached the chain in that time, or the node refused it three times | reads the reason; the same thing again is another operation under another id |
 
 ### The agent's signed request
 
@@ -396,7 +396,8 @@ later request under the same id is compared with. It is not the hash of
 
 | Refusal | Meaning |
 |---|---|
-| `400 bad_request` | a header is missing or malformed, the body is not an operation, the `id` is not valid, or the kind is not one a wallet contract does |
+| `400 bad_request` | a header is missing or malformed, the body is not an operation, the `id` is not valid, the kind is not one a wallet contract does, or a `call`'s `args_base64` is longer than 65,536 characters |
+| `400 insufficient_balance` | a swap or a withdrawal to another chain sends more than the wallet contract holds of the token inside NEAR Intents; checked before any quote |
 | `400 below_min_amount_out`, `upstream_rejected`, `no_liquidity`, `unsupported_token`, `unsupported_chain` | what 1Click answered to the quote |
 | `401 invalid_signature` | the request is not the agent's |
 | `403 policy_denied` | the policy, or the enclave judging the same operation again, refuses it; `message` says why |
@@ -404,6 +405,8 @@ later request under the same id is compared with. It is not the hash of
 | `403 wallet_contract_refused` | the enclave does not serve the account as this wallet's wallet contract: it runs no approved build, has an extension, has signatures switched off, or its pair does not hold this wallet's key; `message` says which |
 | `409 conflict` | the nonce was taken, or the `id` was used for another content |
 | `409 wallet_busy` | another operation is using this wallet; one operation of a wallet runs at a time |
+| `409 conflict` (votes) | 20 operations of this wallet already wait for the approvers; one is decided or closes before another is asked for |
+| `429 rate_limited` | too many quotes for this wallet; try later |
 | `429 operation_limit_reached` | the wallet's counted ceiling on operations is reached |
 
 A refusal creates no operation under the id.
