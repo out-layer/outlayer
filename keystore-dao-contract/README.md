@@ -41,7 +41,7 @@ delay are the root of trust. Every governance method is for DAO members only.
   governed one), `Call{target, method, args, deposit, gas_tgas}` (a method on a
   governed contract; never this contract, never the MPC contract),
   `ApproveOsImage`, `RevokeOsImage`, `ApproveCompose`, `RevokeCompose`,
-  `ApproveWalletContract`, `RevokeWalletContract`, `AddMember`, `RemoveMember`, `SetDelay`, `SetOwner`. `ApproveMeasurements` /
+  `AddMember`, `RemoveMember`, `SetDelay`, `SetOwner`. `ApproveMeasurements` /
   `RevokeMeasurements` are no longer taken (a keystore build is its guest OS and
   its compose); a stored one still reads and does not execute.
 - **The owner** (`owner_id`) cannot propose, vote or execute. It cancels a

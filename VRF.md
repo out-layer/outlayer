@@ -35,7 +35,7 @@ vrf:{request_id}:{sender_id}:{user_seed}
 ```
 
 - **request_id** — the contract's request id (on-chain request) or the numeric request id the coordinator assigns to an HTTPS call. Auto-injected by worker, WASM cannot set it.
-- **sender_id** — the paying account: the transaction's sender (blockchain) or the payment key owner (HTTPS). It is not the wallet contract's account a `use_bound_identity` run acts as. Auto-injected by worker.
+- **sender_id** — the paying account: the transaction's sender (blockchain) or the payment key owner (HTTPS). It is not the bound name a `use_bound_identity` run uses. Auto-injected by worker.
 - **user_seed** — arbitrary string from developer's WASM module. Must not contain `:`.
 
 Example: `vrf:98321:alice.near:coin-flip`

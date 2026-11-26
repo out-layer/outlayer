@@ -54,10 +54,11 @@ When writing WASI containers:
 
 ### NEAR Contract Development
 1. Use `cargo near build` (never raw `cargo build --target wasm32-unknown-unknown`)
-2. Create `rust-toolchain.toml` with `channel = "1.85.0"`
+2. A contract's toolchain is its own: the `rust-toolchain.toml` and the
+   reproducible-build image pinned in its `Cargo.toml`. Do not change them in
+   passing; a new contract takes the newest pair already used here
 3. Add `schemars = "0.8"` and derive `JsonSchema` on all public API types
 4. Use `#[schemars(with = "String")]` for AccountId fields
-5. Use near-sdk 5.9.0
 
 ### OutLayer URLs
 - **API Base**: `https://api.outlayer.ai` (for HTTPS API calls)
@@ -188,9 +189,9 @@ cd keystore-worker && cargo run          # Run keystore
 - [DOCS_INDEX.md](https://github.com/out-layer/dashboard/blob/main/DOCS_INDEX.md) - Integration guides, API reference (dashboard repo)
 - [wasi-examples/WASI_TUTORIAL.md](wasi-examples/WASI_TUTORIAL.md) - WASI guide
 - [docs/CONNECTORS.md](docs/CONNECTORS.md) - Building a connector: model, secrets, limits
+- [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md) - On-chain custody: an agent's wallet contract under two signatures; setup, operations, approvals, limits, leaving, byte formats
 - [docs/TASKS.md](docs/TASKS.md) - Tasks between an agent and its owner: the model, the inbox, the host interface
 - [docs/CONNECTOR_TASKS.md](docs/CONNECTOR_TASKS.md) - Owner confirmation in a connector: the policy's `confirm`, the `confirm` operation, rules, prices, tests
-- [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md) - On-chain custody: an agent's wallet contract under two signatures; setup, operations, approvals, limits, leaving, byte formats
 - [docs/ADMIN.md](docs/ADMIN.md) - Coordinator `/admin/*` endpoints, auth model, what a leaked token reaches
 - [contract/README.md](contract/README.md) - Contract API
 - [worker/README.md](worker/README.md) - Worker config

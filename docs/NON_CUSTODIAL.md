@@ -191,7 +191,7 @@ refused, asking or not:
 | `withdraw` (out of NEAR Intents) | waits for approval |
 | `intents_transfer` (inside NEAR Intents) | waits for approval |
 | `cross_chain_withdraw` (to another chain; its capability must be on) | waits for approval |
-| `call` (a contract call) | refused |
+| `call` (a contract call, `w_execute_extension` and the accounts inside it included) | refused |
 | `delete` (the beneficiary) | refused |
 | `limit_order` (the recipient) | refused |
 | `intents_storage_deposit` (the token contract) | refused |
@@ -219,13 +219,14 @@ is a precondition enforced by measured code, using the public key pinned
 in the on-chain policy. An approver entry without a `pubkey` accepts any
 full-access key of that account, which the enclave checks on chain.
 
-## 6. The configurations
+## 6. The four configurations
 
 | Configuration | Who holds the API credential | Who can move funds | What OutLayer can do alone |
 |---|---|---|---|
 | **Default, no policy** | whoever registered the wallet | that credential holder, unrestricted | nothing outside the primitives, but the rules are empty — do not run value on this |
 | **Policy, no approvers** | the operator of the agent | the credential holder, within the owner's limits, whitelists and caps | nothing outside the policy; the controller can freeze on chain at any time |
 | **Policy with the owner as approver** | may be the platform or the agent | **no one without the owner's NEP-413 signature** | nothing; a proposal without the owner's signature never becomes a transaction |
+| **Bound personal account** | the agent holds only a scoped extension | the account holder, always | nothing; the account's own keys stay with its holder, and the extension is revoked in one transaction |
 
 These describe who may authorise a transaction. The last column holds for
 operations the enclave builds itself; the five intents operations in
@@ -234,42 +235,8 @@ governance keys in section 11 sit outside this table. The next two
 sections are about where the root itself lives and how its owner takes it
 out, which is a separate choice.
 
-> Availability: these three configurations and per-customer vaults are
-> live on mainnet.
-
-### On-chain custody
-
-A wallet with an owner — an account registered for the owner's exit in the
-keystore DAO — can keep its main balance in a wallet contract: a NEAR
-account running the two-key variant of the NEAR Intents wallet contract.
-The owner installs it on a sub-account of theirs or on their own account,
-with a pair of public
-keys: the agent's and the wallet's TEE key. The wallet contract executes a
-request only under both signatures.
-
-- The enclave signs its half only for an operation the owner's policy
-  allows, and only when a policy stored by the owner account is on chain.
-- The agent signs last, with its own key.
-- The agent's OutLayer wallet, its working account, relays the transaction
-  and pays its gas.
-
-A wallet contract does a NEAR transfer, a contract call, a transfer inside
-NEAR Intents, a swap and a withdrawal to another chain through 1Click, and
-a withdrawal to NEAR. What the agent works with — a confidential balance,
-a venue's trading account — stays on the working account, under the
-enclave's key as every OutLayer wallet.
-
-What it adds: the chain itself requires two signatures for anything to
-leave the wallet contract, so neither the enclave's key nor the agent's
-moves anything out of it alone, and the owner can leave and sign for both
-sides ([`OWNER_EXIT.md`](OWNER_EXIT.md#leaving-with-a-wallet-contract)).
-What it costs: a NEAR transaction and gas per move, a signature on the
-agent's side, and a setup by the owner. The setup, the operations, their
-routes and the byte formats: [`ON_CHAIN_CUSTODY.md`](ON_CHAIN_CUSTODY.md).
-
-No wallet signs a call to `w_execute_extension`, the method of an account
-with full control of a wallet contract: it is refused under any policy
-and under none.
+> Availability: all four configurations and per-customer vaults are live
+> on mainnet.
 
 ## 7. Per-customer vaults: your own custody root
 
@@ -348,13 +315,10 @@ one. The platform can assemble and submit work; it cannot complete a
 transfer. Best when the platform drives the workflow but must not have
 independent control.
 
-**Customer's wallet contract, two signatures.** The customer installs a
-wallet contract on a NEAR account of their choice and the agent's main
-balance lies there. The chain requires the agent's signature and the
-enclave's for anything to leave it, and the enclave signs only for an
-operation the customer's policy allows. Best when the customer wants that
-rule held by the chain itself and accepts a NEAR transaction and gas per
-move.
+**Customer's own account, scoped extension.** The customer's existing
+NEAR account keeps its own keys and grants a revocable, policy-bounded
+extension to the agent's executor. Best when the customer already holds a
+wallet and wants to keep signing with it.
 
 For escrow, hold the funds in an on-chain contract rather than in a
 platform wallet. Funds locked by contract rules are not held by anyone,

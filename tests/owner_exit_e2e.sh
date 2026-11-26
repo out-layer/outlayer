@@ -39,8 +39,12 @@
 #       the NEAR-deposit route swaps through Intents, which testnet lacks — runs a call
 #   E10 sign-message refuses a NEP-641 recipient (`<chain>: <account>[ -> …][ @ <time>]`)
 #       with its own words; an ordinary recipient is signed (wallet 0 has no policy)
-#   B2  a call to `w_execute_extension` from the owner's wallet (wallet 0 has no policy):
-#       403 `policy_denied`
+#   B1  `PUT /wallet/v1/binding` with the owner's wallet: to another account (personal mode)
+#       and in the leased mode (another account, the owner's own) refused with the
+#       coordinator's words; the owner's own account in the personal mode taken, pending,
+#       then deleted
+#   B2  a w_execute_extension of the owner's wallet on another account: refused in the
+#       keystore's words
 #   E5  a full-access key deleted from the owner's account stops opening the owner's
 #       wallets; the row says how long the coordinator kept it
 #   X1  an exit without the fee is refused; started with it; a second one is refused; a
@@ -605,13 +609,46 @@ if [[ "$HTTP" == 200 && "$(jq -r '.signature // ""' <<<"$BODY")" == ed25519:* &&
   pass "E10 an ordinary recipient is signed by wallet 0, which has no policy: the NEP-641 rule refuses only its own form"
 else fail "E10 an ordinary recipient: $HTTP $(why)"; fi
 
-# ── B2: no wallet signs a call to w_execute_extension ────────────────────────
-# The method acts with full control of the account it is aimed at, so the call is refused
-# for every wallet, under any policy and under none. Wallet 0 has no policy.
-log "B2 a call to w_execute_extension is refused"
+# ── B1–B2: a wallet that can leave acts only on its owner's account ──────────
+# The wallet's NEAR key is the executor of any account it is bound to, and it leaves with
+# the owner's master. So the coordinator binds it to the owner's own account alone, and
+# never in the leased mode; the keystore signs no w_execute_extension on another account.
+log "B1 the owner's wallet is bound only to the owner's own account"
+B_WORDS="is bound only to the account they leave to"
+b1_put() { api_wk "$KEY0" PUT /wallet/v1/binding "$1" >/dev/null; }
+b1_refused() { # b1_refused <name> <words> <body>
+  b1_put "$3"
+  if [[ "$HTTP" == 400 ]] && grep -qF "$B_WORDS" <<<"$BODY" && grep -qF "$2" <<<"$BODY"; then pass "$1: 400, $2"
+  else fail "$1: $HTTP $(why)"; fi
+}
+b1_refused "B1 personal_account to another account" "'$PARENT' is not that account" \
+  "$(jq -nc --arg a "$PARENT" '{asset_account_id:$a, kind:"personal_account"}')"
+# impl_version 6 is a version the coordinator's own migration seeds: a refusal that names
+# impl_version is the version check, not this rule, and fails the row.
+b1_refused "B1 hos_lease to another account" "kind=hos_lease" \
+  "$(jq -nc --arg a "$PARENT" '{asset_account_id:$a, owner_account_id:$a, impl_version:6, kind:"hos_lease"}')"
+b1_refused "B1 hos_lease to the owner's own account" "kind=hos_lease" \
+  "$(jq -nc --arg a "$OWNER" '{asset_account_id:$a, owner_account_id:$a, impl_version:6, kind:"hos_lease"}')"
+# The owner's own account in the personal mode is taken: a pending record, nothing on
+# chain until the owner installs the wallet contract — which this run does not. Deleted
+# at once.
+b1_put "$(jq -nc --arg a "$OWNER" '{asset_account_id:$a, kind:"personal_account"}')"
+if [[ "$HTTP" == 200 && "$(jq -r '[.kind, .asset_account_id, .binding_status] | @json' <<<"$BODY")" == "[\"personal_account\",\"$OWNER\",\"pending\"]" ]]; then
+  pass "B1 personal_account to the owner's own account: taken, pending"
+  api_wk "$KEY0" DELETE /wallet/v1/binding >/dev/null
+  [[ "$HTTP" == 200 && "$(jq -r .binding_status <<<"$BODY")" == revoked ]] && pass "B1 and deleted" \
+    || fail "B1 the binding to the owner's account could not be deleted: $HTTP $(why)"
+else fail "B1 personal_account to the owner's own account: $HTTP $(why)"; fi
+
+log "B2 the keystore signs no w_execute_extension on another account"
+# An unbound account, so nothing in the coordinator stands in the way: the refusal is the
+# keystore's, before its version gate, the decoder and the policy. A keystore without the
+# rule refuses the call at that gate instead (no binding names a decoder), in other words,
+# and the row fails on the words; nothing is signed either way.
 B2_ARGS=$(jq -nc --arg a "$PARENT" '{request:{external:[{receiver_id:$a, actions:[{action:"transfer", payload:{amount:"1"}}]}]}}')
 api_wk "$KEY0" POST /wallet/v1/call "$(jq -nc --arg r "$PARENT" --argjson a "$B2_ARGS" '{receiver_id:$r, method_name:"w_execute_extension", args:$a, deposit:"1"}')" >/dev/null
-if [[ "$HTTP" == 403 && "$(err_of)" == policy_denied ]]; then pass "B2 refused: 403 policy_denied"
+if [[ "$HTTP" =~ ^4 ]] && grep -qF "acts through w_execute_extension only on the account they leave to" <<<"$BODY" \
+   && grep -qF "'$PARENT' is not that account" <<<"$BODY"; then pass "B2 refused ($HTTP), in the keystore's words"
 else fail "B2 a w_execute_extension on $PARENT: $HTTP $(why)"; fi
 
 # ── E5: a key deleted from the owner's account ───────────────────────────────

@@ -1,8 +1,8 @@
 # Governance
 
-OutLayer's three on-chain contracts are governed by a DAO. No account holds a key that can
-change their code. The DAO members decide together, and every change of the rules, of the code
-or of the software that may hold the master secret waits out a public delay.
+OutLayer's three on-chain contracts are governed by a DAO. Its members decide together, and every
+DAO proposal that changes the rules, the code or the software that may hold the master secret
+waits out a public delay.
 An operations owner runs day-to-day settings. It can apply the brakes and adjust parameters, but
 it cannot change what the contracts are, and the DAO can replace it at any time.
 
@@ -12,14 +12,9 @@ it cannot change what the contracts are, and the DAO can replace it at any time.
 | Main | `outlayer.near` | Execution requests, payments, projects, secrets, wallet policies |
 | Register | `worker.outlayer.near` | The TEE workers: which builds may run, and their keys |
 
-## No full-access keys
+## Function-call keys
 
-None of the three accounts has a full-access key. Nobody can deploy code to them, add a key, or
-sign arbitrary transactions as them.
-
-### Function-call keys
-
-`list-keys` on these accounts still shows keys: function-call keys. Each is a service key for one
+`list-keys` on these accounts shows function-call keys. Each is a service key for one
 narrow job. It signs calls only to the methods listed on it, on one named contract; it cannot
 deploy code, add or remove keys, or transfer NEAR, and its allowance pays only for the gas of
 those calls. A contract installs each of them, never a person:
@@ -32,8 +27,8 @@ those calls. A contract installs each of them, never a person:
   verified attestation, and only for a build the DAO approved. It may call only `request_key`
   (obtain the master secret through NEAR MPC), `mark_vault_verified` and `ban_vault`.
 
-The set follows the running fleet: the keys on an account are those of the instances running
-now. A redeployed worker or keystore registers a new key, and the old one is removed as it is
+The set follows the running fleet: the function-call keys on an account are those of the
+instances running now. A redeployed worker or keystore registers a new key, and the old one is removed as it is
 rotated out: a worker's by `remove_worker_keys`, a keystore's by a DAO vote
 (`propose_revoke_keystore_keys`).
 
@@ -61,7 +56,7 @@ near account list-keys worker.outlayer.near network-config mainnet now
   governance account, an operator, a membership), an older one can no longer execute after a newer
   one has.
 
-### What only the DAO can do
+### What the DAO decides
 
 | Action | How |
 |---|---|
@@ -69,17 +64,17 @@ near account list-keys worker.outlayer.near network-config mainnet now
 | Add or remove a DAO member | `AddMember`, `RemoveMember`. The last member cannot be removed |
 | Change the delay | `SetDelay`, at most 30 days |
 | Approve the software a keystore may run (the builds that may obtain the master secret) | `ApproveCompose`: the hash of the release's exact software, rebuilt by anyone from the published compose. `ApproveOsImage`: the guest OS it runs under. Both wait out the delay |
-| Approve a build of the wallet contract that keystores sign for (on-chain custody) | `ApproveWalletContract`: the code hash of the build. A later build is approved beside the earlier ones, since an account stays on the build it was installed with. `RevokeWalletContract` takes one off. Both wait out the delay |
 | Admit one keystore instance | A vote on its registration. The contract verifies the instance's Intel TDX attestation, checks that it runs an approved OS and an approved release, and records which instance it is. The vote names the key it installs, so it cannot land on another instance's registration. Every instance takes its own vote; the build is checked again when the vote reaches quorum |
 | Approve a worker build | A `Call` to `add_approved_measurements` on the register |
 | Replace the operations owner of any contract | `SetOwner`, or a `Call` to `set_owner` |
 | Replace a contract's governance account or the main contract's operator | A `Call` to `set_governance` / `set_operator` |
 | Change the stablecoin the main contract accepts | A `Call` to `set_payment_token_contract` |
+| Approve a build of the wallet contract that keystores sign for (on-chain custody) | `ApproveWalletContract`: the code hash of the build. A later build is approved beside the earlier ones, since an account stays on the build it was installed with. `RevokeWalletContract` takes one off. Both wait out the delay |
 | Move a balance held by the main contract (a rescue) | A `Call` to `gov_transfer` |
 | Revoke keystore keys | `propose_revoke_keystore_keys`, decided by the members' vote |
 
 A `Call` proposal can reach only a contract the DAO governs, and never the DAO itself or the MPC
-contract. Code changes only as an `Upgrade`, by its hash.
+contract. A proposal changes code only as an `Upgrade`, by its hash.
 
 ### What any single member can do
 Each of these is a narrow switch, not a change of rules:
@@ -116,12 +111,12 @@ None of them touches code, keys, members, the delay or build approvals.
 | Contract | Owner method | What it does | Why the owner has it |
 |---|---|---|---|
 | DAO | `remove_approved_compose`, `remove_approved_os_image` | Revoke keystore builds | The fast brake on a bad build: no keystore of it registers again until the DAO approves a build |
-| DAO | `remove_approved_wallet_contract` | Take a wallet contract build off the list | The fast brake on a bad build: keystores stop signing for its accounts at once. It moves nothing: what lies on them moves by their own keys or through the owner's exit |
 | DAO | `reject_registration` | Reject a keystore registration still waiting for votes | Stops a suspicious instance at once. It installs nothing and approves nothing |
 | DAO | `remove_stale_proposals` | Delete registrations pending for more than 48 hours | Cleanup of instances that stopped waiting |
 | DAO | `cancel` | Cancel a pending or approved proposal | A brake on a mistaken proposal. It cannot cancel a proposal that replaces an owner, a governance account or an operator — the owner cannot keep itself in place |
 | DAO, register | `update_collateral` | Store Intel's TDX reference data (at most 128 KiB per slot) | Intel republishes it about monthly, and every registration verifies against it |
 | Register | `remove_approved_measurements`, `clear_all_approved_measurements` | Revoke worker builds | The fast brake on a bad worker build |
+| DAO | `remove_approved_wallet_contract` | Take a wallet contract build off the list | The fast brake on a bad build: keystores stop signing for its accounts at once. It moves nothing: what lies on them moves by their own keys or through the owner's exit |
 | Register | `remove_worker_keys` | Remove worker keys | Retires keys of stopped workers |
 | Main | `set_paused` | Pause new requests, projects and policy changes | An emergency stop. While paused, users can still freeze their wallets, and refunds and withdrawals keep working |
 | Main | `set_pricing`, `set_subscription_plans`, `set_project_pricing`, `remove_project_pricing` | Prices of execution and of plans | Prices follow costs and the market |
@@ -141,7 +136,7 @@ the DAO's decision.
 ## Verifying it yourself
 - **Code.** `near account view-account-summary <account> network-config mainnet now` shows the code hash; a reproducible
   build of the release (`cargo near build reproducible-wasm`) gives the same sha256.
-- **Keys.** `list-keys` shows only function-call keys.
+- **Keys.** `list-keys` shows the keys on each account.
 - **Governance.** `get_governance` on `outlayer.near` and `worker.outlayer.near` returns
   `dao.outlayer.near`.
 - **Members and delay.** On the DAO: `get_dao_members`, `get_gov_delay_sec`, `get_config`.

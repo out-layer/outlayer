@@ -37,9 +37,8 @@ dashboard host `app.outlayer.ai` serves no API.
 | `X-Wallet-Id` | `/call` to a connector that acts on the wallet | The paying key's own wallet (`wallet_id` from `GET /wallet/v1/address`); without it the run has no wallet |
 | _(none)_ | `/register`, public read endpoints | No auth |
 
-> Only `X-Payment-Key`, `Authorization: Bearer wk_...` / `near:...` or, on
-> `/wallet/contract/v1/*`, the agent's signature headers are accepted for
-> authenticated calls. There is no `X-API-Key` header.
+> Only `X-Payment-Key` or `Authorization: Bearer wk_...` / `near:...` are
+> accepted for authenticated calls. There is no `X-API-Key` header.
 
 ## Execution API
 
@@ -93,6 +92,7 @@ secret issued by the NEAR MPC network. All endpoints except `/register` require
 | GET | `/wallet/v1/audit` | Audit log |
 | POST | `/wallet/v1/delete` | Delete wallet |
 
+### Confidential Intents (private balances)
 ### On-chain custody (wallet contract)
 
 A wallet with an owner can keep its main balance in a wallet contract: a NEAR
@@ -117,7 +117,6 @@ Operations: a NEAR transfer, a contract call, a transfer inside NEAR Intents, a
 swap and a withdrawal to another chain through 1Click, a withdrawal to NEAR.
 The model, the setup and every refusal: [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md).
 
-### Confidential Intents (private balances)
 
 **Mainnet only** — built on NEAR Intents, so unavailable on the testnet API.
 

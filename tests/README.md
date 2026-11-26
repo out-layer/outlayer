@@ -54,6 +54,7 @@ and the rules every live run follows.
 | `unit.sh` | Builds the example wasm and runs the worker's `cargo test`; no network |
 | `run_all.sh` | `unit.sh`, then the wallet suites against a **local** coordinator on `localhost:8080` (skipped when none answers) |
 | `run_custody.sh` | Every custody suite, sequentially, against testnet; prints the plan without `--apply`; needs `PARENT` and, for some suites, `PSQL_CMD` |
+| `run_hos_suite.sh` | Every HoS Agent Connect suite, sequentially, with a coverage report |
 | `run_tests.py` | Runs suites under a pty (for keychain prompts); env from `tests/.env.tests` (gitignored): `MPC_PUBLIC_KEY`, `PARENT`, `APPROVER`, `NETWORK`; `--list`, `--group`, `--all` |
 
 ## Suites by area
@@ -79,15 +80,24 @@ Network is the suite's default; most take `NETWORK` / `COORDINATOR_URL`.
 | `refusals_e2e.sh`, `stuck_request_repair_e2e.sh` | testnet |
 | `wallet_*` mode, signing and dry-run suites | see [WALLET_TESTS.md](WALLET_TESTS.md) |
 
+### HoS Agent Connect
+
+`hos_fixture.sh` (shared fixture), `hos_endpoints_e2e.sh`,
+`hos_decoder_policy_e2e.sh`, `hos_custody_matrix_e2e.sh`,
+`hos_identity_e2e.sh`, `hos_lifecycle_e2e.sh`, `hos_dos_e2e.sh`,
+`hos_gas_floor_e2e.sh`, `hos_lease_stub_e2e.sh`, `hos_lease_live_e2e.sh`,
+`hos_lease_bravo_e2e.sh`, `binding_lifecycle_e2e.sh`,
+`bound_identity_onchain_e2e.sh`, `personal_wallet_e2e.sh`,
+`personal_wallet_global_e2e.sh` — testnet; run them with `run_hos_suite.sh`.
+Stub contracts: `deputy-stub/`, `hos-status-stub/`.
+
 ### Secrets and keys
 
 `secret_access_conditions_e2e.sh`, `secret_build_lock_e2e.sh`,
 `secret_build_lock_fresh_project_e2e.sh`, `secret_predecessor_e2e.sh`,
 `secret_predecessor_cli_e2e.sh`, `secret_prepublish_hash_e2e.sh`,
 `secrets_security_e2e.sh`, `signing_keys_e2e.sh`, `encryption_keys_e2e.sh`,
-`storage_scope_e2e.sh`, `gmail_delegation_e2e.sh` — testnet. Stub contract:
-`deputy-stub/` (a relay contract for `secret_predecessor_e2e.sh` and
-`secrets_security_e2e.sh` X1, and the second contract of `caller_gate_e2e.sh`).
+`storage_scope_e2e.sh`, `gmail_delegation_e2e.sh` — testnet.
 
 ### Connectors, payments, subscriptions
 

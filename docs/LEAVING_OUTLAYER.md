@@ -51,10 +51,11 @@ What the exit does **not** do:
 - **The wallet policy no longer applies.** Limits, allowlists and
   approvals were enforced by the keystore before it signed. A key you
   hold locally signs anything.
-- **It carries no right over another account that OutLayer signed
-  for.** No wallet signs a call to `w_execute_extension`, and a vault
-  wallet signs no raw NEAR payload
-  ([VAULTS.md](../VAULTS.md#a-vault-wallet-acts-through-no-extension)).
+- **It carries no account but yours.** A vault wallet's NEAR key is
+  the executor of any account bound to it through Agent Connect, so a
+  vault wallet is bound only to the vault's `parent`, and never to a
+  leased (`hos_lease`) account
+  ([VAULTS.md](../VAULTS.md#a-vault-wallet-is-bound-only-to-the-parent)).
 
 ---
 

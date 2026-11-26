@@ -4,7 +4,7 @@
 
 ## Executive Summary
 
-**NEAR OutLayer** gives an AI agent two things inside one attested Intel TDX enclave: a multi-chain **custody wallet** whose keys are derived and used inside the enclave and whose spending policy its owner sets, and **verifiable compute** — arbitrary untrusted code executed with hardware-enforced guarantees and an enclave-signed attestation of what ran. With on-chain custody an agent's main balance lies in a wallet contract on NEAR, which executes a request only under two signatures: the agent's own key and a key in the enclave.
+**NEAR OutLayer** gives an AI agent two things inside one attested Intel TDX enclave: a multi-chain **custody wallet** whose keys are derived and used inside the enclave and whose spending policy its owner sets, and **verifiable compute** — arbitrary untrusted code executed with hardware-enforced guarantees and an enclave-signed attestation of what ran.
 
 Compute reaches customers primarily as **connectors**: named operations with on-chain prices (`send_email`, `pay_invoice`) that run in the same enclave that holds the keys. It is also callable directly by a NEAR smart contract via the yield/resume mechanism, or by any backend over HTTPS.
 
@@ -160,7 +160,7 @@ pub struct RequestParams {
     pub compile_only: bool,            // Build parameter: compile only, no execution
     pub project_uuid: Option<String>,  // Set by the contract from a Project source; a caller's value is ignored
     pub attached_usd: Option<U128>,    // Payment to project developer (stablecoin micro-units), Project source only
-    pub use_bound_identity: bool,      // Run the guest as the account of the caller's wallet contract
+    pub use_bound_identity: bool,      // Agent Connect: run the guest under the caller's bound account name
 }
 ```
 
@@ -727,7 +727,7 @@ Variables injected into WASM execution context (system names are stripped from s
 |----------|------------|-----------|
 | `OUTLAYER_EXECUTION_TYPE` | `"NEAR"` | `"HTTPS"` |
 | `NEAR_NETWORK_ID` | `"mainnet"` / `"testnet"` | `"mainnet"` / `"testnet"` |
-| `NEAR_SENDER_ID` | Transaction signer | Payment key owner (or the account of the caller's wallet contract with `use_bound_identity`) |
+| `NEAR_SENDER_ID` | Transaction signer | Payment key owner (or the bound account with `use_bound_identity`) |
 | `NEAR_USER_ACCOUNT_ID` | Paying account | Payment key owner |
 | `NEAR_PREDECESSOR_ID` | Calling account | `""` |
 | `USD_PAYMENT` | `"0"` | X-Attached-Deposit value |
@@ -758,7 +758,7 @@ Blockchain-native email for NEAR accounts. Every NEAR account has an email: `ali
 
 ## Agent Custody
 
-Multi-chain custody wallets for AI agents. The agent gets an API key, the wallet's keys are derived and used in the keystore TEE, the wallet owner controls the policy (TEE custody; with on-chain custody, below, the main balance also needs the agent's own key). User-facing reference: https://app.outlayer.ai/docs/agent-custody. Custody model and its limits: [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md).
+Multi-chain custody wallets for AI agents. The agent gets an API key, wallet keys are derived and used in the keystore TEE, the wallet owner controls the policy. User-facing reference: https://app.outlayer.ai/docs/agent-custody. Custody model and its limits: [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md).
 
 **On-chain custody.** A wallet with an owner can keep its main balance in a wallet contract: a NEAR account running the two-key variant of the NEAR Intents wallet contract, installed by the owner with a pair of public keys — the agent's and the wallet's TEE key (`wallet-contract:{wallet_id}` under the owner's master). The wallet contract executes a request only under both signatures. The enclave signs its half only for an operation the owner's policy allows; the agent signs last; the agent's OutLayer wallet relays the transaction and pays its gas. The whole model: [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md). Routes: [API.md](API.md#on-chain-custody-wallet-contract). After an owner exit the owner derives both keys and acts alone: [docs/OWNER_EXIT.md](docs/OWNER_EXIT.md#leaving-with-a-wallet-contract).
 

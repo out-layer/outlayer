@@ -51,11 +51,11 @@ consent: each is a contract on NEAR, the NEAR MPC network, and a tool you run yo
   deposited stablecoin balance comes back with the contract's `withdraw_balance`.
 - Funds held by a venue under a key of its own — a Polymarket or Hyperliquid account — are
   withdrawn before leaving.
-- A wallet with an exit acts on no other account through an extension: no wallet signs a
-  call to `w_execute_extension`, and a wallet with an exit signs no raw NEAR payload.
-- A wallet contract of the owner's leaves with the owner exit: the owner derives both of
-  its keys and acts on it alone
-  ([OWNER_EXIT.md](OWNER_EXIT.md#leaving-with-a-wallet-contract)).
+- An exit carries no account but the one it leaves to. A wallet's NEAR key is the executor
+  of the account it is bound to through Agent Connect, so a wallet with an exit is bound
+  only to the owner account (owner exit) or the vault's parent (vault exit), and never to a
+  leased account; a leased account is bound to a wallet with no owner. The keystore signs
+  no extension call of such a wallet on any other account.
 
 ## What an exit is not
 

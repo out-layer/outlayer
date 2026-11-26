@@ -54,9 +54,9 @@ let display_name = sender_id.strip_suffix(account_suffix).unwrap_or(&sender_id);
 | `NEAR_USER_ACCOUNT_ID` | The account that sent the transaction (the payer) | Payment Key owner (the payer) |
 
 Always set in both modes. The two are the same account unless the request sets
-`use_bound_identity`: then `NEAR_SENDER_ID` is the account of the caller's
-wallet contract, confirmed by the enclave before the run starts, and
-`NEAR_USER_ACCOUNT_ID` stays the paying account.
+`use_bound_identity` (Agent Connect): then `NEAR_SENDER_ID` is the bound
+account, verified against the chain inside the worker's TEE before the run
+starts, and `NEAR_USER_ACCOUNT_ID` stays the paying account.
 
 **Recommended**: For WASI P2, use the OutLayer SDK instead:
 

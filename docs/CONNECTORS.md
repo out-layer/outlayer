@@ -421,10 +421,9 @@ The full list of injected variables, and what each means, is in
 and cannot be chosen by the caller — that is what the two rules above are for.
 Treat it as the account you are acting for.
 
-`NEAR_USER_ACCOUNT_ID` is who **paid**. The two are the same unless the call
-sets `use_bound_identity`: the run then acts as the account of the caller's
-wallet contract. That is opt-in per call. Bill and attribute against the payer;
-act as the sender.
+`NEAR_USER_ACCOUNT_ID` is who **paid**. The two are the same unless the caller
+is an Agent Connect wallet running under a bound account's name, which is opt-in
+per call. Bill and attribute against the payer; act as the sender.
 
 A NEP-366 meta-transaction runs as the account that signed the delegate action:
 it is `NEAR_SENDER_ID`, `NEAR_USER_ACCOUNT_ID` and `NEAR_PREDECESSOR_ID`, its
@@ -534,7 +533,7 @@ legitimate, and you choose. A `none` key is driven by every caller alike: sign
 with it only what your code composes under its own prefix, name the caller from
 the host — `NEAR_USER_ACCOUNT_ID`, the account that paid, or `NEAR_SENDER_ID`
 (`env::signer_account_id()`), the account the run acts as, which differs only
-with `use_bound_identity` — and expect no `sign-nep413` from it — the
+under a bound identity — and expect no `sign-nep413` from it — the
 host refuses one, because it would log every caller in as the key's account.
 A caller's own secret rows are its input too: sign a variable only when
 `OUTLAYER_SECRETS_ROWS` shows it came from a row whose owner you trust.

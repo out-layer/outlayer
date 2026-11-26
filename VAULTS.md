@@ -236,21 +236,27 @@ That is the sovereignty feature working as designed. For end-users:
 - A `parent` controlled by a multisig or a contract shifts the trust
   from "the customer" to "the customer's signers".
 
-### A vault wallet acts through no extension
+### A vault wallet is bound only to the parent
 
-Every key of a vault wallet leaves with the vault's master to `parent`,
-and so would any right another account gave its NEAR key. Before the
-exit the keystore signs nothing that uses such a right. No wallet signs
-a call to `w_execute_extension`, the method of an account with full
-control of a wallet contract: the call answers 403 `policy_denied`
-under any policy and under none. A vault wallet also signs no raw NEAR
-payload (`raw_sign` on `near`), whatever its policy lists: 32 bytes
-signed with its NEAR key are any NEAR transaction, and the keystore
-cannot read them.
+A wallet's NEAR key is the executor of the account it is bound to
+through Agent Connect (`PUT /wallet/v1/binding`), and every key of a
+vault wallet leaves with the vault's master to `parent`. A vault wallet
+is therefore bound to `parent` itself, in the `personal_account` mode,
+and to no other account: the coordinator refuses any other
+`asset_account_id` (400, naming the parent), and refuses
+`kind=hos_lease` outright — a leased account is never the parent's own.
+The keystore holds the same line on its own: it signs no
+`w_execute_extension` of a vault wallet whose receiver is not the
+`parent` named by the vault's `get_state` — the answer its serving gate
+reads on every request — under any policy and whatever binding is
+recorded.
 
-An account that names a vault wallet's address in its own extensions,
-outside OutLayer, hands itself to whoever holds the vault's master
-after the exit — name it only from `parent`'s own account.
+A vault wallet also signs no raw NEAR payload (`raw_sign` on `near`),
+whatever its policy lists: 32 bytes signed with its NEAR key are any
+NEAR transaction, and the keystore cannot read them. And an account
+that names a vault wallet's address in its own extensions, outside
+OutLayer, hands itself to whoever holds the vault's master after the
+exit — name it only from `parent`'s own account.
 
 ### Duplicate-derivation monitor
 

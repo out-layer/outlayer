@@ -505,7 +505,9 @@ choice.
 
 A program run in OutLayer acts as the account in `NEAR_SENDER_ID`. With
 `use_bound_identity` set on a call, that account is the caller's wallet
-contract instead of the wallet's own NEAR account. The flag is on both ways of
+contract instead of the wallet's own NEAR account. A wallet with an active
+binding (Agent Connect) runs as its bound account, as before: the wallet
+contract is the name of a wallet that has no active binding. The flag is on both ways of
 starting a run: the body of the HTTPS call and the arguments of
 `request_execution` on chain. It is off by default and is the caller's choice
 on each call.
@@ -513,7 +515,7 @@ on each call.
 - Billing does not follow the name: `NEAR_USER_ACCOUNT_ID` stays the account
   that paid.
 - Over HTTPS the wallet is the one the paying key names. A call whose key
-  names no wallet, or whose wallet has no wallet contract, is refused with
+  names no wallet, or whose wallet has neither an active binding nor a wallet contract, is refused with
   `409 no_bound_identity` before it is priced or charged. On chain the wallet
   is the one whose NEAR account sent the transaction.
 - Before the program is given the name, the worker asks the enclave. The

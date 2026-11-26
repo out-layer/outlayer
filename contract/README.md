@@ -87,8 +87,8 @@ near call outlayer.testnet request_execution '{
   - `attached_usd` (U128, stablecoin minimal units, `1000000` = $1) — payment to
     the project's owner, debited from the caller's stablecoin balance in the
     contract (`ft_on_transfer` with `deposit_balance`). `Project` source only.
-  - `use_bound_identity` (bool) — run the guest as the account of the
-    caller's wallet contract.
+  - `use_bound_identity` (bool) — run the guest under the caller's bound
+    account name.
   - `force_rebuild`, `store_on_fastfs`, `compile_only` — build controls.
     `force_rebuild` is refused for a `WasmUrl` source; `store_on_fastfs`
     requires `force_rebuild`; compile-only refuses a non-empty `input_data`.

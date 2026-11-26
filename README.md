@@ -43,7 +43,7 @@ Live on mainnet: 1.5M attested executions, self-hosted Intel TDX servers, five c
 
 - **The key is never stored.** It is derived on demand inside the enclave from a master secret. No endpoint exports it.
 - **The master comes from NEAR MPC, not from OutLayer.** The MPC network derives it (confidential key derivation) and releases it only to a keystore whose TDX attestation was verified on chain and whose build the DAO approved. Each release is a public transaction.
-- **The agent holds an API key, not the wallet's private key.** A leaked API key is bounded by the policy and is revoked or frozen by the owner. The addresses and the funds stay. (With [on-chain custody](#on-chain-custody-two-signatures-required-by-the-chain) the agent also holds a key of its own, one of the two the wallet contract requires.)
+- **The agent holds an API key, not a private key.** A leaked API key is bounded by the policy and is revoked or frozen by the owner. The addresses and the funds stay.
 - **No credential store for many users.** A deterministic wallet is addressed by a NEAR account plus a seed and authenticated by that account's signature. One NEAR key serves any number of user wallets, and removing the key revokes access within 60 seconds.
 - **Free to create.** A wallet is a NEAR implicit account: one API call, no transaction, no storage deposit, no key registration on `intents.near`. An agent can register itself and hand its owner a link to take control.
 
@@ -113,9 +113,13 @@ A signature costs one round trip to the keystore and one free view call. MPC is 
 - **HTTPS.** `POST https://api.outlayer.ai/call/{owner}/{project}` with a payment key: a prepaid stablecoin balance registered in the contract, with per-call and per-project limits. No wallet popup and no NEAR on the caller's side.
 - **Earnings.** A caller can attach a payment for the program's author on either door; the author withdraws it in stablecoins.
 
+### The agent can act as the user's own account
+
+By default an agent acts as its own implicit account. With account binding it acts as `alice.near`: the user installs a small wallet contract by hash (a global contract) and adds the agent's executor to it. The user's own keys keep signing, the agent gets only what the policy allows, and one transaction ends it.
+
 ### On-chain custody: two signatures, required by the chain
 
-An agent's wallet is an implicit account whose key is derived in the enclave: one API call, no transaction per operation, every feature. An owner who wants the chain itself to require two signatures installs a wallet contract on a NEAR account of their choice, and the agent's main balance lies there. The wallet contract executes a request only under both: the agent's own key and a key in OutLayer's enclave, which signs only for an operation the owner's policy allows. Each move is a NEAR transaction with gas, relayed and paid by the agent's OutLayer wallet, and the owner can leave and sign for both sides. With `use_bound_identity` a program runs as the wallet contract's account. The model, the setup and the routes: [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md).
+An agent's wallet is an implicit account whose key is derived in the enclave: one API call, no transaction per operation, every feature. An owner who wants the chain itself to require two signatures installs a wallet contract on a NEAR account of their choice, and the agent's main balance lies there. The wallet contract executes a request only under both: the agent's own key and a key in OutLayer's enclave, which signs only for an operation the owner's policy allows. Each move is a NEAR transaction with gas, relayed and paid by the agent's OutLayer wallet, and the owner can leave and sign for both sides. With `use_bound_identity` a program of a wallet that has no binding runs as the wallet contract's account. The model, the setup and the routes: [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md).
 
 ### Verifiable end to end
 
@@ -186,7 +190,7 @@ A request names the code as a registered project, or as a WASM file by URL and s
 
 **Hosts.** Workers and keystores run in Intel TDX confidential VMs on OutLayer's own bare-metal servers, deployed with [`deploy/self-hosted-tdx`](deploy/self-hosted-tdx/README.md). No third-party cloud service is in the attestation path.
 
-**Governance.** The keystore DAO (`dao.outlayer.near`) has three members and decides two of three. It approves keystore and worker builds and governs the three contracts, none of which carries a full-access key; every change of code or approved builds waits a 72-hour public delay. See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
+**Governance.** The keystore DAO (`dao.outlayer.near`) has three members and decides two of three. It approves keystore and worker builds and governs the three contracts; proposals that change code or approved builds wait a 72-hour public delay. See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
 
 What each party can and cannot do, and every limit stated plainly: [docs/NON_CUSTODIAL.md](docs/NON_CUSTODIAL.md).
 
