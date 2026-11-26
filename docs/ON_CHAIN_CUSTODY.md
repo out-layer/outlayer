@@ -146,12 +146,20 @@ sub-account:
 
 | Choice | What it means |
 |---|---|
-| Keep the owner's key on it (the default) | The owner acts on the account at any time with their own wallet, and can install the contract again with another agent key at the same address. Whoever holds that key moves everything on the account at once, and no policy applies to it |
-| Remove every key from it | Nothing moves without the agent's signature and the enclave's. The owner alone acts on it only through the owner's exit, after its window. It cannot be undone, and another agent key means another account |
+| Keep the owner's key on it (the default) | The owner acts on the account at any time with their own wallet. Whoever holds that key moves everything on the account at once, and no policy applies to it |
+| Remove every key from it | Nothing moves without the agent's signature and the enclave's. The owner alone acts on it only through the owner's exit, after its window. It cannot be undone |
 
 With the owner account itself as the agent's account there is no choice: the
 owner's key stays, since the account needs it to store a policy, to approve
-and to leave.
+and to leave. The agent then acts as the owner's account toward every contract
+its policy lets it call: what that account may do there, a vote in a DAO
+included, the agent does in its name. Calls to OutLayer's own contracts are
+refused, so the agent cannot store the policy it is held to.
+
+A key registered for an account in NEAR Intents is an access key for what the
+account holds there: it signs intents for the account with no signature of the
+agent or of the enclave. A sub-account the setup creates has none. An owner
+account that has used NEAR Intents has its own, as it has its NEAR key.
 
 While the owner holds a key of the account, the setup is undone from the
 owner's own wallet: another contract deployed on the account, or the account
@@ -235,7 +243,7 @@ The same record without the setup link:
 | Route | Does |
 |---|---|
 | `GET /wallet/v1/contract/key` | the enclave's public key of this wallet's wallet contract: `{ "tee_public_key": "<hex>" }` |
-| `PUT /wallet/v1/contract` | names the account, `{ "account_id": "…" }`; reads its pair from the chain. Naming the same account again reads the pair again, which is how another agent key on the same account is taken up |
+| `PUT /wallet/v1/contract` | names the account, `{ "account_id": "…" }`; reads its pair from the chain. Naming the same account again reads the pair again; an account that is another wallet's is `409` |
 | `GET /wallet/v1/contract` | the recorded account and the agent's public key; `404 request_not_found` when the wallet has none |
 
 ### The sealed key
@@ -448,6 +456,10 @@ operation, with amounts below the policy's threshold passing without one.
   every other kind counts its input amount under its token.
 - **A prepared request that is not relayed within an hour is closed.** The
   wallet contract accepts a request for an hour from its `created_at_ns`.
+- **A freeze stops new requests, not the one already prepared.** A prepared
+  request carries the enclave's half, and the wallet contract accepts it with
+  the agent's half until its hour ends. One operation runs at a time, so that
+  is one request at most.
 - One operation of a wallet runs at a time (`409 wallet_busy`), so the limits
   are counted correctly.
 - The working account pays the gas of every relay. It needs NEAR for that.
@@ -526,11 +538,12 @@ The commands and the moves they build:
 - The registration for the exit comes before the wallet contract: on-chain
   custody is refused for a wallet without an owner, so no wallet contract is
   set up without a way out.
-- The wallet contract has no operation that replaces a key. With a key of the
-  owner's kept on the account, another agent key is the contract installed
-  again on the same account, and the address stays; `PUT /wallet/v1/contract`
-  then reads the pair again. With the account's keys removed it is another
-  account, and the assets move there by ordinary operations.
+- The pair of a wallet contract is set once, when it is installed, and both
+  keys are derived for the owner and the wallet: the same wallet always has
+  the same pair. Another agent key is another agent: a new OutLayer wallet
+  with a wallet contract on another account. The owner moves the assets there
+  with their key of the old account, or through the exit where the keys were
+  removed.
 - An owner who keeps a key on the account acts on it at any time with that
   key, without an exit.
 
@@ -541,7 +554,7 @@ The commands and the moves they build:
 | The enclave (memory read) | the enclave's key. No signature of the agent, so no move out of a wallet contract; and no move signed by the agent that the policy did not pass, since the agent signs last. What lies on the working account is under the enclave's key |
 | OutLayer's governance: a hostile build, a hostile upgrade of OutLayer's own contracts | the enclave's key, and still no move out of a wallet contract without the agent's signature. No contract OutLayer can change is on the path of the funds in a wallet contract |
 | The coordinator (the API in front of the enclave) | no move of its own and no request in the agent's name: the enclave verifies the agent's signature and reads the wallet contract itself. The coordinator supplies the 1Click deposit address, the request's nonce and the counters of what was spent; the agent checks the request before it signs |
-| The agent's machine | the agent's key. Every operation still passes the enclave's policy; the owner freezes the wallet and installs the contract again with another agent key, or sets up another account |
+| The agent's machine | the agent's key. Every operation still passes the enclave's policy; the owner freezes the wallet, sets up another agent on another account and moves the assets there |
 | A prompt injection into the agent | an operation request, which the enclave judges by the policy |
 | The owner account's key | the agent's key, by the setup's signature. With a locked policy: what the policy allows as it stands, since a change of policy and an exit both need the approvers. Without a lock the owner's key is the whole authority |
 | An access key of the wallet contract's account, where the owner kept one | everything on that account, at once: the key is above the contract, and neither the policy nor its lock applies |

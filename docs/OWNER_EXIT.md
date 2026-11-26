@@ -66,6 +66,9 @@ current generation: the wallet is created once the claim has settled.
 A wallet in an owner's scope is deterministic: `wallet_id = f(account, seed, owner path)`.
 With no seed in the link the owner's next free numbered seed is taken — `0`, `1`, `2`, ….
 
+The policy of a wallet in an owner's scope is stored by the owner account and by no other:
+the keystore signs a policy for that sender alone, and `403` for any other.
+
 An agent that already works on a wallet without an owner can move to one with an exit: it
 is a new wallet at a new address, the funds move by an ordinary transfer, and the venue
 accounts of the old wallet (Hyperliquid, Polymarket) are opened again under the new one.

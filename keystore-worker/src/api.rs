@@ -4710,6 +4710,16 @@ async fn wallet_sign_policy_handler(
 
     validate_wallet_id(&req.wallet_id)?;
     let customer = extract_customer_from_header(&headers)?;
+    // A wallet in an owner's scope has its owner before it has a policy: the
+    // account whose master derives its keys. Its policy is that account's to
+    // store, and on-chain custody serves no policy stored by another.
+    if let Some(crate::crypto::Customer::Owner { account, .. }) = customer.as_ref() {
+        if req.caller != account.as_str() {
+            return Err(ApiError::Forbidden(format!(
+                "This wallet belongs to {account}: its policy is stored by that account and by no other."
+            )));
+        }
+    }
     state
         .ensure_customer_loaded(customer.as_ref())
         .await
