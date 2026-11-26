@@ -117,7 +117,7 @@ the API carries between them a token and a sealed key it cannot read.
 | 3 | Owner | chooses the account and what happens to the account's own keys (below) |
 | 4 | Owner | signs one message with the owner key; the page turns the signature into the agent's key and shows the pair the contract will require |
 | 5 | Owner | creates the account if it is a sub-account, and installs the wallet contract on it with the pair |
-| 6 | Owner | hands the agent its key: the page seals it to the agent's one-time key and names the account, `PUT /wallet/v1/contract/setup/{token}` |
+| 6 | Owner | hands the agent its key: the page seals it to the agent's one-time key and names the account, `POST /wallet/v1/contract/setup/owner` |
 | 7 | Owner | stores a policy for the wallet; the enclave signs for a wallet contract only under a policy its owner stored |
 | 8 | Agent | collects the account and its key: `GET /wallet/v1/contract/setup` |
 
@@ -183,7 +183,8 @@ pair on chain holds this wallet's enclave key. A wallet has one setup: opening
 again issues another token for another one-time key, ends the earlier token,
 and discards a sealed key that was not collected.
 
-`GET /wallet/v1/contract/setup/{token}` — the token is the only credential.
+`GET /wallet/v1/contract/setup/owner` — the token is the only credential, sent as
+`Authorization: Bearer <token>` and never in a URL of the API.
 
 ```json
 {
@@ -203,7 +204,7 @@ The page computes the message itself and signs only when the API's request
 equals it. A token that is unknown or expired, or that a later setup of the
 wallet superseded, answers `404 request_not_found`.
 
-`PUT /wallet/v1/contract/setup/{token}` — the token is the only credential.
+`POST /wallet/v1/contract/setup/owner` — the token is the only credential, sent the same way.
 
 ```json
 { "account_id": "agent.alice.near", "sealed_agent_key": "<base64>" }
@@ -434,7 +435,8 @@ operation, with amounts below the policy's threshold passing without one.
 - An operation that needs approvers is answered `pending_approval` with
   `approval_id`. The vote is read and cast on like any other
   (`GET /wallet/v1/approval/{id}`, `POST /wallet/v1/approve/{id}`); its type
-  is `wallet_contract`, and it stays open for 24 hours. The policy's `webhook_url` receives `approval_needed`
+  is `wallet_contract`, and it lives 24 hours: the agent asks again within
+  them, voted or not, or the operation is closed. The policy's `webhook_url` receives `approval_needed`
   with `operation_id` (the agent's id), `approval_id`, `type` and `required`.
 - **An approval starts nothing.** Once the approvers have voted, the agent
   sends the same request again under the same id. The votes go to the enclave
