@@ -972,6 +972,18 @@ pub struct WalletSignRequest {
     /// rules + multisig independently.
     #[serde(default)]
     pub usage: Option<serde_json::Value>,
+    /// Agent Connect: which binding mode the coordinator believes this wallet
+    /// operates in, and — for the leased mode — the DECODER the coordinator
+    /// resolved for the bound account's implementation version through its
+    /// `hos_impl_versions` table. Both are CLAIMS: the enclave has no chain
+    /// access, so it cannot check them, only refuse what it cannot evaluate —
+    /// and it evaluates by decoder, not by partner version, so a partner
+    /// release that changes nothing on the wire never reaches this image. See
+    /// `binding::signing_version_gate` for what that buys.
+    #[serde(default)]
+    pub binding_kind: Option<String>,
+    #[serde(default)]
+    pub decoder_version: Option<u32>,
 }
 
 /// Supplementary signing material — see `WalletSignRequest::artifact`.
@@ -1063,6 +1075,13 @@ pub struct WalletCheckPolicyRequest {
     /// When provided, skips fetching from NEAR contract.
     #[serde(default)]
     pub encrypted_policy_data: Option<String>,
+    /// See `WalletSignRequest::binding_kind`. The pre-flight check must answer
+    /// what the signature would, or a caller could be told "allowed" and then
+    /// refused at signing.
+    #[serde(default)]
+    pub binding_kind: Option<String>,
+    #[serde(default)]
+    pub decoder_version: Option<u32>,
 }
 
 /// Response from policy check. The decrypted policy is NEVER returned — it does not

@@ -577,7 +577,7 @@ mod guest_error_parse_tests {
         assert_eq!(p.message, "daily limit exceeded");
 
         let p =
-            parse_guest_error("wallet_busy: no grant terminal=false in_flight_request_id=abc");
+            parse_guest_error("agent_connect_denied: no grant terminal=false in_flight_request_id=abc");
         assert_eq!(p.terminal, Some(false));
         assert_eq!(p.in_flight_request_id.as_deref(), Some("abc"));
         assert_eq!(p.message, "no grant");

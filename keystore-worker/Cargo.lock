@@ -1484,7 +1484,7 @@ dependencies = [
 [[package]]
 name = "custody-core"
 version = "0.1.0"
-source = "git+https://github.com/out-layer/shared-tee-helpers?branch=onchain-custody#04f28d5d7647ba907ea496b8bf9e35c98d22f0c8"
+source = "git+https://github.com/out-layer/shared-tee-helpers?branch=onchain-custody#95d9280e22e8a05648a02b003245a5b67c053f54"
 dependencies = [
  "base64 0.22.1",
  "borsh",
@@ -4595,7 +4595,7 @@ dependencies = [
 [[package]]
 name = "shared-tee-helpers"
 version = "0.1.0"
-source = "git+https://github.com/out-layer/shared-tee-helpers?branch=onchain-custody#04f28d5d7647ba907ea496b8bf9e35c98d22f0c8"
+source = "git+https://github.com/out-layer/shared-tee-helpers?branch=onchain-custody#95d9280e22e8a05648a02b003245a5b67c053f54"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4861,7 +4861,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

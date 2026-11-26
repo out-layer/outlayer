@@ -766,6 +766,7 @@ async fn worker_iteration(
     let is_https_call = execution_request.is_https_call;
     let call_id = execution_request.call_id.clone();
     let payment_key_owner = execution_request.payment_key_owner.clone();
+    let binding_kind = execution_request.binding_kind.clone();
     let bound_wallet = execution_request.bound_wallet.clone();
     let payment_key_nonce = execution_request.payment_key_nonce;
     let usd_payment = execution_request.usd_payment.clone();
@@ -969,24 +970,33 @@ come from the coordinator's own flow. contract={:?} task={:?}",
 
     info!("✅ Claimed {} job(s) for request_id={}", claim_response.jobs.len(), request_id);
 
-    // A job whose context sender differs from the party that called is asked
-    // to run as another account: a wallet contract's. "Acting as
-    // trader.alice.near" is an identity statement, and the coordinator's word
-    // is not taken for it: the keystore, in its enclave, derives the wallet's
-    // own account and its TEE key, and reads from the chain that the account
-    // is the wallet contract holding that key. Any fault, not being able to
-    // ask included, refuses the job rather than running it under the caller's
-    // own name: a guest that derives keys from its sender never runs under an
-    // unverified one. Sits AFTER the claim so the refusal completes the job
-    // with a readable reason instead of leaving it queued for another worker
-    // to hit the same wall.
+    // Agent Connect: a job whose context sender differs from the party that
+    // actually called is claiming to run under a bound account's name. The
+    // claim arrives from the coordinator, but "acting as agent.tla" is an
+    // identity statement, so it is settled by the CHAIN, here in the TEE: the
+    // named account must list the caller as a live extension. Any fault —
+    // including not being able to ask — refuses the job rather than falling
+    // back to the caller's own name: a guest that derives keys from its sender
+    // must never run under an unverified one. Sits AFTER the claim so the
+    // refusal completes the job with a readable reason instead of leaving it
+    // queued for another worker to hit the same wall.
     //
-    // Both entry paths, so one agent's module behaves the same whichever way
-    // it was started; on each the caller is the party that paid, the identity
-    // that stays in `NEAR_USER_ACCOUNT_ID`.
+    // BOTH entry paths, so one agent's module behaves the same whichever way
+    // it was started. What differs is only who has to prove the claim, and in
+    // both cases it is the party that paid — the identity that stays in
+    // `NEAR_USER_ACCOUNT_ID`:
+    //
+    //   HTTPS    → the payment key's owner, which for an agent key IS the
+    //              wallet's own implicit account (asserted below);
+    //   on-chain → the account that sent the transaction. It may be NAMED —
+    //              a user's own account, or a contract relaying for them — so
+    //              the implicit-account assert must NOT be applied here. It
+    //              exists to catch a credential path attaching a wallet to a
+    //              named owner, which is an HTTPS-only concern.
     //
     // Only a claim that runs something is checked: a build or a wasm_url fetch
-    // runs nothing under any name.
+    // runs nothing under any name, and its worker, outside the TEE, could not
+    // read the coordinator's wallet list to check with.
     let runs = claim_response.jobs.iter().any(|j| matches!(j.job_type, JobType::Execute));
     let claim = if runs {
         identity_claim(
@@ -1000,33 +1010,134 @@ come from the coordinator's own flow. contract={:?} task={:?}",
     };
 
     let bound_sender: Option<String> = match claim {
-        // The coordinator was asked for the wallet contract's identity and had
-        // none to give. Refused rather than run under the caller's own name:
-        // the request named the identity it wanted, and quietly substituting
-        // another answers a question nobody asked.
-        Some((claimed, _)) if claimed.is_empty() => {
+        // The coordinator was asked for a bound identity and had none to give.
+        // Refused rather than run under the caller's own name: the request
+        // named the identity it wanted, and quietly substituting another
+        // answers a question nobody asked.
+        Some((claimed, _, _)) if claimed.is_empty() => {
             let error_msg =
                 "Refusing to run: use_bound_identity was requested, but this caller has no \
-                 wallet contract to run as".to_string();
+                 active binding to run as".to_string();
             error!("❌ {}", error_msg);
             refuse_claimed_jobs(api_client, near_client, claim_response.jobs, request_id, is_https_call, call_id.as_deref(), error_msg).await?;
             return Ok(true);
         }
-        Some((claimed, caller)) => {
+        // On-chain custody: the job names the wallet whose wallet contract the
+        // claimed account is. The keystore, in its enclave, derives that
+        // wallet's own account and its TEE key and reads from the chain that
+        // the account is the wallet contract holding that key. Any fault, not
+        // being able to ask included, refuses the job.
+        Some((claimed, payer, _)) if bound_wallet.is_some() => {
             let verdict = match (bound_wallet.as_ref(), keystore_client) {
                 (Some(wallet), Some(keystore)) => keystore
-                    .wallet_contract_identity(&wallet.wallet_id, claimed, caller, &wallet.scope)
+                    .wallet_contract_identity(&wallet.wallet_id, claimed, payer, &wallet.scope)
                     .await
                     .map_err(|e| format!("Refusing to run as '{}': {:#}", claimed, e)),
                 _ => Err(format!(
-                    "Refusing to run as '{}': the job does not say which wallet it is the \
-                     wallet contract of, or this worker has no keystore to ask",
+                    "Refusing to run as '{}': this worker has no keystore to ask whether it is the \
+                     caller's wallet contract",
                     claimed
                 )),
             };
             match verdict {
                 Ok(()) => {
-                    info!("🔗 Verified wallet contract: {} (caller {})", claimed, caller);
+                    info!("🔗 Verified wallet contract: {} (caller {})", claimed, payer);
+                    Some(claimed.to_string())
+                }
+                Err(error_msg) => {
+                    error!("❌ {}", error_msg);
+                    refuse_claimed_jobs(api_client, near_client, claim_response.jobs, request_id, is_https_call, call_id.as_deref(), error_msg).await?;
+                    return Ok(true);
+                }
+            }
+        }
+        Some((claimed, payer, require_implicit)) => {
+            use shared_tee_helpers::binding::{
+                admit, status_query, BindingKind, ChainObservation, PlainStatus, StatusQuery,
+            };
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            // The job's kind is a HINT for which evidence to gather; absent
+            // (queued before the field existed) means the partner mode,
+            // exactly the pre-kind behavior. The verdict itself comes from
+            // `admit`, which is fail-closed against evidence of the wrong
+            // shape — a lying hint can only refuse the job.
+            // The account whose membership we are about to check IS the payer,
+            // and that holds only because a job carries a wallet solely when
+            // the credential was an AGENT key, whose payment_keys.owner is the
+            // wallet's own implicit account. Assert the shape rather than trust
+            // the chain of reasoning: if a future credential path ever attaches
+            // a wallet to a NAMED owner, this refuses instead of quietly
+            // verifying the wrong account's extension set.
+            let kind = if require_implicit && !shared_tee_helpers::is_implicit_account(payer) {
+                Err(format!(
+                    "Refusing to run as '{}': the executor identity '{}' is not an implicit \
+                     account, so it cannot be this wallet's own",
+                    claimed, payer
+                ))
+            } else {
+                match binding_kind.as_deref() {
+                    None => Ok(BindingKind::HosLease),
+                    Some(s) => BindingKind::parse(s).ok_or_else(|| {
+                        format!(
+                            "Refusing to run as '{}': unknown binding kind '{}'",
+                            claimed, s
+                        )
+                    }),
+                }
+            };
+            let verdict: Result<(), String> = match kind {
+                Err(msg) => Err(msg),
+                Ok(kind) => {
+                    let observation = match status_query(kind) {
+                        StatusQuery::HosAgentStatus => near_client
+                            .fetch_hos_agent_status(claimed, payer)
+                            .await
+                            .map(ChainObservation::HosLease)
+                            .map_err(|e| {
+                                format!(
+                                    "Refusing to run as '{}': cannot verify the binding on chain ({})",
+                                    claimed, e
+                                )
+                            }),
+                        StatusQuery::ExtensionAndCodeHash => {
+                            let code = near_client.fetch_code_hash(claimed).await;
+                            let enabled = near_client.fetch_extension_enabled(claimed, payer).await;
+                            // Whether the build is recognized is the
+                            // coordinator's list, not this binary's; a list
+                            // that cannot be fetched recognizes nothing and
+                            // the verdict is the reversible `CodeHashUnknown`.
+                            let recognized = api_client.wallet_code_hashes().await;
+                            match (code, enabled, recognized) {
+                                (Ok(code_hash), Ok(extension_enabled), Ok(recognized)) => {
+                                    let code_recognized = recognized
+                                        .iter()
+                                        .any(|h| h == &bs58::encode(code_hash).into_string());
+                                    Ok(ChainObservation::PersonalAccount(PlainStatus {
+                                        extension_enabled,
+                                        code_hash,
+                                        code_recognized,
+                                    }))
+                                }
+                                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(format!(
+                                    "Refusing to run as '{}': cannot verify the binding on chain ({})",
+                                    claimed, e
+                                )),
+                            }
+                        }
+                    };
+                    observation.and_then(|obs| {
+                        admit(kind, &obs, now_ns).map(|_| ()).map_err(|fault| {
+                            format!("Refusing to run as '{}': {}", claimed, fault)
+                        })
+                    })
+                }
+            };
+            match verdict {
+                Ok(()) => {
+                    info!("🔗 Verified bound sender: {} (executor {})", claimed, payer);
                     Some(claimed.to_string())
                 }
                 Err(error_msg) => {
@@ -1145,34 +1256,57 @@ come from the coordinator's own flow. contract={:?} task={:?}",
     Ok(true)
 }
 
-/// Who a job is asked to run as, and who called.
+/// Who is claiming an identity, and who has to prove it.
 ///
-/// `Some((claimed, caller))` when the job runs under a name that is not the
-/// caller's own; `None` when the sender IS the caller and there is nothing to
-/// verify.
+/// `Some((claimed, prover, require_implicit))` when the job runs under a name
+/// that is not the caller's own; `None` when the sender IS the caller and there
+/// is nothing to verify.
 ///
-/// The claim is the same on both doors, a wallet contract's account, and so
-/// is the party that has to be that wallet: the one that paid, which stays in
-/// `NEAR_USER_ACCOUNT_ID`. Over HTTPS that is the payment key's owner, on
-/// chain the account that sent the transaction; for an agent each is the
-/// wallet's own NEAR account.
+/// The verdict is the same on both doors — the claim is settled against the
+/// chain — but the PROVER differs, because the two doors know different things:
+///
+/// * HTTPS has no signature to identify anyone, so the party that proves the
+///   claim is the payment key's owner, which for an agent key is the wallet's
+///   own implicit account. `require_implicit` asks for that shape to be checked
+///   rather than assumed: if a future credential path ever attaches a wallet to
+///   a NAMED owner, this refuses instead of quietly verifying the wrong
+///   account's extension set.
+/// * On-chain the caller is already established by a signature, and the claim
+///   is constrained before it ever reaches here: the coordinator resolves it by
+///   looking a binding up under `executor_account_id = <the caller>`, and an
+///   executor is derived from the wallet's own ed25519 key — always a 64-hex
+///   implicit account. A NAMED account cannot match, which is what limits this
+///   door to agents holding a keypair; a user's own `alice.near` is the ASSET
+///   side of a binding, never the executor side.
+///
+///   So `require_implicit` is false there not as a relaxation but because the
+///   check would be dead: nothing named can arrive with a claim. The invariant
+///   it leans on is pinned by `binding::executor_shape` in the coordinator,
+///   because if the derivation ever changed this door would open silently.
+///
+/// In both cases the prover is the party that paid, which is the identity that
+/// stays in `NEAR_USER_ACCOUNT_ID`.
 /// Whose name separates one VRF domain from another.
 ///
 /// **The payer, on both doors** — and the two have to agree, because the whole
 /// point of `use_bound_identity` is that one WASI module behaves the same
 /// whichever way it was started.
 ///
-/// `context.sender_id` is not the payer when the run is as a wallet
-/// contract's account: the coordinator puts that account there, the guest's
-/// name. Reading it here would make the same module draw a different random
-/// stream depending on the door: on chain the alpha would follow the wallet
-/// contract's name, over HTTPS the payment key's owner.
+/// They very nearly did not. `context.sender_id` used to be the account that
+/// sent the transaction, and reading it here was the same as reading the payer.
+/// It is not any more: with a binding the coordinator replaces it with the
+/// BOUND account, which is the guest's name. Falling through to it would have
+/// made the same module draw a different random stream depending on the door —
+/// on chain the alpha would follow the bound name, over HTTPS the payment key's
+/// owner, for one flag and one request.
 ///
 /// `user_account_id` is the transaction's own sender (for a meta-transaction
-/// the account that signed the delegate action) and is never rewritten, so it
-/// comes ahead of the fallback. For a request that is not run as a wallet
-/// contract the three are the same account. Storage's default (`signer`) cell
-/// resolves its account the same way (see `outlayer_storage::cell_account`).
+/// the account that signed the delegate action) and is never rewritten,
+/// so it slots in ahead of the fallback. For every request that carries no
+/// binding the three are the same account and nothing changes at all — which
+/// is also why this cannot be observed as a regression by anything running
+/// today. Storage's default (`signer`) cell resolves its account the same way
+/// (see `outlayer_storage::cell_account`); this keeps VRF in line with it.
 fn vrf_domain_identity(
     payment_key_owner: Option<&String>,
     user_account_id: Option<&String>,
@@ -1184,35 +1318,22 @@ fn vrf_domain_identity(
         .cloned()
 }
 
-/// Who the guest acts as, the `NEAR_SENDER_ID` it reads: the wallet
-/// contract's account when the keystore verified one for this caller, and
-/// the caller otherwise — over HTTPS the owner of the payment key, on chain
-/// the sender of the request.
-fn guest_sender<'a>(
-    bound_sender: Option<&'a String>,
-    is_https_call: bool,
-    payment_key_owner: Option<&'a String>,
-    context_sender: Option<&'a String>,
-) -> Option<&'a String> {
-    bound_sender.or(if is_https_call { payment_key_owner } else { context_sender })
-}
-
 fn identity_claim<'a>(
     is_https_call: bool,
     context_sender: Option<&'a str>,
     payment_key_owner: Option<&'a str>,
     user_account_id: Option<&'a str>,
-) -> Option<(&'a str, &'a str)> {
-    let (claimed, caller) = if is_https_call {
-        (context_sender?, payment_key_owner?)
+) -> Option<(&'a str, &'a str, bool)> {
+    let (claimed, prover, require_implicit) = if is_https_call {
+        (context_sender?, payment_key_owner?, true)
     } else {
-        (context_sender?, user_account_id?)
+        (context_sender?, user_account_id?, false)
     };
     // Same name on both sides: nobody is claiming anything.
-    if claimed == caller {
+    if claimed == prover {
         return None;
     }
-    Some((claimed, caller))
+    Some((claimed, prover, require_implicit))
 }
 
 /// Every environment variable the WORKER owns. A guest may read these as
@@ -1320,9 +1441,9 @@ fn merge_env_vars(
     is_https_call: bool,
     call_id: Option<&String>,
     payment_key_owner: Option<&String>,
-    // The wallet contract's account the keystore verified for this caller
-    // before this function runs. When set, the guest's sender identity;
-    // billing stays on payment_key_owner.
+    // Agent Connect: the CHAIN-VERIFIED bound asset account (verified by the
+    // caller against hos_agent_status before this function runs). When set,
+    // the guest's sender identity; billing stays on payment_key_owner.
     bound_sender: Option<&String>,
     usd_payment: Option<&String>,
     // Network configuration
@@ -1359,16 +1480,17 @@ fn merge_env_vars(
         if is_https_call { "HTTPS".to_string() } else { "NEAR".to_string() }
     );
 
-    if let Some(sender) = guest_sender(bound_sender, is_https_call, payment_key_owner, context.sender_id.as_ref()) {
-        env_vars.insert("NEAR_SENDER_ID".to_string(), sender.clone());
-    }
-
     if is_https_call {
         // HTTPS mode: set blockchain vars to empty.
         //
-        // NEAR_USER_ACCOUNT_ID is the payment key owner whoever the guest acts
-        // as: it is the BILLING identity, and a wallet contract renames who
-        // the guest acts as, not who pays.
+        // NEAR_SENDER_ID — the guest-visible identity: the verified bound
+        // asset account when the wallet operates one (Agent Connect), the
+        // payment key owner otherwise. NEAR_USER_ACCOUNT_ID always stays the
+        // payment key owner: it is the BILLING identity, and a binding
+        // renames who the guest acts as, not who pays.
+        if let Some(sender) = bound_sender.or(payment_key_owner) {
+            env_vars.insert("NEAR_SENDER_ID".to_string(), sender.clone());
+        }
         if let Some(owner) = payment_key_owner {
             env_vars.insert("NEAR_USER_ACCOUNT_ID".to_string(), owner.clone());
         }
@@ -1405,6 +1527,9 @@ fn merge_env_vars(
         // NEAR transaction mode: use context values
 
         // Add execution context
+        if let Some(ref sender_id) = context.sender_id {
+            env_vars.insert("NEAR_SENDER_ID".to_string(), sender_id.clone());
+        }
         if let Some(ref contract_id) = context.contract_id {
             env_vars.insert("NEAR_CONTRACT_ID".to_string(), contract_id.clone());
         }
@@ -1966,7 +2091,7 @@ async fn handle_execute_job(
     is_https_call: bool, // HTTPS API call - skip NEAR contract, call coordinator
     call_id: Option<&String>, // HTTPS call ID for coordinator completion
     payment_key_owner: Option<&String>, // Payment Key owner for HTTPS calls
-    bound_sender: Option<&String>, // the wallet contract's account, verified in worker_iteration
+    bound_sender: Option<&String>, // Agent Connect: chain-verified bound asset account (verified in worker_iteration)
     payment_key_nonce: Option<i32>, // Payment Key nonce for HTTPS calls
     usd_payment: Option<&String>, // USD payment amount for HTTPS calls
     compute_limit_usd: Option<&String>, // What the call authorised for compute: a task's consent carries it
@@ -5282,25 +5407,37 @@ mod verified_sender_tests {
         assert_eq!(identity_claim(false, None, None, Some("alice.near")), None);
     }
 
-    /// Both doors make the same claim, and each names the party that paid as
-    /// the caller the keystore is asked about.
+    /// Both doors settle the SAME claim, and each names the party that paid as
+    /// the one who must prove it.
+    ///
+    /// The two differ in one bit only. On HTTPS the prover must be an implicit
+    /// account — the shape an agent key's owner has — and that is asserted
+    /// rather than assumed, so a future credential path attaching a wallet to a
+    /// NAMED owner refuses instead of verifying the wrong account's extension
+    /// set. On-chain the caller is established by a signature and may perfectly
+    /// well be named (a user's own account, or a contract relaying), so the
+    /// same demand there would refuse correct calls.
     #[test]
-    fn both_doors_claim_alike_and_the_caller_is_the_payer() {
-        let https = identity_claim(true, Some("trader.alice.near"), Some("aaaa"), Some("ignored"));
-        assert_eq!(https, Some(("trader.alice.near", "aaaa")));
+    fn both_doors_claim_alike_but_the_prover_differs() {
+        let https = identity_claim(true, Some("agent.tla"), Some("aaaa"), Some("ignored"));
+        assert_eq!(https, Some(("agent.tla", "aaaa", true)));
 
-        let onchain = identity_claim(false, Some("trader.alice.near"), Some("ignored"), Some("bbbb"));
-        assert_eq!(onchain, Some(("trader.alice.near", "bbbb")));
+        let onchain = identity_claim(false, Some("agent.tla"), Some("ignored"), Some("bob.near"));
+        assert_eq!(
+            onchain,
+            Some(("agent.tla", "bob.near", false)),
+            "on-chain the prover is the signer, and it may be a NAMED account"
+        );
     }
 
-    /// A verified wallet contract's account renames WHO THE GUEST ACTS AS,
-    /// and nothing else.
+    /// Agent Connect: a verified bound asset account renames WHO THE GUEST
+    /// ACTS AS, and nothing else.
     ///
-    /// `NEAR_SENDER_ID` becomes that account — near-email derives its mailbox
-    /// from it, so this line is what makes an agent write from
-    /// `trader.alice.near@near.email`. `NEAR_USER_ACCOUNT_ID` must STAY the
-    /// payment key owner: it is the billing identity, and if it followed the
-    /// sender, usage attribution would move to an account that never paid.
+    /// `NEAR_SENDER_ID` becomes the asset account — near-email derives its
+    /// mailbox from it, so this line is what makes a bound agent write from
+    /// `agent.tla@near.email`. `NEAR_USER_ACCOUNT_ID` must STAY the payment
+    /// key owner: it is the billing identity, and if it followed the binding,
+    /// usage attribution would move to an account that never paid.
     #[test]
     fn a_bound_sender_renames_the_guest_but_not_the_payer() {
         let owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
@@ -5329,34 +5466,15 @@ mod verified_sender_tests {
         assert_eq!(
             env.get("NEAR_USER_ACCOUNT_ID"),
             Some(&owner),
-            "billing identity must not follow the sender"
+            "billing identity must not follow the binding"
         );
-    }
-
-    /// The guest's sender is one rule on both doors: the verified wallet
-    /// contract's account, or else the caller of that door.
-    #[test]
-    fn the_guest_acts_as_the_verified_account_or_as_its_caller() {
-        let (bound, key_owner, sender) = ("agent.tla".to_string(), "aaaa".to_string(), "alice.near".to_string());
-
-        for is_https_call in [true, false] {
-            assert_eq!(
-                super::guest_sender(Some(&bound), is_https_call, Some(&key_owner), Some(&sender)),
-                Some(&bound)
-            );
-        }
-        assert_eq!(super::guest_sender(None, true, Some(&key_owner), Some(&sender)), Some(&key_owner));
-        assert_eq!(super::guest_sender(None, false, Some(&key_owner), Some(&sender)), Some(&sender));
-        // a door whose caller is not known names nobody, not the other door's
-        assert_eq!(super::guest_sender(None, true, None, Some(&sender)), None);
-        assert_eq!(super::guest_sender(None, false, Some(&key_owner), None), None);
     }
 
     /// One flag, one module, one random stream — whichever door it came through.
     ///
     /// The defect this pins was invisible by construction: both doors agreed
     /// while `context.sender_id` still meant "who sent the transaction", and
-    /// they disagree whenever the run is as a wallet contract.
+    /// they silently stopped agreeing the moment a binding could rewrite it.
     /// Nothing would have reported it — the VRF still works, it just answers a
     /// different question on each door.
     #[test]
@@ -5365,7 +5483,7 @@ mod verified_sender_tests {
         let bound = "agent.tla".to_string();
         let key_owner = "aaaa".to_string();
 
-        // On chain as a wallet contract: `context.sender_id` carries its
+        // On chain WITH a binding: `context.sender_id` carries the bound
         // account, and the domain must NOT follow it.
         assert_eq!(
             super::vrf_domain_identity(None, Some(&payer), Some(&bound)),
@@ -5379,7 +5497,7 @@ mod verified_sender_tests {
             Some(key_owner.clone())
         );
 
-        // Otherwise all three are the same account, so every such request
+        // No binding: all three are the same account, so every live request
         // keeps the domain it has today.
         assert_eq!(
             super::vrf_domain_identity(None, Some(&payer), Some(&payer)),

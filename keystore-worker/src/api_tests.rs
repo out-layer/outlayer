@@ -352,7 +352,6 @@ mod wallet_sign_tests {
             // vault's TEE key (`mpc_ckd.rs`).
             "vrf-key".to_string(),
             format!("outlayer.near:{}", "vault.alice.near"),
-            shared_tee_helpers::custody_core::keys::tee_key_seed(id),
         ];
         // The strings an attacker holding the exporter would try, including
         // the ones that spell a sub-key path verbatim.
@@ -3554,21 +3553,30 @@ mod a_wallet_with_no_policy_is_unrestricted {
         );
     }
 
-    /// A rule an absent policy does NOT relax, which is why the request is
-    /// evaluated instead of short-circuited to Allow: no wallet signs a call to
-    /// the wallet contract's extension method.
+    /// The one rule an absent policy does NOT relax, which is why the request is
+    /// evaluated instead of short-circuited to Allow. The envelope is real: an
+    /// unparseable one is refused before any rule is consulted, so a test built
+    /// on empty args would pass with the account-control rule deleted.
     #[test]
-    fn a_wallet_with_no_policy_cannot_call_the_extension_method() {
+    fn the_extension_door_stays_shut() {
+        use base64::Engine;
+        let request = r#"{"request":{
+            "internal":[{"op":"add_extension","payload":{"account_id":"evil.near"}}],
+            "external":[{"receiver_id":"good.near",
+                         "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#;
         let op = Op::Call {
-            to: "alice.near".into(),
-            method: shared_tee_helpers::wallet_policy::WALLET_EXTENSION_METHOD.into(),
-            args_base64: "e30=".into(),
+            to: "agent.tla".into(),
+            method: "w_execute_extension".into(),
+            args_base64: base64::engine::general_purpose::STANDARD.encode(request),
             gas: "100000000000000".into(),
             deposit: "1".into(),
         };
         match evaluate(&policy_to_judge_by(None), &op, None, NOW) {
-            Decision::Deny { reason } => assert!(reason.contains("no wallet signs"), "{reason}"),
-            other => panic!("a wallet with no policy acted as another account: {other:?}"),
+            Decision::Deny { reason } => {
+                assert!(reason.contains("add_extension"), "{reason}");
+                assert!(reason.contains("account-control"), "{reason}");
+            }
+            other => panic!("a wallet with no policy handed its lane to a stranger: {other:?}"),
         }
     }
 
@@ -7445,9 +7453,10 @@ mod recovery_tool_vector {
     }
 }
 
-/// What a wallet whose master leaves with an exit is refused before its policy is read.
+/// A wallet whose master leaves with an exit acts through Agent Connect only on the account
+/// that master leaves to.
 #[cfg(test)]
-mod exit_scope {
+mod extension_principal {
     use super::*;
     use crate::crypto::Customer;
     use near_primitives::types::AccountId;
@@ -7471,6 +7480,43 @@ mod exit_scope {
         Customer::Owner { account: account("alice.near"), generation: 2 }
     }
 
+    #[test]
+    fn an_owner_wallet_acts_only_on_its_owner() {
+        let alice = account("alice.near");
+        let ext = |to| extension_beyond_principal(Some(&owner()), Some(&alice), &call(to, "w_execute_extension"));
+        assert_eq!(ext("alice.near"), None);
+        assert_eq!(
+            ext("bob.near").as_deref(),
+            Some(
+                "A wallet whose keys leave with an exit acts through w_execute_extension only on the \
+                 account they leave to. This wallet's keys leave with its owner's exit, to \
+                 'alice.near': 'bob.near' is not that account"
+            )
+        );
+        assert!(ext("agent.tla").is_some(), "a leased account is never the owner's");
+    }
+
+    #[test]
+    fn a_vault_wallet_acts_only_on_the_vault_parent() {
+        let vault = Customer::Vault(account("vault.alice.near"));
+        let alice = account("alice.near");
+        let ext = |to, parent: Option<&AccountId>| {
+            extension_beyond_principal(Some(&vault), parent, &call(to, "w_execute_extension"))
+        };
+        assert_eq!(ext("alice.near", Some(&alice)), None);
+        let refused = ext("bob.near", Some(&alice)).expect("another account");
+        assert!(
+            refused.contains("the exit of vault 'vault.alice.near', to its parent 'alice.near'")
+                && refused.contains("'bob.near' is not that account"),
+            "{refused}"
+        );
+        // A vault whose state names no parent acts on no account, its own included.
+        for to in ["alice.near", "vault.alice.near"] {
+            let refused = ext(to, None).expect("no parent, no account");
+            assert!(refused.contains("whose state names no parent"), "{refused}");
+        }
+    }
+
     /// A wallet that can leave signs no raw NEAR payload; other raw chains, and wallets that
     /// cannot leave, are not judged here (their policy decides).
     #[test]
@@ -7485,6 +7531,23 @@ mod exit_scope {
         assert_eq!(raw_near_in_exit_scope(None, &raw("near")), None);
         assert_eq!(raw_near_in_exit_scope(Some(&owner()), &raw("ethereum")), None);
         assert_eq!(raw_near_in_exit_scope(Some(&owner()), &call("bob.near", "ft_transfer")), None);
+    }
+
+    /// The default master never leaves; and only the extension door acts AS another
+    /// account — a plain call or transfer to one acts as the wallet itself.
+    #[test]
+    fn only_the_extension_door_of_a_wallet_that_can_leave_is_judged() {
+        let alice = account("alice.near");
+        assert_eq!(extension_beyond_principal(None, None, &call("bob.near", "w_execute_extension")), None);
+        assert_eq!(extension_beyond_principal(Some(&owner()), Some(&alice), &call("bob.near", "ft_transfer")), None);
+        assert_eq!(
+            extension_beyond_principal(
+                Some(&owner()),
+                Some(&alice),
+                &Op::Transfer { to: "bob.near".into(), amount: "1".into() }
+            ),
+            None
+        );
     }
 
     #[test]
@@ -7505,9 +7568,9 @@ mod exit_scope {
         for handler in ["async fn wallet_sign_handler(", "async fn wallet_check_policy_handler("] {
             let body = &src[src.find(handler).expect("the handler")..];
             let body = &body[..body.find("\n}\n").expect("the handler's end")];
-            let load = body.find("state\n        .ensure_customer_loaded(").expect("the customer's load");
+            let load = body.find("let principal = state\n        .ensure_customer_loaded(").expect("the principal");
             let rule = body
-                .find("raw_near_in_exit_scope(customer.as_ref(), &req.op)")
+                .find("extension_beyond_principal(customer.as_ref(), principal.as_ref(), &req.op)")
                 .unwrap_or_else(|| panic!("{handler} does not apply the rule"));
             let policy = body.find("load_wallet_policy(").expect("the policy read");
             assert!(load < rule && rule < policy, "{handler}: the rule runs out of order");

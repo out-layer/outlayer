@@ -220,8 +220,9 @@ pub struct RequestData {
     pub force_rebuild: bool,
     #[serde(default)]
     pub store_on_fastfs: bool,
-    /// The caller asked to run as its wallet contract's account. Carried
-    /// through untouched: the claim is settled in the TEE, not here.
+    /// Agent Connect: the caller asked to run under its bound account's name.
+    /// Carried through untouched — the claim is settled against the chain in
+    /// the TEE, not here.
     #[serde(default)]
     pub use_bound_identity: bool,
     /// Project UUID for persistent storage (passed from request_execution_project)

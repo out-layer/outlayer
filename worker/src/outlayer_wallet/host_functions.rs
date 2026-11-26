@@ -73,8 +73,8 @@ fn sub_path(connector_id: &str, label: &str) -> String {
 ///
 /// Appended fields are the ones that change what to do next, not everything in
 /// the body:
-/// * `terminal` — retrying a refusal that is terminal spins forever while the
-///   owner is never told to act;
+/// * `terminal` — retrying an Agent Connect refusal that is terminal spins
+///   forever while the owner is never told to act;
 /// * `in_flight_request_id` — what to poll instead of retrying blindly;
 /// * `in_flight_operation` — what to wait FOR. It is set even when there is no
 ///   id yet, and it is the difference between retrying at once and backing off:
@@ -1039,9 +1039,10 @@ mod guest_error_tests {
     /// told to act.
     #[test]
     fn a_refusal_says_whether_retrying_is_pointless() {
-        let body = r#"{"error":"policy_denied","message":"the limit is spent","terminal":true}"#;
+        let body = r#"{"error":"agent_connect_denied","message":"the grant is spent",
+                       "class":"grant_exhausted","terminal":true}"#;
         let out = guest_error(body);
-        assert!(out.starts_with("policy_denied: "), "{out}");
+        assert!(out.starts_with("agent_connect_denied: "), "{out}");
         assert!(out.contains("terminal=true"), "{out}");
     }
 
