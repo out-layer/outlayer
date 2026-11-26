@@ -126,11 +126,11 @@ pub struct ExecutionRequest {
     /// Payment Key nonce for HTTPS calls
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payment_key_nonce: Option<i32>,
-    /// Agent Connect: the binding kind behind a bound context sender — the
-    /// hint for WHICH verifier to run before adopting that sender. A hint,
-    /// not truth: each verifier is fail-closed against the wrong contract.
+    /// Which wallet a context sender that is a wallet contract's account
+    /// belongs to. The coordinator's word, checked by the keystore before the
+    /// sender is adopted: a wrong one is refused there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding_kind: Option<String>,
+    pub bound_wallet: Option<BoundWallet>,
     /// USD payment amount for HTTPS calls (X-Attached-Deposit, in minimal token units)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd_payment: Option<String>,
@@ -142,6 +142,14 @@ pub struct ExecutionRequest {
     /// Wallet ID for wallet-enabled executions (e.g. "ed25519:abc..." from X-Wallet-Id header)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallet_id: Option<String>,
+}
+
+/// The wallet of a wallet contract, as the keystore is asked about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundWallet {
+    pub wallet_id: String,
+    /// The owner scope the wallet's keys are derived in (`owner:<account>:<generation>`).
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,9 +317,8 @@ pub struct CreateTaskParams {
     pub compile_only: bool,
     pub force_rebuild: bool,
     pub store_on_fastfs: bool,
-    /// Agent Connect: the on-chain caller asked to be seen as its bound
-    /// account. A CLAIM, settled against the chain in the TEE before the guest
-    /// is given any name.
+    /// The on-chain caller asked to be seen as its wallet contract's account.
+    /// A CLAIM, settled in the TEE before the guest is given any name.
     pub use_bound_identity: bool,
     /// Project UUID for persistent storage (from request_execution_project)
     pub project_uuid: Option<String>,
@@ -2277,38 +2284,6 @@ impl ApiClient {
         Ok(())
     }
 
-    /// The wallet builds the coordinator recognizes for `personal_account`
-    /// bindings, base58 code hashes. The crate's verdict on a bound account
-    /// needs the deployment's answer to "is this build recognized?", and that
-    /// list is data in the coordinator's database — not a constant in this
-    /// binary, so a new wallet build costs a row there rather than a worker
-    /// release. Read per bound run; the path is rare and the answer small.
-    pub async fn wallet_code_hashes(&self) -> Result<Vec<String>> {
-        let url = format!("{}/internal/wallet-code-hashes", self.base_url);
-        let response = self
-            .add_wallet_internal_auth(self.client.get(&url))
-            .send()
-            .await
-            .context("Failed to fetch the recognized wallet code hashes")?;
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Fetching wallet code hashes failed: {}", error_text);
-        }
-        #[derive(serde::Deserialize)]
-        struct Row {
-            code_hash: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct Body {
-            code_hashes: Vec<Row>,
-        }
-        let body: Body = response
-            .json()
-            .await
-            .context("Failed to parse the recognized wallet code hashes")?;
-        Ok(body.code_hashes.into_iter().map(|r| r.code_hash).collect())
-    }
-
     /// Relay that the chain held no policy for the wallet at `block`. A status that is the
     /// coordinator's answer is a [`TerminalRelay`].
     pub async fn notify_wallet_policy_deleted(
@@ -3037,14 +3012,11 @@ mod tests {
     /// Every field the caller hands to `create_task` must survive into the JSON
     /// body, and this reads the source to prove it.
     ///
-    /// `use_bound_identity` reached `CreateTaskParams` and stopped there: the
-    /// wire struct inside `create_task` is declared separately and simply did
-    /// not list it. Nothing failed. The coordinator reads that field with
-    /// `#[serde(default)]`, so a body without it is a body that asked for
-    /// nothing, and the on-chain half of Agent Connect did nothing at all while
-    /// every unit test on both sides stayed green — the defect lives in the gap
-    /// between two correct programs, which is the one place unit tests cannot
-    /// look.
+    /// The wire struct inside `create_task` is declared apart from
+    /// `CreateTaskParams`, and the coordinator reads its fields with
+    /// `#[serde(default)]`: a body that omits `use_bound_identity` is a body
+    /// that asked for nothing, and nothing fails on either side. The gap
+    /// between two correct programs is the one place unit tests cannot look.
     ///
     /// Field-by-field equality, not a whitelist: a field added to the carrier
     /// and forgotten in the body fails here rather than in production.

@@ -448,6 +448,15 @@ pub struct KeystoreClient {
     tee_signing_info: Option<Arc<near_crypto::SecretKey>>,
 }
 
+/// What a keystore said when it refused: its `error` text, or the body as it
+/// came.
+fn keystore_reason(reply: &Reply) -> String {
+    serde_json::from_slice::<serde_json::Value>(&reply.body)
+        .ok()
+        .and_then(|json| json.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| reply.text())
+}
+
 /// What a caller is told when the keystore refuses a secret's access condition.
 ///
 /// The keystore's OWN sentence is kept. It is the only party that knows why the
@@ -1542,6 +1551,38 @@ impl KeystoreClient {
         );
 
         Ok(encrypt_response.encrypted_base64)
+    }
+
+    /// Ask the keystore whether `caller` is the NEAR account of the wallet
+    /// `wallet_id`, and `wallet_contract` the wallet contract of that wallet.
+    /// `Ok` when both hold; the keystore's own reason otherwise. `scope` is
+    /// the owner scope the wallet's keys are derived in.
+    pub async fn wallet_contract_identity(
+        &self,
+        wallet_id: &str,
+        wallet_contract: &str,
+        caller: &str,
+        scope: &str,
+    ) -> Result<()> {
+        #[derive(Debug, Serialize)]
+        struct IdentityRequest<'a> {
+            wallet_id: &'a str,
+            wallet_contract: &'a str,
+            caller: &'a str,
+        }
+
+        let reply = self
+            .post_json(
+                "/wallet/contract/identity",
+                || Ok(IdentityRequest { wallet_id, wallet_contract, caller }),
+                "Wallet contract identity",
+                Some(scope),
+            )
+            .await?;
+        if !reply.status.is_success() {
+            anyhow::bail!("{}", keystore_reason(&reply));
+        }
+        Ok(())
     }
 
     /// Decrypt raw encrypted data using keystore's derived key

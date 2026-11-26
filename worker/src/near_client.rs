@@ -119,13 +119,6 @@ pub struct NearClient {
     client: JsonRpcClient,
     signer: InMemorySigner,
     contract_id: AccountId,
-    /// Kept for the one read the typed client cannot express: NEP-591
-    /// `global_contract_hash` in view_account (see [`Self::fetch_code_hash`]).
-    rpc_url: String,
-    /// For that same read. Built once, with its own timeouts, so a stalled RPC
-    /// cannot hold a job open — and so the read does not pay for a fresh TLS
-    /// setup every time.
-    http: reqwest::Client,
     /// The last nonce this signer's key was given, shared by every clone of the
     /// client (the callback loop and the execution path each hold one). Every
     /// transaction takes the next number here, under this lock, together with
@@ -223,18 +216,10 @@ impl NearClient {
     /// * `contract_id` - OffchainVM contract account ID
     pub fn new(rpc_url: String, signer: InMemorySigner, contract_id: AccountId) -> Result<Self> {
         let client = JsonRpcClient::connect(&rpc_url);
-        let http = reqwest::Client::builder()
-            .timeout(Self::RPC_TIMEOUT)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .context("Failed to build the view_account HTTP client")?;
-
         Ok(Self {
             client,
             signer,
             contract_id,
-            rpc_url,
-            http,
             nonce: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
@@ -1563,145 +1548,6 @@ impl NearClient {
         } else {
             anyhow::bail!("Unexpected response kind from get_secret_vault");
         }
-    }
-
-    /// `hos_agent_status(extension)` on an Agent Connect asset account.
-    ///
-    /// Read from the CHAIN rather than taken from the task, for the same
-    /// reason as [`Self::fetch_payment_key_vault`]: the value decides an
-    /// identity — whether this job may run under the asset account's name —
-    /// and a value supplied by whoever queued the job would let the asker
-    /// pick it. The verdict on the answer is
-    /// `shared_tee_helpers::hos::assess_binding`, shared with the
-    /// coordinator so the two cannot read the same response differently.
-    pub async fn fetch_hos_agent_status(
-        &self,
-        asset_account_id: &str,
-        executor_account_id: &str,
-    ) -> Result<shared_tee_helpers::hos::AgentStatusView> {
-        let asset: AccountId = asset_account_id
-            .parse()
-            .with_context(|| format!("Invalid asset account id: {}", asset_account_id))?;
-
-        let request = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::Finality(Finality::Final),
-            request: near_primitives::views::QueryRequest::CallFunction {
-                account_id: asset,
-                method_name: "hos_agent_status".to_string(),
-                args: json!({ "extension": executor_account_id })
-                    .to_string()
-                    .into_bytes()
-                    .into(),
-            },
-        };
-
-        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(request))
-            .await
-            .context("NEAR RPC hos_agent_status timed out")?
-            .context("Failed to call hos_agent_status")?;
-
-        if let near_jsonrpc_primitives::types::query::QueryResponseKind::CallResult(result) =
-            response.kind
-        {
-            serde_json::from_slice(&result.result)
-                .context("Failed to parse hos_agent_status response")
-        } else {
-            anyhow::bail!("Unexpected response kind from hos_agent_status");
-        }
-    }
-
-    /// `w_is_extension_enabled(executor)` on a personal_account-bound account —
-    /// the membership half of that mode's evidence; the other half is
-    /// [`Self::fetch_code_hash`]. Same chain-not-task rationale as
-    /// [`Self::fetch_hos_agent_status`].
-    pub async fn fetch_extension_enabled(
-        &self,
-        account_id: &str,
-        executor_account_id: &str,
-    ) -> Result<bool> {
-        let account: AccountId = account_id
-            .parse()
-            .with_context(|| format!("Invalid account id: {}", account_id))?;
-
-        let request = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::Finality(Finality::Final),
-            request: near_primitives::views::QueryRequest::CallFunction {
-                account_id: account,
-                method_name: "w_is_extension_enabled".to_string(),
-                args: json!({ "account_id": executor_account_id })
-                    .to_string()
-                    .into_bytes()
-                    .into(),
-            },
-        };
-
-        let response = tokio::time::timeout(Self::RPC_TIMEOUT, self.rpc(request))
-            .await
-            .context("NEAR RPC w_is_extension_enabled timed out")?
-            .context("Failed to call w_is_extension_enabled")?;
-
-        if let near_jsonrpc_primitives::types::query::QueryResponseKind::CallResult(result) =
-            response.kind
-        {
-            serde_json::from_slice(&result.result)
-                .context("Failed to parse w_is_extension_enabled response")
-        } else {
-            anyhow::bail!("Unexpected response kind from w_is_extension_enabled");
-        }
-    }
-
-    /// The hash of the code the account RUNS, raw 32 bytes: `code_hash` for
-    /// an inline deploy, `global_contract_hash` for a NEP-591 global
-    /// reference (the recommended install path, where `code_hash` stays at
-    /// the zero sentinel). Raw JSON-RPC on purpose: the typed `AccountView`
-    /// of this near-primitives has no NEP-591 field and would silently drop
-    /// it — refusing every properly installed wallet. An account that does
-    /// not exist is an error; an account with NO code answers all-zeros —
-    /// both directions end in refusal at the caller.
-    pub async fn fetch_code_hash(&self, account_id: &str) -> Result<[u8; 32]> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": "view_account",
-            "method": "query",
-            "params": {
-                "request_type": "view_account",
-                "finality": "final",
-                "account_id": account_id,
-            },
-        });
-        // The timeout covers the BODY too. Wrapping `send()` alone bounds the
-        // headers and leaves the read after them unbounded, so an RPC that
-        // answers and then stalls holds the job forever — the one failure a
-        // timeout is there to prevent.
-        let resp: serde_json::Value = tokio::time::timeout(Self::RPC_TIMEOUT, async {
-            self.http
-                .post(&self.rpc_url)
-                .json(&body)
-                .send()
-                .await
-                .with_context(|| format!("Failed to view account {}", account_id))?
-                .json::<serde_json::Value>()
-                .await
-                .context("view_account response is not JSON")
-        })
-        .await
-        .context("NEAR RPC view_account timed out")??;
-
-        if let Some(err) = resp.get("error") {
-            anyhow::bail!("view_account({}) RPC error: {}", account_id, err);
-        }
-        let code_hash = resp["result"]["code_hash"].as_str();
-        let global = resp["result"]["global_contract_hash"].as_str();
-        if code_hash.is_none() && global.is_none() {
-            anyhow::bail!("Missing code_hash in view_account for {}", account_id);
-        }
-        let effective =
-            shared_tee_helpers::binding::effective_code_hash_b58(code_hash, global)
-                .unwrap_or_else(|| {
-                    shared_tee_helpers::binding::NO_CODE_HASH_B58.to_string()
-                });
-        shared_tee_helpers::binding::parse_code_hash_base58(&effective)
-            .with_context(|| format!("Unparseable code hash '{}' for {}", effective, account_id))
     }
 
     /// Fetch project version (code source) from contract

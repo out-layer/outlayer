@@ -29,7 +29,7 @@ near-jsonrpc-primitives = "0.37"
 # Shared with the coordinator and keystore: the Agent Connect binding
 # assessment (hos module) must be ONE implementation, so the worker's
 # TEE-side verdict cannot drift from the coordinator's.
-shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", branch = "main" }
+shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", branch = "onchain-custody" }
 
 # WASM execution (wasmtime: WASI P2 components and P1 modules)
 wasmtime = { version = "36", features = ["component-model", "async"] }

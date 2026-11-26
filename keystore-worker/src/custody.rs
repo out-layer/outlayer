@@ -9,7 +9,9 @@
 //! * `prepare`: judges an operation the agent asked for by the owner's policy,
 //!   builds the wallet contract's request for it and signs the TEE's half;
 //! * `relay`: signs, with the wallet's own NEAR key, the transaction that
-//!   carries a request with both halves to the wallet contract.
+//!   carries a request with both halves to the wallet contract;
+//! * `identity`: tells a worker whether a caller's wallet is the one an
+//!   account is the wallet contract of, before a program runs as that account.
 //!
 //! The byte formats and the pure rules are `custody_core`'s; which move an
 //! operation is, `shared_tee_helpers::custody_op`'s. The TEE's key is derived
@@ -34,7 +36,7 @@ use shared_tee_helpers::{
 use crate::{
     api::{
         derive_wallet_ed25519_pubkey, extract_customer_from_header, load_wallet_policy_with_owner,
-        sign_near_transaction, validate_wallet_id, verify_approvals, ApiError, AppState,
+        sign_near_transaction, validate_wallet_id, verify_approvals, wallet_seed, ApiError, AppState,
         ApprovalInfo, WalletSignResponse,
     },
     crypto::Customer,
@@ -53,6 +55,12 @@ const RELAY_GAS: u64 = 300_000_000_000_000;
 /// the contract refuses a request from its future, and a block's time lags.
 const CREATED_AT_LAG_NS: u64 = 60_000_000_000;
 
+/// The route a worker asks, merged into the worker-token group.
+pub fn custody_worker_routes() -> Router<AppState> {
+    Router::new().route("/wallet/contract/identity", post(identity_handler))
+}
+
+/// The routes the coordinator asks, merged into the coordinator-token group.
 pub fn custody_routes() -> Router<AppState> {
     Router::new()
         .route("/wallet/contract/key", post(key_handler))
@@ -461,6 +469,56 @@ async fn relay_handler(
     )
     .await?;
     Ok(Json(response))
+}
+
+// ---------------------------------------------------------------------------
+// identity
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityRequest {
+    wallet_id: String,
+    /// The account a program is asked to run as.
+    wallet_contract: String,
+    /// The NEAR account that called: the wallet's own.
+    caller: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IdentityResponse {
+    /// The account the program may run as.
+    account_id: String,
+}
+
+/// A program runs as an account only when its caller is the wallet that
+/// account is the wallet contract of: the caller is the NEAR account of
+/// `wallet_id`, and the account is admitted with that wallet's TEE key in its
+/// pair. The wallet's id and its scope are the coordinator's word; a wrong
+/// one derives another account or another key, and is refused here.
+async fn identity_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<IdentityRequest>,
+) -> Result<Json<IdentityResponse>, ApiError> {
+    let (customer, _) = owner_scope(&state, &headers, &req.wallet_id).await?;
+    let (near_key, tee) = {
+        let keystore = state.keystore.read().await;
+        let key = |seed: &str| {
+            keystore
+                .get_public_key_for_seed(Some(&customer), seed)
+                .map_err(|e| ApiError::InternalError(format!("Failed to derive a wallet key: {e}")))
+        };
+        (key(&wallet_seed(&req.wallet_id, "near"))?, key(&tee_key_seed(&req.wallet_id))?)
+    };
+    if hex::encode(near_key.as_bytes()) != req.caller {
+        return Err(ApiError::Forbidden(format!(
+            "`{}` is not the account of the wallet it is said to be",
+            req.caller
+        )));
+    }
+    let (wallet_contract, _) = load_admitted(&state, &req.wallet_contract, &tee).await?;
+    Ok(Json(IdentityResponse { account_id: wallet_contract.to_string() }))
 }
 
 #[cfg(test)]

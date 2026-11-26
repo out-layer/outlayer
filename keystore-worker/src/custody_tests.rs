@@ -180,3 +180,22 @@ fn the_request_bodies_take_no_field_they_do_not_name() {
     assert!(serde_json::from_str::<OperationBody>(&format!(r#"{{"op":{op}}}"#)).is_err());
     assert!(serde_json::from_str::<KeyRequest>(r#"{"wallet_id":"w","seed":"x"}"#).is_err());
 }
+
+/// A program is let to run as an account after the caller is shown to be the
+/// wallet's own account and the account is admitted for that wallet.
+#[test]
+fn identity_checks_the_caller_then_admits_the_account() {
+    let identity = body_of(source(), "async fn identity_handler(");
+    let steps = [
+        "owner_scope(&state",
+        r#"wallet_seed(&req.wallet_id, "near")"#,
+        "hex::encode(near_key.as_bytes()) != req.caller",
+        "load_admitted(&state, &req.wallet_contract, &tee)",
+    ];
+    let mut at = 0;
+    for step in steps {
+        let found = identity[at..].find(step).unwrap_or_else(|| panic!("`{step}` is missing or out of order"));
+        at += found + step.len();
+    }
+    assert!(!identity.contains("derive_keypair"));
+}
