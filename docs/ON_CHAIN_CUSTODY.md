@@ -298,7 +298,7 @@ is decoded or trusted as a request.
   the request, so the agent's check is what makes its signature mean the
   operation it asked for.
 - **Replay** is the wallet contract's own protection: a nonce per request,
-  accepted once within the request's validity of one hour.
+  accepted once within the request's validity of ten minutes.
 - **The operation is an object with an id.** The id is the agent's idempotency
   key: 1 to 64 characters of letters, digits, `-` and `_`. Asking again under
   the same id continues the same operation; the same id with another content
@@ -344,7 +344,7 @@ token's own for a token. A token is its id inside NEAR Intents
 | `relayed` | the transaction `tx_hash` was sent and its outcome is not recorded | reads the operation; the read settles it |
 | `success` | the request executed on chain. For a swap or a withdrawal to another chain it says the input reached 1Click's deposit address; `route_status` on a read follows the route | — |
 | `failed` | the chain refused; `result` carries the chain's failure | reads the failure; the same thing again is another operation under another id |
-| `closed` | ended with nothing sent, for `reason`: the vote was rejected or expired, an approval was not used within its 24 hours, a prepared request was not relayed within an hour, or its transaction never reached the chain in that hour | reads the reason; the same thing again is another operation under another id |
+| `closed` | ended with nothing sent, for `reason`: the vote was rejected or expired, an approval was not used within its 24 hours, a prepared request was not relayed within ten minutes, or its transaction never reached the chain in that time | reads the reason; the same thing again is another operation under another id |
 
 ### The agent's signed request
 
@@ -401,6 +401,7 @@ later request under the same id is compared with. It is not the hash of
 | `401 invalid_signature` | the request is not the agent's |
 | `403 policy_denied` | the policy, or the enclave judging the same operation again, refuses it; `message` says why |
 | `403 wallet_frozen` | the wallet is frozen |
+| `403 wallet_contract_refused` | the enclave does not serve the account as this wallet's wallet contract: it runs no approved build, has an extension, has signatures switched off, or its pair does not hold this wallet's key; `message` says which |
 | `409 conflict` | the nonce was taken, or the `id` was used for another content |
 | `409 wallet_busy` | another operation is using this wallet; one operation of a wallet runs at a time |
 | `429 operation_limit_reached` | the wallet's counted ceiling on operations is reached |
@@ -465,11 +466,11 @@ operation, with amounts below the policy's threshold passing without one.
   never relayed, and not when it fails on chain.
 - A `transfer` counts its `amount` and a `call` its `deposit` under `native`;
   every other kind counts its input amount under its token.
-- **A prepared request that is not relayed within an hour is closed.** The
-  wallet contract accepts a request for an hour from its `created_at_ns`.
+- **A prepared request that is not relayed within ten minutes is closed.** The
+  wallet contract accepts a request for ten minutes from its `created_at_ns`.
 - **A freeze stops new requests, not the one already prepared.** A prepared
   request carries the enclave's half, and the wallet contract accepts it with
-  the agent's half until its hour ends. One operation runs at a time, so that
+  the agent's half until its ten minutes end. One operation runs at a time, so that
   is one request at most.
 - One operation of a wallet runs at a time (`409 wallet_busy`), so the limits
   are counted correctly.
@@ -597,7 +598,7 @@ encoding, in the wallet contract's own layout:
 | `signer_id` | string: the wallet contract's account |
 | `nonce` | `u32` |
 | `created_at` | `u64`, nanoseconds since the Unix epoch |
-| `timeout_secs` | `u32`, `3600` |
+| `timeout_secs` | `u32`, `600` |
 | wallet operations | `u32` count, `0` |
 | promises | `u32` count, `1` |
 | `receiver_id` | string |

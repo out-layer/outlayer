@@ -25,6 +25,7 @@ use shared_tee_helpers::{
         admit::{admit, Admitted, Fault, Observed},
         agent_request::{NotSigned, SignedAgentRequest, OPERATION_METHOD, OPERATION_PATH},
         halves::{sign_half, Role},
+        refusal,
         keys::tee_key_seed,
         message::RequestMessage,
         moves::{build, Context, Move},
@@ -174,13 +175,11 @@ async fn load_admitted(
     let (code_hash, block) = near.view_account_code_hash_at_final(&account).await.map_err(unread)?;
     let code_hash = code_hash
         .and_then(|b58| shared_tee_helpers::code_hash::parse_code_hash_base58(&b58))
-        .ok_or_else(|| {
-            ApiError::Forbidden(format!("`{account}` runs no contract, so it is not a wallet contract"))
-        })?;
+        .ok_or_else(|| not_admitted(format!("`{account}` runs no contract, so it is not a wallet contract")))?;
     // An account that runs anything but an approved build is refused before
     // any of its methods is called.
     if !approved_builds(state, near).await?.contains(&code_hash) {
-        return Err(ApiError::Forbidden(format!("`{account}`: {}", Fault::CodeHash)));
+        return Err(not_admitted(format!("`{account}`: {}", Fault::CodeHash)));
     }
 
     let at = BlockReference::BlockId(BlockId::Hash(block));
@@ -201,8 +200,13 @@ async fn load_admitted(
     };
 
     let admitted = admit(&code_hash, tee.as_bytes(), &observed)
-        .map_err(|fault| ApiError::Forbidden(format!("`{account}`: {fault}")))?;
+        .map_err(|fault| not_admitted(format!("`{account}`: {fault}")))?;
     Ok((account, admitted))
+}
+
+/// The account is not served as this wallet's wallet contract.
+fn not_admitted(message: String) -> ApiError {
+    ApiError::Refused { code: refusal::WALLET_CONTRACT_REFUSED, message }
 }
 
 /// The builds this keystore signs for: the keystore DAO's list, read on
@@ -328,7 +332,7 @@ async fn prepare_handler(
         .verified(wallet_contract.as_str(), &admitted.pair.agent, now_ns / 1_000_000_000)
         .map_err(|why| match why {
             NotSigned::Field(_) => ApiError::BadRequest(why.to_string()),
-            NotSigned::Signature => ApiError::Forbidden(why.to_string()),
+            NotSigned::Signature => ApiError::Refused { code: refusal::INVALID_SIGNATURE, message: why.to_string() },
         })?;
 
     // The operation judged is the one in the bytes the agent signed.
@@ -353,7 +357,9 @@ async fn prepare_handler(
     }
     let usage = req.usage.as_ref().map(wallet_policy::Usage::from_current_usage);
     match wallet_policy::evaluate(&policy, &op, usage.as_ref(), now_ns / 1_000_000_000) {
-        Decision::Frozen => return Err(ApiError::Forbidden("Wallet is frozen".to_string())),
+        Decision::Frozen => {
+            return Err(ApiError::Refused { code: refusal::WALLET_FROZEN, message: "Wallet is frozen".to_string() })
+        }
         Decision::Deny { reason } => return Err(ApiError::Forbidden(reason)),
         Decision::RequiresApproval { threshold } => {
             let wallet_pubkey =
@@ -463,13 +469,14 @@ async fn relay_handler(
     let expires_ns = req.message.created_at_ns.saturating_add(u64::from(TIMEOUT_SECS) * 1_000_000_000);
     if now_ns >= expires_ns {
         return Err(ApiError::BadRequest(
-            "the request is past the hour the wallet contract accepts it for".to_string(),
+            "the request is past the time the wallet contract accepts it for".to_string(),
         ));
     }
     if !admitted.pair.verify(&req.message, &req.proof) {
-        return Err(ApiError::Forbidden(
-            "The proof is not the agent's and the TEE's signatures over this request".to_string(),
-        ));
+        return Err(ApiError::Refused {
+            code: refusal::INVALID_SIGNATURE,
+            message: "The proof is not the agent's and the TEE's signatures over this request".to_string(),
+        });
     }
 
     let actions = relay_actions(&req.message, &req.proof);

@@ -286,7 +286,7 @@ prints.
 
 The owner's master (`owner-exit claim`) is `CUSTOMER_RECOVERY_MASTER` and the
 signature over the agent-key request is `AGENT_KEY_SIGNATURE` (hex or base64),
-both in the environment. A request is valid for an hour from the moment it is
+both in the environment. A request is valid for ten minutes from the moment it is
 made; `--nonce` defaults to the current second, which the wallet contract has
 not seen.
 

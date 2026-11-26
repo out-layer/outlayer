@@ -670,6 +670,10 @@ pub enum ApiError {
     /// or exists with a different key on it (verified against testnet), so
     /// "send NEAR and it will work" would be a remedy we cannot know applies.
     ChainRefused(String),
+    /// A refusal with a machine code beside its sentence (HTTP 403): one the
+    /// caller answers as what it is and not as a denial by the policy. The
+    /// codes are `custody_core::refusal`'s.
+    Refused { code: &'static str, message: String },
     InternalError(String),
     /// This instance cannot serve the request at this moment, and the same
     /// request can succeed when made again: HTTP 503. A condition of the
@@ -712,6 +716,7 @@ impl ApiError {
             | ApiError::Unavailable(m)
             | ApiError::SecretsNotFound(m)
             | ApiError::SigningKeysRefused(_, m) => m,
+            ApiError::Refused { message, .. } => message,
             ApiError::TooManyRequests => "Too many requests",
         }
     }
@@ -751,6 +756,10 @@ impl IntoResponse for ApiError {
             ApiError::ChainRefused(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            ApiError::Refused { code, message } => {
+                return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": message, "code": code})))
+                    .into_response()
+            }
             ApiError::SigningKeysRefused(status, msg) => {
                 return (status, Json(serde_json::json!({"error": msg, "code": SIGNING_KEYS_REFUSED})))
                     .into_response()

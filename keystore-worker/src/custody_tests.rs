@@ -139,6 +139,7 @@ mod at_the_door {
     use shared_tee_helpers::custody_core::{
         agent_request::{AgentRequest, SignedAgentRequest},
         halves::{proof, sign_half, verify_half, PublicKeyPair, Role},
+        refusal,
         message::{Action, Promise},
     };
 
@@ -310,6 +311,7 @@ mod at_the_door {
     fn refusal(result: Result<PrepareResponse, ApiError>) -> String {
         match result {
             Err(ApiError::Forbidden(reason)) | Err(ApiError::BadRequest(reason)) => reason,
+            Err(ApiError::Refused { message, .. }) => message,
             Err(other) => panic!("refused for another class of reason: {other:?}"),
             Ok(_) => panic!("a request was built and the TEE's half made"),
         }
@@ -421,7 +423,10 @@ mod at_the_door {
                 }),
             )
             .await;
-            assert!(matches!(identity, Err(ApiError::Forbidden(_))), "{why}");
+            assert!(
+                matches!(identity, Err(ApiError::Refused { code: refusal::WALLET_CONTRACT_REFUSED, .. })),
+                "{why}"
+            );
         }
     }
 
@@ -567,6 +572,35 @@ mod at_the_door {
         assert_eq!(call.args, prepared.message.execute_signed_args(&proof));
     }
 
+    /// A refusal that is not the policy's says which it is, so the API in
+    /// front answers a freeze as a freeze and a bad signature as one; a
+    /// denial by the policy carries no code.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_the_policys_names_itself() {
+        let stand = stand().await;
+        let honest = stand.chain.lock().unwrap().clone();
+        let code = |result: Result<PrepareResponse, ApiError>| match result {
+            Err(ApiError::Refused { code, .. }) => Some(code),
+            Err(ApiError::Forbidden(_)) => None,
+            other => panic!("not a refusal: {:?}", other.map(|r| r.request_hash)),
+        };
+
+        let other = SigningKey::from_bytes(&[0xb2; 32]);
+        assert_eq!(code(prepare(&stand, prepare_request(&other, TRANSFER, now())).await), Some(refusal::INVALID_SIGNATURE));
+
+        *stand.chain.lock().unwrap() = Chain { policy: Some((OWNER.to_string(), true, json!({}))), ..honest.clone() };
+        assert_eq!(code(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await), Some(refusal::WALLET_FROZEN));
+
+        *stand.chain.lock().unwrap() = Chain { extensions: vec![OWNER.to_string()], ..honest.clone() };
+        assert_eq!(
+            code(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await),
+            Some(refusal::WALLET_CONTRACT_REFUSED)
+        );
+
+        *stand.chain.lock().unwrap() = Chain { policy: None, ..honest };
+        assert_eq!(code(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await), None);
+    }
+
     async fn wallet_account(stand: &Stand) -> String {
         let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
         let key = stand.state.keystore.read().await.get_public_key_for_seed(Some(&customer), &wallet_seed(WALLET, "near")).unwrap();
@@ -620,23 +654,29 @@ mod at_the_door {
         };
 
         for unproven in [hex::encode(tee_half), hex::encode(agent_half), proof(&tee_half, &agent_half), proof(&tee_half, &tee_half)] {
-            assert!(matches!(relay(msg.clone(), unproven).await, Err(ApiError::Forbidden(_))));
+            assert!(matches!(
+                relay(msg.clone(), unproven).await,
+                Err(ApiError::Refused { code: refusal::INVALID_SIGNATURE, .. })
+            ));
         }
 
         // the proof of one request does not relay another
         let mut another = msg.clone();
         another.promise.action = Action::Transfer { amount: 500 };
-        assert!(matches!(relay(another, proof(&agent_half, &tee_half)).await, Err(ApiError::Forbidden(_))));
+        assert!(matches!(
+            relay(another, proof(&agent_half, &tee_half)).await,
+            Err(ApiError::Refused { code: refusal::INVALID_SIGNATURE, .. })
+        ));
 
-        // past its hour, a whole proof relays nothing
+        // past its time, a whole proof relays nothing
         let mut old = msg.clone();
-        old.created_at_ns -= 3_600 * 1_000_000_000;
+        old.created_at_ns -= u64::from(TIMEOUT_SECS) * 1_000_000_000;
         let old_proof = proof(&sign_half(Role::Agent, &stand.agent, &old), &{
             let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
             let (tee, _) = stand.state.keystore.read().await.derive_keypair(Some(&customer), &tee_key_seed(WALLET)).unwrap();
             sign_half(Role::Tee, &tee, &old)
         });
-        assert!(matches!(relay(old, old_proof).await, Err(ApiError::BadRequest(reason)) if reason.contains("past the hour")));
+        assert!(matches!(relay(old, old_proof).await, Err(ApiError::BadRequest(reason)) if reason.contains("past the time")));
 
         let mut elsewhere = msg.clone();
         elsewhere.signer_id = "other.alice.testnet".to_string();
