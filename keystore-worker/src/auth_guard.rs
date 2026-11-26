@@ -51,6 +51,7 @@ pub struct AuthGuard {
 
 impl AuthGuard {
     /// Whether the keystore is in lockout: a request without a valid token is refused at once.
+    #[cfg(test)]
     pub fn locked(&self, now: Instant) -> bool {
         let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         s.locked_until.map_or(false, |t| now < t)

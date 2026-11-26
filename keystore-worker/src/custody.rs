@@ -71,10 +71,9 @@ pub fn custody_routes() -> Router<AppState> {
 /// The owner scope a wallet contract's wallet is in, loaded: the scope, and
 /// the owner's account.
 ///
-/// A wallet contract is for a wallet with an owner only. The owner's master
-/// is the one the owner can leave with, and the TEE's key under it is the key
-/// the owner then holds; a wallet under the default master or a vault's has
-/// no such way out.
+/// A wallet contract is for a wallet with an owner. The owner's master is the
+/// one the owner can leave with, and the TEE's key under it is the key the
+/// owner then holds.
 async fn owner_scope(
     state: &AppState,
     headers: &HeaderMap,
