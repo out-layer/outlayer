@@ -264,6 +264,36 @@ keystore's vector.
 `sign-bearer-near --owner` builds a `Bearer near:` token for an owner's scope, and
 `sign-api-key-claim` signs `api-key:<seed>:<timestamp>:<key_hash>[:<vault_id>]`.
 
+## A wallet contract after an exit
+
+An agent with on-chain custody keeps its main balance in a wallet contract: a
+NEAR account that executes a request only under two signatures, the agent's
+key and the wallet's TEE key. An owner who has left holds both, and
+`customer-recovery wallet-contract` acts on the wallet contract with them. It
+talks to no service and to no chain; any NEAR account sends the call it
+prints.
+
+| Command | Does |
+|---|---|
+| `wallet-contract agent-key-request --owner <account> --wallet-id <id>` | prints the NEP-413 message, recipient and nonce the owner account's own key signs; that signature is the agent's key |
+| `wallet-contract keys --owner <account> --wallet-id <id>` | the pair of public keys; `public_key` equals what the wallet contract's `w_public_key` answers |
+| `wallet-contract request --owner <account> --wallet-id <id> --contract <account> --network mainnet\|testnet <move>` | a request with both halves, as the arguments of `w_execute_signed`, and the near-cli command that sends it |
+
+`<move>` is one of `--transfer-to <account> --amount <yoctoNEAR>`;
+`--call-to <account> --method <name> --args-base64 <b64> --gas <gas> --deposit <yoctoNEAR>`;
+`--intents-transfer-to <account> --token <token id> --amount <units>`;
+`--intents-withdraw-to <account> --token <NEP-141 account> --amount <units>`.
+
+The owner's master (`owner-exit claim`) is `CUSTOMER_RECOVERY_MASTER` and the
+signature over the agent-key request is `AGENT_KEY_SIGNATURE` (hex or base64),
+both in the environment. A request is valid for an hour from the moment it is
+made; `--nonce` defaults to the current second, which the wallet contract has
+not seen.
+
+The bytes are those of `custody-core`
+([shared-tee-helpers](https://github.com/out-layer/shared-tee-helpers)), the
+crate the enclave builds and signs with.
+
 ## Caveats
 
 - Run the tool on a host you trust — the master and derived private keys are printed to stdout. Redirect them to a 0600 file; don't pipe them into a logger or a shared terminal.

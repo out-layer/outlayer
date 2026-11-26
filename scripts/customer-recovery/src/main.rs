@@ -60,6 +60,7 @@ use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 
 mod owner_exit;
+mod wallet_contract;
 mod wallet_keys;
 
 const BLS12381G1_PUBLIC_KEY_SIZE: usize = 48;
@@ -1098,6 +1099,9 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() >= 2 && argv[1] == "owner-exit" {
         return owner_exit::run(&argv[2..]).await;
+    }
+    if argv.len() >= 2 && argv[1] == "wallet-contract" {
+        return wallet_contract::run(&argv[2..]);
     }
     if argv.len() == 2 && argv[1] == "generate-key" {
         return generate_key_subcommand();

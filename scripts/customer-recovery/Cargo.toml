@@ -38,6 +38,9 @@ sha3 = "0.10"
 k256 = { version = "0.13", features = ["ecdsa"] }
 hmac = "0.12"
 ed25519-dalek = "2"
+# The bytes of a wallet contract's request and the derivation of its two keys: the crate the
+# keystore builds and signs with.
+custody-core = { git = "https://github.com/out-layer/shared-tee-helpers", branch = "onchain-custody" }
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 borsh = "1"
