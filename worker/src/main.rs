@@ -1184,6 +1184,19 @@ fn vrf_domain_identity(
         .cloned()
 }
 
+/// Who the guest acts as, the `NEAR_SENDER_ID` it reads: the wallet
+/// contract's account when the keystore verified one for this caller, and
+/// the caller otherwise — over HTTPS the owner of the payment key, on chain
+/// the sender of the request.
+fn guest_sender<'a>(
+    bound_sender: Option<&'a String>,
+    is_https_call: bool,
+    payment_key_owner: Option<&'a String>,
+    context_sender: Option<&'a String>,
+) -> Option<&'a String> {
+    bound_sender.or(if is_https_call { payment_key_owner } else { context_sender })
+}
+
 fn identity_claim<'a>(
     is_https_call: bool,
     context_sender: Option<&'a str>,
@@ -1346,17 +1359,16 @@ fn merge_env_vars(
         if is_https_call { "HTTPS".to_string() } else { "NEAR".to_string() }
     );
 
+    if let Some(sender) = guest_sender(bound_sender, is_https_call, payment_key_owner, context.sender_id.as_ref()) {
+        env_vars.insert("NEAR_SENDER_ID".to_string(), sender.clone());
+    }
+
     if is_https_call {
         // HTTPS mode: set blockchain vars to empty.
         //
-        // NEAR_SENDER_ID — the guest-visible identity: the verified wallet
-        // contract's account when the run asked for it, the payment key owner
-        // otherwise. NEAR_USER_ACCOUNT_ID always stays the payment key owner:
-        // it is the BILLING identity, and a wallet contract renames who the
-        // guest acts as, not who pays.
-        if let Some(sender) = bound_sender.or(payment_key_owner) {
-            env_vars.insert("NEAR_SENDER_ID".to_string(), sender.clone());
-        }
+        // NEAR_USER_ACCOUNT_ID is the payment key owner whoever the guest acts
+        // as: it is the BILLING identity, and a wallet contract renames who
+        // the guest acts as, not who pays.
         if let Some(owner) = payment_key_owner {
             env_vars.insert("NEAR_USER_ACCOUNT_ID".to_string(), owner.clone());
         }
@@ -1393,9 +1405,6 @@ fn merge_env_vars(
         // NEAR transaction mode: use context values
 
         // Add execution context
-        if let Some(ref sender_id) = context.sender_id {
-            env_vars.insert("NEAR_SENDER_ID".to_string(), sender_id.clone());
-        }
         if let Some(ref contract_id) = context.contract_id {
             env_vars.insert("NEAR_CONTRACT_ID".to_string(), contract_id.clone());
         }
@@ -5322,6 +5331,25 @@ mod verified_sender_tests {
             Some(&owner),
             "billing identity must not follow the sender"
         );
+    }
+
+    /// The guest's sender is one rule on both doors: the verified wallet
+    /// contract's account, or else the caller of that door.
+    #[test]
+    fn the_guest_acts_as_the_verified_account_or_as_its_caller() {
+        let (bound, key_owner, sender) = ("agent.tla".to_string(), "aaaa".to_string(), "alice.near".to_string());
+
+        for is_https_call in [true, false] {
+            assert_eq!(
+                super::guest_sender(Some(&bound), is_https_call, Some(&key_owner), Some(&sender)),
+                Some(&bound)
+            );
+        }
+        assert_eq!(super::guest_sender(None, true, Some(&key_owner), Some(&sender)), Some(&key_owner));
+        assert_eq!(super::guest_sender(None, false, Some(&key_owner), Some(&sender)), Some(&sender));
+        // a door whose caller is not known names nobody, not the other door's
+        assert_eq!(super::guest_sender(None, true, None, Some(&sender)), None);
+        assert_eq!(super::guest_sender(None, false, Some(&key_owner), None), None);
     }
 
     /// One flag, one module, one random stream — whichever door it came through.

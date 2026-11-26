@@ -352,8 +352,8 @@ The operation routes take no API key. Each request carries four headers:
 |---|---|
 | `x-agent-account` | the wallet contract's account |
 | `x-agent-timestamp` | Unix seconds, within 120 seconds of the server's clock |
-| `x-agent-nonce` | 16 bytes in hex, the agent's choice; each request is taken once |
-| `x-agent-signature` | 64 bytes in hex: the agent key's Ed25519 signature |
+| `x-agent-nonce` | 16 bytes in lowercase hex, the agent's choice; each request is taken once |
+| `x-agent-signature` | 64 bytes in lowercase hex: the agent key's Ed25519 signature |
 
 The signature covers the method, the path and the body
 ([section 11](#11-byte-formats)), so a request signed for one route is not

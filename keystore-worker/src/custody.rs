@@ -22,8 +22,8 @@ use near_primitives::types::AccountId;
 use serde::{Deserialize, Serialize};
 use shared_tee_helpers::{
     custody_core::{
-        admit::{admit, Admitted, Observed},
-        agent_request::{AgentRequest, OPERATION_METHOD, OPERATION_PATH},
+        admit::{admit, Admitted, Fault, Observed},
+        agent_request::{NotSigned, SignedAgentRequest, OPERATION_METHOD, OPERATION_PATH},
         halves::{sign_half, Role},
         keys::tee_key_seed,
         message::RequestMessage,
@@ -114,6 +114,21 @@ async fn tee_key(
     Ok(key)
 }
 
+/// The public half of [`tee_key`]: the second key of the wallet contract's
+/// pair.
+async fn tee_public_key(
+    state: &AppState,
+    customer: &Customer,
+    wallet_id: &str,
+) -> Result<ed25519_dalek::VerifyingKey, ApiError> {
+    state
+        .keystore
+        .read()
+        .await
+        .get_public_key_for_seed(Some(customer), &tee_key_seed(wallet_id))
+        .map_err(|e| ApiError::InternalError(format!("Failed to derive the TEE key: {e}")))
+}
+
 /// `mainnet` or `testnet`, by the contract this keystore serves.
 fn chain_id(state: &AppState) -> Result<&'static str, ApiError> {
     let contract = near_client(state)?.contract_id().as_str();
@@ -137,80 +152,78 @@ fn near_client(state: &AppState) -> Result<&crate::near::NearClient, ApiError> {
 
 /// Read `account` from the chain and admit it as the wallet contract whose
 /// TEE key is `tee`. Every request about a wallet contract passes here first.
+///
+/// The account's code and the three views of it are read at one final
+/// block, so what is admitted is one state of the account: the pair, the
+/// extensions and the signature switch are answers of the code whose hash
+/// was checked.
 async fn load_admitted(
     state: &AppState,
     account: &str,
     tee: &ed25519_dalek::VerifyingKey,
 ) -> Result<(AccountId, Admitted), ApiError> {
+    use near_primitives::types::{BlockId, BlockReference};
+
     let account: AccountId = account
         .parse()
         .map_err(|_| ApiError::BadRequest(format!("`{account}` is not a NEAR account id")))?;
     let near = near_client(state)?;
     let unread =
         |e: anyhow::Error| ApiError::InternalError(format!("Failed to read the wallet contract: {e:#}"));
-    let view = |method: &'static str| near.view_call_json(&account, method, serde_json::json!({}));
 
-    let observed_code_hash = near
-        .view_account_code_hash(&account)
-        .await
-        .map_err(unread)?
+    let (code_hash, block) = near.view_account_code_hash_at_final(&account).await.map_err(unread)?;
+    let code_hash = code_hash
         .and_then(|b58| shared_tee_helpers::code_hash::parse_code_hash_base58(&b58))
         .ok_or_else(|| {
             ApiError::Forbidden(format!("`{account}` runs no contract, so it is not a wallet contract"))
         })?;
-    // The builds this keystore signs for are the keystore DAO's list, read
-    // on every request: a build the DAO took off it is refused from the next
-    // one. An account that runs anything else is refused before any of its
-    // methods is called.
+    // An account that runs anything but an approved build is refused before
+    // any of its methods is called.
+    if !approved_builds(state, near).await?.contains(&code_hash) {
+        return Err(ApiError::Forbidden(format!("`{account}`: {}", Fault::CodeHash)));
+    }
+
+    let at = BlockReference::BlockId(BlockId::Hash(block));
+    let view = |method: &'static str| near.view_call_json_at(&account, method, serde_json::json!({}), at.clone());
+    fn shaped<T: serde::de::DeserializeOwned>(method: &str, answer: crate::near::ViewAt) -> Result<T, ApiError> {
+        serde_json::from_value(answer.value).map_err(|_| {
+            ApiError::InternalError(format!("the wallet contract's `{method}` answered in another shape"))
+        })
+    }
+    let observed = Observed {
+        code_hash,
+        public_key: shaped("w_public_key", view("w_public_key").await.map_err(unread)?)?,
+        extensions: shaped("w_extensions", view("w_extensions").await.map_err(unread)?)?,
+        signature_allowed: shaped(
+            "w_is_signature_allowed",
+            view("w_is_signature_allowed").await.map_err(unread)?,
+        )?,
+    };
+
+    let admitted = admit(&code_hash, tee.as_bytes(), &observed)
+        .map_err(|fault| ApiError::Forbidden(format!("`{account}`: {fault}")))?;
+    Ok((account, admitted))
+}
+
+/// The builds this keystore signs for: the keystore DAO's list, read on
+/// every request, so a build the DAO took off it is refused from the next
+/// one.
+async fn approved_builds(state: &AppState, near: &crate::near::NearClient) -> Result<Vec<[u8; 32]>, ApiError> {
     let dao = &state
         .mpc_context
         .get()
         .ok_or_else(|| ApiError::InternalError("MPC CKD context not configured".to_string()))?
         .mpc_ckd_config
         .keystore_dao_id;
-    let approved: Vec<String> = serde_json::from_value(
-        near.view_call_json(dao, "get_approved_wallet_contracts", serde_json::json!({}))
-            .await
-            .map_err(|e| {
-                ApiError::Unavailable(format!("the approved wallet contracts could not be read from {dao}: {e:#}"))
-            })?,
+    let listed: Vec<String> = serde_json::from_value(
+        near.view_call_json(dao, "get_approved_wallet_contracts", serde_json::json!({})).await.map_err(|e| {
+            ApiError::Unavailable(format!("the approved wallet contracts could not be read from {dao}: {e:#}"))
+        })?,
     )
-    .map_err(|_| ApiError::InternalError(format!("`get_approved_wallet_contracts` on {dao} answered in another shape")))?;
-    let is_approved = approved
-        .iter()
-        .filter_map(|b58| shared_tee_helpers::code_hash::parse_code_hash_base58(b58))
-        .any(|hash| hash == observed_code_hash);
-    if !is_approved {
-        return Err(ApiError::Forbidden(format!(
-            "`{account}`: {}",
-            shared_tee_helpers::custody_core::admit::Fault::CodeHash
-        )));
-    }
-    let malformed = |method: &str| {
-        ApiError::InternalError(format!("the wallet contract's `{method}` answered in another shape"))
-    };
-    let observed = Observed {
-        code_hash: observed_code_hash,
-        public_key: serde_json::from_value(view("w_public_key").await.map_err(unread)?)
-            .map_err(|_| malformed("w_public_key"))?,
-        extensions: serde_json::from_value(view("w_extensions").await.map_err(unread)?)
-            .map_err(|_| malformed("w_extensions"))?,
-        signature_allowed: serde_json::from_value(
-            view("w_is_signature_allowed").await.map_err(unread)?,
-        )
-        .map_err(|_| malformed("w_is_signature_allowed"))?,
-    };
-
-    let admitted = admit(&observed_code_hash, tee.as_bytes(), &observed)
-        .map_err(|fault| ApiError::Forbidden(format!("`{account}`: {fault}")))?;
-    Ok((account, admitted))
-}
-
-fn hex_bytes<const N: usize>(field: &str, text: &str) -> Result<[u8; N], ApiError> {
-    let mut bytes = [0; N];
-    hex::decode_to_slice(text, &mut bytes)
-        .map_err(|_| ApiError::BadRequest(format!("`{field}` is not {N} bytes in hex")))?;
-    Ok(bytes)
+    .map_err(|_| {
+        ApiError::InternalError(format!("`get_approved_wallet_contracts` on {dao} answered in another shape"))
+    })?;
+    Ok(listed.iter().filter_map(|b58| shared_tee_helpers::code_hash::parse_code_hash_base58(b58)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -236,12 +249,7 @@ async fn key_handler(
     Json(req): Json<KeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
     let (customer, _) = owner_scope(&state, &headers, &req.wallet_id).await?;
-    let public_key = state
-        .keystore
-        .read()
-        .await
-        .get_public_key_for_seed(Some(&customer), &tee_key_seed(&req.wallet_id))
-        .map_err(|e| ApiError::InternalError(format!("Failed to derive the TEE key: {e}")))?;
+    let public_key = tee_public_key(&state, &customer, &req.wallet_id).await?;
     Ok(Json(KeyResponse { tee_public_key: hex::encode(public_key.as_bytes()) }))
 }
 
@@ -269,22 +277,6 @@ struct PrepareRequest {
     usage: Option<serde_json::Value>,
     #[serde(default)]
     approval_info: Option<ApprovalInfo>,
-}
-
-/// An HTTPS request signed by the agent's key
-/// (`custody_core::agent_request`).
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SignedAgentRequest {
-    method: String,
-    path: String,
-    /// The body, byte for byte as the agent sent it.
-    body: String,
-    timestamp: u64,
-    /// 16 bytes in hex.
-    nonce: String,
-    /// 64 bytes in hex.
-    signature: String,
 }
 
 /// The body of the agent's request for an operation.
@@ -332,22 +324,12 @@ async fn prepare_handler(
             "an operation is asked for by {OPERATION_METHOD} {OPERATION_PATH}"
         )));
     }
-    let agent_request = AgentRequest {
-        wallet_contract: wallet_contract.as_str(),
-        method: &signed.method,
-        path: &signed.path,
-        body: signed.body.as_bytes(),
-        timestamp: signed.timestamp,
-        nonce: hex_bytes("agent_request.nonce", &signed.nonce)?,
-    };
-    let signature = hex_bytes("agent_request.signature", &signed.signature)?;
-    if !agent_request.verify(&admitted.pair.agent, &signature, now_ns / 1_000_000_000) {
-        return Err(ApiError::Forbidden(
-            "The request is not signed by the agent's key of this wallet contract, or its \
-             timestamp is not the current time"
-                .to_string(),
-        ));
-    }
+    let agent_request = signed
+        .verified(wallet_contract.as_str(), &admitted.pair.agent, now_ns / 1_000_000_000)
+        .map_err(|why| match why {
+            NotSigned::Field(_) => ApiError::BadRequest(why.to_string()),
+            NotSigned::Signature => ApiError::Forbidden(why.to_string()),
+        })?;
 
     // The operation judged is the one in the bytes the agent signed.
     let OperationBody { op, .. } = serde_json::from_slice(agent_request.body)
@@ -442,6 +424,20 @@ struct RelayRequest {
     proof: String,
 }
 
+/// What the relaying transaction does: one call of `w_execute_signed` with
+/// the request and both halves, and no deposit.
+fn relay_actions(message: &RequestMessage, proof: &str) -> Vec<near_primitives::transaction::Action> {
+    use near_primitives::transaction::{Action, FunctionCallAction};
+    use near_primitives::types::{Balance, Gas};
+
+    vec![Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "w_execute_signed".to_string(),
+        args: message.execute_signed_args(proof),
+        gas: Gas::from_gas(RELAY_GAS),
+        deposit: Balance::from_yoctonear(0),
+    }))]
+}
+
 /// The wallet's own NEAR account pays the gas of a request that the wallet
 /// contract will accept: one call of `w_execute_signed` on the admitted
 /// account, with both halves valid for the message. The transaction comes
@@ -452,12 +448,7 @@ async fn relay_handler(
     Json(req): Json<RelayRequest>,
 ) -> Result<Json<WalletSignResponse>, ApiError> {
     let (customer, _) = owner_scope(&state, &headers, &req.wallet_id).await?;
-    let tee = state
-        .keystore
-        .read()
-        .await
-        .get_public_key_for_seed(Some(&customer), &tee_key_seed(&req.wallet_id))
-        .map_err(|e| ApiError::InternalError(format!("Failed to derive the TEE key: {e}")))?;
+    let tee = tee_public_key(&state, &customer, &req.wallet_id).await?;
     let (wallet_contract, admitted) = load_admitted(&state, &req.wallet_contract, &tee).await?;
 
     if req.message.signer_id != wallet_contract.as_str() || req.message.chain_id != chain_id(&state)? {
@@ -481,25 +472,13 @@ async fn relay_handler(
         ));
     }
 
-    let args = req.message.execute_signed_args(&req.proof);
+    let actions = relay_actions(&req.message, &req.proof);
     let response = sign_near_transaction(
         &state,
         Some(&customer),
         &req.wallet_id,
         hex::encode(req.message.hash()),
-        move |_| {
-            use near_primitives::transaction::{Action, FunctionCallAction};
-            use near_primitives::types::{Balance, Gas};
-            Ok((
-                wallet_contract,
-                vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name: "w_execute_signed".to_string(),
-                    args,
-                    gas: Gas::from_gas(RELAY_GAS),
-                    deposit: Balance::from_yoctonear(0),
-                }))],
-            ))
-        },
+        move |_| Ok((wallet_contract, actions)),
     )
     .await?;
     Ok(Json(response))
@@ -536,21 +515,19 @@ async fn identity_handler(
     Json(req): Json<IdentityRequest>,
 ) -> Result<Json<IdentityResponse>, ApiError> {
     let (customer, _) = owner_scope(&state, &headers, &req.wallet_id).await?;
-    let (near_key, tee) = {
-        let keystore = state.keystore.read().await;
-        let key = |seed: &str| {
-            keystore
-                .get_public_key_for_seed(Some(&customer), seed)
-                .map_err(|e| ApiError::InternalError(format!("Failed to derive a wallet key: {e}")))
-        };
-        (key(&wallet_seed(&req.wallet_id, "near"))?, key(&tee_key_seed(&req.wallet_id))?)
-    };
+    let near_key = state
+        .keystore
+        .read()
+        .await
+        .get_public_key_for_seed(Some(&customer), &wallet_seed(&req.wallet_id, "near"))
+        .map_err(|e| ApiError::InternalError(format!("Failed to derive the wallet's key: {e}")))?;
     if hex::encode(near_key.as_bytes()) != req.caller {
         return Err(ApiError::Forbidden(format!(
             "`{}` is not the account of the wallet it is said to be",
             req.caller
         )));
     }
+    let tee = tee_public_key(&state, &customer, &req.wallet_id).await?;
     let (wallet_contract, _) = load_admitted(&state, &req.wallet_contract, &tee).await?;
     Ok(Json(IdentityResponse { account_id: wallet_contract.to_string() }))
 }

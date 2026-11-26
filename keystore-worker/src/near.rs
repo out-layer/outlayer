@@ -299,6 +299,18 @@ pub struct ViewAt {
     pub block_hash: near_primitives::hash::CryptoHash,
 }
 
+/// The hash of the code an account runs, from the two fields `view_account`
+/// answers with. An inline deploy has it in `code_hash`; an account that uses
+/// a global contract has the all-zeros sentinel there and the hash in
+/// `global_contract_hash`. `None` for an account that runs no contract.
+fn effective_code_hash(inline: Option<&str>, global: Option<&str>) -> Option<String> {
+    const NO_CODE: &str = "11111111111111111111111111111111";
+    match inline {
+        Some(hash) if hash != NO_CODE => Some(hash.to_string()),
+        _ => global.map(str::to_string),
+    }
+}
+
 impl NearClient {
     /// Create new NEAR client (read-only)
     ///
@@ -793,6 +805,17 @@ impl NearClient {
         &self,
         account_id: &AccountId,
     ) -> Result<Option<String>> {
+        self.view_account_code_hash_at_final(account_id).await.map(|(code_hash, _)| code_hash)
+    }
+
+    /// [`Self::view_account_code_hash`] with the hash of the final block the
+    /// RPC answered from: views of the account's contract made at that block
+    /// (`BlockReference::BlockId(BlockId::Hash(..))`) are answered by the
+    /// code this hash names.
+    pub async fn view_account_code_hash_at_final(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<(Option<String>, near_primitives::hash::CryptoHash)> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": "view_account",
@@ -822,27 +845,14 @@ impl NearClient {
         let result = resp
             .get("result")
             .with_context(|| format!("view_account({account_id}): no result field"))?;
-
-        let inline = result
-            .get("code_hash")
+        let block_hash = result
+            .get("block_hash")
             .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let global = result
-            .get("global_contract_hash")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .and_then(|b58| b58.parse().ok())
+            .with_context(|| format!("view_account({account_id}): no block hash"))?;
+        let field = |name: &str| result.get(name).and_then(|v| v.as_str());
 
-        // Inline DeployContract → code_hash holds the real WASM hash.
-        // UseGlobalContract → code_hash is the all-zeros sentinel, the
-        //                     real hash is in global_contract_hash.
-        let chosen = match (inline.as_deref(), global) {
-            (Some(s), Some(g)) if s == "11111111111111111111111111111111" => Some(g),
-            (Some(s), _) if s == "11111111111111111111111111111111" => None,
-            (Some(s), _) => Some(s.to_string()),
-            (None, g) => g,
-        };
-
-        Ok(chosen)
+        Ok((effective_code_hash(field("code_hash"), field("global_contract_hash")), block_hash))
     }
 
     /// Fetch the typed access-key list for an account.
@@ -1252,6 +1262,20 @@ impl std::error::Error for KeyOwnerRefusal {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_code_an_account_runs_is_named_by_either_field() {
+        const NO_CODE: &str = "11111111111111111111111111111111";
+        let inline = Some("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
+        let global = Some("651XC7DH8J4Xczf8JKXH9pyveBY8ZuNCfy5HZ3SvuSiL");
+        assert_eq!(effective_code_hash(inline, None).as_deref(), inline);
+        assert_eq!(effective_code_hash(inline, global).as_deref(), inline);
+        assert_eq!(effective_code_hash(Some(NO_CODE), global).as_deref(), global);
+        assert_eq!(effective_code_hash(None, global).as_deref(), global);
+        assert_eq!(effective_code_hash(Some(NO_CODE), None), None);
+        assert_eq!(effective_code_hash(None, None), None);
+    }
+
 
     /// An endpoint nothing listens on, with a key in its query string.
     const KEYED_DEAD_URL: &str = "http://127.0.0.1:9/?apiKey=SECRET";

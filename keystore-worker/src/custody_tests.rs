@@ -96,65 +96,13 @@ fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
 #[test]
 fn the_tee_key_signs_in_prepare_only() {
     let source = source();
-    assert_eq!(source.matches("tee_key(&state").count(), 1);
+    assert_eq!(source.matches(" tee_key(&state").count(), 1);
     assert_eq!(source.matches("sign_half(").count(), 1);
     assert_eq!(source.matches(".derive_keypair(").count(), 1);
 
     let prepare = body_of(source, "async fn prepare_handler(");
     assert!(prepare.contains("tee_key(&state") && prepare.contains("sign_half(Role::Tee, &tee, &message)"));
     assert!(body_of(source, "async fn tee_key(").contains(".derive_keypair(Some(customer), &tee_key_seed(wallet_id))"));
-}
-
-/// `prepare` is one path in one order: nothing is built or signed before the
-/// wallet contract is admitted, the request is verified as the agent's, the
-/// owner's policy has passed and the approvals are verified.
-#[test]
-fn prepare_judges_before_it_builds() {
-    let prepare = body_of(source(), "async fn prepare_handler(");
-    let steps = [
-        "owner_scope(&state",
-        "load_admitted(&state",
-        "agent_request.verify(&admitted.pair.agent",
-        "serde_json::from_slice(agent_request.body)",
-        "load_wallet_policy_with_owner(&state",
-        "stored_by.as_deref() != Some(owner.as_str())",
-        "wallet_policy::evaluate(&policy, &op",
-        "verify_approvals(",
-        "move_for(&op",
-        "build(",
-        "sign_half(",
-    ];
-    let mut at = 0;
-    for step in steps {
-        let found = prepare[at..].find(step).unwrap_or_else(|| panic!("`{step}` is missing or out of order"));
-        at += found + step.len();
-    }
-    // the stand-in for a wallet with no policy is not for a wallet contract
-    assert!(!prepare.contains("policy_to_judge_by"));
-    // the operation has one source: the signed body
-    assert_eq!(prepare.matches("op:").count(), 0);
-}
-
-/// `relay` serves an admitted wallet contract, signs for a request both
-/// halves are valid over, and puts one call in the transaction.
-#[test]
-fn relay_signs_one_call_for_a_proven_request() {
-    let relay = body_of(source(), "async fn relay_handler(");
-    let steps = [
-        "owner_scope(&state",
-        "load_admitted(&state",
-        "req.message.signer_id != wallet_contract.as_str()",
-        "admitted.pair.verify(&req.message, &req.proof)",
-        "sign_near_transaction(",
-    ];
-    let mut at = 0;
-    for step in steps {
-        let found = relay[at..].find(step).unwrap_or_else(|| panic!("`{step}` is missing or out of order"));
-        at += found + step.len();
-    }
-    assert_eq!(relay.matches("Action::").count(), 1);
-    assert!(relay.contains(r#"method_name: "w_execute_signed".to_string()"#));
-    assert!(relay.contains("deposit: Balance::from_yoctonear(0)"));
 }
 
 #[test]
@@ -180,25 +128,6 @@ fn the_request_bodies_take_no_field_they_do_not_name() {
     assert!(serde_json::from_str::<KeyRequest>(r#"{"wallet_id":"w","seed":"x"}"#).is_err());
 }
 
-/// A program is let to run as an account after the caller is shown to be the
-/// wallet's own account and the account is admitted for that wallet.
-#[test]
-fn identity_checks_the_caller_then_admits_the_account() {
-    let identity = body_of(source(), "async fn identity_handler(");
-    let steps = [
-        "owner_scope(&state",
-        r#"wallet_seed(&req.wallet_id, "near")"#,
-        "hex::encode(near_key.as_bytes()) != req.caller",
-        "load_admitted(&state, &req.wallet_contract, &tee)",
-    ];
-    let mut at = 0;
-    for step in steps {
-        let found = identity[at..].find(step).unwrap_or_else(|| panic!("`{step}` is missing or out of order"));
-        at += found + step.len();
-    }
-    assert!(!identity.contains("derive_keypair"));
-}
-
 /// The handlers against a chain that answers what a scenario says: the
 /// owner's record in the DAO, the wallet contract's account and views, and
 /// the wallet's policy.
@@ -208,7 +137,7 @@ mod at_the_door {
     use ed25519_dalek::SigningKey;
     use serde_json::json;
     use shared_tee_helpers::custody_core::{
-        agent_request::AgentRequest,
+        agent_request::{AgentRequest, SignedAgentRequest},
         halves::{proof, sign_half, verify_half, PublicKeyPair, Role},
         message::{Action, Promise},
     };
@@ -232,7 +161,13 @@ mod at_the_door {
         signature_allowed: bool,
         /// `(stored by, frozen, the policy)`; `None` is no policy on chain.
         policy: Option<(String, bool, serde_json::Value)>,
+        /// The wallet contract's views that were asked for, each with the
+        /// block it was asked at.
+        views_asked: Vec<(String, serde_json::Value)>,
     }
+
+    /// The final block the chain answers `view_account` from.
+    const BLOCK: [u8; 32] = [0xb1; 32];
 
     struct Stand {
         state: AppState,
@@ -259,6 +194,7 @@ mod at_the_door {
             extensions: Vec::new(),
             signature_allowed: true,
             policy: Some((OWNER.to_string(), false, json!({}))),
+            views_asked: Vec::new(),
         }));
 
         let encrypt = {
@@ -275,15 +211,21 @@ mod at_the_door {
             "/",
             post(move |Json(body): Json<serde_json::Value>| {
                 let chain = answers.lock().unwrap().clone();
+                let answers = answers.clone();
                 let encrypt = encrypt.clone();
                 async move {
                     let (id, params) = (body["id"].clone(), body["params"].clone());
                     if params["request_type"] == "view_account" {
                         return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
                             "code_hash": "11111111111111111111111111111111",
-                            "global_contract_hash": bs58::encode(chain.code_hash).into_string()}}));
+                            "global_contract_hash": bs58::encode(chain.code_hash).into_string(),
+                            "block_hash": bs58::encode(BLOCK).into_string(), "block_height": 9}}));
                     }
-                    let view = match params["method_name"].as_str().unwrap_or_default() {
+                    let method = params["method_name"].as_str().unwrap_or_default();
+                    if method.starts_with("w_") {
+                        answers.lock().unwrap().views_asked.push((method.to_string(), params["block_id"].clone()));
+                    }
+                    let view = match method {
                         "get_exit_owner" => json!({
                             "generation": 1, "claim_in_flight": false,
                             "escrow_check": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ESCROW_CHECK)}),
@@ -518,6 +460,113 @@ mod at_the_door {
         }
     }
 
+    /// What is admitted is one state of the account: the three views are
+    /// asked at the block the account's code was read at.
+    #[tokio::test]
+    async fn the_wallet_contract_is_read_at_one_block() {
+        let stand = stand().await;
+        prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.unwrap();
+
+        let asked = stand.chain.lock().unwrap().views_asked.clone();
+        let block = json!(bs58::encode(BLOCK).into_string());
+        assert_eq!(
+            asked,
+            [
+                ("w_public_key".to_string(), block.clone()),
+                ("w_extensions".to_string(), block.clone()),
+                ("w_is_signature_allowed".to_string(), block),
+            ]
+        );
+    }
+
+    /// An account that runs another build is refused before any of its
+    /// methods is called.
+    #[tokio::test]
+    async fn no_method_of_an_unapproved_build_is_called() {
+        let stand = stand().await;
+        stand.chain.lock().unwrap().code_hash = [0; 32];
+        refusal(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await);
+        assert!(stand.chain.lock().unwrap().views_asked.is_empty());
+    }
+
+    /// `prepare` is one path in one order: with two things wrong, the earlier
+    /// gate is the one that refuses. The wallet contract is admitted, then the
+    /// request is shown to be the agent's, then the owner's policy is read
+    /// and judged, and only then is the operation turned into a move.
+    #[tokio::test]
+    async fn the_earlier_gate_refuses() {
+        let stand = stand().await;
+        let honest = stand.chain.lock().unwrap().clone();
+        let other = SigningKey::from_bytes(&[0xb2; 32]);
+        let to_itself = r#"{"id":"x","op":{"kind":"transfer","to":"trader.alice.testnet","amount":"1"}}"#;
+
+        // not admitted, and not the agent's
+        *stand.chain.lock().unwrap() = Chain { extensions: vec![OWNER.to_string()], ..honest.clone() };
+        let reason = refusal(prepare(&stand, prepare_request(&other, TRANSFER, now())).await);
+        assert!(reason.contains("extension"), "{reason}");
+
+        // not the agent's, and no policy
+        *stand.chain.lock().unwrap() = Chain { policy: None, ..honest.clone() };
+        let reason = refusal(prepare(&stand, prepare_request(&other, TRANSFER, now())).await);
+        assert!(reason.contains("not signed by the agent"), "{reason}");
+
+        // not the agent's, and a body that is no operation: nothing is read
+        // from bytes the agent did not sign
+        let reason = refusal(prepare(&stand, prepare_request(&other, r#"{"nonsense":1}"#, now())).await);
+        assert!(reason.contains("not signed by the agent"), "{reason}");
+
+        // no policy, and an operation a wallet contract does not do
+        let reason = refusal(prepare(&stand, prepare_request(&stand.agent, to_itself, now())).await);
+        assert!(reason.contains("no policy on chain"), "{reason}");
+
+        // a frozen wallet, and an operation a wallet contract does not do
+        *stand.chain.lock().unwrap() = Chain { policy: Some((OWNER.to_string(), true, json!({}))), ..honest };
+        let reason = refusal(prepare(&stand, prepare_request(&stand.agent, to_itself, now())).await);
+        assert!(reason.contains("frozen"), "{reason}");
+    }
+
+    /// The handed-on request is read strictly: bytes in another spelling are
+    /// refused as malformed before any signature is checked.
+    #[tokio::test]
+    async fn the_signed_request_has_one_spelling() {
+        let stand = stand().await;
+        let honest = prepare_request(&stand.agent, TRANSFER, now());
+        for (nonce, signature) in [
+            (honest.agent_request.nonce.replace('7', "A"), honest.agent_request.signature.clone()),
+            (honest.agent_request.nonce.clone(), honest.agent_request.signature.to_uppercase()),
+            (honest.agent_request.nonce.clone(), format!("0x{}", &honest.agent_request.signature[2..])),
+        ] {
+            let mut req = prepare_request(&stand.agent, TRANSFER, now());
+            req.agent_request = SignedAgentRequest { nonce, signature, ..req.agent_request };
+            let refused = prepare(&stand, req).await;
+            assert!(
+                matches!(&refused, Err(ApiError::BadRequest(reason)) if reason.contains("lowercase hex")),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// The relaying transaction is one call of `w_execute_signed` with the
+    /// request and its proof, and it carries no deposit.
+    #[tokio::test]
+    async fn the_relaying_transaction_is_one_call_with_no_deposit() {
+        use near_primitives::transaction::Action;
+
+        let stand = stand().await;
+        let prepared = prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.unwrap();
+        let tee_half: [u8; 64] = hex::decode(&prepared.tee_half).unwrap().try_into().unwrap();
+        let proof = proof(&sign_half(Role::Agent, &stand.agent, &prepared.message), &tee_half);
+
+        let actions = relay_actions(&prepared.message, &proof);
+        let [Action::FunctionCall(call)] = actions.as_slice() else {
+            panic!("not one call: {actions:?}");
+        };
+        assert_eq!(call.method_name, "w_execute_signed");
+        assert_eq!(call.deposit, near_primitives::types::Balance::from_yoctonear(0));
+        assert_eq!(call.gas, near_primitives::types::Gas::from_gas(RELAY_GAS));
+        assert_eq!(call.args, prepared.message.execute_signed_args(&proof));
+    }
+
     async fn wallet_account(stand: &Stand) -> String {
         let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
         let key = stand.state.keystore.read().await.get_public_key_for_seed(Some(&customer), &wallet_seed(WALLET, "near")).unwrap();
@@ -539,6 +588,15 @@ mod at_the_door {
 
         assert!(matches!(ask("f".repeat(64)).await, Err(ApiError::Forbidden(_))));
         assert!(matches!(ask(OWNER.to_string()).await, Err(ApiError::Forbidden(_))));
+
+        // a caller that is not the wallet is refused before the account is read
+        stand.chain.lock().unwrap().views_asked.clear();
+        stand.chain.lock().unwrap().code_hash = [0; 32];
+        let refused = ask("f".repeat(64)).await;
+        assert!(
+            matches!(&refused, Err(ApiError::Forbidden(reason)) if reason.contains("not the account of the wallet")),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test]
