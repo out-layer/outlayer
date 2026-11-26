@@ -3,7 +3,7 @@
 //! A wallet with an owner may have a wallet contract: an account that runs
 //! the two-key standard, whose pair of keys is the agent's and this wallet's
 //! TEE key. Nothing moves out of it without a signature of each. This file is
-//! the three things the keystore does for it:
+//! the four things the keystore does for it:
 //!
 //! * `key`: says what the TEE's public key of a wallet is, for the setup;
 //! * `prepare`: judges an operation the agent asked for by the owner's policy,

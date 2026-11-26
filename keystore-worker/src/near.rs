@@ -299,18 +299,6 @@ pub struct ViewAt {
     pub block_hash: near_primitives::hash::CryptoHash,
 }
 
-/// The hash of the code an account runs, from the two fields `view_account`
-/// answers with. An inline deploy has it in `code_hash`; an account that uses
-/// a global contract has the all-zeros sentinel there and the hash in
-/// `global_contract_hash`. `None` for an account that runs no contract.
-fn effective_code_hash(inline: Option<&str>, global: Option<&str>) -> Option<String> {
-    const NO_CODE: &str = "11111111111111111111111111111111";
-    match inline {
-        Some(hash) if hash != NO_CODE => Some(hash.to_string()),
-        _ => global.map(str::to_string),
-    }
-}
-
 impl NearClient {
     /// Create new NEAR client (read-only)
     ///
@@ -852,7 +840,10 @@ impl NearClient {
             .with_context(|| format!("view_account({account_id}): no block hash"))?;
         let field = |name: &str| result.get(name).and_then(|v| v.as_str());
 
-        Ok((effective_code_hash(field("code_hash"), field("global_contract_hash")), block_hash))
+        Ok((
+            shared_tee_helpers::code_hash::effective_code_hash_b58(field("code_hash"), field("global_contract_hash")),
+            block_hash,
+        ))
     }
 
     /// Fetch the typed access-key list for an account.
@@ -1262,20 +1253,6 @@ impl std::error::Error for KeyOwnerRefusal {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_code_an_account_runs_is_named_by_either_field() {
-        const NO_CODE: &str = "11111111111111111111111111111111";
-        let inline = Some("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
-        let global = Some("651XC7DH8J4Xczf8JKXH9pyveBY8ZuNCfy5HZ3SvuSiL");
-        assert_eq!(effective_code_hash(inline, None).as_deref(), inline);
-        assert_eq!(effective_code_hash(inline, global).as_deref(), inline);
-        assert_eq!(effective_code_hash(Some(NO_CODE), global).as_deref(), global);
-        assert_eq!(effective_code_hash(None, global).as_deref(), global);
-        assert_eq!(effective_code_hash(Some(NO_CODE), None), None);
-        assert_eq!(effective_code_hash(None, None), None);
-    }
-
 
     /// An endpoint nothing listens on, with a key in its query string.
     const KEYED_DEAD_URL: &str = "http://127.0.0.1:9/?apiKey=SECRET";
