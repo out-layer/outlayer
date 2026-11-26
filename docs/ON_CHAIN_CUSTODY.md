@@ -448,6 +448,16 @@ operation, with amounts below the policy's threshold passing without one.
   is `wallet_contract`, and it lives 24 hours: the agent asks again within
   them, voted or not, or the operation is closed. The policy's `webhook_url` receives `approval_needed`
   with `operation_id` (the agent's id), `approval_id`, `type` and `required`.
+- **Each change of status is told to the owner's webhook.** When the policy
+  names a `webhook_url`, it receives `operation_updated` with `operation_id`
+  (the agent's id), `type` (`wallet_contract`), `status`, `tx_hash` and
+  `reason` as an operation becomes `awaiting_signature`, `relayed`, `success`,
+  `failed` or `closed`. The address is the one the policy named when the
+  operation was asked.
+- **What is under way.** `GET /wallet/contract/v1/operations`, signed like
+  every other request, lists the operations that are not over (waiting for
+  the approvers, for the agent's half, or for the chain), newest first, at
+  most 100: the place an agent that restarted picks up from.
 - **An approval starts nothing.** Once the approvers have voted, the agent
   sends the same request again under the same id. The votes go to the enclave
   with it, the enclave verifies them over the operation's hash, and the
