@@ -6,9 +6,8 @@
 # for could `add_public_key` a key that signs for it outside the TEE, or move any
 # balance past every limit. So a call whose receiver is the intents contract is
 # refused unless the policy sets `capabilities.intents_call.allowed` — with no
-# policy too — and so is an Agent Connect promise aimed at it, which would act
-# as the BOUND account. The refusal is the policy's, before anything is signed,
-# so it is visible on testnet although intents.near exists on mainnet only.
+# policy too. The refusal is the policy's, before anything is signed, so it is
+# visible on testnet although intents.near exists on mainnet only.
 #
 #   C0 control: the same /call aimed at another contract is not refused by the
 #      policy — so C1's refusal is the fence, not a door that refuses everything
@@ -23,21 +22,17 @@
 #   N2 a policy LISTING intents.near / intents.far as sign_message recipients →
 #      still 403: the owner cannot open this one
 #   N3 control: a recipient the policy lists → 200
-#   E1 Agent Connect: a nested storage_deposit aimed at intents.near → 403
-#      naming intents_call (a method the decoder knows, so only the fence stops it)
-#   E2 the same nested storage_deposit aimed at a token contract → passes
 #   S1 POST /wallet/v1/intents/storage-deposit → 503 (intents are mainnet-only)
 #
 # Not here: raw signing with the NEAR key (no public route builds it; crate and
 # keystore unit tests), and a Trusted op's artifact (the coordinator builds it;
 # a compromised coordinator is out of reach of a client test). Spends testnet
-# NEAR: four policies (0.1 each) and one bound account (1.2 + 0.3, deleted at
-# the end).
+# NEAR: four policies (0.1 each).
 #
 #   PARENT=outlayer-alice.testnet ./tests/intents_call_fence_e2e.sh --apply
 set -uo pipefail
 source "$(dirname "$0")/lib/hos_common.sh"
-[[ "${1:-}" == "--apply" ]] || { sed -n 2,26p "$0"; exit 0; }
+[[ "${1:-}" == "--apply" ]] || { sed -n 2,25p "$0"; exit 0; }
 hos_require
 
 # A well-formed key nobody holds: the call is refused before it is signed.
@@ -139,34 +134,6 @@ if store_policy "$SEED_C" "$WID_C" '{"rules":{},"capabilities":{"sign_message":{
   [[ "$HTTP" == 200 ]] && pass "N3 control: a listed recipient is signed" || fail "N3 control: a listed recipient answered HTTP $HTTP: $(msg_of)"
 else
   fail "N2 the policy could not be stored; the case is unjudged"
-fi
-
-# ── E1, E2: Agent Connect ────────────────────────────────────────────────────
-log "E Agent Connect: a bound account of its own"
-if new_bound_wallet fence; then
-  CLEAN_ASSET="$ASSET"
-  cleanup() {
-    api "$SEED" DELETE /wallet/v1/binding >/dev/null 2>&1 || true
-    account_exists "$CLEAN_ASSET" && { note "cleaning up $CLEAN_ASSET"; delete_account "$CLEAN_ASSET"; }
-  }
-  trap cleanup EXIT
-  SD_ARGS=$(jq -nc --arg a "$ASSET" '{account_id:$a}')
-
-  log "E1 a nested storage_deposit aimed at intents.near"
-  call_ext "$SEED" "$ASSET" "$(ext_call intents.near storage_deposit "$SD_ARGS" 1250000000000000000000)" >/dev/null
-  fenced "E1 a bound account's promise to intents.near is refused"
-
-  log "E2 the same promise aimed at a token contract"
-  call_ext "$SEED" "$ASSET" "$(ext_call usdc.fakes.testnet storage_deposit "$SD_ARGS" 1250000000000000000000)" >/dev/null
-  if grep -q "intents_call" <<<"$BODY"; then
-    fail "E2 a promise to a token contract was refused by the intents fence: $(msg_of)"
-  elif [[ "$HTTP" == 200 ]]; then
-    pass "E2 a promise to a token contract passes ($(jq -r '.status // ""' <<<"$BODY"))"
-  else
-    fail "E2 expected the control to pass, got HTTP $HTTP $(err_of): $(msg_of)"
-  fi
-else
-  fail "E the bound wallet could not be built; E1 and E2 are unjudged"
 fi
 
 # ── S1 ───────────────────────────────────────────────────────────────────────

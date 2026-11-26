@@ -25,23 +25,13 @@
 #       names nothing
 #   Y1  async:true with a secrets_ref sees the same environment as sync, read
 #       back through /calls/{id}
-#   S1  a wallet the row does not name is refused, with and without
-#       use_bound_identity — a binding moves the name a guest acts as, not
-#       access
+#   S1  a wallet the row does not name is refused
 #   P1  header AND body on a connector: the body's row wins [AGENT_SECRET_MODE;
 #       RUN_CONNECTOR_BODY=0 skips it on a coordinator too old to honour a body
 #       secrets_ref on the connector path]
-#   D3  a wallet with an ACTIVE personal binding names the owner's row and sets
-#       use_bound_identity → the secret arrives, `sender` becomes the BOUND
-#       account, and `payer` stays the wallet. The third is the point: a binding
-#       moves the name a guest acts as, never whose money or whose access
 #   D2  the same grant on the ON-CHAIN door: the wallet signs
 #       `request_execution` itself and the secret arrives, judged by the
 #       transaction's own receipt tree rather than by the send being accepted
-#   D9  a wallet with an ACTIVE binding, asking for a row that does not name
-#       it, is refused — even though the name it wears is a subaccount of the
-#       owner's own account. The control call runs first, so the refusal is
-#       known to come from the condition and not from a dead binding
 #   C6  the first call after a new version is activated, carrying a secrets_ref
 #       → the re-queue path still passes the reference through
 #   C8  two agents firing at once, each naming its OWN row: neither ever sees the
@@ -50,10 +40,6 @@
 #       operation, not for the secrets: nothing is decrypted for a call that
 #       will not run. Live, the COORDINATOR's door refuses before the worker
 #       is reached; the worker's own ordering guard is pinned by a unit test
-#   D7  the binding is revoked and the grant stands: the wallet keeps reading
-#       the secret until the OWNER edits the row. Destructive — it ends the
-#       binding D3 and D9 need, so it runs last and only with
-#       D7_DESTROY_BINDING=1
 #   X1  the on-chain door judges the transaction's SIGNER: `user_account_id`
 #       is `signer_id`. A contract the owner signs one transaction to
 #       (tests/deputy-stub) is the predecessor and the payer when it relays
@@ -172,8 +158,6 @@ AGENT_ACCOUNT="${AGENT_ACCOUNT:-}"
 AGENT_WK="${AGENT_WK:-}"
 AGENT2_PAYMENT_KEY="${AGENT2_PAYMENT_KEY:-}"
 AGENT2_ACCOUNT="${AGENT2_ACCOUNT:-}"
-# D3: the account the agent's wallet is bound to (its binding must be ACTIVE).
-BOUND_ASSET="${BOUND_ASSET:-}"
 # C6: a published version of $PROJECT to activate, other than the active one.
 # The default is the current code built WITHOUT the manifest feature, published
 # non-active for exactly this: no author secret declared, so the caller's row
@@ -196,7 +180,7 @@ DEPOSIT='0.1 NEAR'
 
 MODE="${1:-}"
 if [[ "$MODE" != "--apply" ]]; then
-  sed -n '3,112p' "$0" >&2
+  sed -n '3,98p' "$0" >&2
   echo "  Pass --apply to run." >&2
   exit 0
 fi
@@ -561,7 +545,7 @@ else
   HANG_FIX="the worker must settle the refused call (audit row 11: report_refusal \
 answers complete_https_call) — deploy the worker"
   POLL_KEY="$AGENT_PAYMENT_KEY"
-  log "S1 a wallet the row does not name, with and without use_bound_identity"
+  log "S1 a wallet the row does not name"
   # The control first. An expired key, a spent balance or a project that refuses
   # this caller all produce the same shape of answer as a condition that does
   # not name the wallet, and S1 would read any of them as an access rule
@@ -583,20 +567,6 @@ answers complete_https_call) — deploy the worker"
     grep -qiE "denied|permission|condition" <<<"$RUN_ERR" \
       && pass "S1 and the refusal comes from the condition, not from a spent key or an empty balance" \
       || fail "S1 refused, but not by the condition: '$(head -c 160 <<<"$RUN_ERR")'"
-  fi
-  https_post "$AGENT_PAYMENT_KEY" "$PROJECT" \
-    "$(jq -nc --arg a "$PARENT" --arg pr "$ROW" '{input:{message:"probe"}, secrets_ref:{account_id:$a, profile:$pr}, use_bound_identity:true}')"
-  if [[ "$RUN_OK" == "true" && "$(field .user)" == "true" ]]; then
-    fail "S1 use_bound_identity admitted a wallet the row does not name"
-  elif grep -qiE "has no ACTIVE binding" <<<"$RUN_ERR"; then
-    # The row judges a binding that moves the name a guest acts as; a wallet without one is
-    # refused before any row is read, so there is nothing to judge here.
-    skip "S1 with use_bound_identity needs the AGENT_PAYMENT_KEY wallet to hold an ACTIVE binding (it has none)"
-  else
-    answered "S1 with use_bound_identity"
-    grep -qiE "denied|permission|condition" <<<"$RUN_ERR" \
-      && pass "S1 and that refusal, too, comes from the condition" \
-      || fail "S1 (use_bound_identity) refused, but not by the condition: '$(head -c 160 <<<"$RUN_ERR")'"
   fi
   fi
   unset S1_DEAD
@@ -785,43 +755,12 @@ if want A4; then
   fi
 fi
 
-# ── D3 a bound wallet reading the owner's row ────────────────────────────────
-#
-# The whole grant model rests on one separation: a binding moves the NAME a guest
-# acts as and nothing else. So this asserts three things at once, and the third
-# carries it — if `payer` followed the binding, every grant and every quota would
-# be attributed to an account that paid nothing.
-if ! want D3; then
-  :
-elif [[ -z "$AGENT_PAYMENT_KEY" || -z "$AGENT_ACCOUNT" || -z "$BOUND_ASSET" ]]; then
-  skip "D3 needs AGENT_PAYMENT_KEY, AGENT_ACCOUNT and BOUND_ASSET (the account that wallet is bound to, binding ACTIVE)"
-else
-  log "D3 the agent names the owner's row while acting as $BOUND_ASSET"
-  set_access "$PROJECT" "$ROW" "$(whitelist "$PARENT" "$AGENT_ACCOUNT")"
-  https_post "$AGENT_PAYMENT_KEY" "$PROJECT" \
-    "$(jq -nc --arg a "$PARENT" --arg pr "$ROW" '{input:{message:"d3"}, secrets_ref:{account_id:$a, profile:$pr}, use_bound_identity:true}')"
-  if [[ "$RUN_OK" != "true" ]]; then
-    fail "D3 the bound run did not complete: HTTP $HTTP_CODE $(head -c 160 <<<"$RUN_ERR")"
-  else
-    [[ "$(secret_value USER_SECRET)" == "$USER_CANARY" ]] \
-      && pass "D3 the grant still admits the wallet while it acts as another name" \
-      || fail "D3 the canary did not arrive: got '$(secret_value USER_SECRET)'"
-    [[ "$(field .sender)" == "$BOUND_ASSET" ]] \
-      && pass "D3 sender became the BOUND account ($BOUND_ASSET)" \
-      || fail "D3 sender is '$(field .sender)', expected $BOUND_ASSET"
-    [[ "$(field .payer)" == "$AGENT_ACCOUNT" ]] \
-      && pass "D3 and the PAYER did not move — access and money follow the wallet, not the name" \
-      || fail "D3 payer is '$(field .payer)', expected $AGENT_ACCOUNT — billing followed a binding"
-  fi
-  restore_row
-fi
-
 # ── D2 the same grant, on the ON-CHAIN door ──────────────────────────────────
 #
 # D1 (in the example's `03`) grants a wallet and lets it read the owner's row
 # over HTTPS. This is that same grant through the other door: the wallet signs
 # `request_execution` itself, through `POST /wallet/v1/call`, because the
-# executor's key lives inside the enclave and cannot be signed with locally.
+# wallet's key lives inside the enclave and cannot be signed with locally.
 #
 # WHAT IT JUDGES BY, and why that matters here more than anywhere else.
 # `request_execution` yields: the send returns a transaction hash long before
@@ -899,51 +838,6 @@ else
         || fail "D2 the module saw payer '$(jq -r '.payer // ""' <<<"$D2_OUT")', expected $AGENT_ACCOUNT"
     fi
   fi
-  restore_row
-fi
-
-# ── D9 a BOUND wallet the row does not name ──────────────────────────────────
-#
-# The catalogue words this as a stranger's wallet bound to the stranger's own
-# account. This runs it in a sharper form: the wallet is bound to a subaccount
-# of the OWNER's own name, so the bound identity is as close to the owner as a
-# binding can put it, and it still buys nothing. Access is judged on the payer.
-#
-# Two calls, in this order, because the second means nothing without the first.
-# A refusal proves the condition gated the run only if the very same call was
-# admitted a moment earlier — otherwise a suspended binding, an expired key or
-# a typo in the profile would read exactly like a working access rule.
-if ! want D9; then
-  :
-elif [[ -z "$AGENT_PAYMENT_KEY" || -z "$AGENT_ACCOUNT" || -z "$BOUND_ASSET" ]]; then
-  skip "D9 needs AGENT_PAYMENT_KEY, AGENT_ACCOUNT and BOUND_ASSET (that wallet's binding ACTIVE)"
-else
-  log "D9 the same bound call, once named by the row and once not"
-  D9_BODY=$(jq -nc --arg a "$PARENT" --arg pr "$ROW" \
-    '{input:{message:"d9"}, secrets_ref:{account_id:$a, profile:$pr}, use_bound_identity:true}')
-
-  set_access "$PROJECT" "$ROW" "$(whitelist "$PARENT" "$AGENT_ACCOUNT")"
-  POLL_KEY="$AGENT_PAYMENT_KEY"
-  https_post "$AGENT_PAYMENT_KEY" "$PROJECT" "$D9_BODY"
-  if [[ "$RUN_OK" == "true" && "$(field .sender)" == "$BOUND_ASSET" ]]; then
-    pass "D9 the binding is live: the guest acts as $BOUND_ASSET and the grant admits it"
-  else
-    fail "D9 the control call did not run bound — success=$RUN_OK sender='$(field .sender)' err='$(head -c 140 <<<"$RUN_ERR")'. Nothing below would mean anything, so the refusal half is not judged"
-    D9_SKIP=1
-  fi
-
-  if [[ "${D9_SKIP:-0}" != "1" ]]; then
-    set_access "$PROJECT" "$ROW" "$(whitelist "$PARENT")"
-    https_post "$AGENT_PAYMENT_KEY" "$PROJECT" "$D9_BODY"
-    if [[ "$(secret_value USER_SECRET)" == "$USER_CANARY" ]]; then
-      fail "D9 the secret arrived at a wallet the row does not name — a binding widened access"
-    elif [[ "$RUN_OK" == "false" ]] && grep -qi "denied\|permission" <<<"$RUN_ERR"; then
-      pass "D9 refused once the row stopped naming the wallet, though the name it wears is the owner's own subaccount"
-    else
-      fail "D9 neither admitted nor clearly refused: success=$RUN_OK err='$(head -c 160 <<<"$RUN_ERR")'"
-    fi
-  fi
-  unset D9_SKIP
   restore_row
 fi
 
@@ -1078,7 +972,7 @@ else
   echo "        condition is $(printf '%s' "$U9_COND" | wc -c | tr -d ' ') bytes" >&2
   # A subshell: set_access exits on refusal, and a refusal here is a legitimate
   # outcome (the contract may cap the condition's size). Called directly in this
-  # condition it would take the whole suite with it — T1-T4, CLI3, W1 and D7
+  # condition it would take the whole suite with it — T1-T4, CLI3 and W1
   # would never run — and the else branch below would be unreachable.
   if ( set_access "$PROJECT" "$ROW" "$U9_COND" ); then
     pass "U9 the contract stored a ${U9_SIZE}-account whitelist"
@@ -1149,8 +1043,8 @@ else
   if [[ "$RUN_OK" == "false" ]] && grep -qi "unknown variant\|ValidUntil" <<<"$RUN_ERR"; then
     skip "T1–T3: the keystore does not know ValidUntil yet ($(head -c 100 <<<"$RUN_ERR")) — deploy the keystore that carries it"
     restore_row
-    # Skipping the T rows must not end the suite: W1 and D7 come after them,
-    # and neither has anything to do with time-limited grants.
+    # Skipping the T rows must not end the suite: W1 comes after them, and it
+    # has nothing to do with time-limited grants.
     T_UNSUPPORTED=1
   elif [[ "$RUN_OK" == "false" ]] && grep -qi "denied" <<<"$RUN_ERR"; then
     # The VERDICT and the REASON are two claims, and only the first is the
@@ -1378,7 +1272,7 @@ fi
 # names nothing the request type has, so the door ignores it — but "ignored"
 # is a claim about the guest's ENVIRONMENT and the row's condition, and those
 # are what is read here: the guest sees the payer, the row is judged against
-# the key's owner. The bound half is D3.
+# the key's owner.
 if ! want D12; then
   :
 elif [[ -z "$OWNER_PAYMENT_KEY" ]]; then
@@ -1861,77 +1755,6 @@ PY
     fi
   fi
   unset X1_DEAD
-fi
-
-# ── D7 a grant outlives the binding it was made for ──────────────────────────
-#
-# RUN THIS LAST. It revokes the binding, which is the fixture D3 and D9 need,
-# and nothing here puts it back: re-binding needs the asset account and the
-# setup kit again.
-#
-# The trade-off, stated out loud. A whitelist names an executor, not a
-# binding, so tearing the binding down leaves the grant standing — the agent
-# keeps reading the secret until somebody edits the condition. That is the cost
-# of explicit grants, and the reason the dashboard lists grants per account and
-# `ValidUntil` exists. The row proves both halves: still admitted after the
-# revocation, refused the moment the owner edits the row.
-if ! want D7; then
-  :
-elif [[ -z "$AGENT_PAYMENT_KEY" || -z "$AGENT_ACCOUNT" || -z "$AGENT_WK" ]]; then
-  skip "D7 needs AGENT_PAYMENT_KEY, AGENT_ACCOUNT and AGENT_WK (the wallet whose binding is torn down)"
-elif [[ "${D7_DESTROY_BINDING:-0}" != "1" ]]; then
-  skip "D7 revokes this wallet's binding and cannot restore it — pass D7_DESTROY_BINDING=1 to allow that"
-else
-  log "D7 the binding goes away; the grant does not"
-  set_access "$PROJECT" "$ROW" "$(whitelist "$PARENT" "$AGENT_ACCOUNT")"
-  POLL_KEY="$AGENT_PAYMENT_KEY"
-
-  D7_BEFORE=$(curl -sS --max-time 60 "$COORDINATOR_URL/wallet/v1/binding" \
-    -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") 2>/dev/null | jq -r '.binding_status // "none"')
-  if [[ "$D7_BEFORE" == "active" ]]; then
-    pass "D7 the wallet starts with an ACTIVE binding"
-  else
-    # Without a binding to revoke, "the binding is gone" and "the grant still
-    # admits" are both true of a wallet that never had one, and the row's whole
-    # subject — that revoking a binding does not revoke a grant — is untested
-    # while both halves report PASS.
-    skip "D7 needs an ACTIVE binding to tear down; this wallet's is '$D7_BEFORE'"
-    D7_SKIP=1
-  fi
-
-  curl -sS --max-time 60 -X DELETE "$COORDINATOR_URL/wallet/v1/binding" \
-    -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") >/dev/null 2>&1
-  D7_AFTER=$(curl -sS --max-time 60 "$COORDINATOR_URL/wallet/v1/binding" \
-    -H @<(printf '%s\n' "Authorization: Bearer $AGENT_WK") 2>/dev/null | jq -r '.binding_status // .error // "?"')
-  if [[ "${D7_SKIP:-0}" == "1" ]]; then
-    note "D7 the binding reads '$D7_AFTER' — there was none to remove, so this says nothing"
-  else
-    [[ "$D7_AFTER" != "active" ]] \
-      && pass "D7 OutLayer's side of the binding is closed ($D7_AFTER); the extension on the account is the owner's to remove" \
-      || fail "D7 the binding is STILL active after DELETE; the rest of this row would prove nothing"
-  fi
-
-  https_post "$AGENT_PAYMENT_KEY" "$PROJECT" \
-    "$(jq -nc --arg a "$PARENT" --arg pr "$ROW" '{input:{message:"d7"}, secrets_ref:{account_id:$a, profile:$pr}}')"
-  if [[ "${D7_SKIP:-0}" == "1" ]]; then
-    note "D7 the wallet is admitted, but no binding was ever removed — this is U-row ground, not evidence that grants outlive bindings"
-  else
-    [[ "$RUN_OK" == "true" && "$(secret_value USER_SECRET)" == "$USER_CANARY" ]] \
-      && pass "D7 the grant still admits the wallet with no binding at all — grants outlive bindings" \
-      || fail "D7 the wallet lost the secret when the binding went: success=$RUN_OK err='$(head -c 140 <<<"$RUN_ERR")'"
-  fi
-
-  set_access "$PROJECT" "$ROW" "$(whitelist "$PARENT")"
-  https_post "$AGENT_PAYMENT_KEY" "$PROJECT" \
-    "$(jq -nc --arg a "$PARENT" --arg pr "$ROW" '{input:{message:"d7b"}, secrets_ref:{account_id:$a, profile:$pr}}')"
-  if [[ "$(secret_value USER_SECRET)" == "$USER_CANARY" ]]; then
-    fail "D7 the secret still arrived after the owner removed the account from the row"
-  elif [[ "$RUN_OK" == "false" ]] && grep -qi "denied\|permission" <<<"$RUN_ERR"; then
-    pass "D7 editing the condition is what ends the grant — and it ends it at once"
-  else
-    fail "D7 after the revocation the call neither ran nor was clearly refused: success=$RUN_OK err='$(head -c 160 <<<"$RUN_ERR")'"
-  fi
-  restore_row
 fi
 
 verdict "secrets security"

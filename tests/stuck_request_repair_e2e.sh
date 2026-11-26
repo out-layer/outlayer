@@ -23,28 +23,18 @@
 #   R3  a transaction the chain never saw stays `processing` — this is what
 #       separates "we died after sending" from "we died before". Without it
 #       the repair would declare everything stuck to be finished
-#   R4  the door keeps its per-promise detail through the repair —
-#       `result.promises[]` with indexes and receivers, which is the G3
-#       acceptance condition. SKIPPED without an active binding
 #
-# R1 is the one that has already been wrong: the repair used to read
-# `request_data.args_base64`, a field that does not exist there, so the door's
-# envelope never decoded and the charge came out empty. A unit test now pins
-# the SOURCE (`op_canonical`), but it cannot see a renamed field inside it —
-# only this run can.
+# R1's charge is decoded from the row's `op_canonical`. A unit test pins that
+# SOURCE, but it cannot see a renamed field inside it — only this run can.
 #
 # Requires: a way to run SQL against the coordinator's database — either
 # $PGURL for a direct psql, or $PSQL_CMD when the database is not reachable
 # from here (on the deployed environments it is not) — plus $PARENT with a
 # keychain credential and ~0.3 NEAR, and `outlayer` logged in as $PARENT.
 #
-# R4 additionally needs a wallet with an ACTIVE binding, which this script
-# cannot create: pass REUSE_SEED and BOUND_TO. Produce one with
-#   PARENT=you.testnet KEEP=1 ./tests/binding_lifecycle_e2e.sh --apply
-#
 # Run (spends real testnet NEAR and writes to the coordinator's database):
 #   PGURL=postgres://... PARENT=you.testnet ./tests/stuck_request_repair_e2e.sh --apply
-#   PSQL_CMD=./tsql PARENT=you.testnet REUSE_SEED=binding-... BOUND_TO=... \
+#   PSQL_CMD=./tsql PARENT=you.testnet REUSE_SEED=<seed of a funded wallet> \
 #     ./tests/stuck_request_repair_e2e.sh --apply
 
 set -uo pipefail
@@ -60,20 +50,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/rpc.sh"   # keyed RPC_
 WNEAR="${WNEAR:-wrap.testnet}"
 PARENT="${PARENT:-}"
 PGURL="${PGURL:-}"
-# The RECIPIENT of the door transfer R4 repairs — someone else's account, not
-# the bound account itself. Passing the bound account makes the contract panic
-# with "self-calls are not allowed", which reads as a broken door and is only a
-# misused parameter. Left empty, R4 says so and skips.
-BOUND_TO="${BOUND_TO:-}"
-
-# Run against an EXISTING wallet instead of minting one.
-#
-# R4 is the reason. It needs a wallet with an ACTIVE binding, and a binding is
-# not something this script can produce — it takes an on-chain account with the
-# wallet contract installed and a handshake (`binding_lifecycle_e2e.sh`). A
-# freshly minted `stuckrep-*` wallet has no binding and never will inside one
-# run, so R4 was unreachable for as long as this script insisted on its own
-# wallet.
+# Run against an EXISTING wallet, by its seed, instead of minting one.
 #
 # The reused wallet is NOT swept at the end: it is somebody else's, it was here
 # before this run and is expected to outlive it.
@@ -100,7 +77,7 @@ pass() { printf '\033[32m✓ %s\033[0m\n' "$*" >&2; PASS=$((PASS+1)); }
 fail() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; FAILED=$((FAILED+1)); FAILED_NAMES+=("$*"); }
 
 if [[ "$APPLY" != true ]]; then
-  sed -n '3,48p' "$0" >&2
+  sed -n '3,38p' "$0" >&2
   echo "  Pass --apply to run." >&2
   exit 0
 fi
@@ -340,42 +317,6 @@ USAGE_R3_AFTER=$(usage_native "$WID")
 sql "UPDATE wallet_requests SET status = '$ROW_STATUS',
        result_data = jsonb_set(result_data, '{tx_hash}', to_jsonb('$ROW_TX'::text))
      WHERE request_id = '$REQ_ID'" >/dev/null
-
-# ── R4: the door, per-promise ────────────────────────────────────────────────
-log "R4 the same repair on an extension-door call keeps its per-promise detail"
-if [[ -z "$BOUND_TO" ]]; then
-  note "R4 SKIPPED — set BOUND_TO=<recipient> and run against a wallet with an ACTIVE binding."
-  note "Nothing else in the queue checks that the repair decodes the ENVELOPE rather than the"
-  note "outer 1-yocto marker, which is the half that was broken until 2026-08-20."
-else
-  D=$(curl -sS -X POST "$COORDINATOR_URL/wallet/v1/binding/transfer" \
-    -H "$(AUTH "$SEED")" -H 'Content-Type: application/json' \
-    -d "$(jq -nc --arg to "$BOUND_TO" --arg a "$CALL_DEPOSIT" '{to:$to, amount:$a}')")
-  DREQ=$(jq -r '.request_id // empty' <<<"$D")
-  if grep -q 'self-calls are not allowed' <<<"$D"; then
-    # Named separately from the generic failure below: the contract is behaving
-    # exactly as designed, and reporting it as a broken door sends whoever reads
-    # this run looking at the coordinator instead of at their own invocation.
-    fail "R4 BOUND_TO is the bound account itself, so the door refused a self-call — pass someone else's account (see the note at the top of this file)"
-  elif [[ -z "$DREQ" ]]; then
-    fail "R4 the door call returned no request_id: $(head -c 300 <<<"$D")"
-  else
-    DUSAGE_BEFORE=$(usage_native "$WID")
-    sql "UPDATE wallet_requests
-         SET status = 'processing',
-             result_data = (result_data - 'usage_charged' - 'settled_late' - 'promises' - 'failure')
-         WHERE request_id = '$DREQ'" >/dev/null
-    R4=$(curl -sS "$COORDINATOR_URL/wallet/v1/requests/$DREQ" -H "$(AUTH "$SEED")")
-    NPROM=$(jq -r '.result.promises | length // 0' <<<"$R4" 2>/dev/null || echo 0)
-    DUSAGE_AFTER=$(usage_native "$WID")
-    [[ "${NPROM:-0}" -ge 1 ]] \
-      && pass "R4 the repair rebuilt $NPROM promise result(s) with receivers — the G3 ladder survives a late settlement" \
-      || fail "R4 no promises came back; the repair read the outer marker instead of the envelope, which is exactly the defect fixed on 2026-08-20"
-    [[ "$DUSAGE_AFTER" != "$DUSAGE_BEFORE" ]] \
-      && pass "R4 the door was charged by its contents ($DUSAGE_BEFORE → $DUSAGE_AFTER), not by its 1-yocto marker" \
-      || fail "R4 nothing was charged — a door call repaired late is a free spend against the ceiling"
-  fi
-fi
 
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAILED" >&2
 for n in "${FAILED_NAMES[@]:-}"; do [[ -n "$n" ]] && printf '  \033[31m✗ %s\033[0m\n' "$n" >&2; done

@@ -19,10 +19,6 @@
 #   Network. `outlayer` follows ~/.outlayer/default-network unless told
 #   otherwise, which on this machine is MAINNET. Exported once, here.
 #
-#   The binding. Three suites need an ACTIVE personal_account binding, and
-#   minting one costs an account plus NEAR. This runner mints ONE with
-#   binding_lifecycle (KEEP=1) and hands it to the rest, or takes yours.
-#
 #   Prerequisites. A suite whose inputs are missing is SKIPPED loudly, naming
 #   exactly what is absent. It is never counted as a pass.
 #
@@ -30,17 +26,16 @@
 #   ./tests/run_custody.sh                       # print the plan, run nothing
 #   PARENT=you.testnet PSQL_CMD=./tsql \
 #     ./tests/run_custody.sh --apply             # everything it has inputs for
-#   PARENT=you.testnet ./tests/run_custody.sh --apply velocity binding
+#   PARENT=you.testnet ./tests/run_custody.sh --apply velocity concurrent
 #                                                # only the named suites
 #
 # Inputs (each suite states its own; supply what you have):
 #   PARENT           a testnet account with a keychain credential and ~5 NEAR
 #   PSQL_CMD         wrapper taking one SQL statement — the coordinator's
 #                    database is not reachable off its host
-#   FUNDER EXECUTOR RECIPIENT   three accounts, for the contract-level probes
 #   MPC_PUBLIC_KEY   enables the dedicated-vault probes; without it the vault
 #                    suite runs in default-vault mode
-#   API_KEY APPROVER ADMIN_TOKEN BOUND_TO   per-suite extras
+#   API_KEY APPROVER ADMIN_TOKEN RECIPIENT OUTSIDER   per-suite extras
 
 set -uo pipefail
 
@@ -50,7 +45,7 @@ ARGS=()
 for a in "$@"; do
   case "$a" in
     --apply) APPLY=true ;;
-    -h|--help) sed -n '3,44p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,38p' "$0"; exit 0 ;;
     *) ARGS+=("$a") ;;
   esac
 done
@@ -76,16 +71,11 @@ RAN=(); PASSED=(); FAILED=(); SKIPPED=()
 
 # name | script | required env vars (space separated) | what it covers
 SUITES=(
-  "binding|binding_lifecycle_e2e.sh|PARENT|the binding state machine: PUT/GET/DELETE, the setup kit, and the refusal messages for each wrong shape"
-  "personal-wallet|personal_wallet_e2e.sh|FUNDER EXECUTOR RECIPIENT|the installed wallet contract itself: the kit transaction, the code hash, membership, the fund lane, and four distinct contract-level refusals"
-  "personal-global|personal_wallet_global_e2e.sh|FUNDER EXECUTOR RECIPIENT|the same install by GLOBAL contract reference (NEP-591) rather than by uploaded bytes"
-  "velocity|velocity_accounting_e2e.sh|PARENT PSQL_CMD|what the velocity counters are actually fed — refused calls, partial promises, gross deposits, the calendar buckets"
+  "velocity|velocity_accounting_e2e.sh|PARENT PSQL_CMD|what the velocity counters are actually fed — transfers that landed and that failed, gross deposits, the calendar buckets"
   "concurrent|wallet_concurrent_spend_e2e.sh|PARENT|two spends at the same instant against one ceiling — the only suite that fires simultaneous requests"
   "credentials|call_credentials_e2e.sh|PARENT|which credential may pay for a /call and which may not"
   "probe|wallet_probe_e2e.sh|PARENT RECIPIENT OUTSIDER|the wallet surface end to end on a self-minted wallet"
-  "bound-identity|bound_identity_onchain_e2e.sh|PARENT BINDING_SEED ASSET|use_bound_identity over the ON-CHAIN door, and that billing does not follow the borrowed name"
-  "identity-https|hos_identity_e2e.sh|PARENT|the HTTPS half of use_bound_identity: unbound, pending, and a key that names no wallet are refused rather than answered with the caller's own name"
-  "stuck-repair|stuck_request_repair_e2e.sh|PARENT PSQL_CMD|the lazy repair of rows left in processing, including the door's per-promise detail"
+  "stuck-repair|stuck_request_repair_e2e.sh|PARENT PSQL_CMD|the lazy repair of rows left in processing"
   "approvals|approval_flow_wk_e2e.sh|PARENT APPROVER|multisig approval over a wk_ credential"
   "auto-approval|policy_auto_approval_e2e.sh|PARENT APPROVER|approval.auto_up_to (what runs without the approvers in a window) and addresses.unlisted=ask (a new address waits)"
   "refusals|refusals_e2e.sh|PARENT|the endpoints that exist to say no: /reject's signature binding, the internal endpoints' auth gate, and delete toward an address the policy does not list"
@@ -113,7 +103,7 @@ wanted() { # wanted <name> — no filter means everything
 
 # ── the plan ─────────────────────────────────────────────────────────────────
 if [[ "$APPLY" != true ]]; then
-  sed -n '3,44p' "$0" >&2
+  sed -n '3,38p' "$0" >&2
   log "Plan on this machine"
   for entry in "${SUITES[@]}"; do
     IFS='|' read -r name script req what <<<"$entry"
@@ -126,9 +116,6 @@ if [[ "$APPLY" != true ]]; then
     fi
   done
   echo >&2
-  if [[ -z "${BINDING_SEED:-}" || -z "${ASSET:-}" ]]; then
-    note "BINDING_SEED/ASSET are unset: --apply mints one binding first and hands it to the suites above that ask for it, so they will run rather than skip."
-  fi
   [[ -z "$TIMEOUT" ]] && note "No timeout(1) here — a wedged suite will hold the run. Install coreutils for a watchdog."
   note "Pass --apply to run. Expect roughly an hour with the ${GAP}s gaps, and real testnet NEAR to move."
   exit 0
@@ -144,46 +131,6 @@ for a in "${ARGS[@]:-}"; do
   for e in "${SUITES[@]}"; do IFS='|' read -r n _ _ _ <<<"$e"; [[ "$a" == "$n" ]] && known=true; done
   $known || { echo "✗ no suite called '$a'. Run with no arguments to see the list." >&2; exit 1; }
 done
-
-# ── one binding, shared ──────────────────────────────────────────────────────
-# Minting it costs an account and NEAR, and three suites want the same one.
-if [[ -z "${BINDING_SEED:-}" || -z "${ASSET:-}" ]] \
-   && { wanted bound-identity || wanted velocity || wanted stuck-repair; }; then
-  log "Minting one binding for the suites that need it (KEEP=1)"
-  BL=$(mktemp -t custody_bind.XXXXXX)
-  if KEEP=1 "$SCRIPT_DIR/binding_lifecycle_e2e.sh" --apply 2>&1 | tee "$BL" >&2; then
-    # STRIP THE COLOURS FIRST. The line is printed through `note`, which wraps it
-    # in an ANSI reset, and `[^ ]*` stops at a space — which `\033[0m` is not. So
-    # the LAST value on the line came out with the escape glued to it, and only
-    # that one: `ASSET` survived because something follows it. A seed carrying a
-    # reset is refused by `/wallet/v1/address` ("only [a-zA-Z0-9._-] allowed"),
-    # which reads as a broken endpoint rather than a mangled argument.
-    BL_PLAIN=$(sed $'s/\033\[[0-9;]*[mK]//g' "$BL")
-    BINDING_SEED=$(grep -o 'BINDING_SEED=[^ ]*' <<<"$BL_PLAIN" | tail -1 | cut -d= -f2)
-    ASSET=$(grep -o 'ASSET=[^ ]*' <<<"$BL_PLAIN" | tail -1 | cut -d= -f2)
-    export BINDING_SEED ASSET
-    # `stuck_request_repair_e2e.sh` reads REUSE_SEED/BOUND_TO, not
-    # BINDING_SEED/ASSET — without these its R4 door probe silently skips, and
-    # R4 is the only place the repair's per-promise decoding is exercised.
-    export REUSE_SEED="$BINDING_SEED" BOUND_TO="$PARENT"
-    [[ -n "$BINDING_SEED" && -n "$ASSET" ]] \
-      && note "binding: $ASSET (seed $BINDING_SEED) — reuse it with BINDING_SEED=… ASSET=…" \
-      || warn "binding_lifecycle printed no seed/asset; the suites needing one will skip"
-  else
-    warn "binding_lifecycle failed — the suites needing a binding will skip"
-  fi
-  rm -f "$BL"
-  # It already ran; do not run it twice. An empty result here would re-enable
-  # EVERYTHING (`wanted` is true for all when the filter is empty), so the
-  # marker suite is used to keep the list non-empty.
-  ARGS=($(for e in "${SUITES[@]}"; do IFS='|' read -r n _ _ _ <<<"$e"; wanted "$n" && [[ "$n" != binding ]] && echo "$n"; done))
-  ARGS=("${ARGS[@]:-__none__}")
-  if [[ -n "$BINDING_SEED" && -n "$ASSET" ]]; then
-    PASSED+=("binding (as part of setup)")
-  else
-    FAILED+=("binding (setup mint failed)")
-  fi
-fi
 
 # ── run ──────────────────────────────────────────────────────────────────────
 FIRST=true
