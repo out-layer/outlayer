@@ -585,7 +585,7 @@ fn run(input: &Input, raw: &Value) -> Output {
 /// Every value here is injected by the worker. None of it is anything the
 /// caller could have set in the request body, which is the point: a test can
 /// compare what it sent with what the guest saw.
-/// Who the guest was told it is — BOTH identities, because Agent Connect
+/// Who the guest was told it is — BOTH identities, because on-chain custody
 /// splits them and the whole point of `use_bound_identity` is that only one
 /// of the two moves.
 ///

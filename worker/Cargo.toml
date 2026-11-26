@@ -26,9 +26,9 @@ near-primitives = "0.37"
 near-crypto = "0.37"
 near-jsonrpc-primitives = "0.37"
 
-# Shared with the coordinator and keystore: the Agent Connect binding
-# assessment (hos module) must be ONE implementation, so the worker's
-# TEE-side verdict cannot drift from the coordinator's.
+# Shared with the coordinator and keystore: the policy evaluator and the
+# on-chain custody rules are ONE implementation, so the worker's TEE-side
+# verdict cannot drift from the coordinator's.
 shared-tee-helpers = { git = "https://github.com/out-layer/shared-tee-helpers", branch = "onchain-custody" }
 
 # WASM execution (wasmtime: WASI P2 components and P1 modules)

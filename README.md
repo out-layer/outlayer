@@ -43,7 +43,7 @@ Live on mainnet: 1.5M attested executions, self-hosted Intel TDX servers, five c
 
 - **The key is never stored.** It is derived on demand inside the enclave from a master secret. No endpoint exports it.
 - **The master comes from NEAR MPC, not from OutLayer.** The MPC network derives it (confidential key derivation) and releases it only to a keystore whose TDX attestation was verified on chain and whose build the DAO approved. Each release is a public transaction.
-- **The agent holds an API key, not a private key.** A leaked API key is bounded by the policy and is revoked or frozen by the owner. The addresses and the funds stay.
+- **The agent holds an API key, not the wallet's private key.** A leaked API key is bounded by the policy and is revoked or frozen by the owner. The addresses and the funds stay. (With [on-chain custody](#on-chain-custody-two-signatures-required-by-the-chain) the agent also holds a key of its own, one of the two the wallet contract requires.)
 - **No credential store for many users.** A deterministic wallet is addressed by a NEAR account plus a seed and authenticated by that account's signature. One NEAR key serves any number of user wallets, and removing the key revokes access within 60 seconds.
 - **Free to create.** A wallet is a NEAR implicit account: one API call, no transaction, no storage deposit, no key registration on `intents.near`. An agent can register itself and hand its owner a link to take control.
 
@@ -115,7 +115,7 @@ A signature costs one round trip to the keystore and one free view call. MPC is 
 
 ### On-chain custody: two signatures, required by the chain
 
-An agent's wallet is an implicit account whose key is derived in the enclave: one API call, no transaction per operation, every feature. An owner who wants the chain itself to require two signatures installs a wallet contract on a NEAR account of their choice, and the agent's main balance lies there. The wallet contract executes a request only under both: the agent's own key and a key in OutLayer's enclave, which signs only for an operation the owner's policy allows. Each move is a NEAR transaction with gas, relayed and paid by the agent's OutLayer wallet, and the owner can leave and sign for both sides. With `use_bound_identity` a program runs as the wallet contract's account.
+An agent's wallet is an implicit account whose key is derived in the enclave: one API call, no transaction per operation, every feature. An owner who wants the chain itself to require two signatures installs a wallet contract on a NEAR account of their choice, and the agent's main balance lies there. The wallet contract executes a request only under both: the agent's own key and a key in OutLayer's enclave, which signs only for an operation the owner's policy allows. Each move is a NEAR transaction with gas, relayed and paid by the agent's OutLayer wallet, and the owner can leave and sign for both sides. With `use_bound_identity` a program runs as the wallet contract's account. The model, the setup and the routes: [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md).
 
 ### Verifiable end to end
 

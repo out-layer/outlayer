@@ -5,6 +5,11 @@ package outlayer:wallet@0.1.0;
 /// Allows WASI modules to interact with the wallet system when
 /// the execution request includes an X-Wallet-Id header.
 ///
+/// Every function acts on the wallet's own account, the one whose key is in
+/// the enclave. What lies in a wallet contract (on-chain custody) is not
+/// reached from here: it moves only under the agent's own signature, through
+/// the operation routes.
+///
 /// All functions return (result, error) tuples:
 /// - On success: (json_result, "")
 /// - On error: ("", error_string)
@@ -27,9 +32,6 @@ package outlayer:wallet@0.1.0;
 ///   `in_flight_request_id=<id>`, which you can poll instead of retrying blind.
 /// - `policy_denied` — the owner's policy refused it. Retrying changes nothing.
 /// - `wallet_frozen` — the owner stopped the wallet.
-/// - `agent_connect_denied` — the Agent Connect pre-flight refused before
-///   signing, so no gas was spent. Carries `terminal=true|false`: `true` means
-///   retrying is pointless and the owner must act.
 /// - `insufficient_balance` — not enough on the account this operation spends.
 ///
 /// A body that is not one of ours comes back verbatim rather than dressed up
@@ -44,9 +46,6 @@ package outlayer:wallet@0.1.0;
 ///         "wallet_busy" => return retry_later(&error),
 ///         // The owner has to act. Say so and stop.
 ///         "policy_denied" | "wallet_frozen" => return tell_the_owner(&error),
-///         "agent_connect_denied" if error.contains("terminal=true") => {
-///             return tell_the_owner(&error)
-///         }
 ///         _ => return Err(error),
 ///     }
 /// }

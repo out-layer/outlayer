@@ -242,8 +242,8 @@ out, which is a separate choice.
 A wallet with an owner — an account registered for the owner's exit in the
 keystore DAO — can keep its main balance in a wallet contract: a NEAR
 account running the two-key variant of the NEAR Intents wallet contract.
-The owner installs it on a NEAR account of their choice (a sub-account of
-theirs by default, or any named or implicit account) with a pair of public
+The owner installs it on a sub-account of theirs or on their own account,
+with a pair of public
 keys: the agent's and the wallet's TEE key. The wallet contract executes a
 request only under both signatures.
 

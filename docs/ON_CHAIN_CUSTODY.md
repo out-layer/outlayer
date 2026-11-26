@@ -222,9 +222,11 @@ wallet superseded, answers `404 request_not_found`.
 ```
 
 The account's pair is read from the chain (`w_public_key`). It is refused with
-`400 bad_request` when the account does not answer with a pair of keys or the
-pair's second half is not this wallet's enclave key, and with
-`422 chain_refused` when the chain has no such account, contract or method.
+`400 bad_request` when the account is neither the owner's nor a sub-account of
+it, when it does not answer with a pair of keys or the pair's second half is
+not this wallet's enclave key; with `409 conflict` when the account is another
+wallet's wallet contract; and with `422 chain_refused` when the chain has no
+such account, contract or method.
 
 `GET /wallet/v1/contract/setup` — wallet API key.
 
@@ -319,9 +321,9 @@ token's own for a token. A token is its id inside NEAR Intents
 | `swap` | `token_in`, `amount_in`, `token_out`, `min_out` | `mt_transfer` of the input to the deposit address of a 1Click quote whose recipient and refund address are the wallet contract inside NEAR Intents |
 | `cross_chain_withdraw` | `to`, `amount`, `token`, `chain` | `mt_transfer` of the input to the deposit address of a 1Click quote whose recipient is `to` on `chain` and whose refund address is the wallet contract |
 
-- A `call` to a NEAR Intents contract or to the keystore DAO contract, and a
-  call of a method whose name starts with `w_execute_`, are refused. A wallet
-  contract sends no request to itself.
+- A `call` to a NEAR Intents contract, to the keystore DAO contract or to the
+  OutLayer contract, and a call of a method whose name starts with
+  `w_execute_`, are refused. A wallet contract sends no request to itself.
 - NEAR Intents is on mainnet only: `intents_transfer`, `withdraw`, `swap` and
   `cross_chain_withdraw` are refused on testnet.
 - The result of a swap arrives in the wallet contract's balance inside NEAR
@@ -342,7 +344,7 @@ token's own for a token. A token is its id inside NEAR Intents
 | `relayed` | the transaction `tx_hash` was sent and its outcome is not recorded | reads the operation; the read settles it |
 | `success` | the request executed on chain. For a swap or a withdrawal to another chain it says the input reached 1Click's deposit address; `route_status` on a read follows the route | — |
 | `failed` | the chain refused; `result` carries the chain's failure | reads the failure; the same thing again is another operation under another id |
-| `closed` | ended with nothing sent, for `reason`: the vote did not end in approval, or a prepared request was not relayed within an hour | reads the reason; the same thing again is another operation under another id |
+| `closed` | ended with nothing sent, for `reason`: the vote was rejected or expired, an approval was not used within its 24 hours, or a prepared request was not relayed within an hour | reads the reason; the same thing again is another operation under another id |
 
 ### The agent's signed request
 
@@ -356,7 +358,7 @@ The operation routes take no API key. Each request carries four headers:
 | `x-agent-signature` | 64 bytes in lowercase hex: the agent key's Ed25519 signature |
 
 The signature covers the method, the path and the body
-([section 11](#11-byte-formats)), so a request signed for one route is not
+([section 12](#12-byte-formats)), so a request signed for one route is not
 taken by another. A request not signed by the agent's key of the wallet
 contract it names, or with a timestamp outside the window, answers
 `401 invalid_signature`; so does an account that is no wallet's wallet

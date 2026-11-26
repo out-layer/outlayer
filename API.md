@@ -105,12 +105,17 @@ key names the account; the agent's own key asks for each operation.
 | GET | `/wallet/v1/contract/key` | Wallet API key | The public key of the wallet's TEE key, one of the pair the owner installs |
 | PUT | `/wallet/v1/contract` | Wallet API key | Name the account that is this wallet's wallet contract; its pair is read from the chain and must hold this wallet's TEE key |
 | GET | `/wallet/v1/contract` | Wallet API key | The wallet contract of this wallet |
+| POST | `/wallet/v1/contract/setup` | Wallet API key | Open a setup: a one-time token for the owner's page, which the agent hands over as a link |
+| GET | `/wallet/v1/contract/setup` | Wallet API key | Collect the finished setup: the account and the agent's key, sealed to the agent's one-time key |
+| GET | `/wallet/v1/contract/setup/owner` | Setup token (`Authorization: Bearer`) | What the owner's page needs: the wallet's TEE key and the message the agent's key is derived from |
+| POST | `/wallet/v1/contract/setup/owner` | Setup token (`Authorization: Bearer`) | Finish: name the owner's account or a sub-account of it and hand the agent its sealed key; the token ends |
 | POST | `/wallet/contract/v1/operations` | Agent's signature | Ask for an operation: the owner's policy judges it, and the enclave signs its half of the request for an operation the policy allows |
 | GET | `/wallet/contract/v1/operations/{id}` | Agent's signature | Where the operation stands |
 | POST | `/wallet/contract/v1/operations/{id}/relay` | Agent's signature | The agent adds its half; the wallet's own NEAR account sends the transaction to the wallet contract and pays its gas |
 
 Operations: a NEAR transfer, a contract call, a transfer inside NEAR Intents, a
 swap and a withdrawal to another chain through 1Click, a withdrawal to NEAR.
+The model, the setup and every refusal: [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md).
 
 ### Confidential Intents (private balances)
 

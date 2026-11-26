@@ -51,7 +51,8 @@ package outlayer:signing-keys@0.1.0;
 ///   once. Every caller drives it alike, so sign with it only messages the
 ///   module composes under a fixed prefix of its own, naming the caller from
 ///   the host — `NEAR_USER_ACCOUNT_ID` (who paid) or `NEAR_SENDER_ID` (whom
-///   the run acts as, a bound identity's agent) — never from the input. The environment is input
+///   the run acts as: the wallet contract's account under
+///   `use_bound_identity`) — never from the input. The environment is input
 ///   too: a caller names secret rows of its own, so a variable is signed only
 ///   when `OUTLAYER_SECRETS_ROWS` shows it came from a row whose owner the
 ///   module trusts. `sign-nep413` refuses it: a NEP-413 signature is a login

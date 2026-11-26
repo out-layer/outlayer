@@ -143,7 +143,7 @@ interface takes an account.
 
 The run that **answers** a task is the preparer's, started by the platform
 on the owner's approval: it is admitted with the consent sealed in the task
-— the preparer's payment key, wallet, identity binding and compute limit, as
+— the preparer's payment key, wallet, wallet-contract identity and compute limit, as
 the preparing run had them — and the host refuses the answer in any other
 run (`not-the-preparer`), and in the preparer's own run without the owner's
 signature over this task, this hash and these words (`approval-invalid`).
@@ -226,7 +226,7 @@ the outcomes kept, stay.
 | `state` | bytes of the project's own, sealed beside the task and handed back when it is answered. The prepared action lives there. Never shown |
 | `policy_hash` | the hash of the policy the task was made under |
 | `build` | SHA-256 of the build that made the task: the code the owner's proof names, and the build the run that answers must be of |
-| consent | sealed beside the envelope, never shown: the preparing run's payment key (its nonce), wallet, whether its identity was bound, and its compute limit — what the run that carries the task out must be admitted with. The store keeps the same facts in the clear as the task's **voucher**, from which the platform starts that run |
+| consent | sealed beside the envelope, never shown: the preparing run's payment key (its nonce), wallet, whether it ran as its wallet contract's account, and its compute limit — what the run that carries the task out must be admitted with. The store keeps the same facts in the clear as the task's **voucher**, from which the platform starts that run |
 | `thread` | the id of the first task of the conversation; a turn keeps the conversation's preparer |
 | life | 24 hours at most; a project may ask for less, but not under 15 minutes for a task that takes an answer (a notice has no floor) |
 
@@ -556,7 +556,7 @@ is `ok([])`.
 | `unlock()` | owner | writes the copies for the devices now in force |
 
 `open` seals the run's consent into the task — its payment key, wallet,
-identity binding and compute limit — and sends the same facts to the store as
+wallet-contract identity and compute limit — and sends the same facts to the store as
 the voucher. `answered` holds the run it is in to that consent before it
 looks at the signature: another key, wallet, identity, or more compute than
 the preparing run was allowed is `not-the-preparer`. The refusals a run
