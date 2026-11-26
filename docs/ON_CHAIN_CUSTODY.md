@@ -116,7 +116,7 @@ the API carries between them a token and a sealed key it cannot read.
 | 2 | Owner | opens the link and connects the owner account; the page shows the owner, the agent's OutLayer wallet, the enclave's key for it and the network |
 | 3 | Owner | chooses the account and what happens to the account's own keys (below) |
 | 4 | Owner | signs one message with the owner key; the page turns the signature into the agent's key and shows the pair the contract will require |
-| 5 | Owner | creates the account if it is a sub-account, and installs the wallet contract on it with the pair |
+| 5 | Owner | signs one plain transaction: the creation of the sub-account, or one key added to their own account. The page then installs the wallet contract on the account with the pair |
 | 6 | Owner | hands the agent its key: the page seals it to the agent's one-time key and names the account, `POST /wallet/v1/contract/setup/owner` |
 | 7 | Owner | stores a policy for the wallet; the enclave signs for a wallet contract only under a policy its owner stored |
 | 8 | Agent | collects the account and its key: `GET /wallet/v1/contract/setup` |
@@ -129,10 +129,14 @@ A refused wallet leaves the page on the same step.
 | Choice | What happens |
 |---|---|
 | A sub-account of the owner's, `<name>.<owner>` (the page offers `agent`) | The owner's wallet creates it with 0.5 NEAR for its storage, the owner's key and a key the page holds for the installing transaction alone. The page then sends the account's own transaction: the global contract by its hash, `w_init` with the pair, and the removal of the page's key |
-| The owner account itself | The owner's wallet signs the installing transaction on the account it is connected with. The owner's key stays on it and acts on it directly |
+| The owner account itself | The owner's wallet adds one full-access key the page holds for the installing transaction alone: made in the tab, stored nowhere. The page then sends the same transaction as for a sub-account, which removes that key. The owner's key stays on the account and acts on it directly |
 
-Installing is one transaction signed by the account itself: `UseGlobalContract`
-by the code hash, then `w_init(public_key)` with 1 yoctoNEAR attached. OutLayer
+The owner's wallet signs nothing but an account creation, a transfer and added
+keys, which every wallet signs. Installing is one transaction of the account
+itself, signed by the page's key: `UseGlobalContract` by the code hash, then
+`w_init(public_key)` with 1 yoctoNEAR attached, then the removal of the page's
+key. A page closed between the two leaves that key on the account with nobody
+holding it; the owner removes it in their wallet. OutLayer
 neither creates the account nor computes its address. An account that was
 installed by other means is named with `PUT /wallet/v1/contract`; it is taken
 under the same check.
