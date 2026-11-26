@@ -1482,6 +1482,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "custody-core"
+version = "0.1.0"
+source = "git+https://github.com/out-layer/shared-tee-helpers?branch=onchain-custody#9a6475ac6c15015aa1ccfd503520d572491e04d2"
+dependencies = [
+ "base64 0.22.1",
+ "borsh",
+ "ed25519-dalek",
+ "hex",
+ "hmac",
+ "serde",
+ "sha2",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4580,11 +4595,12 @@ dependencies = [
 [[package]]
 name = "shared-tee-helpers"
 version = "0.1.0"
-source = "git+https://github.com/out-layer/shared-tee-helpers?branch=onchain-custody#c2c2b7fc10ce1e00fa452918e05774c46b81b240"
+source = "git+https://github.com/out-layer/shared-tee-helpers?branch=onchain-custody#9a6475ac6c15015aa1ccfd503520d572491e04d2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bs58 0.5.1",
+ "custody-core",
  "ed25519-dalek",
  "hex",
  "near-crypto",
@@ -4845,7 +4861,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

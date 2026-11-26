@@ -45,6 +45,7 @@ use tower_http::trace::TraceLayer;
 #[path = "api_support.rs"]
 mod support;
 use support::*;
+pub(crate) use support::{ApprovalInfo, WalletSignResponse};
 
 /// How many approval (or rejection) votes one signing request may carry.
 ///
@@ -589,10 +590,17 @@ fn seed_for_log(seed: &str) -> String {
     }
 }
 
-/// The roots of the families derived only for what a job's manifest declares
-/// (`crate::signing_keys`, `crate::encryption_keys`, `crate::task_keys`),
-/// version included in none so a later scheme is covered too.
-pub(crate) const DECLARED_KEY_ROOTS: [&str; 3] = ["signing-key:", "encryption-key:", "task-key:"];
+/// The roots no caller-written seed may start at: the families derived only
+/// for what a job's manifest declares (`crate::signing_keys`,
+/// `crate::encryption_keys`, `crate::task_keys`), version included in none so
+/// a later scheme is covered too, and the TEE's key of a wallet contract
+/// (`crate::custody`).
+pub(crate) const DECLARED_KEY_ROOTS: [&str; 4] = [
+    "signing-key:",
+    "encryption-key:",
+    "task-key:",
+    shared_tee_helpers::custody_core::keys::TEE_KEY_ROOT,
+];
 
 /// Refuse a seed a caller spells when it starts at a declared-key root.
 ///
@@ -805,6 +813,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/wallet/decrypt-policy", post(wallet_decrypt_policy_handler))
         // Ephemeral keys — separate module, returns private keys (see ephemeral_keys.rs)
         .merge(crate::ephemeral_keys::ephemeral_key_routes())
+        .merge(crate::custody::custody_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             coordinator_auth_middleware,
@@ -5144,7 +5153,7 @@ fn raw_near_in_exit_scope(
     ))
 }
 
-async fn verify_approvals(
+pub(crate) async fn verify_approvals(
     state: &AppState,
     policy: &shared_tee_helpers::wallet_policy::Policy,
     wallet_pubkey: &str,
@@ -5338,7 +5347,7 @@ async fn verify_approvals(
 /// Derive the wallet's on-chain ed25519 pubkey ("ed25519:<hex>") from `wallet:{id}:near`.
 /// The single source of truth for the policy key AND the approval-message wallet binding —
 /// both MUST use the identical string, so they share this helper.
-async fn derive_wallet_ed25519_pubkey(
+pub(crate) async fn derive_wallet_ed25519_pubkey(
     state: &AppState,
     customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,
@@ -5432,6 +5441,16 @@ async fn load_wallet_policy(
     wallet_id: &str,
     customer: Option<&crate::crypto::Customer>,
 ) -> Result<Option<shared_tee_helpers::wallet_policy::Policy>, ApiError> {
+    Ok(load_wallet_policy_with_owner(state, wallet_id, customer).await?.map(|(policy, _)| policy))
+}
+
+/// The wallet's policy, and the account the contract records as the one that
+/// stored it (`owner` of its `get_wallet_policy`), from one read of the chain.
+pub(crate) async fn load_wallet_policy_with_owner(
+    state: &AppState,
+    wallet_id: &str,
+    customer: Option<&crate::crypto::Customer>,
+) -> Result<Option<(shared_tee_helpers::wallet_policy::Policy, Option<String>)>, ApiError> {
     let near_client = state.near_client.as_ref().ok_or_else(|| {
         ApiError::InternalError("NEAR client not configured".to_string())
     })?;
@@ -5446,6 +5465,7 @@ async fn load_wallet_policy(
         Some(pv) => pv,
         None => return Ok(None),
     };
+    let owner = policy_view.get("owner").and_then(|v| v.as_str()).map(str::to_string);
 
     // The frozen flag is visible without decryption.
     //
@@ -5471,10 +5491,10 @@ async fn load_wallet_policy(
         None => false,
     };
     if frozen {
-        return Ok(Some(shared_tee_helpers::wallet_policy::Policy {
-            frozen: true,
-            ..Default::default()
-        }));
+        return Ok(Some((
+            shared_tee_helpers::wallet_policy::Policy { frozen: true, ..Default::default() },
+            owner,
+        )));
     }
 
     let encrypted_data_b64 = policy_view
@@ -5493,7 +5513,7 @@ async fn load_wallet_policy(
     let mut policy: shared_tee_helpers::wallet_policy::Policy = serde_json::from_slice(&decrypted)
         .map_err(|e| ApiError::InternalError(format!("Policy parse failed: {}", e)))?;
     policy.frozen = policy.frozen || frozen;
-    Ok(Some(policy))
+    Ok(Some((policy, owner)))
 }
 
 /// The wallet's implicit NEAR account id (hex of the derived ed25519 pubkey).
@@ -5788,7 +5808,7 @@ async fn sign_nep413(
 /// Derive the wallet key, query the access-key nonce + block hash, build a NEAR
 /// `Transaction::V0` from the actions produced by `make_tx`, sign it, and return the
 /// signed transaction. The signer is the wallet's implicit account.
-async fn sign_near_transaction<F>(
+pub(crate) async fn sign_near_transaction<F>(
     state: &AppState,
     customer: Option<&crate::crypto::Customer>,
     wallet_id: &str,

@@ -325,6 +325,21 @@ adding a family:
 `no_exportable_seed_can_name_a_signing_key` in `api_tests.rs` encodes the invariant:
 add the new family's seed to that test before adding the family.
 
+### The TEE's key of a wallet contract
+
+A wallet with an owner may have a wallet contract (Agent On-chain custody): an
+account that runs the two-key standard and executes a request only under two
+signatures, the agent's and the TEE's. The TEE's key is
+`wallet-contract:{wallet_id}` under the owner's master, a root of its own that
+no caller-written seed may start at (`DECLARED_KEY_ROOTS`). It is derived in
+`src/custody.rs` (`tee_key`) and signs one thing: its half of a request that
+`/wallet/contract/prepare` built for an operation the owner's policy allowed.
+An owner who leaves derives the same key from their master
+(`custody_core::keys::tee_key`).
+
+`WALLET_CONTRACT_CODE_HASH` (base58) is the code hash of the published build
+of that contract; without it the three `/wallet/contract/*` routes refuse.
+
 ### Signing keys
 
 A WebAssembly artefact may declare signing keys in its manifest

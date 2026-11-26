@@ -352,6 +352,7 @@ mod wallet_sign_tests {
             // vault's TEE key (`mpc_ckd.rs`).
             "vrf-key".to_string(),
             format!("outlayer.near:{}", "vault.alice.near"),
+            shared_tee_helpers::custody_core::keys::tee_key_seed(id),
         ];
         // The strings an attacker holding the exporter would try, including
         // the ones that spell a sub-key path verbatim.
@@ -1424,6 +1425,7 @@ mod tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         // Nothing listens on port 1 — any RPC call would fail, which is the point: the cap must
         // be enforced without one.
@@ -1567,6 +1569,7 @@ mod tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         state_config.allowed_worker_token_hashes =
             vec![hex::encode(Sha256::digest(token.as_bytes()))];
@@ -1857,6 +1860,7 @@ mod tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         AppState::new(crate::crypto::Keystore::generate(), config, None)
     }
@@ -3285,6 +3289,8 @@ mod a_caller_seed_cannot_start_at_a_declared_key_root {
         assert!(SIGNING_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[0]));
         assert!(ENCRYPTION_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[1]));
         assert!(crate::task_keys::TASK_KEY_LABEL.starts_with(DECLARED_KEY_ROOTS[2]));
+        assert_eq!(DECLARED_KEY_ROOTS[3], "wallet-contract:");
+        assert!(shared_tee_helpers::custody_core::keys::tee_key_seed("abc").starts_with(DECLARED_KEY_ROOTS[3]));
     }
 
     #[test]
@@ -4323,6 +4329,7 @@ mod signing_keys_at_the_door {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         let near_client = rpc.map(|url| crate::near::NearClient::new(url, "outlayer.test").unwrap());
         AppState::new(keystore, config, near_client)
@@ -6223,6 +6230,7 @@ mod contract_vote_tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         let near_client = crate::near::NearClient::new("http://127.0.0.1:1", "outlayer.test").unwrap();
         AppState::new(crate::crypto::Keystore::generate(), config, Some(near_client))
@@ -6284,6 +6292,7 @@ mod contract_vote_tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
         (AppState::new(crate::crypto::Keystore::generate(), config, Some(near_client)), seen)
@@ -6609,6 +6618,7 @@ mod payment_check_multisig_tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
         AppState::new(keystore, config, Some(near_client))
@@ -6825,6 +6835,7 @@ mod policy_lock_tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
         (AppState::new(keystore, config, Some(near_client)), Chain { seen, resolve_to })
@@ -7120,6 +7131,7 @@ mod policy_lock_tests {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         let near_client = crate::near::NearClient::new("http://127.0.0.1:1", "outlayer.test").unwrap();
         let state = AppState::new(crate::crypto::Keystore::generate(), config, Some(near_client));
@@ -7253,6 +7265,7 @@ mod update_of_a_vault_row {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         let near_client = crate::near::NearClient::new(&url, "outlayer.test").unwrap();
         let state = AppState::new(keystore, config, Some(near_client));
@@ -7371,6 +7384,7 @@ mod recovery_tool_vector {
             near_contract_id: None,
             keystore_key_type: near_crypto::KeyType::ED25519,
             tee_allowed_key_types: shared_tee_helpers::AllowedKeyTypes { ed25519: true, ml_dsa_65: true },
+            wallet_contract_code_hash: None,
         };
         AppState::new(crate::crypto::Keystore::from_master_secret(&[0x11; 32]).unwrap(), config, None)
     }

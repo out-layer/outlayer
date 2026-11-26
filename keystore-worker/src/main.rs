@@ -23,6 +23,7 @@ mod api;
 mod auth_guard;
 mod config;
 mod crypto;
+mod custody;
 mod eip712;
 mod ephemeral_keys;
 mod near;
