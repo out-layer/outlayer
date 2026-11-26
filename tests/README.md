@@ -128,6 +128,10 @@ and the self-cleaning sweep on stuck requests made through `proxy.wat`; ~10 min)
 `submit_keystore_registration`: what a hostile submitter sends instead, the gas of each,
 the build approved by vote and taken off by the owner, votes that name the key) — testnet.
 The same registration on the same real data, offline: `keystore-dao-contract/src/registration_tests.rs`.
+A DAO release before its `Upgrade` proposal: `keystore-dao-contract/tests/upgrade_sandbox.sh`
+upgrades the code deployed on `dao.outlayer.<net>` (read through the keyed RPC) to
+`target/near/keystore_dao_contract.wasm` on a local `nearprotocol/sandbox`, through governance,
+and checks that the state reads the same; nothing is sent to testnet or mainnet.
 
 ### Basic execution
 

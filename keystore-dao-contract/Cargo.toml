@@ -45,7 +45,7 @@ ed25519-small-order = { path = "../ed25519-small-order" }
 # toolchain rather than wasm32. Cargo activates this feature only for
 # tests / examples / benches, so the production WASM stays unaffected.
 near-sdk = { version = "= 5.29.0", features = ["legacy", "unit-testing"] }
-near-workspaces = { version = "= 0.14.1", features = ["unstable"] }
+near-workspaces = { version = "= 0.22.1", features = ["unstable"] }
 tokio = { version = "1.40", features = ["full"] }
 anyhow = "1.0"
 dstack-event-log = { path = "../dstack-event-log", features = ["test-helpers"] }
