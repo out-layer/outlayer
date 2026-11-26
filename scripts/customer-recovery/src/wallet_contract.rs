@@ -46,6 +46,13 @@ struct Flags(Vec<(String, String)>);
 
 /// The flags each command takes beside `--owner` and `--wallet-id`; for
 /// `request`, the first of each move is what selects it.
+/// How far back a request is dated, in seconds: the wallet contract refuses
+/// one from its future, and a block's time lags.
+const DATED_BACK_SECS: u64 = 60;
+
+/// How long a request can still be sent after it is made.
+const VALID_FOR_SECS: u64 = custody_core::TIMEOUT_SECS as u64 - DATED_BACK_SECS;
+
 const REQUEST_FLAGS: [&str; 3] = ["--contract", "--network", "--nonce"];
 const MOVES: [&[&str]; 4] = [
     &["--transfer-to", "--amount"],
@@ -170,7 +177,7 @@ fn request(flags: &Flags, agent: &SigningKey, tee: &SigningKey, now_ns: u64) -> 
             intents_contract: "intents.near".to_string(),
             nonce,
             // the contract refuses a request from its future, and a block's time lags
-            created_at_ns: now_ns.saturating_sub(60_000_000_000),
+            created_at_ns: now_ns.saturating_sub(DATED_BACK_SECS * 1_000_000_000),
         },
     )
     .map_err(|refusal| anyhow!("{refusal}"))?;
@@ -188,7 +195,7 @@ fn request(flags: &Flags, agent: &SigningKey, tee: &SigningKey, now_ns: u64) -> 
         "gas": "300000000000000",
         "deposit": "0",
         "public_key": pair.to_string(),
-        "valid_for_seconds": 3540,
+        "valid_for_seconds": VALID_FOR_SECS,
         "network": network,
     }))
 }

@@ -4694,6 +4694,34 @@ async fn wallet_sign_secret_delete_handler(
     }))
 }
 
+/// Whose policy a wallet's is to store. A wallet in an owner's scope has its
+/// owner before it has a policy: the account whose master derives its keys,
+/// and a policy is that account's to store. A policy another account stored
+/// earlier stays that account's to change, since the contract takes a change
+/// from the account that stored it and from no other; on-chain custody does
+/// not serve such a policy. Any other wallet: the caller's, as the contract
+/// holds it.
+pub(crate) async fn policy_is_the_callers_to_store(
+    state: &AppState,
+    customer: Option<&crate::crypto::Customer>,
+    wallet_id: &str,
+    caller: &str,
+) -> Result<(), ApiError> {
+    let Some(crate::crypto::Customer::Owner { account, .. }) = customer else {
+        return Ok(());
+    };
+    if caller == account.as_str() {
+        return Ok(());
+    }
+    let stored_by = load_wallet_policy_with_owner(state, wallet_id, customer).await?.and_then(|(_, by)| by);
+    if stored_by.as_deref() == Some(caller) {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(format!(
+        "This wallet belongs to {account}: its policy is stored by that account and by no other."
+    )))
+}
+
 /// Sign encrypted policy data so the NEAR contract can verify wallet ownership.
 ///
 /// The contract's `store_wallet_policy` requires a signature over
@@ -4719,20 +4747,11 @@ async fn wallet_sign_policy_handler(
 
     validate_wallet_id(&req.wallet_id)?;
     let customer = extract_customer_from_header(&headers)?;
-    // A wallet in an owner's scope has its owner before it has a policy: the
-    // account whose master derives its keys. Its policy is that account's to
-    // store, and on-chain custody serves no policy stored by another.
-    if let Some(crate::crypto::Customer::Owner { account, .. }) = customer.as_ref() {
-        if req.caller != account.as_str() {
-            return Err(ApiError::Forbidden(format!(
-                "This wallet belongs to {account}: its policy is stored by that account and by no other."
-            )));
-        }
-    }
     state
         .ensure_customer_loaded(customer.as_ref())
         .await
         .map_err(ApiError::from_customer_load)?;
+    policy_is_the_callers_to_store(&state, customer.as_ref(), &req.wallet_id, &req.caller).await?;
 
     // SECURITY: the signing key here (`wallet:{id}:near`) is ALSO the wallet's NEAR tx key,
     // and a NEAR tx signature is `sign(sha256(borsh(tx)))`. So we must NEVER sign a

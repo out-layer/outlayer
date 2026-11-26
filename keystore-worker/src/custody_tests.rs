@@ -601,6 +601,36 @@ mod at_the_door {
         assert_eq!(code(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await), None);
     }
 
+    /// In an owner's scope a policy is the owner's to store. One that another
+    /// account stored earlier stays that account's to change, and nobody
+    /// else's: the contract takes a change from the account that stored it.
+    #[tokio::test]
+    async fn a_policy_is_the_owners_to_store_and_its_first_authors_to_change() {
+        let stand = stand().await;
+        let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
+        let may = |caller: &'static str| {
+            let state = stand.state.clone();
+            let customer = customer.clone();
+            async move { crate::api::policy_is_the_callers_to_store(&state, Some(&customer), WALLET, caller).await }
+        };
+
+        // stored by the owner, or not stored yet: the owner alone
+        assert!(may(OWNER).await.is_ok());
+        assert!(matches!(may("mallory.testnet").await, Err(ApiError::Forbidden(reason)) if reason.contains(OWNER)));
+        stand.chain.lock().unwrap().policy = None;
+        assert!(may(OWNER).await.is_ok());
+        assert!(matches!(may("mallory.testnet").await, Err(ApiError::Forbidden(_))));
+
+        // stored by another account earlier: that account still changes it, and no third one
+        stand.chain.lock().unwrap().policy = Some(("carol.testnet".to_string(), false, json!({})));
+        assert!(may("carol.testnet").await.is_ok());
+        assert!(may(OWNER).await.is_ok());
+        assert!(matches!(may("mallory.testnet").await, Err(ApiError::Forbidden(_))));
+
+        // a wallet outside an owner's scope: the rule is the contract's alone
+        assert!(crate::api::policy_is_the_callers_to_store(&stand.state, None, WALLET, "anyone.testnet").await.is_ok());
+    }
+
     async fn wallet_account(stand: &Stand) -> String {
         let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
         let key = stand.state.keystore.read().await.get_public_key_for_seed(Some(&customer), &wallet_seed(WALLET, "near")).unwrap();

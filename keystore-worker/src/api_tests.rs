@@ -6899,23 +6899,6 @@ mod policy_lock_tests {
             .map(|Json(r)| r)
     }
 
-    /// In an owner's scope the policy is the owner's to store: a signature for
-    /// any other sender is refused before the owner's keys are loaded.
-    #[tokio::test]
-    async fn an_owner_scope_signs_a_policy_for_its_owner_only() {
-        let (state, _chain) = chain(None).await;
-        let blob = blob(&state, &new_open()).await;
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Customer-Vault", "owner:alice.near:1".parse().unwrap());
-
-        let refused = wallet_sign_policy_handler(State(state.clone()), headers, Json(request(&blob, None))).await;
-        match refused {
-            Err(ApiError::Forbidden(message)) => assert!(message.contains("alice.near"), "{message}"),
-            other => panic!("expected a refusal naming the owner, got {:?}", other.map(|Json(r)| r.version)),
-        }
-        assert_ne!(CALLER, "alice.near");
-    }
-
     /// The signature verifies over exactly the contract's `v2` message, with
     /// the deadline the answer carries — a week out, give or take the test.
     fn assert_signed_over(resp: &WalletSignPolicyResponse, blob: &str, version: u64, locked: bool) {
