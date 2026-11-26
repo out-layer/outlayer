@@ -488,6 +488,14 @@ mod at_the_door {
                 "mainnet only",
             ),
             (r#"{"id":"x","op":{"kind":"transfer","to":"trader.alice.testnet","amount":"1"}}"#, "to itself"),
+            (
+                r#"{"id":"x","op":{"kind":"call","to":"outlayer.testnet","method":"store_wallet_policy","args_base64":"e30=","gas":"30000000000000","deposit":"0"}}"#,
+                "to the OutLayer contract",
+            ),
+            (
+                r#"{"id":"x","op":{"kind":"call","to":"outlayer.testnet","method":"delete_wallet_policy","args_base64":"e30=","gas":"30000000000000","deposit":"0"}}"#,
+                "to the OutLayer contract",
+            ),
             (r#"{"id":"x","op":{"kind":"transfer","to":"bob.testnet","amount":"1"},"extra":1}"#, "not an operation"),
         ] {
             let reason = refusal(prepare(&stand, prepare_request(&stand.agent, body, now())).await);
@@ -546,6 +554,16 @@ mod at_the_door {
         let mut another = msg.clone();
         another.promise.action = Action::Transfer { amount: 500 };
         assert!(matches!(relay(another, proof(&agent_half, &tee_half)).await, Err(ApiError::Forbidden(_))));
+
+        // past its hour, a whole proof relays nothing
+        let mut old = msg.clone();
+        old.created_at_ns -= 3_600 * 1_000_000_000;
+        let old_proof = proof(&sign_half(Role::Agent, &stand.agent, &old), &{
+            let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
+            let (tee, _) = stand.state.keystore.read().await.derive_keypair(Some(&customer), &tee_key_seed(WALLET)).unwrap();
+            sign_half(Role::Tee, &tee, &old)
+        });
+        assert!(matches!(relay(old, old_proof).await, Err(ApiError::BadRequest(reason)) if reason.contains("past the hour")));
 
         let mut elsewhere = msg.clone();
         elsewhere.signer_id = "other.alice.testnet".to_string();

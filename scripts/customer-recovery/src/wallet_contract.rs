@@ -44,16 +44,40 @@ Environment (never on the command line):
 /// `--name value` pairs.
 struct Flags(Vec<(String, String)>);
 
+/// The flags each command takes beside `--owner` and `--wallet-id`; for
+/// `request`, the first of each move is what selects it.
+const REQUEST_FLAGS: [&str; 3] = ["--contract", "--network", "--nonce"];
+const MOVES: [&[&str]; 4] = [
+    &["--transfer-to", "--amount"],
+    &["--call-to", "--method", "--args-base64", "--gas", "--deposit"],
+    &["--intents-transfer-to", "--token", "--amount"],
+    &["--intents-withdraw-to", "--token", "--amount"],
+];
+
 impl Flags {
     fn parse(args: &[String]) -> Result<Self> {
-        let mut flags = Vec::new();
+        let mut flags: Vec<(String, String)> = Vec::new();
         for pair in args.chunks(2) {
             match pair {
-                [name, value] if name.starts_with("--") => flags.push((name.clone(), value.clone())),
+                [name, value] if name.starts_with("--") => {
+                    if flags.iter().any(|(seen, _)| seen == name) {
+                        bail!("{name} is given twice");
+                    }
+                    flags.push((name.clone(), value.clone()));
+                }
                 _ => bail!("expected `--flag value` pairs\n{USAGE}"),
             }
         }
         Ok(Self(flags))
+    }
+
+    /// Refuse a flag the command does not take: a mistyped or a leftover one
+    /// would otherwise change nothing, silently.
+    fn only(&self, allowed: &[&str]) -> Result<()> {
+        match self.0.iter().find(|(name, _)| !allowed.contains(&name.as_str())) {
+            Some((name, _)) => bail!("{name} is not a flag of this command\n{USAGE}"),
+            None => Ok(()),
+        }
     }
 
     fn get(&self, name: &str) -> Option<&str> {
@@ -96,6 +120,15 @@ fn agent(owner: &str, wallet_id: &str) -> Result<SigningKey> {
 }
 
 fn the_move(flags: &Flags) -> Result<Move> {
+    // one move, and no flag of another
+    let chosen: Vec<&&[&str]> = MOVES.iter().filter(|mv| flags.get(mv[0]).is_some()).collect();
+    let [mv] = chosen.as_slice() else {
+        bail!("exactly one move is required\n{USAGE}");
+    };
+    let allowed: Vec<&str> =
+        ["--owner", "--wallet-id"].iter().chain(REQUEST_FLAGS.iter()).chain(mv.iter()).copied().collect();
+    flags.only(&allowed)?;
+
     let text = |name: &str| flags.need(name).map(str::to_string);
     Ok(if let Some(to) = flags.get("--transfer-to") {
         Move::NearTransfer { to: to.to_string(), amount: flags.number("--amount")? }
@@ -156,12 +189,25 @@ fn request(flags: &Flags, agent: &SigningKey, tee: &SigningKey, now_ns: u64) -> 
         "deposit": "0",
         "public_key": pair.to_string(),
         "valid_for_seconds": 3540,
-        "send_with": format!(
-            "near contract call-function as-transaction {contract} w_execute_signed json-args '{args}' \
-             prepaid-gas '300 Tgas' attached-deposit '0 NEAR' sign-as <any account of yours> \
-             network-config {network} sign-with-keychain send"
-        ),
+        "network": network,
     }))
+}
+
+/// A word for a POSIX shell: single-quoted, with each `'` inside written as `'\''`.
+fn shell_word(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// The near-cli command that sends a request made by [`request`].
+fn send_command(made: &serde_json::Value) -> String {
+    let field = |name: &str| made[name].as_str().unwrap_or_default();
+    format!(
+        "near contract call-function as-transaction {} w_execute_signed json-args {} prepaid-gas '300 Tgas' \
+         attached-deposit '0 NEAR' sign-as <account> network-config {} sign-with-keychain send",
+        shell_word(field("contract")),
+        shell_word(&made["args"].to_string()),
+        shell_word(field("network")),
+    )
 }
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
@@ -173,13 +219,17 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     crate::wallet_keys::validate_wallet_id(wallet_id)?;
 
     let out = match command.as_str() {
-        "agent-key-request" => serde_json::json!({
+        "agent-key-request" => {
+            flags.only(&["--owner", "--wallet-id"])?;
+            serde_json::json!({
             "message": agent_key_message(owner, wallet_id),
             "recipient": AGENT_KEY_RECIPIENT,
             "nonce_base64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, AGENT_KEY_NONCE),
             "sign_with": "the owner account's own key, as a NEP-413 message; put the signature in AGENT_KEY_SIGNATURE",
-        }),
+            })
+        }
         "keys" => {
+            flags.only(&["--owner", "--wallet-id"])?;
             let (agent, tee) = (agent(owner, wallet_id)?, tee(wallet_id)?);
             let pair = PublicKeyPair { agent: agent.verifying_key().to_bytes(), tee: tee.verifying_key().to_bytes() };
             serde_json::json!({
@@ -194,7 +244,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("the clock reads before 1970")?
                 .as_nanos() as u64;
-            request(&flags, &agent(owner, wallet_id)?, &tee(wallet_id)?, now_ns)?
+            let made = request(&flags, &agent(owner, wallet_id)?, &tee(wallet_id)?, now_ns)?;
+            // The command goes to stderr, apart from the JSON, quoted for a shell.
+            eprintln!("Send it from any account of yours:\n{}", send_command(&made));
+            made
         }
         other => bail!("unknown wallet-contract command `{other}`\n{USAGE}"),
     };
@@ -239,7 +292,8 @@ mod tests {
             serde_json::json!({ "receiver_id": "alice.near", "actions": [{ "action": "transfer", "payload": { "amount": "1000" } }] })
         );
         assert_eq!(made["args"]["proof"].as_str().unwrap().len(), 256);
-        assert!(made["send_with"].as_str().unwrap().contains("w_execute_signed"));
+        let command = send_command(&made);
+        assert!(command.contains("w_execute_signed") && command.contains("network-config 'mainnet'"));
     }
 
     #[test]
@@ -260,6 +314,30 @@ mod tests {
         let to_itself: Vec<&str> =
             base.iter().chain(["--transfer-to", "trader.alice.testnet", "--amount", "1"].iter()).copied().collect();
         assert!(request(&flags(&to_itself), &agent, &tee, NOW_NS).is_err());
+    }
+
+    #[test]
+    fn a_word_is_quoted_for_a_shell() {
+        assert_eq!(shell_word("plain"), "'plain'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("$(id) `id` \"x\""), "'$(id) `id` \"x\"'");
+    }
+
+    #[test]
+    fn a_flag_of_another_move_a_repeated_or_an_unknown_one_is_refused() {
+        let (agent, tee) = keys();
+        let base = ["--network", "testnet", "--contract", "trader.alice.testnet"];
+        let with = |extra: &[&str]| -> Vec<String> { base.iter().chain(extra.iter()).map(|s| s.to_string()).collect() };
+        for extra in [
+            // a transfer of NEAR with a token named: not a token transfer
+            &["--transfer-to", "alice.testnet", "--amount", "1", "--token", "nep141:wrap.near"][..],
+            &["--transfer-to", "alice.testnet", "--amount", "1", "--call-to", "app.testnet"],
+            &["--transfer-to", "alice.testnet", "--amount", "1", "--amont", "2"],
+        ] {
+            let flags = Flags::parse(&with(extra)).unwrap();
+            assert!(request(&flags, &agent, &tee, NOW_NS).is_err(), "{extra:?}");
+        }
+        assert!(Flags::parse(&with(&["--amount", "1", "--amount", "2"])).is_err());
     }
 
     #[test]

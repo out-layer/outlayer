@@ -28,6 +28,7 @@ use shared_tee_helpers::{
         keys::tee_key_seed,
         message::RequestMessage,
         moves::{build, Context, Move},
+        TIMEOUT_SECS,
     },
     custody_op::move_for,
     wallet_policy::{self, Decision, Op},
@@ -377,6 +378,16 @@ async fn prepare_handler(
     // The policy passed: the move, the request for it, the TEE's half.
     let mv = move_for(&op, req.deposit_address.as_deref())
         .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))?;
+    // The contract that holds the policies takes its caller for the account
+    // that acts: a wallet contract installed on the owner's own account would
+    // store, replace or delete a policy as the owner.
+    if matches!(&mv, Move::Call { to, .. } if to == near_client(&state)?.contract_id().as_str()) {
+        return Err(ApiError::BadRequest(
+            "A wallet contract does not make this call: it is to the OutLayer contract, which takes \
+             its caller for the owner"
+                .to_string(),
+        ));
+    }
     let chain_id = chain_id(&state)?;
     if chain_id != "mainnet" && matches!(mv, Move::IntentsTransfer { .. } | Move::IntentsWithdraw { .. }) {
         return Err(ApiError::BadRequest("NEAR Intents is on mainnet only".to_string()));
@@ -438,6 +449,16 @@ async fn relay_handler(
     if req.message.signer_id != wallet_contract.as_str() || req.message.chain_id != chain_id(&state)? {
         return Err(ApiError::BadRequest(
             "the request is for another wallet contract or another chain".to_string(),
+        ));
+    }
+    // A request past the wallet contract's timeout is refused there: the
+    // working account pays for no transaction that can only fail.
+    let now_ns = crate::types::now_ns()
+        .map_err(|e| ApiError::InternalError(format!("the clock cannot be read: {e}")))?;
+    let expires_ns = req.message.created_at_ns.saturating_add(u64::from(TIMEOUT_SECS) * 1_000_000_000);
+    if now_ns >= expires_ns {
+        return Err(ApiError::BadRequest(
+            "the request is past the hour the wallet contract accepts it for".to_string(),
         ));
     }
     if !admitted.pair.verify(&req.message, &req.proof) {
