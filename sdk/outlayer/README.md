@@ -86,7 +86,7 @@ let api_key = env::var("OPENAI_API_KEY");
 
 **Common environment variables:**
 - `OUTLAYER_EXECUTION_TYPE` - `NEAR` (on-chain request) or `HTTPS`
-- `NEAR_SENDER_ID` - On-chain: the transaction signer. HTTPS: the payment key owner (or the bound account with `use_bound_identity`)
+- `NEAR_SENDER_ID` - On-chain: the transaction signer. HTTPS: the payment key owner (or the account of the caller's wallet contract with `use_bound_identity`)
 - `NEAR_USER_ACCOUNT_ID` - The paying account
 - `NEAR_PREDECESSOR_ID` - Account that called OutLayer (empty over HTTPS)
 - `NEAR_TRANSACTION_HASH` - Transaction hash (empty over HTTPS)

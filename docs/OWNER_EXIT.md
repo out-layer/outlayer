@@ -188,23 +188,25 @@ funded — has no such account: it is not listed and counts toward the five. A w
   applications keep reading them. An agent's secret filed under a wallet that left stays on
   chain as ciphertext; its deletion is signed by the wallet's key, which the owner holds.
 
-## A wallet with an exit is bound only to its owner's account
+## Leaving with a wallet contract
 
-A wallet's NEAR key is the executor of the account it is bound to through Agent Connect
-(`PUT /wallet/v1/binding`), and that key leaves with the owner's master. A binding to any
-other account would hand that account to whoever holds the master after the exit. So an
-owner's wallet is bound to the owner's own account, in the `personal_account` mode, and
-to nothing else:
+An agent with on-chain custody keeps its main balance in a wallet contract: a NEAR account
+that executes a request only under two signatures, the agent's key and the wallet's TEE
+key. The TEE key is derived under the owner's master, with the root `wallet-contract:`, so
+it leaves with the master. After the exit the owner derives both keys and acts on the
+wallet contract alone with `customer-recovery wallet-contract`: it builds a request that
+carries both signatures and prints the near-cli command that sends it. The tool talks to no
+service and to no chain, and any NEAR account sends the call. The commands and the moves
+they build: [scripts/customer-recovery/README.md](../scripts/customer-recovery/README.md#a-wallet-contract-after-an-exit).
 
-- `PUT /wallet/v1/binding` with any other `asset_account_id` answers 400: "A wallet whose
-  keys leave with an exit is bound only to the account they leave to. This wallet's keys
-  leave with its owner's exit, to '<owner>': '<account>' is not that account".
-- `kind=hos_lease` is refused for an owner's wallet whatever the account: a leased account
-  is never the owner's own. A leased account is bound to a wallet with no owner and no
-  vault.
-- The keystore holds the same line on its own: it signs no `w_execute_extension` of an
-  owner's wallet whose receiver is not the owner's account, under any policy and whatever
-  binding is recorded.
+## A wallet with an exit acts through no extension
+
+A wallet's NEAR key leaves with the owner's master, and so would any right another account
+gave that key. Before the exit the keystore signs nothing that uses such a right:
+
+- No wallet signs a call to `w_execute_extension`, the method of an account with full
+  control of a wallet contract. The call answers 403 `policy_denied` under any policy and
+  under none.
 - An owner's wallet signs no raw NEAR payload (`raw_sign` on `near`), whatever its policy
   lists: 32 bytes signed with the wallet's NEAR key are any NEAR transaction, this one
   included, and the keystore cannot read them. NEAR is signed through `call`, `transfer` and
@@ -219,17 +221,16 @@ whose keys can leave unless the account is the wallet owner's own.
 
 ## A wallet never calls the keystore DAO
 
-The DAO takes whoever calls it for an owner. A wallet bound to its owner's account through
-Agent Connect acts as that account, so the agent holding the wallet's key could start and
-claim the owner's exit. The keystore therefore signs no call to the keystore DAO
-(`dao.outlayer.near`, `dao.outlayer.testnet`) — sent directly, or as a promise of a
-`w_execute_extension` request — under any policy, with no capability that opens it. Every
+The DAO takes whoever calls it for an owner. The keystore signs no call to the keystore DAO
+(`dao.outlayer.near`, `dao.outlayer.testnet`) under any policy, with no capability that
+opens it, and an operation of a wallet contract that calls it is refused as well. Every
 exit call is a transaction the owner signs with the account's own key.
 
-For the same reason `sign-message` signs no message whose recipient has the form NEP-641
-gives an account's off-chain authorization (`<chain>: <account>[ -> …] @ <time>`, or the same
-without ` @ <time>`): such a signature would be the bound account's word, given off chain. A
-recipient that only looks like one — `Login: alice` — is refused as well.
+`sign-message` signs no message whose recipient has the form NEP-641 gives an account's
+off-chain authorization (`<chain>: <account>[ -> …] @ <time>`, or the same without
+` @ <time>`): such a signature is the account's authorization, given off chain, of itself
+and of every account that named it an extension. A recipient that only looks like one —
+`Login: alice` — is refused as well.
 
 A keystore starts only under a DAO this rule names.
 

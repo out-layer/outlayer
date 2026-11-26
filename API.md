@@ -33,11 +33,13 @@ dashboard host `app.outlayer.ai` serves no API.
 |--------|---------|---------|
 | `X-Payment-Key: owner:nonce:secret` | `/call`, `/calls/{id}`, `/payment-keys/balance`, `/subscription/*` | A payment key: a funded key, a subscription, or the wallet's trial key |
 | `Authorization: Bearer wk_...` or `Bearer near:...` | All wallet endpoints, `POST /trial-key`, `GET /calls/{id}` | Wallet API key, or a deterministic wallet's NEAR signature. It runs the wallet and does not pay: on `/call` alone it is refused as `401 wk_is_not_a_payer` |
+| `x-agent-account`, `x-agent-timestamp`, `x-agent-nonce`, `x-agent-signature` | `/wallet/contract/v1/*` | The agent's own key, one of the pair in its wallet contract: each request is signed by it. No API key on these routes |
 | `X-Wallet-Id` | `/call` to a connector that acts on the wallet | The paying key's own wallet (`wallet_id` from `GET /wallet/v1/address`); without it the run has no wallet |
 | _(none)_ | `/register`, public read endpoints | No auth |
 
-> Only `X-Payment-Key` or `Authorization: Bearer wk_...` / `near:...` are
-> accepted for authenticated calls. There is no `X-API-Key` header.
+> Only `X-Payment-Key`, `Authorization: Bearer wk_...` / `near:...` or, on
+> `/wallet/contract/v1/*`, the agent's signature headers are accepted for
+> authenticated calls. There is no `X-API-Key` header.
 
 ## Execution API
 
@@ -90,6 +92,25 @@ secret issued by the NEAR MPC network. All endpoints except `/register` require
 | GET | `/wallet/v1/requests` · `/requests/{id}` | Request list / status |
 | GET | `/wallet/v1/audit` | Audit log |
 | POST | `/wallet/v1/delete` | Delete wallet |
+
+### On-chain custody (wallet contract)
+
+A wallet with an owner can keep its main balance in a wallet contract: a NEAR
+account, installed by the owner, that executes a request only under two
+signatures — the agent's own key and the wallet's TEE key. The wallet's API
+key names the account; the agent's own key asks for each operation.
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/wallet/v1/contract/key` | Wallet API key | The public key of the wallet's TEE key, one of the pair the owner installs |
+| PUT | `/wallet/v1/contract` | Wallet API key | Name the account that is this wallet's wallet contract; its pair is read from the chain and must hold this wallet's TEE key |
+| GET | `/wallet/v1/contract` | Wallet API key | The wallet contract of this wallet |
+| POST | `/wallet/contract/v1/operations` | Agent's signature | Ask for an operation: the owner's policy judges it, and the enclave signs its half of the request for an operation the policy allows |
+| GET | `/wallet/contract/v1/operations/{id}` | Agent's signature | Where the operation stands |
+| POST | `/wallet/contract/v1/operations/{id}/relay` | Agent's signature | The agent adds its half; the wallet's own NEAR account sends the transaction to the wallet contract and pays its gas |
+
+Operations: a NEAR transfer, a contract call, a transfer inside NEAR Intents, a
+swap and a withdrawal to another chain through 1Click, a withdrawal to NEAR.
 
 ### Confidential Intents (private balances)
 

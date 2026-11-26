@@ -113,9 +113,9 @@ A signature costs one round trip to the keystore and one free view call. MPC is 
 - **HTTPS.** `POST https://api.outlayer.ai/call/{owner}/{project}` with a payment key: a prepaid stablecoin balance registered in the contract, with per-call and per-project limits. No wallet popup and no NEAR on the caller's side.
 - **Earnings.** A caller can attach a payment for the program's author on either door; the author withdraws it in stablecoins.
 
-### The agent can act as the user's own account
+### On-chain custody: two signatures, required by the chain
 
-By default an agent acts as its own implicit account. With account binding it acts as `alice.near`: the user installs a small wallet contract by hash (a global contract) and adds the agent's executor to it. The user's own keys keep signing, the agent gets only what the policy allows, and one transaction ends it.
+An agent's wallet is an implicit account whose key is derived in the enclave: one API call, no transaction per operation, every feature. An owner who wants the chain itself to require two signatures installs a wallet contract on a NEAR account of their choice, and the agent's main balance lies there. The wallet contract executes a request only under both: the agent's own key and a key in OutLayer's enclave, which signs only for an operation the owner's policy allows. Each move is a NEAR transaction with gas, relayed and paid by the agent's OutLayer wallet, and the owner can leave and sign for both sides. With `use_bound_identity` a program runs as the wallet contract's account.
 
 ### Verifiable end to end
 
