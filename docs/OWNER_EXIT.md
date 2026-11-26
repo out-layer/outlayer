@@ -198,6 +198,7 @@ wallet contract alone with `customer-recovery wallet-contract`: it builds a requ
 carries both signatures and prints the near-cli command that sends it. The tool talks to no
 service and to no chain, and any NEAR account sends the call. The commands and the moves
 they build: [scripts/customer-recovery/README.md](../scripts/customer-recovery/README.md#a-wallet-contract-after-an-exit).
+The wallet contract, its two keys and what each party holds: [ON_CHAIN_CUSTODY.md](ON_CHAIN_CUSTODY.md).
 
 ## A wallet with an exit acts through no extension
 

@@ -190,6 +190,7 @@ cd keystore-worker && cargo run          # Run keystore
 - [docs/CONNECTORS.md](docs/CONNECTORS.md) - Building a connector: model, secrets, limits
 - [docs/TASKS.md](docs/TASKS.md) - Tasks between an agent and its owner: the model, the inbox, the host interface
 - [docs/CONNECTOR_TASKS.md](docs/CONNECTOR_TASKS.md) - Owner confirmation in a connector: the policy's `confirm`, the `confirm` operation, rules, prices, tests
+- [docs/ON_CHAIN_CUSTODY.md](docs/ON_CHAIN_CUSTODY.md) - On-chain custody: an agent's wallet contract under two signatures; setup, operations, approvals, limits, leaving, byte formats
 - [docs/ADMIN.md](docs/ADMIN.md) - Coordinator `/admin/*` endpoints, auth model, what a leaked token reaches
 - [contract/README.md](contract/README.md) - Contract API
 - [worker/README.md](worker/README.md) - Worker config

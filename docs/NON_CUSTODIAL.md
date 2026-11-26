@@ -264,7 +264,8 @@ leave the wallet contract, so neither the enclave's key nor the agent's
 moves anything out of it alone, and the owner can leave and sign for both
 sides ([`OWNER_EXIT.md`](OWNER_EXIT.md#leaving-with-a-wallet-contract)).
 What it costs: a NEAR transaction and gas per move, a signature on the
-agent's side, and a setup by the owner.
+agent's side, and a setup by the owner. The setup, the operations, their
+routes and the byte formats: [`ON_CHAIN_CUSTODY.md`](ON_CHAIN_CUSTODY.md).
 
 No wallet signs a call to `w_execute_extension`, the method of an account
 with full control of a wallet contract: it is refused under any policy
