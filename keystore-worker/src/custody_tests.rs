@@ -199,3 +199,356 @@ fn identity_checks_the_caller_then_admits_the_account() {
     }
     assert!(!identity.contains("derive_keypair"));
 }
+
+/// The handlers against a chain that answers what a scenario says: the
+/// owner's record in the DAO, the wallet contract's account and views, and
+/// the wallet's policy.
+mod at_the_door {
+    use std::sync::{Arc, Mutex};
+
+    use ed25519_dalek::SigningKey;
+    use serde_json::json;
+    use shared_tee_helpers::custody_core::{
+        agent_request::AgentRequest,
+        halves::{proof, sign_half, verify_half, PublicKeyPair, Role},
+        message::{Action, Promise},
+    };
+
+    use super::*;
+
+    const OWNER: &str = "alice.testnet";
+    const SCOPE: &str = "owner:alice.testnet:1";
+    const CONTRACT: &str = "trader.alice.testnet";
+    const CODE_HASH: [u8; 32] = [0xc0; 32];
+    const ESCROW_CHECK: [u8; 32] = [0xe5; 32];
+
+    /// What the chain says. Each test changes one thing.
+    #[derive(Clone)]
+    struct Chain {
+        code_hash: [u8; 32],
+        public_key: String,
+        extensions: Vec<String>,
+        signature_allowed: bool,
+        /// `(stored by, frozen, the policy)`; `None` is no policy on chain.
+        policy: Option<(String, bool, serde_json::Value)>,
+    }
+
+    struct Stand {
+        state: AppState,
+        chain: Arc<Mutex<Chain>>,
+        agent: SigningKey,
+        tee: ed25519_dalek::VerifyingKey,
+    }
+
+    fn agent_key() -> SigningKey {
+        SigningKey::from_bytes(&[0xa1; 32])
+    }
+
+    async fn stand() -> Stand {
+        let keystore = Keystore::from_master_secret(&[0x11; 32]).unwrap();
+        let owner: AccountId = OWNER.parse().unwrap();
+        keystore.load_owner(&owner, 1, ESCROW_CHECK);
+        let customer = Customer::Owner { account: owner, generation: 1 };
+        let tee = keystore.get_public_key_for_seed(Some(&customer), &tee_key_seed(WALLET)).unwrap();
+        let pair = PublicKeyPair { agent: agent_key().verifying_key().to_bytes(), tee: tee.to_bytes() };
+        let chain = Arc::new(Mutex::new(Chain {
+            code_hash: CODE_HASH,
+            public_key: pair.to_string(),
+            extensions: Vec::new(),
+            signature_allowed: true,
+            policy: Some((OWNER.to_string(), false, json!({}))),
+        }));
+
+        let encrypt = {
+            let keystore = keystore.clone();
+            move |policy: &serde_json::Value| {
+                let sealed = keystore
+                    .encrypt(Some(&customer), &format!("wallet-policy:{WALLET}"), policy.to_string().as_bytes())
+                    .unwrap();
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sealed)
+            }
+        };
+        let answers = chain.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let chain = answers.lock().unwrap().clone();
+                let encrypt = encrypt.clone();
+                async move {
+                    let (id, params) = (body["id"].clone(), body["params"].clone());
+                    if params["request_type"] == "view_account" {
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "code_hash": "11111111111111111111111111111111",
+                            "global_contract_hash": bs58::encode(chain.code_hash).into_string()}}));
+                    }
+                    let view = match params["method_name"].as_str().unwrap_or_default() {
+                        "get_exit_owner" => json!({
+                            "generation": 1, "claim_in_flight": false,
+                            "escrow_check": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ESCROW_CHECK)}),
+                        "w_public_key" => json!(chain.public_key),
+                        "w_extensions" => json!(chain.extensions),
+                        "w_is_signature_allowed" => json!(chain.signature_allowed),
+                        "get_wallet_policy" => match &chain.policy {
+                            None => serde_json::Value::Null,
+                            Some((owner, frozen, policy)) => {
+                                json!({ "owner": owner, "frozen": frozen, "encrypted_data": encrypt(policy) })
+                            }
+                        },
+                        other => panic!("the chain is not asked for {other}: {params}"),
+                    };
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "block_hash": "11111111111111111111111111111111", "block_height": 9, "logs": [],
+                        "result": view.to_string().into_bytes()}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let config = crate::config::Config {
+            near_rpc_url: url.clone().into(),
+            wallet_contract_code_hash: Some(CODE_HASH),
+            ..state().config
+        };
+        let near_client = crate::near::NearClient::new(&url, "outlayer.testnet").unwrap();
+        let state = AppState::new(keystore, config, Some(near_client));
+        let secret_key = near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519);
+        state.set_mpc_context(
+            crate::mpc_ckd::MpcCkdConfig {
+                mpc_contract_id: "v1.signer.test".parse().unwrap(),
+                mpc_domain_id: 2,
+                mpc_public_key: "unused".into(),
+                near_rpc_url: url,
+                keystore_dao_id: "dao.test".parse().unwrap(),
+            },
+            near_crypto::InMemorySigner { account_id: "dao.test".parse().unwrap(), public_key: secret_key.public_key(), secret_key },
+        );
+        Stand { state, chain, agent: agent_key(), tee }
+    }
+
+    fn now() -> u64 {
+        crate::types::now_ns().unwrap() / 1_000_000_000
+    }
+
+    const TRANSFER: &str = r#"{"id":"pay-1","op":{"kind":"transfer","to":"bob.testnet","amount":"5"}}"#;
+
+    /// The coordinator's `prepare` request for `body`, signed by `key` at `timestamp`.
+    fn prepare_request(key: &SigningKey, body: &str, timestamp: u64) -> PrepareRequest {
+        let nonce = [7; 16];
+        let signature = AgentRequest {
+            wallet_contract: CONTRACT,
+            method: OPERATION_METHOD,
+            path: OPERATION_PATH,
+            body: body.as_bytes(),
+            timestamp,
+            nonce,
+        }
+        .sign(key);
+        serde_json::from_value(json!({
+            "wallet_id": WALLET,
+            "wallet_contract": CONTRACT,
+            "agent_request": {
+                "method": OPERATION_METHOD, "path": OPERATION_PATH, "body": body,
+                "timestamp": timestamp, "nonce": hex::encode(nonce), "signature": hex::encode(signature),
+            },
+            "nonce": 3,
+        }))
+        .unwrap()
+    }
+
+    async fn prepare(stand: &Stand, req: PrepareRequest) -> Result<PrepareResponse, ApiError> {
+        prepare_handler(State(stand.state.clone()), scope(Some(SCOPE)), Json(req)).await.map(|Json(r)| r)
+    }
+
+    fn refusal(result: Result<PrepareResponse, ApiError>) -> String {
+        match result {
+            Err(ApiError::Forbidden(reason)) | Err(ApiError::BadRequest(reason)) => reason,
+            Err(other) => panic!("refused for another class of reason: {other:?}"),
+            Ok(_) => panic!("a request was built and the TEE's half made"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowed_operation_comes_back_as_its_request_with_the_tees_half() {
+        let stand = stand().await;
+        let prepared = prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.unwrap();
+
+        let msg = &prepared.message;
+        assert_eq!((msg.chain_id.as_str(), msg.signer_id.as_str(), msg.nonce), ("testnet", CONTRACT, 3));
+        assert_eq!(
+            msg.promise,
+            Promise { receiver_id: "bob.testnet".to_string(), action: Action::Transfer { amount: 5 } }
+        );
+        assert_eq!(prepared.message_hash, hex::encode(msg.hash()));
+        let created_s = msg.created_at_ns / 1_000_000_000;
+        assert!((now() - 62..=now() - 59).contains(&created_s), "dated a minute back: {created_s}");
+
+        let tee_half: [u8; 64] = hex::decode(&prepared.tee_half).unwrap().try_into().unwrap();
+        assert!(verify_half(Role::Tee, stand.tee.as_bytes(), msg, &tee_half));
+        // with the agent's half the wallet contract accepts it
+        let pair = PublicKeyPair { agent: stand.agent.verifying_key().to_bytes(), tee: stand.tee.to_bytes() };
+        assert!(pair.verify(msg, &proof(&sign_half(Role::Agent, &stand.agent, msg), &tee_half)));
+    }
+
+    #[tokio::test]
+    async fn the_request_has_to_be_the_agents_for_this_route_and_now() {
+        let stand = stand().await;
+
+        let other = SigningKey::from_bytes(&[0xb2; 32]);
+        assert!(refusal(prepare(&stand, prepare_request(&other, TRANSFER, now())).await).contains("not signed by the agent"));
+
+        for timestamp in [now() - 600, now() + 600] {
+            let stale = prepare_request(&stand.agent, TRANSFER, timestamp);
+            assert!(refusal(prepare(&stand, stale).await).contains("not signed by the agent"));
+        }
+
+        // the body changed after it was signed: another amount is another request
+        let mut tampered = prepare_request(&stand.agent, TRANSFER, now());
+        tampered.agent_request.body = TRANSFER.replace(r#""amount":"5""#, r#""amount":"500""#);
+        assert!(refusal(prepare(&stand, tampered).await).contains("not signed by the agent"));
+
+        // a request signed for another route is not an operation
+        let mut elsewhere = prepare_request(&stand.agent, TRANSFER, now());
+        elsewhere.agent_request.path = format!("{OPERATION_PATH}/pay-1/relay");
+        assert!(refusal(prepare(&stand, elsewhere).await).contains("an operation is asked for by"));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_signed_without_the_owners_policy_passing() {
+        let stand = stand().await;
+        let ask = || async { refusal(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await) };
+        let set = |policy| stand.chain.lock().unwrap().policy = policy;
+
+        set(None);
+        assert!(ask().await.contains("no policy on chain"));
+
+        set(Some(("mallory.testnet".to_string(), false, json!({}))));
+        assert!(ask().await.contains("not stored by its owner"));
+
+        set(Some((OWNER.to_string(), true, json!({}))));
+        assert!(ask().await.contains("frozen"));
+
+        let approvers = json!({
+            "approval": { "threshold": { "required": 1 }, "approvers": [{ "id": "a.testnet", "role": "admin" }] }
+        });
+        set(Some((OWNER.to_string(), false, approvers)));
+        assert!(ask().await.to_lowercase().contains("approval"));
+    }
+
+    #[tokio::test]
+    async fn only_an_admitted_wallet_contract_is_served() {
+        let stand = stand().await;
+        let honest = stand.chain.lock().unwrap().clone();
+        let cases = [
+            (Chain { code_hash: [0; 32], ..honest.clone() }, "published build"),
+            (Chain { extensions: vec![OWNER.to_string()], ..honest.clone() }, "extension"),
+            (Chain { signature_allowed: false, ..honest.clone() }, "does not accept signatures"),
+            (Chain { public_key: "not a pair".to_string(), ..honest.clone() }, "not a pair of keys"),
+            (
+                Chain {
+                    public_key: PublicKeyPair {
+                        agent: stand.agent.verifying_key().to_bytes(),
+                        tee: SigningKey::from_bytes(&[0xee; 32]).verifying_key().to_bytes(),
+                    }
+                    .to_string(),
+                    ..honest.clone()
+                },
+                "another wallet's",
+            ),
+        ];
+        for (chain, why) in cases {
+            *stand.chain.lock().unwrap() = chain;
+            let reason = refusal(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await);
+            assert!(reason.contains(why), "{why}: {reason}");
+
+            let identity = identity_handler(
+                State(stand.state.clone()),
+                scope(Some(SCOPE)),
+                Json(IdentityRequest {
+                    wallet_id: WALLET.to_string(),
+                    wallet_contract: CONTRACT.to_string(),
+                    caller: wallet_account(&stand).await,
+                }),
+            )
+            .await;
+            assert!(matches!(identity, Err(ApiError::Forbidden(_))), "{why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operation_a_wallet_contract_does_not_do_is_refused_after_the_policy() {
+        let stand = stand().await;
+        for (body, why) in [
+            (r#"{"id":"x","op":{"kind":"delete","beneficiary":"bob.testnet"}}"#, "does not do `delete`"),
+            (
+                r#"{"id":"x","op":{"kind":"intents_transfer","to":"bob.testnet","amount":"1","token":"nep141:wrap.near"}}"#,
+                "mainnet only",
+            ),
+            (r#"{"id":"x","op":{"kind":"transfer","to":"trader.alice.testnet","amount":"1"}}"#, "to itself"),
+            (r#"{"id":"x","op":{"kind":"transfer","to":"bob.testnet","amount":"1"},"extra":1}"#, "not an operation"),
+        ] {
+            let reason = refusal(prepare(&stand, prepare_request(&stand.agent, body, now())).await);
+            assert!(reason.contains(why), "{why}: {reason}");
+        }
+    }
+
+    async fn wallet_account(stand: &Stand) -> String {
+        let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
+        let key = stand.state.keystore.read().await.get_public_key_for_seed(Some(&customer), &wallet_seed(WALLET, "near")).unwrap();
+        hex::encode(key.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_program_runs_as_the_account_for_its_own_wallet_only() {
+        let stand = stand().await;
+        let ask = |caller: String| {
+            identity_handler(
+                State(stand.state.clone()),
+                scope(Some(SCOPE)),
+                Json(IdentityRequest { wallet_id: WALLET.to_string(), wallet_contract: CONTRACT.to_string(), caller }),
+            )
+        };
+        let Json(served) = ask(wallet_account(&stand).await).await.unwrap();
+        assert_eq!(served.account_id, CONTRACT);
+
+        assert!(matches!(ask("f".repeat(64)).await, Err(ApiError::Forbidden(_))));
+        assert!(matches!(ask(OWNER.to_string()).await, Err(ApiError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn relay_signs_nothing_for_a_request_that_is_not_proven() {
+        let stand = stand().await;
+        let prepared = prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.unwrap();
+        let msg = prepared.message;
+        let tee_half: [u8; 64] = hex::decode(&prepared.tee_half).unwrap().try_into().unwrap();
+        let agent_half = sign_half(Role::Agent, &stand.agent, &msg);
+        let relay = |message: RequestMessage, proof: String| {
+            relay_handler(
+                State(stand.state.clone()),
+                scope(Some(SCOPE)),
+                Json(RelayRequest {
+                    wallet_id: WALLET.to_string(),
+                    wallet_contract: CONTRACT.to_string(),
+                    message,
+                    proof,
+                }),
+            )
+        };
+
+        for unproven in [hex::encode(tee_half), hex::encode(agent_half), proof(&tee_half, &agent_half), proof(&tee_half, &tee_half)] {
+            assert!(matches!(relay(msg.clone(), unproven).await, Err(ApiError::Forbidden(_))));
+        }
+
+        // the proof of one request does not relay another
+        let mut another = msg.clone();
+        another.promise.action = Action::Transfer { amount: 500 };
+        assert!(matches!(relay(another, proof(&agent_half, &tee_half)).await, Err(ApiError::Forbidden(_))));
+
+        let mut elsewhere = msg.clone();
+        elsewhere.signer_id = "other.alice.testnet".to_string();
+        assert!(matches!(relay(elsewhere, proof(&agent_half, &tee_half)).await, Err(ApiError::BadRequest(_))));
+    }
+}
