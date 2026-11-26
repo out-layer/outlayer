@@ -344,7 +344,7 @@ token's own for a token. A token is its id inside NEAR Intents
 | `relayed` | the transaction `tx_hash` was sent and its outcome is not recorded | reads the operation; the read settles it |
 | `success` | the request executed on chain. For a swap or a withdrawal to another chain it says the input reached 1Click's deposit address; `route_status` on a read follows the route | — |
 | `failed` | the chain refused; `result` carries the chain's failure | reads the failure; the same thing again is another operation under another id |
-| `closed` | ended with nothing sent, for `reason`: the vote was rejected or expired, an approval was not used within its 24 hours, or a prepared request was not relayed within an hour | reads the reason; the same thing again is another operation under another id |
+| `closed` | ended with nothing sent, for `reason`: the vote was rejected or expired, an approval was not used within its 24 hours, a prepared request was not relayed within an hour, or its transaction never reached the chain in that hour | reads the reason; the same thing again is another operation under another id |
 
 ### The agent's signed request
 
