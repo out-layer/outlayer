@@ -1,5 +1,9 @@
 # On-chain custody: an agent with a wallet contract
 
+> **On testnet now** (`https://testnet-api.outlayer.ai`); on mainnet with the
+> next release. Until then `api.outlayer.ai` answers `404` on every route
+> below.
+
 An agent with on-chain custody keeps its main balance in a **wallet contract**:
 a NEAR account that runs the two-key variant of the
 [NEAR Intents wallet contract](https://github.com/near/intents/tree/main/contracts/wallet).
