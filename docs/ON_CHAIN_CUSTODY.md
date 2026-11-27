@@ -487,7 +487,16 @@ operation, with amounts below the policy's threshold passing without one.
   is one request at most.
 - One operation of a wallet runs at a time (`409 wallet_busy`), so the limits
   are counted correctly.
-- The working account pays the gas of every relay. It needs NEAR for that.
+- The working account pays the gas of every relay, and keeps **0.5 NEAR** for
+  it. Before a relay runs, the node checks that the working account could pay
+  the 300 Tgas the relay attaches at the highest gas price the transaction can
+  meet, ten times the current one: 0.3 NEAR at today's 0.0001 NEAR per Tgas, on
+  both networks. That 0.3 NEAR is checked, not spent. A relay of a transfer
+  burns about 0.0004 NEAR; a call burns more, at most 0.03 NEAR when it uses all
+  300 Tgas. With 0.5 NEAR the 0.2 above the check pays for some 500 transfers,
+  and for at least six relays that burn everything. Top the account up to 0.5
+  once it is under 0.35 NEAR, rather than at a refusal: a relay the account
+  cannot cover answers `402 wallet_underfunded` with its balance and the cost.
 
 ## 8. What lies in the wallet contract and what stays on the working account
 
