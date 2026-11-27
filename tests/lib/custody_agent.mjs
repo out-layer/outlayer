@@ -223,7 +223,8 @@ async function rpcCall(method, params) {
   if (body.error) throw new Error(JSON.stringify(body.error.data ?? body.error).slice(0, 300));
   return body.result;
 }
-/** StateInit at the 0s address by the funded one-time key, then the key's account deleted to the owner. */
+/** StateInit at the 0s address by the funded one-time key; the key's account is deleted to
+ *  the owner whatever the StateInit did, as the page does. Both sent as the page sends them. */
 async function create0s(owner, pair) {
   const secret = readFileSync(process.env.PAGE_KEY_FILE, 'utf8').trim();
   const seed = unbase58(secret.slice('ed25519:'.length)).subarray(0, 32);
@@ -231,11 +232,19 @@ async function create0s(owner, pair) {
   const ak = await rpcCall('query', { request_type: 'view_access_key', finality: 'final', account_id: signer, public_key: `ed25519:${base58(edPublicOf(seed))}` });
   const nonce = BigInt(ak.nonce) + 1n, blockHash = unbase58(ak.block_hash);
   const account = deterministic(pair);
-  const created = await rpcCall('broadcast_tx_commit', [signedTx(seed, signer, account, nonce, blockHash, Buffer.concat([Buffer.of(11), stateInitOf(pair), le(0, 16)]))]);
-  const closed = await rpcCall('broadcast_tx_commit', [signedTx(seed, signer, signer, nonce + 1n, blockHash, Buffer.concat([Buffer.of(7), borshString(owner)]))]);
+  const send = (receiver, n, action) => rpcCall('send_tx', { signed_tx_base64: signedTx(seed, signer, receiver, n, blockHash, action), wait_until: 'FINAL' });
   const failed = (o) => o.status && o.status.Failure ? JSON.stringify(o.status.Failure).slice(0, 200) : null;
-  if (failed(created)) throw new Error(`StateInit failed: ${failed(created)}`);
-  if (failed(closed)) throw new Error(`the one-time key's account was not deleted: ${failed(closed)}`);
+  let why = null;
+  try {
+    const created = await send(account, nonce, Buffer.concat([Buffer.of(11), stateInitOf(pair), le(0, 16)]));
+    if (failed(created)) why = `StateInit failed: ${failed(created)}`;
+  } catch (e) {
+    why = `StateInit was not sent: ${e.message}`;
+  } finally {
+    const closed = await send(signer, nonce + 1n, Buffer.concat([Buffer.of(7), borshString(owner)]));
+    if (failed(closed)) why = `${why ? `${why}; ` : ''}the one-time key's account was not deleted: ${failed(closed)}`;
+  }
+  if (why) throw new Error(why);
   return account;
 }
 function base58(bytes) {

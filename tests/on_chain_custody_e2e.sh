@@ -144,14 +144,15 @@ op_state() { agent GET "$OPS/$1"; }
 keep_prepared() { # keep_prepared <name>
   jq -c '.message' <<<"$BODY" > "$WORK/$1.msg"; jq -r '.tee_half' <<<"$BODY" > "$WORK/$1.tee"
 }
-# check_prepared <name> <op-json> — the agent's own checks before it signs: the request is
-# this wallet contract's, is the operation asked for, and carries a valid TEE half.
+# check_prepared <name> <op-json> [account] — the agent's own checks before it signs: the
+# request is this wallet contract's (the agent's account unless named), is the operation
+# asked for, and carries a valid TEE half.
 check_prepared() {
-  local name=$1 op=$2 msg; msg=$(cat "$WORK/$name.msg")
+  local name=$1 op=$2 signer=${3:-$ACCOUNT_OF_AGENT} msg; msg=$(cat "$WORK/$name.msg")
   local kind; kind=$(jq -r .kind <<<"$op")
   local want
   case "$kind" in
-    transfer) want=$(jq -nc --arg s "$ACCOUNT_OF_AGENT" --argjson op "$op" '[$s, $op.to, "transfer", $op.amount]')
+    transfer) want=$(jq -nc --arg s "$signer" --argjson op "$op" '[$s, $op.to, "transfer", $op.amount]')
               [[ "$(jq -c '[.signer_id, .promise.receiver_id, .promise.action.action, .promise.action.amount]' <<<"$msg")" == "$want" ]] || return 1 ;;
     *) return 1 ;;
   esac
@@ -294,7 +295,8 @@ if [[ "$HTTP" == 200 && "$(jq -c '[.account_id, .agent_public_key]' <<<"$BODY")"
   pass "S1 the owner finished the setup: the coordinator read the pair from the chain"
 else fail "S1 the owner's finish: $HTTP $(why)"; fi
 owner_page GET
-[[ "$HTTP" == 404 ]] && pass "S3 the setup token is spent" || fail "S3 the spent token answered $HTTP"
+[[ "$HTTP" == 409 ]] && grep -q "\`$AGENT_ACC\`" <<<"$BODY" && pass "S3 the spent token says the setup was finished, with its account (409)" \
+  || fail "S3 the spent token answered $HTTP $(why)"
 
 # The agent collects its key.
 api_wk "$WK0" GET /wallet/v1/contract/setup >/dev/null
@@ -666,7 +668,7 @@ if new_wallet 2; then
     ask "s5m-$TS" "$TRANSFER_SMALL"
     if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
       keep_prepared s5m
-      check_prepared s5m "$TRANSFER_SMALL" && pass "S5 the move is prepared, and is the transfer asked for" || fail "S5 the prepared request differs"
+      check_prepared s5m "$TRANSFER_SMALL" "$ACC0S" && pass "S5 the move is prepared, and is the transfer asked for" || fail "S5 the prepared request differs"
       relay_with "s5m-$TS" "$(node "$AGENT_JS" half "$WORK/s5m.msg")"
       [[ "$HTTP" == 200 ]] && settle "s5m-$TS" && [[ "$STATUS" == success ]] && pass "S5 a move out of the 0s contract executed" \
         || fail "S5 the move: $HTTP status=$STATUS $(why)"
