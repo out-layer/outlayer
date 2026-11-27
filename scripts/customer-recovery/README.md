@@ -276,7 +276,7 @@ prints.
 | Command | Does |
 |---|---|
 | `wallet-contract agent-key-request --owner <account> --wallet-id <id>` | prints the NEP-413 message, recipient and nonce the owner account's own key signs; that signature is the agent's key |
-| `wallet-contract keys --owner <account> --wallet-id <id>` | the pair of public keys; `public_key` equals what the wallet contract's `w_public_key` answers |
+| `wallet-contract keys --owner <account> --wallet-id <id> [--build <code hash>]` | the pair of public keys; `public_key` equals what the wallet contract's `w_public_key` answers. `deterministic_account` is the `0s` address of a wallet contract of that pair on the build (the published one by default): where it is when the setup made a new account with no key |
 | `wallet-contract request --owner <account> --wallet-id <id> --contract <account> --network mainnet\|testnet <move>` | a request with both halves, as the arguments of `w_execute_signed`, and the near-cli command that sends it |
 
 `<move>` is one of `--transfer-to <account> --amount <yoctoNEAR>`;

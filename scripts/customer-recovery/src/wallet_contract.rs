@@ -32,8 +32,10 @@ Usage:
   customer-recovery wallet-contract agent-key-request --owner <account> --wallet-id <id>
       What the owner's NEAR key signs (NEP-413) for the agent's key.
 
-  customer-recovery wallet-contract keys --owner <account> --wallet-id <id>
-      The pair of public keys of the wallet contract.
+  customer-recovery wallet-contract keys --owner <account> --wallet-id <id> [--build <code hash>]
+      The pair of public keys of the wallet contract, and the 0s address (NEP-616)
+      of a wallet contract of that pair on the build (base58; the published one
+      by default), for a setup that made a new account with no key.
 
   customer-recovery wallet-contract request --owner <account> --wallet-id <id>
       --contract <account> --network mainnet|testnet [--nonce <n>] <move>
@@ -244,7 +246,15 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             })
         }
         "keys" => {
-            flags.only(&["--owner", "--wallet-id"])?;
+            flags.only(&["--owner", "--wallet-id", "--build"])?;
+            let build: [u8; 32] = match flags.get("--build") {
+                None => WALLET_CONTRACT_BUILD,
+                Some(b58) => bs58::decode(b58)
+                    .into_vec()
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| anyhow!("--build is a code hash: 32 bytes in base58"))?,
+            };
             let (agent, tee) = (agent(owner, wallet_id)?, tee(wallet_id)?);
             let pair = PublicKeyPair { agent: agent.verifying_key().to_bytes(), tee: tee.verifying_key().to_bytes() };
             serde_json::json!({
@@ -254,7 +264,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 "check": "`public_key` is what the wallet contract's `w_public_key` answers",
                 // where a wallet contract of this pair is, when the setup made a new account
                 // with no key (NEP-616); a sub-account or the owner's own account is named
-                "deterministic_account": custody_core::deterministic::deterministic_account(&WALLET_CONTRACT_BUILD, &pair),
+                "deterministic_account": custody_core::deterministic::deterministic_account(&build, &pair),
+                "build": bs58::encode(build).into_string(),
             })
         }
         "request" => {

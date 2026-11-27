@@ -24,18 +24,33 @@
 #       swapped, and M1's proof sent again — none moves the balance. Then the agent's half:
 #       the operation goes through
 #   H   the HTTPS door: a request taken twice (409), a stale timestamp, a `wk_` on the
-#       operation routes, an agent's signature on a `wk_` route, another key's signature
+#       operation routes, an agent's signature on a `wk_` route, another key's signature;
+#       an internal operation of the wallet contract (add_extension) cannot be asked for
 #   P1  over `per_transaction`: refused, nothing to sign
 #   A   the agent: the same id with another body is refused; the open operations list shows
 #       an operation waiting for the agent's half; asking again continues it
 #   P2  above `auto_up_to`: the operation waits; listed as pending; the approver votes; the
 #       agent's repeat under the same id is prepared and goes through
+#   D   the build list: the DAO revokes the build; an operation is not prepared, and one
+#       prepared before is not relayed; the DAO approves it again and the agent goes on
+#   T   a request past its ten minutes is not executed, and the balance does not move
 #   I1  use_bound_identity: a program run with the flag runs as the wallet contract's account
 #       (needs a trial key for the wallet; steps aside loudly without one)
+#   S5  a new account with no key: the owner funds a one-time key with an ordinary transfer,
+#       the key creates the wallet contract at its 0s address (NEP-616) by StateInit and
+#       deletes its own account; the account has no key and no balance, runs the approved
+#       build and holds the pair; the setup takes it; the spent token answers 409; a move
+#   Z   STORAGE_MOVES calls (default 0) with no deposit from that zero-balance contract:
+#       its storage against the zero-balance limit of 770 bytes
+#   X   the owner's exit: after the claim the agent's operations are refused; the owner,
+#       with the recovery tool and no OutLayer service, moves funds out of the wallet contract
 #
-# Not here: the DAO revoking the build (two DAO votes, and every wallet on testnet refused between them), an
-# extension added to a wallet contract by hand, the owner's exit (owner_exit_e2e.sh), and
-# the NEAR Intents kinds (mainnet only).
+# D takes two DAO votes on testnet (members' keys in the local keychain); between them every
+# wallet contract on testnet is refused, and the cleanup approves the build again if the run
+# stops there. T waits out the ten minutes. Not here: an extension added to a wallet contract
+# by hand (it takes both keys, so it is the owner's after the exit, when the keystore no
+# longer serves that generation anyway: keystore unit tests hold the rule), and the NEAR
+# Intents kinds (mainnet only).
 #
 # Run:
 #   PARENT=outlayer-alice.testnet ./tests/on_chain_custody_e2e.sh --apply
@@ -47,7 +62,7 @@
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 source "$HOS_LIB_DIR/near_sign.sh"
 
-[[ "${1:-}" == "--apply" ]] || { sed -n '3,45p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
+[[ "${1:-}" == "--apply" ]] || { sed -n '3,60p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
 [[ "$NETWORK" == testnet ]] || { echo "✗ this suite runs on testnet" >&2; exit 1; }
 
 DAO="${DAO:-dao.outlayer.testnet}"
@@ -56,6 +71,8 @@ BUILD="${BUILD:-651XC7DH8J4Xczf8JKXH9pyveBY8ZuNCfy5HZ3SvuSiL}"
 APPROVER="${APPROVER:-outlayer-carol.testnet}"
 RECIPIENT="${RECIPIENT:-outlayer-daniel.testnet}"
 STRANGER="${STRANGER:-outlayer-bob.testnet}"
+DAO_MEMBER="${DAO_MEMBER:-zavodil.testnet}"
+MPC_CONTRACT="${MPC_CONTRACT:-v1.signer-prod.testnet}"
 VECTORS="${VECTORS:-$REPO_ROOT/../shared-tee-helpers/custody-core/vectors}"
 AGENT_JS="$HOS_LIB_DIR/custody_agent.mjs"
 hos_require
@@ -71,7 +88,20 @@ WORK=$(mktemp -d -t on_chain_custody.XXXXXX) || exit 1
 chmod 700 "$WORK"
 TS=$(date +%s)
 
+REVOKED=""
+approve_build() { # the DAO's vote for the build, driven to execution
+  local i
+  for i in 1 2 3 4 5; do
+    (NETWORK=testnet; source "$REPO_ROOT/scripts/lib/dao_gov.sh"; dao_drive "$DAO" "$DAO_MEMBER" "$(jq -nc --arg h "$BUILD" '{ApproveWalletContract:{code_hash:$h}}')") >/dev/null 2>&1 && return 0
+    sleep 65
+  done
+  return 1
+}
 cleanup() {
+  if [[ -n "$REVOKED" ]]; then
+    warn "the run stopped with the build revoked: approving it again"
+    approve_build || warn "the build is NOT approved again: run the ApproveWalletContract vote by hand"
+  fi
   # The agent's account has no key by design: what it holds stays there.
   rm -f -- "${AGENT_CREDS:?}"
   if [[ -f "$OWNER_CREDS" ]]; then
@@ -239,10 +269,11 @@ else fail "S1 the owner's page: $HTTP $(why)"; fi
 AK_MSG=$(jq -r '.agent_key_request.message' <<<"$BODY"); AK_NONCE=$(jq -r '.agent_key_request.nonce_base64' <<<"$BODY")
 AK_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" "$RECOVERY_BIN" sign-nep413 \
   --message "$AK_MSG" --recipient outlayer-agent-key --nonce-base64 "$AK_NONCE" | jq -r .signature)
-node "$AGENT_JS" seed "$OWNER" "$WID0" "$AK_SIG" "$WORK/owner_side.seed"
+AGENT_KEY_SIGNATURE="$AK_SIG" node "$AGENT_JS" seed "$OWNER" "$WID0" "$WORK/owner_side.seed"
 AK_SIG2=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" "$RECOVERY_BIN" sign-nep413 \
   --message "$AK_MSG" --recipient outlayer-agent-key --nonce-base64 "$AK_NONCE" | jq -r .signature)
 [[ "$AK_SIG" == "$AK_SIG2" ]] && pass "S1 the owner's signature repeats: the agent's key needs no backup" || fail "S1 the owner's signature differs on a second signing"
+( umask 077; printf '%s' "$AK_SIG" > "$WORK/ak.sig" )
 unset AK_SIG AK_SIG2
 AGENT_PUB=$(AGENT_SEED_FILE="$WORK/owner_side.seed" node "$AGENT_JS" pub)
 
@@ -299,7 +330,7 @@ if new_wallet 1; then
   S4_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" "$RECOVERY_BIN" sign-nep413 \
     --message "$(jq -r '.agent_key_request.message' <<<"$BODY")" --recipient outlayer-agent-key \
     --nonce-base64 "$(jq -r '.agent_key_request.nonce_base64' <<<"$BODY")" | jq -r .signature)
-  node "$AGENT_JS" seed "$OWNER" "$WID1" "$S4_SIG" "$WORK/s4.seed"; unset S4_SIG
+  AGENT_KEY_SIGNATURE="$S4_SIG" node "$AGENT_JS" seed "$OWNER" "$WID1" "$WORK/s4.seed"; unset S4_SIG
   A1=$(AGENT_SEED_FILE="$WORK/s4.seed" node "$AGENT_JS" pub)
   [[ "$A1" != "$AGENT_PUB" ]] && pass "S4 each wallet has its own agent key" || fail "S4 the same agent key for two wallets"
   OUT=$(near contract deploy "$OWNER" use-global-hash "$BUILD" with-init-call w_init \
@@ -312,9 +343,8 @@ if new_wallet 1; then
   [[ "$HTTP" == 400 ]] && grep -q 'was not set up for this wallet' <<<"$BODY" && pass "S3 the agent cannot name another wallet's contract: 400" \
     || fail "S3 another wallet's contract answered $HTTP $(why)"
   api_wk "$WK1" PUT /wallet/v1/contract "$(jq -nc --arg a "$PARENT" '{account_id:$a}')" >/dev/null
-  if [[ "$HTTP" == 400 ]] && grep -q 'does not answer `w_public_key`' <<<"$BODY"; then pass "S3 an account with no wallet contract: 400"
-  elif [[ "$HTTP" =~ ^4 ]]; then finding "S3 an account with no contract is refused ($HTTP), but with the RPC's words, not the setup's: $(why)"
-  else fail "S3 an account with no contract answered $HTTP $(why)"; fi
+  [[ "$HTTP" == 400 ]] && grep -q 'does not answer `w_public_key`' <<<"$BODY" && pass "S3 an account with no wallet contract: 400" \
+    || fail "S3 an account with no contract answered $HTTP $(why)"
   rm -f "$WORK/s4.seed"
 else fail "S4 the second wallet: $HTTP $(why)"; fi
 
@@ -411,6 +441,10 @@ api_wk "$WK0" GET "$OPS" >/dev/null
 H_HEADERS=$(node "$AGENT_JS" headers "$AGENT_ACC" GET /wallet/v1/balance "")
 HTTP=$(curl -sS -o /dev/null -w '%{http_code}' "$COORDINATOR_URL/wallet/v1/balance?chain=near" -H @- <<<"$H_HEADERS" 2>/dev/null)
 [[ "$HTTP" == 401 ]] && pass "H  an agent's signature on a wk_ route: 401" || fail "H  an agent's signature on a wk_ route answered $HTTP"
+ask "h-ext-$TS" "$(jq -nc --arg a "$STRANGER" '{kind:"add_extension", account_id:$a}')"
+[[ "$HTTP" == 400 && -z "$(jq -r '.tee_half // ""' <<<"$BODY")" ]] \
+  && pass "H  an internal operation of the wallet contract (add_extension) cannot be asked for: 400" \
+  || fail "H  add_extension answered $HTTP $(why)"
 openssl rand -hex 32 > "$WORK/other.seed"
 AGENT_SEED_FILE="$WORK/other.seed" agent GET "$OPS"
 [[ "$HTTP" == 401 ]] && pass "H  another key's signature in the wallet contract's name: 401" || fail "H  another key answered $HTTP $(why)"
@@ -442,6 +476,60 @@ if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
   [[ "$(jq -r --arg id "a-$TS" '[.operations[]? | select(.id == $id)] | length' <<<"$BODY")" == 0 ]] && pass "A  a settled operation is no longer open" \
     || fail "A  the settled operation is still listed"
 else fail "A  ask: $HTTP $(why)"; fi
+
+# ── D + T ────────────────────────────────────────────────────────────────────
+log "D  the build list"
+in_list() { near_view "$DAO" get_approved_wallet_contracts '{}' | jq -e --arg b "$BUILD" 'index($b) != null' >/dev/null 2>&1; }
+ask "t-$TS" "$TRANSFER_TINY"
+if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+  keep_prepared t; T_HALF=$(node "$AGENT_JS" half "$WORK/t.msg")
+  T_DEADLINE=$(( $(jq -r .created_at_ns "$WORK/t.msg" | cut -c1-10) + 600 ))
+  pass "T  prepared, and kept unsigned until its ten minutes end"
+else fail "T  ask: $HTTP $(why)"; fi
+REVOKED=1
+for i in 1 2 3 4 5; do
+  (NETWORK=testnet; source "$REPO_ROOT/scripts/lib/dao_gov.sh"; dao_drive "$DAO" "$DAO_MEMBER" "$(jq -nc --arg h "$BUILD" '{RevokeWalletContract:{code_hash:$h}}')") >/dev/null 2>&1 && break
+  sleep 65
+done
+if ! in_list; then
+  pass "D  the DAO revoked the build"
+  ask "d-$TS" "$TRANSFER_TINY"
+  [[ "$HTTP" == 403 && "$(jq -r .error <<<"$BODY")" == wallet_contract_refused ]] \
+    && pass "D  an operation is not prepared for a build off the list (403 wallet_contract_refused)" \
+    || fail "D  with the build revoked: $HTTP $(why)"
+  if [[ -n "${T_HALF:-}" ]]; then
+    relay_with "t-$TS" "$T_HALF"
+    [[ "$HTTP" =~ ^4 ]] && pass "D  a request prepared before is not relayed either ($HTTP $(jq -r .error <<<"$BODY"))" \
+      || fail "D  a prepared request was relayed with the build revoked: $HTTP $(why)"
+    op_state "t-$TS"
+    [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]] && pass "D  and it still waits for its half" || fail "D  the refused relay left it $(jq -r .status <<<"$BODY")"
+  fi
+else fail "D  the revoke vote did not execute"; fi
+if approve_build && in_list; then
+  REVOKED=""
+  pass "D  the DAO approved the build again"
+  ask "d-$TS" "$TRANSFER_TINY"
+  if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+    keep_prepared d
+    relay_with "d-$TS" "$(node "$AGENT_JS" half "$WORK/d.msg")"
+    if [[ "$HTTP" == 200 ]] && settle "d-$TS" && [[ "$STATUS" == success ]]; then pass "D  the agent goes on under the same id"
+    else fail "D  relay after the approval: $HTTP status=$STATUS $(why)"; fi
+  else fail "D  after the approval: $HTTP $(why)"; fi
+else fail "D  the build is not approved again"; fi
+
+log "T  a request past its time"
+if [[ -n "${T_HALF:-}" ]]; then
+  WAIT=$(( T_DEADLINE + 15 - $(date +%s) ))
+  (( WAIT > 0 )) && { note "waiting ${WAIT}s for the request's ten minutes to end"; sleep "$WAIT"; }
+  C0=$(balance "$AGENT_ACC")
+  relay_with "t-$TS" "$T_HALF"
+  [[ "$HTTP" == 200 ]] && settle "t-$TS"
+  T_STATUS=$(jq -r '.status // ""' <<<"$BODY")
+  if [[ "$T_STATUS" != success ]]; then pass "T  not executed: $HTTP ${T_STATUS:-} $(jq -r '(.reason // .message // "") | .[0:120]' <<<"$BODY")"
+  else fail "T  a request past its ten minutes was executed"; fi
+  sleep 3
+  [[ "$(balance "$AGENT_ACC")" == "$C0" ]] && pass "T  the balance did not move" || fail "T  the balance moved"
+fi
 
 # ── P2 ───────────────────────────────────────────────────────────────────────
 log "P2 above auto_up_to: the approver"
@@ -490,6 +578,139 @@ else
   [[ "$HTTP" == 200 && "$SENDER" == "$AGENT_ACC" ]] && pass "I1 the program runs as the wallet contract's account ($SENDER)" \
     || fail "I1 use_bound_identity: $HTTP sender='$SENDER' $(why)"
   unset PK
+fi
+
+# ── S5 + Z ───────────────────────────────────────────────────────────────────
+log "S5 a new account with no key: the 0s wallet contract (NEP-616)"
+if new_wallet 2; then
+  WID2=$WID WK2=$WK WACC2=$WACC
+  fund_account "$WACC2" 1 || fail "S5 the working account could not be funded"
+  api_wk "$WK2" GET /wallet/v1/contract/key >/dev/null; TEE2=$(jq -r '.tee_public_key // ""' <<<"$BODY")
+  RPUB2=$(node "$AGENT_JS" x25519-new "$WORK/s5.x")
+  api_wk "$WK2" POST /wallet/v1/contract/setup "$(jq -nc --arg r "$RPUB2" '{recipient_public_key:$r}')" >/dev/null
+  SETUP_TOKEN=$(jq -r '.token // ""' <<<"$BODY")
+  owner_page GET
+  S5_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" "$RECOVERY_BIN" sign-nep413 \
+    --message "$(jq -r '.agent_key_request.message' <<<"$BODY")" --recipient outlayer-agent-key \
+    --nonce-base64 "$(jq -r '.agent_key_request.nonce_base64' <<<"$BODY")" | jq -r .signature)
+  AGENT_KEY_SIGNATURE="$S5_SIG" node "$AGENT_JS" seed "$OWNER" "$WID2" "$WORK/s5.seed"; unset S5_SIG
+  A2=$(AGENT_SEED_FILE="$WORK/s5.seed" node "$AGENT_JS" pub)
+  PAIR2="$A2$TEE2"; EXPECTED_0S=$(node "$AGENT_JS" deterministic "$PAIR2")
+  # the one-time key: funded by the owner with an ordinary transfer, nothing else
+  KP=$(node "$HOS_LIB_DIR/ed25519_keypair.mjs")
+  ( umask 077; jq -r .private_key <<<"$KP" > "$WORK/page.key" )
+  K_ACC=$(node -e 'const B="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";let n=0n;for(const c of process.argv[1].slice(8))n=n*58n+BigInt(B.indexOf(c));console.log(n.toString(16).padStart(64,"0"))' "$(jq -r .public_key <<<"$KP")")
+  unset KP
+  O0=$(balance "$OWNER")
+  OUT=$(near --quiet tokens "$OWNER" send-near "$K_ACC" '0.02 NEAR' network-config "$NETWORK" sign-with-keychain send 2>&1) \
+    || fail "S5 the owner's transfer to the one-time key: $(near_why "$OUT")"
+  sleep 4
+  ACC0S=$(RPC_URL="$RPC_URL" PAGE_KEY_FILE="$WORK/page.key" node "$AGENT_JS" create-0s "$OWNER" "$PAIR2" 2>&1 | tail -1)
+  rm -f "$WORK/page.key"
+  if [[ "$ACC0S" == "$EXPECTED_0S" ]]; then
+    pass "S5 the one-time key created the wallet contract by StateInit at its address ($ACC0S)"
+    sleep 3
+    V=$(view_account "$ACC0S")
+    [[ "$(jq -r '[.result.amount, .result.global_contract_hash] | @json' <<<"$V")" == "[\"0\",\"$BUILD\"]" ]] \
+      && pass "S5 the account runs the approved build with no balance ($(jq -r .result.storage_usage <<<"$V") bytes)" \
+      || fail "S5 the account: $(jq -c '.result | {amount, global_contract_hash, storage_usage}' <<<"$V")"
+    [[ "$(access_keys "$ACC0S")" == "[]" ]] && pass "S5 no access key on it" || fail "S5 keys: $(access_keys "$ACC0S")"
+    [[ "$(near_view "$ACC0S" w_public_key '{}' | tr -d '"')" == "$PAIR2" ]] && pass "S5 w_public_key is the pair" || fail "S5 w_public_key differs"
+    [[ "$(view_account "$K_ACC" | jq -r '.error.cause.name // "exists"')" == UNKNOWN_ACCOUNT ]] \
+      && pass "S5 the one-time key's account is deleted" || fail "S5 the one-time key's account is still there"
+    SPENT=$(python3 -I -c 'import sys; print((int(sys.argv[1]) - int(sys.argv[2])) / 1e24)' "$O0" "$(balance "$OWNER")")
+    note "S5 the owner spent $SPENT NEAR in all (the transfer's gas, the StateInit, the rest returned)"
+    owner_page POST "$(jq -nc --arg a "$ACC0S" --arg s "$(AGENT_SEED_FILE="$WORK/s5.seed" node "$AGENT_JS" seal "$RPUB2" "$WID2")" '{account_id:$a, sealed_agent_key:$s}')"
+    [[ "$HTTP" == 200 && "$(jq -r .account_id <<<"$BODY")" == "$ACC0S" ]] && pass "S5 the setup takes the 0s account" || fail "S5 finish: $HTTP $(why)"
+    owner_page GET
+    [[ "$HTTP" == 409 ]] && grep -q 'finished already' <<<"$BODY" && pass "S5 the spent token says the setup was finished (409)" \
+      || fail "S5 the spent token answered $HTTP $(why)"
+    api_wk "$WK2" GET /wallet/v1/contract/setup >/dev/null
+    node "$AGENT_JS" open "$WORK/s5.x" "$WID2" "$(jq -r .sealed_agent_key <<<"$BODY")" "$WORK/s5.collected"
+    [[ "$(AGENT_SEED_FILE="$WORK/s5.collected" node "$AGENT_JS" pub)" == "$A2" ]] && pass "S5 the agent collected its key" || fail "S5 the collected key differs"
+
+    # the owner's policy for this wallet: transfers and calls
+    POLICY2=$(jq -nc --arg w "$WID2" '{wallet_id:$w, rules:{transaction_types:["transfer","call"], limits:{per_transaction:{native:"50000000000000000000000"}}}}')
+    api_wk "$WK2" POST /wallet/v1/encrypt-policy "$POLICY2" >/dev/null; PENC=$(jq -r '.encrypted_base64 // ""' <<<"$BODY")
+    api_wk "$WK2" POST /wallet/v1/sign-policy "$(jq -nc --arg ed "$PENC" --arg c "$OWNER" '{encrypted_data:$ed, caller:$c}')" >/dev/null
+    ARGS=$(jq -c --arg ed "$PENC" '{wallet_pubkey:("ed25519:" + .public_key_hex), encrypted_data:$ed, wallet_signature:.signature_hex, version, locked, valid_until}' <<<"$BODY")
+    OUT=$(near contract call-function as-transaction "$CONTRACT_ID" store_wallet_policy json-args "$ARGS" \
+      prepaid-gas '100 Tgas' attached-deposit '0.1 NEAR' sign-as "$OWNER" network-config "$NETWORK" sign-with-keychain send 2>&1) \
+      || fail "S5 store_wallet_policy: $(near_why "$OUT")"
+    unset ARGS; sleep 5
+    SAVED_ACCOUNT=$ACCOUNT_OF_AGENT SAVED_SEED=$AGENT_SEED_FILE
+    export ACCOUNT_OF_AGENT="$ACC0S" AGENT_SEED_FILE="$WORK/s5.seed"
+
+    log "Z  storage of a zero-balance 0s contract: ${STORAGE_MOVES:-0} calls with no deposit"
+    CALL0=$(jq -nc '{kind:"call", to:"wrap.testnet", method:"ft_metadata", args_base64:"e30=", gas:"5000000000000", deposit:"0"}')
+    Z0=$(view_account "$ACC0S" | jq -r .result.storage_usage); ZOK=0; ZFAIL=""
+    for i in $(seq 1 "${STORAGE_MOVES:-0}"); do
+      ask "z$i-$TS" "$CALL0"
+      if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+        keep_prepared z
+        relay_with "z$i-$TS" "$(node "$AGENT_JS" half "$WORK/z.msg")"
+        if [[ "$HTTP" == 200 ]] && settle "z$i-$TS" && [[ "$STATUS" == success ]]; then ZOK=$((ZOK + 1))
+        else ZFAIL="call $i: $HTTP status=$STATUS $(why)"; break; fi
+      else ZFAIL="call $i asked: $HTTP $(why)"; break; fi
+      (( i % 25 == 0 )) && note "Z  after $i calls: $(view_account "$ACC0S" | jq -r .result.storage_usage) bytes"
+    done
+    if (( ${STORAGE_MOVES:-0} > 0 )); then
+      Z1=$(view_account "$ACC0S" | jq -r .result.storage_usage)
+      if [[ -z "$ZFAIL" ]]; then pass "Z  $ZOK calls from a zero-balance 0s contract: storage $Z0 → $Z1 bytes (zero-balance limit 770)"
+      else finding "Z  after $ZOK calls the next one failed at $Z1 bytes (from $Z0): $ZFAIL"; fi
+    fi
+
+    log "S5 a move out of the 0s contract"
+    near --quiet tokens "$PARENT" send-near "$ACC0S" '0.05 NEAR' network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+    sleep 3
+    ask "s5m-$TS" "$TRANSFER_SMALL"
+    if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+      keep_prepared s5m
+      check_prepared s5m "$TRANSFER_SMALL" && pass "S5 the move is prepared, and is the transfer asked for" || fail "S5 the prepared request differs"
+      relay_with "s5m-$TS" "$(node "$AGENT_JS" half "$WORK/s5m.msg")"
+      [[ "$HTTP" == 200 ]] && settle "s5m-$TS" && [[ "$STATUS" == success ]] && pass "S5 a move out of the 0s contract executed" \
+        || fail "S5 the move: $HTTP status=$STATUS $(why)"
+    else fail "S5 ask: $HTTP $(why)"; fi
+    export ACCOUNT_OF_AGENT="$SAVED_ACCOUNT" AGENT_SEED_FILE="$SAVED_SEED"
+  else fail "S5 create-0s: $ACC0S"; fi
+else fail "S5 the third wallet: $HTTP $(why)"; fi
+
+# ── X ────────────────────────────────────────────────────────────────────────
+log "X  the owner's exit"
+MPC_PK=$(near_view "$MPC_CONTRACT" public_key '{"domain_id":2}' | tr -d '"')
+exit_tool() {
+  local cmd=$1; shift
+  RPC_URL="$RPC_URL" OWNER_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" MPC_PUBLIC_KEY="$MPC_PK" \
+    "$RECOVERY_BIN" owner-exit "$cmd" --owner "$OWNER" --dao "$DAO" "$@" 2>&1
+}
+MASTER=""
+if [[ "$MPC_PK" == bls12381g2:* ]] && OUT=$(exit_tool initiate); then
+  pass "X  the owner started the exit"
+  AFTER=$(near_view "$DAO" get_exit_owner "$(jq -nc --arg a "$OWNER" '{account:$a}')" | jq -r '(.pending.kind.Exit.finalize_after // 0) / 1e9 | floor')
+  WAIT=$(( AFTER + 6 - $(date +%s) )); (( WAIT > 0 )) && { note "waiting ${WAIT}s for the exit window"; sleep "$WAIT"; }
+  OUT=$(exit_tool claim --claim-file "$WORK/claim.json")
+  MASTER=$(grep -oE '^master_hex=[0-9a-f]{64}$' <<<"$OUT" | cut -d= -f2); OUT=$(grep -v '^master_hex=' <<<"$OUT")
+  [[ -n "$MASTER" ]] && pass "X  the claim gave the owner the master" || fail "X  claim: $(near_why "$OUT")"
+else fail "X  the exit did not start: $(near_why "$OUT")"; fi
+if [[ -n "$MASTER" ]]; then
+  ask "x-$TS" "$TRANSFER_TINY"
+  [[ "$HTTP" =~ ^4 ]] && pass "X  after the claim the agent's operation is refused ($HTTP $(why))" \
+    || fail "X  after the claim: $HTTP $(why)"
+  KEYS_OUT=$(CUSTOMER_RECOVERY_MASTER="$MASTER" AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" "$RECOVERY_BIN" wallet-contract keys --owner "$OWNER" --wallet-id "$WID0" 2>/dev/null)
+  [[ "$(jq -r .public_key <<<"$KEYS_OUT")" == "$AGENT_PUB$TEE_PUB" ]] && pass "X  the tool derives both keys of the pair from the master and the signature" \
+    || fail "X  the tool's pair is not the contract's"
+  R0=$(balance "$RECIPIENT")
+  MADE=$(CUSTOMER_RECOVERY_MASTER="$MASTER" AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" "$RECOVERY_BIN" wallet-contract request \
+    --owner "$OWNER" --wallet-id "$WID0" --contract "$AGENT_ACC" --network testnet \
+    --transfer-to "$RECIPIENT" --amount 50000000000000000000000 2>/dev/null)
+  OUT=$(near contract call-function as-transaction "$AGENT_ACC" w_execute_signed json-args "$(jq -c .args <<<"$MADE")" \
+    prepaid-gas '300 Tgas' attached-deposit '0 NEAR' sign-as "$STRANGER" network-config "$NETWORK" sign-with-keychain send 2>&1) \
+    || fail "X  the owner's request: $(near_why "$OUT")"
+  sleep 3
+  [[ "$(sub "$(balance "$RECIPIENT")" "$R0")" == 50000000000000000000000 ]] \
+    && pass "X  the owner moved 0.05 NEAR out of the wallet contract with no OutLayer service" \
+    || fail "X  the owner's move did not arrive"
+  unset MASTER MADE KEYS_OUT
 fi
 
 verdict on_chain_custody

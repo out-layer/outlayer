@@ -9,7 +9,8 @@
 // 64 hex characters), and a private X25519 key lives in a file this script writes (0600).
 //
 //   selftest <vectors-dir>                       custody-core/vectors: messages, agent_request, keys
-//   seed <owner> <wallet-id> <sig-base64> <out>  the agent's seed from the owner's signature → file
+//   seed <owner> <wallet-id> <out>               the agent's seed from the owner's signature (base64,
+//                                                in AGENT_KEY_SIGNATURE) → file
 //   pub                                          the agent's public key, hex
 //   headers <account> <METHOD> <path> <body-file>  curl header lines of a signed request
 //   hash <msg.json>                              the request's hash, hex
@@ -20,11 +21,15 @@
 //   x25519-new <private-key-file>                a one-time key; prints its public key, hex
 //   seal <recipient-pub-hex> <wallet-id>         the agent's seed sealed to it, base64
 //   open <private-key-file> <wallet-id> <sealed-base64> <out>  the seed it opens → file
+//   deterministic <pair-hex>                     the 0s address (NEP-616) of a fresh wallet contract
+//   create-0s <owner> <pair-hex>                 with the one-time key in PAGE_KEY_FILE (ed25519:…,
+//                                                funded): StateInit at the 0s address, then the key's
+//                                                account deleted to <owner>; RPC_URL (env)
 import {
   createHash, createHmac, createPrivateKey, createPublicKey, sign, verify,
   generateKeyPairSync, diffieHellman, hkdfSync, createCipheriv, createDecipheriv, randomBytes,
 } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const utf8 = (s) => Buffer.from(s, 'utf8');
@@ -154,6 +159,92 @@ function open(privateRaw, sealed, walletId) {
   return Buffer.concat([d.update(sealed.subarray(33, sealed.length - 16)), d.final()]);
 }
 
+// ── a wallet contract at its deterministic address (NEP-616) ───────────────────
+// keccak-256 (not SHA3: the original padding), for "0s" + hex(keccak256(borsh(StateInit))[12..32]).
+const KECCAK_RC = [
+  0x1n, 0x8082n, 0x800000000000808an, 0x8000000080008000n, 0x808bn, 0x80000001n, 0x8000000080008081n,
+  0x8000000000008009n, 0x8an, 0x88n, 0x80008009n, 0x8000000an, 0x8000808bn, 0x800000000000008bn,
+  0x8000000000008089n, 0x8000000000008003n, 0x8000000000008002n, 0x8000000000000080n, 0x800an,
+  0x800000008000000an, 0x8000000080008081n, 0x8000000000008080n, 0x80000001n, 0x8000000080008008n,
+];
+const KECCAK_ROT = [0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14];
+const M64 = (1n << 64n) - 1n;
+const rotl = (x, n) => (n === 0 ? x : ((x << BigInt(n)) | (x >> BigInt(64 - n))) & M64);
+function keccak256(data) {
+  const rate = 136;
+  const padded = Buffer.alloc(Math.ceil((data.length + 1) / rate) * rate);
+  Buffer.from(data).copy(padded);
+  padded[data.length] ^= 0x01;
+  padded[padded.length - 1] ^= 0x80;
+  const st = new Array(25).fill(0n);
+  for (let off = 0; off < padded.length; off += rate) {
+    for (let i = 0; i < rate / 8; i++) st[i] ^= padded.readBigUInt64LE(off + 8 * i);
+    for (let round = 0; round < 24; round++) {
+      const c = [0, 1, 2, 3, 4].map((x) => st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20]);
+      for (let x = 0; x < 5; x++) {
+        const d = c[(x + 4) % 5] ^ rotl(c[(x + 1) % 5], 1);
+        for (let y = 0; y < 25; y += 5) st[x + y] ^= d;
+      }
+      const b = new Array(25);
+      for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) b[y + 5 * ((2 * x + 3 * y) % 5)] = rotl(st[x + 5 * y], KECCAK_ROT[x + 5 * y]);
+      for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) st[x + 5 * y] = b[x + 5 * y] ^ (~b[((x + 1) % 5) + 5 * y] & M64 & b[((x + 2) % 5) + 5 * y]);
+      st[0] ^= KECCAK_RC[round];
+    }
+  }
+  const out = Buffer.alloc(32);
+  for (let i = 0; i < 4; i++) out.writeBigUInt64LE(st[i], 8 * i);
+  return out;
+}
+
+/** The published two-key build, by code hash (651XC7DH8J4Xczf8JKXH9pyveBY8ZuNCfy5HZ3SvuSiL). */
+const WALLET_BUILD = Buffer.from('4b5158b0d1e911e86575ec7aa3cd07d5df23b5aa5572544aa981b5e154eb6771', 'hex');
+const stateOf = (pair) => Buffer.concat([Buffer.of(1), le(0, 4), fromHex(pair, 64), le(3600, 4), le(0, 8), le(0, 4), le(0, 4), le(0, 4)]);
+const stateInitOf = (pair, build = WALLET_BUILD) => {
+  const state = stateOf(pair);
+  return Buffer.concat([Buffer.of(0, 0), build, le(1, 4), le(0, 4), le(state.length, 4), state]);
+};
+const deterministic = (pair, build = WALLET_BUILD) => `0s${hex(keccak256(stateInitOf(pair, build)).subarray(12))}`;
+
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function unbase58(text) {
+  let n = 0n;
+  for (const c of text) { const i = B58.indexOf(c); if (i < 0) throw new Error('not base58'); n = n * 58n + BigInt(i); }
+  let h = n.toString(16); if (h.length % 2) h = '0' + h;
+  return Buffer.concat([Buffer.alloc(text.match(/^1*/)[0].length), Buffer.from(n === 0n ? '' : h, 'hex')]);
+}
+/** A signed transaction of one action, base64: the frame nearcore takes. */
+function signedTx(seed, signerId, receiverId, nonce, blockHash, action) {
+  const tx = Buffer.concat([borshString(signerId), Buffer.of(0), edPublicOf(seed), le(nonce, 8), borshString(receiverId), blockHash, le(1, 4), action]);
+  return Buffer.concat([tx, Buffer.of(0), edSign(seed, sha256(tx))]).toString('base64');
+}
+async function rpcCall(method, params) {
+  const r = await fetch(process.env.RPC_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+  const body = await r.json();
+  if (body.error) throw new Error(JSON.stringify(body.error.data ?? body.error).slice(0, 300));
+  return body.result;
+}
+/** StateInit at the 0s address by the funded one-time key, then the key's account deleted to the owner. */
+async function create0s(owner, pair) {
+  const secret = readFileSync(process.env.PAGE_KEY_FILE, 'utf8').trim();
+  const seed = unbase58(secret.slice('ed25519:'.length)).subarray(0, 32);
+  const signer = hex(edPublicOf(seed));
+  const ak = await rpcCall('query', { request_type: 'view_access_key', finality: 'final', account_id: signer, public_key: `ed25519:${base58(edPublicOf(seed))}` });
+  const nonce = BigInt(ak.nonce) + 1n, blockHash = unbase58(ak.block_hash);
+  const account = deterministic(pair);
+  const created = await rpcCall('broadcast_tx_commit', [signedTx(seed, signer, account, nonce, blockHash, Buffer.concat([Buffer.of(11), stateInitOf(pair), le(0, 16)]))]);
+  const closed = await rpcCall('broadcast_tx_commit', [signedTx(seed, signer, signer, nonce + 1n, blockHash, Buffer.concat([Buffer.of(7), borshString(owner)]))]);
+  const failed = (o) => o.status && o.status.Failure ? JSON.stringify(o.status.Failure).slice(0, 200) : null;
+  if (failed(created)) throw new Error(`StateInit failed: ${failed(created)}`);
+  if (failed(closed)) throw new Error(`the one-time key's account was not deleted: ${failed(closed)}`);
+  return account;
+}
+function base58(bytes) {
+  let n = BigInt('0x' + (Buffer.from(bytes).toString('hex') || '0')); let out = '';
+  while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
+  for (const b of bytes) { if (b === 0) out = '1' + out; else break; }
+  return out;
+}
+
 // ── selftest ─────────────────────────────────────────────────────────────────
 function selftest(dir) {
   let ok = 0;
@@ -184,6 +275,16 @@ function selftest(dir) {
   const seed = seedFromSignature(fromHex(k.agent.signature, 64), k.owner, k.wallet_id);
   same('agent seed', hex(seed), k.agent.seed);
   same('agent public key', hex(edPublicOf(seed)), k.agent.public_key);
+  if (existsSync(join(dir, 'deterministic.json'))) {
+    const d = JSON.parse(readFileSync(join(dir, 'deterministic.json'), 'utf8'));
+    const build = Buffer.from(d.code_hash_hex, 'hex');
+    same('the published build', d.code_hash_hex, hex(WALLET_BUILD));
+    for (const c of d.cases) {
+      same(`${c.name}: 0s state`, hex(stateOf(c.pair)), c.state);
+      same(`${c.name}: 0s state_init`, hex(stateInitOf(c.pair, build)), c.state_init);
+      same(`${c.name}: 0s address`, deterministic(c.pair, build), c.account_id);
+    }
+  }
   const x = generateKeyPairSync('x25519');
   const xRaw = x.privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32);
   same('seal and open', hex(open(xRaw, seal(xRawPublic(x.privateKey), seed, k.wallet_id), k.wallet_id)), hex(seed));
@@ -201,7 +302,9 @@ try {
   switch (cmd) {
     case 'selftest': selftest(args[0]); break;
     case 'seed': {
-      const [owner, walletId, sigB64, out] = args;
+      const [owner, walletId, out] = args;
+      const sigB64 = process.env.AGENT_KEY_SIGNATURE;
+      if (!sigB64) throw new Error('AGENT_KEY_SIGNATURE is not set');
       writeSecret(out, hex(seedFromSignature(Buffer.from(sigB64, 'base64'), owner, walletId)));
       break;
     }
@@ -236,6 +339,8 @@ try {
       writeSecret(out, hex(open(fromHex(readFileSync(privFile, 'utf8').trim(), 32), Buffer.from(sealedB64, 'base64'), walletId)));
       break;
     }
+    case 'deterministic': console.log(deterministic(args[0])); break;
+    case 'create-0s': console.log(await create0s(args[0], args[1])); break;
     default:
       console.error('usage: custody_agent.mjs selftest|seed|pub|headers|hash|half|https-half|verify-tee|execute-args|x25519-new|seal|open …');
       process.exit(2);
