@@ -19,6 +19,14 @@ use custody_core::{
 };
 use ed25519_dalek::SigningKey;
 
+/// The published two-key wallet contract, by its code hash
+/// (`651XC7DH8J4Xczf8JKXH9pyveBY8ZuNCfy5HZ3SvuSiL`): the build a setup with a
+/// new account installs.
+const WALLET_CONTRACT_BUILD: [u8; 32] = [
+    0x4b, 0x51, 0x58, 0xb0, 0xd1, 0xe9, 0x11, 0xe8, 0x65, 0x75, 0xec, 0x7a, 0xa3, 0xcd, 0x07, 0xd5,
+    0xdf, 0x23, 0xb5, 0xaa, 0x55, 0x72, 0x54, 0x4a, 0xa9, 0x81, 0xb5, 0xe1, 0x54, 0xeb, 0x67, 0x71,
+];
+
 const USAGE: &str = "\
 Usage:
   customer-recovery wallet-contract agent-key-request --owner <account> --wallet-id <id>
@@ -244,6 +252,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 "tee_public_key": hex::encode(pair.tee),
                 "public_key": pair.to_string(),
                 "check": "`public_key` is what the wallet contract's `w_public_key` answers",
+                // where a wallet contract of this pair is, when the setup made a new account
+                // with no key (NEP-616); a sub-account or the owner's own account is named
+                "deterministic_account": custody_core::deterministic::deterministic_account(&WALLET_CONTRACT_BUILD, &pair),
             })
         }
         "request" => {
@@ -265,6 +276,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `0s` address the tool prints is custody-core's for the published build.
+    #[test]
+    fn keys_name_the_deterministic_account_of_the_pair() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/deterministic.json"))
+                .unwrap();
+        assert_eq!(hex::encode(WALLET_CONTRACT_BUILD), vectors["code_hash_hex"].as_str().unwrap());
+        for case in vectors["cases"].as_array().unwrap() {
+            let bytes = hex::decode(case["pair"].as_str().unwrap()).unwrap();
+            let pair = PublicKeyPair { agent: bytes[..32].try_into().unwrap(), tee: bytes[32..].try_into().unwrap() };
+            assert_eq!(
+                custody_core::deterministic::deterministic_account(&WALLET_CONTRACT_BUILD, &pair),
+                case["account_id"].as_str().unwrap()
+            );
+        }
+    }
 
     fn flags(pairs: &[&str]) -> Flags {
         Flags::parse(&pairs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
