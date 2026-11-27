@@ -127,7 +127,7 @@ the API carries between them a token and a sealed key it cannot read.
 
 | Step | Who | What |
 |---|---|---|
-| 1 | Agent | makes a one-time X25519 key and opens a setup: `POST /wallet/v1/contract/setup`; gives its owner the link `https://app.outlayer.ai/wallet/custody?setup=<token>` |
+| 1 | Agent | makes a one-time X25519 key and opens a setup: `POST /wallet/v1/contract/setup`; gives its owner the link `https://app.outlayer.ai/wallet/custody#setup=<token>` |
 | 2 | Owner | opens the link and connects the owner account; the page shows the owner, the agent's OutLayer wallet, the enclave's key for it and the network |
 | 3 | Owner | chooses the account and what happens to the account's own keys (below) |
 | 4 | Owner | signs one message with the owner key; the page turns the signature into the agent's key and shows the pair the contract will require |
