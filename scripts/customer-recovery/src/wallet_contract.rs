@@ -117,7 +117,12 @@ impl Flags {
 fn tee(wallet_id: &str) -> Result<SigningKey> {
     let master = std::env::var("CUSTOMER_RECOVERY_MASTER")
         .context("CUSTOMER_RECOVERY_MASTER is not set: the owner's master from `owner-exit claim`")?;
-    let master = crate::wallet_keys::parse_master(&master)?;
+    tee_from(&master, wallet_id)
+}
+
+/// The enclave's key of a wallet contract, from the owner's master as `owner-exit claim` prints it.
+fn tee_from(master: &str, wallet_id: &str) -> Result<SigningKey> {
+    let master = crate::wallet_keys::parse_master(master)?;
     Ok(tee_key(&master, wallet_id))
 }
 
@@ -125,6 +130,11 @@ fn agent(owner: &str, wallet_id: &str) -> Result<SigningKey> {
     let text = std::env::var("AGENT_KEY_SIGNATURE").context(
         "AGENT_KEY_SIGNATURE is not set: the owner's signature over `wallet-contract agent-key-request`",
     )?;
+    agent_from(&text, owner, wallet_id)
+}
+
+/// The agent's key, from the owner's 64-byte signature in hex or in base64.
+fn agent_from(text: &str, owner: &str, wallet_id: &str) -> Result<SigningKey> {
     let text = text.trim();
     let bytes = match hex::decode(text) {
         Ok(bytes) => bytes,
@@ -302,6 +312,38 @@ mod tests {
                 custody_core::deterministic::deterministic_account(&WALLET_CONTRACT_BUILD, &pair),
                 case["account_id"].as_str().unwrap()
             );
+        }
+    }
+
+    /// The signature is taken in hex or in base64, with space around it, and is the
+    /// agent key custody-core derives; anything that is not 64 bytes is refused, so a
+    /// truncated paste never becomes another key.
+    #[test]
+    fn the_agents_key_is_the_one_of_the_owners_signature_in_either_spelling() {
+        use base64::Engine;
+        let signature = [0x51u8; 64];
+        let want = agent_key(&signature, "alice.near", "w-1").verifying_key();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+        for text in [hex::encode(signature), format!("  {b64}\n")] {
+            assert_eq!(agent_from(&text, "alice.near", "w-1").unwrap().verifying_key(), want, "{text}");
+        }
+        assert_ne!(agent_from(&b64, "alice.near", "w-2").unwrap().verifying_key(), want, "another wallet");
+        assert_ne!(agent_from(&b64, "bob.near", "w-1").unwrap().verifying_key(), want, "another owner");
+        for bad in [hex::encode([0x51u8; 63]), hex::encode([0x51u8; 65]), "not a signature!".to_string(), String::new()] {
+            assert!(agent_from(&bad, "alice.near", "w-1").is_err(), "{bad:?}");
+        }
+    }
+
+    /// The enclave's key follows from the master and the wallet's id alone, and a
+    /// master that is not one is refused.
+    #[test]
+    fn the_enclaves_key_is_the_one_of_the_master_and_the_wallet() {
+        let master = [0x4du8; 32];
+        let want = tee_key(&master, "w-1").verifying_key();
+        assert_eq!(tee_from(&hex::encode(master), "w-1").unwrap().verifying_key(), want);
+        assert_ne!(tee_from(&hex::encode(master), "w-2").unwrap().verifying_key(), want);
+        for bad in ["", "zz", &hex::encode([0x4du8; 31])] {
+            assert!(tee_from(bad, "w-1").is_err(), "{bad:?}");
         }
     }
 
