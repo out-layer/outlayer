@@ -15,44 +15,7 @@ and the 1Click API as it is.
 This page is the design and its reasons. Routes, byte formats and the setup
 are in the reference: [ON_CHAIN_CUSTODY.md](ON_CHAIN_CUSTODY.md).
 
-```mermaid
-flowchart LR
-  subgraph OWN["Owner's side"]
-    O["Owner account<br/>full-access key"]
-    AG["Agent<br/>key A, Ed25519<br/>checks the request, signs last"]
-  end
-
-  subgraph OL["OutLayer"]
-    API["Coordinator / API<br/>carries requests, nonces, quotes<br/>holds no key of the wallet contract"]
-    TEE["Enclave, Intel TDX<br/>checks the owner's policy<br/>builds the request<br/>key E, derived when it signs"]
-    WA["Working account<br/>TEE custody<br/>relays, pays gas"]
-  end
-
-  subgraph CHAIN["NEAR"]
-    WC["Wallet contract 0s…<br/>NEP-616 instance of the global contract<br/>public key = A‖E<br/>no access key, no extension"]
-    INT["intents.near<br/>balance of 0s…"]
-    DAO["Keystore DAO contract<br/>approved code hashes<br/>escrow of the owner's master"]
-    MPC["NEAR MPC<br/>CKD key of the escrow"]
-  end
-
-  ONE["1Click API<br/>quote, deposit address"]
-
-  O -. "one NEP-413 signature derives A" .-> AG
-  O -->|"policy, approvals, freeze"| TEE
-  AG -->|"1 · operation, signed by A"| API
-  API <-->|"2 · prepare"| TEE
-  TEE -. "reads code hash, pair, no extension" .-> WC
-  TEE -. "reads approved builds" .-> DAO
-  API -->|"3 · request + sig_tee"| AG
-  AG -->|"4 · sig_agent"| API
-  API --> WA
-  WA ==>|"5 · w_execute_signed(msg, sig_agent‖sig_tee)"| WC
-  WC -->|"promise: mt_transfer, ft_withdraw"| INT
-  INT --- ONE
-  O -. "owner exit: start, wait the window, claim" .-> DAO
-  DAO -. "CKD for the owner account" .-> MPC
-  O ==>|"after the exit: signs both halves alone"| WC
-```
+![Agent On-chain custody: the agent with its wallet contract, and OutLayer's enclave](images/on-chain-custody.svg)
 
 ## 1. What a contract that holds an agent's funds has to do
 
