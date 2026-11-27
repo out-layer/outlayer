@@ -94,6 +94,22 @@ other wallet is refused with `400 bad_request` on every route below.
   so the owner's wallet makes the same signature over the same message, and
   the same key follows. Whoever is given that signature holds the agent's key:
   the message says so and names the one site that asks for it.
+- **The agent's key follows the owner's key that signed.** Another key of the
+  same account signs the same message differently and makes another agent
+  key, which is not in the contract. So the signing key is a full-access key
+  of the owner account: NEP-413 has a wallet sign with one, and the page
+  refuses a signature of any other before it uses it. While the agent holds
+  funds in the wallet contract that key stays on the owner account: it is how
+  the owner makes the agent's key again after an exit, and how a new machine
+  of the agent gets it (section 4). Deleted, it leaves the agent's own copy as
+  the only one.
+- **Any site can ask a wallet for that signature.** A NEP-413 request names
+  its recipient, and the wallet does not hold the recipient to the site that
+  asks; a page that asks for `outlayer-agent-key` with this message gets the
+  agent's key. The message names `app.outlayer.ai` as the one place it is
+  signed, and a wallet that shows the asking site shows where the request
+  came from. The agent's key alone moves nothing out of the wallet contract:
+  every operation also needs the enclave's half, under the owner's policy.
 - **The link between a wallet and its wallet contract is checked on chain.**
   The enclave's key comes from the wallet's id, and the contract's state holds
   that key: a wrong id derives a key that is not in the contract.
@@ -154,6 +170,17 @@ full-access key leaves only the first and the third choice. A tab closed
 between the owner's transaction and the install leaves a sub-account with the
 owner's key on it, and the one-time key of a `0s` setup with what remains of
 the 0.02 NEAR.
+
+A `0s` account keeps its state under the zero-balance limit only while few
+nonces are on record. The contract records each request's nonce in a map of
+32-nonce blocks: one block is 8 bytes, and the coordinator gives a wallet's
+requests consecutive nonces, so 32 consecutive nonces fill one block. On the first
+request after an hour the contract moves the blocks it holds to an "old" set,
+and on one after two hours it drops both, so the blocks on record are those of
+the last one to two hours. A fresh `0s` wallet contract takes 265 bytes, which
+leaves 63 blocks, about 2,000 nonces, inside that window. A wallet contract
+busier than that needs NEAR on its account for the storage; the request that
+would go over the limit fails and moves nothing.
 
 The coordinator takes the account only when its pair on chain holds this
 wallet's enclave key, and, for a `0s` address, only when the address derives
@@ -220,12 +247,14 @@ key, ends the earlier token, and discards a sealed key that was not collected.
     "message": "This signature is the key of your OutLayer agent. Sign it only on app.outlayer.ai, when you set up or recover an agent.\nOwner: alice.near\nWallet: …",
     "recipient": "outlayer-agent-key",
     "nonce_base64": "b3V0bGF5ZXIvYWdlbnQta2V5L3YxL25vbmNlAAAAAAA="
-  }
+  },
+  "current_contract": null
 }
 ```
 
-The page computes the message itself and signs only when the API's request
-equals it. A token that is unknown or expired, or that a later setup of the
+`current_contract` is the wallet contract the wallet has already,
+`{"account_id", "agent_public_key"}`, or `null`. The page computes the message
+itself and signs only when the API's request equals it. A token that is unknown or expired, or that a later setup of the
 wallet superseded, answers `404 request_not_found`; a token whose setup is
 finished answers `409 conflict`, naming the account it named.
 
@@ -274,6 +303,58 @@ The same record without the setup link:
 | `GET /wallet/v1/contract/key` | the enclave's public key of this wallet's wallet contract: `{ "tee_public_key": "<hex>" }` |
 | `PUT /wallet/v1/contract` | names the account, `{ "account_id": "…" }`; reads its pair from the chain. Naming the same account again reads the pair again; an account that is another wallet's is `409` |
 | `GET /wallet/v1/contract` | the recorded account and the agent's public key; `404 request_not_found` when the wallet has none |
+
+### A setup of a wallet that has a wallet contract
+
+A setup of a wallet that has a wallet contract installs nothing: it hands the
+same agent key over again. The page offers no choice of account unless the
+owner chooses a new contract (below). It reads the chain before it keeps
+anything, and the owner's signature decides:
+
+| The signature makes | The page |
+|---|---|
+| the agent key on record, and the account answers with the pair | seals the key to the agent, for that account; nothing is sent |
+| the agent key on record, and the account no longer answers with the pair (its contract was replaced or removed) | stops with nothing sent, and offers a new wallet contract for this key as the owner's explicit choice |
+| another agent key, whose wallet contract already runs at its `0s` address or on the owner's account | that contract is the owner's: step 2 says the agent moves to it from the one on record, whose funds stay there, and hands the key to it |
+| another agent key, with no contract | stops with nothing sent, names the key that signed and asks for a signature of the key that set the wallet up; or, as the owner's explicit choice, sets up a new wallet contract for this key. The funds of the contract on record do not follow |
+
+Until step 2 nothing is sent, and the owner can go back from a new contract to
+another signature. The new contract is the way out when the contract on record is not the
+owner's (someone else finished a setup with the link first) or the key that
+made it is gone. The page keeps nothing of an earlier signature: the chain and
+the contract on record are the measure. An account the agent named itself
+(`PUT /wallet/v1/contract`) has its key handed over by no setup; the agent
+names it again.
+
+### An agent on a new machine
+
+An agent that lost its machine has lost two secrets: its wallet API key and
+the seed of its key. Both come back without the old files:
+
+1. The agent makes a new wallet API key (`wk_` and 64 hex characters) and
+   gives the owner its SHA-256 fingerprint.
+2. The owner stores a policy that names the fingerprint among the wallet's
+   keys (`authorized_key_hashes`): on the policy page, in the list of keys, or
+   through the API with `Bearer near:` in the owner's scope. A locked policy
+   needs its approvers for that, as for any change of policy. Once the
+   coordinator has synced the policy the new key runs the same wallet.
+3. The agent opens a setup with the new key and gives the owner the link; the
+   owner signs with the key that set the wallet up, and the agent collects the
+   same agent key (the subsection above).
+4. The owner revokes the lost key: `DELETE /wallet/v1/api-key/{key_hash}` with
+   `Bearer near:`. The last key of a wallet is not revoked, so this comes after
+   step 2. It takes the lost key's fingerprint, which no route lists: until it
+   is revoked the lost key runs the wallet within the policy, and an owner who
+   cannot name it freezes the wallet if the old machine may be in other hands.
+
+The owner's `Bearer near:` signs the plain text `auth:<seed>:<timestamp>:@owner`
+with a full-access key of the owner account; it is not NEP-413, so a browser
+wallet does not make it, and a key file does (`tests/lib/owner_token.mjs`). The
+wallet's seed is the one its creation link named, or `0`, `1`, … in the order
+the owner's wallets were made; `GET /wallet/v1/contract` under each tells which
+wallet holds which contract. `GET /wallet/v1/policy` returns the policy's
+fields but its webhook URL, which a policy stored again carries only when the
+owner adds it.
 
 ### The sealed key
 
@@ -569,6 +650,14 @@ The flag changes a name. It gives the program no signature of the wallet
 contract: a move out of the wallet contract is an operation of
 [section 5](#5-an-operation).
 
+The history of runs (`/executions` on the site, `GET /public/jobs`) lists a run
+under the account that sent and paid for it: the working account for a run
+started on chain, the payment key's owner for an HTTPS call. The wallet
+contract's name is what the program saw, not a filter of the history.
+
+An HTTPS call parses the program's output as JSON unless the body says
+otherwise: a program that prints text runs with `"response_format": "Text"`.
+
 ## 10. Leaving with a wallet contract
 
 The owner's exit ([OWNER_EXIT.md](OWNER_EXIT.md)) yields the owner's master.
@@ -590,6 +679,13 @@ the near-cli command that sends it. It talks to no service and to no chain.
 The commands and the moves they build:
 [scripts/customer-recovery/README.md](../scripts/customer-recovery/README.md#a-wallet-contract-after-an-exit).
 
+- The exit is the owner account's by its name. The keystore DAO contract
+  builds the escrow's path from the account that calls it, never from an
+  argument, so no call reaches another owner's master or OutLayer's own; and
+  every exit method takes a deposit, which a function-call key cannot attach,
+  so only a full-access key of the owner account starts, cancels or claims an
+  exit. Any such key will do: the exit does not follow the key that signed the
+  setup. The agent's key does: after an exit the owner makes it with that key.
 - The registration for the exit comes before the wallet contract: on-chain
   custody is refused for a wallet without an owner, so no wallet contract is
   set up without a way out.
@@ -613,7 +709,7 @@ The commands and the moves they build:
 | A prompt injection into the agent | an operation request, which the enclave judges by the policy |
 | The owner account's key | the agent's key, by the setup's signature. With a locked policy: what the policy allows as it stands, since a change of policy and an exit both need the approvers. Without a lock the owner's key is the whole authority |
 | An access key of the wallet contract's account, where the owner kept one | everything on that account, at once: the key is above the contract, and neither the policy nor its lock applies |
-| A setup token | the right to name this wallet's wallet contract once, within 24 hours: the owner's account, a sub-account of it, or the `0s` address of a fresh wallet contract on an approved build, always with this wallet's enclave key in its pair. A holder who finishes first with a `0s` contract of their own agent key acts as the agent, within the owner's policy, until the owner finishes a new setup. The token ends when the setup is finished and says so after. The sealed agent key opens with the agent's one-time key alone |
+| A setup token | the right to name this wallet's wallet contract once, within 24 hours: the owner's account, a sub-account of it, or the `0s` address of a fresh wallet contract on an approved build, always with this wallet's enclave key in its pair. A holder who finishes first with a `0s` contract of their own agent key acts as the agent, within the owner's policy, until the owner finishes a new setup: on the page, a new wallet contract for the owner's own key (section 4). The token ends when the setup is finished and says so after. The sealed agent key opens with the agent's one-time key alone |
 | NEAR MPC | the enclave's key, through the master; not the agent's, which comes from the owner's own signature. No move out of a wallet contract |
 
 ## 12. Byte formats

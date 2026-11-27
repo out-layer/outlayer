@@ -40,7 +40,8 @@
 #       the key creates the wallet contract at its 0s address (NEP-616) by StateInit and
 #       deletes its own account; the account has no key and no balance, runs the approved
 #       build and holds the pair; the setup takes it; the spent token answers 409; a move
-#   Z   STORAGE_MOVES calls (default 0) with no deposit from that zero-balance contract:
+#   Z   STORAGE_MOVES calls (default 0) with no deposit from that zero-balance contract
+#       (then, with STORAGE_REST seconds, a rest and one more call):
 #       its storage against the zero-balance limit of 770 bytes
 #   X   the owner's exit: after the claim the agent's operations are refused; the owner,
 #       with the recovery tool and no OutLayer service, moves funds out of the wallet contract
@@ -586,7 +587,8 @@ fi
 log "S5 a new account with no key: the 0s wallet contract (NEP-616)"
 if new_wallet 2; then
   WID2=$WID WK2=$WK WACC2=$WACC
-  fund_account "$WACC2" 1 || fail "S5 the working account could not be funded"
+  # 1 NEAR, and 1 more per 1000 storage calls: each relay spends about 0.0004
+  fund_account "$WACC2" $(( 1 + ${STORAGE_MOVES:-0} / 1000 )) || fail "S5 the working account could not be funded"
   api_wk "$WK2" GET /wallet/v1/contract/key >/dev/null; TEE2=$(jq -r '.tee_public_key // ""' <<<"$BODY")
   RPUB2=$(node "$AGENT_JS" x25519-new "$WORK/s5.x")
   api_wk "$WK2" POST /wallet/v1/contract/setup "$(jq -nc --arg r "$RPUB2" '{recipient_public_key:$r}')" >/dev/null
@@ -654,12 +656,26 @@ if new_wallet 2; then
         if [[ "$HTTP" == 200 ]] && settle "z$i-$TS" && [[ "$STATUS" == success ]]; then ZOK=$((ZOK + 1))
         else ZFAIL="call $i: $HTTP status=$STATUS $(why)"; break; fi
       else ZFAIL="call $i asked: $HTTP $(why)"; break; fi
-      (( i % 25 == 0 )) && note "Z  after $i calls: $(view_account "$ACC0S" | jq -r .result.storage_usage) bytes"
+      (( i % 25 == 0 )) && note "Z  $(date -u +%T) after $i calls: $(view_account "$ACC0S" | jq -r .result.storage_usage) bytes, last nonce $(jq -r .nonce "$WORK/z.msg")"
     done
     if (( ${STORAGE_MOVES:-0} > 0 )); then
       Z1=$(view_account "$ACC0S" | jq -r .result.storage_usage)
       if [[ -z "$ZFAIL" ]]; then pass "Z  $ZOK calls from a zero-balance 0s contract: storage $Z0 → $Z1 bytes (zero-balance limit 770)"
       else finding "Z  after $ZOK calls the next one failed at $Z1 bytes (from $Z0): $ZFAIL"; fi
+      # STORAGE_REST seconds with no call, then one: past two timeouts the contract drops
+      # every nonce it keeps on that call
+      if (( ${STORAGE_REST:-0} > 0 )); then
+        note "Z  $(date -u +%T) resting ${STORAGE_REST}s"
+        sleep "$STORAGE_REST"
+        ask "zr-$TS" "$CALL0"
+        if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+          keep_prepared z
+          relay_with "zr-$TS" "$(node "$AGENT_JS" half "$WORK/z.msg")"
+          if [[ "$HTTP" == 200 ]] && settle "zr-$TS" && [[ "$STATUS" == success ]]; then
+            pass "Z  after the rest the call executes: storage $(view_account "$ACC0S" | jq -r .result.storage_usage) bytes (was $Z1)"
+          else finding "Z  after the rest the call failed: $HTTP status=$STATUS $(why)"; fi
+        else finding "Z  after the rest the call was not prepared: $HTTP $(why)"; fi
+      fi
     fi
 
     log "S5 a move out of the 0s contract"
