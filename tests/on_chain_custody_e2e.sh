@@ -148,11 +148,11 @@ op_state() { agent GET "$OPS/$1"; }
 keep_prepared() { # keep_prepared <name>
   jq -c '.message' <<<"$BODY" > "$WORK/$1.msg"; jq -r '.tee_half' <<<"$BODY" > "$WORK/$1.tee"
 }
-# check_prepared <name> <op-json> [account] — the agent's own checks before it signs: the
-# request is this wallet contract's (the agent's account unless named), is the operation
-# asked for, and carries a valid TEE half.
+# check_prepared <name> <op-json> [account] [tee-key] — the agent's own checks before it
+# signs: the request is this wallet contract's (the agent's account and wallet 0's TEE key
+# unless named), is the operation asked for, and carries a valid TEE half.
 check_prepared() {
-  local name=$1 op=$2 signer=${3:-$ACCOUNT_OF_AGENT} msg; msg=$(cat "$WORK/$name.msg")
+  local name=$1 op=$2 signer=${3:-$ACCOUNT_OF_AGENT} tee=${4:-$TEE_PUB} msg; msg=$(cat "$WORK/$name.msg")
   local kind; kind=$(jq -r .kind <<<"$op")
   local want
   case "$kind" in
@@ -161,7 +161,7 @@ check_prepared() {
     *) return 1 ;;
   esac
   [[ "$(jq -r .chain_id <<<"$msg")" == testnet ]] || return 1
-  node "$AGENT_JS" verify-tee "$WORK/$name.msg" "$(cat "$WORK/$name.tee")" "$TEE_PUB"
+  node "$AGENT_JS" verify-tee "$WORK/$name.msg" "$(cat "$WORK/$name.tee")" "$tee"
 }
 relay_with() { agent POST "$OPS/$1/relay" "$(jq -nc --arg h "$2" '{agent_half:$h}')"; }
 # settle <id> — poll the operation until the chain answered; STATUS is where it ended.
@@ -687,7 +687,7 @@ if new_wallet 2; then
     ask "s5m-$TS" "$TRANSFER_SMALL"
     if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
       keep_prepared s5m
-      check_prepared s5m "$TRANSFER_SMALL" "$ACC0S" && pass "S5 the move is prepared, and is the transfer asked for" || fail "S5 the prepared request differs"
+      check_prepared s5m "$TRANSFER_SMALL" "$ACC0S" "$TEE2" && pass "S5 the move is prepared, and is the transfer asked for" || fail "S5 the prepared request differs"
       relay_with "s5m-$TS" "$(node "$AGENT_JS" half "$WORK/s5m.msg")"
       [[ "$HTTP" == 200 ]] && settle "s5m-$TS" && [[ "$STATUS" == success ]] && pass "S5 a move out of the 0s contract executed" \
         || fail "S5 the move: $HTTP status=$STATUS $(why)"
