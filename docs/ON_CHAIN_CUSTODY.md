@@ -96,8 +96,17 @@ other wallet is refused with `400 bad_request` on every route below.
 - **A signature of one role is never valid for the other.** Each half is made
   under its own prefix, and a signature the agent makes over an HTTPS request
   is in a third byte format. A pair with equal keys is refused by the contract.
+- **The enclave signs one shape of request, and never one it is given.** It
+  builds every request itself from the operation the agent signed: one
+  promise to another account, with one function call or one transfer. No
+  route asks for the wallet contract's own operations (adding or removing an
+  extension, switching signatures off), for a second promise, or for a
+  request to sign as it is; such a body is refused as not an operation. This
+  is the guarantee the rest stands on: an extension added under the two
+  signatures could move everything the contract holds with neither.
 - **A wallet contract has no extension.** An extension has full control of a
-  wallet contract, so the enclave signs for no wallet contract that has one.
+  wallet contract, so the enclave signs for no wallet contract that has one:
+  the second line behind the one above.
 - **A build the DAO approved, by its code hash.** The account uses a global
   contract by its code hash, so the installing transaction carries no code.
   The enclave reads the account's code hash before every signature and signs

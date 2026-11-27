@@ -101,6 +101,14 @@ async fn owner_scope(
 
 /// The TEE's key of the wallet contract of `wallet_id`, in the owner scope
 /// `customer` that [`owner_scope`] loaded.
+///
+/// This key signs one thing: the TEE's half in `prepare_handler`, over a
+/// request built there from the operation the agent signed. No other route
+/// derives it, and nothing a caller sends is signed with it as it came
+/// (`custody_tests::the_tee_key_signs_in_prepare_only`). A second use of it, a
+/// message to sign passed in, or a request of another shape is what would let
+/// someone add an extension to the wallet contract and move its funds past
+/// both signatures.
 async fn tee_key(
     state: &AppState,
     customer: &Customer,
@@ -405,6 +413,10 @@ async fn prepare_handler(
         },
     )
     .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))?;
+    // The one signature of the TEE's key: over `message`, which `build` made
+    // from a move above and which can only be one promise to another account
+    // with one function call or transfer (custody-core `message`). The
+    // request a caller would like signed is never taken in its place.
     let tee_half = sign_half(Role::Tee, &tee, &message);
 
     Ok(Json(PrepareResponse {

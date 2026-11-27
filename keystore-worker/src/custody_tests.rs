@@ -459,9 +459,39 @@ mod at_the_door {
                 "to the OutLayer contract",
             ),
             (r#"{"id":"x","op":{"kind":"transfer","to":"bob.testnet","amount":"1"},"extra":1}"#, "not an operation"),
+            // the wallet contract's own operations: an extension, the signature mode
+            (r#"{"id":"x","op":{"kind":"add_extension","account_id":"bob.testnet"}}"#, "not an operation"),
+            (r#"{"id":"x","op":{"kind":"remove_extension","account_id":"bob.testnet"}}"#, "not an operation"),
+            (r#"{"id":"x","op":{"kind":"set_signature_mode","enable":false}}"#, "not an operation"),
+            (r#"{"id":"x","op":{"internal":[{"op":"add_extension","account_id":"bob.testnet"}]}}"#, "not an operation"),
         ] {
             let reason = refusal(prepare(&stand, prepare_request(&stand.agent, body, now())).await);
             assert!(reason.contains(why), "{why}: {reason}");
+        }
+    }
+
+    /// `prepare` takes an operation, never a request to sign: a body that
+    /// carries a request, a proof or a half of its own is not a `prepare`
+    /// request at all.
+    #[test]
+    fn prepare_takes_no_request_from_its_caller() {
+        let stand_free = |extra: serde_json::Value| {
+            let mut req = json!({
+                "wallet_id": WALLET, "wallet_contract": CONTRACT, "nonce": 3,
+                "agent_request": { "method": OPERATION_METHOD, "path": OPERATION_PATH, "body": TRANSFER,
+                    "timestamp": 1, "nonce": hex::encode([7u8; 16]), "signature": hex::encode([0u8; 64]) },
+            });
+            req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<PrepareRequest>(req)
+        };
+        assert!(stand_free(json!({})).is_ok());
+        for extra in [
+            json!({ "message": { "chain_id": "testnet" } }),
+            json!({ "message_hash": "00" }),
+            json!({ "proof": "00" }),
+            json!({ "tee_half": "00" }),
+        ] {
+            assert!(stand_free(extra.clone()).is_err(), "{extra}");
         }
     }
 
