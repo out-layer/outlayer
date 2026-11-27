@@ -3515,17 +3515,46 @@ async fn handle_execute_job(
                 let call_id_str = call_id.ok_or_else(|| anyhow::anyhow!("HTTPS call missing call_id"))?;
                 info!("📤 HTTPS call: submitting result to coordinator (call_id={})", call_id_str);
 
-                // Convert ExecutionOutput to serde_json::Value
-                let output_json = execution_result.output.as_ref().map(|out| match out {
-                    api_client::ExecutionOutput::Bytes(bytes) => {
-                        use base64::{engine::general_purpose::STANDARD, Engine};
-                        serde_json::Value::String(STANDARD.encode(bytes))
+                let output_json = match https_output(execution_result.output.as_ref()) {
+                    Ok(output) => output,
+                    Err(too_large) => {
+                        // The caller is told why; an answer the coordinator refuses
+                        // would leave the call waiting for the stale sweep instead.
+                        if let Err(e) = api_client
+                            .complete_https_call(
+                                call_id_str,
+                                false,
+                                None,
+                                Some(too_large.clone()),
+                                execution_result.instructions,
+                                execution_result.execution_time_ms,
+                                Some(job.job_id),
+                            )
+                            .await
+                        {
+                            error!("❌ Failed to report an oversized HTTPS output: {}", e);
+                        }
+                        if let Err(e) = api_client
+                            .complete_job(
+                                job.job_id,
+                                false,
+                                None,
+                                Some(too_large),
+                                execution_result.execution_time_ms,
+                                execution_result.instructions,
+                                None,
+                                None,
+                                if compile_cost > 0 { Some(compile_cost.to_string()) } else { None },
+                                Some(api_client::JobStatus::ExecutionFailed),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!("⚠️ Failed to report execute job completion: {}", e);
+                        }
+                        return Ok(());
                     }
-                    api_client::ExecutionOutput::Text(text) => {
-                        serde_json::Value::String(text.clone())
-                    }
-                    api_client::ExecutionOutput::Json(json) => json.clone(),
-                });
+                };
 
                 match api_client.complete_https_call(
                     call_id_str,
@@ -3539,12 +3568,13 @@ async fn handle_execute_job(
                     Ok(()) => {
                         info!("✅ HTTPS call result submitted to coordinator successfully");
 
-                        // Report success to coordinator job tracking
+                        // Report success to coordinator job tracking. The output went
+                        // with the call above; the job's record does not carry it.
                         if let Err(e) = api_client
                             .complete_job(
                                 job.job_id,
                                 true,
-                                execution_result.output.clone(),
+                                None,
                                 None,
                                 execution_result.execution_time_ms,
                                 execution_result.instructions,
@@ -6286,5 +6316,61 @@ mod guest_text_for_log_tests {
         let line = super::guest_text_for_log("panicked: apikey=SECRET");
         assert!(line.starts_with("23 bytes, sha256 "), "{line}");
         assert!(!line.contains("SECRET"));
+    }
+}
+
+/// The most an HTTPS call's `output` may take once encoded: the coordinator takes
+/// a worker's answer up to 10 MiB, and the rest of the answer fits in what is left.
+const HTTPS_OUTPUT_MAX_BYTES: usize = 9 * 1024 * 1024;
+
+/// A run's output as the HTTPS answer carries it: JSON as it is, text as a
+/// string, bytes as a base64 string. An output larger than an HTTPS answer
+/// takes is the run's failure, named with its size.
+fn https_output(output: Option<&api_client::ExecutionOutput>) -> Result<Option<serde_json::Value>, String> {
+    let Some(output) = output else { return Ok(None) };
+    let value = match output {
+        api_client::ExecutionOutput::Bytes(bytes) => {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            serde_json::Value::String(STANDARD.encode(bytes))
+        }
+        api_client::ExecutionOutput::Text(text) => serde_json::Value::String(text.clone()),
+        api_client::ExecutionOutput::Json(json) => json.clone(),
+    };
+    let encoded = value.to_string().len();
+    if encoded > HTTPS_OUTPUT_MAX_BYTES {
+        return Err(format!(
+            "The program's output is {encoded} bytes once encoded for the HTTPS answer, above the {HTTPS_OUTPUT_MAX_BYTES} an HTTPS call returns. Return less, or store the result and return a reference to it."
+        ));
+    }
+    Ok(Some(value))
+}
+
+#[cfg(test)]
+mod https_output_tests {
+    use super::*;
+    use api_client::ExecutionOutput;
+
+    #[test]
+    fn each_format_is_carried_as_the_call_answers_it() {
+        assert_eq!(https_output(None).unwrap(), None);
+        assert_eq!(https_output(Some(&ExecutionOutput::Text("hi".into()))).unwrap(), Some(serde_json::json!("hi")));
+        assert_eq!(https_output(Some(&ExecutionOutput::Bytes(vec![0, 1, 2]))).unwrap(), Some(serde_json::json!("AAEC")));
+        assert_eq!(
+            https_output(Some(&ExecutionOutput::Json(serde_json::json!({"a": 1})))).unwrap(),
+            Some(serde_json::json!({"a": 1}))
+        );
+    }
+
+    /// Bytes grow by a third in base64, so a stdout under the run's own cap can
+    /// still be too large for the answer: that is the run's failure, with its size.
+    #[test]
+    fn an_output_too_large_for_the_answer_is_a_failure_that_says_so() {
+        let fits = vec![7u8; HTTPS_OUTPUT_MAX_BYTES / 4 * 3 - 3];
+        assert!(https_output(Some(&ExecutionOutput::Bytes(fits))).is_ok());
+        let too_large = vec![7u8; HTTPS_OUTPUT_MAX_BYTES / 4 * 3 + 3];
+        let why = https_output(Some(&ExecutionOutput::Bytes(too_large))).unwrap_err();
+        assert!(why.contains("bytes once encoded") && why.contains(&HTTPS_OUTPUT_MAX_BYTES.to_string()), "{why}");
+        let text = "\u{1}".repeat(HTTPS_OUTPUT_MAX_BYTES / 6 + 1);
+        assert!(https_output(Some(&ExecutionOutput::Text(text))).is_err(), "a text escaped past the limit");
     }
 }
