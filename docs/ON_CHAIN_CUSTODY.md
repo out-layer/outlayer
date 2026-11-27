@@ -197,11 +197,17 @@ deleted.
 ```
 
 The token is valid for 24 hours and ends when the setup is finished. Whoever
-holds it can name this wallet's wallet contract once, and only as the owner
-account or a sub-account of it; the account is taken only when its pair on
-chain holds this wallet's enclave key. A wallet has one setup: opening
-again issues another token for another one-time key, ends the earlier token,
-and discards a sealed key that was not collected.
+holds it can name this wallet's wallet contract once: the owner's account, a
+sub-account of it, or the `0s` address of a fresh wallet contract on a build
+the keystore DAO approved; in every case the account is taken only when its
+pair on chain holds this wallet's enclave key. A `0s` contract can be made by
+anyone with any agent key beside the wallet's public enclave key, so a holder
+of the token who finishes first can name one with an agent key of their own
+and act as the agent, within the owner's policy, until the owner finishes a
+new setup, which replaces it. The link carries the token in its fragment,
+which the browser sends to no server, and a spent token says it was spent. A
+wallet has one setup: opening again issues another token for another one-time
+key, ends the earlier token, and discards a sealed key that was not collected.
 
 `GET /wallet/v1/contract/setup/owner` — the token is the only credential, sent as
 `Authorization: Bearer <token>` and never in a URL of the API.
@@ -607,7 +613,7 @@ The commands and the moves they build:
 | A prompt injection into the agent | an operation request, which the enclave judges by the policy |
 | The owner account's key | the agent's key, by the setup's signature. With a locked policy: what the policy allows as it stands, since a change of policy and an exit both need the approvers. Without a lock the owner's key is the whole authority |
 | An access key of the wallet contract's account, where the owner kept one | everything on that account, at once: the key is above the contract, and neither the policy nor its lock applies |
-| A setup token | the right to name this wallet's wallet contract once, within 24 hours, and only as the owner account or a sub-account of it, which nobody but the owner can make; the account is taken only when its pair holds this wallet's enclave key. The token ends when the setup is finished. The sealed agent key opens with the agent's one-time key alone |
+| A setup token | the right to name this wallet's wallet contract once, within 24 hours: the owner's account, a sub-account of it, or the `0s` address of a fresh wallet contract on an approved build, always with this wallet's enclave key in its pair. A holder who finishes first with a `0s` contract of their own agent key acts as the agent, within the owner's policy, until the owner finishes a new setup. The token ends when the setup is finished and says so after. The sealed agent key opens with the agent's one-time key alone |
 | NEAR MPC | the enclave's key, through the master; not the agent's, which comes from the owner's own signature. No move out of a wallet contract |
 
 ## 12. Byte formats
