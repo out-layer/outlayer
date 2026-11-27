@@ -1,0 +1,54 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='1400' height='756' viewBox='0 0 1400 756'>
+<defs><marker id='ae' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='8' markerHeight='8' orient='auto'><path d='M0,0 L10,5 L0,10 z' fill='#374151'/></marker><marker id='ad' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='8' markerHeight='8' orient='auto'><path d='M0,0 L10,5 L0,10 z' fill='#2563eb'/></marker><marker id='ag' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='8' markerHeight='8' orient='auto'><path d='M0,0 L10,5 L0,10 z' fill='#16a34a'/></marker></defs>
+<rect x='0' y='0' width='1400' height='756' fill='#ffffff'/>
+<text x='700.0' y='34' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='18' font-weight='bold' fill='#111'>One operation: the enclave signs what the policy allows, the agent signs last</text>
+<line x1='130' y1='92' x2='130' y2='682' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='400' y1='92' x2='400' y2='682' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='700' y1='92' x2='700' y2='682' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='1010' y1='92' x2='1010' y2='682' stroke='#cbd5e1' stroke-width='1.5'/>
+<line x1='1270' y1='92' x2='1270' y2='682' stroke='#cbd5e1' stroke-width='1.5'/>
+<rect x='55.0' y='48' width='150' height='44' rx='6' fill='#dbeafe' stroke='#2563eb' stroke-width='1.5'/>
+<text x='130' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Agent, key A</text>
+<rect x='325.0' y='48' width='150' height='44' rx='6' fill='#f3f4f6' stroke='#6b7280' stroke-width='1.5'/>
+<text x='400' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>OutLayer API</text>
+<rect x='586.0' y='48' width='228' height='44' rx='6' fill='#dcfce7' stroke='#16a34a' stroke-width='1.5'/>
+<text x='700' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Enclave: policy, key E</text>
+<rect x='927.5' y='48' width='165' height='44' rx='6' fill='#fef3c7' stroke='#d97706' stroke-width='1.5'/>
+<text x='1010' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Wallet contract</text>
+<rect x='1195.0' y='48' width='150' height='44' rx='6' fill='#fef3c7' stroke='#d97706' stroke-width='1.5'/>
+<text x='1270' y='75' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>intents.near</text>
+<rect x='55.0' y='682' width='150' height='44' rx='6' fill='#dbeafe' stroke='#2563eb' stroke-width='1.5'/>
+<text x='130' y='709' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Agent, key A</text>
+<rect x='325.0' y='682' width='150' height='44' rx='6' fill='#f3f4f6' stroke='#6b7280' stroke-width='1.5'/>
+<text x='400' y='709' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>OutLayer API</text>
+<rect x='586.0' y='682' width='228' height='44' rx='6' fill='#dcfce7' stroke='#16a34a' stroke-width='1.5'/>
+<text x='700' y='709' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Enclave: policy, key E</text>
+<rect x='927.5' y='682' width='165' height='44' rx='6' fill='#fef3c7' stroke='#d97706' stroke-width='1.5'/>
+<text x='1010' y='709' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Wallet contract</text>
+<rect x='1195.0' y='682' width='150' height='44' rx='6' fill='#fef3c7' stroke='#d97706' stroke-width='1.5'/>
+<text x='1270' y='709' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>intents.near</text>
+<line x1='130' y1='126' x2='400' y2='126' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='265.0' y='118' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>an operation, signed by A</text>
+<line x1='400' y1='172' x2='700' y2='172' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='550.0' y='164' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>prepare</text>
+<line x1='700' y1='218' x2='1010' y2='218' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='855.0' y='210' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>read: an approved build, the pair, no extension</text>
+<path d='M 700,258 h 40 v 18 h -36' fill='none' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='750' y='271' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>the owner&#x27;s policy: limits, allowlists, approvals</text>
+<path d='M 700,304 h 40 v 18 h -36' fill='none' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='750' y='317' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>build the request, sign it with E</text>
+<line x1='700' y1='356' x2='400' y2='356' stroke='#16a34a' stroke-width='2.2' marker-end='url(#ag)' stroke-dasharray='6,4'/>
+<text x='550.0' y='348' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>the request and the signature of E</text>
+<line x1='400' y1='402' x2='130' y2='402' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)' stroke-dasharray='6,4'/>
+<text x='265.0' y='394' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>the request and the signature of E</text>
+<path d='M 130,442 h 40 v 18 h -36' fill='none' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='180' y='455' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>is it the operation asked for? then sign, last</text>
+<line x1='130' y1='494' x2='400' y2='494' stroke='#2563eb' stroke-width='2.2' marker-end='url(#ad)'/>
+<text x='265.0' y='486' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>the signature of A</text>
+<line x1='400' y1='540' x2='1010' y2='540' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='705.0' y='532' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>w_execute_signed(request, both signatures), sent by the working account</text>
+<path d='M 1010,580 h 40 v 18 h -36' fill='none' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='1060' y='593' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>both signatures, the nonce</text>
+<line x1='1010' y1='632' x2='1270' y2='632' stroke='#374151' stroke-width='1.5' marker-end='url(#ae)'/>
+<text x='1140.0' y='624' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='13' font-weight='normal' fill='#1f2937'>one promise</text>
+</svg>

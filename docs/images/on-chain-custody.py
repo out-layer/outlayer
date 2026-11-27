@@ -65,13 +65,15 @@ box(390, 20, 420, 70, "owner", ["Owner: a NEAR account", "sets the policy, appro
 zone(40, 125, 520, 350, "#eff6ff", "#2563eb", "The agent: its key and its wallet contract", "start")
 zone(640, 125, 520, 350, "#f0fdf4", "#16a34a", "OutLayer: an Intel TDX enclave", "end")
 
-box(90, 165, 420, 90, "door", ["Agent", "key A, made from one signature of the owner", "checks the request and signs last"])
-box(690, 165, 420, 90, "enclave", ["Keystore", "key E, derived only when it signs", "signs only what the owner's policy allows"])
+box(90, 165, 420, 110, "door", ["Agent", "key A, made from one signature of the owner", "checks the request and signs last"])
+box(90, 355, 420, 100, "chain", ["Wallet contract on NEAR", "the NEAR Intents wallet contract, holds the funds",
+                                  "a keyless 0s… account (NEP-616) by default",
+                                  "key = A ‖ E: executes only with both signatures"])
 
-box(90, 355, 420, 100, "chain", ["Wallet contract 0s… on NEAR", "the NEAR Intents wallet contract, NEP-616 account",
-                                  "public key = A ‖ E, no access key", "holds the funds; executes only with both signatures"])
-box(690, 355, 420, 100, "enclave", ["Working account (TEE custody)", "relays the request and pays the gas",
-                                     "connectors, venues, other chains"])
+box(690, 165, 420, 74, "enclave", ["The owner's policy", "limits, allowlists, approvals by M of N,", "freeze, lock"])
+box(690, 250, 420, 70, "enclave", ["The second signature: key E", "made only for an operation the policy allows"])
+box(690, 355, 205, 100, "enclave", ["Working account", "TEE custody:", "other chains, venues,", "relays, pays gas"])
+box(905, 355, 205, 100, "enclave", ["Connectors, secrets", "web2: banks, mail,", "exchanges; their keys", "stay in the enclave"])
 
 # ── the owner's two acts ────────────────────────────────────────────────────
 arrow("M 450,90 L 450,165", "#7c3aed")
@@ -82,13 +84,13 @@ label(750, 108, ["policy, approvals, freeze"], "#7c3aed")
 # ── the two signatures meet at the wallet contract ──────────────────────────
 arrow("M 510,195 L 690,195")
 label(600, 180, ["operation"])
-arrow("M 690,228 L 510,228")
-label(600, 243, ["request to check"])
+arrow("M 690,265 L 510,265")
+label(600, 250, ["request to check"])
 
-arrow("M 220,255 L 220,355", "#2563eb", width=2.6)
-label(220, 305, ["signature of A"], "#2563eb", 13)
-arrow("M 800,255 L 800,305 L 380,305 L 380,355", "#16a34a", width=2.6)
-label(600, 305, ["signature of E"], "#16a34a", 13)
+arrow("M 220,275 L 220,355", "#2563eb", width=2.6)
+label(220, 316, ["signature of A"], "#2563eb", 13)
+arrow("M 800,320 L 800,338 L 380,338 L 380,355", "#16a34a", width=2.6)
+label(600, 338, ["signature of E"], "#16a34a", 13)
 
 arrow("M 690,420 L 510,420")
 label(600, 420, ["w_execute_signed"])
@@ -97,7 +99,7 @@ label(600, 420, ["w_execute_signed"])
 zone(40, 510, 1120, 130, "#fffbeb", "#fcd34d", "NEAR")
 box(90, 548, 420, 74, "chain", ["intents.near and the 1Click API", "the balance, swaps, withdrawals to other chains"])
 box(690, 548, 200, 74, "chain", ["NEAR MPC", "reaches key E", "and never key A"])
-box(910, 548, 200, 74, "chain", ["Keystore DAO", "approves builds by hash,", "holds the exit's escrow"])
+box(910, 548, 200, 74, "chain", ["OutLayer DAO", "approves builds by hash,", "holds the exit's escrow"])
 arrow("M 300,455 L 300,548")
 label(300, 492, ["one promise"])
 arrow("M 810,40 L 1185,40 L 1185,585 L 1110,585", "#7c3aed")

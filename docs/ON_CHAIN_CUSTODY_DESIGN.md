@@ -27,7 +27,7 @@ account that holds its money has to meet five requirements at once:
 | 1 | The chain itself refuses a move that two independent parties did not sign | [section 2](#2-the-wallet-contract-used-as-designed) |
 | 2 | The party that checks the policy moves nothing alone | [section 3](#3-two-keys-and-where-each-comes-from) |
 | 3 | The network that derives keys moves nothing alone | [section 3](#3-two-keys-and-where-each-comes-from) |
-| 4 | The owner acts alone when the provider is gone | [section 6](#6-leaving-without-outlayer) |
+| 4 | The owner acts alone when the provider is gone | [section 7](#7-leaving-without-outlayer) |
 | 5 | No new stateful code sits under the funds | [section 2](#2-the-wallet-contract-used-as-designed) |
 
 ## 2. The wallet contract, used as designed
@@ -52,14 +52,19 @@ at its word:
 - **A public key that cannot be changed.** The wallet contract fixes its
   public key at the first initialization. With the pair as that key, "both
   must sign" is a permanent rule of the account, not a setting.
-- **A deterministic account (NEP-616).** The address is `0s…`, derived from
-  the `StateInit`: the code hash of the build and the first state with the
-  pair. It commits to both, so the address alone says which code runs and
-  whose keys it answers to. One `DeterministicStateInit` action creates it,
-  and anyone can send that action: no factory, no deploy by the owner, and no
-  access key on the account at any moment of its life.
-- **A zero-balance account.** A fresh wallet contract takes 265 bytes of the
-  770 the protocol stores for free, so the account needs no NEAR to exist.
+- **A deterministic account (NEP-616), by default.** The address is `0s…`,
+  derived from the `StateInit`: the code hash of the build and the first state
+  with the pair. It commits to both, so the address alone says which code runs
+  and whose keys it answers to. One `DeterministicStateInit` action creates
+  it, and anyone can send that action: no factory, no deploy by the owner, and
+  no access key on the account at any moment of its life.
+- **A zero-balance account.** A fresh `0s…` wallet contract takes 265 bytes of
+  the 770 the protocol stores for free, so the account needs no NEAR to exist.
+- **Or an account with a name.** The same contract and the same pair install
+  on a named account when the owner wants one: a sub-account of the owner's,
+  left with no access key, or the owner's own account, for an owner who wants
+  the agent to act under that name. The choice is the owner's, at setup; the
+  two signatures are the same in each.
 - **Nonces as the contract recommends.** The contract keeps "double-timeout
   window" nonces in a bitmap and recommends that a single signer generate
   them incrementally. The coordinator gives a wallet's requests consecutive
@@ -73,8 +78,9 @@ at its word:
   says an extension controls the instance. The enclave therefore never signs
   the addition of an extension, and signs for no wallet contract that has one.
 - **A global contract by its code hash.** The account names its code by hash,
-  so the installing transaction carries no code and the account cannot be
-  moved to other code. The keystore DAO approves builds by that hash, and the
+  so the installing transaction carries no code, and a keyless account stays
+  on that code for good. The OutLayer DAO (`dao.outlayer.near`) approves
+  builds by that hash, and the
   enclave reads the account's hash from the chain before every signature.
 
 On chain, the new code under the funds is the signing standard. There is no
@@ -108,28 +114,7 @@ What each party can do alone:
 
 ## 4. One operation
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as Agent, key A
-    participant C as Coordinator / API
-    participant E as Enclave, Intel TDX, key E
-    participant W as Wallet contract 0s…
-    participant R as Receiver, e.g. intents.near
-
-    A->>C: operation with id, signed by A
-    C->>E: prepare
-    E->>W: read code hash, w_public_key, extensions
-    Note over E: approved build, pair holds E, no extension<br/>owner's policy: limits, allowlists, approvals, freeze
-    E-->>C: RequestMessage + sig_tee
-    C-->>A: RequestMessage + sig_tee
-    Note over A: is the request the operation asked for?<br/>then sign, last
-    A->>C: sig_agent
-    C->>E: relay
-    E->>W: w_execute_signed(msg, proof = sig_agent‖sig_tee), sent by the working account
-    Note over W: chain_id, signer_id, nonce, both signatures
-    W->>R: one promise, FunctionCall or Transfer
-```
+![One operation: the enclave signs what the policy allows, the agent signs last](images/on-chain-custody-operation.svg)
 
 Three rules make this more than "two signatures":
 
@@ -148,12 +133,27 @@ Three rules make this more than "two signatures":
   with what it asked for before it signs. A refused or a waiting operation
   leaves no half of a move anywhere.
 
-The owner's policy is what the enclave holds every operation to: limits per
-transaction and per period, allowlists of receivers and of operation kinds, approvals by
-M of N approvers above a threshold, a freeze, and a lock that puts a change of
-the policy itself, and an exit, under the same approvers.
+## 5. The owner's policy
 
-## 5. What a compromise reaches
+The policy is the owner's, stored on NEAR by the owner account and changed by
+no one else. The enclave reads it from the chain and holds every operation to
+it before the second signature exists:
+
+| Rule | What the owner sets |
+|---|---|
+| What the agent may do at all | the kinds of operation: transfer, contract call, swap, withdrawal to another chain |
+| Limits | per transaction and per hour, day and month, per token |
+| Addresses | an allowlist or a blocklist of receivers |
+| Approvals | M of N approvers sign the exact operation in their own wallets; an amount per period goes out without them, and a payment to an address off the allowlist can wait for them instead of being refused |
+| Lock | a change of the policy, and an exit, need the same approvers |
+| Freeze | one transaction from the owner straight to the contract stops the wallet |
+
+One policy covers the wallet contract and the working account together, with
+one set of limits, so the owner writes the rules once. An agent can ask for
+anything; what is outside the policy is never signed, however the request is
+worded.
+
+## 6. What a compromise reaches
 
 | What is compromised | What it reaches in the wallet contract |
 |---|---|
@@ -169,12 +169,12 @@ For funds to move against the owner's policy, the enclave and the agent's own
 key have to fail together. No single system on the list is enough, the network
 that derives keys included.
 
-## 6. Leaving without OutLayer
+## 7. Leaving without OutLayer
 
 The owner leaves alone, holding both keys of every wallet contract they own
 ([OWNER_EXIT.md](OWNER_EXIT.md)).
 
-The owner's master is escrowed in the keystore DAO contract, sealed under a
+The owner's master is escrowed in the OutLayer DAO's contract (`dao.outlayer.near`), sealed under a
 key only NEAR MPC can produce for that owner. The contract builds the key's
 path from the account that calls it, so the exit belongs to the owner account
 by its name. The owner starts an exit, waits the window they chose, and claims
@@ -186,7 +186,7 @@ enough.
 After the exit the owner is the only holder of both keys, and the wallet
 contract is an ordinary Intents wallet of theirs.
 
-## 7. Questions for any design that holds an agent's funds
+## 8. Questions for any design that holds an agent's funds
 
 | Question | Agent On-chain custody |
 |---|---|
@@ -198,7 +198,7 @@ contract is an ordinary Intents wallet of theirs.
 | What new contract code sits under the funds? | one signing standard, with no state and no clock |
 | What does the agent reach beyond the chain? | every OutLayer connector and secret, under the same owner's policy and approvals |
 
-## 8. NEAR Intents and other chains
+## 9. NEAR Intents and other chains
 
 The wallet contract holds its balance in `intents.near` like any Intents
 account. A swap or a withdrawal to another chain goes through the 1Click API
@@ -212,23 +212,29 @@ The signing standard also implements the off-chain side of the contract
 authorizes an off-chain message under the same two signatures, with nothing
 to add on the wallet's side.
 
-## 9. Two modes that compose
+## 10. What the agent keeps: every other part of OutLayer
 
-OutLayer has two modes of custody, and an agent uses both.
+The wallet contract holds the agent's main balance. Everything else an agent
+does with OutLayer stays as it is, under the same owner and the same policy:
 
-**TEE custody** is the agent's working account: its keys live in the enclave,
-under the same owner's policy. It signs on NEAR, in NEAR Intents, on EVM
-chains and Solana, holds a confidential balance, trades on venues, and needs
-neither a key on the agent's side nor a transaction per move. It is the right
-tool for a balance that works all day.
+- **TEE custody, the working account.** Its keys live in the enclave. It signs
+  on NEAR, in NEAR Intents, on EVM chains and Solana, holds a confidential
+  balance, and needs neither a key on the agent's side nor a transaction per
+  move. It is the right tool for a balance that works all day, and it is what
+  relays the wallet contract's requests.
+- **Connectors to web2 and venues.** A bank account, a mailbox, a GitHub
+  organisation, a trading venue: the credential is a secret that opens only
+  inside the enclave, the connector's own rules and the owner's approvals
+  apply, and the agent never receives the key.
+- **Programs.** Any WASI program runs in the enclave next to the keys. Run
+  with `use_bound_identity`, it acts under the wallet contract's name, so an
+  agent has one identity for its funds and for everything it does with them.
+- **The owner's inbox.** What the agent may not do alone it prepares, and the
+  owner approves the exact action with one wallet signature.
 
-**Agent On-chain custody** is the agent's main balance: the wallet contract,
-where the chain requires two signatures.
-
-The agent moves funds between the two as its work needs, and the owner decides
-how much stands where. Connectors, secrets and programs serve both: a program
-run with `use_bound_identity` acts under the wallet contract's name, so an
-agent has one identity for its funds and for everything it does with them.
+The agent moves funds between the wallet contract and the working account as
+its work needs, and the owner decides how much stands where. The two modes of
+custody solve different problems, and an agent uses both.
 
 ## Reference
 
