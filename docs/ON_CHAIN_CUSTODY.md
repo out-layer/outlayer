@@ -333,28 +333,26 @@ the seed of its key. Both come back without the old files:
 
 1. The agent makes a new wallet API key (`wk_` and 64 hex characters) and
    gives the owner its SHA-256 fingerprint.
-2. The owner stores a policy that names the fingerprint among the wallet's
-   keys (`authorized_key_hashes`): on the policy page, in the list of keys, or
+2. The owner stores the policy with the fingerprint as the wallet's key
+   (`authorized_key_hashes`): on the policy page, in the list of keys, or
    through the API with `Bearer near:` in the owner's scope. A locked policy
-   needs its approvers for that, as for any change of policy. Once the
-   coordinator has synced the policy the new key runs the same wallet.
+   needs its approvers for that, as for any change of policy. The list is the
+   whole list: while a policy names keys, the key the wallet was created with
+   steps aside, and a key the policy no longer names stops working. So the
+   new key starts and the lost one ends with the same write, a few seconds
+   after it; a policy that names no key brings the creation key back.
 3. The agent opens a setup with the new key and gives the owner the link; the
    owner signs with the key that set the wallet up, and the agent collects the
    same agent key (the subsection above).
-4. The owner revokes the lost key: `DELETE /wallet/v1/api-key/{key_hash}` with
-   `Bearer near:`. The last key of a wallet is not revoked, so this comes after
-   step 2. It takes the lost key's fingerprint, which no route lists: until it
-   is revoked the lost key runs the wallet within the policy, and an owner who
-   cannot name it freezes the wallet if the old machine may be in other hands.
 
 The owner's `Bearer near:` signs the plain text `auth:<seed>:<timestamp>:@owner`
 with a full-access key of the owner account; it is not NEP-413, so a browser
 wallet does not make it, and a key file does (`tests/lib/owner_token.mjs`). The
 wallet's seed is the one its creation link named, or `0`, `1`, … in the order
-the owner's wallets were made; `GET /wallet/v1/contract` under each tells which
-wallet holds which contract. `GET /wallet/v1/policy` returns the policy's
-fields but its webhook URL, which a policy stored again carries only when the
-owner adds it.
+the owner's wallets were made when the link named none; `GET /wallet/v1/contract`
+under a seed tells which wallet contract that wallet holds. `GET /wallet/v1/policy`
+returns the policy's fields but its webhook URL, which a policy stored again
+carries only when the owner adds it.
 
 ### The sealed key
 
