@@ -239,6 +239,64 @@ The agent moves funds between the wallet contract and the working account as
 its work needs, and the owner decides how much stands where. The two modes of
 custody solve different problems, and an agent uses both.
 
+## 11. An agent at work
+
+A live agent, set up as this page describes. Its owner is `coin-toss.testnet`;
+its wallet contract is the named form,
+[`test-agent.coin-toss.testnet`](https://testnet.nearblocks.io/address/test-agent.coin-toss.testnet):
+the approved build, the pair `A ‖ E` as its public key, and no access key.
+
+### On chain: moves out of the wallet contract
+
+The agent asks for an operation with a request it signs with its key, gets
+back the wallet contract's request with the enclave's signature, checks it,
+adds its own and hands both to be relayed:
+
+```http
+POST /wallet/contract/v1/operations
+{ "id": "pay-daniel-1", "op": { "kind": "transfer", "to": "outlayer-daniel.testnet", "amount": "10000000000000000000000" } }
+
+POST /wallet/contract/v1/operations/pay-daniel-1/relay
+{ "agent_half": "<the agent's signature over the request>" }
+```
+
+| Operation | On chain |
+|---|---|
+| A transfer of 0.01 NEAR to `outlayer-daniel.testnet` | [`7h2BqFei…`](https://testnet.nearblocks.io/txns/7h2BqFeiYfwSB9fiMuqxX6MRiJsw4Zv4oGzHMp8X3qGM) |
+| A contract call: `storage_deposit` on `wrap.testnet`, 0.00125 NEAR attached | [`62JmnoEX…`](https://testnet.nearblocks.io/txns/62JmnoEX1E75Qas92kxoTnGYxzGFuyjfjPsjkW8h7AM8) |
+
+Each transaction reads the same way. Its signer is the agent's working
+account, which only relays and pays the gas. Its one action is
+`w_execute_signed` on the wallet contract, with the request and the proof of
+two signatures. The transfer or the call that follows is the wallet
+contract's own: the receiver sees `test-agent.coin-toss.testnet` as its
+caller, and the funds leave that account.
+
+### Off chain: work under the wallet contract's name
+
+The same agent runs programs in the enclave, and with `use_bound_identity`
+they act as its wallet contract. A program that answers with the account it
+runs as, called through `request_execution`:
+
+| Run | Result |
+|---|---|
+| [`G9xTvnhp…`](https://testnet.nearblocks.io/txns/G9xTvnhp1fzspmkN5UjGZu9kkYBVBMeS7BHYiLS6HnaB), attested: [job 382593](https://app.outlayer.ai/attestation/382593?network=testnet) | `test-agent.coin-toss.testnet said "design-doc-134045 chain" at block 279568920` |
+
+The same program is called over HTTPS with no transaction at all, paid by the
+agent's payment key:
+
+```http
+POST /call/{owner}/{project}
+X-Payment-Key: <the agent's payment key>
+{ "input": "hello", "use_bound_identity": true, "response_format": "Text" }
+```
+
+Before the program is given the name, the enclave confirms on chain that the
+caller's wallet holds that wallet contract. The name gives a program no
+signature of the wallet contract: funds move only by the operations above.
+Connectors work the same way, so what an agent does at a bank, in a mailbox
+or on a venue carries the identity that holds its funds.
+
 ## Reference
 
 - [ON_CHAIN_CUSTODY.md](ON_CHAIN_CUSTODY.md): the setup, the routes, statuses, limits, byte formats
