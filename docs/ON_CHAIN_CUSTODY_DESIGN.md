@@ -98,8 +98,11 @@ The two keys have different origins on purpose. A comes from the owner's own
 key and passes through no service: the owner's page seals it to the agent, and
 the API carries a ciphertext it cannot open. Ed25519 signatures are
 deterministic, so the same signature gives the same key again and the agent's
-key needs no backup. E follows from the owner's master, which NEAR MPC
-protects.
+key needs no backup. E follows from the owner's master. NEAR MPC
+issues the master secret behind it only to an enclave whose attested build the
+OutLayer DAO approved, through the DAO's contract or through a vault
+contract on the owner's own account. The two are the agent signer and the TEE
+signer of every request.
 
 What each party can do alone:
 

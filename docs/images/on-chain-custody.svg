@@ -5,12 +5,12 @@
 <text x='600.0' y='50.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Owner: a NEAR account</text>
 <text x='600.0' y='70.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>sets the policy, approves, can leave with both keys</text>
 <rect x='40' y='125' width='520' height='350' rx='8' fill='#eff6ff' stroke='#2563eb' stroke-width='2'/>
-<text x='58' y='150' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>The agent: its key and its wallet contract</text>
+<text x='58' y='150' text-anchor='start' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Agent On-chain custody, on NEAR</text>
 <rect x='640' y='125' width='520' height='350' rx='8' fill='#f0fdf4' stroke='#16a34a' stroke-width='2'/>
 <text x='1142' y='150' text-anchor='end' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>OutLayer: an Intel TDX enclave</text>
 <rect x='90' y='165' width='420' height='110' rx='6' fill='#dbeafe' stroke='#2563eb' stroke-width='1.5'/>
-<text x='300.0' y='205.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Agent</text>
-<text x='300.0' y='225.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>key A, made from one signature of the owner</text>
+<text x='300.0' y='205.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Agent signer: key A</text>
+<text x='300.0' y='225.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>made from one signature of the owner</text>
 <text x='300.0' y='245.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>checks the request and signs last</text>
 <rect x='90' y='355' width='420' height='100' rx='6' fill='#fef3c7' stroke='#d97706' stroke-width='1.5'/>
 <text x='300.0' y='380.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Wallet contract on NEAR</text>
@@ -22,8 +22,8 @@
 <text x='900.0' y='207.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>limits, allowlists, approvals by M of N,</text>
 <text x='900.0' y='227.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>freeze, lock</text>
 <rect x='690' y='250' width='420' height='70' rx='6' fill='#dcfce7' stroke='#16a34a' stroke-width='1.5'/>
-<text x='900.0' y='280.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>The second signature: key E</text>
-<text x='900.0' y='300.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>made only for an operation the policy allows</text>
+<text x='900.0' y='280.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>TEE signer: key E</text>
+<text x='900.0' y='300.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>signs only an operation the policy allows</text>
 <rect x='690' y='355' width='205' height='100' rx='6' fill='#dcfce7' stroke='#16a34a' stroke-width='1.5'/>
 <text x='792.5' y='380.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>Working account</text>
 <text x='792.5' y='400.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>TEE custody:</text>
@@ -68,6 +68,10 @@
 <text x='1010.0' y='570.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#111'>OutLayer DAO</text>
 <text x='1010.0' y='590.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>approves builds by hash,</text>
 <text x='1010.0' y='610.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='14' font-weight='normal' fill='#111'>holds the exit&#x27;s escrow</text>
+<path d='M 790,548 L 790,475' fill='none' stroke='#374151' stroke-width='1.8' marker-end='url(#ae)'/>
+<rect x='817.2' y='478.0' width='215.60000000000002' height='38' rx='3' fill='#ffffff' stroke='#e5e7eb'/>
+<text x='925' y='493.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='12' font-weight='normal' fill='#374151'>master secret, through the DAO</text>
+<text x='925' y='509.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='12' font-weight='normal' fill='#374151'>or the owner&#x27;s own vault</text>
 <path d='M 300,455 L 300,548' fill='none' stroke='#374151' stroke-width='1.8' marker-end='url(#ae)'/>
 <rect x='256.04' y='481.0' width='87.92' height='22' rx='3' fill='#ffffff' stroke='#e5e7eb'/>
 <text x='300' y='496.0' text-anchor='middle' font-family='Helvetica, Arial, sans-serif' font-size='12' font-weight='normal' fill='#374151'>one promise</text>

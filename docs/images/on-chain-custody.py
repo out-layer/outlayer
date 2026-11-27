@@ -62,16 +62,16 @@ def marker(name, color, start=False):
 box(390, 20, 420, 70, "owner", ["Owner: a NEAR account", "sets the policy, approves, can leave with both keys"])
 
 # ── two sides of equal weight ───────────────────────────────────────────────
-zone(40, 125, 520, 350, "#eff6ff", "#2563eb", "The agent: its key and its wallet contract", "start")
+zone(40, 125, 520, 350, "#eff6ff", "#2563eb", "Agent On-chain custody, on NEAR", "start")
 zone(640, 125, 520, 350, "#f0fdf4", "#16a34a", "OutLayer: an Intel TDX enclave", "end")
 
-box(90, 165, 420, 110, "door", ["Agent", "key A, made from one signature of the owner", "checks the request and signs last"])
+box(90, 165, 420, 110, "door", ["Agent signer: key A", "made from one signature of the owner", "checks the request and signs last"])
 box(90, 355, 420, 100, "chain", ["Wallet contract on NEAR", "the NEAR Intents wallet contract, holds the funds",
                                   "a keyless 0s… account (NEP-616) by default",
                                   "key = A ‖ E: executes only with both signatures"])
 
 box(690, 165, 420, 74, "enclave", ["The owner's policy", "limits, allowlists, approvals by M of N,", "freeze, lock"])
-box(690, 250, 420, 70, "enclave", ["The second signature: key E", "made only for an operation the policy allows"])
+box(690, 250, 420, 70, "enclave", ["TEE signer: key E", "signs only an operation the policy allows"])
 box(690, 355, 205, 100, "enclave", ["Working account", "TEE custody:", "other chains, venues,", "relays, pays gas"])
 box(905, 355, 205, 100, "enclave", ["Connectors, secrets", "web2: banks, mail,", "exchanges; their keys", "stay in the enclave"])
 
@@ -100,6 +100,8 @@ zone(40, 510, 1120, 130, "#fffbeb", "#fcd34d", "NEAR")
 box(90, 548, 420, 74, "chain", ["intents.near and the 1Click API", "the balance, swaps, withdrawals to other chains"])
 box(690, 548, 200, 74, "chain", ["NEAR MPC", "reaches key E", "and never key A"])
 box(910, 548, 200, 74, "chain", ["OutLayer DAO", "approves builds by hash,", "holds the exit's escrow"])
+arrow("M 790,548 L 790,475")
+label(925, 497, ["master secret, through the DAO", "or the owner's own vault"])
 arrow("M 300,455 L 300,548")
 label(300, 492, ["one promise"])
 arrow("M 810,40 L 1185,40 L 1185,585 L 1110,585", "#7c3aed")
