@@ -235,9 +235,28 @@ does with OutLayer stays as it is, under the same owner and the same policy:
 - **The owner's inbox.** What the agent may not do alone it prepares, and the
   owner approves the exact action with one wallet signature.
 
-The agent moves funds between the wallet contract and the working account as
-its work needs, and the owner decides how much stands where. The two modes of
-custody solve different problems, and an agent uses both.
+### A working balance and a main balance
+
+Not every operation needs a transaction on NEAR. The two modes work together
+the way an exchange runs a hot and a cold wallet:
+
+1. The main balance stands in the wallet contract, under two signatures.
+2. For work that needs speed or another chain, the agent moves an amount out
+   of the wallet contract to its working account: one operation, under both
+   signatures and the policy.
+3. On the working account the enclave signs by itself, within the same
+   policy. A connector trades on Hyperliquid or Polymarket, the agent pays on
+   an EVM chain or Solana, places limit orders, holds a confidential balance:
+   no transaction on NEAR and no gas per move.
+4. When the work is done the agent sends what is left, and what it earned,
+   back to the wallet contract.
+
+The policy does not change between the two: one policy of the owner, with one
+set of limits and the same approvers, covers the wallet contract and the
+working account together. The owner decides how much the agent may take out
+and keep at work; the rest stays where the chain requires two signatures.
+
+The two modes of custody solve different problems, and an agent uses both.
 
 ## 11. An agent at work
 
