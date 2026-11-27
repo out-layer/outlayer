@@ -1,0 +1,123 @@
+{
+  "author": "node0",
+  "chunks": [],
+  "header": {
+    "approvals": [
+      "ed25519:5YmhMJBrp7vJNwC5gT1cekUH4TJh6GSqV6WgEpYHW7wNmrfW4hLZEuV4gbgznuDfTJux57EdpqcQ8nP6tVKASHj9",
+      "ed25519:5ydYangeeJ8VLztda4C4SBJBYru2WVW6437Fdb3w92FjpjM5v6MN55dKJd35bFYxbQkpcdXRyhzmcdMPo46WUwoc",
+      "ed25519:31Y8XUXea5XmY7am4a9TNTfaRmG32EoXb67vuHpN69b1QeAjWabcer8ecY1vtCALYaDJzDYbNmCE5tateeYuYFX7",
+      "ed25519:2Pw8FKSqS2DsvMCDu3AGUCVQ8KawSXWkeYY4FeYunA4mxBsuCnVwMuUxZzW7jn3VUxLYfc7anKnSkeJV7XUcGNAW",
+      null,
+      null,
+      "ed25519:5TfVWvEdZQvNDkDV64YGd3QUTMWDhPvq4VWfEHqX5LL1MtAA24ppc2pWB2sScScjkcQsZLjZRp3gQBu545pCWntA",
+      "ed25519:3ETxMQ2A5V926zhcHmDtZyEHs1j3tjCbUKWypRvVt7pcmiVB9VLw24tQL84zXT7pUBUH3T84HMT9GrfHYZ5RD6Dw",
+      "ed25519:5G2dsKfiPXhcVK6WtcyVTjxhTdWrbCHXGxVHFqQdo581j8UwRkoU7XvbLpjTPFHQVP5YYwzu8xrzq4D87yBBNY7a",
+      "ed25519:2QfuzWL6qMX2b1TsSE2uSJTd9fJcufhtgYTSniDRKkTynmNj5ug18rcKujp5mTqC3W6i1JrSoN6K8z6oHVbSbQy2",
+      "ed25519:44zD5bQeUYBWZzYwM8HH1ZFapM5eD2qwjWLCjgCECCPBupDQhv5zt6xfZtwEbDgqVLqD6g5YDbG3S3L6Niaswftk",
+      "ed25519:6mgJqgxSte1bzUVseFBYKc5p2fyZn5jyA6J61urELNkQtVgoMvfBc9beXQxKJKdYA3ctxWRPBGC8Btkb7bbXYPR",
+      "ed25519:5qwyTkhixVPAeKVENoREBQF6ibP8jwCu8SRvzNRdFW9pyJaLhY2sFKbV85SHunYaWdfQ5xHU4skrQL8oz4yrVyig",
+      "ed25519:27iPF7xNxppPpJ7v55krBEDftSU38QKvt34dBDFbUs28Ya86k8S6REiGQu1DvmrrGrYzNCWMbHeLsM8nUF4YunWz",
+      null,
+      null,
+      "ed25519:2WtVWEzauoF6Jj1xC4Vu3Y8dLvsLNXrFhWY29VJSrv7LqcFq3cvKFDMe7pYF7S65UwdV76L8HbqxHmeRTwPJ3tZ1",
+      "ed25519:2AZ8bvCg87KCXeo9toRhgS6NuwKtXy7jjmqUW1uBLNoLcYVohUmdidbRckGoSDgd5SXJo788Mx8C3zpUABY92KLm",
+      "ed25519:2GCJUU9ivHZ6NpLCMWgHu9aV4pGK3iQR58m2EGGUCNHKM8mgtwziEf5Njsd9VRCdBGDnK9K2WVEBQQUaBWxuNRoD",
+      "ed25519:gjpbAt3eoh61GdGzJjfo8g4GcEEBv5W2r8NgXCqtDcqXf1y8TdssW1hSmXbn1JxwjPg24iRZ2gZwt2wNgbr5EzY"
+    ],
+    "block_body_hash": "GQPTC5Mme1p7THBAZhFTAB7dszfHZPjjioxvWSTvMgUh",
+    "block_merkle_root": "5ave4Jew7PE3x8UrrkXk6pKR9AEuzakhtPvfiB5i7Uon",
+    "block_ordinal": 231569227,
+    "challenges_result": [],
+    "challenges_root": "11111111111111111111111111111111",
+    "chunk_endorsements": [
+      [
+        255,
+        255,
+        1
+      ],
+      [
+        255,
+        255,
+        1
+      ],
+      [
+        255,
+        255,
+        7
+      ],
+      [
+        255,
+        255,
+        31
+      ],
+      [
+        255,
+        15
+      ],
+      [
+        255,
+        255,
+        3
+      ],
+      [
+        255,
+        255,
+        7
+      ],
+      [
+        255,
+        255,
+        1
+      ],
+      [
+        255,
+        255,
+        7
+      ],
+      [
+        255,
+        255,
+        15
+      ]
+    ],
+    "chunk_headers_root": "FA3okRnXZEKcNjyHM1SziZV9vNShbt4wFaejArHHDLBZ",
+    "chunk_mask": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "chunk_receipts_root": "4eEggNqxvSwmk1GxxmBH8gJiYFnpiZfc82aaEy4VFQnk",
+    "chunk_tx_root": "C88Bu4aA3zyLxRBU36X8rQandrSxDMV2pfdnUYB45XrR",
+    "chunks_included": 10,
+    "epoch_id": "8WZopomcjoLm7RsMMQgX4nq3dk1h59yH66ttoxLgh5DU",
+    "epoch_sync_data_hash": null,
+    "gas_price": "100000000",
+    "hash": "54FMkXE4omv18pmXt6CnqAKvYG9PFCrZBHM2uVJpyXdS",
+    "height": 279578481,
+    "last_ds_final_block": "5gBnqZpa83BHXySpX2FPyQtKMawRWojHUwYBYNv7XqfZ",
+    "last_final_block": "ADjsnruGiYcYSZeqG2cBn3pS15kTRTQEk3jVmKTDoT8Y",
+    "latest_protocol_version": 88,
+    "next_bp_hash": "FZyRz8KvsV2WLDMDSuNzv9x5hRMCraxJkF7n1N7KAm1o",
+    "next_epoch_id": "8UpxcVpgr93yHF9eWkWpwqD4PbE9WsWo9hf9tTUG6Vad",
+    "outcome_root": "fbbagyympywG8rsc8etsXjF8WvS1CuG3Wf6NTkaGwdE",
+    "prev_hash": "5gBnqZpa83BHXySpX2FPyQtKMawRWojHUwYBYNv7XqfZ",
+    "prev_height": 279578480,
+    "prev_state_root": "33tedqxmt6WEDK4Uwdd2q5mULbYEv2revEqoj5ZX3AL5",
+    "random_value": "BSh4b4XEKGXEZuQtjjfML4EoWGdWBFVLgVScgj1ZyvHR",
+    "rent_paid": "0",
+    "shard_split": null,
+    "signature": "ed25519:2VSixVNJ1Cq3e58V3zrnW9shrR5ZRW23DxNTDXSaycc3v3SMiRJE5cWmHYSz8mBxc9Hv4TTCba5pdvnq6NfiqipE",
+    "timestamp": 1795792451743395801,
+    "timestamp_nanosec": "1795792451743395801",
+    "total_supply": "2682727922339848455963790617812290",
+    "validator_proposals": [],
+    "validator_reward": "0"
+  }
+}

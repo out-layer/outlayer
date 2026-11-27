@@ -157,6 +157,8 @@ mod at_the_door {
         code_hash: [u8; 32],
         /// The builds the keystore DAO approved, as it lists them.
         approved: Vec<String>,
+        /// The DAO's list cannot be read: the node answers that view with an error.
+        approved_unreadable: bool,
         public_key: String,
         extensions: Vec<String>,
         signature_allowed: bool,
@@ -191,6 +193,7 @@ mod at_the_door {
         let chain = Arc::new(Mutex::new(Chain {
             code_hash: CODE_HASH,
             approved: vec![bs58::encode(CODE_HASH).into_string()],
+            approved_unreadable: false,
             public_key: pair.to_string(),
             extensions: Vec::new(),
             signature_allowed: true,
@@ -216,15 +219,31 @@ mod at_the_door {
                 let encrypt = encrypt.clone();
                 async move {
                     let (id, params) = (body["id"].clone(), body["params"].clone());
+                    if body["method"] == "block" {
+                        // a final block of testnet, without its chunks
+                        let block: serde_json::Value = serde_json::from_str(include_str!("fixtures/final_block.json")).unwrap();
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": block}));
+                    }
                     if params["request_type"] == "view_account" {
                         return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
                             "code_hash": "11111111111111111111111111111111",
                             "global_contract_hash": bs58::encode(chain.code_hash).into_string(),
                             "block_hash": bs58::encode(BLOCK).into_string(), "block_height": 9}}));
                     }
+                    if params["request_type"] == "view_access_key" {
+                        // the working account's key, for the relaying transaction
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "nonce": 41, "permission": "FullAccess",
+                            "block_hash": bs58::encode(BLOCK).into_string(), "block_height": 9}}));
+                    }
                     let method = params["method_name"].as_str().unwrap_or_default();
                     if method.starts_with("w_") {
                         answers.lock().unwrap().views_asked.push((method.to_string(), params["block_id"].clone()));
+                    }
+                    if method == "get_approved_wallet_contracts" && chain.approved_unreadable {
+                        return Json(json!({"jsonrpc": "2.0", "id": id, "error": {
+                            "name": "HANDLER_ERROR", "cause": {"name": "UNKNOWN_ACCOUNT"},
+                            "code": -32000, "message": "Server error", "data": "the account does not exist"}}));
                     }
                     let view = match method {
                         "get_exit_owner" => json!({
@@ -427,6 +446,19 @@ mod at_the_door {
                 matches!(identity, Err(ApiError::Refused { code: refusal::WALLET_CONTRACT_REFUSED, .. })),
                 "{why}"
             );
+        }
+    }
+
+    /// The DAO's list that cannot be read is not an empty list: nothing is refused
+    /// as unapproved and nothing is signed; the caller is told to come again.
+    #[tokio::test]
+    async fn an_unreadable_list_of_builds_is_unavailable_not_a_refusal() {
+        let stand = stand().await;
+        stand.chain.lock().unwrap().approved_unreadable = true;
+        match prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await {
+            Err(ApiError::Unavailable(why)) => assert!(why.contains("approved wallet contracts"), "{why}"),
+            Err(other) => panic!("answered as {other:?}"),
+            Ok(_) => panic!("a request was prepared with the list unread"),
         }
     }
 
@@ -691,6 +723,47 @@ mod at_the_door {
             matches!(&refused, Err(ApiError::Forbidden(reason)) if reason.contains("not the account of the wallet")),
             "{refused:?}"
         );
+    }
+
+    /// A proven request is relayed as the working account's transaction to the
+    /// wallet contract: the one call, the next nonce, and nothing else in it.
+    #[tokio::test]
+    async fn a_proven_request_is_signed_as_one_call_to_the_wallet_contract() {
+        use near_primitives::transaction::{Action as TxAction, SignedTransaction};
+
+        let stand = stand().await;
+        let prepared = prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.unwrap();
+        let tee_half: [u8; 64] = hex::decode(&prepared.tee_half).unwrap().try_into().unwrap();
+        let whole = proof(&sign_half(Role::Agent, &stand.agent, &prepared.message), &tee_half);
+        let Json(signed) = relay_handler(
+            State(stand.state.clone()),
+            scope(Some(SCOPE)),
+            Json(RelayRequest {
+                wallet_id: WALLET.to_string(),
+                wallet_contract: CONTRACT.to_string(),
+                message: prepared.message.clone(),
+                proof: whole.clone(),
+            }),
+        )
+        .await
+        .expect("a proven request");
+
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signed.signed_tx_base64.as_deref().expect("a signed transaction")).unwrap();
+        let tx: SignedTransaction = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(tx.transaction.receiver_id().as_str(), CONTRACT);
+        assert_eq!(tx.transaction.signer_id().as_str(), wallet_account(&stand).await);
+        assert_eq!(
+            tx.transaction.nonce(),
+            near_primitives::transaction::TransactionNonce::Nonce { nonce: 42 },
+            "the key's nonce and one"
+        );
+        let block: serde_json::Value = serde_json::from_str(include_str!("fixtures/final_block.json")).unwrap();
+        assert_eq!(tx.transaction.block_hash().to_string(), block["header"]["hash"].as_str().unwrap());
+        let [TxAction::FunctionCall(call)] = tx.transaction.actions() else {
+            panic!("not one call: {:?}", tx.transaction.actions());
+        };
+        assert_eq!(call.method_name, "w_execute_signed");
+        assert_eq!(call.args, prepared.message.execute_signed_args(&whole));
     }
 
     #[tokio::test]
