@@ -43,6 +43,9 @@
 #   Z   STORAGE_MOVES calls (default 0) with no deposit from that zero-balance contract
 #       (then, with STORAGE_REST seconds, a rest and one more call):
 #       its storage against the zero-balance limit of 770 bytes
+#   NM  an agent on a new machine: the owner's own signature (Bearer near:) stores a policy
+#       naming a new key, which runs the wallet while the old one stops; a setup again shows
+#       the wallet contract on record and hands the same agent key over for the same account
 #   X   the owner's exit: after the claim the agent's operations are refused; the owner,
 #       with the recovery tool and no OutLayer service, moves funds out of the wallet contract
 #
@@ -692,6 +695,75 @@ if new_wallet 2; then
     export ACCOUNT_OF_AGENT="$SAVED_ACCOUNT" AGENT_SEED_FILE="$SAVED_SEED"
   else fail "S5 create-0s: $ACC0S"; fi
 else fail "S5 the third wallet: $HTTP $(why)"; fi
+
+# ── NM ───────────────────────────────────────────────────────────────────────
+log "NM an agent on a new machine: a new key through the owner's own signature, the same agent key again"
+# The owner's request under `Bearer near:` in the owner's scope, signed with the owner's key file
+# (tests/lib/owner_token.mjs, the code the skill gives the owner). Sets HTTP and BODY.
+owner_api() {
+  local method=$1 path=$2 body=${3:-} out bodyf
+  throttle
+  out=$(mktemp "$WORK/out.XXXXXX")
+  local -a args=(-sS -o "$out" -w '%{http_code}' -X "$method" "$COORDINATOR_URL$path" --max-time 60 -H @-)
+  if [[ -n "$body" ]]; then bodyf=$(mktemp "$WORK/body.XXXXXX"); printf '%s' "$body" > "$bodyf"; args+=(-H 'Content-Type: application/json' --data-binary @"$bodyf"); fi
+  HTTP=$(curl "${args[@]}" <<<"Authorization: Bearer near:$(OWNER_KEY_FILE="$OWNER_CREDS" node "$HOS_LIB_DIR/owner_token.mjs" "$OWNER" 0)" 2>/dev/null)
+  BODY=$(tr -d '\n' < "$out"); rm -f "$out" ${bodyf:+"$bodyf"}
+}
+# owner_policy <jq filter over GET /wallet/v1/policy> — the owner stores the policy the filter makes.
+owner_policy() {
+  owner_api GET /wallet/v1/policy; local current=$BODY
+  owner_api POST /wallet/v1/encrypt-policy "$(jq -c "$1" <<<"$current")"
+  local enc; enc=$(jq -r '.encrypted_base64 // ""' <<<"$BODY"); [[ -n "$enc" ]] || return 1
+  owner_api POST /wallet/v1/sign-policy "$(jq -nc --arg e "$enc" --arg c "$OWNER" '{encrypted_data:$e, caller:$c}')"
+  [[ "$HTTP" == 200 ]] || return 1
+  local args; args=$(jq -c --arg e "$enc" '{wallet_pubkey:("ed25519:"+.public_key_hex), encrypted_data:$e, wallet_signature:.signature_hex, version, locked, valid_until}' <<<"$BODY")
+  near contract call-function as-transaction "$CONTRACT_ID" store_wallet_policy json-args "$args" \
+    prepaid-gas '100 Tgas' attached-deposit '0.1 NEAR' sign-as "$OWNER" network-config "$NETWORK" sign-with-keychain send >/dev/null 2>&1
+}
+key_works() { # key_works <wk_> — the key answers within a minute
+  local i; for i in $(seq 1 20); do api_wk "$1" GET '/wallet/v1/address?chain=near' >/dev/null; [[ "$HTTP" == 200 ]] && return 0; sleep 3; done; return 1
+}
+owner_api GET /wallet/v1/contract
+[[ "$HTTP" == 200 && "$(jq -r .account_id <<<"$BODY")" == "$AGENT_ACC" ]] \
+  && pass "NM the owner reaches the wallet by its own signature: seed 0 holds $AGENT_ACC" || fail "NM the owner's token: $HTTP $(why)"
+( umask 077; printf 'wk_%s' "$(openssl rand -hex 32)" > "$WORK/new.wk" )
+NEW_HASH=$(printf '%s' "$(cat "$WORK/new.wk")" | shasum -a 256 | cut -d' ' -f1)
+api_wk "$(cat "$WORK/new.wk")" GET '/wallet/v1/address?chain=near' >/dev/null
+[[ "$HTTP" == 401 ]] || fail "NM the new key answered $HTTP before any policy named it"
+if owner_policy "$(printf '{wallet_id, rules, approval, capabilities, refund_addresses, authorized_key_hashes: ["%s"]} | with_entries(select(.value != null))' "$NEW_HASH")" \
+   && key_works "$(cat "$WORK/new.wk")"; then
+  pass "NM the owner's policy names the new key, and it runs the wallet"
+  api_wk "$WK0" GET '/wallet/v1/address?chain=near' >/dev/null
+  [[ "$HTTP" == 401 ]] && pass "NM the key of the old machine stops with the same write" || fail "NM the old key answered $HTTP"
+else fail "NM the new key: the policy store or its sync failed"; fi
+
+# A setup again from the new machine: the same owner key, the same agent key, the same account.
+RPUB3=$(node "$AGENT_JS" x25519-new "$WORK/new.x")
+api_wk "$(cat "$WORK/new.wk")" POST /wallet/v1/contract/setup "$(jq -nc --arg r "$RPUB3" '{recipient_public_key:$r}')" >/dev/null
+SETUP_TOKEN=$(jq -r '.token // ""' <<<"$BODY")
+owner_page GET
+if [[ "$HTTP" == 200 && "$(jq -c '[.current_contract.account_id, .current_contract.agent_public_key]' <<<"$BODY")" == "$(jq -nc --arg a "$AGENT_ACC" --arg k "$AGENT_PUB" '[$a,$k]')" ]]; then
+  pass "NM the owner's page names the wallet contract the wallet has, and its agent key"
+else fail "NM current_contract: $HTTP $(jq -c '.current_contract // "absent"' <<<"$BODY" 2>/dev/null | cut -c1-160)"; fi
+AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" node "$AGENT_JS" seed "$OWNER" "$WID0" "$WORK/again.seed"
+[[ "$(AGENT_SEED_FILE="$WORK/again.seed" node "$AGENT_JS" pub)" == "$AGENT_PUB" ]] \
+  && pass "NM the owner's key makes the agent key on record again" || fail "NM the signature made another agent key"
+owner_page POST "$(jq -nc --arg a "$AGENT_ACC" --arg s "$(AGENT_SEED_FILE="$WORK/again.seed" node "$AGENT_JS" seal "$RPUB3" "$WID0")" '{account_id:$a, sealed_agent_key:$s}')"
+[[ "$HTTP" == 200 && "$(jq -r .account_id <<<"$BODY")" == "$AGENT_ACC" ]] && pass "NM the setup again hands the key over for the same account" \
+  || fail "NM the hand-over: $HTTP $(why)"
+api_wk "$(cat "$WORK/new.wk")" GET /wallet/v1/contract/setup >/dev/null
+if [[ "$(jq -r .done <<<"$BODY")" == true ]] \
+   && node "$AGENT_JS" open "$WORK/new.x" "$WID0" "$(jq -r .sealed_agent_key <<<"$BODY")" "$WORK/new.seed" \
+   && [[ "$(AGENT_SEED_FILE="$WORK/new.seed" node "$AGENT_JS" pub)" == "$AGENT_PUB" ]]; then
+  pass "NM the agent on the new machine holds the same agent key, for $AGENT_ACC"
+else fail "NM the new machine's agent key: $(jq -c '{done, error}' <<<"$BODY" 2>/dev/null)"; fi
+rm -f "$WORK/again.seed" "$WORK/new.seed" "$WORK/new.x"
+
+# Back as it was: a policy that names no key brings the creation key back.
+if owner_policy '{wallet_id, rules, approval, capabilities, refund_addresses} | with_entries(select(.value != null))' && key_works "$WK0"; then
+  pass "NM a policy naming no key brings the creation key back"
+else fail "NM the creation key did not come back"; fi
+rm -f "$WORK/new.wk"
 
 # ── X ────────────────────────────────────────────────────────────────────────
 log "X  the owner's exit"
