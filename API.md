@@ -118,8 +118,9 @@ secret issued by the NEAR MPC network. All endpoints except `/register` require
 | GET | `/public/pricing` | Current pricing |
 | GET | `/public/stats` · `/public/workers` | Network stats / live workers |
 | GET | `/public/connectors` · `/public/connectors/{id}/describe` | Connector catalogue / one connector's operations |
-| GET / POST | `/public/storage/get` · `/public/storage/batch` | Read public (unencrypted) project storage |
-| GET | `/public/payment-keys/{owner}/{nonce}/balance` · `/usage` | Payment key balance / usage |
+| GET | `/public/storage/get` | Read one public (unencrypted) project storage entry |
+| POST | `/public/storage/batch` | Read several public (unencrypted) project storage entries |
+| GET | `/public/payment-keys/{owner}/{nonce}/balance` · `/public/payment-keys/{owner}/{nonce}/usage` | Payment key balance / usage |
 | GET | `/public/project-earnings/{owner}` · `/public/users/{account}/earnings` | Earnings (read) |
 | GET | `/attestations/by-call/{call_id}` · `/by-tx/{tx_hash}` · `/by-request/{request_id}` | Attestation record of one execution |
 | GET | `/public/collateral` | Intel TDX collateral for verifying an attestation |
