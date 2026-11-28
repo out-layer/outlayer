@@ -6,24 +6,32 @@ at risk, and what the owner does about it. The design itself is in
 
 ## The answers
 
+**Funds at risk** means funds in the wallet contract, here and in section 2;
+the hot wallet of [section 4](#4-a-cold-wallet-and-a-hot-wallet) is a
+separate, optional balance.
+
 | Threat | What the attacker needs | Funds at risk | What the owner does |
 |---|---|---|---|
 | The server that operates the service goes down | nothing | **none** | waits, or leaves through the owner exit with no OutLayer service |
-| The server is compromised from outside | a remote exploit of the API host | **none** | nothing |
+| The server is compromised from outside | a remote exploit of the API host | **none**, for an agent that makes the SDK's checks | nothing |
 | The TEE is read at the hardware level (DRAM interposer) | physical access to a powered-off keystore server, its root | **none** | nothing |
 | NEAR MPC is compromised | 11 of the 16 mainnet nodes | **none** | nothing |
-| OutLayer's governance is used against its users | a quorum of the OutLayer DAO's members | **none** | leaves through the owner exit, which is shorter than the delay of any change |
-| The agent's machine or model is compromised | the agent's host, or a prompt injection | **what the policy allows** without the owner | freezes; moves the funds to a new wallet contract; replaces the agent's API and payment keys |
-| The owner's key is stolen, policy locked | the owner's key | **what the policy allows** without the owner | nothing: the policy and the exit wait for the approvers |
+| OutLayer's governance is used against its users | a quorum of the OutLayer DAO's members | **none** | leaves through the owner exit (24 to 48 hours) before a change of the DAO contract's code or of the approved builds takes effect (72 hours after its vote) |
+| The agent's machine or model is compromised | the agent's host, or a prompt injection | **what the policy allows** without the owner | freezes; then sets up a new agent key and wallet contract, allows that account in the policy, unfreezes and moves the funds, or leaves through the exit; replaces the agent's API and payment keys |
+| The owner's key is stolen, policy locked | the owner's key | **what the policy allows** per period, on a wallet contract account with no access key | with the approvers, moves the funds out; replaces the key |
 | A relayer, proxy or RPC on the path | a position on the network | **none** | nothing |
 
 **What the policy allows** is the owner's choice: the kinds of operation,
-limits per transaction and per hour, day and month, receivers on an
-allowlist, and approvals by M of N above a threshold.
+the tokens, limits per transaction and per period (hour, day and month),
+receivers on an allowlist, and approvals by M of N above a threshold. The
+enclave judges the per-transaction limit, the kinds, the tokens, the
+allowlist, the approvals and the freeze from chain data; the amounts per
+period are counted by the OutLayer API and passed to the enclave.
 
-Nothing leaves the wallet contract without both signatures, and the enclave
-gives its own only to an operation the owner's policy allows. No single
-system in the table is enough to move funds.
+On a wallet contract account with no access key (the `0s…` default and a
+sub-account the setup made), nothing leaves the wallet contract without both
+signatures, and the enclave gives its own only to an operation the owner's
+policy allows. None of the systems in the table moves funds alone.
 
 ## 1. The path the money takes
 
@@ -32,7 +40,8 @@ executes a move only with two signatures:
 
 * **A, the agent's key.** Made from one signature of the owner's own key
   (NEP-413), and kept by the agent. No OutLayer service holds it; the owner
-  makes it again by signing again.
+  makes it again by signing again with the same key of their account that
+  signed at setup.
 * **E, the enclave's key.** Derived inside the OutLayer keystore enclave
   (Intel TDX) from the owner's master, at the moment of signing. NEAR MPC
   gives the master secret only to an enclave whose build and instance the
@@ -58,21 +67,24 @@ OutLayer's API, keystore or servers stop, for an hour or for good.
 * **The owner** leaves alone through the owner exit: they start it from their
   own account on the DAO contract, wait the window they chose (24 to 48
   hours), and claim the master within 7 days. From it they derive E, their
-  wallet repeats one signature and gives A, and an offline tool builds a
-  request with both halves that any NEAR account relays. NEAR and NEAR MPC are
+  wallet repeats one signature, with the same key of the owner's account that
+  signed at setup, and gives A, and an offline tool builds a request with
+  both halves that any NEAR account relays. NEAR and NEAR MPC are
   enough; no OutLayer service takes part.
 
 ### 2.2 A server is compromised from outside
 
 An attacker holds the API host: the coordinator, its database, its queue.
 
-* **Funds at risk:** none. The server holds neither key and can produce
-  neither signature.
+* **Funds at risk:** none, for an agent that makes the SDK's checks. The
+  server holds neither key and can produce neither signature.
 * **Operations.** The enclave signs only an operation the agent signed, held
-  to the policy the enclave reads from the chain itself. The agent checks
-  what comes back before it signs: the receiver, method, arguments and
-  amount of the request; for a swap or a withdrawal to another chain, the
-  1Click deposit address, which the agent looks up at 1Click itself (the
+  to the policy the enclave reads from the chain itself. With this server
+  compromised, what holds is the per-transaction limit, the kinds, the
+  tokens, the allowlist, the approvals and the freeze; the amounts per period
+  are counted by this server. The agent's SDK checks what comes back before
+  the agent signs: the receiver, method, arguments and amount of the request; for a swap or a withdrawal to another chain, the
+  1Click deposit address, which the SDK looks up at 1Click itself (the
   recipient, the refund address, the assets and the amounts of that quote).
 * **Setup.** The page seals the owner's signature to a key that is in the
   link the agent gave its owner, so it reaches the agent and no one else.
@@ -109,8 +121,7 @@ keystore alike. What a design controls is what one TEE break reaches.
   no half-signed move waits anywhere to be completed.
 * **A forged attestation** made with keys extracted this way from the
   attacker's own machine does not get the master: a keystore instance needs a
-  DAO vote that names its key, and the servers' KMS starts the keystore only
-  on listed devices.
+  DAO vote that names its key.
 
 ### 2.4 NEAR MPC is compromised
 
@@ -123,7 +134,8 @@ mainnet nodes (read from `v1.signer`, 2026-11-28).
 * **Cost:** eleven independent operators, each in a TEE: their collusion, or
   the attack of 2.3 eleven times.
 * **NEAR MPC unavailable:** running keystores keep working; a new keystore
-  instance and the owner exit wait for MPC.
+  instance, an owner's first wallet (its escrow is written with MPC) and the
+  owner exit wait for MPC.
 
 ### 2.5 OutLayer's governance is used against its users
 
@@ -133,32 +145,38 @@ A build that leaks the master is approved through the OutLayer DAO.
   contract changes only by their vote.
 * **What it yields:** E at most.
 * **Funds at risk:** none. E moves nothing without A.
-* **The owner leaves first.** A vote that changes the DAO contract or
-  approves a build takes effect 72 hours after it passes, in the open, on
-  chain. The owner exit takes 24 to 48 hours. An owner who sees a change they
-  do not accept starts the exit and holds both keys before the change is in
-  force, so the governance cannot lock an owner in.
+* **The owner can leave before a change is in force.** A change of the DAO
+  contract's code or of the approved builds takes effect 72 hours after its
+  vote, in the open, on chain. The owner exit takes 24 to 48 hours, so an
+  owner who does not accept a change leaves with both keys before it is in
+  force.
 
 ### 2.6 The agent's machine or model is compromised
 
 Malware on the agent's host, a stolen key A, or a prompt injection.
 
 * **Funds at risk:** what the policy allows without the owner. Every operation passes the enclave's
-  policy: the kinds of operation the owner allowed, the limits per period,
-  the allowlist of receivers, approvals above the threshold. An injected
-  request is judged like any other.
+  policy: the kinds of operation the owner allowed, the limits per
+  transaction and per period, the allowlist of receivers, approvals above the
+  threshold. An injected request is judged like any other.
 * **Cost:** the cheapest of all; a prompt injection is free. This is what the
   policy is for.
 * **The owner** freezes the wallet with one transaction from their own wallet,
-  straight to the contract, and moves the funds to a new wallet contract set
-  up for a new agent key. The agent's API key and payment key were on the same
-  host, so the owner replaces them too.
+  straight to the contract. A freeze stops new requests at once; a request
+  prepared in the last ten minutes can still execute. The owner then sets up
+  a new agent key and wallet contract, allows that account in the policy,
+  unfreezes and moves the funds, or leaves through the owner exit. The
+  agent's API key and payment key were on the same host, so the owner
+  replaces them too.
 
 ### 2.7 The owner's key is stolen
 
-* **With a locked policy:** what the policy allows without the owner. A change of the policy, its
-  unlock and the owner exit each need the approvers' quorum, which the stolen
-  key alone is not; waiting does not help the attacker.
+* **With a locked policy**, on a wallet contract account that has no access
+  key: what the policy allows per period. A change of the policy, its unlock
+  and the owner exit each need the approvers' quorum, which the stolen key
+  alone is not. The approvers and the owner then move the funds out, and the
+  owner replaces the key. A wallet contract installed on the owner's own
+  account is under that account's keys.
 * **The owner exit** takes the window the owner set, and any single approver
   cancels it.
 * The lock is the owner's choice; the approvers can be a Ledger, a second
@@ -177,11 +195,11 @@ cannot change it.
 |---|---|
 | What one operation depends on | one NEAR transaction with two Ed25519 checks. No signing round of NEAR MPC: operations go on while MPC is unavailable |
 | Who signs an operation | the agent, by itself, inside the policy. The owner signs nothing per operation; they are asked only above the limits they set |
-| Code under the funds | the NEAR Intents wallet contract and one signing standard, with no state and no clock: nothing to watch, nothing that runs on a timer |
-| Beyond the chain | connectors to web2 services and venues, and the secrets they use, under the same policy and approvals |
-| Setup by the owner | one signature and one small transaction in their own wallet (about 0.01 NEAR of gas, paid by the owner); the wallet contract has no access key and holds no NEAR for storage |
-| The agent's key | made by the owner's signature, again whenever needed; nothing to back up |
-| One operation | two HTTPS calls and one local signature; one NEAR transaction, relayed by any account |
+| Code under the funds | one signing standard with no state and no clock, on the NEAR Intents wallet contract |
+| Beyond the chain | connectors to web2 services and venues, and the secrets they use; the connector's own rules and the owner's approvals apply |
+| Setup by the owner | one signature and one transaction in their own wallet for the wallet contract (about 0.01 NEAR of gas); before it the owner registers once for the exit (0.05 NEAR) and stores a policy; the agent's working account keeps 0.5 NEAR for relays; by default the wallet contract has no access key and holds no NEAR for storage |
+| The agent's key | made by the owner's signature, again whenever needed with the same key of the owner's account that signed at setup; nothing to back up |
+| One operation | two HTTPS calls, each signed by the agent's key, and the agent's signature on the move; one NEAR transaction, relayed by any account |
 | Chains | NEAR and NEAR Intents; other chains through 1Click swaps and withdrawals |
 | The owner's controls | policy, approvals in their own wallet, freeze, lock, exit |
 | Integration | the OutLayer JS SDK and agent skills; nothing to deploy, no contract of one's own |
@@ -194,8 +212,9 @@ The agent works the way an exchange runs its wallets:
   balance stays there, under two signatures.
 * **The hot wallet** is the agent's TEE custody account, OutLayer's
   enclave-held account, signed by the enclave alone under the same policy:
-  one API call per move and no gas, on EVM chains, Solana, trading venues, a
-  confidential balance, and connectors to web2 services.
+  one API call per move and no NEAR transaction per move, on EVM chains,
+  Solana, trading venues, a confidential balance, and connectors to web2
+  services.
 
 For work that needs the hot wallet, the agent moves the amount the operation
 needs out of the cold wallet, as one operation under both signatures and the
@@ -219,6 +238,6 @@ Nothing in this model waits to be built:
   owner's setup page, running end to end on testnet.
 
 On chain, the code under the funds is the NEAR Intents wallet contract and
-one signing standard of about two hundred lines, with no state and no clock.
+one signing standard of about two hundred lines with no state and no clock.
 No OutLayer contract sits on the path of the money, and none that OutLayer
 can upgrade.

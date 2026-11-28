@@ -50,8 +50,9 @@ at its word:
   hundred lines of signature verification with no state, no clock and no
   queue: the whole of what a reviewer reads beyond the core.
 - **A public key that cannot be changed.** The wallet contract fixes its
-  public key at the first initialization. With the pair as that key, "both
-  must sign" is a permanent rule of the account, not a setting.
+  public key at the first initialization. With the pair as that key, on an account
+  with no access key, "both must sign" is a permanent rule of the account,
+  not a setting.
 - **A deterministic account (NEP-616), by default.** The address is `0s…`,
   derived from the `StateInit`: the code hash of the build and the first state
   with the pair. It commits to both, so the address alone says which code runs
@@ -63,7 +64,8 @@ at its word:
 - **Or an account with a name.** The same contract and the same pair install
   on a named account when the owner wants one: a sub-account of the owner's,
   left with no access key, or the owner's own account, for an owner who wants
-  the agent to act under that name. The choice is the owner's, at setup; the
+  the agent to act under that name; there the owner's keys stay above the
+  contract. The choice is the owner's, at setup; the
   two signatures are the same in each.
 - **Nonces as the contract recommends.** The contract keeps "double-timeout
   window" nonces in a bitmap and recommends that a single signer generate
@@ -91,8 +93,8 @@ upgrade.
 
 | Key | Where it comes from | Who can make it |
 |---|---|---|
-| A, the agent's | one NEP-413 signature of the owner's full-access key over a fixed message that names the owner and the wallet; the key's seed is an HMAC of that signature | the owner, in their own wallet, at any time. The enclave never sees it |
-| E, the enclave's | derived inside the enclave from the owner's master and the wallet's id, at the moment of signing; stored nowhere | the enclave; the owner after an exit |
+| A, the agent's | one NEP-413 signature of the owner's full-access key over a fixed message that names the owner and the wallet; the key's seed is an HMAC of that signature | the owner, in their own wallet, at any time, with the same key of their account that signed at setup. The enclave never sees it |
+| E, the enclave's | derived inside the enclave from the owner's master and the wallet's id, at the moment of signing; kept only in the enclave's memory | the enclave; the owner after an exit |
 
 The two keys have different origins on purpose. A comes from the owner's own
 key and passes through no service: the owner's page seals it to the agent, and
@@ -100,8 +102,7 @@ the API carries a ciphertext it cannot open. Ed25519 signatures are
 deterministic, so the same signature gives the same key again and the agent's
 key needs no backup. E follows from the owner's master. NEAR MPC
 issues the master secret behind it only to an enclave whose attested build the
-OutLayer DAO approved, through the DAO's contract or through a vault
-contract on the owner's own account. The two are the agent signer and the TEE
+OutLayer DAO approved, through the DAO's contract. The two are the agent signer and the TEE
 signer of every request.
 
 What each party can do alone:
@@ -145,11 +146,15 @@ it before the second signature exists:
 | Rule | What the owner sets |
 |---|---|
 | What the agent may do at all | the kinds of operation: transfer, contract call, swap, withdrawal to another chain |
-| Limits | per transaction and per hour, day and month, per token |
+| Limits | per transaction and per period (hour, day and month), per token |
 | Addresses | an allowlist or a blocklist of receivers |
 | Approvals | M of N approvers sign the exact operation in their own wallets; an amount per period goes out without them, and a payment to an address off the allowlist can wait for them instead of being refused |
 | Lock | a change of the policy, and an exit, need the same approvers |
-| Freeze | one transaction from the owner straight to the contract stops the wallet |
+| Freeze | one transaction from the owner straight to the contract stops new requests at once |
+
+The enclave judges the per-transaction limit, the kinds, the tokens, the
+addresses, the approvals and the freeze from chain data; the amounts per
+period are counted by the OutLayer API and passed to the enclave.
 
 One policy covers the wallet contract and the working account together, with
 one set of limits, so the owner writes the rules once. An agent can ask for
@@ -162,15 +167,17 @@ worded.
 |---|---|
 | The enclave's memory | E, and no signature of the agent: nothing moves. The agent signs last, so no signed half of a refused move exists to be found |
 | OutLayer's governance: a hostile build or upgrade | E at most, and still no move without the agent's signature |
-| The coordinator | no key and no move; the enclave verifies the agent's signature and reads the wallet contract itself |
+| The coordinator | no key, and no move for an agent that makes the SDK's checks; the enclave verifies the agent's signature and reads the wallet contract itself. The amounts per period are counted here; the per-transaction limit, the kinds, the tokens, the allowlist, the approvals and the freeze hold without it |
 | The agent's machine | A. Every operation still passes the enclave's policy; the owner freezes the wallet |
 | A prompt injection into the agent | an operation request, which the enclave judges by the policy |
-| The owner's key, under a locked policy | what the policy allows as it stands: a change of policy and an exit both need the approvers |
+| The owner's key, under a locked policy | on a wallet contract account with no access key, what the policy allows per period: a change of the policy, its unlock and an exit need the approvers' quorum. A wallet contract on the owner's own account is under that account's keys |
 | NEAR MPC | E, through the master; not A, which comes from the owner's own signature. Nothing moves |
 
-Nothing leaves the wallet contract without both signatures, and the enclave
-gives its own only to an operation the owner's policy allows. No single system
-on the list is enough to move funds, the network that derives keys included.
+On a wallet contract account with no access key (the `0s…` default and a
+sub-account the setup made), nothing leaves the wallet contract without both
+signatures, and the enclave gives its own only to an operation the owner's
+policy allows. None of the systems on the list moves funds alone, the network
+that derives keys included.
 
 ## 7. Leaving without OutLayer
 
@@ -181,33 +188,35 @@ The owner's master is escrowed in the OutLayer DAO's contract (`dao.outlayer.nea
 key only NEAR MPC can produce for that owner. The contract builds the key's
 path from the account that calls it, so the exit belongs to the owner account
 by its name. The owner starts an exit, waits the window they chose, and claims
-the master. From it they derive E; their wallet repeats one signature and
-gives A; and an offline tool builds a request with both halves that any NEAR
+the master. From it they derive E; their wallet repeats one signature, with
+the same key of the owner's account that signed at setup, and gives A; and an offline tool builds a request with both halves that any NEAR
 account can relay. No OutLayer service takes part: NEAR and NEAR MPC are
 enough.
 
-After the exit the owner is the only holder of both keys, and the wallet
-contract is an ordinary Intents wallet of theirs.
+After the exit the owner holds both keys. The pair of the wallet contract
+does not change, so the owner moves the balance to an account of their own.
 
 ## 8. Questions for any design that holds an agent's funds
 
 | Question | Agent On-chain custody |
 |---|---|
-| What does a move need? | the agent's signature and the enclave's, which the enclave gives only under the policy; no single system is enough |
+| What does a move need? | the agent's signature and the enclave's, which the enclave gives only under the policy; none of the systems moves funds alone |
 | What can the party that checks the policy do alone? | refuse |
 | What can the network that derives keys do alone? | reach one key of the two |
 | What runs for each move? | one NEAR transaction with two Ed25519 verifications; no signing round of a network |
 | How does the owner act with the provider gone? | the owner exit: both keys, signed offline |
 | What new contract code sits under the funds? | one signing standard, with no state and no clock |
-| What does the agent reach beyond the chain? | every OutLayer connector and secret, under the same owner's policy and approvals |
+| What does the agent reach beyond the chain? | every OutLayer connector and secret; the connector's own rules and the owner's approvals apply |
 
 ## 9. NEAR Intents and other chains
 
 The wallet contract holds its balance in `intents.near` like any Intents
 account. A swap or a withdrawal to another chain goes through the 1Click API
-as it is: the quote names the wallet contract as recipient and refund
-address, and the wallet contract funds it with one `mt_transfer` to the
-quote's deposit address. A withdrawal on NEAR is `ft_withdraw`. Each is one
+as it is: for a swap the quote names the wallet contract as recipient and
+refund address; for a withdrawal to another chain the recipient is the
+address the operation names and the refund address is the wallet contract.
+The wallet contract funds the quote with one `mt_transfer` to its deposit
+address. A withdrawal on NEAR is `ft_withdraw`. Each is one
 request under two signatures.
 
 The signing standard also implements the off-chain side of the contract
