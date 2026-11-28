@@ -51,8 +51,24 @@
 #   NM  an agent on a new machine: the owner's own signature (Bearer near:) stores a policy
 #       naming a new key, which runs the wallet while the old one stops; a setup again shows
 #       the wallet contract on record and hands the same agent key over for the same account
-#   X   the owner's exit: after the claim the agent's operations are refused; the owner,
-#       with the recovery tool and no OutLayer service, moves funds out of the wallet contract
+#   L   a locked policy on a wallet with a wallet contract (wallet 0; APPROVER and APPROVER2,
+#       2 of 2). The keystore signs the lock only when the owner's exit needs the same quorum
+#       in the DAO, and never with an approver pinned to a key; with the set named, the owner
+#       alone stores the first locked policy
+#   LF  under the lock the owner alone freezes: nothing is prepared; and unfreezes
+#   LB  an operation inside the limits needs no approver: prepared, the TEE's half verified,
+#       the agent's half last, executed
+#   LC  a change of the policy by the owner alone is held: nothing signed, the chain and the
+#       limit in force unchanged, a delete refused on chain; one vote of two keeps it held;
+#       the second signs it, the owner stores it (still locked) and the new limit applies
+#   LE  the exit under the lock: the owner alone cannot drop the exit approvers (one reject
+#       ends the change); an exit past its window is not claimed without a vote, a vote from
+#       outside the set is refused, and one reject ends the exit
+#   LU  the unlock is a change like any other: held, then signed by the quorum and stored
+#   X   the owner's exit: with exit approvers in force (L) one vote of two does not open the
+#       claim and the second does; after the claim the agent's operations are refused; the
+#       owner, with the recovery tool and no OutLayer service, moves funds out of the wallet
+#       contract
 #
 # D takes two DAO votes on testnet (members' keys in the local keychain); between them every
 # wallet contract on testnet is refused, and the cleanup approves the build again if the run
@@ -63,15 +79,18 @@
 #
 # Run:
 #   PARENT=outlayer-alice.testnet ./tests/on_chain_custody_e2e.sh --apply
-# APPROVER (default outlayer-carol) votes; RECIPIENT (default outlayer-daniel) is paid;
-# STRANGER (default outlayer-bob) sends the on-chain refusals. About 4.5 NEAR of PARENT's, most of
-# it left on the run's accounts. The working account relays: nearcore reserves 300 Tgas at its
-# pessimistic gas price before a relay runs (0.3 NEAR on testnet), so it is funded with 1 NEAR.
+# APPROVER (default outlayer-carol) votes; APPROVER2 (default RECIPIENT) is the lock's second
+# approver; RECIPIENT (default outlayer-daniel) is paid; STRANGER (default outlayer-bob) sends
+# the on-chain refusals. About 4.5 NEAR of PARENT's, most of it left on the run's accounts. The
+# working account relays: nearcore reserves 300 Tgas at its pessimistic gas price before a relay
+# runs (0.3 NEAR on testnet), so it is funded with 1 NEAR. L is the owner's: three policy writes
+# (0.1 NEAR attached to each), one more exit fee (0.01 NEAR) and one more exit window (60 s);
+# the approvers pay the gas of their exit votes.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 source "$HOS_LIB_DIR/near_sign.sh"
 
-[[ "${1:-}" == "--apply" ]] || { sed -n '3,65p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
+[[ "${1:-}" == "--apply" ]] || { sed -n '3,81p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
 [[ "$NETWORK" == testnet ]] || { echo "✗ this suite runs on testnet" >&2; exit 1; }
 
 DAO="${DAO:-dao.outlayer.testnet}"
@@ -79,13 +98,14 @@ CONTRACT_ID="${CONTRACT_ID:-outlayer.testnet}"
 BUILD="${BUILD:-651XC7DH8J4Xczf8JKXH9pyveBY8ZuNCfy5HZ3SvuSiL}"
 APPROVER="${APPROVER:-outlayer-carol.testnet}"
 RECIPIENT="${RECIPIENT:-outlayer-daniel.testnet}"
+APPROVER2="${APPROVER2:-$RECIPIENT}"
 STRANGER="${STRANGER:-outlayer-bob.testnet}"
 DAO_MEMBER="${DAO_MEMBER:-zavodil.testnet}"
 MPC_CONTRACT="${MPC_CONTRACT:-v1.signer-prod.testnet}"
 VECTORS="${VECTORS:-$REPO_ROOT/../shared-tee-helpers/custody-core/vectors}"
 AGENT_JS="$HOS_LIB_DIR/custody_agent.mjs"
 hos_require
-for a in "$APPROVER" "$RECIPIENT" "$STRANGER"; do
+for a in "$APPROVER" "$APPROVER2" "$RECIPIENT" "$STRANGER"; do
   [[ -f "$CREDS_DIR/$a.json" ]] || { echo "✗ creds missing for $a" >&2; exit 1; }
 done
 
@@ -412,6 +432,7 @@ api_wk "$WK0" POST /wallet/v1/encrypt-policy "$POLICY" >/dev/null
 PENC=$(jq -r '.encrypted_base64 // ""' <<<"$BODY")
 api_wk "$WK0" POST /wallet/v1/sign-policy "$(jq -nc --arg ed "$PENC" --arg c "$OWNER" '{encrypted_data:$ed, caller:$c}')" >/dev/null
 if [[ "$HTTP" == 200 ]]; then
+  WPUB0="ed25519:$(jq -r .public_key_hex <<<"$BODY")"
   ARGS=$(jq -c --arg ed "$PENC" '{wallet_pubkey:("ed25519:" + .public_key_hex), encrypted_data:$ed, wallet_signature:.signature_hex, version, locked, valid_until}' <<<"$BODY")
   OUT=$(near contract call-function as-transaction "$CONTRACT_ID" store_wallet_policy json-args "$ARGS" \
     prepaid-gas '100 Tgas' attached-deposit '0.1 NEAR' sign-as "$OWNER" network-config "$NETWORK" sign-with-keychain send 2>&1) \
@@ -811,19 +832,272 @@ if owner_policy '{wallet_id, rules, approval, capabilities, refund_addresses} | 
 else fail "NM the creation key did not come back"; fi
 rm -f "$WORK/new.wk"
 
-# ── X ────────────────────────────────────────────────────────────────────────
-log "X  the owner's exit"
+# ── L ────────────────────────────────────────────────────────────────────────
+# The owner's side of the DAO's exit, for L and X.
 MPC_PK=$(near_view "$MPC_CONTRACT" public_key '{"domain_id":2}' | tr -d '"')
 exit_tool() {
   local cmd=$1; shift
   RPC_URL="$RPC_URL" OWNER_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" MPC_PUBLIC_KEY="$MPC_PK" \
     "$RECOVERY_BIN" owner-exit "$cmd" --owner "$OWNER" --dao "$DAO" "$@" 2>&1
 }
+exit_record() { near_view "$DAO" get_exit_owner "$(jq -nc --arg a "$OWNER" '{account:$a}')"; }
+# exit_set — the exit approvers in force, sorted, and their threshold.
+exit_set() { exit_record | jq -c '[(.approvers | sort), .threshold]' 2>/dev/null; }
+# tx <signer> <contract> <method> <args-json> <deposit> — a transaction; its output in OUT.
+# One refused for its nonce was never applied (near-cli read the key's nonce from a node a
+# block behind) and is sent again.
+tx() {
+  local attempt rc
+  for attempt in 1 2 3; do
+    OUT=$(near --quiet contract call-function as-transaction "$2" "$3" json-args "$4" \
+      prepaid-gas '100 Tgas' attached-deposit "$5" sign-as "$1" network-config "$NETWORK" \
+      sign-with-keychain send 2>&1); rc=$?
+    sleep 3
+    grep -q 'Transaction nonce .* must be account\[access_key\].nonce' <<<"$OUT" || return $rc
+  done
+  return $rc
+}
+# exit_vote <approve|reject> <approver> <nonce> — an approver's vote on the owner's pending action.
+exit_vote() { tx "$2" "$DAO" "${1}_exit" "$(jq -nc --arg o "$OWNER" --argjson n "$3" '{owner:$o, nonce:$n}')" '1 yoctoNEAR'; }
+# The policy record of wallet 0 on chain as version/locked/frozen; chain_shows waits for it.
+policy_chain() { near_view "$CONTRACT_ID" get_wallet_policy "$(jq -nc --arg k "${WPUB0:-}" '{wallet_pubkey:$k}')" | jq -r '"\(.version)/\(.locked)/\(.frozen)"' 2>/dev/null; }
+chain_shows() { # chain_shows <row and what> <version/locked/frozen>
+  local i got=""
+  for i in 1 2 3 4 5 6; do got=$(policy_chain); [[ "$got" == "$2" ]] && break; sleep 3; done
+  [[ "$got" == "$2" ]] && pass "$1: the chain shows version/locked/frozen $got" || fail "$1: the chain shows $got, expected $2"
+}
+# policy_ask <policy-json> — wallet 0's key asks the keystore to sign a policy for the owner.
+# 0: signed, BODY is the signature and L_ENC the ciphertext. 2: held for the approvers
+# (L_AID, L_RID, L_HASH). 1: refused, HTTP and BODY say why.
+policy_ask() {
+  L_ENC=""; L_AID=""; L_RID=""; L_HASH=""
+  api_wk "$WK0" POST /wallet/v1/encrypt-policy "$1" >/dev/null
+  L_ENC=$(jq -r '.encrypted_base64 // ""' <<<"$BODY" 2>/dev/null); [[ -n "$L_ENC" ]] || return 1
+  api_wk "$WK0" POST /wallet/v1/sign-policy "$(jq -nc --arg ed "$L_ENC" --arg c "$OWNER" '{encrypted_data:$ed, caller:$c}')" >/dev/null
+  if [[ "$(jq -r '.status // ""' <<<"$BODY" 2>/dev/null)" == pending_approval ]]; then
+    L_AID=$(jq -r .approval_id <<<"$BODY"); L_RID=$(jq -r .request_id <<<"$BODY"); L_HASH=$(jq -r .request_hash <<<"$BODY")
+    return 2
+  fi
+  [[ "$HTTP" == 200 && -n "$(jq -r '.signature_hex // ""' <<<"$BODY" 2>/dev/null)" ]]
+}
+# policy_store <store_wallet_policy args> — the owner's transaction.
+policy_store() { tx "$OWNER" "$CONTRACT_ID" store_wallet_policy "$1" '0.1 NEAR'; }
+# policy_vote <approver> <approval id> <request hash> — a NEP-413 approve by the approver's own
+# key. HTTP and BODY are the coordinator's answer.
+policy_vote() {
+  local who=$1 aid=$2 hash=$3 wpk nonce sig
+  api - GET "/wallet/v1/approval/$aid" >/dev/null; wpk=$(jq -r '.wallet_pubkey // ""' <<<"$BODY")
+  nonce=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+  sig=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$CREDS_DIR/$who.json")" "$RECOVERY_BIN" sign-nep413 \
+    --message "approve:$aid:$wpk:$hash" --recipient "$CONTRACT_ID" --nonce-base64 "$nonce" | jq -r .signature)
+  api - POST "/wallet/v1/approve/$aid" "$(jq -nc --arg s "$sig" --arg pk "$(jq -r .public_key "$CREDS_DIR/$who.json")" \
+    --arg a "$who" --arg n "$nonce" '{signature:$s, public_key:$pk, account_id:$a, nonce:$n}')" >/dev/null
+}
+# policy_request <request id> — the held write's request, waited for; R_ST is where it ended
+# and BODY the request.
+R_ST=""
+policy_request() {
+  local i; R_ST=""
+  for i in $(seq 1 20); do
+    sleep 3
+    api_wk "$WK0" GET "/wallet/v1/requests/$1" >/dev/null
+    R_ST=$(jq -r '.status // ""' <<<"$BODY" 2>/dev/null)
+    [[ "$R_ST" == success || "$R_ST" == failed || "$R_ST" == rejected ]] && return 0
+  done
+  return 1
+}
+# ask_until <id prefix> <op> <status|error> — the agent asks, under a new id each time, until
+# the answer's status or error code is the one named (a write on chain reaches the
+# coordinator within a minute). ASKED is the id of the last ask.
+ASKED=""
+ask_until() {
+  local i
+  for i in $(seq 1 20); do
+    ASKED="$1$i-$TS"; ask "$ASKED" "$2"
+    [[ "$(jq -r '.status // .error // ""' <<<"$BODY" 2>/dev/null)" == "$3" ]] && return 0
+    sleep 3
+  done
+  return 1
+}
+# run_prepared <row> <name> <op> — the operation in BODY is waiting for the agent: checked,
+# signed last, relayed, settled.
+run_prepared() {
+  keep_prepared "$2"
+  check_prepared "$2" "$3" && pass "$1 prepared: the request is the transfer asked for, and the TEE's half is valid" \
+    || fail "$1 the prepared request is not the operation asked for"
+  relay_with "$ASKED" "$(node "$AGENT_JS" half "$WORK/$2.msg")"
+  if [[ "$HTTP" == 200 ]] && settle "$ASKED" && [[ "$STATUS" == success ]]; then pass "$1 the agent's half last: executed"
+  else fail "$1 relay: $HTTP status=$STATUS $(why)"; fi
+}
+
+log "L  a locked policy on a wallet with a wallet contract: approvers $APPROVER + $APPROVER2 (2 of 2)"
+# 0.05 NEAR a transfer, 0.2 a day without the approvers; LC raises the first to 0.1.
+lock_policy() { # lock_policy <per_transaction> <locked true|false> [approvers-json]
+  jq -nc --arg w "$WID0" --arg a "$APPROVER" --arg b "$APPROVER2" --arg per "$1" --argjson locked "$2" --argjson approvers "${3:-null}" \
+    '{wallet_id:$w, rules:{transaction_types:["transfer"], limits:{per_transaction:{native:$per}}},
+      approval:({threshold:{required:2}, approvers:($approvers // [{id:$a},{id:$b}]), auto_up_to:{daily:{native:"200000000000000000000000"}}}
+                + (if $locked then {locked:true} else {} end))}'
+}
+PER_OLD=50000000000000000000000; PER_NEW=100000000000000000000000; L_PER=$PER_OLD
+TRANSFER_OVER=$(jq -nc --arg to "$RECIPIENT" '{kind:"transfer", to:$to, amount:"60000000000000000000000"}')   # 0.06 NEAR
+WANT_SET=$(jq -nc --arg a "$APPROVER" --arg b "$APPROVER2" '[([$a,$b] | sort), 2]')
+L_LOCKED=""; L_V=""
+if [[ -z "${WPUB0:-}" || "$(policy_chain | cut -d/ -f2)" != false ]]; then
+  fail "L  wallet 0 has no unlocked policy on chain to lock ($(policy_chain))"
+else
+  L_V=$(policy_chain | cut -d/ -f1)
+  policy_ask "$(lock_policy "$PER_OLD" true)"; RC=$?
+  [[ $RC -eq 1 && "$HTTP" =~ ^4 ]] && grep -q 'set_exit_approvers' <<<"$BODY" \
+    && pass "L  with no exit approvers in the DAO the keystore does not sign a locked policy ($HTTP, names set_exit_approvers)" \
+    || fail "L  a lock with no exit approvers: rc=$RC $HTTP $(why)"
+  tx "$OWNER" "$DAO" set_exit_approvers "$(jq -nc --arg a "$APPROVER" --arg b "$APPROVER2" '{approvers:[$a,$b], threshold:2}')" '1 yoctoNEAR'
+  [[ "$(exit_set)" == "$WANT_SET" ]] && pass "L  the owner names the exit approvers in the DAO: the first set is in force at once" \
+    || fail "L  set_exit_approvers: $(near_why "$OUT"); the DAO shows $(exit_set)"
+  policy_ask "$(lock_policy "$PER_OLD" true "$(jq -nc --arg a "$APPROVER" --arg k "$APPROVER_PUB" --arg b "$APPROVER2" '[{id:$a, pubkey:$k},{id:$b}]')")"; RC=$?
+  [[ $RC -eq 1 && "$HTTP" =~ ^4 ]] && grep -q 'pinned to a key' <<<"$BODY" \
+    && pass "L  a lock with an approver pinned to a key is not signed ($HTTP)" \
+    || fail "L  a lock with a pinned approver: rc=$RC $HTTP $(why)"
+  policy_ask "$(lock_policy "$PER_OLD" true)"; RC=$?
+  if [[ $RC -eq 0 && "$(jq -c '[.version, .locked]' <<<"$BODY")" == "[$((L_V + 1)),true]" ]]; then
+    pass "L  the keystore signs the lock for the owner alone: version $((L_V + 1)), locked"
+    policy_store "$(jq -c --arg ed "$L_ENC" '{wallet_pubkey:("ed25519:" + .public_key_hex), encrypted_data:$ed, wallet_signature:.signature_hex, version, locked, valid_until}' <<<"$BODY")" \
+      && pass "L  the owner alone stores the first locked policy" || fail "L  store_wallet_policy: $(near_why "$OUT")"
+    L_V=$((L_V + 1))
+    chain_shows "L  after the owner's write" "$L_V/true/false"
+    [[ "$(policy_chain)" == "$L_V/true/false" ]] && L_LOCKED=1
+  else fail "L  the first lock: rc=$RC $HTTP $(why)"; fi
+fi
+
+if [[ -z "$L_LOCKED" ]]; then
+  skip "LF LB LC LE LU: the locked policy is not on chain, so nothing under it is judged"
+else
+  # ── LF ─────────────────────────────────────────────────────────────────────
+  log "LF under the lock the owner alone freezes and unfreezes"
+  tx "$OWNER" "$CONTRACT_ID" freeze_wallet "$(jq -nc --arg k "$WPUB0" '{wallet_pubkey:$k}')" '0 NEAR' \
+    && pass "LF freeze_wallet by the owner alone went through" || fail "LF freeze_wallet: $(near_why "$OUT")"
+  chain_shows "LF frozen" "$L_V/true/true"
+  ask_until lf "$TRANSFER_TINY" wallet_frozen && [[ "$HTTP" == 403 ]] \
+    && pass "LF nothing is prepared for a frozen wallet (403 wallet_frozen)" || fail "LF an operation of a frozen wallet: $HTTP $(why)"
+  tx "$OWNER" "$CONTRACT_ID" unfreeze_wallet "$(jq -nc --arg k "$WPUB0" '{wallet_pubkey:$k}')" '0 NEAR' \
+    && pass "LF unfreeze_wallet by the owner alone went through" || fail "LF unfreeze_wallet: $(near_why "$OUT")"
+  chain_shows "LF unfrozen" "$L_V/true/false"
+
+  # ── LB ─────────────────────────────────────────────────────────────────────
+  log "LB an operation inside the limits, under the lock"
+  if ask_until lb "$TRANSFER_TINY" awaiting_signature; then
+    pass "LB 0.001 NEAR under the locked policy waits for no approver"
+    run_prepared LB lb "$TRANSFER_TINY"
+  else fail "LB ask: $HTTP $(why)"; fi
+
+  # ── LC ─────────────────────────────────────────────────────────────────────
+  log "LC a change of the policy under the lock: 0.05 → 0.1 NEAR a transfer"
+  ask "lc0-$TS" "$TRANSFER_OVER"
+  [[ "$HTTP" == 403 && "$(jq -r .error <<<"$BODY")" == policy_denied ]] && pass "LC 0.06 NEAR is over the limit in force (403 policy_denied)" \
+    || fail "LC 0.06 NEAR before the change: $HTTP $(why)"
+  policy_ask "$(lock_policy "$PER_NEW" true)"; RC=$?
+  if [[ $RC -eq 2 ]]; then
+    C_AID=$L_AID C_RID=$L_RID C_HASH=$L_HASH
+    [[ -z "$(jq -r '.signature_hex // ""' <<<"$BODY")" ]] && pass "LC the owner alone gets no signature: the write is held for the approvers" \
+      || fail "LC a held write carries a signature"
+    api - GET "/wallet/v1/approval/$C_AID" >/dev/null
+    [[ "$(jq -c '[.request_type, .required_approvals, .request_data.version, .request_data.locked]' <<<"$BODY")" == "[\"policy_update\",2,$((L_V + 1)),true]" ]] \
+      && pass "LC the approvers see a policy_update to version $((L_V + 1)), still locked, needing 2 votes" \
+      || fail "LC the approval: $(jq -c '[.request_type, .required_approvals, .request_data.version, .request_data.locked]' <<<"$BODY" 2>/dev/null)"
+    tx "$OWNER" "$CONTRACT_ID" delete_wallet_policy "$(jq -nc --arg k "$WPUB0" '{wallet_pubkey:$k}')" '0 NEAR'
+    RC=$?; WHY=$(near_why "$OUT")
+    [[ $RC -ne 0 ]] && grep -q 'policy is locked' <<<"$WHY" && pass "LC the owner cannot delete the policy instead: refused on chain (policy is locked)" \
+      || fail "LC delete_wallet_policy under the lock: rc=$RC $WHY"
+    policy_vote "$APPROVER" "$C_AID" "$C_HASH"
+    [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == pending ]] && pass "LC one vote of two: still held" || fail "LC the first vote: $HTTP $(why)"
+    chain_shows "LC with one vote" "$L_V/true/false"
+    ask "lc1-$TS" "$TRANSFER_OVER"
+    [[ "$HTTP" == 403 && "$(jq -r .error <<<"$BODY")" == policy_denied ]] && pass "LC the limit in force is still the old one (403 policy_denied)" \
+      || fail "LC 0.06 NEAR with one vote: $HTTP $(why)"
+    policy_vote "$APPROVER2" "$C_AID" "$C_HASH"
+    [[ "$HTTP" == 200 ]] || fail "LC the second vote: $HTTP $(why)"
+    policy_request "$C_RID"
+    if [[ "$R_ST" == success && "$(jq -c '[.result.version, .result.locked]' <<<"$BODY")" == "[$((L_V + 1)),true]" ]]; then
+      pass "LC with the quorum the keystore signed the write: version $((L_V + 1)), locked"
+      policy_store "$(jq -c '.result | {wallet_pubkey, encrypted_data, wallet_signature, version, locked, valid_until}' <<<"$BODY")" \
+        && pass "LC the owner stores the approved policy" || fail "LC store_wallet_policy: $(near_why "$OUT")"
+      L_V=$((L_V + 1)); L_PER=$PER_NEW
+      chain_shows "LC after the quorum" "$L_V/true/false"
+      if ask_until lc "$TRANSFER_OVER" awaiting_signature; then
+        pass "LC the new limit applies: 0.06 NEAR is prepared"
+        run_prepared LC lc "$TRANSFER_OVER"
+      else fail "LC 0.06 NEAR after the change: $HTTP $(why)"; fi
+    else fail "LC the held write ended '$R_ST': $(jq -c '.result' <<<"$BODY" 2>/dev/null | head -c 200)"; fi
+  else fail "LC a change under the lock was not held: rc=$RC $HTTP $(why)"; fi
+
+  # ── LE ─────────────────────────────────────────────────────────────────────
+  log "LE the exit under the lock"
+  tx "$OWNER" "$DAO" set_exit_approvers '{"approvers":[], "threshold":0}' '1 yoctoNEAR'
+  E_REC=$(exit_record); E_NONCE=$(jq -r '.pending.nonce // ""' <<<"$E_REC")
+  if [[ -n "$E_NONCE" && "$(jq -c '.pending.kind | keys' <<<"$E_REC")" == '["SetApprovers"]' && "$(exit_set)" == "$WANT_SET" ]]; then
+    pass "LE the owner alone cannot drop the exit approvers: the change is pending, the set stays in force"
+    exit_vote reject "$APPROVER" "$E_NONCE"
+    [[ "$(exit_record | jq -c '.pending')" == null && "$(exit_set)" == "$WANT_SET" ]] && pass "LE one reject ends the change: the set is as it was" \
+      || fail "LE reject_exit on the change: $(near_why "$OUT"); the DAO shows $(exit_set)"
+  else fail "LE set_exit_approvers to none: $(near_why "$OUT"); pending $(jq -c '.pending.kind // null' <<<"$E_REC" 2>/dev/null)"; fi
+  if [[ "$MPC_PK" == bls12381g2:* ]] && OUT=$(exit_tool initiate); then
+    E_REC=$(exit_record); E_NONCE=$(jq -r '.pending.nonce // ""' <<<"$E_REC"); E_GEN=$(jq -r .generation <<<"$E_REC")
+    pass "LE the owner started an exit (nonce $E_NONCE)"
+    exit_vote approve "$STRANGER" "$E_NONCE"
+    RC=$?; WHY=$(near_why "$OUT")
+    [[ $RC -ne 0 ]] && grep -q 'not an approver of this owner' <<<"$WHY" && pass "LE a vote from outside the set is refused on chain" \
+      || fail "LE approve_exit by $STRANGER: rc=$RC $WHY"
+    AFTER=$(jq -r '(.pending.kind.Exit.finalize_after // 0) / 1e9 | floor' <<<"$E_REC")
+    WAIT=$(( AFTER + 6 - $(date +%s) )); (( WAIT > 0 )) && { note "waiting ${WAIT}s for the exit window"; sleep "$WAIT"; }
+    OUT=$(exit_tool claim --claim-file "$WORK/claim-novote.json"); OUT=$(grep -v '^master_hex=' <<<"$OUT")
+    E_REC=$(exit_record)
+    if grep -q '0 of 2 approvals' <<<"$OUT" && [[ "$(jq -c '[.generation, .claim_in_flight, (.pending.nonce | tostring)]' <<<"$E_REC")" == "[$E_GEN,false,\"$E_NONCE\"]" ]]; then
+      pass "LE past the window the claim is refused without the approvers (0 of 2 approvals); the generation stays $E_GEN"
+    else fail "LE a claim with no vote: $(grep -oE '[0-9]+ of [0-9]+ approvals|the exit window has not elapsed|no exit is pending' <<<"$OUT" | head -1); the DAO shows $(jq -c '{generation, claim_in_flight}' <<<"$E_REC" 2>/dev/null)"; fi
+    exit_vote reject "$APPROVER2" "$E_NONCE"
+    [[ "$(exit_record | jq -c '[.pending, .generation]')" == "[null,$E_GEN]" ]] && pass "LE one reject by an approver ends the exit" \
+      || fail "LE reject_exit: $(near_why "$OUT"); pending $(exit_record | jq -c '.pending.kind // null' 2>/dev/null)"
+    ask_until le "$TRANSFER_TINY" awaiting_signature && pass "LE the wallet goes on after the rejected exit: an operation is prepared" \
+      || fail "LE an operation after the rejected exit: $HTTP $(why)"
+  else fail "LE the exit did not start: $(near_why "$OUT")"; fi
+
+  # ── LU ─────────────────────────────────────────────────────────────────────
+  log "LU the unlock"
+  policy_ask "$(lock_policy "$L_PER" false)"; RC=$?
+  if [[ $RC -eq 2 ]]; then
+    pass "LU the owner alone does not unlock: the write is held for the approvers"
+    U_AID=$L_AID U_RID=$L_RID U_HASH=$L_HASH
+    policy_vote "$APPROVER" "$U_AID" "$U_HASH"
+    [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == pending ]] && pass "LU one vote of two: still held" || fail "LU the first vote: $HTTP $(why)"
+    chain_shows "LU with one vote" "$L_V/true/false"
+    policy_vote "$APPROVER2" "$U_AID" "$U_HASH"
+    [[ "$HTTP" == 200 ]] || fail "LU the second vote: $HTTP $(why)"
+    policy_request "$U_RID"
+    if [[ "$R_ST" == success && "$(jq -c '[.result.version, .result.locked]' <<<"$BODY")" == "[$((L_V + 1)),false]" ]]; then
+      policy_store "$(jq -c '.result | {wallet_pubkey, encrypted_data, wallet_signature, version, locked, valid_until}' <<<"$BODY")" \
+        && pass "LU with the quorum the unlock is signed, and the owner stores it" || fail "LU store_wallet_policy: $(near_why "$OUT")"
+      L_V=$((L_V + 1))
+      chain_shows "LU after the quorum" "$L_V/false/false"
+    else fail "LU the held unlock ended '$R_ST': $(jq -c '.result' <<<"$BODY" 2>/dev/null | head -c 200)"; fi
+  else fail "LU an unlock was not held: rc=$RC $HTTP $(why)"; fi
+fi
+
+# ── X ────────────────────────────────────────────────────────────────────────
+log "X  the owner's exit"
 MASTER=""
 if [[ "$MPC_PK" == bls12381g2:* ]] && OUT=$(exit_tool initiate); then
   pass "X  the owner started the exit"
-  AFTER=$(near_view "$DAO" get_exit_owner "$(jq -nc --arg a "$OWNER" '{account:$a}')" | jq -r '(.pending.kind.Exit.finalize_after // 0) / 1e9 | floor')
+  X_REC=$(exit_record); X_NONCE=$(jq -r '.pending.nonce // ""' <<<"$X_REC"); X_GEN=$(jq -r .generation <<<"$X_REC")
+  AFTER=$(jq -r '(.pending.kind.Exit.finalize_after // 0) / 1e9 | floor' <<<"$X_REC")
   WAIT=$(( AFTER + 6 - $(date +%s) )); (( WAIT > 0 )) && { note "waiting ${WAIT}s for the exit window"; sleep "$WAIT"; }
+  # With exit approvers in force (L) the claim takes their quorum as well as the window.
+  if [[ "$(jq -r '.approvers | length' <<<"$X_REC")" != 0 ]]; then
+    exit_vote approve "$APPROVER" "$X_NONCE" && pass "X  $APPROVER approves the exit on chain" || fail "X  approve_exit by $APPROVER: $(near_why "$OUT")"
+    OUT=$(exit_tool claim --claim-file "$WORK/claim-onevote.json"); OUT=$(grep -v '^master_hex=' <<<"$OUT")
+    grep -q '1 of 2 approvals' <<<"$OUT" && [[ "$(exit_record | jq -r .generation)" == "$X_GEN" ]] \
+      && pass "X  one vote of two does not open the claim (1 of 2 approvals)" \
+      || fail "X  a claim with one vote of two: $(grep -oE '[0-9]+ of [0-9]+ approvals|the exit window has not elapsed|no exit is pending' <<<"$OUT" | head -1)"
+    exit_vote approve "$APPROVER2" "$X_NONCE" && pass "X  $APPROVER2 approves: the quorum" || fail "X  approve_exit by $APPROVER2: $(near_why "$OUT")"
+  fi
   OUT=$(exit_tool claim --claim-file "$WORK/claim.json")
   MASTER=$(grep -oE '^master_hex=[0-9a-f]{64}$' <<<"$OUT" | cut -d= -f2); OUT=$(grep -v '^master_hex=' <<<"$OUT")
   [[ -n "$MASTER" ]] && pass "X  the claim gave the owner the master" || fail "X  claim: $(near_why "$OUT")"
