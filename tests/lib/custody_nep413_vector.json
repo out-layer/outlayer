@@ -1,0 +1,18 @@
+{
+  "comment": "TEST-ONLY owner key (RFC 8032 section 7.1, TEST 3). Never registered anywhere. A NEP-413 signature of the agent key's message, as a wallet makes it: SHA-256 of (2^31 + 413 as u32 LE) || borsh {message, nonce [32], recipient, callbackUrl: None}, signed with Ed25519; then the agent's seed derived from it. Produced by node:crypto; the coordinator's verify_nep413_signature accepts it.",
+  "owner": "alice.near",
+  "wallet_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "owner_secret_seed": "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+  "owner_public_key": "ed25519:Hyx62wPQGyvXCoihZq1BrbUjBRh2LuNxWiiqMkfAuSZr",
+  "owner_public_key_hex": "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+  "message": "This signature is the key of your OutLayer agent. Sign it only on app.outlayer.ai, when you set up or recover an agent.\nOwner: alice.near\nWallet: 7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "recipient": "outlayer-agent-key",
+  "nonce_hex": "6f75746c617965722f6167656e742d6b65792f76312f6e6f6e63650000000000",
+  "nonce_base64": "b3V0bGF5ZXIvYWdlbnQta2V5L3YxL25vbmNlAAAAAAA=",
+  "signed_payload_hex": "9d010080b600000054686973207369676e617475726520697320746865206b6579206f6620796f7572204f75744c61796572206167656e742e205369676e206974206f6e6c79206f6e206170702e6f75746c617965722e61692c207768656e20796f7520736574207570206f72207265636f76657220616e206167656e742e0a4f776e65723a20616c6963652e6e6561720a57616c6c65743a2037633965363637392d373432352d343064652d393434622d6530376663316639306165376f75746c617965722f6167656e742d6b65792f76312f6e6f6e63650000000000120000006f75746c617965722d6167656e742d6b657900",
+  "signed_hash_hex": "553ad9d6397b4d14e3f3a324272fc3f51295ff3e1e6912c83ed8761a090da090",
+  "signature_hex": "b22c14f7f47907f43aa81b9e5e4d195c24f32ca2af86c71dfdc1877ea12fa4ee08d10dd49742b954e5424c50cf67b57524a15c54d7f65170c9fc7a04f414cd09",
+  "signature_base64": "siwU9/R5B/Q6qBueXk0ZXCTzLKKvhscd/cGHfqEvpO4I0Q3Ul0K5VOVCTFDPZ7V1JKFcVNf2UXDJ/HoE9BTNCQ==",
+  "agent_seed": "1b96276c9588bc44e3f3d6a201c40e530e8cea986cc52e6d0d67efb972d9471e",
+  "agent_public_key": "a2215c2057fffbfece8ee61e20379a0a9a15755b994c1db93dbcd703d386b75c"
+}

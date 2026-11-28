@@ -5,11 +5,16 @@
 # The agent's side is tests/lib/custody_agent.mjs (custody-core's byte formats, held to its
 # vectors before anything runs); the owner's page is played by near-cli and the recovery tool.
 #
-#   P   the keystore DAO lists the build; the agent's side matches custody-core's vectors
+#   P   the keystore DAO lists the build; the agent's side matches custody-core's vectors and
+#       the keystore's statement vector
 #   F   an owner registers the exit and gets a wallet (generation 1, seed 0) from an agent link
-#   S1  the setup: the agent opens it; the owner reads it, signs the agent key's message,
+#   S1  the setup: the agent opens it; the owner reads it, checks the keystore's statement over
+#       the TEE key (its signature, then is_keystore_approved on the DAO), signs the agent key's message,
 #       creates `agent.<owner>`, installs the published build with `(A, E)` and removes every
-#       key; seals the agent's key; the agent collects it and opens the same key
+#       key; seals the owner's signature and its key; the agent collects it as the SDK does
+#       (the NEP-413 signature, its key a full-access key of the owner on chain, the key it
+#       derives, the keystore's statement, the pair on chain) and has the same key; a seal of a
+#       signature by a key that is not the owner's is refused at the agent
 #   S2  on chain: the account runs the approved build, answers `w_public_key` with the pair
 #       the coordinator recorded, and has no access key
 #   S3  the setup token is spent; a setup naming an account outside the owner's is refused;
@@ -66,7 +71,7 @@
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 source "$HOS_LIB_DIR/near_sign.sh"
 
-[[ "${1:-}" == "--apply" ]] || { sed -n '3,60p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
+[[ "${1:-}" == "--apply" ]] || { sed -n '3,65p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
 [[ "$NETWORK" == testnet ]] || { echo "✗ this suite runs on testnet" >&2; exit 1; }
 
 DAO="${DAO:-dao.outlayer.testnet}"
@@ -267,10 +272,22 @@ owner_page() { # owner_page <METHOD> [body]
   HTTP=$(curl "${args[@]}" <<<"Authorization: Bearer $SETUP_TOKEN" 2>/dev/null)
   BODY=$(tr -d '\n' < "$out"); rm -f "$out" ${bodyf:+"$bodyf"}
 }
+# The agent's collect, as the SDK's collectSetup: the setup answer in BODY, the TEE key's
+# statement read here; agent_collect <wk> <x-file> <out> [setup-json]. Prints the account.
+agent_collect() {
+  local setup=${4:-$BODY}
+  api_wk "$1" GET /wallet/v1/contract/key >/dev/null
+  jq -nc --argjson s "$setup" --argjson k "$BODY" '{setup:$s, key:$k}' \
+    | RPC_URL="$RPC_URL" node "$AGENT_JS" collect "$2" "$OWNER" "$DAO" "$3"
+}
 owner_page GET
 if [[ "$HTTP" == 200 && "$(jq -c '[.wallet_id, .owner, .tee_public_key, .recipient_public_key, .agent_key_request.recipient]' <<<"$BODY")" == "$(jq -nc --arg w "$WID0" --arg o "$OWNER" --arg t "$TEE_PUB" --arg r "$RPUB" '[$w,$o,$t,$r,"outlayer-agent-key"]')" ]]; then
   pass "S1 the owner's page shows the wallet, the owner, the TEE key and the agent's one-time key"
 else fail "S1 the owner's page: $HTTP $(why)"; fi
+# The page uses the TEE key only once the keystore's statement over it checks out.
+if STATED=$(RPC_URL="$RPC_URL" node "$AGENT_JS" tee-statement "$DAO" "$OWNER" "$WID0" <<<"$BODY" 2>&1) && [[ "$STATED" == "$TEE_PUB" ]]; then
+  pass "S1 the TEE key comes with the keystore's statement: signed by a key $DAO approves, for this owner and wallet"
+else fail "S1 the keystore's statement over the TEE key: $STATED"; fi
 AK_MSG=$(jq -r '.agent_key_request.message' <<<"$BODY"); AK_NONCE=$(jq -r '.agent_key_request.nonce_base64' <<<"$BODY")
 AK_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" "$RECOVERY_BIN" sign-nep413 \
   --message "$AK_MSG" --recipient outlayer-agent-key --nonce-base64 "$AK_NONCE" | jq -r .signature)
@@ -291,7 +308,7 @@ OUT=$(near contract deploy "$AGENT_ACC" use-global-hash "$BUILD" with-init-call 
   || fail "S1 the install: $(near_why "$OUT")"
 OUT=$(near account delete-keys "$AGENT_ACC" public-keys "$OWNER_PUB" network-config "$NETWORK" sign-with-keychain send 2>&1) \
   || fail "S1 the owner's key was not removed: $(near_why "$OUT")"
-SEALED=$(AGENT_SEED_FILE="$WORK/owner_side.seed" node "$AGENT_JS" seal "$RPUB" "$WID0")
+SEALED=$(AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" node "$AGENT_JS" seal "$RPUB" "$OWNER" "$WID0" "$OWNER_PUB")
 owner_page POST "$(jq -nc --arg a "$OWNER.evil.testnet" --arg s "$SEALED" '{account_id:$a, sealed_agent_key:$s}')"
 [[ "$HTTP" == 400 ]] && pass "S3 a setup naming an account outside the owner's: 400" || fail "S3 an outside account answered $HTTP $(why)"
 owner_page POST "$(jq -nc --arg a "$AGENT_ACC" --arg s "$SEALED" '{account_id:$a, sealed_agent_key:$s}')"
@@ -305,10 +322,26 @@ owner_page GET
 # The agent collects its key.
 api_wk "$WK0" GET /wallet/v1/contract/setup >/dev/null
 if [[ "$HTTP" == 200 && "$(jq -c '[.done, .account_id, .agent_public_key]' <<<"$BODY")" == "$(jq -nc --arg a "$AGENT_ACC" --arg k "$AGENT_PUB" '[true,$a,$k]')" ]]; then
-  node "$AGENT_JS" open "$WORK/setup.x" "$WID0" "$(jq -r .sealed_agent_key <<<"$BODY")" "$WORK/agent.seed"
-  [[ "$(AGENT_SEED_FILE="$WORK/agent.seed" node "$AGENT_JS" pub)" == "$AGENT_PUB" ]] \
-    && pass "S1 the agent collected and opened its key: the contract's agent key" || fail "S1 the key the agent opened is not the contract's"
+  SETUP_DONE=$BODY
+  if COLLECTED=$(agent_collect "$WK0" "$WORK/setup.x" "$WORK/agent.seed" 2>&1) && [[ "$COLLECTED" == "$AGENT_ACC" ]] \
+     && [[ "$(AGENT_SEED_FILE="$WORK/agent.seed" node "$AGENT_JS" pub)" == "$AGENT_PUB" ]]; then
+    pass "S1 the agent's collect verified the owner's NEP-413 signature, its key as a full-access key of $OWNER on chain, and the pair on $AGENT_ACC: the contract's agent key"
+  else fail "S1 the agent's collect: $COLLECTED"; fi
+  # Anyone who knows the one-time key can seal to it: a signature of the owner's message by a
+  # key of its own, with the account it would name, is refused by the chain's access keys.
+  KP=$(node "$HOS_LIB_DIR/ed25519_keypair.mjs")
+  FORGED_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key <<<"$KP")" "$RECOVERY_BIN" sign-nep413 \
+    --message "$AK_MSG" --recipient outlayer-agent-key --nonce-base64 "$AK_NONCE" | jq -r .signature)
+  FORGED=$(AGENT_KEY_SIGNATURE="$FORGED_SIG" node "$AGENT_JS" seal "$RPUB" "$OWNER" "$WID0" "$(jq -r .public_key <<<"$KP")")
+  unset KP FORGED_SIG
+  if OUT=$(agent_collect "$WK0" "$WORK/setup.x" "$WORK/forged.seed" "$(jq -c --arg s "$FORGED" '.sealed_agent_key = $s' <<<"$SETUP_DONE")" 2>&1); then
+    fail "S1 a seal of a signature by a key that is not the owner's was taken: $OUT"
+  elif grep -q "is not a full-access key of $OWNER" <<<"$OUT"; then
+    pass "S1 a seal of a signature by a key that is not the owner's is refused at the agent (view_access_key on chain)"
+  else fail "S1 the forged seal was refused for another reason: $OUT"; fi
+  rm -f "$WORK/forged.seed"
 else fail "S1 the agent's collect: $HTTP $(why)"; fi
+skip "S1 a link without \`to\`: the suite finishes the setup with the token and opens no link; the page's setupLink refuses one (dashboard test/wallet-contract.test.mjs)"
 rm -f "$WORK/owner_side.seed"
 export AGENT_SEED_FILE="$WORK/agent.seed" ACCOUNT_OF_AGENT="$AGENT_ACC"
 
@@ -336,22 +369,30 @@ if new_wallet 1; then
   S4_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" "$RECOVERY_BIN" sign-nep413 \
     --message "$(jq -r '.agent_key_request.message' <<<"$BODY")" --recipient outlayer-agent-key \
     --nonce-base64 "$(jq -r '.agent_key_request.nonce_base64' <<<"$BODY")" | jq -r .signature)
-  AGENT_KEY_SIGNATURE="$S4_SIG" node "$AGENT_JS" seed "$OWNER" "$WID1" "$WORK/s4.seed"; unset S4_SIG
+  AGENT_KEY_SIGNATURE="$S4_SIG" node "$AGENT_JS" seed "$OWNER" "$WID1" "$WORK/s4.seed"
+  ( umask 077; printf '%s' "$S4_SIG" > "$WORK/s4.sig" ); unset S4_SIG
   A1=$(AGENT_SEED_FILE="$WORK/s4.seed" node "$AGENT_JS" pub)
   [[ "$A1" != "$AGENT_PUB" ]] && pass "S4 each wallet has its own agent key" || fail "S4 the same agent key for two wallets"
   OUT=$(near contract deploy "$OWNER" use-global-hash "$BUILD" with-init-call w_init \
     json-args "$(jq -nc --arg p "$A1$TEE1" '{public_key:$p}')" prepaid-gas '10 Tgas' attached-deposit '1 yoctoNEAR' \
     network-config "$NETWORK" sign-with-keychain send 2>&1) || fail "S4 the install on $OWNER: $(near_why "$OUT")"
-  owner_page POST "$(jq -nc --arg a "$OWNER" --arg s "$(AGENT_SEED_FILE="$WORK/s4.seed" node "$AGENT_JS" seal "$RPUB" "$WID1")" '{account_id:$a, sealed_agent_key:$s}')"
+  owner_page POST "$(jq -nc --arg a "$OWNER" --arg s "$(AGENT_KEY_SIGNATURE="$(cat "$WORK/s4.sig")" node "$AGENT_JS" seal "$RPUB" "$OWNER" "$WID1" "$OWNER_PUB")" '{account_id:$a, sealed_agent_key:$s}')"
   [[ "$HTTP" == 200 && "$(jq -r .account_id <<<"$BODY")" == "$OWNER" ]] && pass "S4 the owner's own account is the second wallet's contract" || fail "S4 finish: $HTTP $(why)"
   [[ "$(access_keys "$OWNER")" == "[\"$OWNER_PUB\"]" ]] && pass "S4 the owner's key stays on it" || fail "S4 keys on $OWNER: $(access_keys "$OWNER")"
+  api_wk "$WK1" GET /wallet/v1/contract/setup >/dev/null
+  if [[ "$HTTP" == 200 && "$(jq -c '[.done, .account_id, .agent_public_key]' <<<"$BODY")" == "$(jq -nc --arg a "$OWNER" --arg k "$A1" '[true,$a,$k]')" ]]; then
+    if COLLECTED=$(agent_collect "$WK1" "$WORK/setup.x" "$WORK/s4.collected" 2>&1) && [[ "$COLLECTED" == "$OWNER" ]] \
+       && [[ "$(AGENT_SEED_FILE="$WORK/s4.collected" node "$AGENT_JS" pub)" == "$A1" ]]; then
+      pass "S4 the agent collected its key for the owner's own account: the owner's signature, its key on chain and the pair on $OWNER checked"
+    else fail "S4 the agent's collect: $COLLECTED"; fi
+  else fail "S4 the agent's collect: $HTTP $(why)"; fi
   api_wk "$WK1" PUT /wallet/v1/contract "$(jq -nc --arg a "$AGENT_ACC" '{account_id:$a}')" >/dev/null
   [[ "$HTTP" == 400 ]] && grep -q 'was not set up for this wallet' <<<"$BODY" && pass "S3 the agent cannot name another wallet's contract: 400" \
     || fail "S3 another wallet's contract answered $HTTP $(why)"
   api_wk "$WK1" PUT /wallet/v1/contract "$(jq -nc --arg a "$PARENT" '{account_id:$a}')" >/dev/null
   [[ "$HTTP" == 400 ]] && grep -q 'does not answer `w_public_key`' <<<"$BODY" && pass "S3 an account with no wallet contract: 400" \
     || fail "S3 an account with no contract answered $HTTP $(why)"
-  rm -f "$WORK/s4.seed"
+  rm -f "$WORK/s4.seed" "$WORK/s4.sig" "$WORK/s4.collected"
 else fail "S4 the second wallet: $HTTP $(why)"; fi
 
 # ── N ────────────────────────────────────────────────────────────────────────
@@ -600,7 +641,8 @@ if new_wallet 2; then
   S5_SIG=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$OWNER_CREDS")" "$RECOVERY_BIN" sign-nep413 \
     --message "$(jq -r '.agent_key_request.message' <<<"$BODY")" --recipient outlayer-agent-key \
     --nonce-base64 "$(jq -r '.agent_key_request.nonce_base64' <<<"$BODY")" | jq -r .signature)
-  AGENT_KEY_SIGNATURE="$S5_SIG" node "$AGENT_JS" seed "$OWNER" "$WID2" "$WORK/s5.seed"; unset S5_SIG
+  AGENT_KEY_SIGNATURE="$S5_SIG" node "$AGENT_JS" seed "$OWNER" "$WID2" "$WORK/s5.seed"
+  ( umask 077; printf '%s' "$S5_SIG" > "$WORK/s5.sig" ); unset S5_SIG
   A2=$(AGENT_SEED_FILE="$WORK/s5.seed" node "$AGENT_JS" pub)
   PAIR2="$A2$TEE2"; EXPECTED_0S=$(node "$AGENT_JS" deterministic "$PAIR2")
   # the one-time key: funded by the owner with an ordinary transfer, nothing else
@@ -614,6 +656,8 @@ if new_wallet 2; then
   sleep 4
   ACC0S=$(RPC_URL="$RPC_URL" PAGE_KEY_FILE="$WORK/page.key" node "$AGENT_JS" create-0s "$OWNER" "$PAIR2" 2>&1 | tail -1)
   rm -f "$WORK/page.key"
+  SEALED2=$(AGENT_KEY_SIGNATURE="$(cat "$WORK/s5.sig")" node "$AGENT_JS" seal "$RPUB2" "$OWNER" "$WID2" "$OWNER_PUB")
+  rm -f "$WORK/s5.sig"
   if [[ "$ACC0S" == "$EXPECTED_0S" ]]; then
     pass "S5 the one-time key created the wallet contract by StateInit at its address ($ACC0S)"
     sleep 3
@@ -627,14 +671,16 @@ if new_wallet 2; then
       && pass "S5 the one-time key's account is deleted" || fail "S5 the one-time key's account is still there"
     SPENT=$(python3 -I -c 'import sys; print((int(sys.argv[1]) - int(sys.argv[2])) / 1e24)' "$O0" "$(balance "$OWNER")")
     note "S5 the owner spent $SPENT NEAR in all (the transfer's gas, the StateInit, the rest returned)"
-    owner_page POST "$(jq -nc --arg a "$ACC0S" --arg s "$(AGENT_SEED_FILE="$WORK/s5.seed" node "$AGENT_JS" seal "$RPUB2" "$WID2")" '{account_id:$a, sealed_agent_key:$s}')"
+    owner_page POST "$(jq -nc --arg a "$ACC0S" --arg s "$SEALED2" '{account_id:$a, sealed_agent_key:$s}')"
     [[ "$HTTP" == 200 && "$(jq -r .account_id <<<"$BODY")" == "$ACC0S" ]] && pass "S5 the setup takes the 0s account" || fail "S5 finish: $HTTP $(why)"
     owner_page GET
     [[ "$HTTP" == 409 ]] && grep -q 'finished already' <<<"$BODY" && pass "S5 the spent token says the setup was finished (409)" \
       || fail "S5 the spent token answered $HTTP $(why)"
     api_wk "$WK2" GET /wallet/v1/contract/setup >/dev/null
-    node "$AGENT_JS" open "$WORK/s5.x" "$WID2" "$(jq -r .sealed_agent_key <<<"$BODY")" "$WORK/s5.collected"
-    [[ "$(AGENT_SEED_FILE="$WORK/s5.collected" node "$AGENT_JS" pub)" == "$A2" ]] && pass "S5 the agent collected its key" || fail "S5 the collected key differs"
+    if COLLECTED=$(agent_collect "$WK2" "$WORK/s5.x" "$WORK/s5.collected" 2>&1) && [[ "$COLLECTED" == "$ACC0S" ]] \
+       && [[ "$(AGENT_SEED_FILE="$WORK/s5.collected" node "$AGENT_JS" pub)" == "$A2" ]]; then
+      pass "S5 the agent collected its key: the owner's signature, the pair on chain and the 0s address checked"
+    else fail "S5 the agent's collect: $COLLECTED"; fi
 
     # the owner's policy for this wallet: transfers and calls
     POLICY2=$(jq -nc --arg w "$WID2" '{wallet_id:$w, rules:{transaction_types:["transfer","call"], limits:{per_transaction:{native:"50000000000000000000000"}}}}')
@@ -748,12 +794,12 @@ else fail "NM current_contract: $HTTP $(jq -c '.current_contract // "absent"' <<
 AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" node "$AGENT_JS" seed "$OWNER" "$WID0" "$WORK/again.seed"
 [[ "$(AGENT_SEED_FILE="$WORK/again.seed" node "$AGENT_JS" pub)" == "$AGENT_PUB" ]] \
   && pass "NM the owner's key makes the agent key on record again" || fail "NM the signature made another agent key"
-owner_page POST "$(jq -nc --arg a "$AGENT_ACC" --arg s "$(AGENT_SEED_FILE="$WORK/again.seed" node "$AGENT_JS" seal "$RPUB3" "$WID0")" '{account_id:$a, sealed_agent_key:$s}')"
+owner_page POST "$(jq -nc --arg a "$AGENT_ACC" --arg s "$(AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" node "$AGENT_JS" seal "$RPUB3" "$OWNER" "$WID0" "$OWNER_PUB")" '{account_id:$a, sealed_agent_key:$s}')"
 [[ "$HTTP" == 200 && "$(jq -r .account_id <<<"$BODY")" == "$AGENT_ACC" ]] && pass "NM the setup again hands the key over for the same account" \
   || fail "NM the hand-over: $HTTP $(why)"
 api_wk "$(cat "$WORK/new.wk")" GET /wallet/v1/contract/setup >/dev/null
 if [[ "$(jq -r .done <<<"$BODY")" == true ]] \
-   && node "$AGENT_JS" open "$WORK/new.x" "$WID0" "$(jq -r .sealed_agent_key <<<"$BODY")" "$WORK/new.seed" \
+   && [[ "$(agent_collect "$(cat "$WORK/new.wk")" "$WORK/new.x" "$WORK/new.seed")" == "$AGENT_ACC" ]] \
    && [[ "$(AGENT_SEED_FILE="$WORK/new.seed" node "$AGENT_JS" pub)" == "$AGENT_PUB" ]]; then
   pass "NM the agent on the new machine holds the same agent key, for $AGENT_ACC"
 else fail "NM the new machine's agent key: $(jq -c '{done, error}' <<<"$BODY" 2>/dev/null)"; fi

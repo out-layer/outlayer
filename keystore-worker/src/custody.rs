@@ -5,7 +5,8 @@
 //! TEE key. Nothing moves out of it without a signature of each. This file is
 //! the four things the keystore does for it:
 //!
-//! * `key`: says what the TEE's public key of a wallet is, for the setup;
+//! * `key`: says what the TEE's public key of a wallet is, for the setup, in
+//!   a statement the keystore's registration key signs;
 //! * `prepare`: judges an operation the agent asked for by the owner's policy,
 //!   builds the wallet contract's request for it and signs the TEE's half;
 //! * `relay`: signs, with the wallet's own NEAR key, the transaction that
@@ -253,6 +254,77 @@ struct KeyResponse {
     /// The TEE's public key of this wallet's wallet contract, in hex: the
     /// second half of the pair the contract is initialised with.
     tee_public_key: String,
+    /// The owner scope the key is in, `owner:<account>:<generation>`.
+    scope: String,
+    /// The keystore's registration key, `ed25519:<base58>`: the key the
+    /// keystore DAO approved, which `is_keystore_approved` takes.
+    keystore_public_key: String,
+    /// The registration key's Ed25519 signature over [`tee_key_statement`]
+    /// of this answer, in hex.
+    tee_key_signature: String,
+}
+
+/// The first line of [`tee_key_statement`].
+pub const TEE_KEY_STATEMENT_TAG: &str = "OUTLAYER_WALLET_CONTRACT_TEE_KEY/V1";
+
+/// What the keystore states about a wallet contract's TEE key: that `tee` is
+/// the TEE's key of `wallet_id` in the owner scope `scope`, said by a
+/// keystore of the DAO `dao`. One field per line, joined by `\n`, with no
+/// newline at the end.
+///
+/// The coordinator carries the TEE key from the keystore to the owner's page
+/// and to the agent's SDK; a coordinator that put its own key there would
+/// hold the enclave's half of every wallet contract set up meanwhile. So the key
+/// comes with this statement, signed by the keystore's registration key, and
+/// the page and the SDK check the signature and ask the DAO
+/// (`is_keystore_approved`) whether that key is a keystore's before they use
+/// the TEE key.
+///
+/// The registration key signs NEAR transactions too. The statement is text
+/// far longer than 32 bytes, so it is never a transaction hash or a NEP-413
+/// hash that key could be asked to sign elsewhere.
+///
+/// The TEE key itself signs nothing here: it signs in `prepare` alone.
+pub fn tee_key_statement(dao: &str, scope: &str, wallet_id: &str, tee: &[u8; 32]) -> String {
+    [
+        TEE_KEY_STATEMENT_TAG.to_string(),
+        format!("dao:{dao}"),
+        format!("scope:{scope}"),
+        format!("wallet:{wallet_id}"),
+        format!("tee:{}", hex::encode(tee)),
+    ]
+    .join("\n")
+}
+
+/// The keystore DAO and the Ed25519 half of the keystore's registration key:
+/// what signs [`tee_key_statement`]. A keystore registered with another
+/// scheme, or not registered, cannot state its TEE key.
+fn statement_signer(state: &AppState) -> Result<(String, ed25519_dalek::SigningKey), ApiError> {
+    let context = state.mpc_context.get().ok_or_else(|| {
+        ApiError::InternalError(
+            "This keystore cannot state its TEE key: it has no registration key in the keystore DAO".to_string(),
+        )
+    })?;
+    let near_crypto::SecretKey::ED25519(secret) = &context.keystore_dao_signer.secret_key else {
+        return Err(ApiError::InternalError(format!(
+            "This keystore cannot state its TEE key: its registration key is {}, and the statement is signed with ed25519 only",
+            context.keystore_dao_signer.secret_key.key_type()
+        )));
+    };
+    let key = ed25519_dalek::SigningKey::from_keypair_bytes(&secret.0).map_err(|_| {
+        ApiError::InternalError("This keystore cannot state its TEE key: its registration key is malformed".to_string())
+    })?;
+    Ok((context.mpc_ckd_config.keystore_dao_id.to_string(), key))
+}
+
+/// Whether `wallet_id` may stand in [`tee_key_statement`]: 1 to 64 of
+/// `[A-Za-z0-9_-]`. The statement is lines of text, so a wallet id with a
+/// newline, a colon or anything else outside that set could make the text say
+/// another wallet, scope or key than the fields it was built from; such an id
+/// gets no statement. Other routes keep their own rule (`validate_wallet_id`).
+fn is_statement_wallet_id(wallet_id: &str) -> bool {
+    (1..=64).contains(&wallet_id.len())
+        && wallet_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 async fn key_handler(
@@ -260,9 +332,27 @@ async fn key_handler(
     headers: HeaderMap,
     Json(req): Json<KeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
+    if !is_statement_wallet_id(&req.wallet_id) {
+        return Err(ApiError::BadRequest(
+            "wallet_id is 1 to 64 characters of A-Z, a-z, 0-9, '_' and '-': the TEE key is stated for no other".to_string(),
+        ));
+    }
     let (customer, _) = owner_scope(&state, &headers, &req.wallet_id).await?;
+    let (dao, registration) = statement_signer(&state)?;
     let public_key = tee_public_key(&state, &customer, &req.wallet_id).await?;
-    Ok(Json(KeyResponse { tee_public_key: hex::encode(public_key.as_bytes()) }))
+    let scope = customer.to_string();
+    let statement = tee_key_statement(&dao, &scope, &req.wallet_id, public_key.as_bytes());
+    let signature = ed25519_dalek::Signer::sign(&registration, statement.as_bytes());
+    let keystore_public_key = near_crypto::PublicKey::ED25519(near_crypto::ED25519PublicKey(
+        registration.verifying_key().to_bytes(),
+    ))
+    .to_string();
+    Ok(Json(KeyResponse {
+        tee_public_key: hex::encode(public_key.as_bytes()),
+        scope,
+        keystore_public_key,
+        tee_key_signature: hex::encode(signature.to_bytes()),
+    }))
 }
 
 // ---------------------------------------------------------------------------

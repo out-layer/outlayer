@@ -79,6 +79,72 @@ async fn an_owner_scope_that_cannot_be_loaded_is_refused() {
     assert!(refused.is_err(), "{refused:?}");
 }
 
+/// The statement over a TEE key, for fixed inputs, is this text, and the
+/// test key of the vector signs it into the vector's signature: the vector
+/// the owner's page and the SDK check their own reading against.
+#[test]
+fn the_tee_key_statement_is_the_vectors() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/tee_key_statement_vector.json")).unwrap();
+    let field = |name: &str| vector[name].as_str().unwrap_or_else(|| panic!("no `{name}` in the vector")).to_string();
+    let tee: [u8; 32] = hex::decode(field("tee")).unwrap().try_into().unwrap();
+
+    let statement = tee_key_statement(&field("dao"), &field("scope"), &field("wallet"), &tee);
+    assert_eq!(
+        statement,
+        "OUTLAYER_WALLET_CONTRACT_TEE_KEY/V1\n\
+         dao:dao.outlayer.testnet\n\
+         scope:owner:alice.testnet:1\n\
+         wallet:7c9e6679-7425-40de-944b-e07fc1f90ae7\n\
+         tee:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+    );
+    assert_eq!(statement, field("statement"));
+    assert!(statement.len() > 32 && !statement.ends_with('\n'));
+
+    let seed: [u8; 32] = hex::decode(field("secret_seed")).unwrap().try_into().unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let public_key =
+        near_crypto::PublicKey::ED25519(near_crypto::ED25519PublicKey(key.verifying_key().to_bytes())).to_string();
+    let signature = hex::encode(ed25519_dalek::Signer::sign(&key, statement.as_bytes()).to_bytes());
+    assert_eq!(public_key, field("public_key"));
+    assert_eq!(hex::encode(key.verifying_key().to_bytes()), field("public_key_hex"));
+    assert_eq!(signature, field("signature"));
+}
+
+/// A wallet id the statement's lines could be bent by gets no statement:
+/// only 1 to 64 of `[A-Za-z0-9_-]`.
+#[test]
+fn a_statement_names_only_a_plain_wallet_id() {
+    for ok in [WALLET, "a", "wallet_1-B", &"x".repeat(64)] {
+        assert!(is_statement_wallet_id(ok), "{ok:?}");
+    }
+    let long = "x".repeat(65);
+    for refused in [
+        "",
+        long.as_str(),
+        "w\ntee:00",
+        "w\rx",
+        "owner:alice.near:1",
+        "a.b",
+        "a b",
+        "é",
+        "w/1",
+    ] {
+        assert!(!is_statement_wallet_id(refused), "{refused:?}");
+    }
+}
+
+/// A keystore with no registration key in the DAO states no TEE key.
+#[test]
+fn no_statement_without_a_registration_key() {
+    let refused = statement_signer(&state());
+    assert!(
+        matches!(&refused, Err(ApiError::InternalError(reason)) if reason.contains("cannot state its TEE key")),
+        "{:?}",
+        refused.map(|_| ())
+    );
+}
+
 fn source() -> &'static str {
     let source = include_str!("custody.rs");
     &source[..source.find("#[cfg(test)]").expect("the tests' mount")]
@@ -184,6 +250,11 @@ mod at_the_door {
     }
 
     async fn stand() -> Stand {
+        stand_registered_with(near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519)).await
+    }
+
+    /// The stand, with `secret_key` as the keystore's registration key.
+    async fn stand_registered_with(secret_key: near_crypto::SecretKey) -> Stand {
         let keystore = Keystore::from_master_secret(&[0x11; 32]).unwrap();
         let owner: AccountId = OWNER.parse().unwrap();
         keystore.load_owner(&owner, 1, ESCROW_CHECK);
@@ -279,7 +350,6 @@ mod at_the_door {
         };
         let near_client = crate::near::NearClient::new(&url, "outlayer.testnet").unwrap();
         let state = AppState::new(keystore, config, Some(near_client));
-        let secret_key = near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519);
         state.set_mpc_context(
             crate::mpc_ckd::MpcCkdConfig {
                 mpc_contract_id: "v1.signer.test".parse().unwrap(),
@@ -691,6 +761,71 @@ mod at_the_door {
 
         // a wallet outside an owner's scope: the rule is the contract's alone
         assert!(crate::api::policy_is_the_callers_to_store(&stand.state, None, WALLET, "anyone.testnet").await.is_ok());
+    }
+
+    async fn key(stand: &Stand) -> Result<KeyResponse, ApiError> {
+        key_handler(State(stand.state.clone()), scope(Some(SCOPE)), Json(KeyRequest { wallet_id: WALLET.to_string() }))
+            .await
+            .map(|Json(answer)| answer)
+    }
+
+    /// The TEE key comes with the statement over it, signed by the
+    /// registration key the DAO approved, in the scope the coordinator named.
+    #[tokio::test]
+    async fn the_tee_key_comes_with_the_registration_keys_statement() {
+        let stand = stand().await;
+        let answer = key(&stand).await.unwrap();
+        assert_eq!(answer.tee_public_key, hex::encode(stand.tee.to_bytes()));
+        assert_eq!(answer.scope, SCOPE);
+        let registered = &stand.state.mpc_context.get().unwrap().keystore_dao_signer.public_key;
+        assert_eq!(answer.keystore_public_key, registered.to_string());
+        assert!(answer.keystore_public_key.starts_with("ed25519:"));
+        assert_eq!(answer.tee_key_signature.len(), 128);
+        assert_eq!(answer.tee_key_signature, answer.tee_key_signature.to_lowercase());
+
+        let statement = format!(
+            "OUTLAYER_WALLET_CONTRACT_TEE_KEY/V1\ndao:dao.test\nscope:{SCOPE}\nwallet:{WALLET}\ntee:{}",
+            answer.tee_public_key
+        );
+        let public_key: near_crypto::PublicKey = answer.keystore_public_key.parse().unwrap();
+        let signature = near_crypto::Signature::ED25519(ed25519_dalek::Signature::from_bytes(
+            &hex::decode(&answer.tee_key_signature).unwrap().try_into().unwrap(),
+        ));
+        assert!(signature.verify(statement.as_bytes(), &public_key));
+        // the TEE key itself did not sign it
+        let tee = near_crypto::PublicKey::ED25519(near_crypto::ED25519PublicKey(stand.tee.to_bytes()));
+        assert!(!signature.verify(statement.as_bytes(), &tee));
+    }
+
+    /// The route states nothing for a wallet id outside the statement's set,
+    /// before it reads the owner scope.
+    #[tokio::test]
+    async fn no_statement_for_a_wallet_id_with_a_newline() {
+        let stand = stand().await;
+        let refused = key_handler(
+            State(stand.state.clone()),
+            scope(Some(SCOPE)),
+            Json(KeyRequest { wallet_id: format!("{WALLET}\ntee:{}", "00".repeat(32)) }),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(ApiError::BadRequest(reason)) if reason.contains("1 to 64 characters")),
+            "{:?}",
+            refused.map(|_| ())
+        );
+    }
+
+    /// A keystore registered with ml-dsa-65 answers the route with an error
+    /// rather than a key nobody can check.
+    #[tokio::test]
+    async fn a_keystore_registered_with_ml_dsa_states_no_tee_key() {
+        let stand = stand_registered_with(near_crypto::SecretKey::from_random(near_crypto::KeyType::MLDSA65)).await;
+        let refused = key(&stand).await;
+        assert!(
+            matches!(&refused, Err(ApiError::InternalError(reason))
+                if reason.contains("cannot state its TEE key") && reason.contains("ml-dsa-65")),
+            "{refused:?}"
+        );
     }
 
     async fn wallet_account(stand: &Stand) -> String {

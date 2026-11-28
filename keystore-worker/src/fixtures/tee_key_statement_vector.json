@@ -1,0 +1,12 @@
+{
+  "comment": "TEST-ONLY key (RFC 8032 section 7.1, TEST 1). Never registered anywhere. A vector for the keystore statement over a wallet contract TEE key: the statement text and its Ed25519 signature by the key of secret_seed.",
+  "secret_seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "public_key": "ed25519:FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z",
+  "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+  "dao": "dao.outlayer.testnet",
+  "scope": "owner:alice.testnet:1",
+  "wallet": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "tee": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+  "statement": "OUTLAYER_WALLET_CONTRACT_TEE_KEY/V1\ndao:dao.outlayer.testnet\nscope:owner:alice.testnet:1\nwallet:7c9e6679-7425-40de-944b-e07fc1f90ae7\ntee:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+  "signature": "a99b1882323409435bba6f594fe23f4d58f765345acca32a8d790f8d80ab8b7ea5cac207619381c8436dd3c8cfdca07f196d9c856ce2dcf83fc370152d113b01"
+}

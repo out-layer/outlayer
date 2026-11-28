@@ -133,7 +133,7 @@ re-registers and retries.
 | `POST /add_generated_secret`, `/update_user_secrets` | coordinator token | secrets generated inside the keystore; secret updates |
 | `POST /encryption-pubkey` | coordinator token | public key a client seals an input to (`outlayer:encryption-keys`, `open`) |
 | `POST /wallet/*` (derive-address, sign, evm/*, solana/*, sign-policy, sign-secret-store, sign-secret-delete, check-policy, encrypt-policy, decrypt-policy, derive-ephemeral-key) | coordinator token | custody wallets |
-| `POST /wallet/contract/key`, `/wallet/contract/prepare`, `/wallet/contract/relay` | coordinator token | on-chain custody: the TEE's public key of a wallet; its half of a request the owner's policy allows; the relaying transaction ([docs/ON_CHAIN_CUSTODY.md](../docs/ON_CHAIN_CUSTODY.md)) |
+| `POST /wallet/contract/key`, `/wallet/contract/prepare`, `/wallet/contract/relay` | coordinator token | on-chain custody: the TEE's public key of a wallet, with a statement signed by the registration key; its half of a request the owner's policy allows; the relaying transaction ([docs/ON_CHAIN_CUSTODY.md](../docs/ON_CHAIN_CUSTODY.md)) |
 | `POST /wallet/contract/identity` | worker token | whether a caller's wallet is the one an account is the wallet contract of, before a program runs as that account |
 | `POST /sign-vault-verification` | coordinator token | verifies a vault and submits `mark_vault_verified` on the DAO |
 | `POST /derive-vault-tee-key` | coordinator or worker token | public key a vault must carry for the keystore |
