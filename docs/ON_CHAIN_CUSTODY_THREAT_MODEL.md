@@ -96,12 +96,13 @@ keystore alike. What a design controls is what one TEE break reaches.
 * **What it needs:** physical access to the specific server in its data
   centre, root on its host, equipment under $1,000 and the skill to use it.
 * **It cannot be done to a running enclave.** The interposer goes between a
-  memory module and its slot, with the server powered off. The OutLayer
-  keystore does not come back by itself after that: every new keystore
-  instance waits for a DAO vote that names its key, so a power cycle of a
-  keystore server is seen and answered before the master is in its memory
-  again.
-* **What it yields:** the master, so E.
+  memory module and its slot, with the server powered off, and powering off
+  erases the master: it lives only in the enclave's memory.
+* **What it yields by itself:** nothing. The keystore that starts after the
+  power cycle is a new instance with no master. NEAR MPC gives it the master
+  only after a DAO vote that names its key, so the attack works only if the
+  DAO approves an instance on a server that went down for no known reason.
+  In that case the attacker reads the master, and so E.
 * **Funds at risk:** none. A is not in the enclave, and the agent signs last:
   the enclave's half exists only for an operation that passed the policy, and
   no half-signed move waits anywhere to be completed.
