@@ -6,10 +6,6 @@ at risk, and what the owner does about it. The design itself is in
 
 ## The answers
 
-**Funds at risk** means funds in the wallet contract, here and in section 2;
-the hot wallet of [section 4](#4-a-cold-wallet-and-a-hot-wallet) is a
-separate, optional balance.
-
 | Threat | What the attacker needs | Funds at risk | What the owner does |
 |---|---|---|---|
 | The server that operates the service goes down | nothing | **none** | waits, or leaves through the owner exit with no OutLayer service |
@@ -32,6 +28,10 @@ On a wallet contract account with no access key (the `0s…` default and a
 sub-account the setup made), nothing leaves the wallet contract without both
 signatures, and the enclave gives its own only to an operation the owner's
 policy allows. None of the systems in the table moves funds alone.
+
+**Funds at risk** means funds in the wallet contract, here and in section 2;
+the hot wallet of [section 4](#4-a-cold-wallet-and-a-hot-wallet) is a
+separate, optional balance.
 
 ## 1. The path the money takes
 
