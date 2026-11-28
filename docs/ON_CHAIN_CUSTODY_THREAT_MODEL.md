@@ -21,8 +21,9 @@ at risk, and what the owner does about it. The design itself is in
 limits per transaction and per hour, day and month, receivers on an
 allowlist, and approvals by M of N above a threshold.
 
-Funds move against the owner's policy only if the enclave and the agent's own
-key fail together. Every row of the table is one of them alone.
+Nothing leaves the wallet contract without both signatures, and the enclave
+gives its own only to an operation the owner's policy allows. No single
+system in the table is enough to move funds.
 
 ## 1. The path the money takes
 

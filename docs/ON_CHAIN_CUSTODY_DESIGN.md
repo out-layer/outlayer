@@ -168,9 +168,9 @@ worded.
 | The owner's key, under a locked policy | what the policy allows as it stands: a change of policy and an exit both need the approvers |
 | NEAR MPC | E, through the master; not A, which comes from the owner's own signature. Nothing moves |
 
-For funds to move against the owner's policy, the enclave and the agent's own
-key have to fail together. No single system on the list is enough, the network
-that derives keys included.
+Nothing leaves the wallet contract without both signatures, and the enclave
+gives its own only to an operation the owner's policy allows. No single system
+on the list is enough to move funds, the network that derives keys included.
 
 ## 7. Leaving without OutLayer
 
@@ -193,7 +193,7 @@ contract is an ordinary Intents wallet of theirs.
 
 | Question | Agent On-chain custody |
 |---|---|
-| Who has to fail together for funds to move against the policy? | the enclave and the agent's key |
+| What does a move need? | the agent's signature and the enclave's, which the enclave gives only under the policy; no single system is enough |
 | What can the party that checks the policy do alone? | refuse |
 | What can the network that derives keys do alone? | reach one key of the two |
 | What runs for each move? | one NEAR transaction with two Ed25519 verifications; no signing round of a network |
