@@ -35,7 +35,8 @@
 #   A   the agent: the same id with another body is refused; the open operations list shows
 #       an operation waiting for the agent's half; asking again continues it
 #   O   one prepared operation of a wallet at a time: while one waits for the agent's half a
-#       new id answers 409 naming it, is no operation and is not counted in the day's usage;
+#       new id answers 409 operation_waiting naming it in `waiting_operation_id`, is no
+#       operation and is not counted in the day's usage;
 #       the same id answers where it stands; with the first relayed the new id is prepared
 #   S5  a new account with no key: the owner funds a one-time key with an ordinary transfer,
 #       the key creates the wallet contract at its 0s address (NEP-616) by StateInit and
@@ -567,9 +568,10 @@ if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; 
   HASH_O=$(jq -r .request_hash <<<"$BODY"); keep_prepared o1
   U1=$(spent_today)
   ask "o2-$TS" "$TRANSFER_TINY"
-  if [[ "$HTTP" == 409 && "$(jq -r .error <<<"$BODY")" == conflict && -z "$(jq -r '.tee_half // ""' <<<"$BODY")" ]] \
-     && jq -r '.message // ""' <<<"$BODY" | grep -qF "\`o1-$TS\` of this wallet is prepared and waits for the agent's half"; then
-    pass "O  with one operation prepared, a new id is refused and names the one that waits (409 conflict)"
+  if [[ "$HTTP" == 409 && "$(jq -r .error <<<"$BODY")" == operation_waiting \
+        && "$(jq -r '.waiting_operation_id // ""' <<<"$BODY")" == "o1-$TS" && -z "$(jq -r '.tee_half // ""' <<<"$BODY")" ]] \
+     && jq -r '.message // ""' <<<"$BODY" | grep -qF "\`o1-$TS\` of this wallet is prepared and not over"; then
+    pass "O  with one operation prepared, a new id is refused and names the one that waits (409 operation_waiting, waiting_operation_id)"
   else fail "O  a new id beside a prepared operation: $HTTP $(why)"; fi
   op_state "o2-$TS"; O2_HTTP=$HTTP
   agent GET "$OPS"
@@ -1194,7 +1196,7 @@ if [[ "$MPC_PK" == bls12381g2:* ]] && OUT=$(exit_tool initiate); then
 else fail "X  the exit did not start: $(near_why "$OUT")"; fi
 if [[ -n "$MASTER" ]]; then
   ask "x-$TS" "$TRANSFER_TINY"
-  [[ "$HTTP" =~ ^4 ]] && ! grep -q 'is prepared and waits for the agent' <<<"$BODY" \
+  [[ "$HTTP" =~ ^4 && "$(jq -r '.error // ""' <<<"$BODY")" != operation_waiting && -z "$(jq -r '.waiting_operation_id // ""' <<<"$BODY")" ]] \
     && pass "X  after the claim the agent's operation is refused ($HTTP $(why))" \
     || fail "X  after the claim: $HTTP $(why)"
   KEYS_OUT=$(CUSTOMER_RECOVERY_MASTER="$MASTER" AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" "$RECOVERY_BIN" wallet-contract keys --owner "$OWNER" --wallet-id "$WID0" 2>/dev/null)

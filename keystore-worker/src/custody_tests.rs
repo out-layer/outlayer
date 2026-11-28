@@ -982,8 +982,10 @@ mod at_the_door {
         assert!(refused.contains("missing field `usage`"), "{refused}");
     }
 
-    /// A usage that could not be read (`null`) is not "nothing spent": a
-    /// policy with a limit over a window refuses under it.
+    /// A spent amount that could not be read is not "nothing spent": inside a
+    /// whole usage document, an amount that is not a decimal is marked
+    /// unreadable, and a policy with a limit over that window and token
+    /// refuses — the policy's refusal, not the shape check's.
     #[tokio::test]
     async fn an_unreadable_usage_refuses_under_a_window_limit() {
         let stand = stand().await;
@@ -992,12 +994,24 @@ mod at_the_door {
             false,
             json!({"rules": {"limits": {"daily": {"native": "1000"}}}}),
         ));
+        let usage = |daily_native: &str| {
+            json!({"hourly": {}, "daily": {"native": daily_native}, "monthly": {}, "hourly_tx_count": 0})
+        };
+        for amount in ["1e3", "-1", "0x10", "", "12.5"] {
+            let mut wire = wire_request(&stand.agent, TRANSFER, now());
+            wire["usage"] = usage(amount);
+            let refused = prepare(&stand, serde_json::from_value(wire).unwrap()).await;
+            assert!(
+                matches!(&refused, Err(ApiError::Forbidden(reason))
+                    if reason.contains("daily spend for native could not be read")),
+                "{amount:?}: {:?}",
+                refused.map(|_| ())
+            );
+        }
+        // the same document with the amount read is allowed
         let mut wire = wire_request(&stand.agent, TRANSFER, now());
-        wire["usage"] = serde_json::Value::Null;
-        let refused = refusal(prepare(&stand, serde_json::from_value(wire).unwrap()).await);
-        assert!(!refused.is_empty());
-        // the same request with the usage read is allowed
-        assert!(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.is_ok());
+        wire["usage"] = usage("0");
+        assert!(prepare(&stand, serde_json::from_value(wire).unwrap()).await.is_ok());
     }
 
     /// The usage is the coordinator's whole document or nothing: a window
@@ -1029,6 +1043,7 @@ mod at_the_door {
         extra["weekly"] = json!({});
         partials.push(("a window it does not send".to_string(), extra));
         partials.push(("an empty document".to_string(), json!({})));
+        partials.push(("a null usage".to_string(), json!(null)));
 
         for (name, usage) in partials {
             let mut wire = wire_request(&stand.agent, TRANSFER, now());
