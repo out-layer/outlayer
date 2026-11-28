@@ -94,7 +94,7 @@ the NEAR MPC network (its 16 mainnet nodes run in TEEs), and the OutLayer
 keystore alike. What a design controls is what one TEE break reaches.
 
 * **What it needs:** physical access to the specific server in its data
-  centre, root on its host, equipment under $1,000 and the skill to use it.
+  centre and root on its host.
 * **It cannot be done to a running enclave.** The interposer goes between a
   memory module and its slot, with the server powered off, and powering off
   erases the master: it lives only in the enclave's memory.
