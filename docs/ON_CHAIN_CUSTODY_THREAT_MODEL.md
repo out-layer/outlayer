@@ -12,7 +12,7 @@ at risk, and what the owner does about it. The design itself is in
 | The server is compromised from outside | a remote exploit of the API host | **none** | nothing |
 | The TEE is read at the hardware level (DRAM interposer) | physical access to a powered-off keystore server, its root | **none** | nothing |
 | NEAR MPC is compromised | 11 of the 16 mainnet nodes | **none** | nothing |
-| OutLayer's governance is used against its users | a quorum of the OutLayer DAO's members | **none** | leaves through the owner exit |
+| OutLayer's governance is used against its users | a quorum of the OutLayer DAO's members | **none** | leaves through the owner exit, which is shorter than the delay of any change |
 | The agent's machine or model is compromised | the agent's host, or a prompt injection | **what the policy allows** without the owner | freezes; moves the funds to a new wallet contract; replaces the agent's API and payment keys |
 | The owner's key is stolen, policy locked | the owner's key | **what the policy allows** without the owner | nothing: the policy and the exit wait for the approvers |
 | A relayer, proxy or RPC on the path | a position on the network | **none** | nothing |
@@ -132,6 +132,11 @@ A build that leaks the master is approved through the OutLayer DAO.
   contract changes only by their vote.
 * **What it yields:** E at most.
 * **Funds at risk:** none. E moves nothing without A.
+* **The owner leaves first.** A vote that changes the DAO contract or
+  approves a build takes effect 72 hours after it passes, in the open, on
+  chain. The owner exit takes 24 to 48 hours. An owner who sees a change they
+  do not accept starts the exit and holds both keys before the change is in
+  force, so the governance cannot lock an owner in.
 
 ### 2.6 The agent's machine or model is compromised
 
@@ -169,6 +174,10 @@ cannot change it.
 
 | | |
 |---|---|
+| What one operation depends on | one NEAR transaction with two Ed25519 checks. No signing round of NEAR MPC: operations go on while MPC is unavailable |
+| Who signs an operation | the agent, by itself, inside the policy. The owner signs nothing per operation; they are asked only above the limits they set |
+| Code under the funds | the NEAR Intents wallet contract and one signing standard, with no state and no clock: nothing to watch, nothing that runs on a timer |
+| Beyond the chain | connectors to web2 services and venues, and the secrets they use, under the same policy and approvals |
 | Setup by the owner | one signature in their own wallet, no transaction; the wallet contract is created with one action, has no access key and needs no NEAR to exist |
 | The agent's key | made by the owner's signature, again whenever needed; nothing to back up |
 | One operation | two HTTPS calls and one local signature; one NEAR transaction, relayed by any account |
