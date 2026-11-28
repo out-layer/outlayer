@@ -137,11 +137,83 @@ fn a_statement_names_only_a_plain_wallet_id() {
 /// A keystore with no registration key in the DAO states no TEE key.
 #[test]
 fn no_statement_without_a_registration_key() {
-    let refused = statement_signer(&state());
+    let refused = statement_signer(&state(), "its TEE key");
     assert!(
         matches!(&refused, Err(ApiError::InternalError(reason)) if reason.contains("cannot state its TEE key")),
         "{:?}",
         refused.map(|_| ())
+    );
+}
+
+/// The statement over a wallet's policy, for fixed inputs, is this text, and
+/// the test key of the vector signs it into the vector's signature: the
+/// vector the owner's page and the SDK check their own reading against.
+#[test]
+fn the_policy_statement_is_the_vectors() {
+    use sha2::{Digest, Sha256};
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/policy_statement_vector.json")).unwrap();
+    let field = |name: &str| vector[name].as_str().unwrap_or_else(|| panic!("no `{name}` in the vector")).to_string();
+    let blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, field("encrypted_base64")).unwrap();
+    let plaintext = field("policy_json");
+    assert_eq!(hex::encode(Sha256::digest(&blob)), field("blob_sha256"));
+    assert_eq!(hex::encode(Sha256::digest(plaintext.as_bytes())), field("policy_sha256"));
+
+    let statement = policy_statement(&field("dao"), &field("wallet"), &blob, plaintext.as_bytes());
+    assert_eq!(
+        statement,
+        "OUTLAYER_WALLET_POLICY/V1\n\
+         dao:dao.outlayer.testnet\n\
+         wallet:ed25519:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c\n\
+         blob:c9f1a5f79d7bea01a54f4edb41673722f627ee2e82dda324946b63cf4b9b16af\n\
+         policy:002fe573075e40d38573f78c351d185d9e44cea84776dd6b00d1ab0210705a65"
+    );
+    assert_eq!(statement, field("statement"));
+    assert!(statement.len() > 32 && !statement.ends_with('\n'));
+
+    let seed: [u8; 32] = hex::decode(field("secret_seed")).unwrap().try_into().unwrap();
+    let signer = PolicyStatementSigner { dao: field("dao"), registration: ed25519_dalek::SigningKey::from_bytes(&seed) };
+    let stated = signer.state(&field("wallet"), &blob, plaintext.as_bytes());
+    assert_eq!(stated.keystore_public_key, field("public_key"));
+    assert_eq!(stated.policy_statement_signature, field("signature"));
+
+    // one byte of either side is another statement
+    let mut other = blob.clone();
+    other[0] ^= 1;
+    assert_ne!(policy_statement(&field("dao"), &field("wallet"), &other, plaintext.as_bytes()), statement);
+    assert_ne!(policy_statement(&field("dao"), &field("wallet"), &blob, format!("{plaintext} ").as_bytes()), statement);
+}
+
+/// A keystore with no registration key in the DAO states no policy, so it
+/// neither encrypts one nor opens one.
+#[tokio::test]
+async fn no_policy_is_encrypted_or_opened_without_a_registration_key() {
+    let refused = policy_statement_signer(&state()).map(|_| ());
+    assert!(
+        matches!(&refused, Err(ApiError::InternalError(reason)) if reason.contains("cannot state a wallet's policy")),
+        "{refused:?}"
+    );
+    let encrypted = crate::api::wallet_encrypt_policy_handler(
+        State(state()),
+        scope(None),
+        Json(serde_json::from_value(serde_json::json!({"wallet_id": WALLET, "policy_json": "{}"})).unwrap()),
+    )
+    .await;
+    assert!(
+        matches!(&encrypted, Err(ApiError::InternalError(reason)) if reason.contains("cannot state a wallet's policy")),
+        "{:?}",
+        encrypted.map(|_| ())
+    );
+    let opened = crate::api::wallet_open_policy_handler(
+        State(state()),
+        scope(None),
+        Json(serde_json::from_value(serde_json::json!({"wallet_id": WALLET, "encrypted_data": "AAAA"})).unwrap()),
+    )
+    .await;
+    assert!(
+        matches!(&opened, Err(ApiError::InternalError(reason)) if reason.contains("cannot state a wallet's policy")),
+        "{:?}",
+        opened.map(|_| ())
     );
 }
 
@@ -369,8 +441,9 @@ mod at_the_door {
 
     const TRANSFER: &str = r#"{"id":"pay-1","op":{"kind":"transfer","to":"bob.testnet","amount":"5"}}"#;
 
-    /// The coordinator's `prepare` request for `body`, signed by `key` at `timestamp`.
-    fn prepare_request(key: &SigningKey, body: &str, timestamp: u64) -> PrepareRequest {
+    /// The coordinator's `prepare` request for `body`, signed by `key` at
+    /// `timestamp`, as it is on the wire: nothing spent yet.
+    fn wire_request(key: &SigningKey, body: &str, timestamp: u64) -> serde_json::Value {
         let nonce = [7; 16];
         let signature = AgentRequest {
             wallet_contract: CONTRACT,
@@ -381,7 +454,7 @@ mod at_the_door {
             nonce,
         }
         .sign(key);
-        serde_json::from_value(json!({
+        json!({
             "wallet_id": WALLET,
             "wallet_contract": CONTRACT,
             "agent_request": {
@@ -389,8 +462,12 @@ mod at_the_door {
                 "timestamp": timestamp, "nonce": hex::encode(nonce), "signature": hex::encode(signature),
             },
             "nonce": 3,
-        }))
-        .unwrap()
+            "usage": {"hourly": {}, "daily": {}, "monthly": {}, "hourly_tx_count": 0},
+        })
+    }
+
+    fn prepare_request(key: &SigningKey, body: &str, timestamp: u64) -> PrepareRequest {
+        serde_json::from_value(wire_request(key, body, timestamp)).unwrap()
     }
 
     async fn prepare(stand: &Stand, req: PrepareRequest) -> Result<PrepareResponse, ApiError> {
@@ -579,7 +656,7 @@ mod at_the_door {
     fn prepare_takes_no_request_from_its_caller() {
         let stand_free = |extra: serde_json::Value| {
             let mut req = json!({
-                "wallet_id": WALLET, "wallet_contract": CONTRACT, "nonce": 3,
+                "wallet_id": WALLET, "wallet_contract": CONTRACT, "nonce": 3, "usage": {},
                 "agent_request": { "method": OPERATION_METHOD, "path": OPERATION_PATH, "body": TRANSFER,
                     "timestamp": 1, "nonce": hex::encode([7u8; 16]), "signature": hex::encode([0u8; 64]) },
             });
@@ -761,6 +838,212 @@ mod at_the_door {
 
         // a wallet outside an owner's scope: the rule is the contract's alone
         assert!(crate::api::policy_is_the_callers_to_store(&stand.state, None, WALLET, "anyone.testnet").await.is_ok());
+    }
+
+    /// The statement `answer` carries verifies as the registration key's
+    /// over `blob` and `plaintext`, for the wallet's own key.
+    fn assert_states(stand: &Stand, answer: &PolicyStatement, blob: &[u8], plaintext: &[u8]) {
+        let customer = Customer::Owner { account: OWNER.parse().unwrap(), generation: 1 };
+        let wallet = stand
+            .state
+            .keystore
+            .try_read()
+            .unwrap()
+            .get_public_key_for_seed(Some(&customer), &crate::api::wallet_seed(WALLET, "near"))
+            .unwrap();
+        let statement =
+            policy_statement("dao.test", &format!("ed25519:{}", hex::encode(wallet.as_bytes())), blob, plaintext);
+        let registered = &stand.state.mpc_context.get().unwrap().keystore_dao_signer.public_key;
+        assert_eq!(answer.keystore_public_key, registered.to_string());
+        let public_key: near_crypto::PublicKey = answer.keystore_public_key.parse().unwrap();
+        let signature = near_crypto::Signature::ED25519(ed25519_dalek::Signature::from_bytes(
+            &hex::decode(&answer.policy_statement_signature).unwrap().try_into().unwrap(),
+        ));
+        assert!(signature.verify(statement.as_bytes(), &public_key), "the statement is not this one:\n{statement}");
+    }
+
+    fn decoded(blob: &str) -> Vec<u8> {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob).unwrap()
+    }
+
+    /// A policy is encrypted as the bytes it arrived in, with the
+    /// registration key's statement over the ciphertext and those bytes; and
+    /// a ciphertext opens to the same bytes, with the same statement.
+    #[tokio::test]
+    async fn a_policy_is_encrypted_and_opened_with_the_statement_over_its_bytes() {
+        let stand = stand().await;
+        // spaces, an order of keys and a number's spelling that a parse would not keep
+        let policy_json = r#"{ "rules": {"z": 1.0, "a": [1,2]},  "version": 1 }"#;
+        let Json(encrypted) = crate::api::wallet_encrypt_policy_handler(
+            State(stand.state.clone()),
+            scope(Some(SCOPE)),
+            Json(serde_json::from_value(json!({"wallet_id": WALLET, "policy_json": policy_json})).unwrap()),
+        )
+        .await
+        .unwrap();
+        let blob = decoded(&encrypted.encrypted_base64);
+        assert_states(&stand, &encrypted.statement, &blob, policy_json.as_bytes());
+
+        let Json(opened) = crate::api::wallet_open_policy_handler(
+            State(stand.state.clone()),
+            scope(Some(SCOPE)),
+            Json(serde_json::from_value(json!({"wallet_id": WALLET, "encrypted_data": encrypted.encrypted_base64})).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened.policy_json, policy_json);
+        assert_states(&stand, &opened.statement, &blob, policy_json.as_bytes());
+
+        // the answers carry the statement's two fields beside their own
+        let wire = serde_json::to_value(&opened).unwrap();
+        let mut names: Vec<_> = wire.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["keystore_public_key", "policy_json", "policy_statement_signature"]);
+        let wire = serde_json::to_value(&encrypted).unwrap();
+        let mut names: Vec<_> = wire.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["encrypted_base64", "keystore_public_key", "policy_statement_signature"]);
+    }
+
+    /// Nothing is stated for bytes that are not this wallet's policy: another
+    /// wallet's ciphertext, a changed one, or no ciphertext at all.
+    #[tokio::test]
+    async fn only_this_wallets_policy_ciphertext_is_opened() {
+        let stand = stand().await;
+        let encrypt = |wallet_id: &'static str| {
+            let state = stand.state.clone();
+            async move {
+                crate::api::wallet_encrypt_policy_handler(
+                    State(state),
+                    scope(Some(SCOPE)),
+                    Json(serde_json::from_value(json!({"wallet_id": wallet_id, "policy_json": "{}"})).unwrap()),
+                )
+                .await
+                .unwrap()
+                .0
+                .encrypted_base64
+            }
+        };
+        let open = |encrypted_data: String| {
+            let state = stand.state.clone();
+            async move {
+                crate::api::wallet_open_policy_handler(
+                    State(state),
+                    scope(Some(SCOPE)),
+                    Json(serde_json::from_value(json!({"wallet_id": WALLET, "encrypted_data": encrypted_data})).unwrap()),
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+        let own = encrypt(WALLET).await;
+        assert!(open(own.clone()).await.is_ok());
+
+        let mut changed = decoded(&own);
+        *changed.last_mut().unwrap() ^= 1;
+        let changed = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, changed);
+        for refused in [encrypt("another-wallet").await, changed, "not base64 !".to_string(), String::new()] {
+            assert!(matches!(open(refused.clone()).await, Err(ApiError::BadRequest(_))), "{refused:?}");
+        }
+        assert!(serde_json::from_value::<crate::api::WalletOpenPolicyRequest>(
+            json!({"wallet_id": WALLET, "encrypted_data": own, "policy_json": "{}"})
+        )
+        .is_err());
+    }
+
+    /// A keystore registered with ml-dsa-65 encrypts and opens no policy:
+    /// nobody could check its statement.
+    #[tokio::test]
+    async fn a_keystore_registered_with_ml_dsa_states_no_policy() {
+        let stand = stand_registered_with(near_crypto::SecretKey::from_random(near_crypto::KeyType::MLDSA65)).await;
+        let refused = crate::api::wallet_encrypt_policy_handler(
+            State(stand.state.clone()),
+            scope(Some(SCOPE)),
+            Json(serde_json::from_value(json!({"wallet_id": WALLET, "policy_json": "{}"})).unwrap()),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(ApiError::InternalError(reason))
+                if reason.contains("cannot state a wallet's policy") && reason.contains("ml-dsa-65")),
+            "{:?}",
+            refused.map(|_| ())
+        );
+    }
+
+    /// `prepare` judges an operation against what the wallet has spent, so a
+    /// request that names no usage is not a request.
+    #[test]
+    fn prepare_takes_no_request_without_the_usage() {
+        let with_usage = serde_json::to_value(wire_request(&agent_key(), TRANSFER, now())).unwrap();
+        assert!(serde_json::from_value::<PrepareRequest>(with_usage.clone()).is_ok());
+        let mut without = with_usage;
+        without.as_object_mut().unwrap().remove("usage");
+        let refused = serde_json::from_value::<PrepareRequest>(without).unwrap_err().to_string();
+        assert!(refused.contains("missing field `usage`"), "{refused}");
+    }
+
+    /// A usage that could not be read (`null`) is not "nothing spent": a
+    /// policy with a limit over a window refuses under it.
+    #[tokio::test]
+    async fn an_unreadable_usage_refuses_under_a_window_limit() {
+        let stand = stand().await;
+        stand.chain.lock().unwrap().policy = Some((
+            OWNER.to_string(),
+            false,
+            json!({"rules": {"limits": {"daily": {"native": "1000"}}}}),
+        ));
+        let mut wire = wire_request(&stand.agent, TRANSFER, now());
+        wire["usage"] = serde_json::Value::Null;
+        let refused = refusal(prepare(&stand, serde_json::from_value(wire).unwrap()).await);
+        assert!(!refused.is_empty());
+        // the same request with the usage read is allowed
+        assert!(prepare(&stand, prepare_request(&stand.agent, TRANSFER, now())).await.is_ok());
+    }
+
+    /// The usage is the coordinator's whole document or nothing: a window
+    /// left out would read as nothing spent in it, and a count that is not a
+    /// whole number as no transaction this hour. Refused even under a policy
+    /// with no limits, before anything is read.
+    #[tokio::test]
+    async fn a_partial_usage_is_refused() {
+        let stand = stand().await;
+        let whole = json!({"hourly": {"native": "7"}, "daily": {}, "monthly": {}, "hourly_tx_count": 2});
+        let mut partials = Vec::new();
+        for window in ["hourly", "daily", "monthly", "hourly_tx_count"] {
+            let mut partial = whole.clone();
+            partial.as_object_mut().unwrap().remove(window);
+            partials.push((format!("no `{window}`"), partial));
+        }
+        for (name, count) in [("a fractional count", json!(1.5)), ("a count as text", json!("2")), ("a negative count", json!(-1)), ("a null count", json!(null))] {
+            let mut partial = whole.clone();
+            partial["hourly_tx_count"] = count;
+            partials.push((name.to_string(), partial));
+        }
+        let mut amount = whole.clone();
+        amount["daily"] = json!({"native": 7});
+        partials.push(("an amount that is not text".to_string(), amount));
+        let mut window = whole.clone();
+        window["monthly"] = json!(null);
+        partials.push(("a window that is not a map".to_string(), window));
+        let mut extra = whole.clone();
+        extra["weekly"] = json!({});
+        partials.push(("a window it does not send".to_string(), extra));
+        partials.push(("an empty document".to_string(), json!({})));
+
+        for (name, usage) in partials {
+            let mut wire = wire_request(&stand.agent, TRANSFER, now());
+            wire["usage"] = usage;
+            let refused = prepare(&stand, serde_json::from_value(wire).unwrap()).await;
+            assert!(
+                matches!(&refused, Err(ApiError::BadRequest(reason)) if reason.contains("not a whole current_usage document")),
+                "{name}: {:?}",
+                refused.map(|_| ())
+            );
+        }
+        // the whole document is taken
+        let mut wire = wire_request(&stand.agent, TRANSFER, now());
+        wire["usage"] = whole;
+        assert!(prepare(&stand, serde_json::from_value(wire).unwrap()).await.is_ok());
     }
 
     async fn key(stand: &Stand) -> Result<KeyResponse, ApiError> {

@@ -1497,6 +1497,20 @@ fn the_owner_cannot_cancel_a_revocation_of_a_keystore_build() {
 }
 
 #[test]
+fn the_owner_cannot_cancel_a_revocation_of_a_wallet_contract_build() {
+    let mut d = dao(&["m1.testnet", "m2.testnet"], 3_600);
+    at(a("m1.testnet"), 0);
+    let revoke = d.propose(GovAction::RevokeWalletContract { code_hash: wallet_code(1) });
+    let approve = d.propose(GovAction::ApproveWalletContract { code_hash: wallet_code(2) });
+    at(owner(), 0);
+    assert!(refused(|| d.cancel(revoke)), "the owner keeps no build the members take away");
+    assert_eq!(status(&d, revoke), GovStatus::Pending);
+    // An approval it may still stop.
+    d.cancel(approve);
+    assert_eq!(status(&d, approve), GovStatus::Cancelled);
+}
+
+#[test]
 fn a_build_approved_in_uppercase_is_stored_and_checked_in_lowercase() {
     let mut d = dao(&["m1.testnet"], 0);
     let upper = OsImage {

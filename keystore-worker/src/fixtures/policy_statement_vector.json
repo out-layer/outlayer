@@ -1,0 +1,13 @@
+{
+  "comment": "TEST-ONLY key (RFC 8032 section 7.1, TEST 1). Never registered anywhere. A vector for the keystore statement over a wallet policy: the ciphertext and the plaintext it names by their SHA-256, the statement text, and its Ed25519 signature by the key of secret_seed. `encrypted_base64` is fixed bytes, not a ciphertext of `policy_json`: the statement is a function of the two byte strings.",
+  "secret_seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "public_key": "ed25519:FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z",
+  "dao": "dao.outlayer.testnet",
+  "wallet": "ed25519:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+  "encrypted_base64": "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dzj6vH4/wYNFBsiKTA3PkVMU1phaG92fYSLkpmgp661vMPK0djf5u30+wIJEBceJSwzOkFIT1ZdZGtyeYCHjpWc",
+  "policy_json": "{\"version\":1,\"frozen\":false,\"rules\":{\"limits\":{\"daily\":{\"native\":\"1000000000000000000000000\"}},\"addresses\":{\"mode\":\"whitelist\",\"list\":[\"alice.testnet\"]}},\"approval\":null,\"capabilities\":{\"evm_sign\":{\"allowed\":false}},\"webhook_url\":null,\"authorized_key_hashes\":[\"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8\"],\"refund_addresses\":null}",
+  "blob_sha256": "c9f1a5f79d7bea01a54f4edb41673722f627ee2e82dda324946b63cf4b9b16af",
+  "policy_sha256": "002fe573075e40d38573f78c351d185d9e44cea84776dd6b00d1ab0210705a65",
+  "statement": "OUTLAYER_WALLET_POLICY/V1\ndao:dao.outlayer.testnet\nwallet:ed25519:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c\nblob:c9f1a5f79d7bea01a54f4edb41673722f627ee2e82dda324946b63cf4b9b16af\npolicy:002fe573075e40d38573f78c351d185d9e44cea84776dd6b00d1ab0210705a65",
+  "signature": "a923075f761832cafdb30348f85facc59f6a74ea3f7837facdb2c7d0a9ff322c71c5d3f1f153fbc8039a53d93095c4cc97549eab00e091f320b2275429fa1a0f"
+}

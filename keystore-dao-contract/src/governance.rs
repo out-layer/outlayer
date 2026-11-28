@@ -695,9 +695,9 @@ impl KeystoreDao {
     /// replaces a role — `SetOwner` here, a `Call` to `set_owner`, `set_governance` or
     /// `set_operator` on a governed contract — cannot be cancelled by the owner: otherwise a lost
     /// or stolen owner key could keep itself, or a compromised operator, in place. Nor can it
-    /// cancel a revocation of a keystore build (`RevokeOsImage`, `RevokeCompose`): the owner
-    /// brakes, it never keeps a build the members are taking away. Members vote such a proposal
-    /// down, or let it expire.
+    /// cancel a revocation of a keystore build (`RevokeOsImage`, `RevokeCompose`) or of a
+    /// wallet contract build (`RevokeWalletContract`): the owner brakes, it never keeps a build
+    /// the members are taking away. Members vote such a proposal down, or let it expire.
     pub fn cancel(&mut self, proposal_id: u64) {
         self.assert_owner();
         let mut p = self.gov_get(proposal_id)
@@ -716,6 +716,10 @@ impl KeystoreDao {
         require!(
             !matches!(p.action, GovAction::RevokeOsImage { .. } | GovAction::RevokeCompose { .. }),
             "A revocation of a keystore build cannot be cancelled by the owner; members can vote it down"
+        );
+        require!(
+            !matches!(p.action, GovAction::RevokeWalletContract { .. }),
+            "A revocation of a wallet contract build cannot be cancelled by the owner; members can vote it down"
         );
         // The same for a worker build and a worker's key: the members' way to take one off when
         // the owner does not.

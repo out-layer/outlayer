@@ -34,13 +34,9 @@
 #   P1  over `per_transaction`: refused, nothing to sign
 #   A   the agent: the same id with another body is refused; the open operations list shows
 #       an operation waiting for the agent's half; asking again continues it
-#   P2  above `auto_up_to`: the operation waits; listed as pending; the approver votes; the
-#       agent's repeat under the same id is prepared and goes through
-#   D   the build list: the DAO revokes the build; an operation is not prepared, and one
-#       prepared before is not relayed; the DAO approves it again and the agent goes on
-#   T   a request past its ten minutes is not executed, and the balance does not move
-#   I1  use_bound_identity: a program run with the flag runs as the wallet contract's account
-#       (needs a trial key for the wallet; steps aside loudly without one)
+#   O   one prepared operation of a wallet at a time: while one waits for the agent's half a
+#       new id answers 409 naming it, is no operation and is not counted in the day's usage;
+#       the same id answers where it stands; with the first relayed the new id is prepared
 #   S5  a new account with no key: the owner funds a one-time key with an ordinary transfer,
 #       the key creates the wallet contract at its 0s address (NEP-616) by StateInit and
 #       deletes its own account; the account has no key and no balance, runs the approved
@@ -48,6 +44,16 @@
 #   Z   STORAGE_MOVES calls (default 0) with no deposit from that zero-balance contract
 #       (then, with STORAGE_REST seconds, a rest and one more call):
 #       its storage against the zero-balance limit of 770 bytes
+#   D   the build list: the DAO revokes the build; an operation is not prepared (wallet 0),
+#       and one prepared before (T's, on the 0s wallet) is not relayed; the DAO approves it
+#       again and the agent goes on
+#   T   a request of the 0s wallet left unsigned: past its ten minutes it no longer holds the
+#       wallet (a new id is prepared and executed), it is not executed, and the balance does
+#       not move
+#   P2  above `auto_up_to`: the operation waits; listed as pending; the approver votes; the
+#       agent's repeat under the same id is prepared and goes through
+#   I1  use_bound_identity: a program run with the flag runs as the wallet contract's account
+#       (needs a trial key for the wallet; steps aside loudly without one)
 #   NM  an agent on a new machine: the owner's own signature (Bearer near:) stores a policy
 #       naming a new key, which runs the wallet while the old one stops; a setup again shows
 #       the wallet contract on record and hands the same agent key over for the same account
@@ -56,6 +62,7 @@
 #       in the DAO, and never with an approver pinned to a key; with the set named, the owner
 #       alone stores the first locked policy
 #   LF  under the lock the owner alone freezes: nothing is prepared; and unfreezes
+#       (an operation prepared before the freeze reached the coordinator is relayed first)
 #   LB  an operation inside the limits needs no approver: prepared, the TEE's half verified,
 #       the agent's half last, executed
 #   LC  a change of the policy by the owner alone is held: nothing signed, the chain and the
@@ -63,7 +70,8 @@
 #       the second signs it, the owner stores it (still locked) and the new limit applies
 #   LE  the exit under the lock: the owner alone cannot drop the exit approvers (one reject
 #       ends the change); an exit past its window is not claimed without a vote, a vote from
-#       outside the set is refused, and one reject ends the exit
+#       outside the set is refused, and one reject ends the exit; the wallet goes on with
+#       an operation, executed
 #   LU  the unlock is a change like any other: held, then signed by the quorum and stored
 #   X   the owner's exit: with exit approvers in force (L) one vote of two does not open the
 #       claim and the second does; after the claim the agent's operations are refused; the
@@ -72,10 +80,12 @@
 #
 # D takes two DAO votes on testnet (members' keys in the local keychain); between them every
 # wallet contract on testnet is refused, and the cleanup approves the build again if the run
-# stops there. T waits out the ten minutes. Not here: an extension added to a wallet contract
-# by hand (it takes both keys, so it is the owner's after the exit, when the keystore no
-# longer serves that generation anyway: keystore unit tests hold the rule), and the NEAR
-# Intents kinds (mainnet only).
+# stops there. T waits out the ten minutes, on the 0s wallet. No row leaves a prepared
+# operation behind on a wallet that is asked again: each is relayed to its end, and the one
+# kept unsigned (T's) is the last thing its wallet does but for T's own rows after its time.
+# Not here: an extension added to a wallet contract by hand (it takes both keys, so it is the
+# owner's after the exit, when the keystore no longer serves that generation anyway: keystore
+# unit tests hold the rule), and the NEAR Intents kinds (mainnet only).
 #
 # Run:
 #   PARENT=outlayer-alice.testnet ./tests/on_chain_custody_e2e.sh --apply
@@ -85,12 +95,14 @@
 # working account relays: nearcore reserves 300 Tgas at its pessimistic gas price before a relay
 # runs (0.3 NEAR on testnet), so it is funded with 1 NEAR. L is the owner's: three policy writes
 # (0.1 NEAR attached to each), one more exit fee (0.01 NEAR) and one more exit window (60 s);
-# the approvers pay the gas of their exit votes.
+# the approvers pay the gas of their exit votes. O and LE relay what they prepare (0.003 NEAR
+# to RECIPIENT from wallet 0; with O the wallet's moves before P2 come to 0.015 of the 0.02 a
+# day it has without the approver), and T one more move of 0.001 from the 0s wallet.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hos_common.sh"
 source "$HOS_LIB_DIR/near_sign.sh"
 
-[[ "${1:-}" == "--apply" ]] || { sed -n '3,81p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
+[[ "${1:-}" == "--apply" ]] || { sed -n '3,91p' "$0" >&2; warn "Dry run. Pass --apply."; exit 0; }
 [[ "$NETWORK" == testnet ]] || { echo "✗ this suite runs on testnet" >&2; exit 1; }
 
 DAO="${DAO:-dao.outlayer.testnet}"
@@ -545,108 +557,44 @@ if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
     || fail "A  the settled operation is still listed"
 else fail "A  ask: $HTTP $(why)"; fi
 
-# ── D + T ────────────────────────────────────────────────────────────────────
-log "D  the build list"
-in_list() { near_view "$DAO" get_approved_wallet_contracts '{}' | jq -e --arg b "$BUILD" 'index($b) != null' >/dev/null 2>&1; }
-ask "t-$TS" "$TRANSFER_TINY"
-if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
-  keep_prepared t; T_HALF=$(node "$AGENT_JS" half "$WORK/t.msg")
-  T_DEADLINE=$(( $(jq -r .created_at_ns "$WORK/t.msg" | cut -c1-10) + 600 ))
-  pass "T  prepared, and kept unsigned until its ten minutes end"
-else fail "T  ask: $HTTP $(why)"; fi
-REVOKED=1
-for i in 1 2 3 4 5; do
-  (NETWORK=testnet; source "$REPO_ROOT/scripts/lib/dao_gov.sh"; dao_drive "$DAO" "$DAO_MEMBER" "$(jq -nc --arg h "$BUILD" '{RevokeWalletContract:{code_hash:$h}}')") >/dev/null 2>&1 && break
-  sleep 65
-done
-if ! in_list; then
-  pass "D  the DAO revoked the build"
-  ask "d-$TS" "$TRANSFER_TINY"
-  [[ "$HTTP" == 403 && "$(jq -r .error <<<"$BODY")" == wallet_contract_refused ]] \
-    && pass "D  an operation is not prepared for a build off the list (403 wallet_contract_refused)" \
-    || fail "D  with the build revoked: $HTTP $(why)"
-  if [[ -n "${T_HALF:-}" ]]; then
-    relay_with "t-$TS" "$T_HALF"
-    [[ "$HTTP" =~ ^4 ]] && pass "D  a request prepared before is not relayed either ($HTTP $(jq -r .error <<<"$BODY"))" \
-      || fail "D  a prepared request was relayed with the build revoked: $HTTP $(why)"
-    op_state "t-$TS"
-    [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]] && pass "D  and it still waits for its half" || fail "D  the refused relay left it $(jq -r .status <<<"$BODY")"
-  fi
-else fail "D  the revoke vote did not execute"; fi
-if approve_build && in_list; then
-  REVOKED=""
-  pass "D  the DAO approved the build again"
-  ask "d-$TS" "$TRANSFER_TINY"
-  if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
-    keep_prepared d
-    relay_with "d-$TS" "$(node "$AGENT_JS" half "$WORK/d.msg")"
-    if [[ "$HTTP" == 200 ]] && settle "d-$TS" && [[ "$STATUS" == success ]]; then pass "D  the agent goes on under the same id"
-    else fail "D  relay after the approval: $HTTP status=$STATUS $(why)"; fi
-  else fail "D  after the approval: $HTTP $(why)"; fi
-else fail "D  the build is not approved again"; fi
-
-log "T  a request past its time"
-if [[ -n "${T_HALF:-}" ]]; then
-  WAIT=$(( T_DEADLINE + 15 - $(date +%s) ))
-  (( WAIT > 0 )) && { note "waiting ${WAIT}s for the request's ten minutes to end"; sleep "$WAIT"; }
-  C0=$(balance "$AGENT_ACC")
-  relay_with "t-$TS" "$T_HALF"
-  [[ "$HTTP" == 200 ]] && settle "t-$TS"
-  T_STATUS=$(jq -r '.status // ""' <<<"$BODY")
-  if [[ "$T_STATUS" != success ]]; then pass "T  not executed: $HTTP ${T_STATUS:-} $(jq -r '(.reason // .message // "") | .[0:120]' <<<"$BODY")"
-  else fail "T  a request past its ten minutes was executed"; fi
-  sleep 3
-  [[ "$(balance "$AGENT_ACC")" == "$C0" ]] && pass "T  the balance did not move" || fail "T  the balance moved"
-fi
-
-# ── P2 ───────────────────────────────────────────────────────────────────────
-log "P2 above auto_up_to: the approver"
-TRANSFER_MID=$(jq -nc --arg to "$RECIPIENT" '{kind:"transfer", to:$to, amount:"30000000000000000000000"}')   # 0.03 NEAR
-ask "p2-$TS" "$TRANSFER_MID"
-APPROVAL_ID=$(jq -r '.approval_id // ""' <<<"$BODY")
-if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == pending_approval && -n "$APPROVAL_ID" ]]; then
-  pass "P2 the operation waits for the approver"
-  ask "p2-$TS" "$TRANSFER_MID"
-  [[ "$(jq -r .status <<<"$BODY")" == pending_approval ]] && pass "P2 asked again before the vote: still waiting" || fail "P2 a repeat before the vote: $HTTP $(why)"
-  api_wk "$WK0" GET /wallet/v1/pending_approvals >/dev/null
-  [[ "$(jq -r --arg id "$APPROVAL_ID" '[.approvals[]? | select(.approval_id == $id) | .type][0] // ""' <<<"$BODY")" == wallet_contract ]] \
-    && pass "P2 the wallet's pending approvals list it as wallet_contract" || fail "P2 pending_approvals: $HTTP $(why)"
-  DETAILS=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$APPROVAL_ID")
-  APPROVE_MSG="approve:$APPROVAL_ID:$(jq -r .wallet_pubkey <<<"$DETAILS"):$(jq -r .request_hash <<<"$DETAILS")"
-  NONCE_B64=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-  VOTE=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$CREDS_DIR/$APPROVER.json")" "$RECOVERY_BIN" sign-nep413 \
-    --message "$APPROVE_MSG" --recipient "$CONTRACT_ID" --nonce-base64 "$NONCE_B64" | jq -r .signature)
-  api - POST "/wallet/v1/approve/$APPROVAL_ID" "$(jq -nc --arg s "$VOTE" --arg pk "$APPROVER_PUB" --arg a "$APPROVER" --arg n "$NONCE_B64" \
-    '{signature:$s, public_key:$pk, account_id:$a, nonce:$n}')" >/dev/null
-  [[ "$HTTP" == 200 ]] && pass "P2 the approver voted" || fail "P2 the vote: $HTTP $(why)"
-  ask "p2-$TS" "$TRANSFER_MID"
-  if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
-    keep_prepared p2
-    check_prepared p2 "$TRANSFER_MID" && pass "P2 after the vote the repeat is prepared, and is the transfer approved" || fail "P2 the prepared request is not the one approved"
-    relay_with "p2-$TS" "$(node "$AGENT_JS" half "$WORK/p2.msg")"
-    if [[ "$HTTP" == 200 ]] && settle "p2-$TS" && [[ "$STATUS" == success ]]; then pass "P2 executed"
-    else fail "P2 relay: $HTTP status=$STATUS $(why)"; fi
-  else fail "P2 the repeat after the vote: $HTTP $(why)"; fi
-else fail "P2 ask: $HTTP $(why)"; fi
-
-# ── I1 ───────────────────────────────────────────────────────────────────────
-log "I1 use_bound_identity"
-CLAIM=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/trial-key" -H @<(printf '%s\n' "Authorization: Bearer $WK0") \
-  -H 'Content-Type: application/json' -d '{}' 2>/dev/null)
-PK=$(jq -r '.payment_key // empty' <<<"$CLAIM")
-if [[ -z "$PK" ]]; then
-  skip "I1 no trial key for the wallet ($(jq -r '.error // "no answer"' <<<"$CLAIM")): the identity row needs one"
-else
-  out=$(mktemp "$WORK/out.XXXXXX")
-  HTTP=$(curl -sS -o "$out" -w '%{http_code}' -m 300 -X POST "$COORDINATOR_URL/call/connectors.outlayer.testnet/connector-probe" \
-    -H @<(printf '%s\n' "X-Payment-Key: $PK") -H 'Content-Type: application/json' \
-    -d '{"input":{"operation":"whoami"},"use_bound_identity":true}' 2>/dev/null)
-  BODY=$(tr -d '\n' < "$out"); rm -f "$out"
-  SENDER=$(jq -r '.output // .result // "{}"' <<<"$BODY" 2>/dev/null | jq -r '.sender_id // ""' 2>/dev/null)
-  [[ "$HTTP" == 200 && "$SENDER" == "$AGENT_ACC" ]] && pass "I1 the program runs as the wallet contract's account ($SENDER)" \
-    || fail "I1 use_bound_identity: $HTTP sender='$SENDER' $(why)"
-  unset PK
-fi
+# ── O ────────────────────────────────────────────────────────────────────────
+log "O  one prepared operation of a wallet at a time"
+# What the wallet has spent of its daily NEAR, as the owner's policy page shows it.
+spent_today() { api_wk "$WK0" GET /wallet/v1/policy >/dev/null; jq -r '.usage.daily.native.spent // "0" | tostring' <<<"$BODY" 2>/dev/null; }
+U0=$(spent_today)
+ask "o1-$TS" "$TRANSFER_TINY"
+if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+  HASH_O=$(jq -r .request_hash <<<"$BODY"); keep_prepared o1
+  U1=$(spent_today)
+  ask "o2-$TS" "$TRANSFER_TINY"
+  if [[ "$HTTP" == 409 && "$(jq -r .error <<<"$BODY")" == conflict && -z "$(jq -r '.tee_half // ""' <<<"$BODY")" ]] \
+     && jq -r '.message // ""' <<<"$BODY" | grep -qF "\`o1-$TS\` of this wallet is prepared and waits for the agent's half"; then
+    pass "O  with one operation prepared, a new id is refused and names the one that waits (409 conflict)"
+  else fail "O  a new id beside a prepared operation: $HTTP $(why)"; fi
+  op_state "o2-$TS"; O2_HTTP=$HTTP
+  agent GET "$OPS"
+  [[ "$O2_HTTP" == 404 && "$(jq -c --arg a "o1-$TS" --arg b "o2-$TS" '[.operations[]? | select(.id == $a or .id == $b) | [.id, .status]]' <<<"$BODY")" == "[[\"o1-$TS\",\"awaiting_signature\"]]" ]] \
+    && pass "O  nothing was prepared for it: the id is no operation (404), and the open list holds the first alone" \
+    || fail "O  the refused id: GET answered $O2_HTTP; the list: $(jq -c '[.operations[]? | [.id, .status]]' <<<"$BODY" 2>/dev/null | head -c 200)"
+  U2=$(spent_today)
+  [[ "$U1" != "$U0" && "$U2" == "$U1" ]] && pass "O  the prepared operation is counted in the day's usage, the refused one is not ($U0 → $U1 → $U2)" \
+    || fail "O  the day's usage went $U0 → $U1 (prepared) → $U2 (after the refusal)"
+  ask "o1-$TS" "$TRANSFER_TINY"
+  [[ "$(jq -r '[.status, .request_hash] | @json' <<<"$BODY")" == "[\"awaiting_signature\",\"$HASH_O\"]" ]] \
+    && pass "O  the same id answers where it stands: the same request, waiting for the agent's half" || fail "O  the same id: $HTTP $(why)"
+  relay_with "o1-$TS" "$(node "$AGENT_JS" half "$WORK/o1.msg")"
+  if [[ "$HTTP" == 200 ]] && settle "o1-$TS" && [[ "$STATUS" == success ]]; then
+    pass "O  the first is relayed and executed"
+    ask "o2-$TS" "$TRANSFER_TINY"
+    if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+      pass "O  with the first relayed, the id refused before is prepared"
+      keep_prepared o2
+      relay_with "o2-$TS" "$(node "$AGENT_JS" half "$WORK/o2.msg")"
+      if [[ "$HTTP" == 200 ]] && settle "o2-$TS" && [[ "$STATUS" == success ]]; then pass "O  and executed"
+      else fail "O  relay of the second: $HTTP status=$STATUS $(why)"; fi
+    else fail "O  a new id after the relay: $HTTP $(why)"; fi
+  else fail "O  relay of the first: $HTTP status=$STATUS $(why)"; fi
+else fail "O  ask: $HTTP $(why)"; fi
 
 # ── S5 + Z ───────────────────────────────────────────────────────────────────
 log "S5 a new account with no key: the 0s wallet contract (NEP-616)"
@@ -756,12 +704,133 @@ if new_wallet 2; then
       keep_prepared s5m
       check_prepared s5m "$TRANSFER_SMALL" "$ACC0S" "$TEE2" && pass "S5 the move is prepared, and is the transfer asked for" || fail "S5 the prepared request differs"
       relay_with "s5m-$TS" "$(node "$AGENT_JS" half "$WORK/s5m.msg")"
-      [[ "$HTTP" == 200 ]] && settle "s5m-$TS" && [[ "$STATUS" == success ]] && pass "S5 a move out of the 0s contract executed" \
-        || fail "S5 the move: $HTTP status=$STATUS $(why)"
+      if [[ "$HTTP" == 200 ]] && settle "s5m-$TS" && [[ "$STATUS" == success ]]; then
+        pass "S5 a move out of the 0s contract executed"; S5_READY=1
+      else fail "S5 the move: $HTTP status=$STATUS $(why)"; fi
     else fail "S5 ask: $HTTP $(why)"; fi
     export ACCOUNT_OF_AGENT="$SAVED_ACCOUNT" AGENT_SEED_FILE="$SAVED_SEED"
   else fail "S5 create-0s: $ACC0S"; fi
 else fail "S5 the third wallet: $HTTP $(why)"; fi
+
+# ── D + T ────────────────────────────────────────────────────────────────────
+log "D  the build list"
+in_list() { near_view "$DAO" get_approved_wallet_contracts '{}' | jq -e --arg b "$BUILD" 'index($b) != null' >/dev/null 2>&1; }
+# The request kept unsigned is the 0s wallet's (S5): a wallet has one prepared operation at a
+# time, so wallet 0 holds none while D asks for its own, and nothing else needs the 0s wallet
+# while the ten minutes run. on_0s <command…> runs a command as that wallet's agent.
+on_0s() { ACCOUNT_OF_AGENT="$ACC0S" AGENT_SEED_FILE="$WORK/s5.seed" "$@"; }
+T_HALF=""
+if [[ -n "${S5_READY:-}" ]]; then
+  on_0s ask "t-$TS" "$TRANSFER_TINY"
+  if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+    keep_prepared t; T_HALF=$(on_0s node "$AGENT_JS" half "$WORK/t.msg")
+    T_DEADLINE=$(( $(jq -r .created_at_ns "$WORK/t.msg" | cut -c1-10) + 600 ))
+    pass "T  prepared on the 0s wallet, and kept unsigned until its ten minutes end"
+  else fail "T  ask: $HTTP $(why)"; fi
+else skip "T, and D's request prepared before the revoke: the 0s wallet (S5) is not there to hold a request unsigned"; fi
+REVOKED=1
+for i in 1 2 3 4 5; do
+  (NETWORK=testnet; source "$REPO_ROOT/scripts/lib/dao_gov.sh"; dao_drive "$DAO" "$DAO_MEMBER" "$(jq -nc --arg h "$BUILD" '{RevokeWalletContract:{code_hash:$h}}')") >/dev/null 2>&1 && break
+  sleep 65
+done
+if ! in_list; then
+  pass "D  the DAO revoked the build"
+  ask "d-$TS" "$TRANSFER_TINY"
+  [[ "$HTTP" == 403 && "$(jq -r .error <<<"$BODY")" == wallet_contract_refused ]] \
+    && pass "D  an operation is not prepared for a build off the list (403 wallet_contract_refused)" \
+    || fail "D  with the build revoked: $HTTP $(why)"
+  if [[ -n "$T_HALF" ]]; then
+    on_0s relay_with "t-$TS" "$T_HALF"
+    [[ "$HTTP" =~ ^4 ]] && pass "D  a request prepared before is not relayed either ($HTTP $(jq -r .error <<<"$BODY"))" \
+      || fail "D  a prepared request was relayed with the build revoked: $HTTP $(why)"
+    on_0s op_state "t-$TS"
+    [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]] && pass "D  and it still waits for its half" || fail "D  the refused relay left it $(jq -r .status <<<"$BODY")"
+  fi
+else fail "D  the revoke vote did not execute"; fi
+if approve_build && in_list; then
+  REVOKED=""
+  pass "D  the DAO approved the build again"
+  ask "d-$TS" "$TRANSFER_TINY"
+  if [[ "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+    keep_prepared d
+    relay_with "d-$TS" "$(node "$AGENT_JS" half "$WORK/d.msg")"
+    if [[ "$HTTP" == 200 ]] && settle "d-$TS" && [[ "$STATUS" == success ]]; then pass "D  the agent goes on under the same id"
+    else fail "D  relay after the approval: $HTTP status=$STATUS $(why)"; fi
+  else fail "D  after the approval: $HTTP $(why)"; fi
+else fail "D  the build is not approved again"; fi
+
+log "T  a request past its time"
+if [[ -n "$T_HALF" ]]; then
+  WAIT=$(( T_DEADLINE + 15 - $(date +%s) ))
+  (( WAIT > 0 )) && { note "waiting ${WAIT}s for the request's ten minutes to end"; sleep "$WAIT"; }
+  # It still waits for the agent's half; past its time it holds the wallet no longer.
+  on_0s ask "tn-$TS" "$TRANSFER_TINY"
+  if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+    pass "T  past its ten minutes the unsigned request no longer holds the wallet: a new id is prepared"
+    keep_prepared tn
+    on_0s relay_with "tn-$TS" "$(on_0s node "$AGENT_JS" half "$WORK/tn.msg")"
+    if [[ "$HTTP" == 200 ]] && on_0s settle "tn-$TS" && [[ "$STATUS" == success ]]; then pass "T  and executed"
+    else fail "T  relay of the new operation: $HTTP status=$STATUS $(why)"; fi
+    sleep 3
+  else fail "T  a new id after the ten minutes: $HTTP $(why)"; fi
+  C0=$(balance "$ACC0S")
+  on_0s relay_with "t-$TS" "$T_HALF"
+  [[ "$HTTP" == 200 ]] && on_0s settle "t-$TS"
+  T_STATUS=$(jq -r '.status // ""' <<<"$BODY")
+  if [[ "$T_STATUS" != success ]]; then pass "T  not executed: $HTTP ${T_STATUS:-} $(jq -r '(.reason // .message // "") | .[0:120]' <<<"$BODY")"
+  else fail "T  a request past its ten minutes was executed"; fi
+  sleep 3
+  [[ "$(balance "$ACC0S")" == "$C0" ]] && pass "T  the balance did not move" || fail "T  the balance moved"
+fi
+
+# ── P2 ───────────────────────────────────────────────────────────────────────
+log "P2 above auto_up_to: the approver"
+TRANSFER_MID=$(jq -nc --arg to "$RECIPIENT" '{kind:"transfer", to:$to, amount:"30000000000000000000000"}')   # 0.03 NEAR
+ask "p2-$TS" "$TRANSFER_MID"
+APPROVAL_ID=$(jq -r '.approval_id // ""' <<<"$BODY")
+if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == pending_approval && -n "$APPROVAL_ID" ]]; then
+  pass "P2 the operation waits for the approver"
+  ask "p2-$TS" "$TRANSFER_MID"
+  [[ "$(jq -r .status <<<"$BODY")" == pending_approval ]] && pass "P2 asked again before the vote: still waiting" || fail "P2 a repeat before the vote: $HTTP $(why)"
+  api_wk "$WK0" GET /wallet/v1/pending_approvals >/dev/null
+  [[ "$(jq -r --arg id "$APPROVAL_ID" '[.approvals[]? | select(.approval_id == $id) | .type][0] // ""' <<<"$BODY")" == wallet_contract ]] \
+    && pass "P2 the wallet's pending approvals list it as wallet_contract" || fail "P2 pending_approvals: $HTTP $(why)"
+  DETAILS=$(curl -sS "$COORDINATOR_URL/wallet/v1/approval/$APPROVAL_ID")
+  APPROVE_MSG="approve:$APPROVAL_ID:$(jq -r .wallet_pubkey <<<"$DETAILS"):$(jq -r .request_hash <<<"$DETAILS")"
+  NONCE_B64=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+  VOTE=$(CUSTOMER_RECOVERY_PRIVATE_KEY="$(jq -r .private_key "$CREDS_DIR/$APPROVER.json")" "$RECOVERY_BIN" sign-nep413 \
+    --message "$APPROVE_MSG" --recipient "$CONTRACT_ID" --nonce-base64 "$NONCE_B64" | jq -r .signature)
+  api - POST "/wallet/v1/approve/$APPROVAL_ID" "$(jq -nc --arg s "$VOTE" --arg pk "$APPROVER_PUB" --arg a "$APPROVER" --arg n "$NONCE_B64" \
+    '{signature:$s, public_key:$pk, account_id:$a, nonce:$n}')" >/dev/null
+  [[ "$HTTP" == 200 ]] && pass "P2 the approver voted" || fail "P2 the vote: $HTTP $(why)"
+  ask "p2-$TS" "$TRANSFER_MID"
+  if [[ "$HTTP" == 200 && "$(jq -r .status <<<"$BODY")" == awaiting_signature ]]; then
+    keep_prepared p2
+    check_prepared p2 "$TRANSFER_MID" && pass "P2 after the vote the repeat is prepared, and is the transfer approved" || fail "P2 the prepared request is not the one approved"
+    relay_with "p2-$TS" "$(node "$AGENT_JS" half "$WORK/p2.msg")"
+    if [[ "$HTTP" == 200 ]] && settle "p2-$TS" && [[ "$STATUS" == success ]]; then pass "P2 executed"
+    else fail "P2 relay: $HTTP status=$STATUS $(why)"; fi
+  else fail "P2 the repeat after the vote: $HTTP $(why)"; fi
+else fail "P2 ask: $HTTP $(why)"; fi
+
+# ── I1 ───────────────────────────────────────────────────────────────────────
+log "I1 use_bound_identity"
+CLAIM=$(curl -sS -m 60 -X POST "$COORDINATOR_URL/trial-key" -H @<(printf '%s\n' "Authorization: Bearer $WK0") \
+  -H 'Content-Type: application/json' -d '{}' 2>/dev/null)
+PK=$(jq -r '.payment_key // empty' <<<"$CLAIM")
+if [[ -z "$PK" ]]; then
+  skip "I1 no trial key for the wallet ($(jq -r '.error // "no answer"' <<<"$CLAIM")): the identity row needs one"
+else
+  out=$(mktemp "$WORK/out.XXXXXX")
+  HTTP=$(curl -sS -o "$out" -w '%{http_code}' -m 300 -X POST "$COORDINATOR_URL/call/connectors.outlayer.testnet/connector-probe" \
+    -H @<(printf '%s\n' "X-Payment-Key: $PK") -H 'Content-Type: application/json' \
+    -d '{"input":{"operation":"whoami"},"use_bound_identity":true}' 2>/dev/null)
+  BODY=$(tr -d '\n' < "$out"); rm -f "$out"
+  SENDER=$(jq -r '.output // .result // "{}"' <<<"$BODY" 2>/dev/null | jq -r '.sender_id // ""' 2>/dev/null)
+  [[ "$HTTP" == 200 && "$SENDER" == "$AGENT_ACC" ]] && pass "I1 the program runs as the wallet contract's account ($SENDER)" \
+    || fail "I1 use_bound_identity: $HTTP sender='$SENDER' $(why)"
+  unset PK
+fi
 
 # ── NM ───────────────────────────────────────────────────────────────────────
 log "NM an agent on a new machine: a new key through the owner's own signature, the same agent key again"
@@ -906,15 +975,34 @@ policy_request() {
   done
   return 1
 }
-# ask_until <id prefix> <op> <status|error> — the agent asks, under a new id each time, until
-# the answer's status or error code is the one named (a write on chain reaches the
-# coordinator within a minute). ASKED is the id of the last ask.
+# A write on chain reaches the coordinator within a minute, and a wallet has one prepared
+# operation at a time, so neither wait leaves one behind. ASKED is the id of the last ask.
+# ask_until <name> <op> <status> — the agent asks under ONE id until the answer's status is
+# the one named: a refusal writes no operation, so the id is judged anew each time.
 ASKED=""
 ask_until() {
   local i
+  ASKED="$1-$TS"
+  for i in $(seq 1 20); do
+    ask "$ASKED" "$2"
+    [[ "$(jq -r '.status // ""' <<<"$BODY" 2>/dev/null)" == "$3" ]] && return 0
+    sleep 3
+  done
+  return 1
+}
+# refused_until <name> <op> <error> — the agent asks until the refusal named, a new id each
+# time. An ask the coordinator still prepares is an operation: it is signed and relayed to its
+# end before the next ask.
+refused_until() {
+  local i
   for i in $(seq 1 20); do
     ASKED="$1$i-$TS"; ask "$ASKED" "$2"
-    [[ "$(jq -r '.status // .error // ""' <<<"$BODY" 2>/dev/null)" == "$3" ]] && return 0
+    [[ "$(jq -r '.error // ""' <<<"$BODY" 2>/dev/null)" == "$3" ]] && return 0
+    if [[ "$(jq -r '.status // ""' <<<"$BODY" 2>/dev/null)" == awaiting_signature ]]; then
+      keep_prepared early
+      relay_with "$ASKED" "$(node "$AGENT_JS" half "$WORK/early.msg")"
+      [[ "$HTTP" == 200 ]] && settle "$ASKED"
+    fi
     sleep 3
   done
   return 1
@@ -976,7 +1064,7 @@ else
   tx "$OWNER" "$CONTRACT_ID" freeze_wallet "$(jq -nc --arg k "$WPUB0" '{wallet_pubkey:$k}')" '0 NEAR' \
     && pass "LF freeze_wallet by the owner alone went through" || fail "LF freeze_wallet: $(near_why "$OUT")"
   chain_shows "LF frozen" "$L_V/true/true"
-  ask_until lf "$TRANSFER_TINY" wallet_frozen && [[ "$HTTP" == 403 ]] \
+  refused_until lf "$TRANSFER_TINY" wallet_frozen && [[ "$HTTP" == 403 ]] \
     && pass "LF nothing is prepared for a frozen wallet (403 wallet_frozen)" || fail "LF an operation of a frozen wallet: $HTTP $(why)"
   tx "$OWNER" "$CONTRACT_ID" unfreeze_wallet "$(jq -nc --arg k "$WPUB0" '{wallet_pubkey:$k}')" '0 NEAR' \
     && pass "LF unfreeze_wallet by the owner alone went through" || fail "LF unfreeze_wallet: $(near_why "$OUT")"
@@ -1056,8 +1144,10 @@ else
     exit_vote reject "$APPROVER2" "$E_NONCE"
     [[ "$(exit_record | jq -c '[.pending, .generation]')" == "[null,$E_GEN]" ]] && pass "LE one reject by an approver ends the exit" \
       || fail "LE reject_exit: $(near_why "$OUT"); pending $(exit_record | jq -c '.pending.kind // null' 2>/dev/null)"
-    ask_until le "$TRANSFER_TINY" awaiting_signature && pass "LE the wallet goes on after the rejected exit: an operation is prepared" \
-      || fail "LE an operation after the rejected exit: $HTTP $(why)"
+    if ask_until le "$TRANSFER_TINY" awaiting_signature; then
+      pass "LE the wallet goes on after the rejected exit: an operation is prepared"
+      run_prepared LE le "$TRANSFER_TINY"
+    else fail "LE an operation after the rejected exit: $HTTP $(why)"; fi
   else fail "LE the exit did not start: $(near_why "$OUT")"; fi
 
   # ── LU ─────────────────────────────────────────────────────────────────────
@@ -1104,7 +1194,8 @@ if [[ "$MPC_PK" == bls12381g2:* ]] && OUT=$(exit_tool initiate); then
 else fail "X  the exit did not start: $(near_why "$OUT")"; fi
 if [[ -n "$MASTER" ]]; then
   ask "x-$TS" "$TRANSFER_TINY"
-  [[ "$HTTP" =~ ^4 ]] && pass "X  after the claim the agent's operation is refused ($HTTP $(why))" \
+  [[ "$HTTP" =~ ^4 ]] && ! grep -q 'is prepared and waits for the agent' <<<"$BODY" \
+    && pass "X  after the claim the agent's operation is refused ($HTTP $(why))" \
     || fail "X  after the claim: $HTTP $(why)"
   KEYS_OUT=$(CUSTOMER_RECOVERY_MASTER="$MASTER" AGENT_KEY_SIGNATURE="$(cat "$WORK/ak.sig")" "$RECOVERY_BIN" wallet-contract keys --owner "$OWNER" --wallet-id "$WID0" 2>/dev/null)
   [[ "$(jq -r .public_key <<<"$KEYS_OUT")" == "$AGENT_PUB$TEE_PUB" ]] && pass "X  the tool derives both keys of the pair from the master and the signature" \

@@ -45,7 +45,7 @@ use tower_http::trace::TraceLayer;
 #[path = "api_support.rs"]
 mod support;
 use support::*;
-pub(crate) use support::{ApprovalInfo, WalletSignResponse};
+pub(crate) use support::{ApprovalInfo, WalletOpenPolicyRequest, WalletSignResponse};
 
 /// How many approval (or rejection) votes one signing request may carry.
 ///
@@ -821,6 +821,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/wallet/check-policy", post(wallet_check_policy_handler))
         .route("/wallet/encrypt-policy", post(wallet_encrypt_policy_handler))
         .route("/wallet/decrypt-policy", post(wallet_decrypt_policy_handler))
+        .route("/wallet/open-policy", post(wallet_open_policy_handler))
         // Ephemeral keys — separate module, returns private keys (see ephemeral_keys.rs)
         .merge(crate::ephemeral_keys::ephemeral_key_routes())
         .merge(crate::custody::custody_routes())
@@ -6908,8 +6909,30 @@ async fn wallet_check_policy_handler(
     Ok(Json(response))
 }
 
-/// Encrypt a wallet policy for on-chain storage
-async fn wallet_encrypt_policy_handler(
+/// The wallet's key as the contract stores it and as a policy statement names
+/// it: `ed25519:<hex>` of the wallet's NEAR key.
+async fn policy_wallet_pubkey(
+    state: &AppState,
+    customer: Option<&crate::crypto::Customer>,
+    wallet_id: &str,
+) -> Result<String, ApiError> {
+    let key = state
+        .keystore
+        .read()
+        .await
+        .get_public_key_for_seed(customer, &wallet_seed(wallet_id, "near"))
+        .map_err(|e| ApiError::InternalError(format!("Failed to derive public key: {}", e)))?;
+    Ok(format!("ed25519:{}", hex::encode(key.as_bytes())))
+}
+
+/// Encrypt a wallet policy for on-chain storage.
+///
+/// The bytes encrypted are the bytes of `policy_json` as they arrived, and the
+/// answer carries the registration key's statement over the pair
+/// ([`crate::custody::policy_statement`]): the owner signs the ciphertext into
+/// a transaction, and holds it to the plaintext by that statement. A keystore
+/// that cannot make the statement encrypts nothing.
+pub(crate) async fn wallet_encrypt_policy_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<WalletEncryptPolicyRequest>,
@@ -6926,17 +6949,60 @@ async fn wallet_encrypt_policy_handler(
         .ensure_customer_loaded(customer.as_ref())
         .await
         .map_err(ApiError::from_customer_load)?;
+    let signer = crate::custody::policy_statement_signer(&state)?;
 
     let seed = format!("wallet-policy:{}", req.wallet_id);
-    let keystore = state.keystore.read().await;
-
-    let encrypted = keystore
+    let encrypted = state
+        .keystore
+        .read()
+        .await
         .encrypt(customer.as_ref(), &seed, req.policy_json.as_bytes())
         .map_err(|e| ApiError::InternalError(format!("Encryption failed: {}", e)))?;
+    let wallet_pubkey = policy_wallet_pubkey(&state, customer.as_ref(), &req.wallet_id).await?;
 
     Ok(Json(WalletEncryptPolicyResponse {
         encrypted_base64: base64::encode(&encrypted),
+        statement: signer.state(&wallet_pubkey, &encrypted, req.policy_json.as_bytes()),
     }))
+}
+
+/// Open a wallet policy: the plaintext of `encrypted_data`, byte for byte,
+/// with the registration key's statement over the pair
+/// ([`crate::custody::policy_statement`]). What a page shows as a stored
+/// policy, or signs into a transaction after its approvers released it, is
+/// held to the ciphertext by that statement.
+pub(crate) async fn wallet_open_policy_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<WalletOpenPolicyRequest>,
+) -> Result<Json<WalletOpenPolicyResponse>, ApiError> {
+    if !state.is_ready() {
+        return Err(ApiError::Unauthorized("Keystore not ready.".to_string()));
+    }
+
+    validate_wallet_id(&req.wallet_id)?;
+    let customer = extract_customer_from_header(&headers)?;
+    state
+        .ensure_customer_loaded(customer.as_ref())
+        .await
+        .map_err(ApiError::from_customer_load)?;
+    let signer = crate::custody::policy_statement_signer(&state)?;
+
+    let seed = format!("wallet-policy:{}", req.wallet_id);
+    let encrypted = base64::decode(&req.encrypted_data)
+        .map_err(|e| ApiError::BadRequest(format!("encrypted_data is not valid base64: {}", e)))?;
+    let decrypted = state
+        .keystore
+        .read()
+        .await
+        .decrypt(customer.as_ref(), &seed, &encrypted)
+        .map_err(|_| ApiError::BadRequest("encrypted_data did not decrypt as this wallet's policy".to_string()))?;
+    let wallet_pubkey = policy_wallet_pubkey(&state, customer.as_ref(), &req.wallet_id).await?;
+    let statement = signer.state(&wallet_pubkey, &encrypted, &decrypted);
+    let policy_json = String::from_utf8(decrypted)
+        .map_err(|_| ApiError::BadRequest("the policy in encrypted_data is not text".to_string()))?;
+
+    Ok(Json(WalletOpenPolicyResponse { policy_json, statement }))
 }
 
 /// Decrypt a wallet policy for owner-view / config sync. This is NOT the signing

@@ -297,24 +297,105 @@ pub fn tee_key_statement(dao: &str, scope: &str, wallet_id: &str, tee: &[u8; 32]
 }
 
 /// The keystore DAO and the Ed25519 half of the keystore's registration key:
-/// what signs [`tee_key_statement`]. A keystore registered with another
-/// scheme, or not registered, cannot state its TEE key.
-fn statement_signer(state: &AppState) -> Result<(String, ed25519_dalek::SigningKey), ApiError> {
+/// what signs a statement of `what` ([`tee_key_statement`],
+/// [`policy_statement`]). A keystore registered with another scheme, or not
+/// registered, states nothing.
+fn statement_signer(state: &AppState, what: &str) -> Result<(String, ed25519_dalek::SigningKey), ApiError> {
     let context = state.mpc_context.get().ok_or_else(|| {
-        ApiError::InternalError(
-            "This keystore cannot state its TEE key: it has no registration key in the keystore DAO".to_string(),
-        )
+        ApiError::InternalError(format!(
+            "This keystore cannot state {what}: it has no registration key in the keystore DAO"
+        ))
     })?;
     let near_crypto::SecretKey::ED25519(secret) = &context.keystore_dao_signer.secret_key else {
         return Err(ApiError::InternalError(format!(
-            "This keystore cannot state its TEE key: its registration key is {}, and the statement is signed with ed25519 only",
+            "This keystore cannot state {what}: its registration key is {}, and the statement is signed with ed25519 only",
             context.keystore_dao_signer.secret_key.key_type()
         )));
     };
     let key = ed25519_dalek::SigningKey::from_keypair_bytes(&secret.0).map_err(|_| {
-        ApiError::InternalError("This keystore cannot state its TEE key: its registration key is malformed".to_string())
+        ApiError::InternalError(format!("This keystore cannot state {what}: its registration key is malformed"))
     })?;
     Ok((context.mpc_ckd_config.keystore_dao_id.to_string(), key))
+}
+
+/// The registration key, `ed25519:<base58>`, as `is_keystore_approved` takes it.
+fn registration_public_key(registration: &ed25519_dalek::SigningKey) -> String {
+    near_crypto::PublicKey::ED25519(near_crypto::ED25519PublicKey(registration.verifying_key().to_bytes())).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// the statement over a wallet's policy
+// ---------------------------------------------------------------------------
+
+/// The first line of [`policy_statement`].
+pub const POLICY_STATEMENT_TAG: &str = "OUTLAYER_WALLET_POLICY/V1";
+
+/// What the keystore states about a wallet's policy: that the ciphertext
+/// `blob` is the encryption of exactly the bytes `plaintext`, as the policy of
+/// the wallet whose key the contract stores as `wallet_pubkey`
+/// (`ed25519:<hex>`), said by a keystore of the DAO `dao`. Each of the two is
+/// named by its SHA-256 in hex. One field per line, joined by `\n`, with no
+/// newline at the end.
+///
+/// The owner signs a policy's ciphertext into `store_wallet_policy` and reads
+/// a stored policy back, both through the coordinator, and can decrypt
+/// neither. A coordinator that swapped the ciphertext, or showed another
+/// plaintext for it, would have the owner store or trust a policy they never
+/// saw. So every ciphertext the owner is given comes with this statement,
+/// signed by the keystore's registration key; the owner's page hashes the
+/// bytes it holds, checks the signature and asks the DAO
+/// (`is_keystore_approved`) whether that key is a keystore's.
+///
+/// The plaintext is hashed as bytes, never as parsed JSON: what the page
+/// hashes is the text it was given, and it reads the policy from that text.
+///
+/// The registration key signs NEAR transactions too. The statement is text
+/// far longer than 32 bytes, so it is never a transaction hash or a NEP-413
+/// hash that key could be asked to sign elsewhere.
+pub fn policy_statement(dao: &str, wallet_pubkey: &str, blob: &[u8], plaintext: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    [
+        POLICY_STATEMENT_TAG.to_string(),
+        format!("dao:{dao}"),
+        format!("wallet:{wallet_pubkey}"),
+        format!("blob:{}", hex::encode(Sha256::digest(blob))),
+        format!("policy:{}", hex::encode(Sha256::digest(plaintext))),
+    ]
+    .join("\n")
+}
+
+/// [`policy_statement`], signed: what an answer that carries a policy's
+/// ciphertext carries with it.
+#[derive(Debug, Serialize)]
+pub struct PolicyStatement {
+    /// The keystore's registration key, `ed25519:<base58>`: the key the
+    /// keystore DAO approved, which `is_keystore_approved` takes.
+    pub keystore_public_key: String,
+    /// The registration key's Ed25519 signature over [`policy_statement`], in hex.
+    pub policy_statement_signature: String,
+}
+
+/// What signs [`policy_statement`]: taken before a policy is encrypted or
+/// opened, so a keystore that cannot state it does neither.
+pub(crate) struct PolicyStatementSigner {
+    dao: String,
+    registration: ed25519_dalek::SigningKey,
+}
+
+pub(crate) fn policy_statement_signer(state: &AppState) -> Result<PolicyStatementSigner, ApiError> {
+    let (dao, registration) = statement_signer(state, "a wallet's policy")?;
+    Ok(PolicyStatementSigner { dao, registration })
+}
+
+impl PolicyStatementSigner {
+    pub(crate) fn state(&self, wallet_pubkey: &str, blob: &[u8], plaintext: &[u8]) -> PolicyStatement {
+        let statement = policy_statement(&self.dao, wallet_pubkey, blob, plaintext);
+        let signature = ed25519_dalek::Signer::sign(&self.registration, statement.as_bytes());
+        PolicyStatement {
+            keystore_public_key: registration_public_key(&self.registration),
+            policy_statement_signature: hex::encode(signature.to_bytes()),
+        }
+    }
 }
 
 /// Whether `wallet_id` may stand in [`tee_key_statement`]: 1 to 64 of
@@ -338,15 +419,12 @@ async fn key_handler(
         ));
     }
     let (customer, _) = owner_scope(&state, &headers, &req.wallet_id).await?;
-    let (dao, registration) = statement_signer(&state)?;
+    let (dao, registration) = statement_signer(&state, "its TEE key")?;
     let public_key = tee_public_key(&state, &customer, &req.wallet_id).await?;
     let scope = customer.to_string();
     let statement = tee_key_statement(&dao, &scope, &req.wallet_id, public_key.as_bytes());
     let signature = ed25519_dalek::Signer::sign(&registration, statement.as_bytes());
-    let keystore_public_key = near_crypto::PublicKey::ED25519(near_crypto::ED25519PublicKey(
-        registration.verifying_key().to_bytes(),
-    ))
-    .to_string();
+    let keystore_public_key = registration_public_key(&registration);
     Ok(Json(KeyResponse {
         tee_public_key: hex::encode(public_key.as_bytes()),
         scope,
@@ -375,10 +453,38 @@ struct PrepareRequest {
     #[serde(default)]
     deposit_address: Option<String>,
     /// What the wallet has spent, in the coordinator's `current_usage` shape.
-    #[serde(default)]
-    usage: Option<serde_json::Value>,
+    /// Required: a request that names no usage would be judged as if the
+    /// wallet had spent nothing, and every limit over a window would pass.
+    usage: serde_json::Value,
     #[serde(default)]
     approval_info: Option<ApprovalInfo>,
+}
+
+/// The coordinator's `current_usage` document, held to the one shape it
+/// sends: every window, each a map of token to amount text, and the hour's
+/// transaction count as a whole number. Read only to refuse any other shape:
+/// [`wallet_policy::Usage::from_current_usage`] reads a missing window as
+/// nothing spent and a missing or fractional count as 0, so a partial
+/// document would pass every limit over what it leaves out.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct CurrentUsage {
+    daily: std::collections::BTreeMap<String, String>,
+    hourly: std::collections::BTreeMap<String, String>,
+    monthly: std::collections::BTreeMap<String, String>,
+    hourly_tx_count: u32,
+}
+
+/// The usage `prepare` judges against, once the document is the coordinator's whole shape.
+fn custody_usage(document: &serde_json::Value) -> Result<wallet_policy::Usage, ApiError> {
+    CurrentUsage::deserialize(document).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "the usage is not a whole current_usage document (`daily`, `hourly` and `monthly` maps of amount text, \
+             and a whole `hourly_tx_count`): {e}"
+        ))
+    })?;
+    Ok(wallet_policy::Usage::from_current_usage(document))
 }
 
 /// The body of the agent's request for an operation.
@@ -411,6 +517,7 @@ async fn prepare_handler(
     headers: HeaderMap,
     Json(req): Json<PrepareRequest>,
 ) -> Result<Json<PrepareResponse>, ApiError> {
+    let usage = custody_usage(&req.usage)?;
     let (customer, owner) = owner_scope(&state, &headers, &req.wallet_id).await?;
     let tee = tee_key(&state, &customer, &req.wallet_id).await?;
     let (wallet_contract, admitted) =
@@ -453,8 +560,7 @@ async fn prepare_handler(
             "This wallet's policy was not stored by its owner `{owner}`, so nothing is signed under it"
         )));
     }
-    let usage = req.usage.as_ref().map(wallet_policy::Usage::from_current_usage);
-    match wallet_policy::evaluate(&policy, &op, usage.as_ref(), now_ns / 1_000_000_000) {
+    match wallet_policy::evaluate(&policy, &op, Some(&usage), now_ns / 1_000_000_000) {
         Decision::Frozen => {
             return Err(ApiError::Refused { code: refusal::WALLET_FROZEN, message: "Wallet is frozen".to_string() })
         }

@@ -1116,6 +1116,29 @@ pub struct WalletEncryptPolicyRequest {
 #[derive(Debug, Serialize)]
 pub struct WalletEncryptPolicyResponse {
     pub encrypted_base64: String,
+    /// The registration key's statement that `encrypted_base64` encrypts
+    /// exactly the bytes of `policy_json`, for this wallet.
+    #[serde(flatten)]
+    pub statement: crate::custody::PolicyStatement,
+}
+
+/// Request to open a wallet policy: its plaintext as it was encrypted, with
+/// the keystore's statement over the pair.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletOpenPolicyRequest {
+    pub wallet_id: String,
+    /// The encrypted policy (base64), as the contract holds it.
+    pub encrypted_data: String,
+}
+
+/// The plaintext of a policy ciphertext, byte for byte, and the registration
+/// key's statement that the ciphertext encrypts those bytes for this wallet.
+#[derive(Debug, Serialize)]
+pub struct WalletOpenPolicyResponse {
+    pub policy_json: String,
+    #[serde(flatten)]
+    pub statement: crate::custody::PolicyStatement,
 }
 
 /// Request to DECRYPT a wallet policy for owner-view / config sync (NOT the signing
