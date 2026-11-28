@@ -79,12 +79,10 @@ An attacker holds the API host: the coordinator, its database, its queue.
 * **Funds at risk:** none, for an agent that makes the SDK's checks. The
   server holds neither key and can produce neither signature.
 * **Operations.** The enclave signs only an operation the agent signed, held
-  to the policy the enclave reads from the chain itself. With this server
-  compromised, what holds is the per-transaction limit, the kinds, the
-  tokens, the allowlist, the approvals and the freeze; the amounts per period
-  are counted by this server. The agent's SDK checks what comes back before
-  the agent signs: the receiver, method, arguments and amount of the request; for a swap or a withdrawal to another chain, the
-  1Click deposit address, which the SDK looks up at 1Click itself (the
+  to the policy the enclave reads from the chain itself. The agent checks
+  what comes back before it signs: the receiver, method, arguments and
+  amount of the request; for a swap or a withdrawal to another chain, the
+  1Click deposit address, which the agent looks up at 1Click itself (the
   recipient, the refund address, the assets and the amounts of that quote).
 * **Setup.** The page seals the owner's signature to a key that is in the
   link the agent gave its owner, so it reaches the agent and no one else.
