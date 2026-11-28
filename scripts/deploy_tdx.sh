@@ -49,6 +49,12 @@
 #                       printed, one per member (DAO_CHAIN=print). Without it, on testnet, every DAO
 #                       step is sent with the members' keys found in the local legacy keychain.
 #                       Mainnet always prints.
+#   --auto             testnet only, not with --print: a DAO step that waits for its delay (or
+#                       for votes) is driven again every 65 s, up to 10 times, and the run goes on
+#                       in-process as --resume would, so one command takes a worker through its
+#                       measurements approval to its registration, and a keystore through the
+#                       approval of its build, its registration vote and readiness. The waits run
+#                       out -> the same next steps as without it, their --resume carrying --auto.
 #   --dry-run          show what would happen; no deploy, no tx
 #
 # The node deploys from ITS OWN copy of deploy/self-hosted-tdx, not from this checkout: the
@@ -68,7 +74,8 @@
 #           on the Mac.
 # keystore: deploy -> read the CVM's measurements, instance id and compose hash from its guest
 #           agent -> if the DAO has not approved this build yet (its guest OS, its compose
-#           hash): propose it, and continue with --resume once it is executed -> read the key
+#           hash): propose it, and continue with --resume once it is executed (--auto waits for
+#           the execute and continues) -> restart the keystore so it registers -> read the key
 #           and "Proposal ID: N" from the current boot of the keystore's log -> check that
 #           registration N on the DAO is this CVM's (key, five measurements, instance, compose)
 #           -> the members vote FOR THAT KEY (DAO_CHAIN: sent with the local keys, or printed)
@@ -79,9 +86,11 @@
 #   ./scripts/deploy_tdx.sh worker   testnet worker-b --version 0.1.35 --node root@$DAL_HOST
 #   ./scripts/deploy_tdx.sh worker   testnet worker-b --version 0.1.35 --node root@$DAL_HOST --resume
 #   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@$DAL_HOST
+#   ./scripts/deploy_tdx.sh keystore testnet --version 0.1.35 --node root@$DAL_HOST --auto
 set -euo pipefail
 
 DEPLOY_VERSION=""; NODE=""; DIGEST=""; DRY_RUN=false; GATEWAY_URL=""; OS_IMAGE=""; KMS_URL=""; RESUME=false
+AUTO=false
 EXECUTE_EXCLUDES=""; EXCLUDES_SET=false
 REMOTE_USER="outlayer"; REMOTE_DIR="/home/outlayer/self-hosted-tdx"
 POS=()
@@ -104,6 +113,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   # below; an empty string forces "no exclusions" on a node the table covers.
   --execute-excludes) EXECUTE_EXCLUDES="${2-}"; EXCLUDES_SET=true; shift 2;;
   --resume)      RESUME=true; shift;;
+  --auto)        AUTO=true; shift;;
   --print)       export DAO_CHAIN=print; shift;;
   --dry-run|--info) DRY_RUN=true; shift;;
   *) POS+=("$1"); shift;;
@@ -119,6 +129,10 @@ if $RESUME; then
     [ -z "$OS_IMAGE" ] || { echo "worker --resume continues a deploy or an --os-image run: give it without --os-image" >&2; exit 1; }
     WORKER_RESUME=true
   fi
+fi
+if $AUTO; then
+  [ "$NETWORK" = testnet ] || { echo "--auto is testnet only: mainnet DAO steps are voted and executed by the members on their own machines" >&2; exit 1; }
+  [ "${DAO_CHAIN:-send}" = send ] || { echo "--auto waits for DAO steps it sends itself: it does not go with --print (DAO_CHAIN=$DAO_CHAIN)" >&2; exit 1; }
 fi
 [ -n "$DEPLOY_VERSION" ] || { echo "--version <ver> required (e.g. --version 0.1.35)" >&2; exit 1; }
 [ -n "$NODE" ] || { echo "--node <ssh-target> required (e.g. --node root@<node-ip>)" >&2; exit 1; }
@@ -209,6 +223,28 @@ GOV_DAO="dao.outlayer.$SUFFIX"
 GOV_MEMBER="${GOV_MEMBER:-zavodil.$SUFFIX}"
 # shellcheck source=lib/dao_gov.sh
 source "$(dirname "$0")/lib/dao_gov.sh"
+
+# drive_until_executed <dao> <member> <action-json> — dao_drive, and with --auto dao_drive again
+# every AUTO_WAIT_SEC while the proposal waits (rc 2), at most AUTO_WAITS times. The testnet
+# delay is 60 s and the members' keys are local, so the first retry executes it. Returns the last
+# dao_drive's rc: 0 executed, 1 error, 2 still waiting (the caller prints what is left).
+AUTO_WAIT_SEC=65; AUTO_WAITS=10
+drive_until_executed() {
+  local rc=0 n=0 open
+  dao_drive "$@" || rc=$?
+  while $AUTO && [ "$rc" -eq 2 ] && [ "$n" -lt "$AUTO_WAITS" ]; do
+    n=$((n + 1))
+    open=$(dao_find_open "$1" "$3" || true)
+    case "$(echo "$open" | cut -s -d' ' -f2)" in
+      Approved) echo "  --auto: waiting ${AUTO_WAIT_SEC}s for proposal #${open%% *}'s delay ($n/$AUTO_WAITS)" ;;
+      Pending)  echo "  --auto: waiting ${AUTO_WAIT_SEC}s for proposal #${open%% *}'s votes ($n/$AUTO_WAITS)" ;;
+      *)        echo "  --auto: waiting ${AUTO_WAIT_SEC}s for the proposal ($n/$AUTO_WAITS)" ;;
+    esac
+    sleep "$AUTO_WAIT_SEC"
+    rc=0; dao_drive "$@" || rc=$?
+  done
+  return "$rc"
+}
 # Per-component config:
 #   IMAGE   = Docker Hub image (also the GitHub-release digest row label, lowercased).
 #   NAME    = per-instance CVM VM label (lsvm / worker-ctl.sh).
@@ -307,6 +343,7 @@ fi
 fi  # worker --resume deploys nothing
 
 if $DRY_RUN; then
+  if $AUTO; then echo "(dry-run) --auto: a DAO step that waits is driven again every ${AUTO_WAIT_SEC}s, up to $AUTO_WAITS times, and the run continues"; fi
   if $WORKER_RESUME; then
     echo "(dry-run) would: read the measurements of the running CVM '$NAME' on $NODE -> their approval on $REGISTER (the DAO proposal, when it executes, the execute command) -> once approved, the worker's registration (restarted only if it gave up waiting)"
     exit 0
@@ -446,12 +483,12 @@ if printf '%s' "$APPROVED" | grep -qi true; then
 elif dao_has_governance "$GOV_DAO"; then
   # A worker build opens keystore sessions: approving it is a DAO decision.
   echo "  through the DAO $GOV_DAO (member $GOV_MEMBER)"
-  rc=0; dao_drive "$GOV_DAO" "$GOV_MEMBER" "$(dao_measurements_action worker "$REGISTER" "$MEAS")" || rc=$?
+  rc=0; drive_until_executed "$GOV_DAO" "$GOV_MEMBER" "$(dao_measurements_action worker "$REGISTER" "$MEAS")" || rc=$?
   if [ "$rc" -eq 2 ]; then
     echo "  Next:"
     echo "    1. Send the command above (the propose, a member's vote, or the execute once its time has come)."
     echo "    2. Run this — nothing is redeployed; run it again as often as you like:"
-    echo "         $0 worker $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume"
+    echo "         $0 worker $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume$($AUTO && echo " --auto")"
     echo "       Before the execute it shows when the proposal executes and the command that executes it;"
     echo "       after it, it checks that the worker registered."
     echo "  The CVM '$NAME' is up and registers by itself if the proposal executes within ~50 min of its"
@@ -643,15 +680,16 @@ wait_registration() {
   done
 }
 
-# Propose (or move on) one DAO approval; stops the run when it waits for votes or for the delay.
+# Propose (or move on) one DAO approval; stops the run when it waits for votes or for the delay
+# (with --auto: once drive_until_executed has waited AUTO_WAITS times).
 approve_through_dao() {
   local what="$1" action="$2" rc=0
   echo "  $what: through the DAO (member $GOV_MEMBER)"
-  dao_drive "$DAO" "$GOV_MEMBER" "$action" || rc=$?
+  drive_until_executed "$DAO" "$GOV_MEMBER" "$action" || rc=$?
   if [ "$rc" -eq 2 ]; then
     echo "  The CVM '$NAME' stays up and registers once this is executed. Then continue WITHOUT a"
     echo "  new deploy (a new CVM is a new instance):"
-    echo "    $0 keystore $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume"
+    echo "    $0 keystore $NETWORK $NAME --version $DEPLOY_VERSION --node $NODE --resume$($AUTO && echo " --auto")"
     exit 3
   fi
   [ "$rc" -eq 0 ] || { echo "  approval through the DAO failed" >&2; exit 1; }
