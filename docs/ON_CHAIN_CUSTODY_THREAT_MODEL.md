@@ -179,7 +179,7 @@ cannot change it.
 | Who signs an operation | the agent, by itself, inside the policy. The owner signs nothing per operation; they are asked only above the limits they set |
 | Code under the funds | the NEAR Intents wallet contract and one signing standard, with no state and no clock: nothing to watch, nothing that runs on a timer |
 | Beyond the chain | connectors to web2 services and venues, and the secrets they use, under the same policy and approvals |
-| Setup by the owner | one signature in their own wallet, no transaction; the wallet contract is created with one action, has no access key and needs no NEAR to exist |
+| Setup by the owner | one signature and one small transaction in their own wallet (about 0.01 NEAR of gas, paid by the owner); the wallet contract has no access key and holds no NEAR for storage |
 | The agent's key | made by the owner's signature, again whenever needed; nothing to back up |
 | One operation | two HTTPS calls and one local signature; one NEAR transaction, relayed by any account |
 | Chains | NEAR and NEAR Intents; other chains through 1Click swaps and withdrawals |
