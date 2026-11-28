@@ -152,10 +152,6 @@ it before the second signature exists:
 | Lock | a change of the policy, and an exit, need the same approvers |
 | Freeze | one transaction from the owner straight to the contract stops new requests at once |
 
-The enclave judges the per-transaction limit, the kinds, the tokens, the
-addresses, the approvals and the freeze from chain data; the amounts per
-period are counted by the OutLayer API and passed to the enclave.
-
 One policy covers the wallet contract and the working account together, with
 one set of limits, so the owner writes the rules once. An agent can ask for
 anything; what is outside the policy is never signed, however the request is
@@ -167,7 +163,7 @@ worded.
 |---|---|
 | The enclave's memory | E, and no signature of the agent: nothing moves. The agent signs last, so no signed half of a refused move exists to be found |
 | OutLayer's governance: a hostile build or upgrade | E at most, and still no move without the agent's signature |
-| The coordinator | no key, and no move for an agent that makes the SDK's checks; the enclave verifies the agent's signature and reads the wallet contract itself. The amounts per period are counted here; the per-transaction limit, the kinds, the tokens, the allowlist, the approvals and the freeze hold without it |
+| The coordinator | no key and no move; the enclave verifies the agent's signature and reads the wallet contract itself |
 | The agent's machine | A. Every operation still passes the enclave's policy; the owner freezes the wallet |
 | A prompt injection into the agent | an operation request, which the enclave judges by the policy |
 | The owner's key, under a locked policy | on a wallet contract account with no access key, what the policy allows per period: a change of the policy, its unlock and an exit need the approvers' quorum. A wallet contract on the owner's own account is under that account's keys |

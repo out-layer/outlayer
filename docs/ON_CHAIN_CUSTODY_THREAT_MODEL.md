@@ -9,7 +9,7 @@ at risk, and what the owner does about it. The design itself is in
 | Threat | What the attacker needs | Funds at risk | What the owner does |
 |---|---|---|---|
 | The server that operates the service goes down | nothing | **none** | waits, or leaves through the owner exit with no OutLayer service |
-| The server is compromised from outside | a remote exploit of the API host | **none**, for an agent that makes the SDK's checks | nothing |
+| The server is compromised from outside | a remote exploit of the API host | **none** | nothing |
 | The TEE is read at the hardware level (DRAM interposer) | physical access to a powered-off keystore server, its root | **none** | nothing |
 | NEAR MPC is compromised | 11 of the 16 mainnet nodes | **none** | nothing |
 | OutLayer's governance is used against its users | a quorum of the OutLayer DAO's members | **none** | leaves through the owner exit (24 to 48 hours) before a change of the DAO contract's code or of the approved builds takes effect (72 hours after its vote) |
@@ -19,10 +19,7 @@ at risk, and what the owner does about it. The design itself is in
 
 **What the policy allows** is the owner's choice: the kinds of operation,
 the tokens, limits per transaction and per period (hour, day and month),
-receivers on an allowlist, and approvals by M of N above a threshold. The
-enclave judges the per-transaction limit, the kinds, the tokens, the
-allowlist, the approvals and the freeze from chain data; the amounts per
-period are counted by the OutLayer API and passed to the enclave.
+receivers on an allowlist, and approvals by M of N above a threshold.
 
 On a wallet contract account with no access key (the `0s…` default and a
 sub-account the setup made), nothing leaves the wallet contract without both
@@ -76,8 +73,8 @@ OutLayer's API, keystore or servers stop, for an hour or for good.
 
 An attacker holds the API host: the coordinator, its database, its queue.
 
-* **Funds at risk:** none, for an agent that makes the SDK's checks. The
-  server holds neither key and can produce neither signature.
+* **Funds at risk:** none. The server holds neither key and can produce
+  neither signature.
 * **Operations.** The enclave signs only an operation the agent signed, held
   to the policy the enclave reads from the chain itself. The agent checks
   what comes back before it signs: the receiver, method, arguments and
